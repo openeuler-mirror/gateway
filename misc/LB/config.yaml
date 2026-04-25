@@ -1,0 +1,26 @@
+listen_port: 6198
+
+tls:
+  port: 6443
+  cert: "/etc/gateway/server.crt"
+  key: "/etc/gateway/server.key"
+
+default_backend: "127.0.0.1:8080"
+
+routes:
+  - client_ip: "10.0.0.0/24"
+    backend: "10.0.1.1:8080"
+  - client_ip: "192.168.1.0/24"
+    backend: "10.0.2.1:8080"
+  - client_ip: "10.0.5.100"
+    host: "api.example.com"
+    backend: "10.0.3.1:8080"
+  - host: "api.example.com"
+    backend: "10.0.0.1:8080"
+  - host: "*.example.com"
+    backend: "10.0.0.2:8080"
+  - path: "/api/"
+    backend: "10.0.0.3:3000"
+  - host: "app.example.com"
+    path: "/assets/"
+    backend: "10.0.0.4:80"

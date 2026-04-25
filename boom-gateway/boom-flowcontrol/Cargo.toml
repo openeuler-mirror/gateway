@@ -1,0 +1,11 @@
+[package]
+name = "boom-flowcontrol"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+boom-core = { path = "../boom-core" }
+dashmap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+futures = { workspace = true }

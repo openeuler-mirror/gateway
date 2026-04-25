@@ -1,0 +1,14 @@
+[package]
+name = "boom-promptlog"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+arc-swap = { workspace = true }
+tracing = { workspace = true }
+futures = { workspace = true }
+flate2 = { workspace = true }

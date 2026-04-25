@@ -1,0 +1,18 @@
+[package]
+name = "boom-auth"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+boom-core = { path = "../boom-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+moka = { workspace = true }
+chrono = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }

@@ -1,0 +1,24 @@
+[package]
+name = "boom-dashboard"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+boom-core = { path = "../boom-core" }
+boom-flowcontrol = { path = "../boom-flowcontrol" }
+boom-limiter = { path = "../boom-limiter" }
+boom-routing = { path = "../boom-routing" }
+boom-audit = { path = "../boom-audit" }
+boom-promptlog = { path = "../boom-promptlog" }
+axum = { workspace = true }
+sqlx = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+jsonwebtoken = { workspace = true }
+chrono = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+dashmap = { workspace = true }

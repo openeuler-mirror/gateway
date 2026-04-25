@@ -1,0 +1,15 @@
+[package]
+name = "boom-routing"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+boom-core = { path = "../boom-core" }
+arc-swap = { workspace = true }
+dashmap = { workspace = true }
+sqlx = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }

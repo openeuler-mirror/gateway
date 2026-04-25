@@ -1,0 +1,14 @@
+[package]
+name = "gateway-lb"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+async-trait = "0.1"
+pingora-core = { version = "0.8", features = ["openssl"] }
+pingora-proxy = { version = "0.8", features = ["openssl"] }
+serde = { version = "1", features = ["derive"] }
+ipnet = "2"
+log = "0.4"
+serde_yaml = "0.9"
+notify = { version = "7", default-features = false, features = ["macos_kqueue"] }

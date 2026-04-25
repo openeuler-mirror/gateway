@@ -1,0 +1,76 @@
+[workspace]
+resolver = "2"
+members = [
+    "boom-gateway/boom-core",
+    "boom-gateway/boom-config",
+    "boom-gateway/boom-auth",
+    "boom-gateway/boom-provider",
+    "boom-gateway/boom-limiter",
+    "boom-gateway/boom-routing",
+    "boom-gateway/boom-audit",
+    "boom-gateway/boom-flowcontrol",
+    "boom-gateway/boom-main",
+    "boom-gateway/boom-dashboard",
+    "boom-gateway/boom-promptlog",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+# serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+
+# async
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+futures = "0.3"
+
+# web
+axum = { version = "0.8", features = ["macros"] }
+tower = { version = "0.5", features = ["full"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# http client
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
+
+# database
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono", "json", "uuid", "tls-rustls"] }
+
+# error handling
+thiserror = "2"
+anyhow = "1"
+
+# logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
+
+# crypto
+sha2 = "0.10"
+hex = "0.4"
+
+# cache
+moka = { version = "0.12", features = ["future"] }
+
+# time
+chrono = { version = "0.4", features = ["serde"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# concurrent collections
+dashmap = "6"
+
+# lock-free atomic swap (hot-reload)
+arc-swap = "1"
+
+# misc
+uuid = { version = "1", features = ["v4", "serde"] }
+tokio-stream = "0.1"
+bytes = "1"
+jsonwebtoken = "9"
+flate2 = "1"
