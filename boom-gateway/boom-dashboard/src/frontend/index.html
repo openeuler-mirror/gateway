@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>BooMGateway Dashboard</title>
+  <link rel="stylesheet" href="/dashboard/style.css">
+</head>
+<body>
+  <div id="app">
+    <!-- Login Page -->
+    <div id="page-login" class="page active">
+      <div class="login-card">
+        <div class="login-brand">
+          <div class="brand-name">BooM</div>
+          <div class="brand-tagline">Gateway Dashboard</div>
+        </div>
+        <form id="login-form">
+          <div class="form-group">
+            <label for="user_id">Username</label>
+            <input type="text" id="user_id" placeholder='Enter "admin" for admin, or leave blank' value="">
+          </div>
+          <div class="form-group">
+            <label for="api_key">Password (API Key)</label>
+            <input type="password" id="api_key" placeholder="Your API key (sk-...) or master key" required>
+          </div>
+          <button type="submit" id="login-btn">Login</button>
+          <p id="login-error" class="error-msg hidden"></p>
+        </form>
+      </div>
+    </div>
+
+    <!-- User Dashboard -->
+    <div id="page-dashboard" class="page">
+      <div class="layout">
+        <aside class="sidebar">
+          <h2 id="user-sidebar-title">Dashboard</h2>
+          <nav>
+            <a href="#/dashboard" class="nav-link active" data-section="user-overview">Overview</a>
+            <a href="#/dashboard/logs" class="nav-link" data-section="user-logs">Request Logs</a>
+          </nav>
+          <div class="sidebar-footer">
+            <button id="logout-btn" class="btn-secondary">Logout</button>
+          </div>
+        </aside>
+        <main class="main-content">
+          <section id="user-overview" class="section active">
+            <h2>Plan & Usage</h2>
+            <div id="plan-card" class="card">
+              <h3>Current Plan</h3>
+              <div id="plan-info"><p class="loading">Loading...</p></div>
+            </div>
+            <div class="card">
+              <h3>Real-time Usage</h3>
+              <div id="usage-info"><p class="loading">Loading...</p></div>
+            </div>
+            <div class="card">
+              <h3>Token Usage</h3>
+              <div id="token-info"><p class="loading">Loading...</p></div>
+            </div>
+            <div class="card">
+              <h3>Key Information</h3>
+              <div id="key-info"><p class="loading">Loading...</p></div>
+            </div>
+          </section>
+
+          <!-- User: Request Logs -->
+          <section id="user-logs" class="section">
+            <h2>Request Logs</h2>
+            <div id="user-logs-table-wrap"><p class="loading">Loading...</p></div>
+            <div id="user-logs-pagination" class="pagination"></div>
+          </section>
+        </main>
+      </div>
+    </div>
+
+    <!-- Admin Panel -->
+    <div id="page-admin" class="page">
+      <div class="layout">
+        <aside class="sidebar">
+          <h2>Admin Panel</h2>
+          <nav>
+            <a href="#/admin/stats" class="nav-link" data-section="admin-stats">Stats</a>
+            <a href="#/admin/models" class="nav-link" data-section="admin-models">Models</a>
+            <a href="#/admin/aliases" class="nav-link" data-section="admin-aliases">Aliases</a>
+            <a href="#/admin/plans" class="nav-link" data-section="admin-plans">Plans</a>
+            <a href="#/admin/keys" class="nav-link" data-section="admin-keys">Keys</a>
+            <a href="#/admin/teams" class="nav-link" data-section="admin-teams">Teams</a>
+            <a href="#/admin/logs" class="nav-link" data-section="admin-logs">Logs</a>
+            <a href="#/admin/assignments" class="nav-link" data-section="admin-assignments">Assignments</a>
+            <a href="#/admin/config" class="nav-link" data-section="admin-config">Config</a>
+          </nav>
+          <div class="sidebar-footer">
+            <button id="logout-btn-admin" class="btn-secondary">Logout</button>
+          </div>
+        </aside>
+        <main class="main-content">
+          <!-- Stats Section -->
+          <section id="admin-stats" class="section">
+            <div class="section-header">
+              <h2>In-Flight Requests</h2>
+              <div style="display:flex;gap:8px">
+                <button class="btn-small" id="btn-reload-config" title="Hot-reload config.yaml without restart">Reload Config</button>
+                <button class="btn-small" id="btn-refresh-inflight">Refresh</button>
+              </div>
+            </div>
+            <div id="inflight-table-wrap"><p class="loading">Loading...</p></div>
+
+            <div class="section-header" style="margin-top:2rem">
+              <h2>Model Statistics</h2>
+            </div>
+            <div id="stats-table-wrap"><p class="loading">Loading...</p></div>
+          </section>
+
+          <!-- Models Section -->
+          <section id="admin-models" class="section">
+            <div class="section-header">
+              <h2>Model Deployments</h2>
+              <button class="btn-primary" id="btn-new-model">+ Add Model</button>
+            </div>
+            <div id="models-table-wrap"><p class="loading">Loading...</p></div>
+          </section>
+
+          <!-- Aliases Section -->
+          <section id="admin-aliases" class="section">
+            <div class="section-header">
+              <h2>Model Aliases</h2>
+              <button class="btn-primary" id="btn-new-alias">+ Add Alias</button>
+            </div>
+            <div id="aliases-table-wrap"><p class="loading">Loading...</p></div>
+          </section>
+
+          <!-- Plans Section -->
+          <section id="admin-plans" class="section">
+            <div class="section-header">
+              <h2>Plans</h2>
+              <div>
+                <button class="btn-danger" id="btn-reset-all-limits">Reset All Limits</button>
+                <button class="btn-primary" id="btn-new-plan">+ New Plan</button>
+              </div>
+            </div>
+            <div id="plans-table-wrap"><p class="loading">Loading...</p></div>
+          </section>
+
+          <!-- Keys Section -->
+          <section id="admin-keys" class="section">
+            <div class="section-header">
+              <h2>API Keys</h2>
+              <div class="keys-toolbar">
+                <input type="text" id="keys-search" placeholder="Search alias, name, user, token..." class="search-input">
+                <button class="btn-small" id="btn-vip-filter">VIP Only</button>
+                <button class="btn-primary" id="btn-new-key">+ Create Key</button>
+              </div>
+            </div>
+            <div id="keys-table-wrap"><p class="loading">Loading...</p></div>
+            <div id="keys-pagination" class="pagination"></div>
+          </section>
+
+          <!-- Assignments Section -->
+          <section id="admin-assignments" class="section">
+            <div class="section-header">
+              <h2>Key-Plan Assignments</h2>
+              <button class="btn-primary" id="btn-new-assignment">+ Assign</button>
+            </div>
+            <div id="assignments-table-wrap"><p class="loading">Loading...</p></div>
+          </section>
+
+          <!-- Config Section -->
+          <section id="admin-config" class="section">
+            <div class="section-header">
+              <h2>Configuration</h2>
+              <button class="btn-primary" id="btn-new-config">+ Set Value</button>
+            </div>
+            <div id="config-table-wrap"><p class="loading">Loading...</p></div>
+          </section>
+
+          <!-- Teams Section -->
+          <section id="admin-teams" class="section">
+            <div class="section-header">
+              <h2>Teams</h2>
+              <button class="btn-primary" onclick="showCreateTeamModal()">Create Team</button>
+            </div>
+            <div id="teams-table-wrap"><p class="loading">Loading...</p></div>
+          </section>
+
+          <!-- Logs Section -->
+          <section id="admin-logs" class="section">
+            <div class="section-header">
+              <h2>Request Logs</h2>
+              <div>
+                <button class="btn-small" id="btn-prompt-log-toggle">Prompt Log: OFF</button>
+                <button class="btn-small" id="btn-debug-toggle">Debug: OFF</button>
+                <button class="btn-small" id="btn-reset-logs-filters">Reset Filters</button>
+              </div>
+            </div>
+            <div id="logs-table-wrap">
+              <table id="logs-table">
+                <thead>
+                  <tr class="filter-row">
+                    <td></td>
+                    <td><input class="col-filter" data-col="team_alias" placeholder="filter"></td>
+                    <td><input class="col-filter" data-col="key_alias" placeholder="filter"></td>
+                    <td><input class="col-filter" data-col="model" placeholder="filter"></td>
+                    <td><input class="col-filter" data-col="api_path" placeholder="filter"></td>
+                    <td><input class="col-filter" data-col="status_code" placeholder="filter"></td>
+                    <td><input class="col-filter" data-col="stream" placeholder="filter"></td>
+                    <td></td>
+                    <td></td>
+                    <td></td>
+                    <td><input class="col-filter" data-col="error" placeholder="filter"></td>
+                    <td></td>
+                  </tr>
+                  <tr><th>Time</th><th>Team</th><th>Key Alias</th><th>Model</th><th>Path</th><th>Status</th><th>Stream</th><th>Input</th><th>Output</th><th>Duration</th><th>Error</th><th>Detail</th></tr>
+                </thead>
+                <tbody id="logs-tbody"><tr><td colspan="11" class="loading">Loading...</td></tr></tbody>
+              </table>
+            </div>
+            <div id="logs-pagination" class="pagination"></div>
+          </section>
+        </main>
+      </div>
+    </div>
+
+    <!-- Modal Overlay -->
+    <div id="modal-overlay" class="modal-overlay hidden">
+      <div class="modal" id="modal-content"></div>
+    </div>
+  </div>
+
+  <script src="/dashboard/app.js"></script>
+</body>
+</html>

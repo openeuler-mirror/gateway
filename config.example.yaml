@@ -1,0 +1,179 @@
+# BooMGateway 配置文件
+# 兼容 litellm 的 proxy_server_config.yaml 格式
+# model 字段使用 litellm 的 provider/model-id 前缀约定
+
+# ──────────────────────────────────────────────
+# 模型部署列表
+# ──────────────────────────────────────────────
+model_list:
+  # OpenAI — 显式前缀
+  - model_name: gpt-4
+    litellm_params:
+      model: openai/gpt-4-turbo
+      api_key: os.environ/OPENAI_API_KEY
+      rpm: 60                       # 部署级 RPM 限制
+      timeout: 1200                 # 请求超时（秒），默认 1200
+
+  # OpenAI — 自动检测 (gpt- 开头自动识别为 openai)
+  - model_name: gpt-4o
+    litellm_params:
+      model: gpt-4o
+      api_key: ${OPENAI_API_KEY}
+
+  # 同名多部署 → 自动负载均衡（轮询）
+  - model_name: gpt-4o
+    litellm_params:
+      model: openai/gpt-4o
+      api_key: ${OPENAI_API_KEY_BACKUP}
+      api_base: https://api.openai.com/v1
+
+  # Anthropic — 带配额倍率
+  - model_name: claude-sonnet
+    model_info:
+      id: node-a                   # 可选：部署标识
+      input_cost_per_token: 0.000003   # 可选：输入成本
+      output_cost_per_token: 0.000015  # 可选：输出成本
+      quota_count_ratio: 3         # 配额消耗倍率：1 次请求消耗 3 个配额
+    litellm_params:
+      model: anthropic/claude-sonnet-4-20250514
+      api_key: os.environ/ANTHROPIC_API_KEY
+      temperature: 0.7             # 可选：温度覆盖
+      max_tokens: 4096             # 可选：最大输出 token
+
+  # 带流控的部署 — 限制在途请求数和上下文总量
+  # - model_name: gpt-4o
+  #   model_info:
+  #     id: gpt4o-node-1
+  #   flow_control:
+  #     model_queue_limit: 50            # 最大在途请求数（0 或不设 = 无限制）
+  #     model_context_limit: 5000000     # 最大在途输入字符总量（0 或不设 = 无限制）
+  #   litellm_params:
+  #     model: openai/gpt-4o
+  #     api_key: ${OPENAI_API_KEY}
+
+  # Azure OpenAI
+  - model_name: azure-gpt4
+    litellm_params:
+      model: azure/my-gpt4-deployment
+      api_base: https://YOUR_RESOURCE.openai.azure.com
+      api_key: os.environ/AZURE_API_KEY
+      api_version: "2024-02-01"
+
+  # Gemini
+  - model_name: gemini-pro
+    litellm_params:
+      model: gemini/gemini-2.0-flash
+      api_key: os.environ/GEMINI_API_KEY
+
+  # AWS Bedrock
+  - model_name: bedrock-claude
+    litellm_params:
+      model: bedrock/anthropic.claude-3-sonnet
+      aws_region_name: us-east-1
+      aws_access_key_id: ${AWS_ACCESS_KEY_ID}
+      aws_secret_access_key: ${AWS_SECRET_ACCESS_KEY}
+
+  # 自定义请求头
+  - model_name: custom-provider
+    litellm_params:
+      model: openai/custom-model
+      api_key: ${CUSTOM_API_KEY}
+      api_base: https://custom.api.com/v1
+      headers:
+        X-Custom-Header: custom-value
+
+# ──────────────────────────────────────────────
+# 通用设置
+# ──────────────────────────────────────────────
+general_settings:
+  # Master key — 不走 DB 也能鉴权
+  master_key: os.environ/MASTER_KEY
+  # PostgreSQL 连接串（litellm DB）
+  database_url: os.environ/DATABASE_URL
+  # DB 权威模式：true 时 DB 是模型/别名/套餐的数据源，YAML 仅首次 seed
+  # store_model_in_db: false
+
+# ──────────────────────────────────────────────
+# 路由设置
+# ──────────────────────────────────────────────
+router_settings:
+  # 路由策略：round_robin（默认）或 key_affinity（会话亲和）
+  routing_strategy: round_robin
+
+  # 模型别名：客户端用别名请求，实际路由到目标模型
+  model_group_alias:
+    # 简单别名
+    "gpt-4": "gpt-4o"
+
+    # 扩展格式（可设置 hidden: true 使其不在 /v1/models 中展示）
+    "GPT-4o":
+      model: "gpt-4o"
+      hidden: true
+
+    "claude": "claude-sonnet"
+
+  # key_affinity 策略参数（仅 routing_strategy: key_affinity 时生效）
+  # key_affinity_context_threshold: 0     # 上下文字符数阈值，低于此值优先最低负载
+  # key_affinity_rebalance_threshold: 10  # 再均衡阈值（请求数差异超过此值时重新分配）
+
+# ──────────────────────────────────────────────
+# 服务器设置
+# ──────────────────────────────────────────────
+server:
+  host: 0.0.0.0
+  port: 4000
+  workers: 4
+
+# ──────────────────────────────────────────────
+# 全局限流设置
+# ──────────────────────────────────────────────
+rate_limit:
+  enabled: true
+  default_rpm: 60                   # 无套餐的 key 的默认 RPM
+  # 自定义时间窗口: [次数, 秒数]
+  window_limits:
+    - [100, 18000]                  # 100 次请求 / 5 小时
+
+# ──────────────────────────────────────────────
+# 套餐设置
+# ──────────────────────────────────────────────
+plan_settings:
+  default_plan: "basic"             # 未分配套餐的 key 使用的默认套餐
+
+  plans:
+    basic:
+      concurrency_limit: 4          # 最大并发请求数
+      rpm_limit: 60                 # 每分钟请求数
+      window_limits:
+        - [100, 18000]              # 100 次 / 5 小时
+
+    pro:
+      concurrency_limit: 10
+      rpm_limit: 120
+      window_limits:
+        - [500, 18000]
+
+    enterprise:
+      concurrency_limit: 50
+      rpm_limit: 600
+      window_limits:
+        - [2000, 18000]
+        - [500, 3600]               # 500 次 / 1 小时
+
+    # 支持时段调度的套餐
+    scheduled-plan:
+      concurrency_limit: 4
+      rpm_limit: 40
+      window_limits:
+        - [80, 18000]
+      schedule:
+        - hours: "9:00-21:00"       # 高峰期
+          concurrency_limit: 4
+          rpm_limit: 40
+          window_limits:
+            - [80, 18000]
+        - hours: "21:00-9:00"       # 低峰期（支持跨午夜）
+          concurrency_limit: 8
+          rpm_limit: 80
+          window_limits:
+            - [160, 18000]

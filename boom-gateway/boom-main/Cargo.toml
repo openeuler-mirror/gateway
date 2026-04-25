@@ -1,0 +1,42 @@
+[package]
+name = "boom-main"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "boom-gateway"
+path = "src/main.rs"
+
+[dependencies]
+boom-core = { path = "../boom-core" }
+boom-config = { path = "../boom-config" }
+boom-auth = { path = "../boom-auth" }
+boom-provider = { path = "../boom-provider" }
+boom-limiter = { path = "../boom-limiter" }
+boom-routing = { path = "../boom-routing" }
+boom-audit = { path = "../boom-audit" }
+boom-dashboard = { path = "../boom-dashboard" }
+boom-flowcontrol = { path = "../boom-flowcontrol" }
+boom-promptlog = { path = "../boom-promptlog" }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
+clap = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+sqlx = { workspace = true }
+futures = { workspace = true }
+tokio-stream = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+arc-swap = { workspace = true }
+reqwest = { workspace = true }
+moka = { workspace = true, features = ["sync"] }
+dashmap = { workspace = true }

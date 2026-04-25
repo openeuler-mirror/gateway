@@ -1,0 +1,8 @@
+/target
+*.swp
+*.swo
+*~
+.DS_Store
+config.yaml
+!misc/LB/config.yaml
+.env
