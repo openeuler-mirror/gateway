@@ -62,7 +62,8 @@ impl Provider for AzureProvider {
         if let Some(ref key) = self.api_key {
             builder = builder.header("api-key", key);
         }
-        builder = builder.timeout(std::time::Duration::from_secs(600));
+        // Non-streaming: upstream sends no data until the entire response is ready.
+        // Uses the reqwest Client timeout from deployment config (`create_provider`), not a separate 600s cap.
 
         let resp = builder
             .json(&body)

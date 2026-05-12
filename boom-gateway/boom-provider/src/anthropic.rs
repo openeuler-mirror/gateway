@@ -527,10 +527,10 @@ impl Provider for AnthropicProvider {
         if !betas.is_empty() {
             builder = builder.header("anthropic-beta", betas.join(","));
         }
-
         // Non-streaming: upstream sends no data until the entire response is ready.
+        // Uses the reqwest Client timeout from deployment config (`create_provider`), not a separate 600s cap.
+
         let resp = builder
-            .timeout(std::time::Duration::from_secs(600))
             .json(&body)
             .send()
             .await
