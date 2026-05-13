@@ -1,3 +1,4 @@
+pub mod delegated;
 pub mod key_affinity;
 pub mod round_robin;
 

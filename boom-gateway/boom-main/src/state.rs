@@ -5,7 +5,10 @@ use boom_core::provider::Authenticator;
 use boom_core::DebugErrorStore;
 use boom_limiter::{PlanStore, RateLimitPlan, ScheduleSlot, SlidingWindowLimiter};
 use boom_flowcontrol::{FlowControlConfig, FlowController};
-use boom_routing::{AliasStore, DeploymentStore, InFlightTracker, KeyAffinityPolicy, Router, RoundRobinPolicy, SchedulePolicy};
+use boom_routing::{
+    AliasStore, DelegatedPolicy, DeploymentStore, InFlightTracker, KeyAffinityPolicy, Router,
+    RoundRobinPolicy, SchedulePolicy,
+};
 use boom_promptlog::PromptLogWriter;
 use boom_provider;
 use dashmap::DashMap;
@@ -726,6 +729,12 @@ fn create_policy(config: &Config, inflight: &Arc<InFlightTracker>, flow_controll
             );
             policy.set_queue_info(flow_controller.clone());
             Arc::new(policy)
+        }
+        "delegated" => {
+            tracing::info!(
+                "Using delegated policy: per-model replica/load routing delegated to downstream load balancer; require exactly one deployment per model_name"
+            );
+            Arc::new(DelegatedPolicy::new())
         }
         other => {
             tracing::warn!(
