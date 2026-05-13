@@ -26,7 +26,7 @@ pub fn create_provider(
     deployment_id: Option<String>,
 ) -> Result<Arc<dyn Provider>, GatewayError> {
     let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(timeout))
+        .timeout(std::time::Duration::from_secs(timeout.max(1)))
         .build()
         .map_err(|e| GatewayError::ConfigError(format!("Failed to create HTTP client: {}", e)))?;
 

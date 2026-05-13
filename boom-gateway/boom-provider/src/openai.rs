@@ -64,9 +64,7 @@ impl Provider for OpenAIProvider {
             builder = builder.bearer_auth(key);
         }
         // Non-streaming: upstream sends no data until the entire response is ready.
-        // Override timeout to 10 minutes — the client-level timeout (typically 30-60s)
-        // would abort the request during model generation.
-        builder = builder.timeout(std::time::Duration::from_secs(600));
+        // Uses the reqwest Client timeout from deployment config (`create_provider`), not a separate 600s cap.
 
         let resp = builder
             .json(&body)
