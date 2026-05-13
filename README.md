@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="logo.svg" alt="BooMGateway" width="260">
+  <img src="misc/logo.svg" alt="BooMGateway" width="360">
   <br><br>
   <strong>High-Performance LLM API Gateway</strong>
 </div>
@@ -211,7 +211,7 @@ BooMGateway/
 │   ├── boom-dashboard/     Web UI + REST API + JWT auth
 │   └── boom-main/          Entry point, routing, state assembly
 ├── misc/LB/                Pingora load balancer (optional frontend)
-├── watchdog.sh             Process watchdog with auto-restart
+├── misc/logo.svg           Project logo
 ├── config.example.yaml     Complete config reference
 ├── ARCH.md                 Architecture design document
 └── CLAUDE.md               Development guidelines
