@@ -22,6 +22,10 @@ fn default_per_page() -> i64 {
     50
 }
 
+fn normalize_pagination(page: i64, per_page: i64) -> (i64, i64) {
+    (page.max(1), per_page.clamp(1, 1000))
+}
+
 /// A single log row from boom_request_log.
 #[derive(Debug, FromRow)]
 pub struct LogRow {
@@ -51,7 +55,8 @@ pub struct LogsPage {
 
 /// List request logs with optional filters and pagination.
 pub async fn list_logs(pool: &PgPool, query: ListLogsQuery) -> Result<LogsPage, sqlx::Error> {
-    let offset = (query.page - 1).max(0) * query.per_page;
+    let (page, per_page) = normalize_pagination(query.page, query.per_page);
+    let offset = (page - 1) * per_page;
 
     // Build WHERE clause dynamically.
     let mut where_clauses = Vec::new();
@@ -127,15 +132,15 @@ pub async fn list_logs(pool: &PgPool, query: ListLogsQuery) -> Result<LogsPage, 
         cq = cq.bind(200i16);
     }
 
-    q = q.bind(query.per_page).bind(offset);
+    q = q.bind(per_page).bind(offset);
 
     let rows = q.fetch_all(pool).await?;
     let total = cq.fetch_one(pool).await.unwrap_or(0);
 
     Ok(LogsPage {
         logs: rows,
-        page: query.page,
-        per_page: query.per_page,
+        page,
+        per_page,
         total,
     })
 }
@@ -171,4 +176,16 @@ pub fn logs_page_to_json(page: LogsPage) -> Value {
         "per_page": page.per_page,
         "total": page.total,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_pagination;
+
+    #[test]
+    fn normalize_pagination_clamps_invalid_values() {
+        assert_eq!(normalize_pagination(0, 0), (1, 1));
+        assert_eq!(normalize_pagination(-3, -20), (1, 1));
+        assert_eq!(normalize_pagination(2, 5000), (2, 1000));
+    }
 }
