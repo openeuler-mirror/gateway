@@ -360,7 +360,7 @@ async fn chat_completions_inner(
         let usage = UsageTracker::default();
         let sse_stream = sse_stream_from_chat_stream(stream, usage.clone(), debug);
         let inflight_guard = if let Some(ref did) = deployment_id {
-            InFlightGuard::new_for_deployment_with_key(state.inflight.clone(), &inflight_model, did, input_chars as u64, identity.key_alias.as_deref(), &identity.key_hash)
+            InFlightGuard::new_for_deployment(state.inflight.clone(), &inflight_model, did, input_chars as u64)
         } else {
             InFlightGuard::new(state.inflight.clone(), &inflight_model, input_chars as u64)
         };
@@ -413,7 +413,7 @@ async fn chat_completions_inner(
         Ok(response.into_response())
     } else {
         let _inflight = if let Some(ref did) = deployment_id {
-            InFlightGuard::new_for_deployment_with_key(state.inflight.clone(), &inflight_model, did, input_chars as u64, identity.key_alias.as_deref(), &identity.key_hash)
+            InFlightGuard::new_for_deployment(state.inflight.clone(), &inflight_model, did, input_chars as u64)
         } else {
             InFlightGuard::new(state.inflight.clone(), &inflight_model, input_chars as u64)
         };
@@ -1489,7 +1489,7 @@ pub async fn messages(
         let usage = UsageTracker::default();
         let sse_stream = sse_stream_from_anthropic_chat_stream(stream, model.clone(), usage.clone(), debug);
         let inflight_guard = if let Some(ref did) = deployment_id {
-            InFlightGuard::new_for_deployment_with_key(state.inflight.clone(), &inflight_model, did, input_chars as u64, identity.key_alias.as_deref(), &identity.key_hash)
+            InFlightGuard::new_for_deployment(state.inflight.clone(), &inflight_model, did, input_chars as u64)
         } else {
             InFlightGuard::new(state.inflight.clone(), &inflight_model, input_chars as u64)
         };
@@ -1541,7 +1541,7 @@ pub async fn messages(
         Ok(response.into_response())
     } else {
         let _inflight = if let Some(ref did) = deployment_id {
-            InFlightGuard::new_for_deployment_with_key(state.inflight.clone(), &inflight_model, did, input_chars as u64, identity.key_alias.as_deref(), &identity.key_hash)
+            InFlightGuard::new_for_deployment(state.inflight.clone(), &inflight_model, did, input_chars as u64)
         } else {
             InFlightGuard::new(state.inflight.clone(), &inflight_model, input_chars as u64)
         };

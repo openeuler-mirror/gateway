@@ -1689,67 +1689,24 @@ pub async fn get_inflight_stats(
 ) -> Response {
     use std::collections::HashMap;
 
-    let inflight_models = state.inflight.get_stats();
-    let inflight_deployments = state.inflight.get_stats_by_deployment();
     let flowcontrol_stats = state.flow_controller.get_stats();
     let queued_waiters = state.flow_controller.get_queued_waiters();
-
-    // Build lookup: deployment_id → (max_inflight, max_context).
-    let fc_limits: HashMap<&str, (u32, u64)> = flowcontrol_stats.iter()
-        .map(|fc| (fc.deployment_id.as_str(), (fc.max_inflight, fc.max_context)))
-        .collect();
+    let dispatched_keys = state.flow_controller.get_dispatched_keys();
 
     // Build lookup: deployment_id → queued waiter entries.
     let queued_map: HashMap<&str, &Vec<boom_flowcontrol::QueuedWaiterEntry>> = queued_waiters.iter()
         .map(|q| (q.deployment_id.as_str(), &q.waiters))
         .collect();
 
-    // Collect model names that already appear in deployment-level stats.
-    let mut models_covered: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Build lookup: deployment_id → dispatched key entries.
+    let dispatched_map: HashMap<&str, &Vec<boom_flowcontrol::DispatchedKeyEntry>> = dispatched_keys.iter()
+        .map(|d| (d.deployment_id.as_str(), &d.keys))
+        .collect();
 
     let mut rows: HashMap<String, serde_json::Value> = HashMap::new();
 
-    // 1. Inflight deployment data.
-    for d in &inflight_deployments {
-        models_covered.insert(d.model.clone());
-        let (max_reqs, max_ctx) = fc_limits.get(d.deployment_id.as_str()).copied().unwrap_or((0, 0));
-        let fc_stat = flowcontrol_stats.iter()
-            .find(|fc| fc.deployment_id == d.deployment_id);
-        let fc_waiters = fc_stat
-            .map(|fc| fc.waiters + fc.vip_waiters)
-            .unwrap_or(0);
-        let fc_inflight = fc_stat
-            .map(|fc| fc.current_inflight)
-            .unwrap_or(0);
-        let queued_keys: Vec<serde_json::Value> = queued_map.get(d.deployment_id.as_str())
-            .map(|entries| entries.iter().map(|e| json!({
-                "key_alias": e.key_alias,
-                "is_vip": e.is_vip,
-            })).collect())
-            .unwrap_or_default();
-        let key_stats: Vec<serde_json::Value> = d.key_stats.iter().map(|k| json!({
-            "key_alias": k.key_alias,
-            "request_count": k.request_count,
-        })).collect();
-        rows.insert(d.deployment_id.clone(), json!({
-            "model": d.model,
-            "deployment_id": d.deployment_id,
-            "fc_queue": fc_waiters,
-            "in_reqs": d.inflight_requests,
-            "fc_inflight": fc_inflight,
-            "in_reqs_max": max_reqs,
-            "in_context": d.inflight_input_chars,
-            "in_context_max": max_ctx,
-            "queued_keys": queued_keys,
-            "key_stats": key_stats,
-        }));
-    }
-
-    // 2. FlowControl-only deployments (no active inflight but has FC config).
+    // 1. All FlowControl deployments (primary data source).
     for fc in &flowcontrol_stats {
-        if rows.contains_key(&fc.deployment_id) {
-            continue;
-        }
         let model = state.deployment_store.find_model_by_deployment_id(&fc.deployment_id)
             .unwrap_or_else(|| "-".to_string());
         let queued_keys: Vec<serde_json::Value> = queued_map.get(fc.deployment_id.as_str())
@@ -1758,23 +1715,29 @@ pub async fn get_inflight_stats(
                 "is_vip": e.is_vip,
             })).collect())
             .unwrap_or_default();
+        let key_stats = aggregate_dispatched_keys(dispatched_map.get(fc.deployment_id.as_str()).copied());
         rows.insert(fc.deployment_id.clone(), json!({
             "model": model,
             "deployment_id": fc.deployment_id,
             "fc_queue": fc.waiters + fc.vip_waiters,
             "in_reqs": fc.current_inflight,
-            "fc_inflight": fc.current_inflight,
             "in_reqs_max": fc.max_inflight,
             "in_context": fc.current_context,
             "in_context_max": fc.max_context,
             "queued_keys": queued_keys,
-            "key_stats": [],
+            "key_stats": key_stats,
         }));
     }
 
-    // 3. Model-level fallback — deployments without deployment_id.
+    // 2. Model-level fallback — deployments without FC config.
+    let covered_models: std::collections::HashSet<String> = rows.values()
+        .filter_map(|r| r["model"].as_str())
+        .filter(|m| *m != "-")
+        .map(|m| m.to_string())
+        .collect();
+    let inflight_models = state.inflight.get_stats();
     for m in &inflight_models {
-        if models_covered.contains(&m.model) {
+        if covered_models.contains(&m.model) {
             continue;
         }
         rows.insert(format!("__model__{}", m.model), json!({
@@ -1801,6 +1764,26 @@ pub async fn get_inflight_stats(
     });
 
     Json(json!({ "deployments": result })).into_response()
+}
+
+/// Aggregate dispatched key entries by key_alias, returning per-key request counts.
+fn aggregate_dispatched_keys(keys: Option<&Vec<boom_flowcontrol::DispatchedKeyEntry>>) -> Vec<serde_json::Value> {
+    let entries = match keys {
+        Some(e) => e,
+        None => return Vec::new(),
+    };
+    let mut counts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    for entry in entries {
+        *counts.entry(entry.key_alias.clone()).or_insert(0) += 1;
+    }
+    let mut result: Vec<serde_json::Value> = counts.into_iter()
+        .map(|(alias, count)| json!({
+            "key_alias": alias,
+            "request_count": count,
+        }))
+        .collect();
+    result.sort_by(|a, b| b["request_count"].as_u64().cmp(&a["request_count"].as_u64()));
+    result
 }
 
 // ═══════════════════════════════════════════════════════════
