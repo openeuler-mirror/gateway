@@ -3,6 +3,7 @@ use boom_auth::DbAuthenticator;
 use boom_config::Config;
 use boom_core::provider::Authenticator;
 use boom_core::DebugErrorStore;
+use boom_kvindex::{FlatIndex, KvIndexBackend, TokenizerPool};
 use boom_limiter::{PlanStore, RateLimitPlan, ScheduleSlot, SlidingWindowLimiter};
 use boom_flowcontrol::{FlowControlConfig, FlowController};
 use boom_routing::{
@@ -56,6 +57,10 @@ pub struct AppState {
     pub debug_store: Arc<DebugErrorStore>,
     /// Prompt log writer — captures full request/response for audit.
     pub prompt_log_writer: PromptLogWriter,
+    /// KV-cache prefix index (survives reloads). None if kv_aware disabled.
+    pub kv_index: Option<Arc<dyn KvIndexBackend>>,
+    /// Tokenizer pool for computing prefix block hashes (survives reloads).
+    pub tokenizer_pool: Option<Arc<TokenizerPool>>,
 }
 
 /// The state that gets swapped on config reload.
@@ -122,8 +127,42 @@ impl AppState {
         // Debug error store survives across reloads.
         let debug_store = Arc::new(DebugErrorStore::new());
 
-        // Create scheduling policy from config (may reference inflight).
-        let policy = create_policy(&config, &inflight, &flow_controller);
+        // KV-cache index + tokenizer pool (survives reloads).
+        let (kv_index, tokenizer_pool) = if config.router_settings.kv_aware.enabled {
+            let kv_settings = &config.router_settings.kv_aware;
+            let index: Arc<dyn KvIndexBackend> = Arc::new(FlatIndex::new(
+                kv_settings.cache_weight,
+                kv_settings.tier_weight,
+                kv_settings.load_weight,
+            ));
+            let pool = match &kv_settings.tokenizer_dir {
+                Some(dir) => {
+                    let p = TokenizerPool::new(dir.into(), kv_settings.block_size);
+                    tracing::info!(
+                        tokenizer_dir = %dir,
+                        block_size = kv_settings.block_size,
+                        "KV-aware routing: tokenizer pool initialized"
+                    );
+                    Some(Arc::new(p))
+                }
+                None => {
+                    tracing::warn!("KV-aware routing enabled but no tokenizer_dir configured — prefix hashing disabled");
+                    None
+                }
+            };
+            tracing::info!(
+                cache_weight = kv_settings.cache_weight,
+                load_weight = kv_settings.load_weight,
+                tier_weight = kv_settings.tier_weight,
+                "KV-aware routing enabled"
+            );
+            (Some(index), pool)
+        } else {
+            (None, None)
+        };
+
+        // Create scheduling policy from config (may reference inflight and kv_index).
+        let policy = create_policy(&config, &inflight, &flow_controller, &kv_index);
 
         // Router wraps stores + policy for routing decisions.
         let router = Arc::new(Router::new(deployment_store.clone(), alias_store.clone(), policy));
@@ -178,6 +217,8 @@ impl AppState {
             flow_controller,
             debug_store,
             prompt_log_writer,
+            kv_index,
+            tokenizer_pool,
         })
     }
 
@@ -234,7 +275,7 @@ impl AppState {
         seed_flow_controller_from_config(&new_config, &self.flow_controller);
 
         // Recreate policy (fresh counters etc.) — router reuses same stores.
-        let new_policy = create_policy(&new_config, &self.inflight, &self.flow_controller);
+        let new_policy = create_policy(&new_config, &self.inflight, &self.flow_controller, &self.kv_index);
         self.router.set_policy(new_policy);
 
         if let Some(ref pool) = db_pool {
@@ -770,7 +811,12 @@ fn load_plans_from_config(plan_store: &Arc<PlanStore>, config: &Config) {
 // ═══════════════════════════════════════════════════════════
 
 /// Create a scheduling policy from config.
-fn create_policy(config: &Config, inflight: &Arc<InFlightTracker>, flow_controller: &Arc<FlowController>) -> Arc<dyn SchedulePolicy> {
+fn create_policy(
+    config: &Config,
+    inflight: &Arc<InFlightTracker>,
+    flow_controller: &Arc<FlowController>,
+    kv_index: &Option<Arc<dyn KvIndexBackend>>,
+) -> Arc<dyn SchedulePolicy> {
     match config.router_settings.schedule_policy.as_str() {
         "round_robin" | "" => Arc::new(RoundRobinPolicy::new()),
         "key_affinity" => {
@@ -794,6 +840,21 @@ fn create_policy(config: &Config, inflight: &Arc<InFlightTracker>, flow_controll
                 "Using delegated policy: per-model replica/load routing delegated to downstream load balancer; require exactly one deployment per model_name"
             );
             Arc::new(DelegatedPolicy::new())
+        }
+        "kv_aware" => {
+            let kv = match kv_index {
+                Some(idx) => idx.clone(),
+                None => {
+                    tracing::warn!("kv_aware policy selected but kv_index not initialized — falling back to round_robin");
+                    return Arc::new(RoundRobinPolicy::new());
+                }
+            };
+            tracing::info!("Using kv_aware policy");
+            Arc::new(crate::kv_aware::KvcAwarePolicy::new(
+                kv,
+                inflight.clone(),
+                flow_controller.clone(),
+            ))
         }
         other => {
             tracing::warn!(
