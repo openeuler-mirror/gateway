@@ -570,6 +570,10 @@ fn content_to_string(content: &AnthropicContent) -> String {
     }
 }
 
+fn display_prefix(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
+}
+
 /// Convert user message (may contain tool_result blocks → multiple OpenAI messages).
 fn convert_user_message(content: &AnthropicContent, messages: &mut Vec<Message>) {
     match content {
@@ -614,8 +618,7 @@ fn convert_user_message(content: &AnthropicContent, messages: &mut Vec<Message>)
                                         // OpenAI Tool role doesn't support images —
                                         // emit a placeholder so the content isn't silently lost.
                                         let url = normalize::convert_image_source(source);
-                                        let display = if url.len() > 80 { &url[..80] } else { &url };
-                                        Some(format!("[image: {}]", display))
+                                        Some(format!("[image: {}]", display_prefix(&url, 80)))
                                     }
                                     _ => None,
                                 })
@@ -887,6 +890,32 @@ mod tests {
         match &messages[0].content {
             MessageContent::Text(t) => {
                 assert!(t.starts_with("[ERROR]"));
+            }
+            _ => panic!("Expected Text"),
+        }
+    }
+
+    #[test]
+    fn test_tool_result_image_url_prefix_handles_utf8() {
+        let url = format!("{}é-tail.png", "a".repeat(79));
+        let content = AnthropicContent::Blocks(vec![AnthropicContentBlock::ToolResult {
+            tool_use_id: "tool_123".to_string(),
+            content: Some(AnthropicContent::Blocks(vec![AnthropicContentBlock::Image {
+                source: serde_json::json!({
+                    "type": "url",
+                    "url": url
+                }),
+            }])),
+            is_error: None,
+        }]);
+        let mut messages = Vec::new();
+        convert_user_message(&content, &mut messages);
+        assert_eq!(messages.len(), 1);
+        assert!(matches!(messages[0].role, MessageRole::Tool));
+        match &messages[0].content {
+            MessageContent::Text(t) => {
+                assert!(t.starts_with("[image: "));
+                assert!(t.contains('é'));
             }
             _ => panic!("Expected Text"),
         }
