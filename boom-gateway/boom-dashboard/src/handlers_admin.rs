@@ -132,6 +132,10 @@ fn default_per_page() -> i64 {
     50
 }
 
+fn normalize_pagination(page: i64, per_page: i64) -> (i64, i64) {
+    (page.max(1), per_page.clamp(1, 1000))
+}
+
 pub async fn list_keys(
     _session: AdminSession,
     Extension(state): Extension<std::sync::Arc<DashboardState>>,
@@ -249,14 +253,18 @@ pub async fn list_keys(
     let filtered_total = keys.len() as i64;
 
     // In-memory pagination.
-    let offset = ((query.page - 1).max(0) * query.per_page) as usize;
-    let per_page = query.per_page as usize;
-    let page_keys: Vec<Value> = keys.into_iter().skip(offset).take(per_page).collect();
+    let (page, per_page) = normalize_pagination(query.page, query.per_page);
+    let offset = ((page - 1) * per_page) as usize;
+    let page_keys: Vec<Value> = keys
+        .into_iter()
+        .skip(offset)
+        .take(per_page as usize)
+        .collect();
 
     Json(json!({
         "keys": page_keys,
-        "page": query.page,
-        "per_page": query.per_page,
+        "page": page,
+        "per_page": per_page,
         "total": filtered_total,
     }))
     .into_response()
@@ -1204,7 +1212,8 @@ pub async fn list_logs(
         }
     };
 
-    let offset = (query.page - 1).max(0) * query.per_page;
+    let (page, per_page) = normalize_pagination(query.page, query.per_page);
+    let offset = (page - 1) * per_page;
 
     // Build WHERE clause dynamically.
     let mut where_clauses = Vec::new();
@@ -1344,7 +1353,7 @@ pub async fn list_logs(
         cq = cq.bind(p.clone());
     }
 
-    q = q.bind(query.per_page).bind(offset);
+    q = q.bind(per_page).bind(offset);
 
     let rows: Vec<LogRow> = match q.fetch_all(db_pool).await {
         Ok(r) => r,
@@ -1390,8 +1399,8 @@ pub async fn list_logs(
 
     Json(json!({
         "logs": logs,
-        "page": query.page,
-        "per_page": query.per_page,
+        "page": page,
+        "per_page": per_page,
         "total": total,
     }))
     .into_response()
@@ -2058,4 +2067,16 @@ pub async fn get_prompt_log_entry(
         Json(json!({"error": "Request not found in prompt logs"})),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_pagination;
+
+    #[test]
+    fn normalize_pagination_clamps_invalid_values() {
+        assert_eq!(normalize_pagination(0, 0), (1, 1));
+        assert_eq!(normalize_pagination(-3, -20), (1, 1));
+        assert_eq!(normalize_pagination(2, 5000), (2, 1000));
+    }
 }
