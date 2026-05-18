@@ -97,7 +97,7 @@ general_settings:
 # 路由设置
 # ──────────────────────────────────────────────
 router_settings:
-  # 路由策略：round_robin（默认）或 key_affinity（会话亲和）
+  # 路由策略：round_robin（默认）、key_affinity（会话亲和）、delegated（每 model 单条 deployment，请求透传到统一下游负载均衡）
   routing_strategy: round_robin
 
   # 模型别名：客户端用别名请求，实际路由到目标模型

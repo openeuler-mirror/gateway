@@ -308,7 +308,8 @@ impl ModelGroupAlias {
 
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct RouterSettings {
-    /// Scheduling policy: round_robin (default) or key_affinity.
+    /// Scheduling policy: round_robin (default), key_affinity, or delegated
+    /// (replica and load-aware routing delegated to the downstream load balancer service).
     #[serde(default = "default_schedule_policy", alias = "routing_strategy")]
     pub schedule_policy: String,
     /// Model group aliases: alias_name → target_model_name.

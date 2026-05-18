@@ -420,6 +420,7 @@ name = "boom-routing"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "async-trait",
  "boom-core",
  "chrono",
  "dashmap",
