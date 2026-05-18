@@ -591,6 +591,65 @@ fn build_deployments_from_config(config: &Config, deployment_store: &Arc<Deploym
         deployment_store.len(),
         deployment_store.total_deployments(),
     );
+
+    // Build hybrid router (virtual model) if configured.
+    if let Some(ref hybrid_cfg) = config.hybrid_router {
+        build_hybrid_router(hybrid_cfg, deployment_store);
+    }
+}
+
+/// Build the hybrid router virtual model from config.
+///
+/// Creates a `HybridRouterProvider` that holds references to the actual backend
+/// providers for each tier (small/medium/large) and registers it as a normal
+/// deployment under the configured virtual model name (e.g. "hybrid").
+fn build_hybrid_router(
+    hybrid_cfg: &boom_config::HybridRouterConfig,
+    deployment_store: &Arc<DeploymentStore>,
+) {
+    let mut tier_map: std::collections::HashMap<String, (String, Arc<dyn boom_core::provider::Provider>)> =
+        std::collections::HashMap::new();
+
+    for (tier_name, tier_conf) in &hybrid_cfg.tiers {
+        let providers = match deployment_store.get_providers(&tier_conf.target_model) {
+            Some(p) if !p.is_empty() => p,
+            _ => {
+                tracing::error!(
+                    "hybrid_router: tier '{}' target model '{}' not found in deployments, skipping hybrid router",
+                    tier_name,
+                    tier_conf.target_model
+                );
+                return;
+            }
+        };
+
+        // Use the first provider for this tier (round-robin is handled by the
+        // backend deployment's own scheduling if multiple exist).
+        tier_map.insert(
+            tier_name.clone(),
+            (tier_conf.target_model.clone(), providers[0].clone()),
+        );
+    }
+
+    match boom_provider::hybrid_router::HybridRouterProvider::new(
+        hybrid_cfg.model_name.clone(),
+        &hybrid_cfg.default_tier,
+        tier_map,
+    ) {
+        Ok(provider) => {
+            deployment_store.add_deployment(&hybrid_cfg.model_name, Arc::new(provider));
+            tracing::info!(
+                "Hybrid router enabled: virtual model '{}' → small={}, medium={}, large={}",
+                hybrid_cfg.model_name,
+                hybrid_cfg.tiers.get("small").map(|t| t.target_model.as_str()).unwrap_or("?"),
+                hybrid_cfg.tiers.get("medium").map(|t| t.target_model.as_str()).unwrap_or("?"),
+                hybrid_cfg.tiers.get("large").map(|t| t.target_model.as_str()).unwrap_or("?"),
+            );
+        }
+        Err(e) => {
+            tracing::error!("hybrid_router: failed to build provider: {}", e);
+        }
+    }
 }
 
 /// Build aliases directly from YAML config into AliasStore.

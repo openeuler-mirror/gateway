@@ -22,6 +22,49 @@ pub struct Config {
     /// Prompt log configuration (transparent pass-through to boom-promptlog).
     #[serde(default)]
     pub prompt_log: Option<serde_json::Value>,
+    /// Hybrid router configuration — virtual model that classifies requests
+    /// and dispatches to tiered backend models (small/medium/large cup).
+    #[serde(default)]
+    pub hybrid_router: Option<HybridRouterConfig>,
+}
+
+/// Hybrid router configuration — enables a virtual model (e.g. "hybrid") that
+/// inspects request content and routes to the most appropriate tier.
+///
+/// ```yaml
+/// hybrid_router:
+///   model_name: hybrid
+///   default_tier: medium
+///   tiers:
+///     small:
+///       target_model: small-cup
+///     medium:
+///       target_model: medium-cup
+///     large:
+///       target_model: large-cup
+/// ```
+#[derive(Debug, Deserialize, Clone)]
+pub struct HybridRouterConfig {
+    /// Virtual model name that users request (e.g. "hybrid").
+    pub model_name: String,
+    /// Default tier when classification is uncertain.
+    /// One of: "small", "medium", "large". Default: "medium".
+    #[serde(default = "default_tier")]
+    pub default_tier: String,
+    /// Tier definitions mapping tier name to target model.
+    #[serde(default)]
+    pub tiers: HashMap<String, HybridRouterTier>,
+}
+
+fn default_tier() -> String {
+    "medium".to_string()
+}
+
+/// A single tier in the hybrid router configuration.
+#[derive(Debug, Deserialize, Clone)]
+pub struct HybridRouterTier {
+    /// Target model_name in model_list to route to for this tier.
+    pub target_model: String,
 }
 
 /// A single plan definition in YAML config (plan name comes from the HashMap key).
