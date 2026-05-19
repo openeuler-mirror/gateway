@@ -78,19 +78,6 @@ impl Router {
         self.policy.load().inner.select(model, &candidates, key_hash, input_chars)
     }
 
-    /// KV-cache aware routing: resolves candidates then delegates to
-    /// `select_with_context()` with prefix block hashes.
-    pub fn select_provider_with_prefix(
-        &self,
-        model: &str,
-        key_hash: Option<&str>,
-        input_chars: u64,
-        prefix_block_hashes: &[(usize, u64)],
-    ) -> Option<Arc<dyn Provider>> {
-        let candidates = self.resolve_candidates(model)?;
-        self.policy.load().inner.select_with_context(model, &candidates, key_hash, input_chars, prefix_block_hashes)
-    }
-
     /// Resolve model name to a list of candidate providers.
     ///
     /// Priority: exact match → alias resolution → wildcard "*".

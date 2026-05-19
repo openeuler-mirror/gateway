@@ -1,4 +1,3 @@
-pub mod delegated;
 pub mod key_affinity;
 pub mod round_robin;
 
@@ -21,22 +20,6 @@ pub trait SchedulePolicy: Send + Sync {
         key_hash: Option<&str>,
         input_chars: u64,
     ) -> Option<Arc<dyn Provider>>;
-
-    /// Select a provider using KV-cache prefix block hashes for cache-aware routing.
-    ///
-    /// - `prefix_block_hashes`: `(block_index, local_hash)` pairs from tokenization.
-    ///
-    /// Default implementation delegates to `select()` (no KV-cache awareness).
-    fn select_with_context(
-        &self,
-        model: &str,
-        candidates: &[Arc<dyn Provider>],
-        key_hash: Option<&str>,
-        input_chars: u64,
-        _prefix_block_hashes: &[(usize, u64)],
-    ) -> Option<Arc<dyn Provider>> {
-        self.select(model, candidates, key_hash, input_chars)
-    }
 
     /// Policy name (for display / config validation).
     fn name(&self) -> &str;

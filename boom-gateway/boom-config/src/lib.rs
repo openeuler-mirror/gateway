@@ -22,49 +22,6 @@ pub struct Config {
     /// Prompt log configuration (transparent pass-through to boom-promptlog).
     #[serde(default)]
     pub prompt_log: Option<serde_json::Value>,
-    /// Hybrid router configuration — virtual model that classifies requests
-    /// and dispatches to tiered backend models (small/medium/large cup).
-    #[serde(default)]
-    pub hybrid_router: Option<HybridRouterConfig>,
-}
-
-/// Hybrid router configuration — enables a virtual model (e.g. "hybrid") that
-/// inspects request content and routes to the most appropriate tier.
-///
-/// ```yaml
-/// hybrid_router:
-///   model_name: hybrid
-///   default_tier: medium
-///   tiers:
-///     small:
-///       target_model: small-cup
-///     medium:
-///       target_model: medium-cup
-///     large:
-///       target_model: large-cup
-/// ```
-#[derive(Debug, Deserialize, Clone)]
-pub struct HybridRouterConfig {
-    /// Virtual model name that users request (e.g. "hybrid").
-    pub model_name: String,
-    /// Default tier when classification is uncertain.
-    /// One of: "small", "medium", "large". Default: "medium".
-    #[serde(default = "default_tier")]
-    pub default_tier: String,
-    /// Tier definitions mapping tier name to target model.
-    #[serde(default)]
-    pub tiers: HashMap<String, HybridRouterTier>,
-}
-
-fn default_tier() -> String {
-    "medium".to_string()
-}
-
-/// A single tier in the hybrid router configuration.
-#[derive(Debug, Deserialize, Clone)]
-pub struct HybridRouterTier {
-    /// Target model_name in model_list to route to for this tier.
-    pub target_model: String,
 }
 
 /// A single plan definition in YAML config (plan name comes from the HashMap key).
@@ -351,8 +308,7 @@ impl ModelGroupAlias {
 
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct RouterSettings {
-    /// Scheduling policy: round_robin (default), key_affinity, or delegated
-    /// (replica and load-aware routing delegated to the downstream load balancer service).
+    /// Scheduling policy: round_robin (default) or key_affinity.
     #[serde(default = "default_schedule_policy", alias = "routing_strategy")]
     pub schedule_policy: String,
     /// Model group aliases: alias_name → target_model_name.
@@ -369,69 +325,6 @@ pub struct RouterSettings {
     /// Default: 10.
     #[serde(default = "default_rebalance_threshold")]
     pub key_affinity_rebalance_threshold: u64,
-    /// KV-cache aware routing settings.
-    #[serde(default)]
-    pub kv_aware: KvAwareSettings,
-}
-
-/// Settings for KV-cache aware routing.
-#[derive(Debug, Deserialize, Clone)]
-pub struct KvAwareSettings {
-    /// Enable KV-cache aware routing.
-    #[serde(default)]
-    pub enabled: bool,
-    /// Index backend type. Currently only "flat" is supported.
-    #[serde(default = "default_kv_index_backend")]
-    pub index_backend: String,
-    /// Block size for token chunking (tokens per block). Default: 16.
-    #[serde(default = "default_block_size")]
-    pub block_size: usize,
-    /// Weight for cache hit score in combined scoring. Default: 0.5.
-    #[serde(default = "default_cache_weight")]
-    pub cache_weight: f64,
-    /// Weight for load score in combined scoring. Default: 0.2.
-    #[serde(default = "default_load_weight")]
-    pub load_weight: f64,
-    /// Weight for storage tier score in combined scoring. Default: 0.3.
-    #[serde(default = "default_tier_weight")]
-    pub tier_weight: f64,
-    /// Directory containing tokenizer.json files ({tokenizer_dir}/{model}/tokenizer.json).
-    #[serde(default)]
-    pub tokenizer_dir: Option<String>,
-}
-
-impl Default for KvAwareSettings {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            index_backend: default_kv_index_backend(),
-            block_size: default_block_size(),
-            cache_weight: default_cache_weight(),
-            load_weight: default_load_weight(),
-            tier_weight: default_tier_weight(),
-            tokenizer_dir: None,
-        }
-    }
-}
-
-fn default_kv_index_backend() -> String {
-    "flat".to_string()
-}
-
-fn default_block_size() -> usize {
-    16
-}
-
-fn default_cache_weight() -> f64 {
-    0.5
-}
-
-fn default_load_weight() -> f64 {
-    0.2
-}
-
-fn default_tier_weight() -> f64 {
-    0.3
 }
 
 fn default_schedule_policy() -> String {

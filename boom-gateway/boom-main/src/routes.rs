@@ -317,18 +317,9 @@ async fn chat_completions_inner(
     );
 
     // 3. Select provider deployment.
-    // Compute prefix block hashes if tokenizer pool is available.
-    let prefix_hashes = match state.tokenizer_pool.as_ref() {
-        Some(pool) => {
-            let msgs: Vec<serde_json::Value> = req.messages.iter().map(|m| serde_json::to_value(m).unwrap_or_default()).collect();
-            pool.encode_and_hash_openai(&req.model, &msgs).hashes
-        }
-        None => Vec::new(),
-    };
-
     let provider = state
         .router
-        .select_provider_with_prefix(&req.model, Some(&identity.key_hash), input_chars as u64, &prefix_hashes)
+        .select_provider(&req.model, Some(&identity.key_hash), input_chars as u64)
         .ok_or_else(|| {
             let e = GatewayError::ModelNotFound(req.model.clone());
             log_error(&state, &identity, &model, api_path, is_stream, start, &e, Some(request_id.clone()), None, None);
@@ -1455,22 +1446,9 @@ pub async fn messages(
     );
 
     // 3. Select provider deployment.
-    // Compute prefix block hashes if tokenizer pool is available.
-    let prefix_hashes = match state.tokenizer_pool.as_ref() {
-        Some(pool) => {
-            let system_str = req.system.as_ref().and_then(|s| match s {
-                boom_core::types::AnthropicSystemContent::Text(t) => Some(t.as_str()),
-                _ => None,
-            });
-            let msgs: Vec<serde_json::Value> = req.messages.iter().map(|m| serde_json::to_value(m).unwrap_or_default()).collect();
-            pool.encode_and_hash_anthropic(&openai_req.model, system_str, &msgs).hashes
-        }
-        None => Vec::new(),
-    };
-
     let provider = state
         .router
-        .select_provider_with_prefix(&openai_req.model, Some(&identity.key_hash), input_chars as u64, &prefix_hashes)
+        .select_provider(&openai_req.model, Some(&identity.key_hash), input_chars as u64)
         .ok_or_else(|| {
             let e = GatewayError::ModelNotFound(openai_req.model.clone());
             log_error(&state, &identity, &model, "/v1/messages", is_stream, start, &e, Some(request_id.clone()), None, None);
@@ -1772,34 +1750,4 @@ impl From<GatewayError> for AnthropicErrorReply {
     fn from(e: GatewayError) -> Self {
         AnthropicErrorReply(e, false)
     }
-}
-
-// ═══════════════════════════════════════════════════════════
-// KV-Events endpoint (internal)
-// ═══════════════════════════════════════════════════════════
-
-/// Ingest a batch of KV-cache events from inference engines.
-/// POST /internal/kv-events
-pub async fn kv_events(
-    State(state): State<AppState>,
-    Json(batch): Json<boom_core::kv_event::DynamoEventBatch>,
-) -> impl IntoResponse {
-    let count = batch.events.len();
-
-    if let Some(ref kv_index) = state.kv_index {
-        for event in &batch.events {
-            kv_index.apply_event(event);
-        }
-        tracing::debug!(events = count, "KV events processed");
-    } else {
-        tracing::warn!(events = count, "KV events received but kv_index not initialized");
-    }
-
-    (
-        axum::http::StatusCode::OK,
-        Json(serde_json::json!({
-            "status": "ok",
-            "events_processed": count
-        })),
-    )
 }

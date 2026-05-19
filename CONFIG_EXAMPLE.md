@@ -249,73 +249,7 @@ plan_settings:
 | `output_cost_per_token` | f64 | null | 输出成本（每 token） |
 | `quota_count_ratio` | u64 | `1` | 配额消耗倍率。每次请求消耗的配额数，例如设为 3 则一次请求消耗 3 个配额 |
 
-### hybrid_router
-
-虚拟模型配置 — 客户端请求 `model="hybrid"` 时，网关通过启发式分类器分析请求内容，自动路由到小杯/中杯/大杯后端模型。
-
-| 字段 | 类型 | 默认值 | 说明 |
-|---|---|---|---|
-| `model_name` | string | — | 虚拟模型名（如 `"hybrid"`），客户端请求时使用 |
-| `default_tier` | string | `"medium"` | 无法判断时的默认级别（`small`/`medium`/`large`）|
-| `tiers` | map | — | 级别定义，key 为 `small`/`medium`/`large` |
-
-### hybrid_router.tiers.* (级别定义)
-
-| 字段 | 类型 | 说明 |
-|---|---|---|
-| `target_model` | string | 目标模型名，必须引用 `model_list` 中已配置的 `model_name` |
-
-**分类规则（内置启发式）：**
-
-| 特征 | 权重 | 说明 |
-|------|------|------|
-| 文本长度 | 高 | <200字→small, >2000字→large |
-| 代码块 | 高 | 含 ```` ``` ```` → 至少 medium |
-| 调试关键词 | 高 | error/bug/报错/修复 → large |
-| 复杂度关键词 | 中 | 架构/设计/对比/分析/review → large |
-| 数学/推理 | 中 | prove/证明/推导/theorem → large |
-| 工具调用 | 中 | 有 tools → 至少 medium |
-| 对话深度 | 低 | >6轮 → 至少 medium |
-| 系统提示复杂度 | 低 | system prompt >500字 → medium+ |
-
-**配置示例：**
-
-```yaml
-model_list:
-  - model_name: small-cup
-    litellm_params:
-      model: deepseek/deepseek-v4-flash
-  - model_name: medium-cup
-    litellm_params:
-      model: openai/gpt-4o
-  - model_name: large-cup
-    litellm_params:
-      model: anthropic/claude-sonnet-4-20250514
-
-hybrid_router:
-  model_name: hybrid
-  default_tier: medium
-  tiers:
-    small:
-      target_model: small-cup
-    medium:
-      target_model: medium-cup
-    large:
-      target_model: large-cup
-```
-
-客户端使用：
-```bash
-curl http://localhost:4000/v1/chat/completions \
-  -H "Authorization: Bearer $MASTER_KEY" \
-  -d '{"model": "hybrid", "messages": [{"role": "user", "content": "Hello!"}]}'
-# → 路由到 small-cup
-
-curl http://localhost:4000/v1/chat/completions \
-  -H "Authorization: Bearer $MASTER_KEY" \
-  -d '{"model": "hybrid", "messages": [{"role": "user", "content": "帮我分析这个报错：Traceback..."}]}'
-# → 路由到 large-cup
-```
+### router_settings
 
 | 字段 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
