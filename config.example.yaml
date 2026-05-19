@@ -116,6 +116,19 @@ router_settings:
   # key_affinity_context_threshold: 0     # 上下文字符数阈值，低于此值优先最低负载
   # key_affinity_rebalance_threshold: 10  # 再均衡阈值（请求数差异超过此值时重新分配）
 
+  # 内容路由：根据请求内容自动选择模型（可选）
+  # hybrid_router:
+  #   model_name: "auto"                  # 虚拟模型名，客户端请求此名触发分类
+  #   strategy: "tier_classifier"         # 分类策略（默认 tier_classifier）
+  #   default_tier: "medium"              # 分类不确定时使用的默认 tier
+  #   tiers:
+  #     small:
+  #       target_model: "gpt-4o-mini"     # 简单请求 → 轻量模型
+  #     medium:
+  #       target_model: "gpt-4o"          # 中等请求 → 标准模型
+  #     large:
+  #       target_model: "claude-sonnet"   # 复杂请求 → 强力模型
+
 # ──────────────────────────────────────────────
 # 服务器设置
 # ──────────────────────────────────────────────

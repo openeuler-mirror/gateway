@@ -5,7 +5,7 @@ use boom_core::provider::Authenticator;
 use boom_core::DebugErrorStore;
 use boom_limiter::{PlanStore, RateLimitPlan, ScheduleSlot, SlidingWindowLimiter};
 use boom_flowcontrol::{FlowControlConfig, FlowController};
-use boom_routing::{AliasStore, DeploymentStore, InFlightTracker, KeyAffinityPolicy, Router, RoundRobinPolicy, SchedulePolicy};
+use boom_routing::{AliasStore, DeploymentStore, HybridRouter, InFlightTracker, KeyAffinityPolicy, Router, RoundRobinPolicy, SchedulePolicy, StrategyRegistry, TierClassifier};
 use boom_promptlog::PromptLogWriter;
 use boom_provider;
 use dashmap::DashMap;
@@ -122,8 +122,16 @@ impl AppState {
         // Create scheduling policy from config (may reference inflight).
         let policy = create_policy(&config, &inflight, &flow_controller);
 
-        // Router wraps stores + policy for routing decisions.
-        let router = Arc::new(Router::new(deployment_store.clone(), alias_store.clone(), policy));
+        // Build hybrid router classifier (optional, content-based model routing).
+        let hybrid_classifier = build_hybrid_router(&config);
+
+        // Router wraps stores + policy + classifier for routing decisions.
+        let router = Arc::new(Router::with_classifier(
+            deployment_store.clone(),
+            alias_store.clone(),
+            policy,
+            hybrid_classifier,
+        ));
 
         // 5. Build from YAML first, then layer DB-only records on top.
         build_deployments_from_config(&config, &deployment_store);
@@ -233,6 +241,9 @@ impl AppState {
         // Recreate policy (fresh counters etc.) — router reuses same stores.
         let new_policy = create_policy(&new_config, &self.inflight, &self.flow_controller);
         self.router.set_policy(new_policy);
+
+        // Rebuild hybrid router classifier.
+        self.router.set_classifier(build_hybrid_router(&new_config));
 
         if let Some(ref pool) = db_pool {
             // Sync YAML config to DB (upsert source='yaml', handle conflicts).
@@ -706,6 +717,46 @@ fn load_plans_from_config(plan_store: &Arc<PlanStore>, config: &Config) {
 // ═══════════════════════════════════════════════════════════
 // Helpers
 // ═══════════════════════════════════════════════════════════
+
+/// Build a HybridRouter from config, if hybrid_router section is present.
+fn build_hybrid_router(config: &Config) -> Option<Arc<HybridRouter>> {
+    let hr_config = config.router_settings.hybrid_router.as_ref()?;
+
+    let mut registry = StrategyRegistry::new();
+    registry.register(Arc::new(TierClassifier));
+
+    let strategy = match registry.get(&hr_config.strategy) {
+        Some(s) => s.clone(),
+        None => {
+            tracing::error!(
+                strategy = %hr_config.strategy,
+                "Unknown hybrid_router strategy, disabling hybrid router"
+            );
+            return None;
+        }
+    };
+
+    let tiers: std::collections::HashMap<String, String> = hr_config
+        .tiers
+        .iter()
+        .map(|(name, tier)| (name.clone(), tier.target_model.clone()))
+        .collect();
+
+    tracing::info!(
+        model_name = %hr_config.model_name,
+        strategy = %hr_config.strategy,
+        default_tier = %hr_config.default_tier,
+        tiers = ?tiers,
+        "Hybrid router enabled"
+    );
+
+    Some(Arc::new(HybridRouter::new(
+        hr_config.model_name.clone(),
+        strategy,
+        hr_config.default_tier.clone(),
+        tiers,
+    )))
+}
 
 /// Create a scheduling policy from config.
 fn create_policy(config: &Config, inflight: &Arc<InFlightTracker>, flow_controller: &Arc<FlowController>) -> Arc<dyn SchedulePolicy> {

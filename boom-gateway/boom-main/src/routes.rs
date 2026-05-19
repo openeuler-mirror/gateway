@@ -272,6 +272,11 @@ async fn chat_completions_inner(
             GatewayErrorReply(e, false)
         })?;
 
+    // 1b. Content-aware model resolution (hybrid router).
+    let resolved_model = state.router.resolve_request_model(
+        &req.model, &req.messages, &req.tools,
+    );
+
     // 2. Plan-based or default rate limiting.
     let window_limits: Vec<(u64, u64)> = inner
         .config
@@ -319,16 +324,16 @@ async fn chat_completions_inner(
     // 3. Select provider deployment.
     let provider = state
         .router
-        .select_provider(&req.model, Some(&identity.key_hash), input_chars as u64)
+        .select_provider(&resolved_model, Some(&identity.key_hash), input_chars as u64)
         .ok_or_else(|| {
-            let e = GatewayError::ModelNotFound(req.model.clone());
+            let e = GatewayError::ModelNotFound(resolved_model.clone());
             log_error(&state, &identity, &model, api_path, is_stream, start, &e, Some(request_id.clone()), None, None);
             rollback_plan_quota(&state.limiter, &rl_info);
             GatewayErrorReply(e, false)
         })?;
 
     let deployment_id = provider.deployment_id().map(|s| s.to_string());
-    let inflight_model = state.router.resolve_model_name(&model);
+    let inflight_model = state.router.resolve_model_name(&resolved_model);
 
     // 3.5. Flow control — queue if per-deployment limits exceeded.
     let fc_guard = if let Some(ref did) = deployment_id {
@@ -986,6 +991,16 @@ fn check_model_access(
     // Not in key_models — check if it's a configured model or a wildcard case
     let has_wildcard = identity.models.iter().any(|m| m == "*");
     let model_configured = router.is_model_configured(model);
+    let is_virtual = router.is_hybrid_virtual_model(model);
+
+    // Virtual model (hybrid router) — always allow, it resolves to a real model later.
+    if is_virtual {
+        tracing::debug!(
+            "check_model_access: key={:?}, model={}, result=allow (hybrid virtual model)",
+            identity.key_name, model
+        );
+        return Ok(());
+    }
 
     if model_configured {
         tracing::warn!(
@@ -1402,6 +1417,11 @@ pub async fn messages(
             AnthropicErrorReply(e, is_stream)
         })?;
 
+    // 1b. Content-aware model resolution (hybrid router).
+    let resolved_model = state.router.resolve_request_model(
+        &openai_req.model, &openai_req.messages, &openai_req.tools,
+    );
+
     // 2. Plan-based or default rate limiting.
     let window_limits: Vec<(u64, u64)> = inner
         .config
@@ -1448,16 +1468,16 @@ pub async fn messages(
     // 3. Select provider deployment.
     let provider = state
         .router
-        .select_provider(&openai_req.model, Some(&identity.key_hash), input_chars as u64)
+        .select_provider(&resolved_model, Some(&identity.key_hash), input_chars as u64)
         .ok_or_else(|| {
-            let e = GatewayError::ModelNotFound(openai_req.model.clone());
+            let e = GatewayError::ModelNotFound(resolved_model.clone());
             log_error(&state, &identity, &model, "/v1/messages", is_stream, start, &e, Some(request_id.clone()), None, None);
             rollback_plan_quota(&state.limiter, &rl_info);
             AnthropicErrorReply(e, is_stream)
         })?;
 
     let deployment_id = provider.deployment_id().map(|s| s.to_string());
-    let inflight_model = state.router.resolve_model_name(&model);
+    let inflight_model = state.router.resolve_model_name(&resolved_model);
 
     // 3.5. Flow control — queue if per-deployment limits exceeded.
     let fc_guard = if let Some(ref did) = deployment_id {

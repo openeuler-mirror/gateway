@@ -325,6 +325,38 @@ pub struct RouterSettings {
     /// Default: 10.
     #[serde(default = "default_rebalance_threshold")]
     pub key_affinity_rebalance_threshold: u64,
+    /// Content-based hybrid router (optional dynamic model alias).
+    #[serde(default)]
+    pub hybrid_router: Option<HybridRouterConfig>,
+}
+
+/// Configuration for the content-based hybrid router.
+///
+/// When enabled, requesting the virtual `model_name` triggers content
+/// analysis which maps to a real model from `model_list`.
+#[derive(Debug, Deserialize, Clone)]
+pub struct HybridRouterConfig {
+    /// Virtual model name that triggers classification (e.g. "auto").
+    pub model_name: String,
+    /// Classification strategy name. Default: "tier_classifier".
+    #[serde(default = "default_hybrid_strategy")]
+    pub strategy: String,
+    /// Default tier when classification is uncertain.
+    pub default_tier: String,
+    /// Tier name → tier definition.
+    #[serde(default)]
+    pub tiers: HashMap<String, HybridRouterTier>,
+}
+
+/// A single tier in the hybrid router configuration.
+#[derive(Debug, Deserialize, Clone)]
+pub struct HybridRouterTier {
+    /// Target model_name in model_list to route to for this tier.
+    pub target_model: String,
+}
+
+fn default_hybrid_strategy() -> String {
+    "tier_classifier".to_string()
 }
 
 fn default_schedule_policy() -> String {
