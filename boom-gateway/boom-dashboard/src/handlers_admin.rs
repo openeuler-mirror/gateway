@@ -1738,24 +1738,21 @@ pub async fn get_inflight_stats(
         }));
     }
 
-    // 2. Model-level fallback — deployments without FC config.
-    let covered_models: std::collections::HashSet<String> = rows.values()
-        .filter_map(|r| r["model"].as_str())
-        .filter(|m| *m != "-")
-        .map(|m| m.to_string())
-        .collect();
-    let inflight_models = state.inflight.get_stats();
-    for m in &inflight_models {
-        if covered_models.contains(&m.model) {
+    // 2. Per-deployment fallback — deployments without FC config.
+    //    Use deployment-level stats from InFlightTracker so each deployment
+    //    shows up as a separate row with its own deployment_id.
+    let covered_deployments: std::collections::HashSet<String> = rows.keys().cloned().collect();
+    for d in state.inflight.get_deployment_stats() {
+        if covered_deployments.contains(&d.deployment_id) {
             continue;
         }
-        rows.insert(format!("__model__{}", m.model), json!({
-            "model": m.model,
-            "deployment_id": "",
+        rows.insert(d.deployment_id.clone(), json!({
+            "model": d.model,
+            "deployment_id": d.deployment_id,
             "fc_queue": 0,
-            "in_reqs": m.inflight_requests,
+            "in_reqs": d.inflight_requests,
             "in_reqs_max": 0,
-            "in_context": m.inflight_input_chars,
+            "in_context": d.inflight_input_chars,
             "in_context_max": 0,
             "queued_keys": [],
             "key_stats": [],

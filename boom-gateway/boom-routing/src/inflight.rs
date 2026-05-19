@@ -37,6 +37,15 @@ pub struct InFlightStat {
     pub inflight_input_chars: u64,
 }
 
+/// Snapshot of in-flight stats for one deployment.
+#[derive(Debug)]
+pub struct DeploymentInFlightStat {
+    pub model: String,
+    pub deployment_id: String,
+    pub inflight_requests: u64,
+    pub inflight_input_chars: u64,
+}
+
 /// RAII guard that decrements in-flight metrics on Drop.
 ///
 /// Create via [`InFlightGuard::new`] before forwarding a request;
@@ -86,6 +95,24 @@ impl InFlightTracker {
             .get(&key)
             .map(|m| m.request_count.load(Ordering::Relaxed))
             .unwrap_or(0)
+    }
+
+    /// Per-deployment in-flight stats for all deployments with active requests.
+    pub fn get_deployment_stats(&self) -> Vec<DeploymentInFlightStat> {
+        self.deployment_metrics
+            .iter()
+            .filter(|r| r.value().request_count.load(Ordering::Relaxed) > 0)
+            .filter_map(|r| {
+                let key = r.key();
+                let (model, deployment_id) = key.split_once('\0')?;
+                Some(DeploymentInFlightStat {
+                    model: model.to_string(),
+                    deployment_id: deployment_id.to_string(),
+                    inflight_requests: r.value().request_count.load(Ordering::Relaxed),
+                    inflight_input_chars: r.value().input_chars.load(Ordering::Relaxed),
+                })
+            })
+            .collect()
     }
 }
 

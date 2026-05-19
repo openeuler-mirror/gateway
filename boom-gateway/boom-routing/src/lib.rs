@@ -9,7 +9,7 @@ pub use alias_store::{AliasInput, AliasRow, AliasStore};
 pub use deployment_store::{
     DeploymentInput, DeploymentProviderRow, DeploymentRow, DeploymentStore, YamlDeploymentData,
 };
-pub use inflight::{InFlightGuard, InFlightStat, InFlightTracker};
+pub use inflight::{DeploymentInFlightStat, InFlightGuard, InFlightStat, InFlightTracker};
 pub use policy::SchedulePolicy;
 pub use policy::delegated::DelegatedPolicy;
 pub use policy::key_affinity::KeyAffinityPolicy;
