@@ -11,6 +11,7 @@ pub use deployment_store::{
 };
 pub use inflight::{InFlightGuard, InFlightStat, InFlightTracker};
 pub use policy::SchedulePolicy;
+pub use policy::delegated::DelegatedPolicy;
 pub use policy::key_affinity::KeyAffinityPolicy;
 pub use policy::round_robin::RoundRobinPolicy;
 pub use router::Router;

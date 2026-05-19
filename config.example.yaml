@@ -82,6 +82,21 @@ model_list:
       headers:
         X-Custom-Header: custom-value
 
+  # ── Hybrid Router 后端模型（大杯/中杯/小杯）──
+  # 虚拟模型 "hybrid" 会根据请求内容自动路由到以下三个后端之一。
+  # - model_name: small-cup
+  #   litellm_params:
+  #     model: deepseek/deepseek-v4-flash
+  #     api_key: ${DEEPSEEK_API_KEY}
+  # - model_name: medium-cup
+  #   litellm_params:
+  #     model: openai/gpt-4o
+  #     api_key: ${OPENAI_API_KEY}
+  # - model_name: large-cup
+  #   litellm_params:
+  #     model: anthropic/claude-sonnet-4-20250514
+  #     api_key: ${ANTHROPIC_API_KEY}
+
 # ──────────────────────────────────────────────
 # 通用设置
 # ──────────────────────────────────────────────
@@ -94,10 +109,37 @@ general_settings:
   # store_model_in_db: false
 
 # ──────────────────────────────────────────────
+# Hybrid Router（虚拟模型 hybrid）
+# ──────────────────────────────────────────────
+# 客户端请求 model="hybrid" 时，网关通过启发式分类器分析请求内容，
+# 自动路由到最合适的后端模型（小杯/中杯/大杯）。
+#
+# hybrid_router:
+#   model_name: hybrid            # 虚拟模型名，客户端使用此名称请求
+#   default_tier: medium          # 无法判断时的默认级（small/medium/large）
+#   tiers:
+#     small:
+#       target_model: small-cup   # 引用 model_list 中的 model_name
+#     medium:
+#       target_model: medium-cup
+#     large:
+#       target_model: large-cup
+#
+# 分类策略（内置启发式）：
+#   - 文本长度：<200字→小杯，>2000字→大杯
+#   - 代码块：含代码→至少中杯
+#   - 调试关键词（error/bug/报错/修复）→大杯
+#   - 复杂度关键词（架构/设计/对比/分析/review）→大杯
+#   - 数学/推理关键词（prove/证明/推导/theorem）→大杯
+#   - 工具调用（tools）→至少中杯
+#   - 对话深度（>6轮）→至少中杯
+#   - 系统提示复杂度（>500字）→中杯+
+
+# ──────────────────────────────────────────────
 # 路由设置
 # ──────────────────────────────────────────────
 router_settings:
-  # 路由策略：round_robin（默认）或 key_affinity（会话亲和）
+  # 路由策略：round_robin（默认）、key_affinity（会话亲和）、delegated（每 model 单条 deployment，请求透传到统一下游负载均衡）
   routing_strategy: round_robin
 
   # 模型别名：客户端用别名请求，实际路由到目标模型
