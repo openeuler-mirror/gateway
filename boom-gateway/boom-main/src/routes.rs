@@ -272,6 +272,11 @@ async fn chat_completions_inner(
             GatewayErrorReply(e, false)
         })?;
 
+    // 1b. Content-aware model resolution (hybrid router).
+    let resolved_model = state.router.resolve_request_model(
+        &req.model, &req.messages, &req.tools,
+    );
+
     // 2. Plan-based or default rate limiting.
     let window_limits: Vec<(u64, u64)> = inner
         .config
@@ -317,27 +322,18 @@ async fn chat_completions_inner(
     );
 
     // 3. Select provider deployment.
-    // Compute prefix block hashes if tokenizer pool is available.
-    let prefix_hashes = match state.tokenizer_pool.as_ref() {
-        Some(pool) => {
-            let msgs: Vec<serde_json::Value> = req.messages.iter().map(|m| serde_json::to_value(m).unwrap_or_default()).collect();
-            pool.encode_and_hash_openai(&req.model, &msgs).hashes
-        }
-        None => Vec::new(),
-    };
-
     let provider = state
         .router
-        .select_provider_with_prefix(&req.model, Some(&identity.key_hash), input_chars as u64, &prefix_hashes)
+        .select_provider(&resolved_model, Some(&identity.key_hash), input_chars as u64)
         .ok_or_else(|| {
-            let e = GatewayError::ModelNotFound(req.model.clone());
+            let e = GatewayError::ModelNotFound(resolved_model.clone());
             log_error(&state, &identity, &model, api_path, is_stream, start, &e, Some(request_id.clone()), None, None);
             rollback_plan_quota(&state.limiter, &rl_info);
             GatewayErrorReply(e, false)
         })?;
 
     let deployment_id = provider.deployment_id().map(|s| s.to_string());
-    let inflight_model = state.router.resolve_model_name(&model);
+    let inflight_model = state.router.resolve_model_name(&resolved_model);
 
     // 3.5. Flow control — queue if per-deployment limits exceeded.
     let fc_guard = if let Some(ref did) = deployment_id {
@@ -995,6 +991,16 @@ fn check_model_access(
     // Not in key_models — check if it's a configured model or a wildcard case
     let has_wildcard = identity.models.iter().any(|m| m == "*");
     let model_configured = router.is_model_configured(model);
+    let is_virtual = router.is_hybrid_virtual_model(model);
+
+    // Virtual model (hybrid router) — always allow, it resolves to a real model later.
+    if is_virtual {
+        tracing::debug!(
+            "check_model_access: key={:?}, model={}, result=allow (hybrid virtual model)",
+            identity.key_name, model
+        );
+        return Ok(());
+    }
 
     if model_configured {
         tracing::warn!(
@@ -1411,6 +1417,11 @@ pub async fn messages(
             AnthropicErrorReply(e, is_stream)
         })?;
 
+    // 1b. Content-aware model resolution (hybrid router).
+    let resolved_model = state.router.resolve_request_model(
+        &openai_req.model, &openai_req.messages, &openai_req.tools,
+    );
+
     // 2. Plan-based or default rate limiting.
     let window_limits: Vec<(u64, u64)> = inner
         .config
@@ -1455,31 +1466,18 @@ pub async fn messages(
     );
 
     // 3. Select provider deployment.
-    // Compute prefix block hashes if tokenizer pool is available.
-    let prefix_hashes = match state.tokenizer_pool.as_ref() {
-        Some(pool) => {
-            let system_str = req.system.as_ref().and_then(|s| match s {
-                boom_core::types::AnthropicSystemContent::Text(t) => Some(t.as_str()),
-                _ => None,
-            });
-            let msgs: Vec<serde_json::Value> = req.messages.iter().map(|m| serde_json::to_value(m).unwrap_or_default()).collect();
-            pool.encode_and_hash_anthropic(&openai_req.model, system_str, &msgs).hashes
-        }
-        None => Vec::new(),
-    };
-
     let provider = state
         .router
-        .select_provider_with_prefix(&openai_req.model, Some(&identity.key_hash), input_chars as u64, &prefix_hashes)
+        .select_provider(&resolved_model, Some(&identity.key_hash), input_chars as u64)
         .ok_or_else(|| {
-            let e = GatewayError::ModelNotFound(openai_req.model.clone());
+            let e = GatewayError::ModelNotFound(resolved_model.clone());
             log_error(&state, &identity, &model, "/v1/messages", is_stream, start, &e, Some(request_id.clone()), None, None);
             rollback_plan_quota(&state.limiter, &rl_info);
             AnthropicErrorReply(e, is_stream)
         })?;
 
     let deployment_id = provider.deployment_id().map(|s| s.to_string());
-    let inflight_model = state.router.resolve_model_name(&model);
+    let inflight_model = state.router.resolve_model_name(&resolved_model);
 
     // 3.5. Flow control — queue if per-deployment limits exceeded.
     let fc_guard = if let Some(ref did) = deployment_id {
@@ -1772,34 +1770,4 @@ impl From<GatewayError> for AnthropicErrorReply {
     fn from(e: GatewayError) -> Self {
         AnthropicErrorReply(e, false)
     }
-}
-
-// ═══════════════════════════════════════════════════════════
-// KV-Events endpoint (internal)
-// ═══════════════════════════════════════════════════════════
-
-/// Ingest a batch of KV-cache events from inference engines.
-/// POST /internal/kv-events
-pub async fn kv_events(
-    State(state): State<AppState>,
-    Json(batch): Json<boom_core::kv_event::DynamoEventBatch>,
-) -> impl IntoResponse {
-    let count = batch.events.len();
-
-    if let Some(ref kv_index) = state.kv_index {
-        for event in &batch.events {
-            kv_index.apply_event(event);
-        }
-        tracing::debug!(events = count, "KV events processed");
-    } else {
-        tracing::warn!(events = count, "KV events received but kv_index not initialized");
-    }
-
-    (
-        axum::http::StatusCode::OK,
-        Json(serde_json::json!({
-            "status": "ok",
-            "events_processed": count
-        })),
-    )
 }

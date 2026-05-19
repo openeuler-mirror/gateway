@@ -1542,12 +1542,10 @@
 
   function renderLogsPagination(data) {
     const el = document.getElementById("logs-pagination");
-    const pages = Math.ceil(data.total / data.per_page);
-    if (pages <= 1) { el.innerHTML = ""; return; }
     el.innerHTML = `
       <button ${data.page <= 1 ? "disabled" : ""} onclick="window._loadLogsPage(${data.page - 1})">&lt;</button>
-      <span>Page ${data.page} of ${pages} (${data.total} logs)</span>
-      <button ${data.page >= pages ? "disabled" : ""} onclick="window._loadLogsPage(${data.page + 1})">&gt;</button>
+      <span>Page ${data.page}</span>
+      <button ${!data.has_next ? "disabled" : ""} onclick="window._loadLogsPage(${data.page + 1})">&gt;</button>
     `;
   }
 

@@ -1,7 +1,9 @@
 use arc_swap::ArcSwap;
 use boom_core::provider::Provider;
+use boom_core::types::{Message, Tool};
 use std::sync::Arc;
 
+use crate::hybrid_router::HybridRouter;
 use crate::policy::SchedulePolicy;
 use crate::{AliasStore, DeploymentStore};
 
@@ -17,15 +19,21 @@ impl std::ops::Deref for PolicyHolder {
     }
 }
 
+/// Type-erased classifier wrapper for ArcSwap compatibility.
+struct ClassifierHolder {
+    inner: Option<Arc<HybridRouter>>,
+}
+
 /// Unified routing decision engine.
 ///
-/// Owns references to DeploymentStore, AliasStore, and a SchedulePolicy,
-/// providing a single entry point for all routing logic: provider selection,
-/// alias resolution, model visibility, and model configuration checks.
+/// Owns references to DeploymentStore, AliasStore, a SchedulePolicy,
+/// and an optional HybridRouter classifier, providing a single entry
+/// point for all routing logic.
 pub struct Router {
     deployment_store: Arc<DeploymentStore>,
     alias_store: Arc<AliasStore>,
     policy: ArcSwap<PolicyHolder>,
+    classifier: ArcSwap<ClassifierHolder>,
 }
 
 impl Router {
@@ -38,12 +46,34 @@ impl Router {
             deployment_store,
             alias_store,
             policy: ArcSwap::from_pointee(PolicyHolder { inner: policy }),
+            classifier: ArcSwap::from_pointee(ClassifierHolder { inner: None }),
+        }
+    }
+
+    /// Create a Router with an optional hybrid router classifier.
+    pub fn with_classifier(
+        deployment_store: Arc<DeploymentStore>,
+        alias_store: Arc<AliasStore>,
+        policy: Arc<dyn SchedulePolicy>,
+        classifier: Option<Arc<HybridRouter>>,
+    ) -> Self {
+        Self {
+            deployment_store,
+            alias_store,
+            policy: ArcSwap::from_pointee(PolicyHolder { inner: policy }),
+            classifier: ArcSwap::from_pointee(ClassifierHolder { inner: classifier }),
         }
     }
 
     /// Hot-swap the scheduling policy (e.g. on config reload).
     pub fn set_policy(&self, policy: Arc<dyn SchedulePolicy>) {
         self.policy.store(Arc::new(PolicyHolder { inner: policy }));
+    }
+
+    /// Hot-swap the hybrid router classifier (e.g. on config reload).
+    pub fn set_classifier(&self, classifier: Option<Arc<HybridRouter>>) {
+        self.classifier
+            .store(Arc::new(ClassifierHolder { inner: classifier }));
     }
 
     /// Resolve a model name through alias mapping.
@@ -65,6 +95,36 @@ impl Router {
         model.to_string()
     }
 
+    /// Content-aware model resolution: hybrid router classification
+    /// followed by normal alias resolution.
+    ///
+    /// Returns the resolved model name for routing (provider selection,
+    /// inflight, logging). If the classifier is disabled or the model
+    /// doesn't match the virtual name, falls back to `resolve_model_name`.
+    pub fn resolve_request_model(
+        &self,
+        model: &str,
+        messages: &[Message],
+        tools: &Option<Vec<Tool>>,
+    ) -> String {
+        let classifier = self.classifier.load();
+        if let Some(ref hr) = classifier.inner {
+            if let Some(target) = hr.classify(model, messages, tools) {
+                return target;
+            }
+        }
+        self.resolve_model_name(model)
+    }
+
+    /// Check if a model name is the hybrid router's virtual model.
+    pub fn is_hybrid_virtual_model(&self, model: &str) -> bool {
+        self.classifier
+            .load()
+            .inner
+            .as_ref()
+            .map_or(false, |c| c.model_name() == model)
+    }
+
     /// Core routing: exact match → alias resolution → wildcard "*".
     ///
     /// Resolves candidates then delegates to the SchedulePolicy for selection.
@@ -78,35 +138,13 @@ impl Router {
         self.policy.load().inner.select(model, &candidates, key_hash, input_chars)
     }
 
-    /// KV-cache aware routing: resolves candidates then delegates to
-    /// `select_with_context()` with prefix block hashes.
-    pub fn select_provider_with_prefix(
-        &self,
-        model: &str,
-        key_hash: Option<&str>,
-        input_chars: u64,
-        prefix_block_hashes: &[(usize, u64)],
-    ) -> Option<Arc<dyn Provider>> {
-        let candidates = self.resolve_candidates(model)?;
-        self.policy.load().inner.select_with_context(model, &candidates, key_hash, input_chars, prefix_block_hashes)
-    }
-
     /// Resolve model name to a list of candidate providers.
-    ///
-    /// Priority: exact match → alias resolution → wildcard "*".
-    ///
-    /// Important: if the model IS configured (key exists in deployment_store)
-    /// but all its deployments are down (empty provider list), we return None
-    /// immediately — we do NOT fall through to the wildcard. This ensures that
-    /// a user requesting "gpt-4" never gets silently routed to a different model.
-    /// The wildcard catch-all only applies to completely unknown model names.
     fn resolve_candidates(&self, model: &str) -> Option<Vec<Arc<dyn Provider>>> {
         // Exact match first.
         if let Some(ps) = self.deployment_store.get_providers(model) {
             if !ps.is_empty() {
                 return Some(ps);
             }
-            // Model is configured but all deployments are down — don't fall through.
             return None;
         }
 
@@ -116,11 +154,8 @@ impl Router {
                 if !ps.is_empty() {
                     return Some(ps);
                 }
-                // Alias target is configured but all down — don't fall through.
                 return None;
             }
-            // Alias exists but target has no deployment entry — misconfiguration.
-            // Still don't fall through to wildcard.
             return None;
         }
 
@@ -145,6 +180,14 @@ impl Router {
         for alias_name in self.alias_store.visible_names() {
             if !names.contains(&alias_name) {
                 names.push(alias_name);
+            }
+        }
+
+        // Include hybrid router virtual model name if enabled.
+        if let Some(ref hr) = self.classifier.load().inner {
+            let name = hr.model_name().to_string();
+            if !names.contains(&name) {
+                names.push(name);
             }
         }
 

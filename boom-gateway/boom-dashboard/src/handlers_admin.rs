@@ -1297,14 +1297,7 @@ pub async fn list_logs(
            LIMIT ${limit_idx} OFFSET ${offset_idx}"#,
     );
 
-    let count_sql = format!(
-        r#"SELECT COUNT(*) FROM boom_request_log rl
-           LEFT JOIN boom_team_table bt ON rl.team_id = bt.team_id
-           {where_sql}"#,
-    );
-
     let mut q = sqlx::query_as::<_, LogRow>(&sql);
-    let mut cq = sqlx::query_scalar::<_, i64>(&count_sql);
 
     // Pre-build LIKE patterns so they outlive the bind chain.
     let model_pattern      = query.model.as_ref().map(|v| format!("%{}%", v));
@@ -1317,43 +1310,35 @@ pub async fn list_logs(
     // Bind parameters (order must match slot allocation above).
     if let Some(ref v) = query.key_hash {
         q = q.bind(v.clone());
-        cq = cq.bind(v.clone());
     }
     if let Some(ref p) = model_pattern {
         q = q.bind(p.clone());
-        cq = cq.bind(p.clone());
     }
     if query.status.as_deref() == Some("error") {
         q = q.bind(200i16);
-        cq = cq.bind(200i16);
     }
     if let Some(ref p) = request_id_pattern {
         q = q.bind(p.clone());
-        cq = cq.bind(p.clone());
     }
     if let Some(ref p) = key_alias_pattern {
         q = q.bind(p.clone());
-        cq = cq.bind(p.clone());
     }
     if let Some(ref p) = api_path_pattern {
         q = q.bind(p.clone());
-        cq = cq.bind(p.clone());
     }
     if let Some(v) = query.status_code {
         q = q.bind(v);
-        cq = cq.bind(v);
     }
     // stream is handled as a static WHERE clause (no bind needed).
     if let Some(ref p) = error_pattern {
         q = q.bind(p.clone());
-        cq = cq.bind(p.clone());
     }
     if let Some(ref p) = team_alias_pattern {
         q = q.bind(p.clone());
-        cq = cq.bind(p.clone());
     }
 
-    q = q.bind(per_page).bind(offset);
+    // Fetch per_page + 1 to detect if there is a next page.
+    q = q.bind(per_page + 1).bind(offset);
 
     let rows: Vec<LogRow> = match q.fetch_all(db_pool).await {
         Ok(r) => r,
@@ -1367,9 +1352,10 @@ pub async fn list_logs(
         }
     };
 
-    let total: i64 = cq.fetch_one(db_pool).await.unwrap_or(0);
-
+    let has_next = rows.len() > per_page as usize;
     let logs: Vec<Value> = rows
+        .into_iter()
+        .take(per_page as usize)
         .into_iter()
         .map(|r| {
             let display_model = match &r.deployment_id {
@@ -1401,7 +1387,7 @@ pub async fn list_logs(
         "logs": logs,
         "page": page,
         "per_page": per_page,
-        "total": total,
+        "has_next": has_next,
     }))
     .into_response()
 }

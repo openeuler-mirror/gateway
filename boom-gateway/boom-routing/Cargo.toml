@@ -13,7 +13,3 @@ serde_json = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
-
-# `async-trait` is only for unit tests.
-[dev-dependencies]
-async-trait = { workspace = true }

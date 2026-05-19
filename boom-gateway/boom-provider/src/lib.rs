@@ -1,5 +1,4 @@
 pub mod anthropic;
-pub mod hybrid_router;
 pub mod azure;
 pub mod bedrock;
 pub mod gemini;
