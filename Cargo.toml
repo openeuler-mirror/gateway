@@ -12,6 +12,7 @@ members = [
     "boom-gateway/boom-main",
     "boom-gateway/boom-dashboard",
     "boom-gateway/boom-promptlog",
+    "boom-gateway/boom-kvindex",
 ]
 
 [workspace.package]
@@ -74,3 +75,7 @@ tokio-stream = "0.1"
 bytes = "1"
 jsonwebtoken = "9"
 flate2 = "1"
+
+# KV-cache aware routing
+tokenizers = "0.21"
+twox-hash = "2"

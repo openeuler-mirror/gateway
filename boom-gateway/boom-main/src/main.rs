@@ -1,5 +1,6 @@
 mod admin_command;
 mod extractor;
+mod kv_aware;
 mod request_log;
 mod routes;
 mod state;
@@ -136,6 +137,10 @@ fn build_router(state: AppState) -> Router {
         .route("/health/live", get(routes::liveness_check))
         .route("/health/ready", get(routes::readiness_check));
 
+    // Internal routes (for KV event ingestion from inference engines).
+    let internal_routes = Router::new()
+        .route("/internal/kv-events", post(routes::kv_events));
+
     // Admin routes (require master key).
     let admin_routes = Router::new()
         .route("/admin/config/reload", post(routes::admin_reload_config))
@@ -182,6 +187,7 @@ fn build_router(state: AppState) -> Router {
     Router::new()
         .merge(api_routes)
         .merge(health_routes)
+        .merge(internal_routes)
         .merge(admin_routes)
         .merge(dashboard_router)
         .with_state(state)
