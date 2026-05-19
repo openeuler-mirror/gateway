@@ -73,6 +73,19 @@ pub struct QueuedWaiterEntry {
     pub is_vip: bool,
 }
 
+/// Per-deployment dispatched key breakdown for dashboard visibility.
+#[derive(Debug, Clone)]
+pub struct DispatchedKeyStat {
+    pub deployment_id: String,
+    pub keys: Vec<DispatchedKeyEntry>,
+}
+
+/// A single dispatched request's key info.
+#[derive(Debug, Clone)]
+pub struct DispatchedKeyEntry {
+    pub key_alias: String,
+}
+
 // ═══════════════════════════════════════════════════════════
 // Internal types
 // ═══════════════════════════════════════════════════════════
@@ -475,6 +488,31 @@ impl FlowController {
                 QueuedWaiterStat {
                     deployment_id: r.key().clone(),
                     waiters: entries,
+                }
+            })
+            .collect()
+    }
+
+    /// Per-deployment key breakdown for dispatched (in-flight) requests.
+    pub fn get_dispatched_keys(&self) -> Vec<DispatchedKeyStat> {
+        self.slots
+            .iter()
+            .map(|r| {
+                let inner = r.value().inner.lock().unwrap();
+                let keys: Vec<DispatchedKeyEntry> = inner
+                    .vip_queue
+                    .iter()
+                    .chain(inner.normal_queue.iter())
+                    .filter(|r| r.dispatched)
+                    .filter_map(|r| {
+                        r.key_alias.as_ref().map(|alias| DispatchedKeyEntry {
+                            key_alias: alias.clone(),
+                        })
+                    })
+                    .collect();
+                DispatchedKeyStat {
+                    deployment_id: r.key().clone(),
+                    keys,
                 }
             })
             .collect()
