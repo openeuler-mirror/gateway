@@ -6,13 +6,12 @@ use std::task::{Context, Poll};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
-/// Stream wrapper that transparently passes through items while tracking
-/// stream completion for prompt logging.
+/// Stream wrapper that transparently passes through items while accumulating
+/// response content for prompt logging.
 ///
-/// On `Drop`, it sends a log entry with stream metadata to the writer channel.
-/// The actual SSE event content extraction is handled separately in routes.rs
-/// where the raw JSON data is accessible.
-pub struct PromptLogStream<S> {
+/// On `Drop`, it sends a log entry with the accumulated response content
+/// to the writer channel.
+pub struct PromptLogStream<S, F> {
     inner: S,
     sender: mpsc::UnboundedSender<PromptLogEntry>,
     entry: Option<PromptLogEntry>,
@@ -20,15 +19,24 @@ pub struct PromptLogStream<S> {
     start: Instant,
     /// Count of events that passed through.
     event_count: u64,
-    /// Pre-captured stream response content (set from routes.rs).
-    stream_response: Option<serde_json::Value>,
+    /// Accumulated text content from all SSE events.
+    content_buf: String,
+    /// Finish reason from the last event that carries one.
+    finish_reason: Option<String>,
+    /// Extractor closure: receives &S::Item, returns (text, finish_reason).
+    extractor: F,
 }
 
-impl<S> PromptLogStream<S> {
+// Safety: PromptLogStream does not use pin projection for any field.
+// All fields are either Unpin or accessed without pin projection.
+impl<S: Unpin, F: Unpin> Unpin for PromptLogStream<S, F> {}
+
+impl<S, F> PromptLogStream<S, F> {
     pub fn new(
         inner: S,
         sender: mpsc::UnboundedSender<PromptLogEntry>,
         entry: PromptLogEntry,
+        extractor: F,
     ) -> Self {
         let start = Instant::now();
         Self {
@@ -37,28 +45,31 @@ impl<S> PromptLogStream<S> {
             entry: Some(entry),
             start,
             event_count: 0,
-            stream_response: None,
+            content_buf: String::new(),
+            finish_reason: None,
+            extractor,
         }
-    }
-
-    /// Set the response data for this stream (called from routes.rs
-    /// when stream content has been accumulated).
-    pub fn set_stream_response(&mut self, response: serde_json::Value) {
-        self.stream_response = Some(response);
     }
 }
 
-impl<S> Drop for PromptLogStream<S> {
+impl<S, F> Drop for PromptLogStream<S, F> {
     fn drop(&mut self) {
         if let Some(mut entry) = self.entry.take() {
             let duration_ms = self.start.elapsed().as_millis() as u64;
 
-            let response = self.stream_response.take().unwrap_or_else(|| {
+            let response = if self.content_buf.is_empty() {
                 serde_json::json!({
                     "stream": true,
                     "event_count": self.event_count,
                 })
-            });
+            } else {
+                serde_json::json!({
+                    "stream": true,
+                    "event_count": self.event_count,
+                    "content": self.content_buf,
+                    "finish_reason": self.finish_reason,
+                })
+            };
 
             entry.set_response(response);
             entry.set_status(200, duration_ms);
@@ -70,14 +81,26 @@ impl<S> Drop for PromptLogStream<S> {
     }
 }
 
-/// Implement Stream that transparently passes through items.
-impl<S: Stream + Unpin> Stream for PromptLogStream<S> {
+/// Implement Stream that accumulates content and passes through items.
+impl<S, F> Stream for PromptLogStream<S, F>
+where
+    S: Stream + Unpin,
+    F: FnMut(&S::Item) -> (Option<String>, Option<String>) + Unpin,
+{
     type Item = S::Item;
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match self.inner.poll_next_unpin(cx) {
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        match this.inner.poll_next_unpin(cx) {
             Poll::Ready(Some(item)) => {
-                self.event_count += 1;
+                this.event_count += 1;
+                let (text, finish) = (this.extractor)(&item);
+                if let Some(t) = text {
+                    this.content_buf.push_str(&t);
+                }
+                if finish.is_some() {
+                    this.finish_reason = finish;
+                }
                 Poll::Ready(Some(item))
             }
             Poll::Ready(None) => Poll::Ready(None),
