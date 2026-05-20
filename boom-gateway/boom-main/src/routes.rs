@@ -24,6 +24,28 @@ use std::sync::atomic::Ordering;
 use std::task::{Context, Poll};
 use std::time::Instant;
 
+/// Extract client IP from request headers (reverse-proxy aware).
+/// Priority: X-Real-IP > X-Forwarded-For (first IP) > "unknown".
+fn extract_client_ip(headers: &axum::http::HeaderMap) -> String {
+    // Try X-Real-IP first (set by nginx etc.)
+    if let Some(val) = headers.get("X-Real-IP").and_then(|v| v.to_str().ok()) {
+        let ip = val.trim();
+        if !ip.is_empty() {
+            return ip.to_string();
+        }
+    }
+    // Try X-Forwarded-For (first IP in the list).
+    if let Some(val) = headers.get("X-Forwarded-For").and_then(|v| v.to_str().ok()) {
+        if let Some(ip) = val.split(',').next() {
+            let ip = ip.trim();
+            if !ip.is_empty() {
+                return ip.to_string();
+            }
+        }
+    }
+    "unknown".to_string()
+}
+
 /// Acquire flow control guard for a deployment.
 /// Returns Ok(Some(guard)) if acquired, Ok(None) if no slot (pass-through),
 /// or Err with appropriate error reply.
@@ -39,6 +61,7 @@ async fn acquire_fc_guard<E>(
     is_stream: bool,
     start: Instant,
     request_id: &str,
+    client_ip: Option<String>,
     err_wrap: impl Fn(GatewayError, bool) -> E,
 ) -> Result<Option<boom_flowcontrol::FlowControlGuard>, E> {
     let timeout = std::time::Duration::from_secs(1200);
@@ -50,7 +73,7 @@ async fn acquire_fc_guard<E>(
                 waiters,
                 message: format!("Deployment '{}' flow control queue timeout — too many concurrent requests", deployment_id),
             };
-            log_error(state, identity, model, api_path, is_stream, start, &e, Some(request_id.to_string()), Some(deployment_id.to_string()), None);
+            log_error(state, identity, model, api_path, is_stream, start, &e, Some(request_id.to_string()), Some(deployment_id.to_string()), None, client_ip);
             Err(err_wrap(e, is_stream))
         }
         Err(FlowControlError::NoSlot) => Ok(None),
@@ -60,7 +83,7 @@ async fn acquire_fc_guard<E>(
                 message: format!("Request context ({} chars) exceeds deployment max_context limit ({} chars)", context_chars, max_context),
                 limit_type: "flow_control_context",
             };
-            log_error(state, identity, model, api_path, is_stream, start, &e, Some(request_id.to_string()), Some(deployment_id.to_string()), None);
+            log_error(state, identity, model, api_path, is_stream, start, &e, Some(request_id.to_string()), Some(deployment_id.to_string()), None, client_ip);
             Err(err_wrap(e, is_stream))
         }
     }
@@ -220,21 +243,24 @@ impl<S: futures::Stream + Unpin> futures::Stream for LoggedStream<S> {
 pub async fn chat_completions(
     State(state): State<AppState>,
     auth: RequiredAuth,
+    headers: axum::http::HeaderMap,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<impl IntoResponse, GatewayErrorReply> {
-    chat_completions_inner(state, auth, req, "/v1/chat/completions").await
+    chat_completions_inner(state, auth, &headers, req, "/v1/chat/completions").await
 }
 
 /// Shared inner logic for chat completions and legacy completions.
 async fn chat_completions_inner(
     state: AppState,
     auth: RequiredAuth,
+    headers: &axum::http::HeaderMap,
     req: ChatCompletionRequest,
     api_path: &str,
 ) -> Result<impl IntoResponse, GatewayErrorReply> {
     let start = Instant::now();
     let request_id = new_request_id();
     let identity = auth.identity();
+    let client_ip = extract_client_ip(headers);
     let inner = state.inner.load();
     let model = req.model.clone();
     let is_stream = req.stream.unwrap_or(false);
@@ -268,7 +294,7 @@ async fn chat_completions_inner(
     // 1. Model access check (deployment-aware, alias-aware).
     check_model_access(identity, &req.model, &state.router, &inner.config.general_settings.public_models)
         .map_err(|e| {
-            log_error(&state, &identity, &model, api_path, is_stream, start, &e, Some(request_id.clone()), None, None);
+            log_error(&state, &identity, &model, api_path, is_stream, start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()));
             GatewayErrorReply(e, false)
         })?;
 
@@ -304,7 +330,7 @@ async fn chat_completions_inner(
     )
     .await
     .map_err(|e| {
-        log_error(&state, &identity, &model, api_path, is_stream, start, &e, Some(request_id.clone()), None, None);
+        log_error(&state, &identity, &model, api_path, is_stream, start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()));
         GatewayErrorReply(e, false)
     })?;
 
@@ -327,7 +353,7 @@ async fn chat_completions_inner(
         .select_provider(&resolved_model, Some(&identity.key_hash), input_chars as u64)
         .ok_or_else(|| {
             let e = GatewayError::ModelNotFound(resolved_model.clone());
-            log_error(&state, &identity, &model, api_path, is_stream, start, &e, Some(request_id.clone()), None, None);
+            log_error(&state, &identity, &model, api_path, is_stream, start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()));
             rollback_plan_quota(&state.limiter, &rl_info);
             GatewayErrorReply(e, false)
         })?;
@@ -340,7 +366,7 @@ async fn chat_completions_inner(
         acquire_fc_guard(
             &state, did, input_chars as u64, is_vip_key(&identity.metadata),
             identity.key_alias.clone(), api_path, &identity, &model,
-            is_stream, start, &request_id, GatewayErrorReply,
+            is_stream, start, &request_id, Some(client_ip.clone()), GatewayErrorReply,
         ).await?
     } else {
         None
@@ -356,7 +382,7 @@ async fn chat_completions_inner(
     // 4. Route to provider (streaming or non-streaming).
     if is_stream {
         let stream = provider.chat_stream(req).await.map_err(|e| {
-            log_error(&state, &identity, &model, api_path, true, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone());
+            log_error(&state, &identity, &model, api_path, true, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()));
             record_deployment_failure(&state, &deployment_id, &model, &e);
             rollback_plan_quota(&state.limiter, &rl_info);
             GatewayErrorReply(e, true)
@@ -395,6 +421,7 @@ async fn chat_completions_inner(
             output_tokens: None,
             duration_ms: None,
             deployment_id,
+            client_ip: Some(client_ip.clone()),
         }, start, usage);
 
         // Wrap with prompt log stream if enabled, then wrap in Sse.
@@ -403,11 +430,13 @@ async fn chat_completions_inner(
                 let prompt_entry = PromptLogEntry::new(
                     prompt_log_rid.as_deref().unwrap_or_default(),
                     &identity.key_hash,
+                    identity.key_alias.as_deref(),
                     identity.team_alias.as_deref(),
                     prompt_log_model.as_deref().unwrap_or_default(),
                     api_path,
                     true,
                     req_body,
+                    Some(&client_ip),
                 );
                 let prompt_logged = PromptLogStream::new(logged, sender, prompt_entry);
                 let response = Sse::new(prompt_logged).keep_alive(KeepAlive::default());
@@ -423,7 +452,7 @@ async fn chat_completions_inner(
             InFlightGuard::new(state.inflight.clone(), &inflight_model, input_chars as u64)
         };
         let response = provider.chat(req).await.map_err(|e| {
-            log_error(&state, &identity, &model, api_path, false, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone());
+            log_error(&state, &identity, &model, api_path, false, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()));
             record_deployment_failure(&state, &deployment_id, &model, &e);
             rollback_plan_quota(&state.limiter, &rl_info);
             GatewayErrorReply(e, false)
@@ -453,6 +482,7 @@ async fn chat_completions_inner(
                 output_tokens: Some(output_tokens),
                 duration_ms: Some(duration_ms),
                 deployment_id,
+                client_ip: Some(client_ip.clone()),
             },
         );
 
@@ -470,11 +500,13 @@ async fn chat_completions_inner(
                 let mut prompt_entry = PromptLogEntry::new(
                     prompt_log_rid.as_deref().unwrap_or_default(),
                     &identity.key_hash,
+                    identity.key_alias.as_deref(),
                     identity.team_alias.as_deref(),
                     prompt_log_model.as_deref().unwrap_or_default(),
                     api_path,
                     false,
                     req_body,
+                    Some(client_ip.as_str()),
                 );
                 prompt_entry.set_response(serde_json::to_value(&resp).unwrap_or(serde_json::Value::Null));
                 prompt_entry.set_status(200, duration_ms as u64);
@@ -493,10 +525,11 @@ async fn chat_completions_inner(
 pub async fn completions(
     State(state): State<AppState>,
     auth: RequiredAuth,
+    headers: axum::http::HeaderMap,
     Json(req): Json<CompletionRequest>,
 ) -> Result<impl IntoResponse, GatewayErrorReply> {
     let chat_req = req.into_chat_request();
-    chat_completions_inner(state, auth, chat_req, "/v1/completions").await
+    chat_completions_inner(state, auth, &headers, chat_req, "/v1/completions").await
 }
 
 // ============================================================
@@ -1374,12 +1407,14 @@ fn sse_stream_from_chat_stream(
 pub async fn messages(
     State(state): State<AppState>,
     auth: RequiredAuth,
+    headers: axum::http::HeaderMap,
     Json(req): Json<AnthropicMessagesRequest>,
 ) -> Result<impl IntoResponse, AnthropicErrorReply> {
     let start = Instant::now();
     let request_id = new_request_id();
     let openai_req = anthropic_request_to_openai(&req);
     let identity = auth.identity();
+    let client_ip = extract_client_ip(&headers);
     let inner = state.inner.load();
     let model = openai_req.model.clone();
     let is_stream = openai_req.stream.unwrap_or(false);
@@ -1413,7 +1448,7 @@ pub async fn messages(
     // 1. Model access check (deployment-aware, alias-aware).
     check_model_access(identity, &openai_req.model, &state.router, &inner.config.general_settings.public_models)
         .map_err(|e| {
-            log_error(&state, &identity, &model, "/v1/messages", is_stream, start, &e, Some(request_id.clone()), None, None);
+            log_error(&state, &identity, &model, "/v1/messages", is_stream, start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()));
             AnthropicErrorReply(e, is_stream)
         })?;
 
@@ -1449,7 +1484,7 @@ pub async fn messages(
     )
     .await
     .map_err(|e| {
-        log_error(&state, &identity, &model, "/v1/messages", is_stream, start, &e, Some(request_id.clone()), None, None);
+        log_error(&state, &identity, &model, "/v1/messages", is_stream, start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()));
         AnthropicErrorReply(e, is_stream)
     })?;
 
@@ -1471,7 +1506,7 @@ pub async fn messages(
         .select_provider(&resolved_model, Some(&identity.key_hash), input_chars as u64)
         .ok_or_else(|| {
             let e = GatewayError::ModelNotFound(resolved_model.clone());
-            log_error(&state, &identity, &model, "/v1/messages", is_stream, start, &e, Some(request_id.clone()), None, None);
+            log_error(&state, &identity, &model, "/v1/messages", is_stream, start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()));
             rollback_plan_quota(&state.limiter, &rl_info);
             AnthropicErrorReply(e, is_stream)
         })?;
@@ -1484,7 +1519,7 @@ pub async fn messages(
         acquire_fc_guard(
             &state, did, input_chars as u64, is_vip_key(&identity.metadata),
             identity.key_alias.clone(), "/v1/messages", &identity, &model,
-            is_stream, start, &request_id, AnthropicErrorReply,
+            is_stream, start, &request_id, Some(client_ip.clone()), AnthropicErrorReply,
         ).await?
     } else {
         None
@@ -1500,7 +1535,7 @@ pub async fn messages(
     // 4. Route to provider.
     if is_stream {
         let stream = provider.chat_stream(openai_req).await.map_err(|e| {
-            log_error(&state, &identity, &model, "/v1/messages", true, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone());
+            log_error(&state, &identity, &model, "/v1/messages", true, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()));
             record_deployment_failure(&state, &deployment_id, &model, &e);
             rollback_plan_quota(&state.limiter, &rl_info);
             AnthropicErrorReply(e, true)
@@ -1538,6 +1573,7 @@ pub async fn messages(
             output_tokens: None,
             duration_ms: None, // filled by LoggedStream::drop
             deployment_id,
+            client_ip: Some(client_ip.clone()),
         }, start, usage);
 
         // Wrap with prompt log stream if enabled, then wrap in Sse.
@@ -1546,11 +1582,13 @@ pub async fn messages(
                 let prompt_entry = PromptLogEntry::new(
                     prompt_log_rid.as_deref().unwrap_or_default(),
                     &identity.key_hash,
+                    identity.key_alias.as_deref(),
                     identity.team_alias.as_deref(),
                     prompt_log_model.as_deref().unwrap_or_default(),
                     "/v1/messages",
                     true,
                     req_body,
+                    Some(&client_ip.as_str()),
                 );
                 let prompt_logged = PromptLogStream::new(logged, sender, prompt_entry);
                 let response = Sse::new(prompt_logged).keep_alive(KeepAlive::default());
@@ -1566,7 +1604,7 @@ pub async fn messages(
             InFlightGuard::new(state.inflight.clone(), &inflight_model, input_chars as u64)
         };
         let response = provider.chat(openai_req).await.map_err(|e| {
-            log_error(&state, &identity, &model, "/v1/messages", false, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone());
+            log_error(&state, &identity, &model, "/v1/messages", false, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()));
             record_deployment_failure(&state, &deployment_id, &model, &e);
             rollback_plan_quota(&state.limiter, &rl_info);
             AnthropicErrorReply(e, false)
@@ -1596,6 +1634,7 @@ pub async fn messages(
                 output_tokens: Some(output_tokens),
                 duration_ms: Some(duration_ms),
                 deployment_id,
+                client_ip: Some(client_ip.clone()),
             },
         );
 
@@ -1607,11 +1646,13 @@ pub async fn messages(
                 let mut prompt_entry = PromptLogEntry::new(
                     prompt_log_rid.as_deref().unwrap_or_default(),
                     &identity.key_hash,
+                    identity.key_alias.as_deref(),
                     identity.team_alias.as_deref(),
                     prompt_log_model.as_deref().unwrap_or_default(),
                     "/v1/messages",
                     false,
                     req_body,
+                    Some(client_ip.as_str()),
                 );
                 prompt_entry.set_response(serde_json::to_value(&anthropic_resp).unwrap_or(serde_json::Value::Null));
                 prompt_entry.set_status(200, duration_ms as u64);

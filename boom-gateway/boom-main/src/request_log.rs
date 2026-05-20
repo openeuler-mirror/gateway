@@ -33,6 +33,7 @@ pub struct RequestLog {
     pub output_tokens: Option<i32>,
     pub duration_ms: Option<i32>,
     pub deployment_id: Option<String>,
+    pub client_ip: Option<String>,
 }
 
 /// Fire-and-forget: spawn a tokio task to INSERT the log record.
@@ -47,8 +48,8 @@ pub fn log_request(pool: Option<PgPool>, log: RequestLog) {
                     r#"INSERT INTO boom_request_log
                        (request_id, key_hash, key_name, key_alias, team_id, model, model_name, api_path,
                         is_stream, status_code, error_type, error_message,
-                        input_tokens, output_tokens, duration_ms, deployment_id)
-                       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)"#,
+                        input_tokens, output_tokens, duration_ms, deployment_id, client_ip)
+                       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)"#,
                 )
                 .bind(&log.request_id)
                 .bind(&log.key_hash)
@@ -66,6 +67,7 @@ pub fn log_request(pool: Option<PgPool>, log: RequestLog) {
                 .bind(log.output_tokens)
                 .bind(log.duration_ms)
                 .bind(&log.deployment_id)
+                .bind(&log.client_ip)
                 .execute(&pool),
             )
             .await;
@@ -92,6 +94,7 @@ pub fn log_error(
     request_id: Option<String>,
     deployment_id: Option<String>,
     request_body: Option<String>,
+    client_ip: Option<String>,
 ) {
     if !error.should_log_to_db() {
         let dedup_key = format!("{}:{}:{}", error.error_type(), identity.key_hash, model);
@@ -130,6 +133,7 @@ pub fn log_error(
             output_tokens: None,
             duration_ms: Some(start.elapsed().as_millis() as i32),
             deployment_id,
+            client_ip: client_ip.clone(),
         },
     );
 

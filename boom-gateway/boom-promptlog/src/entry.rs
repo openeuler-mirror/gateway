@@ -17,6 +17,11 @@ pub struct PromptLogEntry {
     pub duration_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_ip: Option<String>,
+    /// Domain account derived from key_alias (last space-separated segment).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub domain_account: Option<String>,
     /// Original request body (OpenAI or Anthropic format, stored as-is).
     pub request: serde_json::Value,
     /// Full response body (non-stream) or accumulated content (stream).
@@ -28,12 +33,16 @@ impl PromptLogEntry {
     pub fn new(
         request_id: &str,
         key_hash: &str,
+        key_alias: Option<&str>,
         team_alias: Option<&str>,
         model: &str,
         api_path: &str,
         is_stream: bool,
         request_body: serde_json::Value,
+        client_ip: Option<&str>,
     ) -> Self {
+        let domain_account = key_alias
+            .and_then(|a| a.rsplit_once(' ').map(|(_, last)| last.to_string()));
         Self {
             request_id: request_id.to_string(),
             timestamp: chrono::Utc::now().to_rfc3339(),
@@ -45,6 +54,8 @@ impl PromptLogEntry {
             status_code: None,
             duration_ms: None,
             error_message: None,
+            client_ip: client_ip.map(|s| s.to_string()),
+            domain_account,
             request: request_body,
             response: None,
         }
