@@ -8,20 +8,44 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **Intelligence Boom Gateway** — 高性能 LLM API 网关。Rust workspace 实现，Docker 容器化部署。兼容 litellm 密钥体系，自建速率限制、Dashboard、审计、计费等全部上层功能。
 
-## Build & Run
+## Commit 规范
 
-```bash
-# 构建 Docker 镜像（网关主程序）
-docker build -t boom-gateway boom-gateway/
+提交代码时必须使用 `git commit -s`，这会自动添加作者的 `Signed-off-by` 签名行。同时 Claude Code 在 commit message 末尾添加 `Co-Authored-By` 信息。典型 commit message 格式：
 
-# 构建 Docker 镜像（负载均衡器）
-docker build -t gateway-lb misc/LB/
+```
+fix: capture streaming response content in prompt log
 
-# LB 启停脚本（自动构建 + 生成证书）
-./misc/LB/start.sh start
+描述改动的目的和原因...
+
+Signed-off-by: 作者 <email>
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
 ```
 
-运行时依赖：Docker。构建镜像内使用 rsproxy.cn 作为 crates.io 镜像。
+## PR Review
+
+AtomGit 使用 GitLab 兼容协议，PR 称为 Merge Request，远程引用路径为 `refs/merge-requests/{N}/head`。
+
+### 获取 PR 代码
+
+```bash
+# 1. 拉取指定 MR 到本地分支
+git fetch atomgit refs/merge-requests/{N}/head:pr-{N}
+
+# 2. 查看提交记录
+git log --oneline pr-{N} --not atomgit/master
+
+# 3. 查看改动文件列表
+git diff --stat atomgit/master...pr-{N}
+
+# 4. 查看完整 diff
+git diff atomgit/master...pr-{N}
+```
+
+### 审查重点
+
+1. **架构合规**：是否符合上述模块依赖原则（单向、无环、职责边界清晰）？是否引入了禁止的跨模块依赖？DB 表操作是否越界？
+2. **架构破坏**：是否破坏了现有约定（AppState 生命周期、AdminCommand 模式、热加载规则等）？
+3. **代码质量**：编译是否通过、测试是否覆盖、是否有明显的逻辑错误或安全漏洞（OWASP）？
 
 ## Architecture Principles（架构原则）
 
