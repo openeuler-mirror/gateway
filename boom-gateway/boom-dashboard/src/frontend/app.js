@@ -1206,7 +1206,7 @@
             key_name: document.getElementById("m-key-name").value || null,
             user_id: document.getElementById("m-key-user").value || null,
             team_id: document.getElementById("m-key-team").value || null,
-            models: modelsVal,
+            models: modelsVal || ["all-team-models"],
             max_budget: document.getElementById("m-key-budget").value ? Number(document.getElementById("m-key-budget").value) : null,
             rpm_limit: document.getElementById("m-key-rpm").value ? Number(document.getElementById("m-key-rpm").value) : null,
             plan_name: document.getElementById("m-key-plan").value || null,
@@ -1261,7 +1261,7 @@
         const body = {
           key_alias: aliasVal || null,
           user_id: userVal || null,
-          models: modelsVal,
+          models: modelsVal || ["all-team-models"],
           max_budget: document.getElementById("m-edit-budget").value ? Number(document.getElementById("m-edit-budget").value) : null,
           rpm_limit: document.getElementById("m-edit-rpm").value ? Number(document.getElementById("m-edit-rpm").value) : null,
           metadata: Object.assign({}, existingMeta, { vip: vipChecked }),
@@ -1507,7 +1507,7 @@
     const tbody = document.getElementById("logs-tbody");
     if (!tbody) return;
     if (logs.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="12" class="no-results">No matching logs found.</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="13" class="no-results">No matching logs found.</td></tr>';
       return;
     }
     tbody.innerHTML = logs.map((l) => {
@@ -1525,6 +1525,7 @@
           : "-";
         return `<tr>
         <td class="mono">${formatTimestamp(l.created_at)}</td>
+        <td class="monm">${esc(l.client_ip || "-")}</td>
         <td>${esc(l.team_alias || l.team_id || "-")}</td>
         <td>${esc(l.key_alias || l.key_name || "-")}</td>
         <td class="mono">${esc(l.model)}</td>

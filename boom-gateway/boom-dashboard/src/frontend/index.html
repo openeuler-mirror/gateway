@@ -198,6 +198,7 @@
                 <thead>
                   <tr class="filter-row">
                     <td></td>
+                    <td><input class="col-filter" data-col="client_ip" placeholder="filter"></td>
                     <td><input class="col-filter" data-col="team_alias" placeholder="filter"></td>
                     <td><input class="col-filter" data-col="key_alias" placeholder="filter"></td>
                     <td><input class="col-filter" data-col="model" placeholder="filter"></td>
@@ -210,9 +211,9 @@
                     <td><input class="col-filter" data-col="error" placeholder="filter"></td>
                     <td></td>
                   </tr>
-                  <tr><th>Time</th><th>Team</th><th>Key Alias</th><th>Model</th><th>Path</th><th>Status</th><th>Stream</th><th>Input</th><th>Output</th><th>Duration</th><th>Error</th><th>Detail</th></tr>
+                  <tr><th>Time</th><th>IP</th><th>Team</th><th>Key Alias</th><th>Model</th><th>Path</th><th>Status</th><th>Stream</th><th>Input</th><th>Output</th><th>Duration</th><th>Error</th><th>Detail</th></tr>
                 </thead>
-                <tbody id="logs-tbody"><tr><td colspan="11" class="loading">Loading...</td></tr></tbody>
+                <tbody id="logs-tbody"><tr><td colspan="13" class="loading">Loading...</td></tr></tbody>
               </table>
             </div>
             <div id="logs-pagination" class="pagination"></div>
