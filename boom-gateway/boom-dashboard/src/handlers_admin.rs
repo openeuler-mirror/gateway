@@ -326,8 +326,10 @@ pub async fn create_key(
         .expires
         .as_deref()
         .and_then(|s| NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").ok());
-
-    let models_list: Vec<String> = req.models.unwrap_or_default();
+    let mut models_list: Vec<String> = req.models.unwrap_or_default();
+    if models_list.iter().any(|m| m == "all-team-models") {
+        models_list = vec!["all-team-models".to_string()];
+    }
 
     // 3. INSERT into DB.
     let result = sqlx::query(
@@ -426,7 +428,13 @@ pub async fn update_key(
         }
     }
 
-    let models_list: Option<Vec<String>> = req.models.clone();
+    let models_list: Option<Vec<String>> = req.models.as_ref().map(|v| {
+        if v.iter().any(|m| m == "all-team-models") {
+            vec!["all-team-models".to_string()]
+        } else {
+            v.clone()
+        }
+    });
 
     let expires: Option<NaiveDateTime> = req
         .expires
@@ -1177,6 +1185,7 @@ pub struct ListLogsQuery {
     pub stream: Option<String>,
     pub error: Option<String>,
     pub team_alias: Option<String>,
+    pub client_ip: Option<String>,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -1198,6 +1207,7 @@ struct LogRow {
     duration_ms: Option<i32>,
     created_at: Option<chrono::DateTime<chrono::Utc>>,
     deployment_id: Option<String>,
+    client_ip: Option<String>,
 }
 
 pub async fn list_logs(
@@ -1236,6 +1246,7 @@ pub async fn list_logs(
     // stream is handled as a static WHERE clause (no param slot needed).
     let error_param      = slot!(query.error);
     let team_alias_param = slot!(query.team_alias);
+    let client_ip_param   = slot!(query.client_ip);
 
     if query.key_hash.is_some() {
         where_clauses.push(format!("rl.key_hash = ${}", key_hash_param.unwrap()));
@@ -1272,7 +1283,9 @@ pub async fn list_logs(
     if query.team_alias.is_some() {
         where_clauses.push(format!("bt.team_alias ILIKE ${}", team_alias_param.unwrap()));
     }
-
+    if query.client_ip.is_some() {
+        where_clauses.push(format!("rl.client_ip ILIKE ${}", client_ip_param.unwrap()));
+    }
     let where_sql = if where_clauses.is_empty() {
         String::new()
     } else {
@@ -1289,7 +1302,7 @@ pub async fn list_logs(
                   rl.model, rl.api_path,
                   rl.is_stream, rl.status_code, rl.error_type, rl.error_message,
                   rl.input_tokens, rl.output_tokens, rl.duration_ms, rl.created_at,
-                  rl.deployment_id
+                  rl.deployment_id, rl.client_ip
            FROM boom_request_log rl
            LEFT JOIN boom_team_table bt ON rl.team_id = bt.team_id
            {where_sql}
@@ -1306,6 +1319,7 @@ pub async fn list_logs(
     let api_path_pattern   = query.api_path.as_ref().map(|v| format!("%{}%", v));
     let error_pattern      = query.error.as_ref().map(|v| format!("%{}%", v));
     let team_alias_pattern = query.team_alias.as_ref().map(|v| format!("%{}%", v));
+    let client_ip_pattern  = query.client_ip.as_ref().map(|v| format!("%{}%", v));
 
     // Bind parameters (order must match slot allocation above).
     if let Some(ref v) = query.key_hash {
@@ -1334,6 +1348,9 @@ pub async fn list_logs(
         q = q.bind(p.clone());
     }
     if let Some(ref p) = team_alias_pattern {
+        q = q.bind(p.clone());
+    }
+    if let Some(ref p) = client_ip_pattern {
         q = q.bind(p.clone());
     }
 
@@ -1379,6 +1396,7 @@ pub async fn list_logs(
                 "output_tokens": r.output_tokens,
                 "duration_ms": r.duration_ms,
                 "created_at": r.created_at.map(|d| d.to_rfc3339()),
+                "client_ip": r.client_ip,
             })
         })
         .collect();
@@ -1776,6 +1794,21 @@ fn aggregate_dispatched_keys(keys: Option<&Vec<boom_flowcontrol::DispatchedKeyEn
         .collect();
     result.sort_by(|a, b| b["request_count"].as_u64().cmp(&a["request_count"].as_u64()));
     result
+}
+
+// ═══════════════════════════════════════════════════════════
+// Rebalance Stats
+// ═══════════════════════════════════════════════════════════
+
+pub async fn get_rebalance_stats(
+    _session: AdminSession,
+    Extension(state): Extension<Arc<DashboardState>>,
+) -> Response {
+    let data = state.rebalance_counter.snapshot();
+    let points: Vec<serde_json::Value> = data.into_iter()
+        .map(|(label, count)| json!({ "minute": label, "count": count }))
+        .collect();
+    Json(json!({ "rebalance_events": points })).into_response()
 }
 
 // ═══════════════════════════════════════════════════════════

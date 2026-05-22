@@ -191,6 +191,7 @@
       console.error("loadStats error:", err);
     }
     loadInflight();
+    loadRebalanceStats();
   }
 
   // ── In-Flight ─────────────────────────────────────────
@@ -257,7 +258,7 @@
 
   function startInflightPoll() {
     stopInflightPoll();
-    inflightTimer = setInterval(loadInflight, 3000);
+    inflightTimer = setInterval(() => { loadInflight(); loadRebalanceStats(); }, 3000);
   }
 
   function stopInflightPoll() {
@@ -265,6 +266,45 @@
       clearInterval(inflightTimer);
       inflightTimer = null;
     }
+  }
+
+  // ── Rebalance Chart ──────────────────────────────────
+  async function loadRebalanceStats() {
+    try {
+      const data = await api("/admin/stats/rebalance");
+      renderRebalanceChart(data.rebalance_events || []);
+    } catch (err) {
+      console.error("loadRebalanceStats error:", err);
+    }
+  }
+
+  function renderRebalanceChart(events) {
+    const wrap = document.getElementById("rebalance-chart-wrap");
+    if (!wrap) return;
+    if (!events.length) { wrap.innerHTML = "<p>No data.</p>"; return; }
+
+    const maxCount = Math.max(1, ...events.map((e) => e.count));
+    const bars = events.map((e) => {
+      const pct = (e.count / maxCount) * 100;
+      const showLabel = e.minute === "now" || e.minute.endsWith("0m") || e.minute.endsWith("5m");
+      const title = e.minute === "now" ? "Current minute" : e.minute.replace("-", "") + " ago: " + e.count + " rebalance(s)";
+      return '<div class="rb-bar-col" title="' + esc(title) + '">' +
+        '<div class="rb-bar" style="height:' + Math.max(pct, 1) + '%;background:' + barColor(pct) + '"></div>' +
+        '<div class="rb-bar-label' + (showLabel ? "" : " rb-label-hidden") + '">' + esc(e.minute === "now" ? "now" : e.minute.replace("-","")) + '</div>' +
+        '</div>';
+    }).join("");
+
+    wrap.innerHTML =
+      '<div class="rebalance-chart">' +
+      '<div class="rb-y-axis"><span>' + maxCount + '</span><span>0</span></div>' +
+      '<div class="rb-bars">' + bars + '</div>' +
+      '</div>';
+  }
+
+  function barColor(pct) {
+    if (pct > 75) return "var(--danger)";
+    if (pct > 40) return "#f59e0b";
+    return "var(--primary)";
   }
 
   function renderStatsTable(models) {
@@ -1206,7 +1246,7 @@
             key_name: document.getElementById("m-key-name").value || null,
             user_id: document.getElementById("m-key-user").value || null,
             team_id: document.getElementById("m-key-team").value || null,
-            models: modelsVal,
+            models: modelsVal || ["all-team-models"],
             max_budget: document.getElementById("m-key-budget").value ? Number(document.getElementById("m-key-budget").value) : null,
             rpm_limit: document.getElementById("m-key-rpm").value ? Number(document.getElementById("m-key-rpm").value) : null,
             plan_name: document.getElementById("m-key-plan").value || null,
@@ -1261,7 +1301,7 @@
         const body = {
           key_alias: aliasVal || null,
           user_id: userVal || null,
-          models: modelsVal,
+          models: modelsVal || ["all-team-models"],
           max_budget: document.getElementById("m-edit-budget").value ? Number(document.getElementById("m-edit-budget").value) : null,
           rpm_limit: document.getElementById("m-edit-rpm").value ? Number(document.getElementById("m-edit-rpm").value) : null,
           metadata: Object.assign({}, existingMeta, { vip: vipChecked }),
@@ -1507,7 +1547,7 @@
     const tbody = document.getElementById("logs-tbody");
     if (!tbody) return;
     if (logs.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="12" class="no-results">No matching logs found.</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="13" class="no-results">No matching logs found.</td></tr>';
       return;
     }
     tbody.innerHTML = logs.map((l) => {
@@ -1525,6 +1565,7 @@
           : "-";
         return `<tr>
         <td class="mono">${formatTimestamp(l.created_at)}</td>
+        <td class="monm">${esc(l.client_ip || "-")}</td>
         <td>${esc(l.team_alias || l.team_id || "-")}</td>
         <td>${esc(l.key_alias || l.key_name || "-")}</td>
         <td class="mono">${esc(l.model)}</td>

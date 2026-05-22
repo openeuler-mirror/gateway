@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use clap::Parser;
 use ipnet::IpNet;
 use pingora_core::listeners::tls::TlsSettings;
 use pingora_core::server::Server;
@@ -6,12 +7,18 @@ use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::Result;
 use pingora_proxy::{ProxyHttp, Session};
 use serde::Deserialize;
-use std::env;
 use std::fs;
 use std::net::IpAddr;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
+
+#[derive(Parser, Debug)]
+#[clap(version, about, long_about = None)]
+struct Args {
+    #[arg(short, long, env = "CONFIG_PATH", default_value = "/etc/gateway/routes.yaml")]
+    config: String,
+}
 
 #[derive(Debug, Deserialize)]
 struct Config {
@@ -160,6 +167,26 @@ impl ProxyHttp for Gateway {
 
         Ok(Box::new(HttpPeer::new(addr, false, String::new())))
     }
+
+    async fn upstream_request_filter(
+        &self,
+        session: &mut Session,
+        upstream_request: &mut pingora_http::RequestHeader,
+        _ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        // Extract client IP from the TCP connection.
+        let client_ip = session
+            .client_addr()
+            .and_then(|a| a.as_inet())
+            .map(|a| a.ip().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        // Set X-Real-IP to the immediate client (overwrite if present).
+        let _ = upstream_request.insert_header("X-Real-IP", &client_ip);
+        // Append to X-Forwarded-For to preserve the full proxy chain.
+        let _ = upstream_request.append_header("X-Forwarded-For", &client_ip);
+        Ok(())
+    }
 }
 
 fn watch_config(path: String, config: Arc<RwLock<Config>>) {
@@ -240,8 +267,8 @@ fn watch_config(path: String, config: Arc<RwLock<Config>>) {
 }
 
 fn main() {
-    let config_path =
-        env::var("CONFIG_PATH").unwrap_or_else(|_| "/etc/gateway/routes.yaml".into());
+    let args = Args::parse();
+    let config_path = args.config;
     let config = Config::load(&config_path).expect("failed to load config");
 
     let listen_port = config.listen_port.unwrap_or(6198);

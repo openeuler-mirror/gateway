@@ -54,6 +54,12 @@ pub async fn run_request_log_migration(pool: &sqlx::PgPool) -> Result<(), sqlx::
     )
     .execute(pool)
     .await;
+    // Add client_ip column for tracking client IP address (no-op if already present).
+    let _ = sqlx::query(
+        r#"ALTER TABLE boom_request_log ADD COLUMN IF NOT EXISTS client_ip TEXT"#,
+    )
+    .execute(pool)
+    .await;
     let _ = sqlx::query(
         r#"CREATE INDEX IF NOT EXISTS idx_request_log_model_name ON boom_request_log(model_name)"#,
     )

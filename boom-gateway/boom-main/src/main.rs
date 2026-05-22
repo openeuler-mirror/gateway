@@ -175,6 +175,7 @@ fn build_router(state: AppState) -> Router {
         master_key,
         state.debug_store.clone(),
         state.prompt_log_writer.clone(),
+        state.rebalance_counter.clone(),
     );
     let dashboard_router = boom_dashboard::build_router(dashboard_state);
 

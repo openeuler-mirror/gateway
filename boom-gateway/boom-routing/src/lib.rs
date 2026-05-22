@@ -4,6 +4,7 @@ pub mod hybrid_router;
 pub mod inflight;
 pub mod migrations;
 pub mod policy;
+pub mod rebalance;
 pub mod router;
 
 pub use alias_store::{AliasInput, AliasRow, AliasStore};
@@ -17,4 +18,5 @@ pub use inflight::{DeploymentInFlightStat, InFlightGuard, InFlightStat, InFlight
 pub use policy::SchedulePolicy;
 pub use policy::key_affinity::KeyAffinityPolicy;
 pub use policy::round_robin::RoundRobinPolicy;
+pub use rebalance::RebalanceCounter;
 pub use router::Router;
