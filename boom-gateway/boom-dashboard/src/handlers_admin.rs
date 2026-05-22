@@ -1797,6 +1797,21 @@ fn aggregate_dispatched_keys(keys: Option<&Vec<boom_flowcontrol::DispatchedKeyEn
 }
 
 // ═══════════════════════════════════════════════════════════
+// Rebalance Stats
+// ═══════════════════════════════════════════════════════════
+
+pub async fn get_rebalance_stats(
+    _session: AdminSession,
+    Extension(state): Extension<Arc<DashboardState>>,
+) -> Response {
+    let data = state.rebalance_counter.snapshot();
+    let points: Vec<serde_json::Value> = data.into_iter()
+        .map(|(label, count)| json!({ "minute": label, "count": count }))
+        .collect();
+    Json(json!({ "rebalance_events": points })).into_response()
+}
+
+// ═══════════════════════════════════════════════════════════
 // Rate Limit Window Reset
 // ═══════════════════════════════════════════════════════════
 

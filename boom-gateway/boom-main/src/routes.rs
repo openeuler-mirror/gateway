@@ -438,12 +438,12 @@ async fn chat_completions_inner(
                     req_body,
                     Some(&client_ip),
                 );
-                let prompt_logged = PromptLogStream::new(logged, sender, prompt_entry);
-                let response = Sse::new(prompt_logged).keep_alive(KeepAlive::default());
+                let prompt_logged = PromptLogStream::new(logged, sender, prompt_entry, sse_item_extractor());
+                let response = Sse::new(sse_item_to_event(prompt_logged)).keep_alive(KeepAlive::default());
                 return Ok(response.into_response());
             }
         }
-        let response = Sse::new(logged).keep_alive(KeepAlive::default());
+        let response = Sse::new(sse_item_to_event(logged)).keep_alive(KeepAlive::default());
         Ok(response.into_response())
     } else {
         let _inflight = if let Some(ref did) = deployment_id {
@@ -1289,8 +1289,8 @@ fn sse_stream_from_chat_stream(
     stream: ChatStream,
     usage: UsageTracker,
     debug: bool,
-) -> impl futures::Stream<Item = Result<Event, Infallible>> {
-    let (tx, rx) = tokio::sync::mpsc::channel::<Event>(32);
+) -> impl futures::Stream<Item = Result<SseItem, Infallible>> {
+    let (tx, rx) = tokio::sync::mpsc::channel::<SseItem>(32);
     tokio::spawn(async move {
         let mut tool_arg_buf: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
         let mut stream = std::pin::pin!(stream);
@@ -1370,7 +1370,7 @@ fn sse_stream_from_chat_stream(
                                         usage: None,
                                     };
                                     let data = serde_json::to_string(&flush_chunk).unwrap_or_default();
-                                    if tx.send(Event::default().data(data)).await.is_err() {
+                                    if tx.send(SseItem { event: Event::default().data(&data), json_data: data }).await.is_err() {
                                         return;
                                     }
                                 }
@@ -1380,7 +1380,7 @@ fn sse_stream_from_chat_stream(
 
                     // Emit the original chunk (arguments already taken).
                     let data = serde_json::to_string(&chunk).unwrap_or_default();
-                    if tx.send(Event::default().data(data)).await.is_err() {
+                    if tx.send(SseItem { event: Event::default().data(&data), json_data: data }).await.is_err() {
                         return;
                     }
                 }
@@ -1392,7 +1392,7 @@ fn sse_stream_from_chat_stream(
                     let error_data =
                         serde_json::to_string(&serde_json::json!({"error": "Upstream error"}))
                             .unwrap_or_default();
-                    let _ = tx.send(Event::default().data(error_data)).await;
+                    let _ = tx.send(SseItem { event: Event::default().data(&error_data), json_data: error_data }).await;
                 }
             }
         }
@@ -1590,12 +1590,12 @@ pub async fn messages(
                     req_body,
                     Some(&client_ip.as_str()),
                 );
-                let prompt_logged = PromptLogStream::new(logged, sender, prompt_entry);
-                let response = Sse::new(prompt_logged).keep_alive(KeepAlive::default());
+                let prompt_logged = PromptLogStream::new(logged, sender, prompt_entry, sse_item_extractor());
+                let response = Sse::new(sse_item_to_event(prompt_logged)).keep_alive(KeepAlive::default());
                 return Ok(response.into_response());
             }
         }
-        let response = Sse::new(logged).keep_alive(KeepAlive::default());
+        let response = Sse::new(sse_item_to_event(logged)).keep_alive(KeepAlive::default());
         Ok(response.into_response())
     } else {
         let _inflight = if let Some(ref did) = deployment_id {
@@ -1670,8 +1670,8 @@ fn sse_stream_from_anthropic_chat_stream(
     model: String,
     usage: UsageTracker,
     debug: bool,
-) -> impl futures::Stream<Item = Result<Event, Infallible>> {
-    let (tx, rx) = tokio::sync::mpsc::channel::<Event>(64);
+) -> impl futures::Stream<Item = Result<SseItem, Infallible>> {
+    let (tx, rx) = tokio::sync::mpsc::channel::<SseItem>(64);
 
     tokio::spawn(async move {
         let mut transcoder = AnthropicStreamTranscoder::new(model);
@@ -1697,10 +1697,11 @@ fn sse_stream_from_anthropic_chat_stream(
                         }
                     }
                     for ev in events {
-                        let axum_event = Event::default()
-                            .event(&ev.event)
-                            .data(ev.data);
-                        if tx.send(axum_event).await.is_err() {
+                        let item = SseItem {
+                            event: Event::default().event(&ev.event).data(&ev.data),
+                            json_data: ev.data,
+                        };
+                        if tx.send(item).await.is_err() {
                             return;
                         }
                     }
@@ -1713,12 +1714,12 @@ fn sse_stream_from_anthropic_chat_stream(
                         "type": "error",
                         "error": { "type": "api_error", "message": "Upstream error" }
                     });
+                    let data_str = error_data.to_string();
                     let _ = tx
-                        .send(
-                            Event::default()
-                                .event("error")
-                                .data(error_data.to_string()),
-                        )
+                        .send(SseItem {
+                            event: Event::default().event("error").data(&data_str),
+                            json_data: data_str,
+                        })
                         .await;
                     return;
                 }
@@ -1727,8 +1728,11 @@ fn sse_stream_from_anthropic_chat_stream(
 
         // Flush any held finish events (e.g. if usage chunk never arrived).
         for ev in transcoder.drain() {
-            let axum_event = Event::default().event(&ev.event).data(ev.data);
-            if tx.send(axum_event).await.is_err() {
+            let item = SseItem {
+                event: Event::default().event(&ev.event).data(&ev.data),
+                json_data: ev.data,
+            };
+            if tx.send(item).await.is_err() {
                 return;
             }
         }
@@ -1810,5 +1814,99 @@ impl IntoResponse for AnthropicErrorReply {
 impl From<GatewayError> for AnthropicErrorReply {
     fn from(e: GatewayError) -> Self {
         AnthropicErrorReply(e, false)
+    }
+}
+
+// ============================================================
+// SSE Content Extraction for Prompt Log
+// ============================================================
+
+/// Newtype that pairs an axum SSE Event with its raw JSON data string.
+/// This allows PromptLogStream to extract content without depending on axum
+/// (axum 0.8 Event does not expose a public data getter).
+struct SseItem {
+    event: Event,
+    json_data: String,
+}
+
+/// Convert a stream of `Result<SseItem, Infallible>` into `Result<Event, Infallible>`
+/// for consumption by `Sse::new()`.
+fn sse_item_to_event<S>(stream: S) -> impl futures::Stream<Item = Result<Event, Infallible>>
+where
+    S: futures::Stream<Item = Result<SseItem, Infallible>> + Unpin,
+{
+    futures::stream::unfold(stream, |mut s| async move {
+        use futures::StreamExt;
+        match s.next().await {
+            Some(Ok(item)) => Some((Ok(item.event), s)),
+            Some(Err(e)) => Some((Err(e), s)),
+            None => None,
+        }
+    })
+}
+
+/// Returns a closure that extracts (text, finish_reason) from an SSE stream item.
+fn sse_item_extractor() -> impl FnMut(&Result<SseItem, Infallible>) -> (Option<String>, Option<String>) {
+    |item: &Result<SseItem, Infallible>| match item {
+        Ok(sse_item) => extract_sse_item_content(&sse_item.json_data),
+        Err(_) => (None, None),
+    }
+}
+
+/// Parse an SSE event's JSON data to extract text content and finish reason.
+/// Handles both OpenAI and Anthropic streaming formats.
+fn extract_sse_item_content(data: &str) -> (Option<String>, Option<String>) {
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(data) else {
+        return (None, None);
+    };
+
+    // OpenAI chat completion chunk format:
+    // {"choices":[{"delta":{"content":"..."}}]}
+    // {"choices":[{"delta":{},"finish_reason":"stop"}]}
+    if let Some(choices) = val.get("choices").and_then(|c| c.as_array()) {
+        if let Some(choice) = choices.first() {
+            let text = choice
+                .get("delta")
+                .and_then(|d| d.get("content"))
+                .and_then(|c| c.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
+
+            let finish_reason = choice
+                .get("finish_reason")
+                .and_then(|f| f.as_str())
+                .filter(|s| *s != "null" && !s.is_empty())
+                .map(|s| s.to_string());
+
+            return (text, finish_reason);
+        }
+        return (None, None);
+    }
+
+    // Anthropic SSE format:
+    // {"type":"content_block_delta","delta":{"type":"text_delta","text":"..."}}
+    // {"type":"message_delta","delta":{"stop_reason":"end_turn"},...}
+    let event_type = val.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+    match event_type {
+        "content_block_delta" => {
+            let text = val
+                .get("delta")
+                .and_then(|d| d.get("text"))
+                .and_then(|t| t.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
+            (text, None)
+        }
+        "message_delta" => {
+            let finish_reason = val
+                .get("delta")
+                .and_then(|d| d.get("stop_reason"))
+                .and_then(|r| r.as_str())
+                .filter(|s| *s != "null" && !s.is_empty())
+                .map(|s| s.to_string());
+            (None, finish_reason)
+        }
+        _ => (None, None),
     }
 }

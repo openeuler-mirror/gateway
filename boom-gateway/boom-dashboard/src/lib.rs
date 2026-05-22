@@ -124,6 +124,11 @@ pub fn build_router<S: Clone + Send + Sync + 'static>(state: DashboardState) -> 
             "/dashboard/api/admin/stats/inflight",
             get(handlers_admin::get_inflight_stats),
         )
+        // Admin — Rebalance Events Stats (last 60 minutes).
+        .route(
+            "/dashboard/api/admin/stats/rebalance",
+            get(handlers_admin::get_rebalance_stats),
+        )
         // Admin — Rate Limit Window Reset.
         .route(
             "/dashboard/api/admin/limits/reset/{key_hash}",

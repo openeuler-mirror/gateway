@@ -5,7 +5,7 @@ use boom_core::provider::Authenticator;
 use boom_core::DebugErrorStore;
 use boom_limiter::{PlanStore, RateLimitPlan, ScheduleSlot, SlidingWindowLimiter};
 use boom_flowcontrol::{FlowControlConfig, FlowController};
-use boom_routing::{AliasStore, DeploymentStore, HybridRouter, InFlightTracker, KeyAffinityPolicy, Router, RoundRobinPolicy, SchedulePolicy, StrategyRegistry, TierClassifier};
+use boom_routing::{AliasStore, DeploymentStore, HybridRouter, InFlightTracker, KeyAffinityPolicy, RebalanceCounter, Router, RoundRobinPolicy, SchedulePolicy, StrategyRegistry, TierClassifier};
 use boom_promptlog::PromptLogWriter;
 use boom_provider;
 use dashmap::DashMap;
@@ -53,6 +53,8 @@ pub struct AppState {
     pub debug_store: Arc<DebugErrorStore>,
     /// Prompt log writer — captures full request/response for audit.
     pub prompt_log_writer: PromptLogWriter,
+    /// Key-affinity rebalance event counter (survives reloads).
+    pub rebalance_counter: Arc<RebalanceCounter>,
 }
 
 /// The state that gets swapped on config reload.
@@ -119,8 +121,11 @@ impl AppState {
         // Debug error store survives across reloads.
         let debug_store = Arc::new(DebugErrorStore::new());
 
+        // Rebalance counter survives across reloads.
+        let rebalance_counter = Arc::new(RebalanceCounter::new());
+
         // Create scheduling policy from config (may reference inflight).
-        let policy = create_policy(&config, &inflight, &flow_controller);
+        let policy = create_policy(&config, &inflight, &flow_controller, &rebalance_counter);
 
         // Build hybrid router classifier (optional, content-based model routing).
         let hybrid_classifier = build_hybrid_router(&config);
@@ -183,6 +188,7 @@ impl AppState {
             flow_controller,
             debug_store,
             prompt_log_writer,
+            rebalance_counter,
         })
     }
 
@@ -239,7 +245,7 @@ impl AppState {
         seed_flow_controller_from_config(&new_config, &self.flow_controller);
 
         // Recreate policy (fresh counters etc.) — router reuses same stores.
-        let new_policy = create_policy(&new_config, &self.inflight, &self.flow_controller);
+        let new_policy = create_policy(&new_config, &self.inflight, &self.flow_controller, &self.rebalance_counter);
         self.router.set_policy(new_policy);
 
         // Rebuild hybrid router classifier.
@@ -759,7 +765,7 @@ fn build_hybrid_router(config: &Config) -> Option<Arc<HybridRouter>> {
 }
 
 /// Create a scheduling policy from config.
-fn create_policy(config: &Config, inflight: &Arc<InFlightTracker>, flow_controller: &Arc<FlowController>) -> Arc<dyn SchedulePolicy> {
+fn create_policy(config: &Config, inflight: &Arc<InFlightTracker>, flow_controller: &Arc<FlowController>, rebalance_counter: &Arc<RebalanceCounter>) -> Arc<dyn SchedulePolicy> {
     match config.router_settings.schedule_policy.as_str() {
         "round_robin" | "" => Arc::new(RoundRobinPolicy::new()),
         "key_affinity" => {
@@ -774,6 +780,7 @@ fn create_policy(config: &Config, inflight: &Arc<InFlightTracker>, flow_controll
                 inflight.clone(),
                 ctx_threshold,
                 rebalance_threshold,
+                Some(rebalance_counter.clone()),
             );
             policy.set_queue_info(flow_controller.clone());
             Arc::new(policy)

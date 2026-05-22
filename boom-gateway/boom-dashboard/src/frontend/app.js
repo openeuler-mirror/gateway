@@ -191,6 +191,7 @@
       console.error("loadStats error:", err);
     }
     loadInflight();
+    loadRebalanceStats();
   }
 
   // ── In-Flight ─────────────────────────────────────────
@@ -257,7 +258,7 @@
 
   function startInflightPoll() {
     stopInflightPoll();
-    inflightTimer = setInterval(loadInflight, 3000);
+    inflightTimer = setInterval(() => { loadInflight(); loadRebalanceStats(); }, 3000);
   }
 
   function stopInflightPoll() {
@@ -265,6 +266,45 @@
       clearInterval(inflightTimer);
       inflightTimer = null;
     }
+  }
+
+  // ── Rebalance Chart ──────────────────────────────────
+  async function loadRebalanceStats() {
+    try {
+      const data = await api("/admin/stats/rebalance");
+      renderRebalanceChart(data.rebalance_events || []);
+    } catch (err) {
+      console.error("loadRebalanceStats error:", err);
+    }
+  }
+
+  function renderRebalanceChart(events) {
+    const wrap = document.getElementById("rebalance-chart-wrap");
+    if (!wrap) return;
+    if (!events.length) { wrap.innerHTML = "<p>No data.</p>"; return; }
+
+    const maxCount = Math.max(1, ...events.map((e) => e.count));
+    const bars = events.map((e) => {
+      const pct = (e.count / maxCount) * 100;
+      const showLabel = e.minute === "now" || e.minute.endsWith("0m") || e.minute.endsWith("5m");
+      const title = e.minute === "now" ? "Current minute" : e.minute.replace("-", "") + " ago: " + e.count + " rebalance(s)";
+      return '<div class="rb-bar-col" title="' + esc(title) + '">' +
+        '<div class="rb-bar" style="height:' + Math.max(pct, 1) + '%;background:' + barColor(pct) + '"></div>' +
+        '<div class="rb-bar-label' + (showLabel ? "" : " rb-label-hidden") + '">' + esc(e.minute === "now" ? "now" : e.minute.replace("-","")) + '</div>' +
+        '</div>';
+    }).join("");
+
+    wrap.innerHTML =
+      '<div class="rebalance-chart">' +
+      '<div class="rb-y-axis"><span>' + maxCount + '</span><span>0</span></div>' +
+      '<div class="rb-bars">' + bars + '</div>' +
+      '</div>';
+  }
+
+  function barColor(pct) {
+    if (pct > 75) return "var(--danger)";
+    if (pct > 40) return "#f59e0b";
+    return "var(--primary)";
   }
 
   function renderStatsTable(models) {

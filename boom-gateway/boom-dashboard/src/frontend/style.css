@@ -417,3 +417,52 @@ input[list] {
   line-height: 1.4;
   color: var(--text1);
 }
+
+/* ── Rebalance Bar Chart ───────────────────────────── */
+.rebalance-chart {
+  display: flex;
+  align-items: stretch;
+  height: 160px;
+  gap: 0;
+}
+.rb-y-axis {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  padding: 0 6px 18px 0;
+  font-size: 0.75em;
+  color: var(--text3);
+  text-align: right;
+  min-width: 28px;
+}
+.rb-bars {
+  display: flex;
+  align-items: flex-end;
+  flex: 1;
+  gap: 1px;
+  padding-bottom: 18px;
+  border-bottom: 1px solid var(--surface3);
+}
+.rb-bar-col {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  height: 100%;
+  justify-content: flex-end;
+}
+.rb-bar {
+  width: 100%;
+  min-height: 1px;
+  border-radius: 1px 1px 0 0;
+  transition: height 0.3s ease;
+}
+.rb-bar-label {
+  font-size: 0.55em;
+  color: var(--text3);
+  margin-top: 2px;
+  white-space: nowrap;
+}
+.rb-label-hidden {
+  visibility: hidden;
+}
