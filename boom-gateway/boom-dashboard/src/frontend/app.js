@@ -559,15 +559,20 @@
       return;
     }
     el.innerHTML = '<table class="data-table"><thead><tr>' +
-      '<th>Model</th><th>Status</th><th>Detail</th><th>Wait Time</th>' +
+      '<th>Model</th><th>Status</th><th>Detail</th><th>Total Wait</th>' +
       '</tr></thead><tbody>' +
       requests.map(function (r) {
-        var statusBadge = r.status === "queued"
-          ? '<span class="badge badge-blocked">Queued</span>'
+        var statusBadge = r.status === "waiting"
+          ? '<span class="badge badge-blocked">Waiting</span>'
           : '<span class="badge badge-active">Processing</span>';
-        var detail = r.status === "queued"
-          ? 'Ahead: <strong>' + r.detail.ahead + '</strong> request(s)'
-          : 'Parallel: <strong>' + r.detail.parallel_count + '</strong>';
+        var detail;
+        if (r.status === "waiting") {
+          detail = "Queued — " + (r.ahead || 0) + " ahead";
+        } else {
+          var ps = (r.processing_secs || 0);
+          detail = "Processing — " + (ps < 60 ? ps.toFixed(1) + 's' : (ps / 60).toFixed(1) + 'min')
+            + " (" + (r.parallel_count || 0) + " parallel)";
+        }
         var waitStr = r.wait_time_secs < 60
           ? r.wait_time_secs.toFixed(1) + 's'
           : (r.wait_time_secs / 60).toFixed(1) + 'min';
@@ -575,7 +580,7 @@
         return '<tr>' +
           '<td class="mono">' + esc(r.model) + vipTag + '</td>' +
           '<td>' + statusBadge + '</td>' +
-          '<td>' + detail + '</td>' +
+          '<td>' + esc(detail) + '</td>' +
           '<td>' + waitStr + '</td>' +
           '</tr>';
       }).join('') +

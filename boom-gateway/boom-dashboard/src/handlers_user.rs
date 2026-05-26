@@ -287,24 +287,29 @@ pub async fn get_request_status(
     let requests: Vec<Value> = statuses
         .into_iter()
         .map(|s| {
-            let (status_str, detail) = match &s.status {
-                UserRequestStage::Queued { ahead } => {
-                    ("queued", json!({"ahead": ahead}))
-                }
-                UserRequestStage::Processing { parallel_count } => {
-                    ("processing", json!({"parallel_count": parallel_count}))
-                }
-            };
-            json!({
+            let mut obj = json!({
                 "model": s.model,
-                "deployment_id": s.deployment_id,
-                "status": status_str,
-                "detail": detail,
+                "status": match &s.status {
+                    UserRequestStage::Waiting { .. } => "waiting",
+                    UserRequestStage::Processing { .. } => "processing",
+                },
                 "wait_time_secs": (s.wait_time_secs * 10.0).round() / 10.0,
                 "is_vip": s.is_vip,
-            })
+            });
+            let map = obj.as_object_mut().unwrap();
+            match &s.status {
+                UserRequestStage::Waiting { ahead } => {
+                    map.insert("ahead".to_string(), json!(*ahead));
+                }
+                UserRequestStage::Processing { processing_secs, parallel_count } => {
+                    map.insert("processing_secs".to_string(), json!((*processing_secs * 10.0).round() / 10.0));
+                    map.insert("parallel_count".to_string(), json!(*parallel_count));
+                }
+            }
+            obj
         })
         .collect();
 
     Json(json!({"requests": requests}))
 }
+
