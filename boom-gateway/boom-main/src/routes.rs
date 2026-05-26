@@ -55,6 +55,8 @@ async fn acquire_fc_guard<E>(
     context_chars: u64,
     is_vip: bool,
     key_alias: Option<String>,
+    fc_key_hash: Option<String>,
+    fc_model: Option<String>,
     api_path: &str,
     identity: &boom_core::types::AuthIdentity,
     model: &str,
@@ -65,7 +67,7 @@ async fn acquire_fc_guard<E>(
     err_wrap: impl Fn(GatewayError, bool) -> E,
 ) -> Result<Option<boom_flowcontrol::FlowControlGuard>, E> {
     let timeout = std::time::Duration::from_secs(1200);
-    match state.flow_controller.acquire(deployment_id, context_chars, timeout, is_vip, key_alias).await {
+    match state.flow_controller.acquire(deployment_id, context_chars, timeout, is_vip, key_alias, fc_key_hash, fc_model).await {
         Ok(g) => Ok(Some(g)),
         Err(FlowControlError::Timeout { waiters, .. }) => {
             let e = GatewayError::FlowControlQueueTimeout {
@@ -376,7 +378,9 @@ async fn chat_completions_inner(
     let fc_guard = if let Some(ref did) = deployment_id {
         acquire_fc_guard(
             &state, did, input_chars as u64, is_vip_key(&identity.metadata),
-            identity.key_alias.clone(), api_path, &identity, &model,
+            identity.key_alias.clone(), Some(identity.key_hash.clone()),
+            Some(inflight_model.clone()),
+            api_path, &identity, &model,
             is_stream, start, &request_id, Some(client_ip.clone()), GatewayErrorReply,
         ).await?
     } else {
@@ -1542,7 +1546,9 @@ pub async fn messages(
     let fc_guard = if let Some(ref did) = deployment_id {
         acquire_fc_guard(
             &state, did, input_chars as u64, is_vip_key(&identity.metadata),
-            identity.key_alias.clone(), "/v1/messages", &identity, &model,
+            identity.key_alias.clone(), Some(identity.key_hash.clone()),
+            Some(inflight_model.clone()),
+            "/v1/messages", &identity, &model,
             is_stream, start, &request_id, Some(client_ip.clone()), AnthropicErrorReply,
         ).await?
     } else {

@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // ═══════════════════════════════════════════════════════════
 // Public types
@@ -87,6 +87,31 @@ pub struct DispatchedKeyEntry {
 }
 
 // ═══════════════════════════════════════════════════════════
+// Per-user request status (for personal dashboard)
+// ═══════════════════════════════════════════════════════════
+
+/// Snapshot of a single request's status from a user's perspective.
+#[derive(Debug, Clone)]
+pub struct UserRequestStatus {
+    pub model: String,
+    pub deployment_id: String,
+    pub status: UserRequestStage,
+    pub wait_time_secs: f64,
+    pub is_vip: bool,
+}
+
+/// Whether a request is queued or already processing.
+#[derive(Debug, Clone)]
+pub enum UserRequestStage {
+    /// Waiting in flow control queue; `ahead` is the precise count of
+    /// requests that will be dispatched before this one.
+    Queued { ahead: usize },
+    /// Dispatched to upstream; `parallel_count` is the deployment's
+    /// current in-flight request count.
+    Processing { parallel_count: u32 },
+}
+
+// ═══════════════════════════════════════════════════════════
 // Internal types
 // ═══════════════════════════════════════════════════════════
 
@@ -108,6 +133,12 @@ struct QueuedRequest {
     id: u64,
     context_chars: u64,
     key_alias: Option<String>,
+    /// User's key hash for per-key dashboard queries.
+    key_hash: Option<String>,
+    /// Resolved model name for display.
+    model: Option<String>,
+    /// When this request entered the flow control queue.
+    enqueued_at: Instant,
     /// `false` = waiting in queue, `true` = dispatched (in-flight).
     dispatched: bool,
     /// Oneshot sender — taken and fired when dispatched.
@@ -245,6 +276,43 @@ impl FlowControlSlot {
 
         false
     }
+
+    /// Calculate the precise number of requests ahead of `request_id`.
+    ///
+    /// For VIP requests: counts non-dispatched VIP entries before it.
+    /// For Normal requests: counts ALL VIP waiting (they dispatch first)
+    /// plus non-dispatched normal entries before it.
+    fn position_for(inner: &SlotInner, request_id: u64, is_vip: bool) -> usize {
+        if is_vip {
+            let mut ahead = 0;
+            for req in &inner.vip_queue {
+                if req.id == request_id {
+                    break;
+                }
+                if !req.dispatched {
+                    ahead += 1;
+                }
+            }
+            ahead
+        } else {
+            // All VIP waiting always go first.
+            let vip_waiting = inner
+                .vip_queue
+                .iter()
+                .filter(|r| !r.dispatched)
+                .count();
+            let mut ahead = vip_waiting;
+            for req in &inner.normal_queue {
+                if req.id == request_id {
+                    break;
+                }
+                if !req.dispatched {
+                    ahead += 1;
+                }
+            }
+            ahead
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -307,6 +375,8 @@ impl FlowController {
         timeout: Duration,
         is_vip: bool,
         key_alias: Option<String>,
+        key_hash: Option<String>,
+        model: Option<String>,
     ) -> Result<FlowControlGuard, FlowControlError> {
         let slot = match self.slots.get(deployment_id) {
             Some(s) => s,
@@ -335,6 +405,9 @@ impl FlowController {
                 id: request_id,
                 context_chars,
                 key_alias,
+                key_hash,
+                model,
+                enqueued_at: Instant::now(),
                 dispatched: false,
                 grant: Some(grant_tx),
             };
@@ -516,6 +589,73 @@ impl FlowController {
                 }
             })
             .collect()
+    }
+
+    /// Query all active (queued + processing) requests for a specific key.
+    ///
+    /// For queued requests, returns the precise count of requests that will be
+    /// dispatched before this one, taking VIP priority into account.
+    /// For processing requests, returns the deployment's current parallel count.
+    pub fn get_key_request_status(&self, key_hash: &str) -> Vec<UserRequestStatus> {
+        let mut results = Vec::new();
+
+        for entry in self.slots.iter() {
+            let deployment_id = entry.key().clone();
+            let inner = entry.value().inner.lock().unwrap();
+            let (inflight, _ctx) = FlowControlSlot::inflight_stats(&inner);
+
+            // Scan both queues for requests belonging to this key.
+            for req in inner.vip_queue.iter() {
+                if req.key_hash.as_deref() == Some(key_hash) {
+                    results.push(Self::build_user_status(
+                        req,
+                        &deployment_id,
+                        true,
+                        inflight,
+                        &inner,
+                    ));
+                }
+            }
+            for req in inner.normal_queue.iter() {
+                if req.key_hash.as_deref() == Some(key_hash) {
+                    results.push(Self::build_user_status(
+                        req,
+                        &deployment_id,
+                        false,
+                        inflight,
+                        &inner,
+                    ));
+                }
+            }
+        }
+
+        results
+    }
+
+    fn build_user_status(
+        req: &QueuedRequest,
+        deployment_id: &str,
+        is_vip: bool,
+        inflight: u32,
+        inner: &SlotInner,
+    ) -> UserRequestStatus {
+        let wait_time = req.enqueued_at.elapsed().as_secs_f64();
+        let stage = if req.dispatched {
+            UserRequestStage::Processing {
+                parallel_count: inflight,
+            }
+        } else {
+            let ahead = FlowControlSlot::position_for(inner, req.id, is_vip);
+            UserRequestStage::Queued { ahead }
+        };
+
+        UserRequestStatus {
+            model: req.model.clone().unwrap_or_default(),
+            deployment_id: deployment_id.to_string(),
+            status: stage,
+            wait_time_secs: wait_time,
+            is_vip,
+        }
     }
 }
 
