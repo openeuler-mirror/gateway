@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // ═══════════════════════════════════════════════════════════
 // Public types
@@ -86,6 +86,61 @@ pub struct DispatchedKeyEntry {
     pub key_alias: String,
 }
 
+/// Internal: reverse-index entry for O(K) per-key lookup.
+#[derive(Debug, Clone)]
+struct KeyRequestRef {
+    deployment_id: String,
+    request_id: u64,
+}
+
+fn remove_key_ref(
+    index: &DashMap<String, Vec<KeyRequestRef>>,
+    key_hash: &str,
+    deployment_id: &str,
+    request_id: u64,
+) {
+    if let Some(mut refs) = index.get_mut(key_hash) {
+        let before = refs.len();
+        refs.retain(|r| !(r.deployment_id == deployment_id && r.request_id == request_id));
+        if refs.len() == before {
+            return;
+        }
+        if refs.is_empty() {
+            drop(refs);
+            index.remove(key_hash);
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+// Per-user request status (for personal dashboard)
+// ═══════════════════════════════════════════════════════════
+
+/// Snapshot of a single request's status from a user's perspective.
+#[derive(Debug, Clone)]
+pub struct UserRequestStatus {
+    pub model: String,
+    pub deployment_id: String,
+    pub status: UserRequestStage,
+    pub wait_time_secs: f64,
+    pub is_vip: bool,
+}
+
+/// Whether a request is waiting or already processing.
+#[derive(Debug, Clone)]
+pub enum UserRequestStage {
+    /// Waiting in flow control queue; `ahead` is the precise count of
+    /// requests that will be dispatched before this one.
+    Waiting { ahead: usize },
+    /// Dispatched to upstream.
+    Processing {
+        /// Deployment's current in-flight request count.
+        parallel_count: u32,
+        /// Seconds since this request was dispatched to upstream.
+        processing_secs: f64,
+    },
+}
+
 // ═══════════════════════════════════════════════════════════
 // Internal types
 // ═══════════════════════════════════════════════════════════
@@ -108,6 +163,12 @@ struct QueuedRequest {
     id: u64,
     context_chars: u64,
     key_alias: Option<String>,
+    /// Resolved model name for display.
+    model: Option<String>,
+    /// When this request entered the flow control queue.
+    enqueued_at: Instant,
+    /// When this request was dispatched to upstream (set on dispatch).
+    dispatched_at: Option<Instant>,
     /// `false` = waiting in queue, `true` = dispatched (in-flight).
     dispatched: bool,
     /// Oneshot sender — taken and fired when dispatched.
@@ -126,7 +187,9 @@ struct AcquireCleanup {
     request_id: u64,
     deployment_id: String,
     is_vip: bool,
+    key_hash: Option<String>,
     slots: Arc<DashMap<String, FlowControlSlot>>,
+    key_index: Arc<DashMap<String, Vec<KeyRequestRef>>>,
     consumed: bool,
 }
 
@@ -148,6 +211,9 @@ impl Drop for AcquireCleanup {
         if let Some(idx) = queue.iter().position(|r| r.id == self.request_id) {
             queue.remove(idx);
             FlowControlSlot::dispatch(&mut inner);
+        }
+        if let Some(ref kh) = self.key_hash {
+            remove_key_ref(&self.key_index, kh, &self.deployment_id, self.request_id);
         }
     }
 }
@@ -235,6 +301,7 @@ impl FlowControlSlot {
 
             // Dispatch: mark in-flight and notify waiter.
             queue[idx].dispatched = true;
+            queue[idx].dispatched_at = Some(Instant::now());
             let sender = queue[idx].grant.take().unwrap();
             if sender.send(()).is_err() {
                 queue.remove(idx);
@@ -245,6 +312,43 @@ impl FlowControlSlot {
 
         false
     }
+
+    /// Calculate the precise number of requests ahead of `request_id`.
+    ///
+    /// For VIP requests: counts non-dispatched VIP entries before it.
+    /// For Normal requests: counts ALL VIP waiting (they dispatch first)
+    /// plus non-dispatched normal entries before it.
+    fn position_for(inner: &SlotInner, request_id: u64, is_vip: bool) -> usize {
+        if is_vip {
+            let mut ahead = 0;
+            for req in &inner.vip_queue {
+                if req.id == request_id {
+                    break;
+                }
+                if !req.dispatched {
+                    ahead += 1;
+                }
+            }
+            ahead
+        } else {
+            // All VIP waiting always go first.
+            let vip_waiting = inner
+                .vip_queue
+                .iter()
+                .filter(|r| !r.dispatched)
+                .count();
+            let mut ahead = vip_waiting;
+            for req in &inner.normal_queue {
+                if req.id == request_id {
+                    break;
+                }
+                if !req.dispatched {
+                    ahead += 1;
+                }
+            }
+            ahead
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -253,12 +357,16 @@ impl FlowControlSlot {
 
 pub struct FlowController {
     slots: Arc<DashMap<String, FlowControlSlot>>,
+    /// Reverse index: key_hash → list of (deployment_id, request_id).
+    /// Enables O(K) lookup in get_key_request_status.
+    key_index: Arc<DashMap<String, Vec<KeyRequestRef>>>,
 }
 
 impl FlowController {
     pub fn new() -> Self {
         Self {
             slots: Arc::new(DashMap::new()),
+            key_index: Arc::new(DashMap::new()),
         }
     }
 
@@ -307,6 +415,8 @@ impl FlowController {
         timeout: Duration,
         is_vip: bool,
         key_alias: Option<String>,
+        key_hash: Option<String>,
+        model: Option<String>,
     ) -> Result<FlowControlGuard, FlowControlError> {
         let slot = match self.slots.get(deployment_id) {
             Some(s) => s,
@@ -335,6 +445,9 @@ impl FlowController {
                 id: request_id,
                 context_chars,
                 key_alias,
+                model,
+                enqueued_at: Instant::now(),
+                dispatched_at: None,
                 dispatched: false,
                 grant: Some(grant_tx),
             };
@@ -349,11 +462,24 @@ impl FlowController {
         }
         drop(slot);
 
+        // Populate reverse index if key_hash is available.
+        if let Some(ref kh) = key_hash {
+            self.key_index
+                .entry(kh.clone())
+                .or_insert_with(Vec::new)
+                .push(KeyRequestRef {
+                    deployment_id: deployment_id.to_string(),
+                    request_id,
+                });
+        }
+
         let mut cleanup = AcquireCleanup {
             request_id,
             deployment_id: deployment_id.to_string(),
             is_vip,
+            key_hash: key_hash.clone(),
             slots: self.slots.clone(),
+            key_index: self.key_index.clone(),
             consumed: false,
         };
 
@@ -365,6 +491,8 @@ impl FlowController {
                     deployment_id: deployment_id.to_string(),
                     request_id,
                     is_vip,
+                    key_hash,
+                    key_index: self.key_index.clone(),
                 })
             }
             Ok(Err(_)) => {
@@ -406,9 +534,14 @@ impl FlowController {
                         deployment_id: deployment_id.to_string(),
                         request_id,
                         is_vip,
+                        key_hash,
+                        key_index: self.key_index.clone(),
                     })
                 } else {
                     cleanup.consumed = true;
+                    if let Some(ref kh) = key_hash {
+                        remove_key_ref(&self.key_index, kh, deployment_id, request_id);
+                    }
                     Err(FlowControlError::Timeout {
                         deployment_id: deployment_id.to_string(),
                         waiters: self.total_waiters_for(deployment_id),
@@ -517,6 +650,100 @@ impl FlowController {
             })
             .collect()
     }
+
+    /// Query all active (queued + processing) requests for a specific key.
+    ///
+    /// Uses the reverse index for O(K) lookup where K is the number of
+    /// active requests for this key, instead of scanning all deployment slots.
+    pub fn get_key_request_status(&self, key_hash: &str) -> Vec<UserRequestStatus> {
+        // Snapshot the index entries to avoid holding the index lock while accessing slots.
+        let refs: Vec<KeyRequestRef> = match self.key_index.get(key_hash) {
+            Some(r) => r.value().clone(),
+            None => return Vec::new(),
+        };
+
+        let mut results = Vec::new();
+        let mut stale_refs = Vec::new();
+
+        for kr in &refs {
+            let slot = match self.slots.get(&kr.deployment_id) {
+                Some(s) => s,
+                None => {
+                    stale_refs.push(kr.clone());
+                    continue;
+                }
+            };
+            let inner = slot.inner.lock().unwrap();
+            let (inflight, _ctx) = FlowControlSlot::inflight_stats(&inner);
+
+            // Find the request by ID in either queue.
+            let found = inner
+                .vip_queue
+                .iter()
+                .chain(inner.normal_queue.iter())
+                .find(|r| r.id == kr.request_id);
+
+            match found {
+                Some(req) => {
+                    let is_vip = inner.vip_queue.iter().any(|r| r.id == kr.request_id);
+                    results.push(Self::build_user_status(
+                        req,
+                        &kr.deployment_id,
+                        is_vip,
+                        inflight,
+                        &inner,
+                    ));
+                }
+                None => stale_refs.push(kr.clone()),
+            }
+        }
+
+        // Lazily clean up stale index entries.
+        if !stale_refs.is_empty() {
+            if let Some(mut entries) = self.key_index.get_mut(key_hash) {
+                for kr in &stale_refs {
+                    entries.retain(|r| !(r.deployment_id == kr.deployment_id && r.request_id == kr.request_id));
+                }
+                if entries.is_empty() {
+                    drop(entries);
+                    self.key_index.remove(key_hash);
+                }
+            }
+        }
+
+        results
+    }
+
+    fn build_user_status(
+        req: &QueuedRequest,
+        deployment_id: &str,
+        is_vip: bool,
+        inflight: u32,
+        inner: &SlotInner,
+    ) -> UserRequestStatus {
+        let wait_time = req.enqueued_at.elapsed().as_secs_f64();
+        let stage = if req.dispatched {
+            let processing_secs = req
+                .dispatched_at
+                .map(|t| t.elapsed().as_secs_f64())
+                .unwrap_or(0.0);
+            UserRequestStage::Processing {
+                parallel_count: inflight,
+                processing_secs,
+            }
+        } else {
+            let ahead = FlowControlSlot::position_for(inner, req.id, is_vip);
+            UserRequestStage::Waiting { ahead }
+        };
+
+        UserRequestStatus {
+            model: req.model.clone().unwrap_or_default(),
+            deployment_id: deployment_id.to_string(),
+            status: stage,
+            wait_time_secs: wait_time,
+            is_vip,
+        }
+    }
 }
 
 impl Default for FlowController {
@@ -546,6 +773,8 @@ pub struct FlowControlGuard {
     deployment_id: String,
     request_id: u64,
     is_vip: bool,
+    key_hash: Option<String>,
+    key_index: Arc<DashMap<String, Vec<KeyRequestRef>>>,
 }
 
 impl Drop for FlowControlGuard {
@@ -561,6 +790,9 @@ impl Drop for FlowControlGuard {
                 queue.remove(idx);
                 FlowControlSlot::dispatch(&mut inner);
             }
+        }
+        if let Some(ref kh) = self.key_hash {
+            remove_key_ref(&self.key_index, kh, &self.deployment_id, self.request_id);
         }
     }
 }

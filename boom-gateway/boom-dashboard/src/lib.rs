@@ -42,6 +42,10 @@ pub fn build_router<S: Clone + Send + Sync + 'static>(state: DashboardState) -> 
             "/dashboard/api/user/logs",
             get(handlers_user::get_user_logs),
         )
+        .route(
+            "/dashboard/api/user/request-status",
+            get(handlers_user::get_request_status),
+        )
         // Admin — Plan management.
         .route(
             "/dashboard/api/admin/plans",

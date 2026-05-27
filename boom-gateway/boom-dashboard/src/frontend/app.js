@@ -526,16 +526,65 @@
 
   function startUsageRefresh() {
     clearUsageRefresh();
+    loadRequestStatus();
     usageRefreshTimer = setInterval(async () => {
       try {
         const usage = await api("/user/usage");
         renderUsage(usage);
       } catch {}
+      loadRequestStatus();
     }, 5000);
   }
 
   function clearUsageRefresh() {
     if (usageRefreshTimer) { clearInterval(usageRefreshTimer); usageRefreshTimer = null; }
+  }
+
+  // ── Request Status (queue waiting info) ───────────────
+  async function loadRequestStatus() {
+    try {
+      const data = await api("/user/request-status");
+      renderRequestStatus(data.requests || []);
+    } catch {
+      const el = document.getElementById("request-status-info");
+      if (el) el.innerHTML = '<p style="color:var(--text3)">No active requests.</p>';
+    }
+  }
+
+  function renderRequestStatus(requests) {
+    const el = document.getElementById("request-status-info");
+    if (!el) return;
+    if (requests.length === 0) {
+      el.innerHTML = '<p style="color:var(--text3)">No active requests.</p>';
+      return;
+    }
+    el.innerHTML = '<table class="data-table"><thead><tr>' +
+      '<th>Model</th><th>Status</th><th>Detail</th><th>Total Wait</th>' +
+      '</tr></thead><tbody>' +
+      requests.map(function (r) {
+        var statusBadge = r.status === "waiting"
+          ? '<span class="badge badge-blocked">Waiting</span>'
+          : '<span class="badge badge-active">Processing</span>';
+        var detail;
+        if (r.status === "waiting") {
+          detail = "Queued — " + (r.ahead || 0) + " ahead";
+        } else {
+          var ps = (r.processing_secs || 0);
+          detail = "Processing — " + (ps < 60 ? ps.toFixed(1) + 's' : (ps / 60).toFixed(1) + 'min')
+            + " (" + (r.parallel_count || 0) + " parallel)";
+        }
+        var waitStr = r.wait_time_secs < 60
+          ? r.wait_time_secs.toFixed(1) + 's'
+          : (r.wait_time_secs / 60).toFixed(1) + 'min';
+        var vipTag = r.is_vip ? ' <span class="badge badge-vip" style="font-size:0.75em">VIP</span>' : '';
+        return '<tr>' +
+          '<td class="mono">' + esc(r.model) + vipTag + '</td>' +
+          '<td>' + statusBadge + '</td>' +
+          '<td>' + esc(detail) + '</td>' +
+          '<td>' + waitStr + '</td>' +
+          '</tr>';
+      }).join('') +
+      '</tbody></table>';
   }
 
   // ── Admin: Plans ──────────────────────────────────────

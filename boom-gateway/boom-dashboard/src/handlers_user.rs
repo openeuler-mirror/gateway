@@ -7,6 +7,7 @@ use serde_json::{json, Value};
 
 use crate::auth::DashboardSession;
 use crate::state::DashboardState;
+use boom_flowcontrol::UserRequestStage;
 
 // ── GET /dashboard/api/user/plan ───────────────────────────
 
@@ -273,3 +274,42 @@ pub async fn get_user_logs(
     }))
     .into_response()
 }
+
+// ── GET /dashboard/api/user/request-status ─────────────────
+
+pub async fn get_request_status(
+    session: DashboardSession,
+    Extension(state): Extension<std::sync::Arc<DashboardState>>,
+) -> Json<Value> {
+    let key_hash = &session.claims.key_hash;
+    let statuses = state.flow_controller.get_key_request_status(key_hash);
+
+    let requests: Vec<Value> = statuses
+        .into_iter()
+        .map(|s| {
+            let mut obj = json!({
+                "model": s.model,
+                "status": match &s.status {
+                    UserRequestStage::Waiting { .. } => "waiting",
+                    UserRequestStage::Processing { .. } => "processing",
+                },
+                "wait_time_secs": (s.wait_time_secs * 10.0).round() / 10.0,
+                "is_vip": s.is_vip,
+            });
+            let map = obj.as_object_mut().unwrap();
+            match &s.status {
+                UserRequestStage::Waiting { ahead } => {
+                    map.insert("ahead".to_string(), json!(*ahead));
+                }
+                UserRequestStage::Processing { processing_secs, parallel_count } => {
+                    map.insert("processing_secs".to_string(), json!((*processing_secs * 10.0).round() / 10.0));
+                    map.insert("parallel_count".to_string(), json!(*parallel_count));
+                }
+            }
+            obj
+        })
+        .collect();
+
+    Json(json!({"requests": requests}))
+}
+
