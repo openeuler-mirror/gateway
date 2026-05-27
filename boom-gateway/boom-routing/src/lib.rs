@@ -16,7 +16,8 @@ pub use hybrid_router::{
 };
 pub use inflight::{DeploymentInFlightStat, InFlightGuard, InFlightStat, InFlightTracker};
 pub use policy::SchedulePolicy;
-pub use policy::key_affinity::KeyAffinityPolicy;
 pub use policy::round_robin::RoundRobinPolicy;
+pub use policy::key_affinity::KeyAffinityPolicy;
+pub use policy::kvc_aware::KvcAwarePolicy;
 pub use rebalance::RebalanceCounter;
 pub use router::Router;

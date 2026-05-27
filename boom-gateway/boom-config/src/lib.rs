@@ -328,6 +328,69 @@ pub struct RouterSettings {
     /// Content-based hybrid router (optional dynamic model alias).
     #[serde(default)]
     pub hybrid_router: Option<HybridRouterConfig>,
+    /// KV-cache aware routing settings.
+    #[serde(default)]
+    pub kvc_aware: KvcAwareSettings,
+}
+
+/// Settings for KV-cache aware routing.
+#[derive(Debug, Deserialize, Clone)]
+pub struct KvcAwareSettings {
+    /// Block size for token chunking (tokens per block). Default: 16.
+    #[serde(default = "default_block_size")]
+    pub block_size: usize,
+    /// Weight for cache hit score in combined scoring. Default: 0.5.
+    #[serde(default = "default_cache_weight")]
+    pub cache_weight: f64,
+    /// Weight for load score in combined scoring. Default: 0.2.
+    #[serde(default = "default_load_weight")]
+    pub load_weight: f64,
+    /// Weight for storage tier score in combined scoring. Default: 0.3.
+    #[serde(default = "default_tier_weight")]
+    pub tier_weight: f64,
+    /// Directory containing tokenizer.json files ({tokenizer_dir}/{model}/tokenizer.json).
+    #[serde(default)]
+    pub tokenizer_dir: Option<String>,
+    /// ZMQ endpoints for KV event subscription (e.g., `["tcp://worker-0:5557"]`).
+    #[serde(default)]
+    pub zmq_endpoints: Vec<String>,
+    /// ZMQ topic prefix for subscription filtering. Default: `"kv@"`.
+    #[serde(default = "default_zmq_topic_prefix")]
+    pub zmq_topic_prefix: String,
+}
+
+impl Default for KvcAwareSettings {
+    fn default() -> Self {
+        Self {
+            block_size: default_block_size(),
+            cache_weight: default_cache_weight(),
+            load_weight: default_load_weight(),
+            tier_weight: default_tier_weight(),
+            tokenizer_dir: None,
+            zmq_endpoints: Vec::new(),
+            zmq_topic_prefix: default_zmq_topic_prefix(),
+        }
+    }
+}
+
+fn default_block_size() -> usize {
+    16
+}
+
+fn default_cache_weight() -> f64 {
+    0.5
+}
+
+fn default_load_weight() -> f64 {
+    0.2
+}
+
+fn default_tier_weight() -> f64 {
+    0.3
+}
+
+fn default_zmq_topic_prefix() -> String {
+    "kv@".to_string()
 }
 
 /// Configuration for the content-based hybrid router.

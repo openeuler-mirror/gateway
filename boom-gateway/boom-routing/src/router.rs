@@ -125,17 +125,17 @@ impl Router {
             .map_or(false, |c| c.model_name() == model)
     }
 
-    /// Core routing: exact match → alias resolution → wildcard "*".
-    ///
-    /// Resolves candidates then delegates to the SchedulePolicy for selection.
-    pub fn select_provider(
+    /// KV-cache aware routing: resolves candidates then delegates to
+    /// `select_with_context()` with token IDs.
+    pub fn select_provider_with_prefix(
         &self,
         model: &str,
         key_hash: Option<&str>,
         input_chars: u64,
+        token_ids: &[u32],
     ) -> Option<Arc<dyn Provider>> {
         let candidates = self.resolve_candidates(model)?;
-        self.policy.load().inner.select(model, &candidates, key_hash, input_chars)
+        self.policy.load().inner.select_with_context(model, &candidates, key_hash, input_chars, token_ids)
     }
 
     /// Resolve model name to a list of candidate providers.

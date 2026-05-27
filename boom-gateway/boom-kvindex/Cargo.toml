@@ -1,0 +1,20 @@
+[package]
+name = "boom-kvindex"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+boom-core = { path = "../boom-core" }
+dashmap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+tokenizers.workspace = true
+minijinja = "2"
+parking_lot = "0.12"
+tmq = { workspace = true }
+rmpv = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+regex = "1"
