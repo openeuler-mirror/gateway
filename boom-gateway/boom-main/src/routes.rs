@@ -348,9 +348,20 @@ async fn chat_completions_inner(
     );
 
     // 3. Select provider deployment.
+    // Tokenize request if tokenizer pool is available (for KV-cache prefix matching).
+    let token_ids = match state.tokenizer_pool.as_ref() {
+        Some(pool) => {
+            let msgs: Vec<serde_json::Value> = req.messages.iter().map(|m| serde_json::to_value(m).unwrap_or_default()).collect();
+            let result = pool.tokenize_openai(&resolved_model, &msgs);
+            tracing::debug!(model = %resolved_model, tokens = result.token_ids.len(), "request tokenized");
+            result.token_ids
+        }
+        None => Vec::new(),
+    };
+
     let provider = state
         .router
-        .select_provider(&resolved_model, Some(&identity.key_hash), input_chars as u64)
+        .select_provider_with_prefix(&resolved_model, Some(&identity.key_hash), input_chars as u64, &token_ids)
         .ok_or_else(|| {
             let e = GatewayError::ModelNotFound(resolved_model.clone());
             log_error(&state, &identity, &model, api_path, is_stream, start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()));
@@ -1501,9 +1512,22 @@ pub async fn messages(
     );
 
     // 3. Select provider deployment.
+    // Tokenize request if tokenizer pool is available (for KV-cache prefix matching).
+    let token_ids = match state.tokenizer_pool.as_ref() {
+        Some(pool) => {
+            let system_str = req.system.as_ref().and_then(|s| match s {
+                boom_core::types::AnthropicSystemContent::Text(t) => Some(t.as_str()),
+                _ => None,
+            });
+            let msgs: Vec<serde_json::Value> = req.messages.iter().map(|m| serde_json::to_value(m).unwrap_or_default()).collect();
+            pool.tokenize_anthropic(&resolved_model, system_str, &msgs).token_ids
+        }
+        None => Vec::new(),
+    };
+
     let provider = state
         .router
-        .select_provider(&resolved_model, Some(&identity.key_hash), input_chars as u64)
+        .select_provider_with_prefix(&resolved_model, Some(&identity.key_hash), input_chars as u64, &token_ids)
         .ok_or_else(|| {
             let e = GatewayError::ModelNotFound(resolved_model.clone());
             log_error(&state, &identity, &model, "/v1/messages", is_stream, start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()));
@@ -1909,4 +1933,54 @@ fn extract_sse_item_content(data: &str) -> (Option<String>, Option<String>) {
         }
         _ => (None, None),
     }
+}
+
+// ═══════════════════════════════════════════════════════════
+// KV Index debug endpoint (internal)
+// ═══════════════════════════════════════════════════════════
+
+/// GET /internal/kv-index — dump KV index status with hash details (pretty-printed).
+pub async fn kv_index_status(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let body = match &state.kv_index {
+        Some(kv_index) => {
+            let block_count = kv_index.block_count();
+            let models: Vec<String> = kv_index.model_names().into_iter().collect();
+            let dump = kv_index.debug_dump();
+            let blocks: Vec<serde_json::Value> = dump
+                .into_iter()
+                .map(|(model, token_ids, workers, tier)| {
+                    let token_count = token_ids.len();
+                    // Show first 8 token IDs as sample.
+                    let sample: Vec<u32> = token_ids.into_iter().take(8).collect();
+                    serde_json::json!({
+                        "model": model,
+                        "token_count": token_count,
+                        "token_sample": sample,
+                        "workers": workers,
+                        "tier": serde_json::to_value(tier).unwrap_or_default(),
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "status": "active",
+                "block_count": block_count,
+                "models": models,
+                "blocks": blocks,
+            })
+        }
+        None => serde_json::json!({
+            "status": "disabled",
+            "block_count": 0,
+            "models": [],
+            "blocks": [],
+        }),
+    };
+    let pretty = serde_json::to_string_pretty(&body).unwrap_or_default();
+    (
+        axum::http::StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        pretty,
+    ).into_response()
 }

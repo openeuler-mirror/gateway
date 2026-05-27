@@ -3,6 +3,8 @@ use boom_auth::DbAuthenticator;
 use boom_config::Config;
 use boom_core::provider::Authenticator;
 use boom_core::DebugErrorStore;
+use boom_kvindex::{TokenPrefixIndex, TokenizerPool};
+use boom_core::kv_event::KvIndexBackend;
 use boom_limiter::{PlanStore, RateLimitPlan, ScheduleSlot, SlidingWindowLimiter};
 use boom_flowcontrol::{FlowControlConfig, FlowController};
 use boom_routing::{AliasStore, DeploymentStore, HybridRouter, InFlightTracker, KeyAffinityPolicy, RebalanceCounter, Router, RoundRobinPolicy, SchedulePolicy, StrategyRegistry, TierClassifier};
@@ -55,6 +57,10 @@ pub struct AppState {
     pub prompt_log_writer: PromptLogWriter,
     /// Key-affinity rebalance event counter (survives reloads).
     pub rebalance_counter: Arc<RebalanceCounter>,
+    /// KV-cache prefix index (survives reloads). None if kvc_aware disabled.
+    pub kv_index: Option<Arc<dyn KvIndexBackend>>,
+    /// Tokenizer pool for computing prefix block hashes (survives reloads).
+    pub tokenizer_pool: Option<Arc<TokenizerPool>>,
 }
 
 /// The state that gets swapped on config reload.
@@ -124,8 +130,45 @@ impl AppState {
         // Rebalance counter survives across reloads.
         let rebalance_counter = Arc::new(RebalanceCounter::new());
 
-        // Create scheduling policy from config (may reference inflight).
-        let policy = create_policy(&config, &inflight, &flow_controller, &rebalance_counter);
+        // KV-cache index + tokenizer pool (survives reloads).
+        // Driven by schedule_policy == "kvc_aware", not a separate enabled flag.
+        let is_kvc_aware = config.router_settings.schedule_policy == "kvc_aware";
+        let (kv_index, tokenizer_pool) = if is_kvc_aware {
+            let kv_settings = &config.router_settings.kvc_aware;
+            let index: Arc<dyn KvIndexBackend> = Arc::new(TokenPrefixIndex::new(
+                kv_settings.block_size,
+                kv_settings.cache_weight,
+                kv_settings.tier_weight,
+                kv_settings.load_weight,
+            ));
+            let pool = match &kv_settings.tokenizer_dir {
+                Some(dir) => {
+                    let p = TokenizerPool::new(dir.into());
+                    tracing::info!(
+                        tokenizer_dir = %dir,
+                        block_size = kv_settings.block_size,
+                        "KV-aware routing: tokenizer pool initialized"
+                    );
+                    Some(Arc::new(p))
+                }
+                None => {
+                    tracing::warn!("KV-aware routing enabled but no tokenizer_dir configured — tokenization disabled");
+                    None
+                }
+            };
+            tracing::info!(
+                cache_weight = kv_settings.cache_weight,
+                load_weight = kv_settings.load_weight,
+                tier_weight = kv_settings.tier_weight,
+                "KV-aware routing enabled (token-prefix matching)"
+            );
+            (Some(index), pool)
+        } else {
+            (None, None)
+        };
+
+        // Create scheduling policy from config (may reference inflight, rebalance_counter, kv_index).
+        let policy = create_policy(&config, &inflight, &flow_controller, &rebalance_counter, &kv_index);
 
         // Build hybrid router classifier (optional, content-based model routing).
         let hybrid_classifier = build_hybrid_router(&config);
@@ -189,6 +232,8 @@ impl AppState {
             debug_store,
             prompt_log_writer,
             rebalance_counter,
+            kv_index,
+            tokenizer_pool,
         })
     }
 
@@ -245,7 +290,7 @@ impl AppState {
         seed_flow_controller_from_config(&new_config, &self.flow_controller);
 
         // Recreate policy (fresh counters etc.) — router reuses same stores.
-        let new_policy = create_policy(&new_config, &self.inflight, &self.flow_controller, &self.rebalance_counter);
+        let new_policy = create_policy(&new_config, &self.inflight, &self.flow_controller, &self.rebalance_counter, &self.kv_index);
         self.router.set_policy(new_policy);
 
         // Rebuild hybrid router classifier.
@@ -765,7 +810,13 @@ fn build_hybrid_router(config: &Config) -> Option<Arc<HybridRouter>> {
 }
 
 /// Create a scheduling policy from config.
-fn create_policy(config: &Config, inflight: &Arc<InFlightTracker>, flow_controller: &Arc<FlowController>, rebalance_counter: &Arc<RebalanceCounter>) -> Arc<dyn SchedulePolicy> {
+fn create_policy(
+    config: &Config,
+    inflight: &Arc<InFlightTracker>,
+    flow_controller: &Arc<FlowController>,
+    rebalance_counter: &Arc<RebalanceCounter>,
+    kv_index: &Option<Arc<dyn KvIndexBackend>>,
+) -> Arc<dyn SchedulePolicy> {
     match config.router_settings.schedule_policy.as_str() {
         "round_robin" | "" => Arc::new(RoundRobinPolicy::new()),
         "key_affinity" => {
@@ -782,6 +833,19 @@ fn create_policy(config: &Config, inflight: &Arc<InFlightTracker>, flow_controll
                 rebalance_threshold,
                 Some(rebalance_counter.clone()),
             );
+            policy.set_queue_info(flow_controller.clone());
+            Arc::new(policy)
+        }
+        "kvc_aware" => {
+            let kv = match kv_index {
+                Some(idx) => idx.clone(),
+                None => {
+                    tracing::warn!("kvc_aware policy selected but kv_index not initialized — falling back to round_robin");
+                    return Arc::new(RoundRobinPolicy::new());
+                }
+            };
+            tracing::info!("Using kvc_aware policy");
+            let mut policy = boom_routing::KvcAwarePolicy::new(kv, inflight.clone());
             policy.set_queue_info(flow_controller.clone());
             Arc::new(policy)
         }

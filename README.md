@@ -14,12 +14,13 @@ A production-grade LLM API gateway built in Rust. Unified request entry point fo
 ## Features
 
 - **Multi-Provider Routing** — OpenAI / Anthropic / Azure / Gemini / Bedrock / vLLM / Ollama etc.
-- **Load Balancing** — Round-robin or key-affinity scheduling across same-name deployments
+- **Load Balancing** — Round-robin, key-affinity, or KVC-aware scheduling across same-name deployments
 - **Rate Limiting** — Sliding window + concurrency control + custom time windows + scheduled plans
 - **Plan System** — Flexible plans with key-to-plan assignment, 3-level fallback
 - **Quota Ratio** — Per-model `quota_count_ratio` so expensive models consume more quota
 - **Flow Control** — Per-deployment max inflight requests + max context chars, VIP priority queue
 - **Auto-Disable** — Consecutive failure detection auto-disables faulty deployments (including wildcard `*`)
+- **KV-Cache Aware Routing** — Subscribe to vLLM KV-cache events via ZMQ, route requests to the worker with the most cached prefix, reducing TTFT
 - **Public Models** — `public_models` config grants all keys access to selected models without whitelist updates
 - **Anthropic Native** — `/v1/messages` endpoint (Claude Code / opencode compatible)
 - **Web Dashboard** — SPA admin panel: keys, models, aliases, plans, teams, logs, real-time inflight stats
@@ -207,6 +208,7 @@ BooMGateway/
 │   ├── boom-limiter/       Sliding window rate limiter + concurrency + PlanStore
 │   ├── boom-flowcontrol/   Per-deployment flow control with VIP priority
 │   ├── boom-routing/       DeploymentStore + AliasStore + scheduling policies
+│   ├── boom-kvindex/       KV-cache prefix index + ZMQ subscriber + tokenization
 │   ├── boom-audit/         Request log read/write
 │   ├── boom-dashboard/     Web UI + REST API + JWT auth
 │   └── boom-main/          Entry point, routing, state assembly
@@ -226,6 +228,7 @@ BooMGateway/
 | Async Runtime | Tokio (multi-thread) |
 | Database | PostgreSQL (sqlx, auto-migrate) |
 | Concurrency | DashMap, ArcSwap |
+| KV Events | ZMQ (PUB/SUB), MessagePack |
 | Auth | SHA-256 token hashing, JWT sessions |
 
 ## API Endpoints
@@ -273,6 +276,12 @@ BooMGateway/
 | `GET /health` | Full health status |
 | `GET /health/live` | Liveness probe |
 | `GET /health/ready` | Readiness probe |
+
+### Internal
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /internal/kv-index` | KV-cache prefix index status and Trie contents |
 
 ---
 
@@ -343,6 +352,76 @@ Real-time flow control stats are visible on the dashboard In-Flight panel, inclu
 
 ---
 
+## KV-Cache Aware Routing
+
+Route requests to the vLLM worker that already holds the most relevant KV-cache prefix, reducing recomputation and TTFT. The gateway subscribes to vLLM's ZMQ KV-cache events, builds a token-prefix Trie index, and matches incoming requests against it.
+
+### How It Works
+
+```
+vLLM Workers publish KV events via ZMQ
+  │
+  ▼
+Gateway subscribes and builds per-model Token Prefix Trie
+  │
+  ▼
+Request arrives → Tokenize → Walk Trie → Score candidates → Select best worker
+```
+
+**Scoring**: `combined_score = cache_weight × hit_ratio + tier_weight × tier_score + load_weight × load_score`
+
+No match → falls back to lowest-load selection.
+
+### Configuration
+
+```yaml
+router_settings:
+  schedule_policy: kvc_aware
+
+  kvc_aware:
+    block_size: 128                 # must match vLLM's block_size
+    cache_weight: 0.5               # KV prefix hit weight
+    tier_weight: 0.3                # storage tier weight
+    load_weight: 0.2                # load weight
+    tokenizer_dir: /data/tokenizers # per-model tokenizer files
+    zmq_endpoints:
+      - "tcp://10.0.0.1:5557"
+      - "tcp://10.0.0.2:5557"
+    zmq_topic_prefix: "kv@"
+```
+
+Each model needs its tokenizer files under `{tokenizer_dir}/{model_name}/`:
+- `tokenizer.json` — HuggingFace tokenizer
+- `tokenizer_config.json` — chat_template, special tokens
+- `chat_template.jinja` — optional standalone template file
+
+### Identity Alignment
+
+Gateway and vLLM identifiers must match:
+
+| Dimension | Gateway | vLLM | Must match |
+|-----------|---------|------|-----------|
+| Model name | `model_name` in YAML | `--served-model-name` | Yes |
+| Worker ID | `model_info.id` in YAML | ZMQ topic worker_id | Yes |
+| Block size | `kvc_aware.block_size` | `--block-size` | Yes |
+
+```yaml
+- model_name: MiniMax-M2.7
+  litellm_params:
+    model: hosted_vllm/MiniMax-M2.7
+    api_base: http://10.0.0.1:8000
+  model_info:
+    id: "10.0.0.1"                   # match ZMQ topic worker_id
+```
+
+### Monitoring
+
+`GET /internal/kv-index` — inspect Trie contents, block counts, and worker assignments.
+
+See [docs/kvc-aware-design.md](docs/kvc-aware-design.md) for the full design document.
+
+---
+
 ## Hot Reload
 
 Three ways to trigger, all zero-downtime via ArcSwap atomic swap:
@@ -375,6 +454,7 @@ Routes by `host` (wildcard `*.example.com`), `path` prefix, `client_ip` CIDR.
 |----------|-------------|
 | [ARCH.md](ARCH.md) | Architecture: module diagram, request flow, state management, DB schema |
 | [DESCRIPTOR.md](DESCRIPTOR.md) | Detailed architecture description |
+| [docs/kvc-aware-design.md](docs/kvc-aware-design.md) | KVC-Aware routing design document |
 | [CONFIG_EXAMPLE.md](CONFIG_EXAMPLE.md) | Complete config field reference |
 | [CLAUDE.md](CLAUDE.md) | Development guidelines and architecture principles |
 
