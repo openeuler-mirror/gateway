@@ -36,7 +36,11 @@ pub fn min_load_candidate(
     (best_load, best)
 }
 
-/// Get the total load for a deployment: max(in-flight, FC queue depth).
+/// Get the normalized utilization for a deployment (percentage, 0..100).
+///
+/// Formula: `raw_load * 100 / max_inflight`
+/// - `raw_load` = max(in-flight from tracker, FC queue total), avoiding double-counting.
+/// - `max_inflight` = 0 means unlimited capacity → returns `raw_load` as-is (no normalization).
 pub fn deployment_load(
     tracker: &InFlightTracker,
     queue_info: &Option<Arc<dyn DeploymentQueueInfo>>,
@@ -49,7 +53,21 @@ pub fn deployment_load(
             let queued = queue_info.as_ref().map(|q| q.total_load(id)).unwrap_or(0);
             // queued already includes current_inflight from FlowControl,
             // which ≈ inflight. Use max to avoid double-counting.
-            std::cmp::max(inflight, queued)
+            let raw_load = std::cmp::max(inflight, queued);
+
+            let capacity = queue_info
+                .as_ref()
+                .map(|q| q.max_capacity(id))
+                .unwrap_or(0);
+
+            if capacity > 0 && raw_load > 0 {
+                // Normalize to percentage: raw_load * 100 / capacity.
+                // Both sides are then in 0..100 range, comparable across
+                // deployments with different max_inflight values.
+                raw_load * 100 / (capacity as u64)
+            } else {
+                raw_load
+            }
         }
         None => 0,
     }

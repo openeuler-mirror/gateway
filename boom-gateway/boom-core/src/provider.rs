@@ -97,4 +97,8 @@ pub trait DeploymentQueueInfo: Send + Sync + 'static {
     /// Total load for a deployment: in-flight requests + queued requests.
     /// Returns 0 if the deployment has no flow control configured.
     fn total_load(&self, deployment_id: &str) -> u64;
+
+    /// Maximum concurrent capacity (max_inflight) for a deployment.
+    /// Returns 0 if the deployment has no flow control configured (unlimited).
+    fn max_capacity(&self, deployment_id: &str) -> u32;
 }
