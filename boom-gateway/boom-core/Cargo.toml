@@ -13,3 +13,4 @@ tokio = { workspace = true }
 futures = { workspace = true }
 uuid = { workspace = true }
 dashmap = { workspace = true }
+sqlx = { workspace = true }

@@ -272,8 +272,9 @@ pub async fn list_keys(
 
 #[derive(Debug, Deserialize)]
 pub struct CreateKeyRequest {
-    pub key_name: Option<String>,
     pub key_alias: Option<String>,
+    /// Legacy display name. Defaults to key_alias if not provided.
+    pub key_name: Option<String>,
     pub user_id: Option<String>,
     pub team_id: Option<String>,
     pub models: Option<Vec<String>>,
@@ -331,7 +332,8 @@ pub async fn create_key(
         models_list = vec!["all-team-models".to_string()];
     }
 
-    // 3. INSERT into DB.
+    // 3. INSERT into DB. (key_name defaults to key_alias)
+    let key_name = req.key_name.or(req.key_alias.clone());
     let result = sqlx::query(
         r#"INSERT INTO "boom_verification_token"
            (token, key_name, key_alias, user_id, team_id, models, spend, blocked,
@@ -340,7 +342,7 @@ pub async fn create_key(
            VALUES ($1, $2, $3, $4, $5, $6, 0.0, false, $7, $8, $9, $10, $11, $12, NOW(), NOW())"#,
     )
     .bind(&token_hash)
-    .bind(&req.key_name)
+    .bind(&key_name)
     .bind(&req.key_alias)
     .bind(&req.user_id)
     .bind(&req.team_id)
@@ -365,7 +367,7 @@ pub async fn create_key(
 
     // 4. Optionally assign to plan.
     if let Some(ref plan_name) = req.plan_name {
-        if let Err(e) = state.plan_store.assign_key(&token_hash, plan_name) {
+        if let Err(e) = state.plan_store.assign_key_db(db_pool, &token_hash, plan_name).await {
             tracing::warn!("Key created but plan assignment failed: {}", e);
         }
     }
@@ -374,7 +376,7 @@ pub async fn create_key(
     Json(json!({
         "key": raw_key,
         "token_hash": token_hash,
-        "key_name": req.key_name,
+        "key_alias": req.key_alias,
     }))
     .into_response()
 }
@@ -566,23 +568,57 @@ pub async fn unblock_key(
 // Assignment management
 // ═══════════════════════════════════════════════════════════
 
+#[derive(Debug, Deserialize, Default)]
+pub struct AssignmentsQuery {
+    pub page: Option<usize>,
+    pub page_size: Option<usize>,
+}
+
 pub async fn list_assignments(
     _session: AdminSession,
     Extension(state): Extension<std::sync::Arc<DashboardState>>,
+    Query(params): Query<AssignmentsQuery>,
 ) -> Json<Value> {
-    let assignments = state
-        .plan_store
-        .list_assignments()
-        .into_iter()
+    let assignments = state.plan_store.list_assignments();
+    let total = assignments.len();
+    let page = params.page.unwrap_or(1).max(1);
+    let page_size = params.page_size.unwrap_or(20).clamp(1, 200);
+    let offset = (page - 1) * page_size;
+
+    if offset >= assignments.len() {
+        return Json(json!({
+            "assignments": [],
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+        }));
+    }
+
+    // Only lookup aliases for the current page slice.
+    let page_slice = &assignments[offset..assignments.len().min(offset + page_size)];
+    let hashes: Vec<&str> = page_slice.iter().map(|(h, _)| h.as_str()).collect();
+    let alias_map = state.auth.lookup_key_aliases(&hashes).await;
+
+    let result: Vec<Value> = page_slice
+        .iter()
         .map(|(key_hash, plan_name)| {
+            let key_alias = alias_map.get(key_hash).and_then(|a| a.clone());
+            let token_prefix = format!("{}...", &key_hash[..8.min(key_hash.len())]);
             json!({
                 "key_hash": key_hash,
                 "plan_name": plan_name,
+                "key_alias": key_alias,
+                "token_prefix": token_prefix,
             })
         })
-        .collect::<Vec<_>>();
+        .collect();
 
-    Json(json!({"assignments": assignments}))
+    Json(json!({
+        "assignments": result,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -719,6 +755,7 @@ pub async fn batch_create_keys(
             .and_then(|s| NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").ok());
 
         let models_list: Vec<String> = req.models.clone().unwrap_or_default();
+        let key_name = req.key_name.clone().or(req.key_alias.clone());
 
         let result = sqlx::query(
             r#"INSERT INTO "boom_verification_token"
@@ -728,7 +765,7 @@ pub async fn batch_create_keys(
                VALUES ($1, $2, $3, $4, $5, $6, 0.0, false, $7, $8, $9, $10, $11, $12, NOW(), NOW())"#,
         )
         .bind(&token_hash)
-        .bind(&req.key_name)
+        .bind(&key_name)
         .bind(&req.key_alias)
         .bind(&req.user_id)
         .bind(&req.team_id)
@@ -746,7 +783,7 @@ pub async fn batch_create_keys(
             Ok(_) => {
                 // Optionally assign to plan.
                 if let Some(ref plan_name) = req.plan_name {
-                    if let Err(e) = state.plan_store.assign_key(&token_hash, plan_name) {
+                    if let Err(e) = state.plan_store.assign_key_db(db_pool, &token_hash, plan_name).await {
                         tracing::warn!("Batch: key created but plan assignment failed: {}", e);
                     }
                 }
@@ -1146,14 +1183,21 @@ pub async fn patch_config(
         }
     };
 
-    let result = sqlx::query(
-        r#"INSERT INTO boom_config (key, value) VALUES ($1, $2)
-           ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()"#,
-    )
-    .bind(&req.key)
-    .bind(&req.value)
-    .execute(db_pool)
-    .await;
+    let result: Result<(), sqlx::Error> = async {
+        boom_core::gaussdb_upsert!(
+            db_pool,
+            || sqlx::query(
+                r#"UPDATE boom_config SET value = $2, updated_at = NOW() WHERE key = $1"#,
+            )
+            .bind(&req.key)
+            .bind(&req.value),
+            || sqlx::query(
+                r#"INSERT INTO boom_config (key, value) VALUES ($1, $2)"#,
+            )
+            .bind(&req.key)
+            .bind(&req.value)
+        )
+    }.await;
 
     if let Err(e) = result {
         tracing::error!("Dashboard patch_config failed: {}", e);

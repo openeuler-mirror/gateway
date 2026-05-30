@@ -313,21 +313,29 @@ impl SlidingWindowLimiter {
     pub async fn sync_counters_to_db(&self, pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
         let entries = self.snapshot();
         for (cache_key, count, window_start, window_secs) in &entries {
-            sqlx::query(
-                r#"INSERT INTO boom_rate_limit_state (cache_key, count, window_start, window_secs, updated_at)
-                   VALUES ($1, $2, $3, $4, NOW())
-                   ON CONFLICT (cache_key) DO UPDATE
-                   SET count = EXCLUDED.count,
-                       window_start = EXCLUDED.window_start,
-                       window_secs = EXCLUDED.window_secs,
-                       updated_at = NOW()"#,
-            )
-            .bind(cache_key)
-            .bind(*count as i64)
-            .bind(*window_start as i64)
-            .bind(*window_secs as i64)
-            .execute(pool)
-            .await?;
+            let c = *count as i64;
+            let ws = *window_start as i64;
+            let wsec = *window_secs as i64;
+            boom_core::gaussdb_upsert!(
+                pool,
+                || sqlx::query(
+                    r#"UPDATE boom_rate_limit_state
+                       SET count = $2, window_start = $3, window_secs = $4, updated_at = NOW()
+                       WHERE cache_key = $1"#,
+                )
+                .bind(cache_key)
+                .bind(c)
+                .bind(ws)
+                .bind(wsec),
+                || sqlx::query(
+                    r#"INSERT INTO boom_rate_limit_state (cache_key, count, window_start, window_secs, updated_at)
+                       VALUES ($1, $2, $3, $4, NOW())"#,
+                )
+                .bind(cache_key)
+                .bind(c)
+                .bind(ws)
+                .bind(wsec)
+            )?;
         }
         Ok(())
     }

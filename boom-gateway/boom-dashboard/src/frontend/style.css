@@ -185,6 +185,15 @@ th, td { padding: 10px 14px; text-align: left; border-bottom: 1px solid var(--bo
 th { font-weight: 600; color: var(--text3); font-size: 10px; text-transform: uppercase; letter-spacing: 1px; background: var(--surface2); }
 tr:hover td { background: var(--surface2); }
 .mono { font-family: var(--font); font-size: 14px; }
+.muted { color: var(--text3); font-size: 12px; }
+
+/* ── Key Select List ──────────────────────────────────── */
+.key-select-list { max-height: 220px; overflow-y: auto; border: 1px solid var(--border); border-top: none; border-radius: 0 0 var(--radius-sm) var(--radius-sm); background: var(--surface); }
+.key-select-item { display: flex; justify-content: space-between; align-items: center; padding: 8px 12px; cursor: pointer; border-bottom: 1px solid var(--surface2); }
+.key-select-item:last-child { border-bottom: none; }
+.key-select-item:hover { background: var(--primary-bg); }
+.key-select-alias { font-weight: 500; }
+.key-select-empty { padding: 12px; color: var(--text3); text-align: center; }
 
 /* ── Progress Bar ─────────────────────────────────────── */
 .progress-bar { width: 100%; height: 6px; background: var(--surface3); border-radius: 3px; overflow: hidden; }

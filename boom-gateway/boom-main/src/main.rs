@@ -80,7 +80,7 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("BooMGateway listening on {}", addr);
 
-    let server = axum::serve(listener, app);
+    let server = axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>());
 
     // Ctrl+C: stop server → close DB → exit.
     // tokio::select! drops the losing future, so when shutdown_signal wins,
@@ -164,7 +164,10 @@ fn build_router(state: AppState) -> Router {
 
     // Dashboard router (Web UI + dashboard API).
     // Returns Router<()> — state injected via Extension<Arc<DashboardState>>.
-    let master_key = state.inner.load().config.general_settings.master_key.clone();
+    let inner = state.inner.load();
+    let master_key = inner.config.general_settings.master_key.clone();
+    let key_alias_lookup = inner.key_alias_lookup.clone();
+    drop(inner);
 
     // Admin command channel: dashboard sends write ops, boom-main handles them.
     let (admin_tx, admin_rx) = tokio::sync::mpsc::channel(64);
@@ -183,6 +186,7 @@ fn build_router(state: AppState) -> Router {
         state.debug_store.clone(),
         state.prompt_log_writer.clone(),
         state.rebalance_counter.clone(),
+        key_alias_lookup,
     );
     let dashboard_router = boom_dashboard::build_router(dashboard_state);
 

@@ -430,24 +430,32 @@ impl PlanStore {
             })).collect::<Vec<_>>(),
         ).unwrap_or(serde_json::json!([]));
 
-        sqlx::query(
-            r#"INSERT INTO boom_rate_limit_plan (name, concurrency_limit, rpm_limit, window_limits, schedule, is_default, source)
-               VALUES ($1, $2, $3, $4, $5, false, 'db')
-               ON CONFLICT (name) DO UPDATE
-               SET concurrency_limit = EXCLUDED.concurrency_limit,
-                   rpm_limit = EXCLUDED.rpm_limit,
-                   window_limits = EXCLUDED.window_limits,
-                   schedule = EXCLUDED.schedule,
-                   source = 'db',
-                   updated_at = NOW()"#,
-        )
-        .bind(&plan.name)
-        .bind(plan.concurrency_limit.map(|v| v as i32))
-        .bind(plan.rpm_limit.map(|v| v as i64))
-        .bind(&window_limits_json)
-        .bind(&schedule_json)
-        .execute(pool)
-        .await?;
+        let name = &plan.name;
+        let cl = plan.concurrency_limit.map(|v| v as i32);
+        let rpm = plan.rpm_limit.map(|v| v as i64);
+        boom_core::gaussdb_upsert!(
+            pool,
+            || sqlx::query(
+                r#"UPDATE boom_rate_limit_plan
+                   SET concurrency_limit = $2, rpm_limit = $3,
+                       window_limits = $4, schedule = $5, source = 'db', updated_at = NOW()
+                   WHERE name = $1"#,
+            )
+            .bind(name)
+            .bind(cl)
+            .bind(rpm)
+            .bind(&window_limits_json)
+            .bind(&schedule_json),
+            || sqlx::query(
+                r#"INSERT INTO boom_rate_limit_plan (name, concurrency_limit, rpm_limit, window_limits, schedule, is_default, source)
+                   VALUES ($1, $2, $3, $4, $5, false, 'db')"#,
+            )
+            .bind(name)
+            .bind(cl)
+            .bind(rpm)
+            .bind(&window_limits_json)
+            .bind(&schedule_json)
+        )?;
 
         self.upsert_plan(plan.clone());
         Ok(())
@@ -469,24 +477,40 @@ impl PlanStore {
     }
 
     /// Assign a key to a plan in DB and memory.
+    /// Writes DB first, then updates memory — avoids concurrent dirty reads on failure.
     pub async fn assign_key_db(&self, pool: &sqlx::PgPool, key_hash: &str, plan_name: &str) -> Result<(), String> {
-        self.assign_key(key_hash, plan_name)?;
-
-        if let Err(e) = sqlx::query(
-            r#"INSERT INTO boom_key_plan_assignment (key_hash, plan_name, assigned_at)
-               VALUES ($1, $2, NOW())
-               ON CONFLICT (key_hash) DO UPDATE
-               SET plan_name = EXCLUDED.plan_name"#,
+        // GaussDB-compatible upsert: UPDATE → INSERT → UPDATE (no ON CONFLICT support).
+        let updated = sqlx::query(
+            r#"UPDATE boom_key_plan_assignment SET plan_name = $2 WHERE key_hash = $1"#,
         )
         .bind(key_hash)
         .bind(plan_name)
         .execute(pool)
         .await
-        {
-            // Roll back memory on DB failure.
-            self.unassign_key(key_hash);
-            return Err(format!("DB error: {}", e));
+        .map_err(|e| format!("DB error: {}", e))?;
+        if updated.rows_affected() == 0 {
+            if let Err(_) = sqlx::query(
+                r#"INSERT INTO boom_key_plan_assignment (key_hash, plan_name, assigned_at)
+                   VALUES ($1, $2, NOW())"#,
+            )
+            .bind(key_hash)
+            .bind(plan_name)
+            .execute(pool)
+            .await
+            {
+                sqlx::query(
+                    r#"UPDATE boom_key_plan_assignment SET plan_name = $2 WHERE key_hash = $1"#,
+                )
+                .bind(key_hash)
+                .bind(plan_name)
+                .execute(pool)
+                .await
+                .map_err(|e| format!("DB error: {}", e))?;
+            }
         }
+
+        // DB succeeded — now safe to update memory.
+        self.assign_key(key_hash, plan_name)?;
         Ok(())
     }
 
@@ -510,16 +534,20 @@ impl PlanStore {
     pub async fn sync_assignments_to_db(&self, pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
         let assignments = self.snapshot_assignments();
         for (key_hash, plan_name) in &assignments {
-            sqlx::query(
-                r#"INSERT INTO boom_key_plan_assignment (key_hash, plan_name, assigned_at)
-                   VALUES ($1, $2, NOW())
-                   ON CONFLICT (key_hash) DO UPDATE
-                   SET plan_name = EXCLUDED.plan_name"#,
-            )
-            .bind(key_hash)
-            .bind(plan_name)
-            .execute(pool)
-            .await?;
+            boom_core::gaussdb_upsert!(
+                pool,
+                || sqlx::query(
+                    r#"UPDATE boom_key_plan_assignment SET plan_name = $2 WHERE key_hash = $1"#,
+                )
+                .bind(key_hash)
+                .bind(plan_name),
+                || sqlx::query(
+                    r#"INSERT INTO boom_key_plan_assignment (key_hash, plan_name, assigned_at)
+                       VALUES ($1, $2, NOW())"#,
+                )
+                .bind(key_hash)
+                .bind(plan_name)
+            )?;
         }
         Ok(())
     }

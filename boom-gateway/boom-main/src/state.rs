@@ -1,7 +1,7 @@
 use arc_swap::ArcSwap;
 use boom_auth::DbAuthenticator;
 use boom_config::Config;
-use boom_core::provider::Authenticator;
+use boom_core::provider::{Authenticator, KeyAliasLookup};
 use boom_core::DebugErrorStore;
 use boom_kvindex::{TokenPrefixIndex, TokenizerPool};
 use boom_core::kv_event::KvIndexBackend;
@@ -68,6 +68,8 @@ pub struct AppState {
 pub struct AppStateInner {
     pub config: Config,
     pub auth: Arc<dyn Authenticator>,
+    /// Narrow view for Dashboard — only exposes key alias lookups, not full auth.
+    pub key_alias_lookup: Arc<dyn KeyAliasLookup>,
     pub health: HealthStatus,
 }
 
@@ -343,11 +345,13 @@ impl AppState {
         started_at: chrono::DateTime<chrono::Utc>,
         reload_count: u64,
     ) -> Result<AppStateInner, anyhow::Error> {
-        // Build authenticator.
-        let auth: Arc<dyn Authenticator> = Arc::new(DbAuthenticator::new(
+        // Build authenticator — store concrete type in Arc so we can derive both trait objects.
+        let auth_impl = Arc::new(DbAuthenticator::new(
             db_pool.clone(),
             config.general_settings.master_key.clone(),
         ));
+        let auth: Arc<dyn Authenticator> = auth_impl.clone();
+        let key_alias_lookup: Arc<dyn KeyAliasLookup> = auth_impl;
 
         let health = HealthStatus {
             started_at,
@@ -359,6 +363,7 @@ impl AppState {
         Ok(AppStateInner {
             config,
             auth,
+            key_alias_lookup,
             health,
         })
     }
