@@ -203,6 +203,7 @@ struct UserLogRow {
     error_type: Option<String>,
     error_message: Option<String>,
     created_at: Option<chrono::DateTime<chrono::Utc>>,
+    client_ip: Option<String>,
 }
 
 pub async fn get_user_logs(
@@ -221,7 +222,7 @@ pub async fn get_user_logs(
     let rows: Vec<UserLogRow> = match sqlx::query_as(
         r#"SELECT model, api_path, is_stream, status_code,
                   input_tokens, output_tokens, duration_ms,
-                  error_type, error_message, created_at
+                  error_type, error_message, created_at, client_ip
            FROM boom_request_log
            WHERE key_hash = $1
            ORDER BY created_at DESC
@@ -262,6 +263,7 @@ pub async fn get_user_logs(
                 "error_type": r.error_type,
                 "error_message": r.error_message,
                 "created_at": r.created_at.map(|d| d.to_rfc3339()),
+                "client_ip": r.client_ip,
             })
         })
         .collect();

@@ -1,10 +1,11 @@
 use crate::models::{TeamRow, VerificationToken};
-use boom_core::provider::Authenticator;
+use boom_core::provider::{Authenticator, KeyAliasLookup};
 use boom_core::types::AuthIdentity;
 use boom_core::GatewayError;
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+use std::collections::HashMap;
 use std::time::Duration;
 use tracing;
 
@@ -267,6 +268,34 @@ impl Authenticator for DbAuthenticator {
                 identity.key_name, model, identity.models, identity.team_models
             );
             Err(GatewayError::ModelNotAllowed(model.to_string()))
+        }
+    }
+}
+
+#[async_trait]
+impl KeyAliasLookup for DbAuthenticator {
+    async fn lookup_key_aliases(&self, key_hashes: &[&str]) -> HashMap<String, Option<String>> {
+        let db = match &self.db {
+            Some(pool) => pool,
+            None => return HashMap::new(),
+        };
+        if key_hashes.is_empty() {
+            return HashMap::new();
+        }
+        // Note: the `token` column in boom_verification_token stores the SHA-256 hash
+        // of the API key (not the raw key), which matches the key_hashes parameter.
+        match sqlx::query_as::<_, (String, Option<String>)>(
+            r#"SELECT token, key_alias FROM "boom_verification_token" WHERE token = ANY($1)"#,
+        )
+        .bind(key_hashes)
+        .fetch_all(db)
+        .await
+        {
+            Ok(rows) => rows.into_iter().collect(),
+            Err(e) => {
+                tracing::error!("Failed to lookup key aliases: {}", e);
+                HashMap::new()
+            }
         }
     }
 }

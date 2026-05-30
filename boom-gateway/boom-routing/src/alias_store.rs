@@ -190,20 +190,24 @@ impl AliasStore {
 
     /// Create or upsert an alias in DB (source='db') and update memory.
     pub async fn create_db(&self, pool: &PgPool, input: &AliasInput) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            r#"INSERT INTO boom_model_alias (alias_name, target_model, hidden, source)
-               VALUES ($1, $2, $3, 'db')
-               ON CONFLICT (alias_name) DO UPDATE
-               SET target_model = EXCLUDED.target_model,
-                   hidden = EXCLUDED.hidden,
-                   source = 'db',
-                   updated_at = NOW()"#,
-        )
-        .bind(&input.alias_name)
-        .bind(&input.target_model)
-        .bind(input.hidden)
-        .execute(pool)
-        .await?;
+        boom_core::gaussdb_upsert!(
+            pool,
+            || sqlx::query(
+                r#"UPDATE boom_model_alias
+                   SET target_model = $2, hidden = $3, source = 'db', updated_at = NOW()
+                   WHERE alias_name = $1"#,
+            )
+            .bind(&input.alias_name)
+            .bind(&input.target_model)
+            .bind(input.hidden),
+            || sqlx::query(
+                r#"INSERT INTO boom_model_alias (alias_name, target_model, hidden, source)
+                   VALUES ($1, $2, $3, 'db')"#,
+            )
+            .bind(&input.alias_name)
+            .bind(&input.target_model)
+            .bind(input.hidden)
+        )?;
 
         self.set_alias(
             input.alias_name.clone(),

@@ -379,9 +379,10 @@
       return;
     }
     wrap.innerHTML = `<table>
-      <tr><th>Time</th><th>Model</th><th>Path</th><th>Status</th><th>Stream</th><th>Input</th><th>Output</th><th>Duration</th><th>Error</th></tr>
+      <tr><th>Time</th><th>IP</th><th>Model</th><th>Path</th><th>Status</th><th>Stream</th><th>Input</th><th>Output</th><th>Duration</th><th>Error</th></tr>
       ${logs.map((l) => `<tr>
         <td class="mono">${formatTimestamp(l.created_at)}</td>
+        <td class="mono">${esc(l.client_ip || "-")}</td>
         <td class="mono">${esc(l.model)}</td>
         <td class="mono">${esc(l.api_path)}</td>
         <td>${l.status_code >= 400 ? '<span style="color:var(--danger)">' + l.status_code + '</span>' : l.status_code}</td>
@@ -704,6 +705,33 @@
   }
 
   window._loadKeysPage = (p) => loadKeys(p);
+  window._copyText = function(btn, text) {
+    const done = function() { btn.textContent = "Copied!"; setTimeout(function() { btn.textContent = "Copy"; }, 2000); };
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(text).then(done).catch(function() {
+        // Fallback for non-secure contexts.
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        ta.style.position = "fixed";
+        ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        ta.select();
+        try { document.execCommand("copy"); } catch (e) { /* ignore */ }
+        document.body.removeChild(ta);
+        done();
+      });
+    } else {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      try { document.execCommand("copy"); } catch (e) { /* ignore */ }
+      document.body.removeChild(ta);
+      done();
+    }
+  };
   window._editKey = (tokenHash) => {
     const key = keysDataCache.find((k) => k.token_hash === tokenHash);
     if (key) showEditKeyModal(key);
@@ -723,25 +751,47 @@
   };
 
   // ── Admin: Assignments ────────────────────────────────
-  async function loadAssignments() {
+  let assignmentsPage = 1;
+  const ASSIGNMENTS_PER_PAGE = 20;
+  let assignmentsTotal = 0;
+  let assignmentsData = [];
+
+  async function loadAssignments(page) {
     try {
-      const data = await api("/admin/assignments");
-      renderAssignmentsTable(data.assignments || []);
+      assignmentsPage = page || 1;
+      const data = await api(`/admin/assignments?page=${assignmentsPage}&page_size=${ASSIGNMENTS_PER_PAGE}`);
+      assignmentsData = data.assignments || [];
+      assignmentsTotal = data.total || 0;
+      renderAssignmentsTable();
     } catch {}
   }
 
-  function renderAssignmentsTable(assignments) {
+  function renderAssignmentsTable() {
     const wrap = document.getElementById("assignments-table-wrap");
-    if (assignments.length === 0) { wrap.innerHTML = "<p>No assignments.</p>"; return; }
+    if (assignmentsTotal === 0) { wrap.innerHTML = "<p>No assignments.</p>"; renderAssignmentsPagination(); return; }
     wrap.innerHTML = `<table>
-      <tr><th>Key Hash</th><th>Plan</th><th>Actions</th></tr>
-      ${assignments.map((a) => `<tr>
-        <td class="mono">${esc(a.key_hash.substring(0, 16))}...</td>
+      <tr><th>Key</th><th>Plan</th><th>Actions</th></tr>
+      ${assignmentsData.map((a) => `<tr>
+        <td><span>${esc(a.key_alias || "(no alias)")}</span><br><span class="mono muted">${esc(a.token_prefix || a.key_hash.substring(0, 8) + "...")}</span></td>
         <td>${esc(a.plan_name)}</td>
         <td><button class="btn-danger" onclick="window._unassignKey('${esc(a.key_hash)}')">Remove</button></td>
       </tr>`).join("")}
     </table>`;
+    renderAssignmentsPagination();
   }
+
+  function renderAssignmentsPagination() {
+    const el = document.getElementById("assignments-pagination");
+    const pages = Math.ceil(assignmentsTotal / ASSIGNMENTS_PER_PAGE);
+    if (pages <= 1) { el.innerHTML = ""; return; }
+    el.innerHTML = `
+      <button ${assignmentsPage <= 1 ? "disabled" : ""} onclick="window._loadAssignmentsPage(${assignmentsPage - 1})">&lt;</button>
+      <span>Page ${assignmentsPage} of ${pages} (${assignmentsTotal} assignments)</span>
+      <button ${assignmentsPage >= pages ? "disabled" : ""} onclick="window._loadAssignmentsPage(${assignmentsPage + 1})">&gt;</button>
+    `;
+  }
+
+  window._loadAssignmentsPage = (p) => loadAssignments(p);
 
   window._unassignKey = async (hash) => {
     await api(`/admin/assignments/${encodeURIComponent(hash)}`, { method: "DELETE" });
@@ -1215,8 +1265,13 @@
   }
   window.hideModal = hideModal;
 
+  // Prevent modal close when drag starts on content but ends on overlay.
+  let _modalMouseDownTarget = null;
+  document.getElementById("modal-overlay").addEventListener("mousedown", (e) => {
+    _modalMouseDownTarget = e.target;
+  });
   document.getElementById("modal-overlay").addEventListener("click", (e) => {
-    if (e.target === e.currentTarget) hideModal();
+    if (e.target === e.currentTarget && _modalMouseDownTarget === e.currentTarget) hideModal();
   });
 
   function showNewPlanModal(prefill) {
@@ -1264,13 +1319,12 @@
     showModal(`
       <h3>Create API Key</h3>
       <div class="form-group"><label>Key Alias ${tip("Short unique identifier for this key, e.g. 'alice' or 'team-api'. Used for display in dashboard and debug logging.")}</label><input id="m-key-alias"></div>
-      <div class="form-group"><label>Key Name ${tip("Human-readable name for this key.")}</label><input id="m-key-name"></div>
       <div class="form-group"><label>User ID ${tip("Optional user identifier for tracking.")}</label><input id="m-key-user"></div>
-      <div class="form-group"><label>Team ID ${tip("Optional team identifier.")}</label><input id="m-key-team"></div>
+      <div class="form-group"><label>Team ${tip("Optional team assignment.")}</label><select id="m-key-team"><option value="">-- None --</option></select></div>
       <div class="form-group"><label>Models ${tip("Select model access. Check 'all-team-models' for full access, or pick specific models.")}</label><div class="model-check-combo" id="m-key-models-combo"></div></div>
       <div class="form-group"><label>Max Budget ${tip("Maximum budget in USD. Leave empty for unlimited.")}</label><input id="m-key-budget" type="number" step="0.01"></div>
       <div class="form-group"><label>RPM Limit ${tip("Per-key RPM override. Leave empty to use plan or default limits.")}</label><input id="m-key-rpm" type="number"></div>
-      <div class="form-group"><label>Plan ${tip("Assign this key to a rate limit plan. Leave empty for default plan.")}</label><input id="m-key-plan" list="key-plan-list"><datalist id="key-plan-list"></datalist></div>
+      <div class="form-group"><label>Plan ${tip("Assign this key to a rate limit plan. Leave empty for default plan.")}</label><select id="m-key-plan"><option value="">-- Default --</option></select></div>
       <div class="modal-actions">
         <button class="btn-secondary" onclick="hideModal()" style="width:auto">Cancel</button>
         <button class="btn-primary" id="m-key-submit">Create</button>
@@ -1281,9 +1335,21 @@
       const container = document.getElementById("m-key-models-combo");
       if (container) initModelCombo(container, [], names);
     });
+    // Populate team dropdown
+    api("/admin/teams").then((data) => {
+      const sel = document.getElementById("m-key-team");
+      if (sel && data.teams) {
+        data.teams.forEach((t) => {
+          const o = document.createElement("option");
+          o.value = t.team_id;
+          o.textContent = t.team_alias || t.team_id;
+          sel.appendChild(o);
+        });
+      }
+    }).catch(() => {});
     getPlanNames().then((names) => {
-      const dl = document.getElementById("key-plan-list");
-      if (dl) names.forEach((n) => { const o = document.createElement("option"); o.value = n; dl.appendChild(o); });
+      const sel = document.getElementById("m-key-plan");
+      if (sel) names.forEach((n) => { const o = document.createElement("option"); o.value = n; o.textContent = n; sel.appendChild(o); });
     });
     document.getElementById("m-key-submit").addEventListener("click", async () => {
       try {
@@ -1292,7 +1358,6 @@
           method: "POST",
           body: JSON.stringify({
             key_alias: document.getElementById("m-key-alias").value.trim() || null,
-            key_name: document.getElementById("m-key-name").value || null,
             user_id: document.getElementById("m-key-user").value || null,
             team_id: document.getElementById("m-key-team").value || null,
             models: modelsVal || ["all-team-models"],
@@ -1301,13 +1366,14 @@
             plan_name: document.getElementById("m-key-plan").value || null,
           }),
         });
+        const rawKey = data.key;
         hideModal();
         showModal(`
           <h3>Key Created</h3>
           <p class="key-warning">Copy this key now. It will NOT be shown again.</p>
-          <div class="key-display">${esc(data.key)}</div>
-          <p>Key Name: ${esc(data.key_name || "-")}</p>
-          <div class="modal-actions">
+          <div class="key-display">${esc(rawKey)}</div>
+          <div class="modal-actions" style="justify-content:space-between">
+            <button class="btn-secondary" style="width:auto" onclick="window._copyText(this,'${esc(rawKey)}')">Copy</button>
             <button class="btn-primary" onclick="hideModal(); window._loadKeysPage();">Done</button>
           </div>
         `);
@@ -1376,37 +1442,72 @@
   function showNewAssignmentModal() {
     showModal(`
       <h3>Assign Key to Plan</h3>
-      <div class="form-group"><label>Key Hash ${tip("The full key hash of the API key to assign.")}</label><input id="m-asgn-hash" required list="asgn-hash-list"><datalist id="asgn-hash-list"></datalist></div>
-      <div class="form-group"><label>Plan ${tip("Select an existing plan to assign this key to.")}</label><input id="m-asgn-plan" required list="asgn-plan-list"><datalist id="asgn-plan-list"></datalist></div>
+      <div class="form-group"><label>Key ${tip("Search by key alias or token prefix, then select from the list.")}</label>
+        <input id="m-asgn-search" placeholder="Type to search keys..." autocomplete="off">
+        <div id="m-asgn-key-list" class="key-select-list"></div>
+        <input type="hidden" id="m-asgn-hash">
+      </div>
+      <div class="form-group"><label>Plan ${tip("Select an existing plan to assign this key to.")}</label><select id="m-asgn-plan" required><option value="">-- Select Plan --</option></select></div>
       <div class="modal-actions">
         <button class="btn-secondary" onclick="hideModal()" style="width:auto">Cancel</button>
         <button class="btn-primary" id="m-asgn-submit">Assign</button>
       </div>
     `);
-    // Populate plan datalist
+    // Populate plan dropdown
     getPlanNames().then((names) => {
-      const dl = document.getElementById("asgn-plan-list");
-      if (dl) names.forEach((n) => { const o = document.createElement("option"); o.value = n; dl.appendChild(o); });
+      const sel = document.getElementById("m-asgn-plan");
+      if (sel) names.forEach((n) => { const o = document.createElement("option"); o.value = n; o.textContent = n; sel.appendChild(o); });
     });
-    // Populate key hash datalist from existing keys
-    (async () => {
-      try {
-        const data = await api("/admin/keys");
-        const dl = document.getElementById("asgn-hash-list");
-        if (dl) (data.keys || []).forEach((k) => {
-          const o = document.createElement("option");
-          o.value = k.token_hash;
-          o.label = k.key_alias || k.token_hash.substring(0, 12) + "...";
-          dl.appendChild(o);
+    // Key search: use backend API for consistent, unlimited search
+    const searchInput = document.getElementById("m-asgn-search");
+    const listEl = document.getElementById("m-asgn-key-list");
+    const hashInput = document.getElementById("m-asgn-hash");
+    let searchTimer = null;
+
+    function renderKeyResults(keys) {
+      if (keys.length === 0) {
+        listEl.innerHTML = '<div class="key-select-empty">No matching keys</div>';
+        return;
+      }
+      listEl.innerHTML = keys.map((k) => {
+        const alias = k.key_alias || "(no alias)";
+        const prefix = k.token_prefix || (k.token_hash || "").substring(0, 12) + "...";
+        return `<div class="key-select-item" data-hash="${esc(k.token_hash)}" data-alias="${esc(k.key_alias || "")}" data-prefix="${esc(k.token_prefix || "")}">
+          <span class="key-select-alias">${esc(alias)}</span>
+          <span class="mono muted">${esc(prefix)}</span>
+        </div>`;
+      }).join("");
+      listEl.querySelectorAll(".key-select-item").forEach((el) => {
+        el.addEventListener("click", () => {
+          hashInput.value = el.dataset.hash;
+          searchInput.value = el.dataset.alias || el.dataset.prefix || el.dataset.hash.substring(0, 12) + "...";
+          listEl.innerHTML = "";
         });
-      } catch {}
-    })();
+      });
+    }
+
+    searchInput.addEventListener("input", () => {
+      const q = searchInput.value.trim();
+      hashInput.value = "";
+      clearTimeout(searchTimer);
+      if (!q) { listEl.innerHTML = ""; return; }
+      searchTimer = setTimeout(async () => {
+        try {
+          const data = await api(`/admin/keys?per_page=12&search=${encodeURIComponent(q)}`);
+          renderKeyResults(data.keys || []);
+        } catch (err) {
+          listEl.innerHTML = '<div class="key-select-empty">Search failed</div>';
+        }
+      }, 200);
+    });
+
     document.getElementById("m-asgn-submit").addEventListener("click", async () => {
+      if (!hashInput.value) { alert("Please select a key from the search results."); return; }
       try {
         await api("/admin/assignments", {
           method: "POST",
           body: JSON.stringify({
-            key_hash: document.getElementById("m-asgn-hash").value,
+            key_hash: hashInput.value,
             plan_name: document.getElementById("m-asgn-plan").value,
           }),
         });
@@ -1614,7 +1715,7 @@
           : "-";
         return `<tr>
         <td class="mono">${formatTimestamp(l.created_at)}</td>
-        <td class="monm">${esc(l.client_ip || "-")}</td>
+        <td class="mono">${esc(l.client_ip || "-")}</td>
         <td>${esc(l.team_alias || l.team_id || "-")}</td>
         <td>${esc(l.key_alias || l.key_name || "-")}</td>
         <td class="mono">${esc(l.model)}</td>

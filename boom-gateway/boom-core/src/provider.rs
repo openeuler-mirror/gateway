@@ -4,6 +4,7 @@ use crate::types::{
 };
 use crate::GatewayError;
 use async_trait::async_trait;
+use std::collections::HashMap;
 
 /// Provider trait — each LLM provider implements this.
 ///
@@ -46,9 +47,22 @@ pub trait RateLimiter: Send + Sync + 'static {
     ) -> Result<RateLimitDecision, GatewayError>;
 }
 
-/// Authenticator trait — validates API keys and returns identity info.
+/// Narrow trait for looking up key aliases by token hashes.
+/// Separated from Authenticator so that consumers (e.g. Dashboard) don't
+/// depend on the full authentication interface.
 #[async_trait]
-pub trait Authenticator: Send + Sync + 'static {
+pub trait KeyAliasLookup: Send + Sync + 'static {
+    /// Batch-lookup key aliases by token hashes.
+    /// Returns a map of token_hash → key_alias (None if no alias set).
+    async fn lookup_key_aliases(&self, _key_hashes: &[&str]) -> HashMap<String, Option<String>> {
+        HashMap::new()
+    }
+}
+
+/// Authenticator trait — validates API keys and returns identity info.
+/// Extends KeyAliasLookup so that any Authenticator can also resolve key aliases.
+#[async_trait]
+pub trait Authenticator: KeyAliasLookup {
     /// Authenticate a raw API key string (e.g. from Authorization header).
     /// Returns the resolved identity or an error.
     async fn authenticate(&self, api_key: &str) -> Result<AuthIdentity, GatewayError>;

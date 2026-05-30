@@ -1,7 +1,7 @@
 use crate::extractor::RequiredAuth;
 use crate::request_log::{log_error, log_request, RequestLog};
 use crate::state::AppState;
-use axum::extract::{Path, State};
+use axum::extract::{ConnectInfo, Path, State};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
 use axum::Json;
@@ -24,9 +24,9 @@ use std::sync::atomic::Ordering;
 use std::task::{Context, Poll};
 use std::time::Instant;
 
-/// Extract client IP from request headers (reverse-proxy aware).
-/// Priority: X-Real-IP > X-Forwarded-For (first IP) > "unknown".
-fn extract_client_ip(headers: &axum::http::HeaderMap) -> String {
+/// Extract client IP from request headers with TCP fallback.
+/// Priority: X-Real-IP > X-Forwarded-For (first IP) > TCP remote addr > "unknown".
+fn extract_client_ip(headers: &axum::http::HeaderMap, remote_addr: Option<std::net::SocketAddr>) -> String {
     // Try X-Real-IP first (set by nginx etc.)
     if let Some(val) = headers.get("X-Real-IP").and_then(|v| v.to_str().ok()) {
         let ip = val.trim();
@@ -42,6 +42,10 @@ fn extract_client_ip(headers: &axum::http::HeaderMap) -> String {
                 return ip.to_string();
             }
         }
+    }
+    // Fallback to TCP connection remote address.
+    if let Some(addr) = remote_addr {
+        return addr.ip().to_string();
     }
     "unknown".to_string()
 }
@@ -119,7 +123,6 @@ fn record_deployment_failure(state: &AppState, deployment_id: &Option<String>, m
                         pool, &state.deployment_store, &did, &model,
                     ).await;
                 }
-                // Remove counter after auto-disable to prevent repeated triggers.
                 state.failure_counter.remove(&did);
             });
         }
@@ -246,9 +249,10 @@ pub async fn chat_completions(
     State(state): State<AppState>,
     auth: RequiredAuth,
     headers: axum::http::HeaderMap,
+    ConnectInfo(remote_addr): ConnectInfo<std::net::SocketAddr>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<impl IntoResponse, GatewayErrorReply> {
-    chat_completions_inner(state, auth, &headers, req, "/v1/chat/completions").await
+    chat_completions_inner(state, auth, &headers, Some(remote_addr), req, "/v1/chat/completions").await
 }
 
 /// Shared inner logic for chat completions and legacy completions.
@@ -256,13 +260,14 @@ async fn chat_completions_inner(
     state: AppState,
     auth: RequiredAuth,
     headers: &axum::http::HeaderMap,
+    remote_addr: Option<std::net::SocketAddr>,
     req: ChatCompletionRequest,
     api_path: &str,
 ) -> Result<impl IntoResponse, GatewayErrorReply> {
     let start = Instant::now();
     let request_id = new_request_id();
     let identity = auth.identity();
-    let client_ip = extract_client_ip(headers);
+    let client_ip = extract_client_ip(headers, remote_addr);
     let inner = state.inner.load();
     let model = req.model.clone();
     let is_stream = req.stream.unwrap_or(false);
@@ -541,10 +546,11 @@ pub async fn completions(
     State(state): State<AppState>,
     auth: RequiredAuth,
     headers: axum::http::HeaderMap,
+    ConnectInfo(remote_addr): ConnectInfo<std::net::SocketAddr>,
     Json(req): Json<CompletionRequest>,
 ) -> Result<impl IntoResponse, GatewayErrorReply> {
     let chat_req = req.into_chat_request();
-    chat_completions_inner(state, auth, &headers, chat_req, "/v1/completions").await
+    chat_completions_inner(state, auth, &headers, Some(remote_addr), chat_req, "/v1/completions").await
 }
 
 // ============================================================
@@ -1423,13 +1429,14 @@ pub async fn messages(
     State(state): State<AppState>,
     auth: RequiredAuth,
     headers: axum::http::HeaderMap,
+    ConnectInfo(remote_addr): ConnectInfo<std::net::SocketAddr>,
     Json(req): Json<AnthropicMessagesRequest>,
 ) -> Result<impl IntoResponse, AnthropicErrorReply> {
     let start = Instant::now();
     let request_id = new_request_id();
     let openai_req = anthropic_request_to_openai(&req);
     let identity = auth.identity();
-    let client_ip = extract_client_ip(&headers);
+    let client_ip = extract_client_ip(&headers, Some(remote_addr));
     let inner = state.inner.load();
     let model = openai_req.model.clone();
     let is_stream = openai_req.stream.unwrap_or(false);
