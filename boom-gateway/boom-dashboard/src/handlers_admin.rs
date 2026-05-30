@@ -365,9 +365,15 @@ pub async fn create_key(
             .into_response();
     }
 
-    // 4. Optionally assign to plan.
+    // 4. Optionally assign to plan (skip DB write if same as default).
     if let Some(ref plan_name) = req.plan_name {
-        if let Err(e) = state.plan_store.assign_key_db(db_pool, &token_hash, plan_name).await {
+        let is_default = state.plan_store.get_default_plan_name().as_deref() == Some(plan_name.as_str());
+        let result = if is_default {
+            state.plan_store.assign_key(&token_hash, plan_name)
+        } else {
+            state.plan_store.assign_key_db(db_pool, &token_hash, plan_name).await
+        };
+        if let Err(e) = result {
             tracing::warn!("Key created but plan assignment failed: {}", e);
         }
     }
@@ -781,9 +787,15 @@ pub async fn batch_create_keys(
 
         match result {
             Ok(_) => {
-                // Optionally assign to plan.
+                // Optionally assign to plan (skip DB write if same as default).
                 if let Some(ref plan_name) = req.plan_name {
-                    if let Err(e) = state.plan_store.assign_key_db(db_pool, &token_hash, plan_name).await {
+                    let is_default = state.plan_store.get_default_plan_name().as_deref() == Some(plan_name.as_str());
+                    let result = if is_default {
+                        state.plan_store.assign_key(&token_hash, plan_name)
+                    } else {
+                        state.plan_store.assign_key_db(db_pool, &token_hash, plan_name).await
+                    };
+                    if let Err(e) = result {
                         tracing::warn!("Batch: key created but plan assignment failed: {}", e);
                     }
                 }

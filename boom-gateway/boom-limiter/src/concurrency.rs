@@ -139,6 +139,11 @@ impl PlanStore {
         *guard = name;
     }
 
+    /// Get the default plan name (raw string, for comparison purposes).
+    pub fn get_default_plan_name(&self) -> Option<String> {
+        self.default_plan_name.lock().unwrap().clone()
+    }
+
     /// Get the default plan (if configured and the plan actually exists).
     /// Mutex is released before reading the plans DashMap to prevent ABBA
     /// with `clear_plans` (which writes plans then takes Mutex).
