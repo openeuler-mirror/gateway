@@ -319,12 +319,13 @@ pub struct RouterSettings {
     /// 0 means always use affinity (no warm-up). Default: 0.
     #[serde(default)]
     pub key_affinity_context_threshold: u64,
-    /// Key-affinity: rebalance threshold (absolute request count difference).
-    /// If the preferred provider's in-flight count exceeds the minimum
-    /// by more than this value, reassign to the least-loaded provider.
-    /// Default: 10.
+    /// Key-affinity: rebalance threshold (percentage, 1..=100).
+    /// If the preferred provider's utilization exceeds the least-loaded
+    /// by more than this percentage, reassign to the least-loaded provider.
+    /// Utilization = (in-flight + queued) * 100 / max_inflight per deployment.
+    /// Default: 20 (20% utilization difference triggers rebalance).
     #[serde(default = "default_rebalance_threshold")]
-    pub key_affinity_rebalance_threshold: u64,
+    pub key_affinity_rebalance_threshold: u8,
     /// Content-based hybrid router (optional dynamic model alias).
     #[serde(default)]
     pub hybrid_router: Option<HybridRouterConfig>,
@@ -426,8 +427,8 @@ fn default_schedule_policy() -> String {
     "round_robin".to_string()
 }
 
-fn default_rebalance_threshold() -> u64 {
-    10
+fn default_rebalance_threshold() -> u8 {
+    20
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -535,6 +536,17 @@ pub fn load_config(path: &str) -> Result<Config, GatewayError> {
         p.aws_secret_access_key = p.aws_secret_access_key.take().map(|v| resolve_env_value(&v));
         for v in p.headers.values_mut() {
             *v = resolve_env_value(v);
+        }
+    }
+
+    // Validate key-affinity rebalance threshold when policy is key_affinity.
+    if config.router_settings.schedule_policy == "key_affinity" {
+        let t = config.router_settings.key_affinity_rebalance_threshold;
+        if t == 0 || t > 100 {
+            return Err(GatewayError::ConfigError(format!(
+                "key_affinity_rebalance_threshold must be 1..=100 (percentage), got {}",
+                t
+            )));
         }
     }
 

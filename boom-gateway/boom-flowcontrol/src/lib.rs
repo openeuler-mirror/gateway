@@ -762,6 +762,13 @@ impl DeploymentQueueInfo for FlowController {
             None => 0,
         }
     }
+
+    fn max_capacity(&self, deployment_id: &str) -> u32 {
+        self.slots
+            .get(deployment_id)
+            .map(|s| s.inner.lock().unwrap().max_inflight)
+            .unwrap_or(0)
+    }
 }
 
 // ═══════════════════════════════════════════════════════════

@@ -28,10 +28,10 @@ pub struct KeyAffinityPolicy {
     /// always pick lowest-load (warm-up to distribute initial load).
     /// 0 means always use affinity (no warm-up).
     context_threshold: u64,
-    /// Rebalance threshold: if the preferred provider's load exceeds the
-    /// minimum by more than this factor (absolute request count difference),
-    /// reassign to the least loaded provider.
-    rebalance_threshold: u64,
+    /// Rebalance threshold: if the preferred provider's utilization exceeds
+    /// the minimum by more than this percentage (1..=100), reassign to the
+    /// least loaded provider.
+    rebalance_threshold: u8,
     /// Optional counter to track rebalance events for dashboard stats.
     rebalance_counter: Option<Arc<RebalanceCounter>>,
 }
@@ -40,7 +40,7 @@ impl KeyAffinityPolicy {
     pub fn new(
         tracker: Arc<InFlightTracker>,
         context_threshold: u64,
-        rebalance_threshold: u64,
+        rebalance_threshold: u8,
         rebalance_counter: Option<Arc<RebalanceCounter>>,
     ) -> Self {
         Self {
@@ -117,7 +117,7 @@ impl SchedulePolicy for KeyAffinityPolicy {
                 let load_preferred = load_for_deployment(&self.tracker, &self.queue_info, model, provider.as_ref());
                 let (min_load, least_loaded) = min_load_candidate(&self.tracker, &self.queue_info, model, candidates);
 
-                if load_preferred > min_load + self.rebalance_threshold {
+                if load_preferred > min_load + self.rebalance_threshold as u64 {
                     // Rebalance to least loaded.
                     if let Some(ref counter) = self.rebalance_counter {
                         counter.record();
