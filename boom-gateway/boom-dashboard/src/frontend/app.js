@@ -192,6 +192,7 @@
     }
     loadInflight();
     loadRebalanceStats();
+    loadRequestRateStats();
   }
 
   // ── In-Flight ─────────────────────────────────────────
@@ -258,7 +259,7 @@
 
   function startInflightPoll() {
     stopInflightPoll();
-    inflightTimer = setInterval(() => { loadInflight(); loadRebalanceStats(); }, 3000);
+    inflightTimer = setInterval(() => { loadInflight(); loadRebalanceStats(); loadRequestRateStats(); }, 3000);
   }
 
   function stopInflightPoll() {
@@ -305,6 +306,51 @@
     if (pct > 75) return "var(--danger)";
     if (pct > 40) return "#f59e0b";
     return "var(--primary)";
+  }
+
+  // ── Request Rate Charts ──────────────────────────────────
+  async function loadRequestRateStats() {
+    try {
+      const data = await api("/admin/stats/request_rate");
+      renderRequestRateCharts(data.charts || []);
+    } catch (err) {
+      console.error("loadRequestRateStats error:", err);
+    }
+  }
+
+  function renderRequestRateCharts(charts) {
+    const wrap = document.getElementById("request-rate-wrap");
+    if (!wrap) return;
+    if (!charts.length) { wrap.innerHTML = "<p>No data.</p>"; return; }
+
+    var html = "";
+    charts.forEach(function (chart) {
+      var events = chart.events || [];
+      if (!events.length) return;
+      var maxCount = Math.max(1, ...events.map(function (e) { return e.count; }));
+      var label = chart.deployment_id === "_total"
+        ? "ALL MODELS"
+        : esc(chart.model) + ":" + esc(chart.deployment_id);
+
+      var bars = events.map(function (e) {
+        var pct = (e.count / maxCount) * 100;
+        var showLabel = e.minute === "now" || e.minute.endsWith("0m") || e.minute.endsWith("5m");
+        var title = e.minute === "now" ? "Current minute" : e.minute.replace("-", "") + " ago: " + e.count + " req(s)";
+        return '<div class="rb-bar-col" title="' + esc(title) + '">' +
+          '<div class="rb-bar" style="height:' + Math.max(pct, 1) + '%;background:' + barColor(pct) + '"></div>' +
+          '<div class="rb-bar-label' + (showLabel ? "" : " rb-label-hidden") + '">' + esc(e.minute === "now" ? "now" : e.minute.replace("-","")) + '</div>' +
+          '</div>';
+      }).join("");
+
+      html += '<div style="margin-bottom:0.8rem">' +
+        '<div style="font-size:0.85em;font-weight:600;margin-bottom:2px;color:var(--text2)">' + label + '</div>' +
+        '<div class="rebalance-chart">' +
+        '<div class="rb-y-axis"><span>' + maxCount + '</span><span>0</span></div>' +
+        '<div class="rb-bars">' + bars + '</div>' +
+        '</div></div>';
+    });
+
+    wrap.innerHTML = html || "<p>No data.</p>";
   }
 
   function renderStatsTable(models) {

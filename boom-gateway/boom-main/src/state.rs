@@ -7,7 +7,7 @@ use boom_kvindex::{TokenPrefixIndex, TokenizerPool};
 use boom_core::kv_event::KvIndexBackend;
 use boom_limiter::{PlanStore, RateLimitPlan, ScheduleSlot, SlidingWindowLimiter};
 use boom_flowcontrol::{FlowControlConfig, FlowController};
-use boom_routing::{AliasStore, DeploymentStore, HybridRouter, InFlightTracker, KeyAffinityPolicy, RebalanceCounter, Router, RoundRobinPolicy, SchedulePolicy, StrategyRegistry, TierClassifier};
+use boom_routing::{AliasStore, DeploymentStore, HybridRouter, InFlightTracker, KeyAffinityPolicy, RebalanceCounter, RequestRateTracker, Router, RoundRobinPolicy, SchedulePolicy, StrategyRegistry, TierClassifier};
 use boom_promptlog::PromptLogWriter;
 use boom_provider;
 use dashmap::DashMap;
@@ -57,6 +57,8 @@ pub struct AppState {
     pub prompt_log_writer: PromptLogWriter,
     /// Key-affinity rebalance event counter (survives reloads).
     pub rebalance_counter: Arc<RebalanceCounter>,
+    /// Per-deployment request rate tracker (survives reloads).
+    pub request_rate: Arc<RequestRateTracker>,
     /// KV-cache prefix index (survives reloads). None if kvc_aware disabled.
     pub kv_index: Option<Arc<dyn KvIndexBackend>>,
     /// Tokenizer pool for computing prefix block hashes (survives reloads).
@@ -131,6 +133,7 @@ impl AppState {
 
         // Rebalance counter survives across reloads.
         let rebalance_counter = Arc::new(RebalanceCounter::new());
+        let request_rate = Arc::new(RequestRateTracker::new());
 
         // KV-cache index + tokenizer pool (survives reloads).
         // Driven by schedule_policy == "kvc_aware", not a separate enabled flag.
@@ -234,6 +237,7 @@ impl AppState {
             debug_store,
             prompt_log_writer,
             rebalance_counter,
+            request_rate,
             kv_index,
             tokenizer_pool,
         })

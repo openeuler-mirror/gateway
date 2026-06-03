@@ -379,6 +379,11 @@ async fn chat_completions_inner(
     let deployment_id = provider.deployment_id().map(|s| s.to_string());
     let inflight_model = state.router.resolve_model_name(&resolved_model);
 
+    // 3.1. Record request rate per deployment.
+    if let Some(ref did) = deployment_id {
+        state.request_rate.record(did);
+    }
+
     // 3.5. Flow control — queue if per-deployment limits exceeded.
     let fc_guard = if let Some(ref did) = deployment_id {
         acquire_fc_guard(
@@ -1548,6 +1553,11 @@ pub async fn messages(
 
     let deployment_id = provider.deployment_id().map(|s| s.to_string());
     let inflight_model = state.router.resolve_model_name(&resolved_model);
+
+    // 3.1. Record request rate per deployment.
+    if let Some(ref did) = deployment_id {
+        state.request_rate.record(did);
+    }
 
     // 3.5. Flow control — queue if per-deployment limits exceeded.
     let fc_guard = if let Some(ref did) = deployment_id {

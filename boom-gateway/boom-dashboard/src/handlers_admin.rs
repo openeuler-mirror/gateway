@@ -1868,6 +1868,30 @@ pub async fn get_rebalance_stats(
 }
 
 // ═══════════════════════════════════════════════════════════
+// Request Rate Stats (per deployment, last 60 minutes)
+// ═══════════════════════════════════════════════════════════
+
+pub async fn get_request_rate_stats(
+    _session: AdminSession,
+    Extension(state): Extension<Arc<DashboardState>>,
+) -> Response {
+    let all = state.request_rate.snapshot_all();
+    let charts: Vec<serde_json::Value> = all.into_iter().map(|(dep_id, data)| {
+        let model = if dep_id == "_total" {
+            "ALL".to_string()
+        } else {
+            state.deployment_store.find_model_by_deployment_id(&dep_id)
+                .unwrap_or_else(|| "-".to_string())
+        };
+        let events: Vec<serde_json::Value> = data.into_iter()
+            .map(|(label, count)| json!({ "minute": label, "count": count }))
+            .collect();
+        json!({ "deployment_id": dep_id, "model": model, "events": events })
+    }).collect();
+    Json(json!({ "charts": charts })).into_response()
+}
+
+// ═══════════════════════════════════════════════════════════
 // Rate Limit Window Reset
 // ═══════════════════════════════════════════════════════════
 
