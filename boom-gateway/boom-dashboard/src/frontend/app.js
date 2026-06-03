@@ -290,6 +290,7 @@
       const showLabel = e.minute === "now" || e.minute.endsWith("0m") || e.minute.endsWith("5m");
       const title = e.minute === "now" ? "Current minute" : e.minute.replace("-", "") + " ago: " + e.count + " rebalance(s)";
       return '<div class="rb-bar-col" title="' + esc(title) + '">' +
+        '<div class="rb-bar-value' + (e.count === 0 ? " rb-bar-value-zero" : "") + '">' + e.count + '</div>' +
         '<div class="rb-bar" style="height:' + Math.max(pct, 1) + '%;background:' + barColor(pct) + '"></div>' +
         '<div class="rb-bar-label' + (showLabel ? "" : " rb-label-hidden") + '">' + esc(e.minute === "now" ? "now" : e.minute.replace("-","")) + '</div>' +
         '</div>';
@@ -337,6 +338,7 @@
         var showLabel = e.minute === "now" || e.minute.endsWith("0m") || e.minute.endsWith("5m");
         var title = e.minute === "now" ? "Current minute" : e.minute.replace("-", "") + " ago: " + e.count + " req(s)";
         return '<div class="rb-bar-col" title="' + esc(title) + '">' +
+          '<div class="rb-bar-value' + (e.count === 0 ? " rb-bar-value-zero" : "") + '">' + e.count + '</div>' +
           '<div class="rb-bar" style="height:' + Math.max(pct, 1) + '%;background:' + barColor(pct) + '"></div>' +
           '<div class="rb-bar-label' + (showLabel ? "" : " rb-label-hidden") + '">' + esc(e.minute === "now" ? "now" : e.minute.replace("-","")) + '</div>' +
           '</div>';
