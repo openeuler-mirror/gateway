@@ -460,6 +460,15 @@ input[list] {
   height: 100%;
   justify-content: flex-end;
 }
+.rb-bar-value {
+  font-size: 0.55em;
+  color: var(--text3);
+  margin-bottom: 1px;
+  line-height: 1;
+}
+.rb-bar-value-zero {
+  visibility: hidden;
+}
 .rb-bar {
   width: 100%;
   min-height: 1px;

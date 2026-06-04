@@ -3,7 +3,7 @@ use boom_core::DebugErrorStore;
 use boom_flowcontrol::FlowController;
 use boom_limiter::{PlanStore, SlidingWindowLimiter};
 use boom_promptlog::PromptLogWriter;
-use boom_routing::{AliasStore, DeploymentStore, InFlightTracker, RebalanceCounter};
+use boom_routing::{AliasStore, DeploymentStore, InFlightTracker, RebalanceCounter, RequestRateTracker};
 use dashmap::DashMap;
 use serde_json::Value;
 use sqlx::PgPool;
@@ -84,6 +84,8 @@ pub struct DashboardState {
     pub prompt_log_writer: PromptLogWriter,
     /// Key-affinity rebalance event counter for dashboard stats.
     pub rebalance_counter: Arc<RebalanceCounter>,
+    /// Per-deployment request rate tracker for dashboard stats.
+    pub request_rate: Arc<RequestRateTracker>,
     /// Authenticator — used for key alias lookups (reads boom_verification_token).
     pub auth: Arc<dyn KeyAliasLookup>,
 }
@@ -102,6 +104,7 @@ impl DashboardState {
         debug_store: Arc<DebugErrorStore>,
         prompt_log_writer: PromptLogWriter,
         rebalance_counter: Arc<RebalanceCounter>,
+        request_rate: Arc<RequestRateTracker>,
         auth: Arc<dyn KeyAliasLookup>,
     ) -> Self {
         // Derive JWT secret from master_key, or use a random fallback.
@@ -124,6 +127,7 @@ impl DashboardState {
             debug_store,
             prompt_log_writer,
             rebalance_counter,
+            request_rate,
             auth,
         }
     }

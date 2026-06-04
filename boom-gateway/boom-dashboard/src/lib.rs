@@ -133,6 +133,11 @@ pub fn build_router<S: Clone + Send + Sync + 'static>(state: DashboardState) -> 
             "/dashboard/api/admin/stats/rebalance",
             get(handlers_admin::get_rebalance_stats),
         )
+        // Admin — Request Rate Stats per deployment (last 60 minutes).
+        .route(
+            "/dashboard/api/admin/stats/request_rate",
+            get(handlers_admin::get_request_rate_stats),
+        )
         // Admin — Rate Limit Window Reset.
         .route(
             "/dashboard/api/admin/limits/reset/{key_hash}",

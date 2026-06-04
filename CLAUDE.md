@@ -23,23 +23,7 @@ Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
 
 ## PR Review
 
-AtomGit 使用 GitLab 兼容协议，PR 称为 Merge Request，远程引用路径为 `refs/merge-requests/{N}/head`。
-
-### 获取 PR 代码
-
-```bash
-# 1. 拉取指定 MR 到本地分支
-git fetch atomgit refs/merge-requests/{N}/head:pr-{N}
-
-# 2. 查看提交记录
-git log --oneline pr-{N} --not atomgit/master
-
-# 3. 查看改动文件列表
-git diff --stat atomgit/master...pr-{N}
-
-# 4. 查看完整 diff
-git diff atomgit/master...pr-{N}
-```
+使用 `/atomgit_pr_review` skill 进行 PR 审查（含拉取代码、审查、发表评论的完整流程）。
 
 ### 审查重点
 
