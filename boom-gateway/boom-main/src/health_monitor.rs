@@ -216,8 +216,10 @@ fn health_client() -> reqwest::Client {
 
 fn health_url(target: &DeploymentHealthTarget, path: &str) -> Option<String> {
     let api_base = target.api_base.as_ref()?.trim_end_matches('/');
+    // Strip the /v1 suffix that api_base carries for routing — health endpoints sit at the root.
+    let base = api_base.strip_suffix("/v1").unwrap_or(api_base);
     let path = if path.starts_with('/') { path.to_string() } else { format!("/{}", path) };
-    Some(format!("{}{}", api_base, path))
+    Some(format!("{}{}", base, path))
 }
 
 async fn probe(client: &reqwest::Client, url: &str) -> Result<(), String> {
