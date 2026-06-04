@@ -62,6 +62,16 @@ pub struct DeploymentProviderRow {
     pub deployment_id: Option<String>,
 }
 
+/// Minimal deployment row used by boom-main health monitor.
+#[derive(Debug, sqlx::FromRow, Clone)]
+pub struct DeploymentHealthTarget {
+    pub model_name: String,
+    pub deployment_id: String,
+    pub api_base: Option<String>,
+    pub enabled: Option<bool>,
+    pub auto_disabled: Option<bool>,
+}
+
 /// Input for creating/updating a deployment in DB.
 #[derive(Debug, Clone)]
 pub struct DeploymentInput {
@@ -309,6 +319,18 @@ impl DeploymentStore {
         .await
     }
 
+    /// Load all deployment rows that can be probed by the health monitor.
+    pub async fn list_health_check_targets(pool: &sqlx::PgPool) -> Result<Vec<DeploymentHealthTarget>, sqlx::Error> {
+        sqlx::query_as::<_, DeploymentHealthTarget>(
+            r#"SELECT model_name, deployment_id, api_base, enabled, auto_disabled
+               FROM boom_model_deployment
+               WHERE deployment_id IS NOT NULL
+               ORDER BY model_name, created_at"#,
+        )
+        .fetch_all(pool)
+        .await
+    }
+
     /// Load enabled deployment rows for a specific model (for reload after update/delete).
     pub async fn load_model_rows(pool: &sqlx::PgPool, model_name: &str) -> Result<Vec<DeploymentProviderRow>, sqlx::Error> {
         sqlx::query_as::<_, DeploymentProviderRow>(
@@ -438,7 +460,7 @@ impl DeploymentStore {
         let row: Option<(String,)> = sqlx::query_as(
             r#"UPDATE boom_model_deployment
                SET enabled = false, auto_disabled = true, updated_at = NOW()
-               WHERE deployment_id = $1
+               WHERE deployment_id = $1 AND enabled IS NOT FALSE
                RETURNING model_name"#,
         )
         .bind(deployment_id)
@@ -449,6 +471,28 @@ impl DeploymentStore {
             tracing::warn!(
                 deployment_id = %deployment_id,
                 "No rows updated — deployment_id may not exist in DB"
+            );
+        }
+        Ok(row.map(|(name,)| name))
+    }
+
+    /// Auto-enable a deployment that was previously auto-disabled.
+    /// Returns the actual model_name of the enabled deployment, or None if not found/not auto-disabled.
+    pub async fn auto_enable_db(pool: &sqlx::PgPool, deployment_id: &str) -> Result<Option<String>, sqlx::Error> {
+        let row: Option<(String,)> = sqlx::query_as(
+            r#"UPDATE boom_model_deployment
+               SET enabled = true, auto_disabled = false, updated_at = NOW()
+               WHERE deployment_id = $1 AND auto_disabled = true
+               RETURNING model_name"#,
+        )
+        .bind(deployment_id)
+        .fetch_optional(pool)
+        .await?;
+
+        if row.is_none() {
+            tracing::warn!(
+                deployment_id = %deployment_id,
+                "No rows updated — deployment may not exist or was not auto-disabled"
             );
         }
         Ok(row.map(|(name,)| name))

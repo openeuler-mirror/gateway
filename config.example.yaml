@@ -94,6 +94,18 @@ general_settings:
   # store_model_in_db: false
 
 # ──────────────────────────────────────────────
+# 部署健康检查（自动离线/恢复）
+# ──────────────────────────────────────────────
+deployment_health_check:
+  auto_offline_enabled: false          # 在线节点探活失败后是否自动离线
+  auto_recovery_enabled: false         # 自动离线节点恢复后是否自动上线
+  path: /metric                        # 探活路径：GET {api_base}{path}
+  failure_threshold: 3                 # 连续失败次数达到阈值后自动离线
+  recovery_threshold: 2                # 连续成功次数达到阈值后自动恢复
+  offline_check_interval_secs: 30      # 在线节点探活间隔
+  recovery_check_interval_secs: 60     # 自动离线节点探活间隔
+
+# ──────────────────────────────────────────────
 # 路由设置
 # ──────────────────────────────────────────────
 router_settings:

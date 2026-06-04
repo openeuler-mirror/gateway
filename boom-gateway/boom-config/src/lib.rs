@@ -19,10 +19,50 @@ pub struct Config {
     pub rate_limit: RateLimitSettings,
     #[serde(default)]
     pub plan_settings: PlanSettings,
+    #[serde(default)]
+    pub deployment_health_check: DeploymentHealthCheckSettings,
     /// Prompt log configuration (transparent pass-through to boom-promptlog).
     #[serde(default)]
     pub prompt_log: Option<serde_json::Value>,
 }
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct DeploymentHealthCheckSettings {
+    #[serde(default)]
+    pub auto_offline_enabled: bool,
+    #[serde(default)]
+    pub auto_recovery_enabled: bool,
+    #[serde(default = "default_health_check_path")]
+    pub path: String,
+    #[serde(default = "default_failure_threshold")]
+    pub failure_threshold: u32,
+    #[serde(default = "default_recovery_threshold")]
+    pub recovery_threshold: u32,
+    #[serde(default = "default_offline_check_interval_secs")]
+    pub offline_check_interval_secs: u64,
+    #[serde(default = "default_recovery_check_interval_secs")]
+    pub recovery_check_interval_secs: u64,
+}
+
+impl Default for DeploymentHealthCheckSettings {
+    fn default() -> Self {
+        Self {
+            auto_offline_enabled: false,
+            auto_recovery_enabled: false,
+            path: default_health_check_path(),
+            failure_threshold: default_failure_threshold(),
+            recovery_threshold: default_recovery_threshold(),
+            offline_check_interval_secs: default_offline_check_interval_secs(),
+            recovery_check_interval_secs: default_recovery_check_interval_secs(),
+        }
+    }
+}
+
+fn default_health_check_path() -> String { "/metric".to_string() }
+fn default_failure_threshold() -> u32 { 3 }
+fn default_recovery_threshold() -> u32 { 2 }
+fn default_offline_check_interval_secs() -> u64 { 30 }
+fn default_recovery_check_interval_secs() -> u64 { 60 }
 
 /// A single plan definition in YAML config (plan name comes from the HashMap key).
 #[derive(Debug, Deserialize, Clone)]

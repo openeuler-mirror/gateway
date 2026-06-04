@@ -10,10 +10,11 @@ use boom_flowcontrol::{FlowControlConfig, FlowController};
 use boom_routing::{AliasStore, DeploymentStore, HybridRouter, InFlightTracker, KeyAffinityPolicy, RebalanceCounter, RequestRateTracker, Router, RoundRobinPolicy, SchedulePolicy, StrategyRegistry, TierClassifier};
 use boom_promptlog::PromptLogWriter;
 use boom_provider;
-use dashmap::DashMap;
 use sqlx::PgPool;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64};
+use std::sync::atomic::AtomicU64;
+
+use crate::health_monitor::DeploymentHealthStore;
 
 /// Shared application state.
 ///
@@ -47,8 +48,8 @@ pub struct AppState {
     pub inflight: Arc<InFlightTracker>,
     /// Request counter for periodic summary logging.
     pub request_count: Arc<AtomicU64>,
-    /// deployment_id → consecutive failure count (auto-disable threshold).
-    pub failure_counter: Arc<DashMap<String, Arc<AtomicU32>>>,
+    /// Deployment health counters for metric-driven auto offline/recovery.
+    pub deployment_health: Arc<DeploymentHealthStore>,
     /// Per-deployment flow controller (survives reloads).
     pub flow_controller: Arc<FlowController>,
     /// Debug error store — captures upstream error details on demand.
@@ -232,7 +233,7 @@ impl AppState {
             router,
             inflight,
             request_count: Arc::new(AtomicU64::new(0)),
-            failure_counter: Arc::new(DashMap::new()),
+            deployment_health: Arc::new(DeploymentHealthStore::new()),
             flow_controller,
             debug_store,
             prompt_log_writer,
