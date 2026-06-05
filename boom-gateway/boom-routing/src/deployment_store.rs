@@ -397,7 +397,9 @@ impl DeploymentStore {
                    aws_secret_access_key = COALESCE($10, aws_secret_access_key),
                    rpm = $11, tpm = $12, timeout = $13, headers = $14,
                    temperature = $15, max_tokens = $16, enabled = $17,
-                   auto_disabled = CASE WHEN $17 = true THEN false ELSE auto_disabled END,
+                   auto_disabled = CASE WHEN $17 = true THEN false
+                                       WHEN enabled IS NOT FALSE AND $17 = false THEN false
+                                       ELSE auto_disabled END,
                    deployment_id = COALESCE($18, deployment_id),
                    quota_count_ratio = $19,
                    max_inflight_queue_len = $20, max_context_len = $21,

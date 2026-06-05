@@ -215,7 +215,6 @@ pub async fn auto_disable_deployment(
     pool: &sqlx::PgPool,
     deployment_store: &Arc<DeploymentStore>,
     deployment_id: &str,
-    _requested_model: &str,
 ) {
     tracing::warn!(
         deployment_id = %deployment_id,
