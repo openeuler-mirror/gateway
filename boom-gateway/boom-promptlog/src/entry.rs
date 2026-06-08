@@ -1,6 +1,12 @@
 use serde::{Deserialize, Serialize};
 
 /// A single prompt log entry — one line in a JSONL file.
+///
+/// For non-streaming requests, `response` is the full response body.
+/// For streaming requests, `response` contains raw SSE chunks:
+/// ```json
+/// {"stream": true, "event_count": 42, "chunks": [{...}, {...}, ...]}
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PromptLogEntry {
     pub request_id: String,
@@ -24,7 +30,7 @@ pub struct PromptLogEntry {
     pub domain_account: Option<String>,
     /// Original request body (OpenAI or Anthropic format, stored as-is).
     pub request: serde_json::Value,
-    /// Full response body (non-stream) or accumulated content (stream).
+    /// Full response body (non-stream) or raw SSE chunks array (stream).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response: Option<serde_json::Value>,
 }

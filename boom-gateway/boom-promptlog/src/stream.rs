@@ -6,29 +6,22 @@ use std::task::{Context, Poll};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
-/// Stream wrapper that transparently passes through items while accumulating
-/// response content for prompt logging.
+/// Stream wrapper that accumulates raw SSE chunks and writes one log entry on Drop.
 ///
-/// On `Drop`, it sends a log entry with the accumulated response content
-/// to the writer channel.
+/// Unlike the old content-extracting approach, this stores each SSE event's raw
+/// JSON in a `chunks` array — no field-level parsing, no content extraction.
 pub struct PromptLogStream<S, F> {
     inner: S,
     sender: mpsc::UnboundedSender<PromptLogEntry>,
     entry: Option<PromptLogEntry>,
-    /// Start time for duration calculation.
     start: Instant,
-    /// Count of events that passed through.
     event_count: u64,
-    /// Accumulated text content from all SSE events.
-    content_buf: String,
-    /// Finish reason from the last event that carries one.
-    finish_reason: Option<String>,
-    /// Extractor closure: receives &S::Item, returns (text, finish_reason).
-    extractor: F,
+    /// Accumulated raw SSE chunks (parsed JSON values).
+    chunks: Vec<serde_json::Value>,
+    /// Extracts raw JSON data string from a stream item.
+    raw_data_fn: F,
 }
 
-// Safety: PromptLogStream does not use pin projection for any field.
-// All fields are either Unpin or accessed without pin projection.
 impl<S: Unpin, F: Unpin> Unpin for PromptLogStream<S, F> {}
 
 impl<S, F> PromptLogStream<S, F> {
@@ -36,7 +29,7 @@ impl<S, F> PromptLogStream<S, F> {
         inner: S,
         sender: mpsc::UnboundedSender<PromptLogEntry>,
         entry: PromptLogEntry,
-        extractor: F,
+        raw_data_fn: F,
     ) -> Self {
         let start = Instant::now();
         Self {
@@ -45,9 +38,8 @@ impl<S, F> PromptLogStream<S, F> {
             entry: Some(entry),
             start,
             event_count: 0,
-            content_buf: String::new(),
-            finish_reason: None,
-            extractor,
+            chunks: Vec::new(),
+            raw_data_fn,
         }
     }
 }
@@ -57,19 +49,11 @@ impl<S, F> Drop for PromptLogStream<S, F> {
         if let Some(mut entry) = self.entry.take() {
             let duration_ms = self.start.elapsed().as_millis() as u64;
 
-            let response = if self.content_buf.is_empty() {
-                serde_json::json!({
-                    "stream": true,
-                    "event_count": self.event_count,
-                })
-            } else {
-                serde_json::json!({
-                    "stream": true,
-                    "event_count": self.event_count,
-                    "content": self.content_buf,
-                    "finish_reason": self.finish_reason,
-                })
-            };
+            let response = serde_json::json!({
+                "stream": true,
+                "event_count": self.event_count,
+                "chunks": self.chunks,
+            });
 
             entry.set_response(response);
             entry.set_status(200, duration_ms);
@@ -81,11 +65,10 @@ impl<S, F> Drop for PromptLogStream<S, F> {
     }
 }
 
-/// Implement Stream that accumulates content and passes through items.
 impl<S, F> Stream for PromptLogStream<S, F>
 where
     S: Stream + Unpin,
-    F: FnMut(&S::Item) -> (Option<String>, Option<String>) + Unpin,
+    F: FnMut(&S::Item) -> Option<String> + Unpin,
 {
     type Item = S::Item;
 
@@ -94,12 +77,10 @@ where
         match this.inner.poll_next_unpin(cx) {
             Poll::Ready(Some(item)) => {
                 this.event_count += 1;
-                let (text, finish) = (this.extractor)(&item);
-                if let Some(t) = text {
-                    this.content_buf.push_str(&t);
-                }
-                if finish.is_some() {
-                    this.finish_reason = finish;
+                if let Some(raw) = (this.raw_data_fn)(&item) {
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) {
+                        this.chunks.push(val);
+                    }
                 }
                 Poll::Ready(Some(item))
             }
