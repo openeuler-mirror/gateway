@@ -364,9 +364,11 @@ async fn chat_completions_inner(
     if is_stream {
         let stream = provider.chat_stream(req).await.map_err(|e| {
             log_error(&state, &identity, &model, api_path, true, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()));
+            crate::health_monitor::record_request_failure(&state, &deployment_id, &e);
             rollback_plan_quota(&state.limiter, &rl_info);
             GatewayErrorReply(e, true)
         })?;
+        crate::health_monitor::reset_request_failure(&state, &deployment_id);
         let usage = UsageTracker::default();
         let sse_stream = sse_stream_from_chat_stream(stream, usage.clone(), debug);
         let inflight_guard = if let Some(ref did) = deployment_id {
@@ -432,9 +434,11 @@ async fn chat_completions_inner(
         };
         let response = provider.chat(req).await.map_err(|e| {
             log_error(&state, &identity, &model, api_path, false, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()));
+            crate::health_monitor::record_request_failure(&state, &deployment_id, &e);
             rollback_plan_quota(&state.limiter, &rl_info);
             GatewayErrorReply(e, false)
         })?;
+        crate::health_monitor::reset_request_failure(&state, &deployment_id);
 
         let duration_ms = start.elapsed().as_millis() as i32;
         let input_tokens = response.usage.prompt_tokens as i32;
@@ -1535,9 +1539,11 @@ pub async fn messages(
     if is_stream {
         let stream = provider.chat_stream(openai_req).await.map_err(|e| {
             log_error(&state, &identity, &model, "/v1/messages", true, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()));
+            crate::health_monitor::record_request_failure(&state, &deployment_id, &e);
             rollback_plan_quota(&state.limiter, &rl_info);
             AnthropicErrorReply(e, true)
         })?;
+        crate::health_monitor::reset_request_failure(&state, &deployment_id);
         let usage = UsageTracker::default();
         let sse_stream = sse_stream_from_anthropic_chat_stream(stream, model.clone(), usage.clone(), debug);
         let inflight_guard = if let Some(ref did) = deployment_id {
@@ -1602,9 +1608,11 @@ pub async fn messages(
         };
         let response = provider.chat(openai_req).await.map_err(|e| {
             log_error(&state, &identity, &model, "/v1/messages", false, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()));
+            crate::health_monitor::record_request_failure(&state, &deployment_id, &e);
             rollback_plan_quota(&state.limiter, &rl_info);
             AnthropicErrorReply(e, false)
         })?;
+        crate::health_monitor::reset_request_failure(&state, &deployment_id);
 
         let duration_ms = start.elapsed().as_millis() as i32;
         let input_tokens = response.usage.prompt_tokens as i32;

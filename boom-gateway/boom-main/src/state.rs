@@ -11,8 +11,9 @@ use boom_routing::{AliasStore, DeploymentStore, HybridRouter, InFlightTracker, K
 use boom_promptlog::PromptLogWriter;
 use boom_provider;
 use sqlx::PgPool;
+use dashmap::DashMap;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU32, AtomicU64};
 
 use crate::health_monitor::DeploymentHealthStore;
 
@@ -50,6 +51,8 @@ pub struct AppState {
     pub request_count: Arc<AtomicU64>,
     /// Deployment health counters for metric-driven auto offline/recovery.
     pub deployment_health: Arc<DeploymentHealthStore>,
+    /// Request-failure consecutive counters for request-driven auto-disable.
+    pub request_failure_counter: Arc<DashMap<String, AtomicU32>>,
     /// Per-deployment flow controller (survives reloads).
     pub flow_controller: Arc<FlowController>,
     /// Debug error store — captures upstream error details on demand.
@@ -234,6 +237,7 @@ impl AppState {
             inflight,
             request_count: Arc::new(AtomicU64::new(0)),
             deployment_health: Arc::new(DeploymentHealthStore::new()),
+            request_failure_counter: Arc::new(DashMap::new()),
             flow_controller,
             debug_store,
             prompt_log_writer,

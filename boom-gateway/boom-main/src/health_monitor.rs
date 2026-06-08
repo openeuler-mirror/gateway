@@ -1,6 +1,7 @@
 use crate::state::AppState;
 use boom_routing::DeploymentHealthTarget;
 use dashmap::DashMap;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Default)]
@@ -60,7 +61,58 @@ impl DeploymentHealthStore {
         entry.last_error = Some(error);
     }
 
-    fn clear(&self, deployment_id: &str) { self.counters.remove(deployment_id); }
+    pub fn clear(&self, deployment_id: &str) { self.counters.remove(deployment_id); }
+}
+
+pub fn record_request_failure(state: &AppState, deployment_id: &Option<String>, error: &boom_core::GatewayError) {
+    let cfg = &state.inner.load().config.deployment_health_check;
+    if !cfg.request_failure_auto_offline_enabled || !error.is_deployment_failure() {
+        return;
+    }
+
+    if let Some(ref did) = deployment_id {
+        let threshold = cfg.request_failure_threshold.max(1);
+        let counter = state.request_failure_counter
+            .entry(did.clone())
+            .or_insert_with(|| std::sync::atomic::AtomicU32::new(0));
+        let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+        tracing::warn!(
+            deployment_id = %did,
+            count,
+            threshold,
+            "Request failure recorded for deployment"
+        );
+
+        if count >= threshold {
+            let state = state.clone();
+            let did = did.clone();
+            tokio::spawn(async move {
+                if let Some(ref pool) = state.db_pool {
+                    crate::admin_command::auto_disable_deployment(
+                        pool,
+                        &state.deployment_store,
+                        &did,
+                    )
+                    .await;
+                }
+                state.deployment_health.clear(&did);
+                state.request_failure_counter.remove(&did);
+            });
+        }
+    }
+}
+
+pub fn reset_request_failure(state: &AppState, deployment_id: &Option<String>) {
+    let cfg = &state.inner.load().config.deployment_health_check;
+    if !cfg.request_failure_auto_offline_enabled {
+        return;
+    }
+
+    if let Some(ref did) = deployment_id {
+        if let Some(counter) = state.request_failure_counter.get(did) {
+            counter.store(0, Ordering::Relaxed);
+        }
+    }
 }
 
 pub fn spawn_deployment_health_monitor(
@@ -133,6 +185,7 @@ async fn run_offline_checker(state: AppState, mut shutdown: tokio::sync::broadca
                         )
                         .await;
                         state.deployment_health.clear(&target.deployment_id);
+                        state.request_failure_counter.remove(&target.deployment_id);
                     }
                 }
             }
@@ -196,6 +249,7 @@ async fn run_recovery_checker(state: AppState, mut shutdown: tokio::sync::broadc
                         )
                         .await;
                         state.deployment_health.clear(&target.deployment_id);
+                        state.request_failure_counter.remove(&target.deployment_id);
                     }
                 }
                 Err(e) => state.deployment_health.record_recovery_failure(&target.deployment_id, e),

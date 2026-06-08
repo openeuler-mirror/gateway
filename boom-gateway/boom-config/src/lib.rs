@@ -42,6 +42,10 @@ pub struct DeploymentHealthCheckSettings {
     pub offline_check_interval_secs: u64,
     #[serde(default = "default_recovery_check_interval_secs")]
     pub recovery_check_interval_secs: u64,
+    #[serde(default)]
+    pub request_failure_auto_offline_enabled: bool,
+    #[serde(default = "default_request_failure_threshold")]
+    pub request_failure_threshold: u32,
 }
 
 impl Default for DeploymentHealthCheckSettings {
@@ -54,6 +58,8 @@ impl Default for DeploymentHealthCheckSettings {
             recovery_threshold: default_recovery_threshold(),
             offline_check_interval_secs: default_offline_check_interval_secs(),
             recovery_check_interval_secs: default_recovery_check_interval_secs(),
+            request_failure_auto_offline_enabled: false,
+            request_failure_threshold: default_request_failure_threshold(),
         }
     }
 }
@@ -63,6 +69,7 @@ fn default_failure_threshold() -> u32 { 3 }
 fn default_recovery_threshold() -> u32 { 2 }
 fn default_offline_check_interval_secs() -> u64 { 30 }
 fn default_recovery_check_interval_secs() -> u64 { 60 }
+fn default_request_failure_threshold() -> u32 { 3 }
 
 /// A single plan definition in YAML config (plan name comes from the HashMap key).
 #[derive(Debug, Deserialize, Clone)]
