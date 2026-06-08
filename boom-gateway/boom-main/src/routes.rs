@@ -146,24 +146,6 @@ fn new_request_id() -> String {
 // Debug logging — dump full request/response for specific keys
 // ═══════════════════════════════════════════════════════════
 
-const DEBUG_KEY_PATTERN: &str = "fortest";
-
-fn is_debug_key(key_alias: Option<&str>) -> bool {
-    key_alias.map(|a| a.contains(DEBUG_KEY_PATTERN)).unwrap_or(false)
-}
-
-fn debug_append(label: &str, data: &str) {
-    use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("reqs.log")
-    {
-        let ts = chrono::Utc::now().to_rfc3339();
-        let _ = writeln!(f, "\n===== {} {} =====\n{}", ts, label, data);
-        let _ = f.flush();
-    }
-}
 
 // ============================================================
 // InFlightStream — wraps a stream with an InFlightGuard so the
@@ -273,11 +255,6 @@ async fn chat_completions_inner(
     let is_stream = req.stream.unwrap_or(false);
 
     tracing::info!(request_id = %request_id, model = %model, stream = is_stream, path = api_path, "chat_completions request started");
-
-    let debug = is_debug_key(identity.key_alias.as_deref());
-    if debug {
-        debug_append("REQUEST", &serde_json::to_string(&req).unwrap_or_default());
-    }
 
     // Prompt log: check early to avoid unnecessary cloning.
     let prompt_log_should = state.prompt_log_writer.should_capture(
@@ -414,7 +391,7 @@ async fn chat_completions_inner(
         })?;
         reset_deployment_failure(&state, &deployment_id);
         let usage = UsageTracker::default();
-        let sse_stream = sse_stream_from_chat_stream(stream, usage.clone(), debug);
+        let sse_stream = sse_stream_from_chat_stream(stream, usage.clone());
         let inflight_guard = if let Some(ref did) = deployment_id {
             InFlightGuard::new_for_deployment(state.inflight.clone(), &inflight_model, did, input_chars as u64)
         } else {
@@ -463,7 +440,7 @@ async fn chat_completions_inner(
                     req_body,
                     Some(&client_ip),
                 );
-                let prompt_logged = PromptLogStream::new(logged, sender, prompt_entry, sse_item_extractor());
+                let prompt_logged = PromptLogStream::new(logged, sender, prompt_entry, sse_raw_data_extractor());
                 let response = Sse::new(sse_item_to_event(prompt_logged)).keep_alive(KeepAlive::default());
                 return Ok(response.into_response());
             }
@@ -1314,7 +1291,6 @@ fn log_request_summary(
 fn sse_stream_from_chat_stream(
     stream: ChatStream,
     usage: UsageTracker,
-    debug: bool,
 ) -> impl futures::Stream<Item = Result<SseItem, Infallible>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<SseItem>(32);
     tokio::spawn(async move {
@@ -1323,9 +1299,6 @@ fn sse_stream_from_chat_stream(
         while let Some(result) = stream.next().await {
             match result {
                 Ok(mut chunk) => {
-                    if debug {
-                        debug_append("STREAM CHUNK", &serde_json::to_string(&chunk).unwrap_or_default());
-                    }
                     if let Some(ref u) = chunk.usage {
                         if let Ok(mut g) = usage.lock() {
                             g.0 = u.prompt_tokens;
@@ -1411,9 +1384,6 @@ fn sse_stream_from_chat_stream(
                     }
                 }
                 Err(e) => {
-                    if debug {
-                        debug_append("STREAM ERROR", &e.to_string());
-                    }
                     tracing::error!("SSE stream error (OpenAI): {}", e);
                     let error_data =
                         serde_json::to_string(&serde_json::json!({"error": "Upstream error"}))
@@ -1448,10 +1418,6 @@ pub async fn messages(
 
     tracing::info!(request_id = %request_id, model = %model, stream = is_stream, "messages request started");
 
-    let debug = is_debug_key(identity.key_alias.as_deref());
-    if debug {
-        debug_append("REQUEST (anthropic)", &serde_json::to_string(&req).unwrap_or_default());
-    }
 
     // Prompt log: check early to avoid unnecessary cloning.
     let prompt_log_should = state.prompt_log_writer.should_capture(
@@ -1589,7 +1555,7 @@ pub async fn messages(
         })?;
         reset_deployment_failure(&state, &deployment_id);
         let usage = UsageTracker::default();
-        let sse_stream = sse_stream_from_anthropic_chat_stream(stream, model.clone(), usage.clone(), debug);
+        let sse_stream = sse_stream_from_anthropic_chat_stream(stream, model.clone(), usage.clone());
         let inflight_guard = if let Some(ref did) = deployment_id {
             InFlightGuard::new_for_deployment(state.inflight.clone(), &inflight_model, did, input_chars as u64)
         } else {
@@ -1637,7 +1603,7 @@ pub async fn messages(
                     req_body,
                     Some(&client_ip.as_str()),
                 );
-                let prompt_logged = PromptLogStream::new(logged, sender, prompt_entry, sse_item_extractor());
+                let prompt_logged = PromptLogStream::new(logged, sender, prompt_entry, sse_raw_data_extractor());
                 let response = Sse::new(sse_item_to_event(prompt_logged)).keep_alive(KeepAlive::default());
                 return Ok(response.into_response());
             }
@@ -1716,7 +1682,6 @@ fn sse_stream_from_anthropic_chat_stream(
     stream: ChatStream,
     model: String,
     usage: UsageTracker,
-    debug: bool,
 ) -> impl futures::Stream<Item = Result<SseItem, Infallible>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<SseItem>(64);
 
@@ -1727,9 +1692,6 @@ fn sse_stream_from_anthropic_chat_stream(
         while let Some(result) = stream.next().await {
             match result {
                 Ok(chunk) => {
-                    if debug {
-                        debug_append("STREAM CHUNK (anthropic)", &serde_json::to_string(&chunk).unwrap_or_default());
-                    }
                     // Extract usage from the chunk (OpenAI sends usage in the final chunk).
                     if let Some(ref u) = chunk.usage {
                         if let Ok(mut g) = usage.lock() {
@@ -1738,11 +1700,6 @@ fn sse_stream_from_anthropic_chat_stream(
                         }
                     }
                     let events = transcoder.transcode(&chunk);
-                    for ev in &events {
-                        if debug {
-                            debug_append("ANTHROPIC SSE", &format!("event: {} | data: {}", ev.event, ev.data));
-                        }
-                    }
                     for ev in events {
                         let item = SseItem {
                             event: Event::default().event(&ev.event).data(&ev.data),
@@ -1754,9 +1711,7 @@ fn sse_stream_from_anthropic_chat_stream(
                     }
                 }
                 Err(e) => {
-                    if debug {
-                        debug_append("STREAM ERROR (anthropic)", &e.to_string());
-                    }
+                    tracing::error!("SSE stream error (Anthropic): {}", e);
                     let error_data = serde_json::json!({
                         "type": "error",
                         "error": { "type": "api_error", "message": "Upstream error" }
@@ -1892,69 +1847,11 @@ where
     })
 }
 
-/// Returns a closure that extracts (text, finish_reason) from an SSE stream item.
-fn sse_item_extractor() -> impl FnMut(&Result<SseItem, Infallible>) -> (Option<String>, Option<String>) {
+/// Returns a closure that extracts raw JSON data from an SSE stream item.
+fn sse_raw_data_extractor() -> impl FnMut(&Result<SseItem, Infallible>) -> Option<String> + Unpin {
     |item: &Result<SseItem, Infallible>| match item {
-        Ok(sse_item) => extract_sse_item_content(&sse_item.json_data),
-        Err(_) => (None, None),
-    }
-}
-
-/// Parse an SSE event's JSON data to extract text content and finish reason.
-/// Handles both OpenAI and Anthropic streaming formats.
-fn extract_sse_item_content(data: &str) -> (Option<String>, Option<String>) {
-    let Ok(val) = serde_json::from_str::<serde_json::Value>(data) else {
-        return (None, None);
-    };
-
-    // OpenAI chat completion chunk format:
-    // {"choices":[{"delta":{"content":"..."}}]}
-    // {"choices":[{"delta":{},"finish_reason":"stop"}]}
-    if let Some(choices) = val.get("choices").and_then(|c| c.as_array()) {
-        if let Some(choice) = choices.first() {
-            let text = choice
-                .get("delta")
-                .and_then(|d| d.get("content"))
-                .and_then(|c| c.as_str())
-                .filter(|s| !s.is_empty())
-                .map(|s| s.to_string());
-
-            let finish_reason = choice
-                .get("finish_reason")
-                .and_then(|f| f.as_str())
-                .filter(|s| *s != "null" && !s.is_empty())
-                .map(|s| s.to_string());
-
-            return (text, finish_reason);
-        }
-        return (None, None);
-    }
-
-    // Anthropic SSE format:
-    // {"type":"content_block_delta","delta":{"type":"text_delta","text":"..."}}
-    // {"type":"message_delta","delta":{"stop_reason":"end_turn"},...}
-    let event_type = val.get("type").and_then(|t| t.as_str()).unwrap_or("");
-
-    match event_type {
-        "content_block_delta" => {
-            let text = val
-                .get("delta")
-                .and_then(|d| d.get("text"))
-                .and_then(|t| t.as_str())
-                .filter(|s| !s.is_empty())
-                .map(|s| s.to_string());
-            (text, None)
-        }
-        "message_delta" => {
-            let finish_reason = val
-                .get("delta")
-                .and_then(|d| d.get("stop_reason"))
-                .and_then(|r| r.as_str())
-                .filter(|s| *s != "null" && !s.is_empty())
-                .map(|s| s.to_string());
-            (None, finish_reason)
-        }
-        _ => (None, None),
+        Ok(sse_item) => Some(sse_item.json_data.clone()),
+        Err(_) => None,
     }
 }
 

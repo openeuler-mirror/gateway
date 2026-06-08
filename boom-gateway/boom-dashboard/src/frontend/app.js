@@ -1310,6 +1310,7 @@
 
   function hideModal() {
     document.getElementById("modal-overlay").classList.add("hidden");
+    document.getElementById("modal-content").classList.remove("modal-wide");
   }
   window.hideModal = hideModal;
 
@@ -1794,29 +1795,146 @@
   window._viewPromptLog = async function(requestId, keyHash, teamAlias) {
     const overlay = document.getElementById("modal-overlay");
     const modalEl = overlay ? overlay.querySelector(".modal") : null;
-    // Widen modal for JSON viewing.
-    if (modalEl) modalEl.style.width = "90vw";
+    // Widen modal for JSON viewing via CSS class (cleared on hideModal).
+    if (modalEl) modalEl.classList.add("modal-wide");
     showModal('<div style="text-align:center;padding:40px">Loading...</div>');
     try {
       const params = new URLSearchParams({ key_hash: keyHash });
       if (teamAlias) params.set("team_alias", teamAlias);
       const data = await api("/admin/prompt-log/entry/" + encodeURIComponent(requestId) + "?" + params);
-      const json = JSON.stringify(data, null, 2);
+      const containerId = "plj-" + Date.now();
       showModal(
-        '<h3 style="margin-bottom:12px">Prompt Log Detail</h3>' +
-        '<div style="max-height:72vh;overflow:auto;background:#1e1e2e;color:#cdd6f4;padding:16px;border-radius:8px;font-size:13px;line-height:1.5;white-space:pre-wrap;word-break:break-word;font-family:Menlo,Consolas,monospace">' +
-        esc(json) + '</div>'
+        '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">' +
+        '<h3 style="margin:0">Prompt Log Detail</h3>' +
+        '<div style="display:flex;gap:6px">' +
+        '<button class="btn-small" id="' + containerId + '-collapse">Collapse All</button>' +
+        '<button class="btn-small" id="' + containerId + '-expand">Expand All</button>' +
+        '<button class="btn-small" id="' + containerId + '-raw">Raw JSON</button>' +
+        '</div></div>' +
+        '<div id="' + containerId + '" style="max-height:72vh;overflow:auto;background:#1e1e2e;color:#cdd6f4;padding:16px;border-radius:8px;font-size:13px;line-height:1.5;font-family:Menlo,Consolas,monospace"></div>' +
+        '<pre id="' + containerId + '-rawpre" style="display:none;max-height:72vh;overflow:auto;background:#1e1e2e;color:#cdd6f4;padding:16px;border-radius:8px;font-size:13px;line-height:1.5;white-space:pre-wrap;word-break:break-word;font-family:Menlo,Consolas,monospace">' + esc(JSON.stringify(data, null, 2)) + '</pre>'
       );
+      const tree = document.getElementById(containerId);
+      renderJsonTree(data, tree);
+      document.getElementById(containerId + "-collapse").onclick = () => {
+        tree.querySelectorAll(".jvt-toggle.open").forEach(el => el.click());
+      };
+      document.getElementById(containerId + "-expand").onclick = () => {
+        tree.querySelectorAll(".jvt-toggle:not(.open)").forEach(el => el.click());
+      };
+      document.getElementById(containerId + "-raw").onclick = (e) => {
+        const rawPre = document.getElementById(containerId + "-rawpre");
+        const showing = rawPre.style.display !== "none";
+        rawPre.style.display = showing ? "none" : "block";
+        tree.style.display = showing ? "block" : "none";
+        e.target.textContent = showing ? "Raw JSON" : "Tree View";
+      };
     } catch (err) {
       showModal('<div style="padding:20px;color:var(--danger)">Failed to load prompt log: ' + esc(err.message) + '</div>');
     }
-    // Restore modal width on close.
-    const restoreWidth = () => {
-      if (modalEl) modalEl.style.width = "";
-      overlay.removeEventListener("click", restoreWidth);
-    };
-    overlay.addEventListener("click", restoreWidth);
   };
+
+  // JSON tree renderer with collapsible nodes.
+  function renderJsonTree(val, container, depth) {
+    depth = depth || 0;
+    const maxDepth = 3; // auto-expand up to this depth
+    if (val === null || val === undefined) {
+      container.appendChild(document.createTextNode("null"));
+      return;
+    }
+    if (typeof val === "boolean" || typeof val === "number") {
+      container.appendChild(document.createTextNode(String(val)));
+      return;
+    }
+    if (typeof val === "string") {
+      // Long strings (likely content): truncate with expand
+      if (val.length > 500) {
+        const short = document.createElement("span");
+        short.className = "jvt-str-preview";
+        short.textContent = JSON.stringify(val.substring(0, 200)) + ' … (' + val.length + ' chars)';
+        short.title = "Click to show full string";
+        short.style.cursor = "pointer";
+        short.style.color = "#a5d6ff";
+        const full = document.createElement("span");
+        full.className = "jvt-str-full";
+        full.style.display = "none";
+        full.textContent = JSON.stringify(val);
+        short.onclick = () => { short.style.display = "none"; full.style.display = "inline"; };
+        full.onclick = () => { full.style.display = "none"; short.style.display = "inline"; };
+        full.style.cursor = "pointer";
+        full.style.color = "#a5d6ff";
+        container.appendChild(short);
+        container.appendChild(full);
+      } else {
+        const s = document.createElement("span");
+        s.style.color = "#a5d6ff";
+        s.textContent = JSON.stringify(val);
+        container.appendChild(s);
+      }
+      return;
+    }
+    const isArr = Array.isArray(val);
+    const entries = isArr ? val.map((v, i) => [i, v]) : Object.entries(val);
+    if (entries.length === 0) {
+      container.appendChild(document.createTextNode(isArr ? "[]" : "{}"));
+      return;
+    }
+    // Collapsible block
+    const toggle = document.createElement("span");
+    toggle.className = "jvt-toggle" + (depth < maxDepth ? " open" : "");
+    toggle.textContent = depth < maxDepth ? "▼" : "▶";
+    toggle.style.cursor = "pointer";
+    toggle.style.userSelect = "none";
+    toggle.style.marginRight = "4px";
+    toggle.style.color = "#7c8594";
+
+    const summary = document.createElement("span");
+    summary.className = "jvt-summary";
+    summary.textContent = isArr ? "[" + entries.length + " items]" : "{" + entries.length + " keys}";
+    summary.style.color = "#7c8594";
+    summary.style.marginRight = "4px";
+    summary.style.display = depth < maxDepth ? "none" : "inline";
+
+    const body = document.createElement("div");
+    body.className = "jvt-body";
+    body.style.display = depth < maxDepth ? "block" : "none";
+    body.style.marginLeft = "16px";
+    body.style.borderLeft = "1px solid #3a3f4b";
+    body.style.paddingLeft = "8px";
+
+    entries.forEach(function(entry) {
+      var line = document.createElement("div");
+      line.style.marginTop = "2px";
+      if (!isArr) {
+        var keySpan = document.createElement("span");
+        keySpan.style.color = "#d2a8ff";
+        keySpan.textContent = JSON.stringify(entry[0]) + ": ";
+        line.appendChild(keySpan);
+      }
+      renderJsonTree(entry[1], line, depth + 1);
+      body.appendChild(line);
+    });
+
+    var closing = document.createElement("span");
+    closing.className = "jvt-close";
+    closing.textContent = isArr ? "]" : "}";
+    closing.style.color = "#7c8594";
+
+    toggle.onclick = function() {
+      var isOpen = toggle.classList.toggle("open");
+      toggle.textContent = isOpen ? "▼" : "▶";
+      body.style.display = isOpen ? "block" : "none";
+      closing.style.display = isOpen ? "none" : "inline";
+      summary.style.display = isOpen ? "none" : "inline";
+    };
+
+    container.appendChild(toggle);
+    container.appendChild(summary);
+    container.appendChild(document.createTextNode(isArr ? "[" : "{"));
+    container.appendChild(body);
+    container.appendChild(closing);
+    container.appendChild(document.createTextNode("\n"));
+  }
 
   // ── Model Checkbox Combo ──────────────────────────────
   // Renders a custom multi-select dropdown with checkboxes.
