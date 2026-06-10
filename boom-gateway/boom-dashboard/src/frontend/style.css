@@ -703,20 +703,21 @@ tr.filter-row td { padding: 3px 4px; background: var(--surface2); border-bottom:
 
 /* ── Table cell tooltip ─────────────────────────────────── */
 .cell-tip { position: relative; cursor: default; }
-.cell-tip::after {
-  content: attr(data-tip);
-  position: absolute; left: 50%; bottom: calc(100% + 6px);
-  transform: translateX(-50%);
+
+/* ── Global tooltip (JS positioned) ─────────────────────── */
+#vtip {
+  position: fixed; z-index: 999;
   background: var(--text); color: var(--text-inv);
   font-size: 12px; font-weight: 400; line-height: 1.5;
   letter-spacing: 0; text-transform: none;
-  padding: 6px 10px; border-radius: 8px;
-  white-space: pre-wrap; width: max-content; max-width: 280px;
-  z-index: 200; pointer-events: none;
-  opacity: 0; transition: opacity .15s ease;
-  box-shadow: var(--shadow-md);
+  padding: 8px 12px; border-radius: 8px;
+  white-space: pre-wrap; max-width: 320px;
+  box-shadow: var(--shadow-lg);
+  pointer-events: none; opacity: 0;
+  transition: opacity .12s ease;
+  word-break: break-word;
 }
-.cell-tip:hover::after { opacity: 1; }
+#vtip.show { opacity: 1; }
 
 /* ── Datalist styling ───────────────────────────────────── */
 input[list] {

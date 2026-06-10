@@ -1838,14 +1838,18 @@ fn aggregate_dispatched_keys(keys: Option<&Vec<boom_flowcontrol::DispatchedKeyEn
         Some(e) => e,
         None => return Vec::new(),
     };
-    let mut counts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    // Aggregate by key_alias, tracking count and is_vip (true if any entry was VIP).
+    let mut acc: std::collections::HashMap<String, (u64, bool)> = std::collections::HashMap::new();
     for entry in entries {
-        *counts.entry(entry.key_alias.clone()).or_insert(0) += 1;
+        let e = acc.entry(entry.key_alias.clone()).or_insert((0, false));
+        e.0 += 1;
+        e.1 = e.1 || entry.is_vip;
     }
-    let mut result: Vec<serde_json::Value> = counts.into_iter()
-        .map(|(alias, count)| json!({
+    let mut result: Vec<serde_json::Value> = acc.into_iter()
+        .map(|(alias, (count, is_vip))| json!({
             "key_alias": alias,
             "request_count": count,
+            "is_vip": is_vip,
         }))
         .collect();
     result.sort_by(|a, b| b["request_count"].as_u64().cmp(&a["request_count"].as_u64()));

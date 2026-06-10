@@ -82,9 +82,45 @@
     setupAdminButtons();
     setupThemeToggle();
     updateThemeIcons();
+    setupViewportTooltip();
     window.addEventListener("hashchange", () => { onRoute(); onUserRoute(); });
     checkSession();
   });
+
+  // ── Viewport-aware tooltip for .cell-tip ──────────────
+  // Positions tooltip above or below the element depending on available space.
+  function setupViewportTooltip() {
+    var tip = document.getElementById("vtip");
+    if (!tip) return;
+    document.addEventListener("mouseover", function(e) {
+      var el = e.target.closest(".cell-tip");
+      if (!el || !el.dataset.tip) { tip.classList.remove("show"); return; }
+      tip.textContent = el.dataset.tip;
+      tip.classList.add("show");
+      // Measure after adding to DOM
+      var r = el.getBoundingClientRect();
+      var tw = tip.offsetWidth;
+      var th = tip.offsetHeight;
+      var vw = window.innerWidth;
+      var vh = window.innerHeight;
+      // Default: above, centered
+      var top = r.top - th - 8;
+      var left = r.left + r.width / 2 - tw / 2;
+      // Not enough space above → flip below
+      if (top < 4) top = r.bottom + 8;
+      // Clamp horizontal
+      if (left < 4) left = 4;
+      if (left + tw > vw - 4) left = vw - tw - 4;
+      // If still off-screen bottom, just clamp
+      if (top + th > vh - 4) top = vh - th - 4;
+      tip.style.top = top + "px";
+      tip.style.left = left + "px";
+    });
+    document.addEventListener("mouseout", function(e) {
+      var el = e.target.closest(".cell-tip");
+      if (el) tip.classList.remove("show");
+    });
+  }
 
   function setupThemeToggle() {
     document.querySelectorAll(".theme-toggle").forEach(function(btn) {
@@ -271,8 +307,8 @@
           var fcQueueHtml = String(d.fc_queue);
           if (d.fc_queue > 0 && d.queued_keys && d.queued_keys.length > 0) {
             var items = d.queued_keys.map(function (k) {
-              var prefix = k.is_vip ? "[VIP] " : "";
-              return prefix + esc(k.key_alias || "?");
+              var vipTag = k.is_vip ? "★ " : "";
+              return vipTag + esc(k.key_alias || "?");
             });
             fcQueueHtml = '<span class="cell-tip" data-tip="' + items.join("&#10;").replace(/"/g, "&quot;") + '">' + d.fc_queue + '</span>';
           }
@@ -281,7 +317,8 @@
           var reqsHtml = reqsDisplay;
           if (d.in_reqs > 0 && d.key_stats && d.key_stats.length > 0) {
             var reqItems = d.key_stats.map(function (k) {
-              return esc(k.key_alias || "?") + ": " + k.request_count;
+              var vipTag = k.is_vip ? "★ " : "";
+              return vipTag + esc(k.key_alias || "?") + ": " + k.request_count;
             });
             reqsHtml = '<span class="cell-tip" data-tip="' + reqItems.join("&#10;").replace(/"/g, "&quot;") + '">' + reqsDisplay + '</span>';
           }
