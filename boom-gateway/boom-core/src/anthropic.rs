@@ -129,10 +129,9 @@ pub fn openai_response_to_anthropic(resp: &ChatCompletionResponse) -> AnthropicM
                                     .push(AnthropicResponseContentBlock::Text { text: text.clone() });
                             }
                         }
-                        ContentPart::Reasoning { reasoning } => {
-                            content_blocks.push(AnthropicResponseContentBlock::Thinking {
-                                thinking: reasoning.clone(),
-                            });
+                        ContentPart::Reasoning { .. } => {
+                            // Silently dropped — litellm also does not convert
+                            // reasoning_content → thinking blocks for Anthropic format.
                         }
                         _ => {}
                     }
@@ -200,8 +199,6 @@ pub struct AnthropicStreamTranscoder {
     message_started: bool,
     content_block_index: u32,
     text_block_open: bool,
-    /// Whether a thinking block is currently open.
-    thinking_block_open: bool,
     /// Maps OpenAI tool_call index → Anthropic content block index.
     tool_block_map: HashMap<u32, u32>,
     /// Buffers argument fragments per OpenAI tool_call index.
@@ -224,7 +221,6 @@ impl AnthropicStreamTranscoder {
             message_started: false,
             content_block_index: 0,
             text_block_open: false,
-            thinking_block_open: false,
             tool_block_map: HashMap::new(),
             tool_arg_buf: HashMap::new(),
             input_tokens: 0,
@@ -235,18 +231,9 @@ impl AnthropicStreamTranscoder {
         }
     }
 
-    /// Close the currently open content block (text or thinking) if any.
+    /// Close the currently open content block (text or tool) if any.
     fn close_open_block(&mut self, events: &mut Vec<AnthropicSseEvent>) {
-        if self.thinking_block_open {
-            self.thinking_block_open = false;
-            let idx = self.content_block_index;
-            self.content_block_index += 1;
-            events.push(AnthropicSseEvent {
-                event: "content_block_stop".to_string(),
-                data: serde_json::json!({ "type": "content_block_stop", "index": idx })
-                    .to_string(),
-            });
-        } else if self.text_block_open {
+        if self.text_block_open {
             self.text_block_open = false;
             let idx = self.content_block_index;
             self.content_block_index += 1;
@@ -311,59 +298,13 @@ impl AnthropicStreamTranscoder {
                 });
             }
 
-            // Reasoning content delta → thinking block.
-            if let Some(ref reasoning) = choice.delta.reasoning_content {
-                if !reasoning.is_empty() {
-                    // Close text block if open (thinking comes before text).
-                    if self.text_block_open {
-                        self.text_block_open = false;
-                        let idx = self.content_block_index;
-                        self.content_block_index += 1;
-                        events.push(AnthropicSseEvent {
-                            event: "content_block_stop".to_string(),
-                            data: serde_json::json!({ "type": "content_block_stop", "index": idx })
-                                .to_string(),
-                        });
-                    }
-                    if !self.thinking_block_open {
-                        self.thinking_block_open = true;
-                        let idx = self.content_block_index;
-                        events.push(AnthropicSseEvent {
-                            event: "content_block_start".to_string(),
-                            data: serde_json::json!({
-                                "type": "content_block_start",
-                                "index": idx,
-                                "content_block": { "type": "thinking", "thinking": "" }
-                            })
-                            .to_string(),
-                        });
-                    }
-                    events.push(AnthropicSseEvent {
-                        event: "content_block_delta".to_string(),
-                        data: serde_json::json!({
-                            "type": "content_block_delta",
-                            "index": self.content_block_index,
-                            "delta": { "type": "thinking_delta", "thinking": reasoning }
-                        })
-                        .to_string(),
-                    });
-                }
-            }
+            // Reasoning content delta — silently dropped for Anthropic format.
+            // litellm also does not convert reasoning_content → thinking blocks.
 
             // Text content delta — only open a text block when there's actual text.
             if let Some(ref text) = choice.delta.content {
                 if !text.is_empty() {
                     // Close thinking block before starting text.
-                    if self.thinking_block_open {
-                        self.thinking_block_open = false;
-                        let idx = self.content_block_index;
-                        self.content_block_index += 1;
-                        events.push(AnthropicSseEvent {
-                            event: "content_block_stop".to_string(),
-                            data: serde_json::json!({ "type": "content_block_stop", "index": idx })
-                                .to_string(),
-                        });
-                    }
                     if !self.text_block_open {
                         self.text_block_open = true;
                         let idx = self.content_block_index;
