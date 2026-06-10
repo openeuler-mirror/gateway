@@ -1,7 +1,6 @@
 use crate::routes::GatewayErrorReply;
 use crate::state::AppState;
 use axum::extract::FromRequestParts;
-use axum::http::header::HeaderValue;
 use axum::http::request::Parts;
 use boom_core::types::AuthIdentity;
 use boom_core::GatewayError;
@@ -78,6 +77,7 @@ fn extract_api_key(parts: &Parts) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::extract_api_key;
+    use axum::http::header::HeaderValue;
     use axum::http::Request;
 
     fn extract_from_header(name: &str, value: &str) -> Option<String> {

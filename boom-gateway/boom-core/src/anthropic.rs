@@ -101,6 +101,7 @@ pub fn anthropic_request_to_openai(req: &AnthropicMessagesRequest) -> ChatComple
         top_logprobs: None,
         logit_bias: None,
         extra,
+        gateway_headers: HashMap::new(),
     }
 }
 
