@@ -65,5 +65,11 @@ pub async fn run_request_log_migration(pool: &sqlx::PgPool) -> Result<(), sqlx::
     )
     .execute(pool)
     .await;
+    // Add ttft_ms column for streaming Time-To-First-Token tracking (no-op if already present).
+    let _ = sqlx::query(
+        r#"ALTER TABLE boom_request_log ADD COLUMN IF NOT EXISTS ttft_ms INTEGER"#,
+    )
+    .execute(pool)
+    .await;
     Ok(())
 }

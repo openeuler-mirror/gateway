@@ -587,35 +587,52 @@
 
   function renderUsage(usage) {
     const el = document.getElementById("usage-info");
-    const concLimit = usage.concurrency_limit || "-";
-    let html = `<p>Current concurrency: <strong>${usage.concurrency}</strong> / ${concLimit}</p>`;
-    if (usage.windows.length === 0) {
-      html += "<p>No active rate limit windows.</p>";
+    let html = '<div class="usage-grid">';
+
+    // Concurrency card
+    const concLimit = usage.concurrency_limit;
+    const concCount = usage.concurrency;
+    if (concLimit != null) {
+      html += `<div class="usage-limit-card">
+        <div class="usage-limit-title">Concurrency</div>
+        <div class="usage-limit-count">${concCount} / ${concLimit}</div>
+        <div class="usage-limit-reset">Simultaneous requests</div>
+      </div>`;
     } else {
-      html += '<table><tr><th>Plan</th><th>Window</th><th>Count</th><th>Progress</th></tr>';
-      const planName = usage.plan_name || "-";
-      usage.windows.forEach((w) => {
-        const windowLabel = formatDuration(w.window_secs);
-        const limit = w.limit;
-        const countLabel = limit != null ? `${w.count} / ${limit}` : `${w.count}`;
-        const pct = w.count > 0 && w.window_secs > 0 ? Math.min((w.elapsed_secs / w.window_secs) * 100, 100) : 0;
-        const fillClass = limit != null && w.count >= limit ? "danger" : limit != null && w.count / limit >= 0.8 ? "warn" : "";
-        const isRpm = w.window_secs === 60;
-        const label = isRpm ? "rpm" : planName;
-        let planCell = esc(label);
-        if (limit != null && w.count >= limit) {
-          const remaining = Math.max(0, w.window_secs - w.elapsed_secs);
-          planCell += `<br><span style="color:var(--text3);font-size:0.85em">配额已用完，${formatHMS(remaining)}后重置</span>`;
-        }
-        html += `<tr>
-          <td>${planCell}</td>
-          <td>${esc(windowLabel)}</td>
-          <td>${countLabel}</td>
-          <td><div class="progress-bar"><div class="progress-fill ${fillClass}" style="width:${pct}%"></div></div></td>
-        </tr>`;
-      });
-      html += "</table>";
+      html += `<div class="usage-limit-card">
+        <div class="usage-limit-title">Concurrency</div>
+        <div class="usage-limit-count">${concCount}</div>
+        <div class="usage-limit-reset">Unlimited</div>
+      </div>`;
     }
+
+    // Rate limit window cards
+    if (usage.windows.length === 0) {
+      html += '<div class="usage-limit-card"><div class="usage-limit-title">Rate Limits</div><div class="usage-limit-reset">No active windows</div></div>';
+    } else {
+      usage.windows.forEach((w) => {
+        const limit = w.limit;
+        const isRpm = w.window_secs === 60;
+        const label = isRpm ? "RPM" : formatDuration(w.window_secs) + " limit";
+        const remaining = Math.max(0, w.window_secs - w.elapsed_secs);
+
+        if (limit != null) {
+          html += `<div class="usage-limit-card">
+            <div class="usage-limit-title">${esc(label)}</div>
+            <div class="usage-limit-count">${w.count} / ${limit}</div>
+            <div class="usage-limit-reset">Resets in ${formatCountdown(remaining)}</div>
+          </div>`;
+        } else {
+          html += `<div class="usage-limit-card">
+            <div class="usage-limit-title">${esc(label)}</div>
+            <div class="usage-limit-count">${w.count}</div>
+            <div class="usage-limit-reset">Unlimited · resets in ${formatCountdown(remaining)}</div>
+          </div>`;
+        }
+      });
+    }
+
+    html += '</div>';
     el.innerHTML = html;
   }
 
@@ -1862,7 +1879,7 @@
     const tbody = document.getElementById("logs-tbody");
     if (!tbody) return;
     if (logs.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="13" class="no-results">No matching logs found.</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="14" class="no-results">No matching logs found.</td></tr>';
       return;
     }
     tbody.innerHTML = logs.map((l) => {
@@ -1905,6 +1922,7 @@
         <td>${l.input_tokens != null ? formatNumber(l.input_tokens) : "-"}</td>
         <td>${l.output_tokens != null ? formatNumber(l.output_tokens) : "-"}</td>
         <td>${l.duration_ms != null ? l.duration_ms + "ms" : "-"}</td>
+        <td>${l.ttft_ms != null ? l.ttft_ms + "ms" : "-"}</td>
         <td>${errorCell}</td>
         <td>${detailCell}</td>
       </tr>`;

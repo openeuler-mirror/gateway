@@ -1,13 +1,13 @@
 /* ── Fonts ───────────────────────────────────────────────── */
-@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=Space+Grotesk:wght@500;600;700&family=Fira+Code:wght@400;500;600&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700;800&family=Space+Grotesk:wght@500;600;700&family=Fira+Code:wght@400;500;600&display=swap');
 
 /* ── Reset ─────────────────────────────────────────────── */
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
 /* ── Light Theme (default) ─────────────────────────────── */
 :root {
-  --font: "Plus Jakarta Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  --heading: "Space Grotesk", "Plus Jakarta Sans", sans-serif;
+  --font: "DM Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --heading: "Space Grotesk", "DM Sans", sans-serif;
   --mono: "Fira Code", "JetBrains Mono", "Menlo", "Consolas", monospace;
   --radius: 10px;
   --radius-sm: 6px;
@@ -516,6 +516,19 @@ tbody tr:nth-child(even):hover td { background: var(--surface2); }
 .progress-fill { height: 100%; background: var(--primary); border-radius: 3px; transition: width .4s ease; }
 .progress-fill.warn { background: var(--warn); }
 .progress-fill.danger { background: var(--danger); }
+
+/* ── Usage Limit Cards ────────────────────────────────── */
+.usage-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; }
+.usage-limit-card {
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+}
+.usage-limit-title { font-size: .8em; font-weight: 600; color: var(--text3); text-transform: uppercase; letter-spacing: .04em; margin-bottom: 6px; }
+.usage-limit-count { font-size: 1.2em; font-weight: 700; color: var(--text); font-family: var(--heading); margin-bottom: 8px; }
+.usage-limit-card .progress-bar { margin-bottom: 6px; }
+.usage-limit-reset { font-size: .8em; color: var(--text3); }
 
 /* ── Pagination ─────────────────────────────────────────── */
 .pagination {
