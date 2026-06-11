@@ -20,7 +20,6 @@ use sqlx::PgPool;
 use std::convert::Infallible;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::task::{Context, Poll};
 use std::time::Instant;
 
@@ -91,49 +90,6 @@ async fn acquire_fc_guard<E>(
             };
             log_error(state, identity, model, api_path, is_stream, start, &e, Some(request_id.to_string()), Some(deployment_id.to_string()), None, client_ip);
             Err(err_wrap(e, is_stream))
-        }
-    }
-}
-
-/// Consecutive failure threshold to trigger auto-disable.
-const AUTO_DISABLE_THRESHOLD: u32 = 3;
-
-/// Record a deployment failure: increment the counter and auto-disable if threshold reached.
-fn record_deployment_failure(state: &AppState, deployment_id: &Option<String>, model: &str, error: &GatewayError) {
-    if !error.is_deployment_failure() {
-        return;
-    }
-    if let Some(ref did) = deployment_id {
-        let counter = state.failure_counter
-            .entry(did.clone())
-            .or_insert_with(|| Arc::new(std::sync::atomic::AtomicU32::new(0)));
-        let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-        tracing::warn!(
-            deployment_id = %did,
-            count = count,
-            "Deployment failure recorded"
-        );
-        if count >= AUTO_DISABLE_THRESHOLD {
-            let state = state.clone();
-            let did = did.clone();
-            let model = model.to_string();
-            tokio::spawn(async move {
-                if let Some(ref pool) = state.db_pool {
-                    crate::admin_command::auto_disable_deployment(
-                        pool, &state.deployment_store, &did, &model,
-                    ).await;
-                }
-                state.failure_counter.remove(&did);
-            });
-        }
-    }
-}
-
-/// Reset the failure counter for a deployment on success.
-fn reset_deployment_failure(state: &AppState, deployment_id: &Option<String>) {
-    if let Some(ref did) = deployment_id {
-        if let Some(counter) = state.failure_counter.get(did) {
-            counter.store(0, Ordering::Relaxed);
         }
     }
 }
@@ -385,11 +341,11 @@ async fn chat_completions_inner(
     if is_stream {
         let stream = provider.chat_stream(req).await.map_err(|e| {
             log_error(&state, &identity, &model, api_path, true, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()));
-            record_deployment_failure(&state, &deployment_id, &model, &e);
+            crate::health_monitor::record_request_failure(&state, &deployment_id, &e);
             rollback_plan_quota(&state.limiter, &rl_info);
             GatewayErrorReply(e, true)
         })?;
-        reset_deployment_failure(&state, &deployment_id);
+        crate::health_monitor::reset_request_failure(&state, &deployment_id);
         let usage = UsageTracker::default();
         let sse_stream = sse_stream_from_chat_stream(stream, usage.clone());
         let inflight_guard = if let Some(ref did) = deployment_id {
@@ -455,11 +411,11 @@ async fn chat_completions_inner(
         };
         let response = provider.chat(req).await.map_err(|e| {
             log_error(&state, &identity, &model, api_path, false, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()));
-            record_deployment_failure(&state, &deployment_id, &model, &e);
+            crate::health_monitor::record_request_failure(&state, &deployment_id, &e);
             rollback_plan_quota(&state.limiter, &rl_info);
             GatewayErrorReply(e, false)
         })?;
-        reset_deployment_failure(&state, &deployment_id);
+        crate::health_monitor::reset_request_failure(&state, &deployment_id);
 
         let duration_ms = start.elapsed().as_millis() as i32;
         let input_tokens = response.usage.prompt_tokens as i32;
@@ -1549,11 +1505,11 @@ pub async fn messages(
     if is_stream {
         let stream = provider.chat_stream(openai_req).await.map_err(|e| {
             log_error(&state, &identity, &model, "/v1/messages", true, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()));
-            record_deployment_failure(&state, &deployment_id, &model, &e);
+            crate::health_monitor::record_request_failure(&state, &deployment_id, &e);
             rollback_plan_quota(&state.limiter, &rl_info);
             AnthropicErrorReply(e, true)
         })?;
-        reset_deployment_failure(&state, &deployment_id);
+        crate::health_monitor::reset_request_failure(&state, &deployment_id);
         let usage = UsageTracker::default();
         let sse_stream = sse_stream_from_anthropic_chat_stream(stream, model.clone(), usage.clone());
         let inflight_guard = if let Some(ref did) = deployment_id {
@@ -1618,11 +1574,11 @@ pub async fn messages(
         };
         let response = provider.chat(openai_req).await.map_err(|e| {
             log_error(&state, &identity, &model, "/v1/messages", false, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()));
-            record_deployment_failure(&state, &deployment_id, &model, &e);
+            crate::health_monitor::record_request_failure(&state, &deployment_id, &e);
             rollback_plan_quota(&state.limiter, &rl_info);
             AnthropicErrorReply(e, false)
         })?;
-        reset_deployment_failure(&state, &deployment_id);
+        crate::health_monitor::reset_request_failure(&state, &deployment_id);
 
         let duration_ms = start.elapsed().as_millis() as i32;
         let input_tokens = response.usage.prompt_tokens as i32;

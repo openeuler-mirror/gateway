@@ -10,7 +10,8 @@ pub mod router;
 
 pub use alias_store::{AliasInput, AliasRow, AliasStore};
 pub use deployment_store::{
-    DeploymentInput, DeploymentProviderRow, DeploymentRow, DeploymentStore, YamlDeploymentData,
+    DeploymentHealthTarget, DeploymentInput, DeploymentProviderRow, DeploymentRow, DeploymentStore,
+    YamlDeploymentData,
 };
 pub use hybrid_router::{
     ClassifyRequest, ClassificationStrategy, HybridRouter, StrategyRegistry, TierClassifier,
