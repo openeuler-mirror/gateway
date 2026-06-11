@@ -429,6 +429,7 @@ input, select, textarea { font-family: var(--font); font-size: 14px; }
   margin-bottom: 22px;
 }
 .section-header h2 { font-size: 20px; color: var(--text); font-weight: 700; letter-spacing: -.2px; }
+.section-header > div { display: flex; gap: 8px; align-items: center; }
 
 /* ── Cards ──────────────────────────────────────────────── */
 .card {
@@ -448,11 +449,12 @@ input, select, textarea { font-family: var(--font); font-size: 14px; }
 .btn-primary {
   background: var(--primary); color: #fff; border: none;
   padding: 8px 18px; border-radius: var(--radius-sm);
-  font-weight: 600; letter-spacing: .2px;
-  transition: background var(--transition), transform .1s ease;
+  font-size: 13px; font-weight: 600; letter-spacing: .2px;
+  transition: all var(--transition);
+  box-shadow: 0 1px 2px rgba(0,0,0,.08);
 }
-.btn-primary:hover { background: var(--primary-h); }
-.btn-primary:active { transform: scale(.97); }
+.btn-primary:hover { background: var(--primary-h); box-shadow: 0 2px 8px rgba(0,0,0,.12); transform: translateY(-1px); }
+.btn-primary:active { transform: translateY(0) scale(.98); box-shadow: 0 1px 2px rgba(0,0,0,.08); }
 
 .btn-secondary {
   background: var(--surface2); border: 1px solid var(--border);
@@ -462,18 +464,20 @@ input, select, textarea { font-family: var(--font); font-size: 14px; }
 .btn-secondary:hover { border-color: var(--border2); color: var(--text); background: var(--surface3); }
 
 .btn-danger {
-  background: var(--danger-bg); color: var(--danger); border: 1px solid transparent;
-  padding: 5px 12px; border-radius: var(--radius-sm); font-size: 12px;
+  background: var(--danger-bg); color: var(--danger); border: 1px solid rgba(220,53,69,.2);
+  padding: 8px 16px; border-radius: var(--radius-sm); font-size: 13px;
   font-weight: 600; transition: all var(--transition);
+  box-shadow: 0 1px 2px rgba(0,0,0,.06);
 }
-.btn-danger:hover { background: var(--danger); color: #fff; }
+.btn-danger:hover { background: var(--danger); color: #fff; border-color: var(--danger); box-shadow: 0 2px 8px rgba(220,53,69,.2); }
 
 .btn-small {
-  padding: 5px 12px; font-size: 12px; border-radius: var(--radius-xs);
-  border: 1px solid var(--border); background: var(--surface2); color: var(--text2);
+  padding: 6px 14px; font-size: 12px; border-radius: var(--radius-xs);
+  border: 1px solid var(--border); background: var(--surface); color: var(--text2);
   font-weight: 500; transition: all var(--transition);
+  box-shadow: 0 1px 2px rgba(0,0,0,.04);
 }
-.btn-small:hover { border-color: var(--primary); color: var(--primary); background: var(--primary-bg); }
+.btn-small:hover { border-color: var(--primary); color: var(--primary); background: var(--primary-bg); box-shadow: 0 1px 4px rgba(0,0,0,.08); }
 
 /* ── Tables ─────────────────────────────────────────────── */
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
@@ -481,7 +485,6 @@ th {
   padding: 10px 14px; text-align: left; font-weight: 600; color: var(--text3);
   font-size: 11px; text-transform: uppercase; letter-spacing: .8px;
   background: var(--surface2); border-bottom: 1px solid var(--border);
-  position: sticky; top: 0; z-index: 1;
 }
 td {
   padding: 10px 14px; text-align: left;
