@@ -379,6 +379,12 @@ pub struct RouterSettings {
     /// KV-cache aware routing settings.
     #[serde(default)]
     pub kvc_aware: KvcAwareSettings,
+    /// When true, inject the `X-Gateway-Priority` header into upstream requests
+    /// (consumed by the downstream load-aware scheduler). Default false: no extra
+    /// header is injected, keeping normal flows clean. Enable this only when
+    /// rolling out downstream so that downstream schedulers can read request priority.
+    #[serde(default)]
+    pub enable_priority_header: bool,
 }
 
 /// Settings for KV-cache aware routing.

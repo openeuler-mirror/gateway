@@ -199,7 +199,7 @@ async fn chat_completions_inner(
     auth: RequiredAuth,
     headers: &axum::http::HeaderMap,
     remote_addr: Option<std::net::SocketAddr>,
-    req: ChatCompletionRequest,
+    mut req: ChatCompletionRequest,
     api_path: &str,
 ) -> Result<impl IntoResponse, GatewayErrorReply> {
     let start = Instant::now();
@@ -318,9 +318,10 @@ async fn chat_completions_inner(
     }
 
     // 3.5. Flow control — queue if per-deployment limits exceeded.
+    let is_vip = is_vip_key(&identity.metadata);
     let fc_guard = if let Some(ref did) = deployment_id {
         acquire_fc_guard(
-            &state, did, input_chars as u64, is_vip_key(&identity.metadata),
+            &state, did, input_chars as u64, is_vip,
             identity.key_alias.clone(), Some(identity.key_hash.clone()),
             Some(inflight_model.clone()),
             api_path, &identity, &model,
@@ -329,6 +330,9 @@ async fn chat_completions_inner(
     } else {
         None
     };
+
+    // Attach gateway-internal headers (e.g. X-Gateway-Priority) when enabled.
+    req.gateway_headers = build_gateway_headers(is_vip, inner.config.router_settings.enable_priority_header);
 
     // Capture request body for debug recording if debug mode is enabled.
     let debug_req_body = if state.debug_store.is_enabled() {
@@ -1063,6 +1067,21 @@ fn is_vip_key(metadata: &serde_json::Value) -> bool {
         .unwrap_or(false)
 }
 
+/// Build gateway-internal HTTP headers to attach to the upstream request.
+///
+/// Returns an empty map (no extra headers) unless priority-header injection is
+/// explicitly enabled via `router_settings.enable_priority_header`. This keeps
+/// normal deployments clean and only emits `X-Gateway-Priority` when a
+/// downstream scheduler is being rolled out.
+fn build_gateway_headers(is_vip: bool, enable_priority_header: bool) -> std::collections::HashMap<String, String> {
+    let mut headers = std::collections::HashMap::new();
+    if enable_priority_header {
+        let priority = if is_vip { 100 } else { 0 };
+        headers.insert("X-Gateway-Priority".to_string(), priority.to_string());
+    }
+    headers
+}
+
 /// Rollback plan window counters when an upstream request fails.
 /// RPM counters are NOT rolled back (DDoS protection).
 fn rollback_plan_quota(limiter: &Arc<boom_limiter::SlidingWindowLimiter>, rl_info: &RateLimitInfo) {
@@ -1365,7 +1384,7 @@ pub async fn messages(
 ) -> Result<impl IntoResponse, AnthropicErrorReply> {
     let start = Instant::now();
     let request_id = new_request_id();
-    let openai_req = anthropic_request_to_openai(&req);
+    let mut openai_req = anthropic_request_to_openai(&req);
     let identity = auth.identity();
     let client_ip = extract_client_ip(&headers, Some(remote_addr));
     let inner = state.inner.load();
@@ -1482,9 +1501,10 @@ pub async fn messages(
     }
 
     // 3.5. Flow control — queue if per-deployment limits exceeded.
+    let is_vip = is_vip_key(&identity.metadata);
     let fc_guard = if let Some(ref did) = deployment_id {
         acquire_fc_guard(
-            &state, did, input_chars as u64, is_vip_key(&identity.metadata),
+            &state, did, input_chars as u64, is_vip,
             identity.key_alias.clone(), Some(identity.key_hash.clone()),
             Some(inflight_model.clone()),
             "/v1/messages", &identity, &model,
@@ -1493,6 +1513,9 @@ pub async fn messages(
     } else {
         None
     };
+
+    // Attach gateway-internal headers (e.g. X-Gateway-Priority) when enabled.
+    openai_req.gateway_headers = build_gateway_headers(is_vip, inner.config.router_settings.enable_priority_header);
 
     // Capture request body for debug recording if debug mode is enabled.
     let debug_req_body = if state.debug_store.is_enabled() {
@@ -1859,4 +1882,76 @@ pub async fn kv_index_status(
         [(axum::http::header::CONTENT_TYPE, "application/json")],
         pretty,
     ).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_gateway_headers, is_vip_key};
+    use serde_json::json;
+
+    #[test]
+    fn vip_true_in_metadata() {
+        let meta = json!({"vip": true});
+        assert!(is_vip_key(&meta));
+    }
+
+    #[test]
+    fn vip_false_in_metadata() {
+        let meta = json!({"vip": false});
+        assert!(!is_vip_key(&meta));
+    }
+
+    #[test]
+    fn vip_missing_from_metadata() {
+        let meta = json!({"some_other_field": 123});
+        assert!(!is_vip_key(&meta));
+    }
+
+    #[test]
+    fn empty_object_metadata() {
+        let meta = json!({});
+        assert!(!is_vip_key(&meta));
+    }
+
+    #[test]
+    fn null_metadata() {
+        let meta = json!(null);
+        assert!(!is_vip_key(&meta));
+    }
+
+    #[test]
+    fn vip_is_string_not_bool() {
+        let meta = json!({"vip": "true"});
+        assert!(!is_vip_key(&meta), "string 'true' should not count as VIP");
+    }
+
+    #[test]
+    fn vip_is_number_not_bool() {
+        let meta = json!({"vip": 1});
+        assert!(!is_vip_key(&meta), "numeric 1 should not count as VIP");
+    }
+
+    #[test]
+    fn headers_enabled_vip_gives_100() {
+        let headers = build_gateway_headers(true, true);
+        assert_eq!(headers.get("X-Gateway-Priority").map(String::as_str), Some("100"));
+    }
+
+    #[test]
+    fn headers_enabled_normal_gives_0() {
+        let headers = build_gateway_headers(false, true);
+        assert_eq!(headers.get("X-Gateway-Priority").map(String::as_str), Some("0"));
+    }
+
+    #[test]
+    fn headers_disabled_vip_is_empty() {
+        let headers = build_gateway_headers(true, false);
+        assert!(headers.is_empty(), "no header should be injected when disabled");
+    }
+
+    #[test]
+    fn headers_disabled_normal_is_empty() {
+        let headers = build_gateway_headers(false, false);
+        assert!(headers.is_empty(), "no header should be injected when disabled");
+    }
 }
