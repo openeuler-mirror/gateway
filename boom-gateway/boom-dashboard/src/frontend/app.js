@@ -6,6 +6,40 @@
   let currentUser = null;
   let usageRefreshTimer = null;
 
+  // ── Theme ─────────────────────────────────────────────
+  function getTheme() { return document.documentElement.dataset.theme || "light"; }
+  function setTheme(t) {
+    document.documentElement.dataset.theme = t;
+    localStorage.setItem("boom-theme", t);
+    updateThemeIcons();
+  }
+  function toggleTheme() { setTheme(getTheme() === "dark" ? "light" : "dark"); }
+  function updateThemeIcons() {
+    var dark = getTheme() === "dark";
+    document.querySelectorAll(".theme-toggle").forEach(function(btn) {
+      var sun = btn.querySelector(".icon-sun");
+      var moon = btn.querySelector(".icon-moon");
+      if (sun) sun.style.display = dark ? "none" : "block";
+      if (moon) moon.style.display = dark ? "block" : "none";
+    });
+  }
+  function isDark() { return getTheme() === "dark"; }
+
+  // ── Toast ─────────────────────────────────────────────
+  function showToast(msg, duration) {
+    duration = duration || 2500;
+    var container = document.getElementById("toast-container");
+    if (!container) return;
+    var el = document.createElement("div");
+    el.className = "toast";
+    el.textContent = msg;
+    container.appendChild(el);
+    setTimeout(function() {
+      el.classList.add("toast-out");
+      setTimeout(function() { el.remove(); }, 200);
+    }, duration);
+  }
+
   // ── Tooltip helper ────────────────────────────────────
   // Usage: tip("description text") → returns HTML string with ? icon
   function tip(text) {
@@ -46,9 +80,53 @@
     setupLogin();
     setupLogout();
     setupAdminButtons();
+    setupThemeToggle();
+    updateThemeIcons();
+    setupViewportTooltip();
     window.addEventListener("hashchange", () => { onRoute(); onUserRoute(); });
     checkSession();
   });
+
+  // ── Viewport-aware tooltip for .cell-tip ──────────────
+  // Positions tooltip above or below the element depending on available space.
+  function setupViewportTooltip() {
+    var tip = document.getElementById("vtip");
+    if (!tip) return;
+    document.addEventListener("mouseover", function(e) {
+      var el = e.target.closest(".cell-tip");
+      if (!el || !el.dataset.tip) { tip.classList.remove("show"); return; }
+      tip.textContent = el.dataset.tip;
+      tip.classList.add("show");
+      // Measure after adding to DOM
+      var r = el.getBoundingClientRect();
+      var tw = tip.offsetWidth;
+      var th = tip.offsetHeight;
+      var vw = window.innerWidth;
+      var vh = window.innerHeight;
+      // Default: above, centered
+      var top = r.top - th - 8;
+      var left = r.left + r.width / 2 - tw / 2;
+      // Not enough space above → flip below
+      if (top < 4) top = r.bottom + 8;
+      // Clamp horizontal
+      if (left < 4) left = 4;
+      if (left + tw > vw - 4) left = vw - tw - 4;
+      // If still off-screen bottom, just clamp
+      if (top + th > vh - 4) top = vh - th - 4;
+      tip.style.top = top + "px";
+      tip.style.left = left + "px";
+    });
+    document.addEventListener("mouseout", function(e) {
+      var el = e.target.closest(".cell-tip");
+      if (el) tip.classList.remove("show");
+    });
+  }
+
+  function setupThemeToggle() {
+    document.querySelectorAll(".theme-toggle").forEach(function(btn) {
+      btn.addEventListener("click", toggleTheme);
+    });
+  }
 
   // ── API helpers ───────────────────────────────────────
   async function api(path, opts = {}) {
@@ -229,8 +307,8 @@
           var fcQueueHtml = String(d.fc_queue);
           if (d.fc_queue > 0 && d.queued_keys && d.queued_keys.length > 0) {
             var items = d.queued_keys.map(function (k) {
-              var prefix = k.is_vip ? "[VIP] " : "";
-              return prefix + esc(k.key_alias || "?");
+              var vipTag = k.is_vip ? "★ " : "";
+              return vipTag + esc(k.key_alias || "?");
             });
             fcQueueHtml = '<span class="cell-tip" data-tip="' + items.join("&#10;").replace(/"/g, "&quot;") + '">' + d.fc_queue + '</span>';
           }
@@ -239,14 +317,24 @@
           var reqsHtml = reqsDisplay;
           if (d.in_reqs > 0 && d.key_stats && d.key_stats.length > 0) {
             var reqItems = d.key_stats.map(function (k) {
-              return esc(k.key_alias || "?") + ": " + k.request_count;
+              var vipTag = k.is_vip ? "★ " : "";
+              return vipTag + esc(k.key_alias || "?") + ": " + k.request_count;
             });
             reqsHtml = '<span class="cell-tip" data-tip="' + reqItems.join("&#10;").replace(/"/g, "&quot;") + '">' + reqsDisplay + '</span>';
           }
 
+          var deployCell;
+          if (d.deployment_id) {
+            deployCell = '<span class="deploy-model">' + esc(d.model) + '</span>' +
+              '<span class="deploy-sep">:</span>' +
+              '<span class="deploy-id">' + esc(d.deployment_id) + '</span>';
+          } else {
+            deployCell = '<span class="deploy-model">' + esc(d.model) + '</span>';
+          }
+
           return (
             "<tr>" +
-            "<td>" + esc(d.deployment_id ? d.model + ":" + d.deployment_id : d.model) + "</td>" +
+            "<td>" + deployCell + "</td>" +
             "<td>" + fcQueueHtml + "</td>" +
             "<td>" + reqsHtml + "</td>" +
             "<td>" + ctxDisplay + "</td>" +
@@ -291,7 +379,7 @@
       const title = e.minute === "now" ? "Current minute" : e.minute.replace("-", "") + " ago: " + e.count + " rebalance(s)";
       return '<div class="rb-bar-col" title="' + esc(title) + '">' +
         '<div class="rb-bar-value' + (e.count === 0 ? " rb-bar-value-zero" : "") + '">' + e.count + '</div>' +
-        '<div class="rb-bar" style="height:' + Math.max(pct, 1) + '%;background:' + barColor(pct) + '"></div>' +
+        '<div class="rb-bar" style="height:' + Math.max(pct, 1) + '%;background:' + rebalanceBarColor(pct) + '"></div>' +
         '<div class="rb-bar-label' + (showLabel ? "" : " rb-label-hidden") + '">' + esc(e.minute === "now" ? "now" : e.minute.replace("-","")) + '</div>' +
         '</div>';
     }).join("");
@@ -303,10 +391,17 @@
       '</div>';
   }
 
-  function barColor(pct) {
-    if (pct > 75) return "var(--danger)";
-    if (pct > 40) return "#f59e0b";
-    return "var(--primary)";
+  // Throughput chart colors — cool cyan/teal palette suggesting high traffic
+  function throughputBarColor(pct) {
+    if (pct > 75) return "linear-gradient(180deg, #06b6d4, #0891b2)"; // cyan-500 → cyan-600
+    if (pct > 40) return "linear-gradient(180deg, #22d3ee, #06b6d4)"; // cyan-400 → cyan-500
+    return "linear-gradient(180deg, #67e8f9, #22d3ee)";                // cyan-300 → cyan-400
+  }
+  // Rebalance chart colors — muted, subtle, suggesting rare events
+  function rebalanceBarColor(pct) {
+    if (pct > 75) return "linear-gradient(180deg, #f87171, #ef4444)";  // red-400 → red-500
+    if (pct > 0)  return "linear-gradient(180deg, #fca5a5, #f87171)";  // red-300 → red-400
+    return "linear-gradient(180deg, var(--surface3), var(--surface3))"; // neutral
   }
 
   // ── Request Rate Charts ──────────────────────────────────
@@ -339,7 +434,7 @@
         var title = e.minute === "now" ? "Current minute" : e.minute.replace("-", "") + " ago: " + e.count + " req(s)";
         return '<div class="rb-bar-col" title="' + esc(title) + '">' +
           '<div class="rb-bar-value' + (e.count === 0 ? " rb-bar-value-zero" : "") + '">' + e.count + '</div>' +
-          '<div class="rb-bar" style="height:' + Math.max(pct, 1) + '%;background:' + barColor(pct) + '"></div>' +
+          '<div class="rb-bar" style="height:' + Math.max(pct, 1) + '%;background:' + throughputBarColor(pct) + '"></div>' +
           '<div class="rb-bar-label' + (showLabel ? "" : " rb-label-hidden") + '">' + esc(e.minute === "now" ? "now" : e.minute.replace("-","")) + '</div>' +
           '</div>';
       }).join("");
@@ -492,35 +587,52 @@
 
   function renderUsage(usage) {
     const el = document.getElementById("usage-info");
-    const concLimit = usage.concurrency_limit || "-";
-    let html = `<p>Current concurrency: <strong>${usage.concurrency}</strong> / ${concLimit}</p>`;
-    if (usage.windows.length === 0) {
-      html += "<p>No active rate limit windows.</p>";
+    let html = '<div class="usage-grid">';
+
+    // Concurrency card
+    const concLimit = usage.concurrency_limit;
+    const concCount = usage.concurrency;
+    if (concLimit != null) {
+      html += `<div class="usage-limit-card">
+        <div class="usage-limit-title">Concurrency</div>
+        <div class="usage-limit-count">${concCount} / ${concLimit}</div>
+        <div class="usage-limit-reset">Simultaneous requests</div>
+      </div>`;
     } else {
-      html += '<table><tr><th>Plan</th><th>Window</th><th>Count</th><th>Progress</th></tr>';
-      const planName = usage.plan_name || "-";
-      usage.windows.forEach((w) => {
-        const windowLabel = formatDuration(w.window_secs);
-        const limit = w.limit;
-        const countLabel = limit != null ? `${w.count} / ${limit}` : `${w.count}`;
-        const pct = w.count > 0 && w.window_secs > 0 ? Math.min((w.elapsed_secs / w.window_secs) * 100, 100) : 0;
-        const fillClass = limit != null && w.count >= limit ? "danger" : limit != null && w.count / limit >= 0.8 ? "warn" : "";
-        const isRpm = w.window_secs === 60;
-        const label = isRpm ? "rpm" : planName;
-        let planCell = esc(label);
-        if (limit != null && w.count >= limit) {
-          const remaining = Math.max(0, w.window_secs - w.elapsed_secs);
-          planCell += `<br><span style="color:var(--text3);font-size:0.85em">配额已用完，${formatHMS(remaining)}后重置</span>`;
-        }
-        html += `<tr>
-          <td>${planCell}</td>
-          <td>${esc(windowLabel)}</td>
-          <td>${countLabel}</td>
-          <td><div class="progress-bar"><div class="progress-fill ${fillClass}" style="width:${pct}%"></div></div></td>
-        </tr>`;
-      });
-      html += "</table>";
+      html += `<div class="usage-limit-card">
+        <div class="usage-limit-title">Concurrency</div>
+        <div class="usage-limit-count">${concCount}</div>
+        <div class="usage-limit-reset">Unlimited</div>
+      </div>`;
     }
+
+    // Rate limit window cards
+    if (usage.windows.length === 0) {
+      html += '<div class="usage-limit-card"><div class="usage-limit-title">Rate Limits</div><div class="usage-limit-reset">No active windows</div></div>';
+    } else {
+      usage.windows.forEach((w) => {
+        const limit = w.limit;
+        const isRpm = w.window_secs === 60;
+        const label = isRpm ? "RPM" : formatDuration(w.window_secs) + " limit";
+        const remaining = Math.max(0, w.window_secs - w.elapsed_secs);
+
+        if (limit != null) {
+          html += `<div class="usage-limit-card">
+            <div class="usage-limit-title">${esc(label)}</div>
+            <div class="usage-limit-count">${w.count} / ${limit}</div>
+            <div class="usage-limit-reset">Resets in ${formatCountdown(remaining)}</div>
+          </div>`;
+        } else {
+          html += `<div class="usage-limit-card">
+            <div class="usage-limit-title">${esc(label)}</div>
+            <div class="usage-limit-count">${w.count}</div>
+            <div class="usage-limit-reset">Unlimited · resets in ${formatCountdown(remaining)}</div>
+          </div>`;
+        }
+      });
+    }
+
+    html += '</div>';
     el.innerHTML = html;
   }
 
@@ -1123,8 +1235,15 @@
   function updateDebugButton(btn) {
     if (!btn) return;
     btn.textContent = debugEnabled ? "Debug: ON" : "Debug: OFF";
-    btn.style.background = debugEnabled ? "var(--danger)" : "";
-    btn.style.color = debugEnabled ? "#fff" : "";
+    if (debugEnabled) {
+      btn.style.background = "var(--danger)";
+      btn.style.color = "#fff";
+      btn.style.borderColor = "var(--danger)";
+    } else {
+      btn.style.background = "";
+      btn.style.color = "";
+      btn.style.borderColor = "";
+    }
   }
 
   async function toggleDebug() {
@@ -1164,8 +1283,15 @@
   function updatePromptLogButton(btn) {
     if (!btn) return;
     btn.textContent = promptLogEnabled ? "Prompt Log: ON" : "Prompt Log: OFF";
-    btn.style.background = promptLogEnabled ? "#2563eb" : "";
-    btn.style.color = promptLogEnabled ? "#fff" : "";
+    if (promptLogEnabled) {
+      btn.style.background = "var(--info)";
+      btn.style.color = "#fff";
+      btn.style.borderColor = "var(--info)";
+    } else {
+      btn.style.background = "";
+      btn.style.color = "";
+      btn.style.borderColor = "";
+    }
   }
 
   async function togglePromptLog() {
@@ -1268,8 +1394,15 @@
     const btnVipFilter = document.getElementById("btn-vip-filter");
     if (btnVipFilter) btnVipFilter.addEventListener("click", () => {
       keysVipOnly = !keysVipOnly;
-      btnVipFilter.style.background = keysVipOnly ? "var(--primary)" : "";
-      btnVipFilter.style.color = keysVipOnly ? "#fff" : "";
+      if (keysVipOnly) {
+        btnVipFilter.style.background = "var(--primary)";
+        btnVipFilter.style.color = "#fff";
+        btnVipFilter.style.borderColor = "var(--primary)";
+      } else {
+        btnVipFilter.style.background = "";
+        btnVipFilter.style.color = "";
+        btnVipFilter.style.borderColor = "";
+      }
       keysPage = 1;
       loadKeys();
     });
@@ -1746,7 +1879,7 @@
     const tbody = document.getElementById("logs-tbody");
     if (!tbody) return;
     if (logs.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="13" class="no-results">No matching logs found.</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="14" class="no-results">No matching logs found.</td></tr>';
       return;
     }
     tbody.innerHTML = logs.map((l) => {
@@ -1762,18 +1895,34 @@
         const detailCell = promptLogEnabled && l.request_id
           ? '<button class="btn-small" onclick="window._viewPromptLog(\'' + esc(l.request_id) + '\',\'' + esc(l.key_hash) + '\',\'' + esc(l.team_alias || "") + '\')">View</button>'
           : "-";
+        // Timestamp: muted mono badge
+        var tsCell = '<span class="log-ts">' + formatTimestamp(l.created_at) + '</span>';
+        // IP: special mono style
+        var ipCell = '<span class="log-ip">' + esc(l.client_ip || "-") + '</span>';
+        // Model: split into model_name + deployment_id
+        var modelVal = esc(l.model || "-");
+        var modelCell;
+        if (l.model && l.model.includes(":")) {
+          var parts = l.model.split(":");
+          modelCell = '<span class="log-model-name">' + esc(parts[0]) + '</span>' +
+            '<span class="log-model-sep">:</span>' +
+            '<span class="log-model-deploy">' + esc(parts.slice(1).join(":")) + '</span>';
+        } else {
+          modelCell = '<span class="log-model-name">' + modelVal + '</span>';
+        }
         return `<tr>
-        <td class="mono">${formatTimestamp(l.created_at)}</td>
-        <td class="mono">${esc(l.client_ip || "-")}</td>
+        <td>${tsCell}</td>
+        <td>${ipCell}</td>
         <td>${esc(l.team_alias || l.team_id || "-")}</td>
         <td>${esc(l.key_alias || l.key_name || "-")}</td>
-        <td class="mono">${esc(l.model)}</td>
+        <td>${modelCell}</td>
         <td class="mono">${esc(l.api_path)}</td>
         <td>${l.status_code >= 400 ? '<span style="color:var(--danger)">' + l.status_code + '</span>' : l.status_code}</td>
         <td>${l.is_stream ? "Yes" : "No"}</td>
         <td>${l.input_tokens != null ? formatNumber(l.input_tokens) : "-"}</td>
         <td>${l.output_tokens != null ? formatNumber(l.output_tokens) : "-"}</td>
         <td>${l.duration_ms != null ? l.duration_ms + "ms" : "-"}</td>
+        <td>${l.ttft_ms != null ? l.ttft_ms + "ms" : "-"}</td>
         <td>${errorCell}</td>
         <td>${detailCell}</td>
       </tr>`;
@@ -1811,8 +1960,8 @@
         '<button class="btn-small" id="' + containerId + '-expand">Expand All</button>' +
         '<button class="btn-small" id="' + containerId + '-raw">Raw JSON</button>' +
         '</div></div>' +
-        '<div id="' + containerId + '" style="max-height:72vh;overflow:auto;background:#1e1e2e;color:#cdd6f4;padding:16px;border-radius:8px;font-size:13px;line-height:1.5;font-family:Menlo,Consolas,monospace"></div>' +
-        '<pre id="' + containerId + '-rawpre" style="display:none;max-height:72vh;overflow:auto;background:#1e1e2e;color:#cdd6f4;padding:16px;border-radius:8px;font-size:13px;line-height:1.5;white-space:pre-wrap;word-break:break-word;font-family:Menlo,Consolas,monospace">' + esc(JSON.stringify(data, null, 2)) + '</pre>'
+        '<div id="' + containerId + '" style="max-height:72vh;overflow:auto;background:var(--surface2);color:var(--text);padding:16px;border-radius:8px;font-size:13px;line-height:1.5;font-family:var(--mono)"></div>' +
+        '<pre id="' + containerId + '-rawpre" style="display:none;max-height:72vh;overflow:auto;background:var(--surface2);color:var(--text);padding:16px;border-radius:8px;font-size:13px;line-height:1.5;white-space:pre-wrap;word-break:break-word;font-family:var(--mono)">' + esc(JSON.stringify(data, null, 2)) + '</pre>'
       );
       const tree = document.getElementById(containerId);
       renderJsonTree(data, tree);
@@ -1854,7 +2003,7 @@
         short.textContent = JSON.stringify(val.substring(0, 200)) + ' … (' + val.length + ' chars)';
         short.title = "Click to show full string";
         short.style.cursor = "pointer";
-        short.style.color = "#a5d6ff";
+        short.style.color = "var(--info)";
         const full = document.createElement("span");
         full.className = "jvt-str-full";
         full.style.display = "none";
@@ -1862,12 +2011,12 @@
         short.onclick = () => { short.style.display = "none"; full.style.display = "inline"; };
         full.onclick = () => { full.style.display = "none"; short.style.display = "inline"; };
         full.style.cursor = "pointer";
-        full.style.color = "#a5d6ff";
+        full.style.color = "var(--info)";
         container.appendChild(short);
         container.appendChild(full);
       } else {
         const s = document.createElement("span");
-        s.style.color = "#a5d6ff";
+        s.style.color = "var(--info)";
         s.textContent = JSON.stringify(val);
         container.appendChild(s);
       }
@@ -1886,12 +2035,12 @@
     toggle.style.cursor = "pointer";
     toggle.style.userSelect = "none";
     toggle.style.marginRight = "4px";
-    toggle.style.color = "#7c8594";
+    toggle.style.color = "var(--text3)";
 
     const summary = document.createElement("span");
     summary.className = "jvt-summary";
     summary.textContent = isArr ? "[" + entries.length + " items]" : "{" + entries.length + " keys}";
-    summary.style.color = "#7c8594";
+    summary.style.color = "var(--text3)";
     summary.style.marginRight = "4px";
     summary.style.display = depth < maxDepth ? "none" : "inline";
 
@@ -1899,7 +2048,7 @@
     body.className = "jvt-body";
     body.style.display = depth < maxDepth ? "block" : "none";
     body.style.marginLeft = "16px";
-    body.style.borderLeft = "1px solid #3a3f4b";
+    body.style.borderLeft = "1px solid var(--border)";
     body.style.paddingLeft = "8px";
 
     entries.forEach(function(entry) {
@@ -1907,7 +2056,7 @@
       line.style.marginTop = "2px";
       if (!isArr) {
         var keySpan = document.createElement("span");
-        keySpan.style.color = "#d2a8ff";
+        keySpan.style.color = "var(--primary)";
         keySpan.textContent = JSON.stringify(entry[0]) + ": ";
         line.appendChild(keySpan);
       }
@@ -1918,7 +2067,7 @@
     var closing = document.createElement("span");
     closing.className = "jvt-close";
     closing.textContent = isArr ? "]" : "}";
-    closing.style.color = "#7c8594";
+    closing.style.color = "var(--text3)";
 
     toggle.onclick = function() {
       var isOpen = toggle.classList.toggle("open");

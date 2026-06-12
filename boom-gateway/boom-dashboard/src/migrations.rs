@@ -19,9 +19,10 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
     // with the timeout active — PgPool multiplexes queries across connections,
     // so SET on one connection does NOT affect others.
     let mut conn = pool.acquire().await?;
-    sqlx::query("SET lock_timeout = '10s'")
+    // Best-effort: some PostgreSQL-compatible databases don't support lock_timeout.
+    let _ = sqlx::query("SET lock_timeout = '10s'")
         .execute(&mut *conn)
-        .await?;
+        .await;
 
     // 1. Request logs (boom-audit).
     tracing::info!("Migration 1/7: request_log...");
@@ -55,6 +56,12 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
     )
     .execute(&mut *conn)
     .await;
+    // Add ttft_ms column for streaming Time-To-First-Token tracking (no-op if already present).
+    sqlx::query(
+        r#"ALTER TABLE boom_request_log ADD COLUMN IF NOT EXISTS ttft_ms INTEGER"#,
+    )
+    .execute(&mut *conn)
+    .await?;
     tracing::info!("Migration 1/7: done");
 
     // 2. Model deployments + aliases (boom-routing).

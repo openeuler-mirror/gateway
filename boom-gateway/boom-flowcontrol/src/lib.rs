@@ -84,6 +84,7 @@ pub struct DispatchedKeyStat {
 #[derive(Debug, Clone)]
 pub struct DispatchedKeyEntry {
     pub key_alias: String,
+    pub is_vip: bool,
 }
 
 /// Internal: reverse-index entry for O(K) per-key lookup.
@@ -632,17 +633,30 @@ impl FlowController {
             .iter()
             .map(|r| {
                 let inner = r.value().inner.lock().unwrap();
-                let keys: Vec<DispatchedKeyEntry> = inner
+                let vip_keys: Vec<DispatchedKeyEntry> = inner
                     .vip_queue
                     .iter()
-                    .chain(inner.normal_queue.iter())
                     .filter(|r| r.dispatched)
                     .filter_map(|r| {
                         r.key_alias.as_ref().map(|alias| DispatchedKeyEntry {
                             key_alias: alias.clone(),
+                            is_vip: true,
                         })
                     })
                     .collect();
+                let normal_keys: Vec<DispatchedKeyEntry> = inner
+                    .normal_queue
+                    .iter()
+                    .filter(|r| r.dispatched)
+                    .filter_map(|r| {
+                        r.key_alias.as_ref().map(|alias| DispatchedKeyEntry {
+                            key_alias: alias.clone(),
+                            is_vip: false,
+                        })
+                    })
+                    .collect();
+                let mut keys = vip_keys;
+                keys.extend(normal_keys);
                 DispatchedKeyStat {
                     deployment_id: r.key().clone(),
                     keys,

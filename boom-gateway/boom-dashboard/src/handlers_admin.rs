@@ -1261,6 +1261,7 @@ struct LogRow {
     input_tokens: Option<i32>,
     output_tokens: Option<i32>,
     duration_ms: Option<i32>,
+    ttft_ms: Option<i32>,
     created_at: Option<chrono::DateTime<chrono::Utc>>,
     deployment_id: Option<String>,
     client_ip: Option<String>,
@@ -1357,7 +1358,7 @@ pub async fn list_logs(
                   bt.team_alias,
                   rl.model, rl.api_path,
                   rl.is_stream, rl.status_code, rl.error_type, rl.error_message,
-                  rl.input_tokens, rl.output_tokens, rl.duration_ms, rl.created_at,
+                  rl.input_tokens, rl.output_tokens, rl.duration_ms, rl.ttft_ms, rl.created_at,
                   rl.deployment_id, rl.client_ip
            FROM boom_request_log rl
            LEFT JOIN boom_team_table bt ON rl.team_id = bt.team_id
@@ -1451,6 +1452,7 @@ pub async fn list_logs(
                 "input_tokens": r.input_tokens,
                 "output_tokens": r.output_tokens,
                 "duration_ms": r.duration_ms,
+                "ttft_ms": r.ttft_ms,
                 "created_at": r.created_at.map(|d| d.to_rfc3339()),
                 "client_ip": r.client_ip,
             })
@@ -1838,14 +1840,18 @@ fn aggregate_dispatched_keys(keys: Option<&Vec<boom_flowcontrol::DispatchedKeyEn
         Some(e) => e,
         None => return Vec::new(),
     };
-    let mut counts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    // Aggregate by key_alias, tracking count and is_vip (true if any entry was VIP).
+    let mut acc: std::collections::HashMap<String, (u64, bool)> = std::collections::HashMap::new();
     for entry in entries {
-        *counts.entry(entry.key_alias.clone()).or_insert(0) += 1;
+        let e = acc.entry(entry.key_alias.clone()).or_insert((0, false));
+        e.0 += 1;
+        e.1 = e.1 || entry.is_vip;
     }
-    let mut result: Vec<serde_json::Value> = counts.into_iter()
-        .map(|(alias, count)| json!({
+    let mut result: Vec<serde_json::Value> = acc.into_iter()
+        .map(|(alias, (count, is_vip))| json!({
             "key_alias": alias,
             "request_count": count,
+            "is_vip": is_vip,
         }))
         .collect();
     result.sort_by(|a, b| b["request_count"].as_u64().cmp(&a["request_count"].as_u64()));

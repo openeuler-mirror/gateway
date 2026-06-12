@@ -142,6 +142,7 @@ struct LoggedStream<S> {
     pool: Option<PgPool>,
     log: Option<RequestLog>,
     start: Instant,
+    first_token_at: Option<Instant>,
     usage: UsageTracker,
 }
 
@@ -152,6 +153,7 @@ impl<S> LoggedStream<S> {
             pool,
             log: Some(log),
             start,
+            first_token_at: None,
             usage,
         }
     }
@@ -161,6 +163,7 @@ impl<S> Drop for LoggedStream<S> {
     fn drop(&mut self) {
         if let Some(mut log) = self.log.take() {
             log.duration_ms = Some(self.start.elapsed().as_millis() as i32);
+            log.ttft_ms = self.first_token_at.map(|t| (t - self.start).as_millis() as i32);
             // Read accumulated usage from tracker (written by stream mapper).
             if let Ok(guard) = self.usage.lock() {
                 log.input_tokens = guard.0;
@@ -175,7 +178,11 @@ impl<S: futures::Stream + Unpin> futures::Stream for LoggedStream<S> {
     type Item = S::Item;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.inner.poll_next_unpin(cx)
+        let result = self.inner.poll_next_unpin(cx);
+        if self.first_token_at.is_none() && result.is_ready() {
+            self.first_token_at = Some(Instant::now());
+        }
+        result
     }
 }
 
@@ -382,6 +389,7 @@ async fn chat_completions_inner(
             input_tokens: None,
             output_tokens: None,
             duration_ms: None,
+            ttft_ms: None,
             deployment_id,
             client_ip: Some(client_ip.clone()),
         }, start, usage);
@@ -443,6 +451,7 @@ async fn chat_completions_inner(
                 input_tokens: Some(input_tokens),
                 output_tokens: Some(output_tokens),
                 duration_ms: Some(duration_ms),
+                ttft_ms: None,
                 deployment_id,
                 client_ip: Some(client_ip.clone()),
             },
@@ -1564,6 +1573,7 @@ pub async fn messages(
             input_tokens: None,
             output_tokens: None,
             duration_ms: None, // filled by LoggedStream::drop
+            ttft_ms: None,
             deployment_id,
             client_ip: Some(client_ip.clone()),
         }, start, usage);
@@ -1625,6 +1635,7 @@ pub async fn messages(
                 input_tokens: Some(input_tokens),
                 output_tokens: Some(output_tokens),
                 duration_ms: Some(duration_ms),
+                ttft_ms: None,
                 deployment_id,
                 client_ip: Some(client_ip.clone()),
             },
