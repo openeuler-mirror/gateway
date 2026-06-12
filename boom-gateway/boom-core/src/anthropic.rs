@@ -113,6 +113,16 @@ pub fn openai_response_to_anthropic(resp: &ChatCompletionResponse) -> AnthropicM
     let mut content_blocks = Vec::new();
 
     if let Some(choice) = resp.choices.first() {
+        // Top-level `reasoning_content` (OpenAI o1/o3) / `reasoning` (GLM) → thinking block.
+        // Emitted first so the block order matches Anthropic's thinking → text convention.
+        if let Some(ref reasoning) = choice.message.reasoning_content {
+            if !reasoning.is_empty() {
+                content_blocks.push(AnthropicResponseContentBlock::Thinking {
+                    thinking: reasoning.clone(),
+                });
+            }
+        }
+
         // Text and reasoning content.
         match &choice.message.content {
             MessageContent::Text(t) => {
@@ -999,5 +1009,106 @@ mod tests {
         }
         assert_eq!(anthro.usage.cache_creation_input_tokens, Some(3));
         assert_eq!(anthro.usage.cache_read_input_tokens, Some(7));
+    }
+
+    #[test]
+    fn test_top_level_reasoning_content_becomes_thinking() {
+        // Upstream OpenAI-compatible providers (DeepSeek, gpt-5, …) put reasoning
+        // on the top-level `reasoning_content` field, not inside content parts.
+        let resp = ChatCompletionResponse {
+            id: "chatcmpl-1".to_string(),
+            object: "chat.completion".to_string(),
+            created: 0,
+            model: "deepseek".to_string(),
+            choices: vec![Choice {
+                index: 0,
+                message: Message {
+                    role: MessageRole::Assistant,
+                    content: MessageContent::Text("final answer".to_string()),
+                    name: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: Some("thinking…".to_string()),
+                },
+                finish_reason: Some("stop".to_string()),
+                logprobs: None,
+            }],
+            usage: Usage {
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                total_tokens: 2,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+            system_fingerprint: None,
+        };
+        let anthro = openai_response_to_anthropic(&resp);
+        assert_eq!(anthro.content.len(), 2);
+        assert!(matches!(
+            &anthro.content[0],
+            AnthropicResponseContentBlock::Thinking { thinking } if thinking == "thinking…"
+        ));
+        assert!(matches!(
+            &anthro.content[1],
+            AnthropicResponseContentBlock::Text { text } if text == "final answer"
+        ));
+    }
+
+    #[test]
+    fn test_glm_reasoning_alias_deserializes_into_reasoning_content() {
+        // GLM (zhipu) returns `reasoning` instead of `reasoning_content`.
+        // serde alias should accept it on the wire.
+        let raw = serde_json::json!({
+            "id": "chatcmpl-glm",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "glm-4.6",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "hi",
+                    "reasoning": "reasoning from GLM"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+                "total_tokens": 2
+            }
+        });
+        let resp: ChatCompletionResponse =
+            serde_json::from_value(raw).expect("GLM alias should deserialize");
+        assert_eq!(
+            resp.choices[0].message.reasoning_content.as_deref(),
+            Some("reasoning from GLM")
+        );
+        let anthro = openai_response_to_anthropic(&resp);
+        assert!(matches!(
+            &anthro.content[0],
+            AnthropicResponseContentBlock::Thinking { thinking } if thinking == "reasoning from GLM"
+        ));
+    }
+
+    #[test]
+    fn test_glm_streaming_reasoning_alias() {
+        let raw = serde_json::json!({
+            "id": "chatcmpl-glm-stream",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": "glm-4.6",
+            "choices": [{
+                "index": 0,
+                "delta": { "reasoning": "stream-of-thought" },
+                "finish_reason": null
+            }]
+        });
+        let chunk: ChatStreamChunk =
+            serde_json::from_value(raw).expect("GLM stream alias should deserialize");
+        assert_eq!(
+            chunk.choices[0].delta.reasoning_content.as_deref(),
+            Some("stream-of-thought")
+        );
     }
 }

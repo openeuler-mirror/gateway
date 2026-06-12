@@ -64,7 +64,8 @@ pub struct Message {
     pub tool_call_id: Option<String>,
     /// Reasoning content from models like OpenAI o1/o3 (non-streaming).
     /// Carried through the internal format for Anthropic round-tripping.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Accepts `reasoning` as an alias for GLM/zhipu-style upstream responses.
+    #[serde(skip_serializing_if = "Option::is_none", alias = "reasoning")]
     pub reasoning_content: Option<String>,
 }
 
@@ -344,7 +345,8 @@ pub struct StreamDelta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCallDelta>>,
     /// Reasoning content (OpenAI o1/o3 `reasoning_content`, Anthropic `thinking`).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Accepts `reasoning` as an alias for GLM/zhipu-style upstream streams.
+    #[serde(skip_serializing_if = "Option::is_none", alias = "reasoning")]
     pub reasoning_content: Option<String>,
 }
 
