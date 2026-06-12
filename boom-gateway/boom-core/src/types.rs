@@ -281,6 +281,10 @@ pub struct ChatCompletionResponse {
     pub usage: Usage,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_fingerprint: Option<String>,
+    /// Raw upstream response text (before any parsing), set by providers.
+    /// Not serialized — only used for logging/observability.
+    #[serde(skip)]
+    pub raw_response: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -318,6 +322,10 @@ pub struct ChatStreamChunk {
     pub choices: Vec<StreamChoice>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<StreamUsage>,
+    /// Raw upstream SSE data string (before parsing), set by providers.
+    /// Not serialized — only used for logging/observability.
+    #[serde(skip)]
+    pub raw_data: Option<String>,
 }
 
 /// Usage stats returned in the last SSE chunk of a stream.

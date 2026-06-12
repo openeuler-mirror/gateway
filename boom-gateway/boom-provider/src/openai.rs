@@ -84,12 +84,18 @@ impl Provider for OpenAIProvider {
             });
         }
 
-        resp.json::<ChatCompletionResponse>()
-            .await
-            .map_err(|e| {
-                tracing::error!("Failed to parse OpenAI response: {}", e);
-                GatewayError::ProviderError("Failed to process upstream response".to_string())
-            })
+        let raw_text = resp.text().await.map_err(|e| {
+            tracing::error!("Failed to read OpenAI response body: {}", e);
+            GatewayError::ProviderError("Failed to read upstream response".to_string())
+        })?;
+
+        let mut parsed: ChatCompletionResponse = serde_json::from_str(&raw_text).map_err(|e| {
+            tracing::error!("Failed to parse OpenAI response: {}", e);
+            GatewayError::ProviderError("Failed to process upstream response".to_string())
+        })?;
+
+        parsed.raw_response = Some(raw_text);
+        Ok(parsed)
     }
 
     async fn chat_stream(&self, req: ChatCompletionRequest) -> Result<ChatStream, GatewayError> {
@@ -152,7 +158,8 @@ impl Provider for OpenAIProvider {
                                         return;
                                     }
                                     match serde_json::from_str::<ChatStreamChunk>(data) {
-                                        Ok(chunk) => {
+                                        Ok(mut chunk) => {
+                                            chunk.raw_data = Some(data.to_string());
                                             if tx.send(Ok(Some(chunk))).await.is_err() {
                                                 return;
                                             }

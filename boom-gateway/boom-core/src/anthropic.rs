@@ -990,6 +990,7 @@ mod tests {
                 cache_read_input_tokens: Some(7),
             },
             system_fingerprint: None,
+            raw_response: None,
         };
         let anthro = openai_response_to_anthropic(&resp);
         assert_eq!(anthro.content.len(), 2);
@@ -1041,6 +1042,7 @@ mod tests {
                 cache_read_input_tokens: None,
             },
             system_fingerprint: None,
+            raw_response: None,
         };
         let anthro = openai_response_to_anthropic(&resp);
         assert_eq!(anthro.content.len(), 2);
