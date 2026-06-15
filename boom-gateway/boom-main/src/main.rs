@@ -71,7 +71,7 @@ async fn main() -> anyhow::Result<()> {
     spawn_periodic_fc_dispatch(state.flow_controller.clone(), shutdown_tx.subscribe());
 
     // Spawn ZMQ KV event subscriber (if kvc_aware enabled with endpoints).
-    spawn_kv_event_subscriber(&state, shutdown_tx.subscribe());
+    spawn_kv_event_subscriber(&state);
 
     // Spawn deployment health monitor (auto offline/recovery, DB deployments only).
     health_monitor::spawn_deployment_health_monitor(state.clone(), shutdown_tx.subscribe());
@@ -385,27 +385,14 @@ fn spawn_sync_task(state: AppState, mut shutdown: tokio::sync::broadcast::Receiv
     tracing::info!("Background sync task spawned (every 10 min)");
 }
 
-/// Spawn ZMQ KV event subscriber if kvc_aware is enabled with ZMQ endpoints.
-fn spawn_kv_event_subscriber(
-    state: &AppState,
-    shutdown: tokio::sync::broadcast::Receiver<()>,
-) {
-    if let Some(ref kv_index) = state.kv_index {
-        let kv_settings = &state.inner.load().config.router_settings.kvc_aware;
-        if kv_settings.zmq_endpoints.is_empty() {
-            tracing::warn!("kvc_aware enabled but no zmq_endpoints configured — no KV events will be received");
-            return;
-        }
-        let config = boom_kvindex::KvSubscriberConfig {
-            endpoints: kv_settings.zmq_endpoints.clone(),
-            topic_prefix: kv_settings.zmq_topic_prefix.clone(),
-        };
-        boom_kvindex::spawn_kv_subscriber(config, kv_index.clone(), shutdown);
-        tracing::info!(
-            endpoints = ?kv_settings.zmq_endpoints,
-            "ZMQ KV event subscriber spawned"
-        );
-    }
+/// Spawn the ZMQ KV event subscriber if kvc_aware is enabled with endpoints.
+///
+/// Delegates to `AppState::spawn_kv_subscriber`, which records the task handle
+/// on the state so a later SIGHUP reload can abort it before spawning a fresh
+/// subscriber against the rebuilt index.
+fn spawn_kv_event_subscriber(state: &AppState) {
+    let config = state.inner.load().config.clone();
+    state.spawn_kv_subscriber(&config);
 }
 
 /// Initialize tracing with a non-blocking writer.

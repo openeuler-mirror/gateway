@@ -23,6 +23,33 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Instant;
 
+/// Determine whether to request full KV-cache block reporting from vLLM.
+///
+/// vLLM defaults to incremental event reporting (only newly allocated blocks).
+/// Full reporting asks vLLM to re-emit the request's currently cached prefix
+/// blocks, backfilling the trie.
+///
+/// Decision logic (kvc-aware enabled):
+///   - hit ratio ≥ threshold → false (the trie already covers the prefix vLLM
+///     will reuse, so incremental reporting is sufficient — vLLM reuses those
+///     blocks without re-reporting them, but they are already in the trie)
+///   - hit ratio < threshold → true (the trie is missing part of the prefix;
+///     request a full report to backfill, also self-healing future requests)
+/// kvc-aware disabled (no kv_index) → false (vLLM default incremental).
+fn need_full_kv_report(
+    kvc_enabled: bool,
+    kv_hit_ratio: f64,
+    threshold: f64,
+) -> bool {
+    if !kvc_enabled {
+        // kvc-aware disabled → vLLM default (incremental).
+        return false;
+    }
+    // kvc-aware enabled: full report only when the trie doesn't yet
+    // cover enough of the request's prefix.
+    kv_hit_ratio < threshold
+}
+
 /// Extract client IP from request headers with TCP fallback.
 /// Priority: X-Real-IP > X-Forwarded-For (first IP) > TCP remote addr > "unknown".
 fn extract_client_ip(headers: &axum::http::HeaderMap, remote_addr: Option<std::net::SocketAddr>) -> String {
@@ -296,17 +323,21 @@ async fn chat_completions_inner(
 
     // 3. Select provider deployment.
     // Tokenize request if tokenizer pool is available (for KV-cache prefix matching).
-    let token_ids = match state.tokenizer_pool.as_ref() {
-        Some(pool) => {
-            let msgs: Vec<serde_json::Value> = req.messages.iter().map(|m| serde_json::to_value(m).unwrap_or_default()).collect();
-            let result = pool.tokenize_openai(&resolved_model, &msgs);
-            tracing::debug!(model = %resolved_model, tokens = result.token_ids.len(), "request tokenized");
-            result.token_ids
+    let token_ids = {
+        let pool_guard = state.tokenizer_pool.load();
+        match &**pool_guard {
+            Some(pool) => {
+                let msgs: Vec<serde_json::Value> = req.messages.iter().map(|m| serde_json::to_value(m).unwrap_or_default()).collect();
+                let tools_vals: Option<Vec<serde_json::Value>> = req.tools.as_ref().map(|t| t.iter().map(|tool| serde_json::to_value(tool).unwrap_or_default()).collect());
+                let result = pool.tokenize_openai(&resolved_model, &msgs, tools_vals.as_deref());
+                tracing::debug!(model = %resolved_model, tokens = result.token_ids.len(), "request tokenized");
+                result.token_ids
+            }
+            None => Vec::new(),
         }
-        None => Vec::new(),
     };
 
-    let provider = state
+    let selection = state
         .router
         .select_provider_with_prefix(&resolved_model, Some(&identity.key_hash), input_chars as u64, &token_ids)
         .ok_or_else(|| {
@@ -315,6 +346,8 @@ async fn chat_completions_inner(
             rollback_plan_quota(&state.limiter, &rl_info);
             GatewayErrorReply(e, false)
         })?;
+    let provider = selection.provider;
+    let kv_hit_ratio = selection.kv_hit_ratio;
 
     let deployment_id = provider.deployment_id().map(|s| s.to_string());
     let inflight_model = state.router.resolve_model_name(&resolved_model);
@@ -323,6 +356,17 @@ async fn chat_completions_inner(
     if let Some(ref did) = deployment_id {
         state.request_rate.record(did);
     }
+
+    // 3.2. Determine KV-cache reporting mode.
+    //      Full reporting is needed when kvc-aware is enabled so the trie
+    //      stays in sync with vLLM's internal prefix cache — vLLM reuses
+    //      cached blocks without reporting them in incremental mode.
+    //      When kvc-aware is disabled, vLLM uses its default incremental mode.
+    req.kv_cache_report_full = need_full_kv_report(
+        state.kv_index.load().is_some(),
+        kv_hit_ratio,
+        inner.config.router_settings.kvc_aware.full_report_hit_threshold,
+    );
 
     // 3.5. Flow control — queue if per-deployment limits exceeded.
     let is_vip = is_vip_key(&identity.metadata);
@@ -1479,19 +1523,22 @@ pub async fn messages(
 
     // 3. Select provider deployment.
     // Tokenize request if tokenizer pool is available (for KV-cache prefix matching).
-    let token_ids = match state.tokenizer_pool.as_ref() {
-        Some(pool) => {
-            let system_str = req.system.as_ref().and_then(|s| match s {
-                boom_core::types::AnthropicSystemContent::Text(t) => Some(t.as_str()),
-                _ => None,
-            });
-            let msgs: Vec<serde_json::Value> = req.messages.iter().map(|m| serde_json::to_value(m).unwrap_or_default()).collect();
-            pool.tokenize_anthropic(&resolved_model, system_str, &msgs).token_ids
+    let token_ids = {
+        let pool_guard = state.tokenizer_pool.load();
+        match &**pool_guard {
+            Some(pool) => {
+                let system_str = req.system.as_ref().and_then(|s| match s {
+                    boom_core::types::AnthropicSystemContent::Text(t) => Some(t.as_str()),
+                    _ => None,
+                });
+                let msgs: Vec<serde_json::Value> = req.messages.iter().map(|m| serde_json::to_value(m).unwrap_or_default()).collect();
+                pool.tokenize_anthropic(&resolved_model, system_str, &msgs).token_ids
+            }
+            None => Vec::new(),
         }
-        None => Vec::new(),
     };
 
-    let provider = state
+    let selection = state
         .router
         .select_provider_with_prefix(&resolved_model, Some(&identity.key_hash), input_chars as u64, &token_ids)
         .ok_or_else(|| {
@@ -1500,6 +1547,8 @@ pub async fn messages(
             rollback_plan_quota(&state.limiter, &rl_info);
             AnthropicErrorReply(e, is_stream)
         })?;
+    let provider = selection.provider;
+    let kv_hit_ratio = selection.kv_hit_ratio;
 
     let deployment_id = provider.deployment_id().map(|s| s.to_string());
     let inflight_model = state.router.resolve_model_name(&resolved_model);
@@ -1508,6 +1557,13 @@ pub async fn messages(
     if let Some(ref did) = deployment_id {
         state.request_rate.record(did);
     }
+
+    // 3.2. Determine KV-cache reporting mode (same logic as OpenAI path).
+    openai_req.kv_cache_report_full = need_full_kv_report(
+        state.kv_index.load().is_some(),
+        kv_hit_ratio,
+        inner.config.router_settings.kvc_aware.full_report_hit_threshold,
+    );
 
     // 3.5. Flow control — queue if per-deployment limits exceeded.
     let is_vip = is_vip_key(&identity.metadata);
@@ -1853,23 +1909,37 @@ fn sse_raw_data_extractor() -> impl FnMut(&Result<SseItem, Infallible>) -> Optio
 pub async fn kv_index_status(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    let body = match &state.kv_index {
+    // Debug snapshot of the kvc_aware config currently in effect (helps verify
+    // that reload picked up the latest settings).
+    let cfg = &state.inner.load().config.router_settings;
+    let kvc_cfg = &cfg.kvc_aware;
+    let config_snapshot = serde_json::json!({
+        "schedule_policy": cfg.schedule_policy,
+        "block_size": kvc_cfg.block_size,
+        "max_blocks": kvc_cfg.max_blocks,
+        "cache_weight": kvc_cfg.cache_weight,
+        "tier_weight": kvc_cfg.tier_weight,
+        "load_weight": kvc_cfg.load_weight,
+        "full_report_hit_threshold": kvc_cfg.full_report_hit_threshold,
+        "zmq_endpoints": kvc_cfg.zmq_endpoints,
+        "tokenizer_dir": kvc_cfg.tokenizer_dir,
+    });
+
+    let kv_index_guard = state.kv_index.load();
+    let body = match &**kv_index_guard {
         Some(kv_index) => {
             let block_count = kv_index.block_count();
             let models: Vec<String> = kv_index.model_names().into_iter().collect();
             let dump = kv_index.debug_dump();
             let blocks: Vec<serde_json::Value> = dump
                 .into_iter()
-                .map(|(model, token_ids, workers, tier)| {
-                    let token_count = token_ids.len();
-                    // Show first 8 token IDs as sample.
-                    let sample: Vec<u32> = token_ids.into_iter().take(8).collect();
+                .map(|(model, trie_key, workers, tier, depth)| {
                     serde_json::json!({
                         "model": model,
-                        "token_count": token_count,
-                        "token_sample": sample,
+                        "trie_key": trie_key,
                         "workers": workers,
                         "tier": serde_json::to_value(tier).unwrap_or_default(),
+                        "depth": depth,
                     })
                 })
                 .collect();
@@ -1878,6 +1948,7 @@ pub async fn kv_index_status(
                 "block_count": block_count,
                 "models": models,
                 "blocks": blocks,
+                "config": config_snapshot,
             })
         }
         None => serde_json::json!({
@@ -1885,6 +1956,7 @@ pub async fn kv_index_status(
             "block_count": 0,
             "models": [],
             "blocks": [],
+            "config": config_snapshot,
         }),
     };
     let pretty = serde_json::to_string_pretty(&body).unwrap_or_default();

@@ -22,7 +22,7 @@ edition = "2021"
 [workspace.dependencies]
 # serialization
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 serde_yaml = "0.9"
 
 # async
@@ -79,6 +79,9 @@ flate2 = "1"
 # KV-cache aware routing
 tokenizers = "0.21"
 twox-hash = "2"
+
+# LRU cache
+lru = "0.12"
 
 # ZMQ + msgpack (KV event transport)
 tmq = "0.5"

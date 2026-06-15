@@ -3,7 +3,7 @@ use boom_core::provider::{DeploymentQueueInfo, Provider};
 use std::sync::Arc;
 
 use crate::inflight::InFlightTracker;
-use super::SchedulePolicy;
+use super::{SchedulePolicy, Selection};
 
 /// KV-cache aware scheduling policy.
 ///
@@ -52,19 +52,25 @@ impl SchedulePolicy for KvcAwarePolicy {
         _key_hash: Option<&str>,
         _input_chars: u64,
         token_ids: &[u32],
-    ) -> Option<Arc<dyn Provider>> {
+    ) -> Option<Selection> {
         if candidates.is_empty() {
             return None;
         }
+
+        // Single candidate — no routing decision to make; skip the KV lookup.
         if candidates.len() == 1 {
             tracing::trace!(model, "single candidate, skip KVC lookup");
-            return Some(candidates[0].clone());
+            return Some(Selection {
+                provider: candidates[0].clone(),
+                kv_hit_ratio: 0.0,
+            });
         }
 
         // No token IDs — fall back to lowest-load.
         if token_ids.is_empty() {
             tracing::debug!(model, "no token_ids, fallback to lowest-load");
-            return select_lowest_load(&self.tracker, &self.queue_info, model, candidates);
+            return select_lowest_load(&self.tracker, &self.queue_info, model, candidates)
+                .map(|provider| Selection { provider, kv_hit_ratio: 0.0 });
         }
 
         // Collect deployment IDs as worker IDs for KV index lookup.
@@ -75,7 +81,8 @@ impl SchedulePolicy for KvcAwarePolicy {
 
         if worker_ids.is_empty() {
             tracing::debug!(model, "no deployment_id on candidates, fallback to lowest-load");
-            return select_lowest_load(&self.tracker, &self.queue_info, model, candidates);
+            return select_lowest_load(&self.tracker, &self.queue_info, model, candidates)
+                .map(|provider| Selection { provider, kv_hit_ratio: 0.0 });
         }
 
         // Query KV index for best prefix match.
@@ -99,11 +106,17 @@ impl SchedulePolicy for KvcAwarePolicy {
                     .map(|id| id == best.worker_id.as_str())
                     .unwrap_or(false)
             }) {
-                return Some(provider.clone());
+                // Carry the hit ratio out so the gateway can decide
+                // full vs incremental reporting.
+                return Some(Selection {
+                    provider: provider.clone(),
+                    kv_hit_ratio: best.hit_ratio,
+                });
             }
         }
 
-        // No match found — fall back to lowest-load.
+        // No match found — fall back to lowest-load. Hit ratio is 0, so the
+        // gateway will request a full report to backfill the trie.
         tracing::debug!(
             model,
             token_count = token_ids.len(),
@@ -111,6 +124,7 @@ impl SchedulePolicy for KvcAwarePolicy {
             "no KV match, fallback to lowest-load"
         );
         select_lowest_load(&self.tracker, &self.queue_info, model, candidates)
+            .map(|provider| Selection { provider, kv_hit_ratio: 0.0 })
     }
 
     fn name(&self) -> &str {

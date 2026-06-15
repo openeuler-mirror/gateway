@@ -18,3 +18,5 @@ rmpv = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
 regex = "1"
+twox-hash = { workspace = true }
+lru = { workspace = true }

@@ -13,10 +13,10 @@ use boom_core::kv_event::{GatewayKvEvent, StorageTier};
 #[derive(Debug, Clone)]
 pub enum VllmKvEvent {
     BlockStored {
-        /// Cumulative/chained block hashes (signed i64, ExternalBlockHash).
-        block_hashes: Vec<i64>,
+        /// Cumulative/chained block hashes (u64, ExternalBlockHash).
+        block_hashes: Vec<u64>,
         /// Parent block hash (None for the first block in a sequence).
-        parent_block_hash: Option<i64>,
+        parent_block_hash: Option<u64>,
         /// Token IDs in this block.
         token_ids: Vec<u32>,
         /// Number of tokens per block (typically 16).
@@ -28,7 +28,7 @@ pub enum VllmKvEvent {
     },
     BlockRemoved {
         /// Hashes of evicted blocks.
-        block_hashes: Vec<i64>,
+        block_hashes: Vec<u64>,
         /// Storage medium.
         medium: Option<String>,
     },
@@ -125,8 +125,8 @@ fn parse_block_stored(fields: &[rmpv::Value]) -> Result<VllmKvEvent, String> {
         ));
     }
 
-    let block_hashes = parse_i64_array(&fields[0], "block_hashes")?;
-    let parent_block_hash = fields[1].as_i64();
+    let block_hashes = parse_hash_array(&fields[0], "block_hashes")?;
+    let parent_block_hash = fields[1].as_u64();
     let token_ids = parse_u32_array(&fields[2], "token_ids")?;
     let block_size = fields[3]
         .as_u64()
@@ -154,7 +154,7 @@ fn parse_block_removed(fields: &[rmpv::Value]) -> Result<VllmKvEvent, String> {
         return Err("BlockRemoved: expected at least 1 field".into());
     }
 
-    let block_hashes = parse_i64_array(&fields[0], "block_hashes")?;
+    let block_hashes = parse_hash_array(&fields[0], "block_hashes")?;
     let medium = fields.get(1).and_then(|v| v.as_str()).map(|s| s.to_string());
 
     Ok(VllmKvEvent::BlockRemoved {
@@ -163,13 +163,23 @@ fn parse_block_removed(fields: &[rmpv::Value]) -> Result<VllmKvEvent, String> {
     })
 }
 
-fn parse_i64_array(value: &rmpv::Value, name: &str) -> Result<Vec<i64>, String> {
+/// Parse a msgpack array of block hashes (u64) from vLLM.
+///
+/// vLLM computes block hashes as `int.from_bytes(hash_bytes, "big") & ((1 << 64) - 1)`,
+/// producing values in [0, 2^64). msgpack encodes these as unsigned integers.
+/// We use `as_u64()` to correctly handle values > i64::MAX (~50% of hashes).
+fn parse_hash_array(value: &rmpv::Value, name: &str) -> Result<Vec<u64>, String> {
     value
         .as_array()
         .ok_or_else(|| format!("{name} is not an array"))
         .map(|arr| {
             arr.iter()
-                .filter_map(|v| v.as_i64())
+                .filter_map(|v| {
+                    v.as_u64().or_else(|| {
+                        // Fallback: if msgpack encoded as signed int, reinterpret as u64.
+                        v.as_i64().map(|n| n as u64)
+                    })
+                })
                 .collect()
         })
 }
@@ -228,6 +238,7 @@ pub fn vllm_batch_to_gateway_events(
         match event {
             VllmKvEvent::BlockStored {
                 block_hashes,
+                parent_block_hash,
                 token_ids,
                 block_size,
                 medium,
@@ -257,26 +268,53 @@ pub fn vllm_batch_to_gateway_events(
                         Vec::new()
                     };
 
+                    // Build parent_hash chain:
+                    // - idx=0 inherits the event's parent_block_hash
+                    // - idx>0 chains to the previous block in this batch
+                    let parent_hash = if idx == 0 {
+                        *parent_block_hash
+                    } else {
+                        Some(block_hashes[idx - 1])
+                    };
+
                     out.push(GatewayKvEvent::Store {
                         model: model.to_string(),
                         worker_id: worker_id.to_string(),
                         sequence_hash: String::new(),
                         prefix_hash: String::new(),
-                        local_hash: hash as u64,
+                        local_hash: hash,
+                        parent_hash,
                         block_index,
                         token_ids: block_tokens,
                         block_size: *block_size,
                         storage_tier: tier,
                     });
                 }
+
+                // Skip blocks without content hashes: they cannot participate in
+                // prefix caching and thus provide no value for KV-cache-aware routing.
+                // Removing this fallback also eliminates the zombie-block problem:
+                // BlockRemoved events with empty block_hashes had no way to identify
+                // which synthetic-hash blocks to evict.
+                if block_hashes.is_empty() && !token_ids.is_empty() {
+                    tracing::debug!(
+                        model,
+                        worker_id,
+                        token_count = token_ids.len(),
+                        "BlockStored with empty block_hashes, skipping — not cacheable"
+                    );
+                }
             }
-            VllmKvEvent::BlockRemoved { block_hashes, .. } => {
+            VllmKvEvent::BlockRemoved { block_hashes, medium } => {
                 // Per-block eviction: only remove the specific block hashes.
-                let hashes: Vec<u64> = block_hashes.iter().map(|&h| h as u64).collect();
+                // Pass the storage tier so the index can avoid incorrect removal
+                // during GPU↔CPU swap (block removed from GPU but still on CPU).
+                let storage_tier = Some(medium_to_tier(medium));
                 out.push(GatewayKvEvent::EvictBlocks {
                     model: model.to_string(),
                     worker_id: worker_id.to_string(),
-                    block_hashes: hashes,
+                    block_hashes: block_hashes.clone(),
+                    storage_tier,
                 });
             }
             VllmKvEvent::AllBlocksCleared => {
@@ -335,7 +373,7 @@ mod tests {
             rmpv::Value::Array(vec![              // events array
                 rmpv::Value::Array(vec![          // BlockStored event
                     rmpv::Value::from("BlockStored"),
-                    rmpv::Value::Array(vec![rmpv::Value::from(100i64), rmpv::Value::from(200i64)]), // block_hashes
+                    rmpv::Value::Array(vec![rmpv::Value::from(100u64), rmpv::Value::from(200u64)]), // block_hashes
                     rmpv::Value::Nil,             // parent_block_hash
                     rmpv::Value::Array(vec![rmpv::Value::from(1u64), rmpv::Value::from(2u64), rmpv::Value::from(3u64), rmpv::Value::from(4u64)]), // token_ids
                     rmpv::Value::from(16u64),     // block_size
@@ -352,7 +390,7 @@ mod tests {
 
         match &batch.events[0] {
             VllmKvEvent::BlockStored { block_hashes, token_ids, block_size, medium, .. } => {
-                assert_eq!(*block_hashes, vec![100, 200]);
+                assert_eq!(*block_hashes, vec![100u64, 200u64]);
                 assert_eq!(*token_ids, vec![1, 2, 3, 4]);
                 assert_eq!(*block_size, 16);
                 assert_eq!(medium.as_deref(), Some("gpu"));
@@ -371,7 +409,7 @@ mod tests {
             rmpv::Value::Array(vec![
                 rmpv::Value::Array(vec![
                     rmpv::Value::from("BlockRemoved"),
-                    rmpv::Value::Array(vec![rmpv::Value::from(42i64)]),
+                    rmpv::Value::Array(vec![rmpv::Value::from(42u64)]),
                     rmpv::Value::from("cpu"),
                 ]),
             ]),
@@ -383,7 +421,7 @@ mod tests {
 
         match &batch.events[0] {
             VllmKvEvent::BlockRemoved { block_hashes, medium } => {
-                assert_eq!(*block_hashes, vec![42]);
+                assert_eq!(*block_hashes, vec![42u64]);
                 assert_eq!(medium.as_deref(), Some("cpu"));
             }
             other => panic!("expected BlockRemoved, got {other:?}"),
@@ -413,7 +451,7 @@ mod tests {
         let batch = VllmEventBatch {
             ts: 1.0,
             events: vec![VllmKvEvent::BlockStored {
-                block_hashes: vec![100, 200],
+                block_hashes: vec![100u64, 200u64],
                 parent_block_hash: None,
                 token_ids: vec![1, 2, 3, 4, 5, 6, 7, 8],
                 block_size: 4,
@@ -426,12 +464,13 @@ mod tests {
         let events = vllm_batch_to_gateway_events(&batch, "worker-0", "test-model");
         assert_eq!(events.len(), 2);
 
-        // First block
+        // First block: parent_hash = None (root block)
         match &events[0] {
-            GatewayKvEvent::Store { model, worker_id, local_hash, token_ids, block_size, storage_tier, .. } => {
+            GatewayKvEvent::Store { model, worker_id, local_hash, parent_hash, token_ids, block_size, storage_tier, .. } => {
                 assert_eq!(model, "test-model");
                 assert_eq!(worker_id, "worker-0");
-                assert_eq!(*local_hash, 100i64 as u64);
+                assert_eq!(*local_hash, 100u64);
+                assert_eq!(*parent_hash, None);
                 assert_eq!(*token_ids, vec![1, 2, 3, 4]);
                 assert_eq!(*block_size, 4);
                 assert_eq!(*storage_tier, StorageTier::Gpu);
@@ -439,11 +478,47 @@ mod tests {
             other => panic!("expected Store, got {other:?}"),
         }
 
-        // Second block
+        // Second block: parent_hash = Some(100) (chains to first block)
         match &events[1] {
-            GatewayKvEvent::Store { local_hash, token_ids, .. } => {
-                assert_eq!(*local_hash, 200i64 as u64);
+            GatewayKvEvent::Store { local_hash, parent_hash, token_ids, .. } => {
+                assert_eq!(*local_hash, 200u64);
+                assert_eq!(*parent_hash, Some(100u64));
                 assert_eq!(*token_ids, vec![5, 6, 7, 8]);
+            }
+            other => panic!("expected Store, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_vllm_batch_to_gateway_events_store_with_parent() {
+        // Multi-turn: parent_block_hash = Some(999), two new blocks
+        let batch = VllmEventBatch {
+            ts: 1.0,
+            events: vec![VllmKvEvent::BlockStored {
+                block_hashes: vec![300u64, 400u64],
+                parent_block_hash: Some(999u64),
+                token_ids: vec![10, 20, 30, 40, 50, 60, 70, 80],
+                block_size: 4,
+                lora_name: None,
+                medium: Some("gpu".into()),
+            }],
+            data_parallel_rank: None,
+        };
+
+        let events = vllm_batch_to_gateway_events(&batch, "worker-0", "test-model");
+        assert_eq!(events.len(), 2);
+
+        match &events[0] {
+            GatewayKvEvent::Store { local_hash, parent_hash, .. } => {
+                assert_eq!(*local_hash, 300u64);
+                assert_eq!(*parent_hash, Some(999u64));
+            }
+            other => panic!("expected Store, got {other:?}"),
+        }
+        match &events[1] {
+            GatewayKvEvent::Store { local_hash, parent_hash, .. } => {
+                assert_eq!(*local_hash, 400u64);
+                assert_eq!(*parent_hash, Some(300u64));
             }
             other => panic!("expected Store, got {other:?}"),
         }
@@ -468,5 +543,45 @@ mod tests {
         let hash: i64 = -1;
         let as_u64: u64 = hash as u64;
         assert_eq!(as_u64, u64::MAX);
+    }
+
+    #[test]
+    fn test_parse_block_hashes_exceeding_i64_max() {
+        // vLLM block hashes are uint64: int.from_bytes(hash_bytes, "big") & ((1<<64)-1).
+        // ~50% of values exceed i64::MAX. Verify we parse them correctly.
+        use rmpv::encode::write_value;
+
+        let large_hash: u64 = 18446744073709551615u64; // u64::MAX
+        let another_large: u64 = 15000000000000000000u64; // > i64::MAX
+
+        let mut buf = Vec::new();
+        write_value(&mut buf, &rmpv::Value::Array(vec![
+            rmpv::Value::from(1.0_f64),
+            rmpv::Value::Array(vec![
+                rmpv::Value::Array(vec![
+                    rmpv::Value::from("BlockStored"),
+                    rmpv::Value::Array(vec![
+                        rmpv::Value::from(large_hash),
+                        rmpv::Value::from(another_large),
+                    ]),
+                    rmpv::Value::Nil,
+                    rmpv::Value::Array(vec![rmpv::Value::from(1u64); 16]),
+                    rmpv::Value::from(16u64),
+                    rmpv::Value::Nil,
+                    rmpv::Value::from("gpu"),
+                ]),
+            ]),
+            rmpv::Value::Nil,
+        ])).unwrap();
+
+        let batch = parse_vllm_batch(&buf).unwrap();
+        match &batch.events[0] {
+            VllmKvEvent::BlockStored { block_hashes, .. } => {
+                assert_eq!(block_hashes.len(), 2);
+                assert_eq!(block_hashes[0], u64::MAX);
+                assert_eq!(block_hashes[1], 15000000000000000000u64);
+            }
+            other => panic!("expected BlockStored, got {other:?}"),
+        }
     }
 }

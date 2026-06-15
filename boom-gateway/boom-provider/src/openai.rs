@@ -34,6 +34,9 @@ impl OpenAIProvider {
     }
 
     fn build_request(&self, mut req: ChatCompletionRequest) -> serde_json::Value {
+        // Extract internal flags before serialization (they are skip_serializing).
+        let kv_cache_report_full = req.kv_cache_report_full;
+
         // Replace model name with the actual provider model ID.
         req.model = self.model.clone();
         // Convert internal ContentPart::Reasoning to ContentPart::Text so that
@@ -49,7 +52,19 @@ impl OpenAIProvider {
         }
         // Serialize — skip_serializing on `extra` ensures non-standard fields
         // (service_tier, store, etc.) are NOT forwarded to upstream providers.
-        serde_json::to_value(&req).unwrap_or_default()
+        let mut body = serde_json::to_value(&req).unwrap_or_default();
+
+        // Inject vllm_xargs for KV cache full reporting when requested by gateway.
+        if kv_cache_report_full {
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert(
+                    "vllm_xargs".to_string(),
+                    serde_json::json!({ "kv_cache_report_mode": "full" }),
+                );
+            }
+        }
+
+        body
     }
 }
 

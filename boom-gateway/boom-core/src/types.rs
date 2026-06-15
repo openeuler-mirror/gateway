@@ -175,6 +175,11 @@ pub struct ChatCompletionRequest {
     /// in-memory side channel from the route layer to the provider layer.
     #[serde(skip)]
     pub gateway_headers: HashMap<String, String>,
+    /// Internal flag: when true, gateway injects `vllm_xargs.kv_cache_report_mode: "full"`
+    /// into the forwarded request so vLLM reports all cached (reused) prefix blocks,
+    /// not just newly allocated ones. Not set by clients — set by the gateway after routing.
+    #[serde(skip, default)]
+    pub kv_cache_report_full: bool,
 }
 
 // ============================================================
@@ -249,6 +254,7 @@ impl CompletionRequest {
             logit_bias: None,
             extra: self.extra,
             gateway_headers: HashMap::new(),
+            kv_cache_report_full: false,
         }
     }
 }
