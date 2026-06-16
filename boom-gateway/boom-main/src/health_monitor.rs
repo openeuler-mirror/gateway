@@ -276,9 +276,11 @@ fn health_url(target: &DeploymentHealthTarget, path: &str) -> Option<String> {
 
 async fn probe(client: &reqwest::Client, url: &str) -> Result<(), String> {
     let response = client.get(url).send().await.map_err(|e| e.to_string())?;
-    if response.status().is_success() {
-        Ok(())
-    } else {
+    // Connection reachable + 4xx or 2xx → node is alive (404 just means path doesn't exist).
+    // 5xx → node is malfunctioning, counts as health check failure.
+    if response.status().is_server_error() {
         Err(format!("health endpoint returned {}", response.status()))
+    } else {
+        Ok(())
     }
 }
