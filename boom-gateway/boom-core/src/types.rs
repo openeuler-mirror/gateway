@@ -1,6 +1,7 @@
 use crate::GatewayError;
 use futures::Stream;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::pin::Pin;
 
 // ============================================================
@@ -168,6 +169,13 @@ pub struct ChatCompletionRequest {
     /// upstream providers that may not understand them.
     #[serde(default, flatten, skip_serializing)]
     pub extra: serde_json::Map<String, serde_json::Value>,
+    /// Gateway-internal HTTP headers to inject into the upstream request
+    /// (e.g. `X-Gateway-Priority` for the downstream scheduler). Skipped by serde
+    /// in both directions: never parsed from the client body (prevents
+    /// spoofing) and never serialized into the upstream JSON body. Purely an
+    /// in-memory side channel from the route layer to the provider layer.
+    #[serde(skip)]
+    pub gateway_headers: HashMap<String, String>,
 }
 
 // ============================================================
@@ -241,6 +249,7 @@ impl CompletionRequest {
             top_logprobs: None,
             logit_bias: None,
             extra: self.extra,
+            gateway_headers: HashMap::new(),
         }
     }
 }

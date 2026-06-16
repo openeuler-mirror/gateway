@@ -1,5 +1,6 @@
 mod admin_command;
 mod extractor;
+mod health_monitor;
 mod request_log;
 mod routes;
 mod state;
@@ -71,6 +72,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Spawn ZMQ KV event subscriber (if kvc_aware enabled with endpoints).
     spawn_kv_event_subscriber(&state, shutdown_tx.subscribe());
+
+    // Spawn deployment health monitor (auto offline/recovery, DB deployments only).
+    health_monitor::spawn_deployment_health_monitor(state.clone(), shutdown_tx.subscribe());
 
     // Build router.
     let app = build_router(state.clone());

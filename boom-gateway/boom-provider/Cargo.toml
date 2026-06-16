@@ -17,3 +17,6 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 bytes = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+wiremock = "0.6"

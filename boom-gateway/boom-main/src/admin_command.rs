@@ -215,7 +215,6 @@ pub async fn auto_disable_deployment(
     pool: &sqlx::PgPool,
     deployment_store: &Arc<DeploymentStore>,
     deployment_id: &str,
-    _requested_model: &str,
 ) {
     tracing::warn!(
         deployment_id = %deployment_id,
@@ -241,6 +240,38 @@ pub async fn auto_disable_deployment(
         deployment_id = %deployment_id,
         model = %actual_model_name,
         "Deployment auto-disabled and removed from routing"
+    );
+}
+
+/// Auto-enable a deployment that was previously auto-disabled, then reload routing.
+pub async fn auto_enable_deployment(
+    pool: &sqlx::PgPool,
+    deployment_store: &Arc<DeploymentStore>,
+    deployment_id: &str,
+) {
+    tracing::info!(
+        deployment_id = %deployment_id,
+        "Auto-enabling deployment after successful recovery checks"
+    );
+
+    let actual_model_name = match DeploymentStore::auto_enable_db(pool, deployment_id).await {
+        Ok(Some(name)) => name,
+        Ok(None) => {
+            tracing::warn!(deployment_id = %deployment_id, "No rows updated — deployment may not exist or was not auto-disabled");
+            return;
+        }
+        Err(e) => {
+            tracing::error!(deployment_id = %deployment_id, "Failed to auto-enable deployment in DB: {}", e);
+            return;
+        }
+    };
+
+    reload_model_deployments(pool, deployment_store, &actual_model_name).await;
+
+    tracing::info!(
+        deployment_id = %deployment_id,
+        model = %actual_model_name,
+        "Deployment auto-enabled and restored to routing"
     );
 }
 
