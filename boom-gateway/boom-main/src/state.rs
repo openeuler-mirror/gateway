@@ -64,8 +64,16 @@ pub struct AppState {
     /// Per-deployment request rate tracker (survives reloads).
     pub request_rate: Arc<RequestRateTracker>,
     /// KV-cache prefix index, hot-swappable across reloads.
-    /// `None` when kvc_aware is disabled. Reload swaps this atomically; the
-    /// old trie is dropped (rebuilt empty) — see `reload()`.
+    ///
+    /// THIRD lifecycle (distinct from AppState's other fields): unlike
+    /// deployment_store / plan_store / limiter — which survive reloads with
+    /// their contents intact — this is rebuilt EMPTY on every reload. Any
+    /// kvc_aware config change (policy, weights, block_size, zmq_endpoints,
+    /// tokenizer_dir) swaps in a fresh index; the old trie is dropped and the
+    /// new one starts empty, repopulated by a freshly spawned subscriber. The
+    /// transient moment (queries hit an empty trie → 0 hit → degrade to
+    /// lowest-load) is intentional ("rebuild = clear cache"). `None` when
+    /// kvc_aware is disabled. See `reload()`.
     pub kv_index: Arc<ArcSwap<Option<Arc<dyn KvIndexBackend>>>>,
     /// Tokenizer pool for computing prefix block hashes, hot-swappable.
     pub tokenizer_pool: Arc<ArcSwap<Option<Arc<TokenizerPool>>>>,

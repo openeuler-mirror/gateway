@@ -268,9 +268,19 @@ pub fn vllm_batch_to_gateway_events(
                         Vec::new()
                     };
 
-                    // Build parent_hash chain:
-                    // - idx=0 inherits the event's parent_block_hash
-                    // - idx>0 chains to the previous block in this batch
+                    // Build the parent_hash chain within this event.
+                    //
+                    // PRECONDITION: a single BlockStored event carries only the
+                    // consecutively-stored blocks of ONE sequence in one
+                    // scheduler step (vLLM publishes one event per sequence).
+                    // Under that invariant idx=0 continues from the event's
+                    // parent_block_hash (the sequence's last block from the prior
+                    // step), and each idx>0 chains to the preceding block.
+                    //
+                    // The wire format carries no sequence id, so this cannot be
+                    // asserted from the payload. A multi-sequence batch would
+                    // mis-chain blocks and corrupt the trie — revisit if vLLM
+                    // ever coalesces sequences into one event.
                     let parent_hash = if idx == 0 {
                         *parent_block_hash
                     } else {

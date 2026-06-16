@@ -441,6 +441,25 @@ impl Default for KvcAwareSettings {
     }
 }
 
+impl KvcAwareSettings {
+    /// Validate semantic constraints serde cannot enforce.
+    pub fn validate(&self) -> Result<(), GatewayError> {
+        // full_report_hit_threshold must be a valid ratio in (0.0, 1.0]:
+        //   - <= 0 would never trigger a full report, so the trie never
+        //     backfills and KVC matches degrade to zero (silent failure).
+        //   - > 1 would always trigger a full report (equivalent to disabling
+        //     the optimization); NaN is rejected too since all comparisons
+        //     against NaN are false.
+        let threshold = self.full_report_hit_threshold;
+        if !(threshold > 0.0 && threshold <= 1.0) {
+            return Err(GatewayError::ConfigError(format!(
+                "router_settings.kvc_aware.full_report_hit_threshold must be in (0.0, 1.0], got {threshold}"
+            )));
+        }
+        Ok(())
+    }
+}
+
 fn default_block_size() -> usize {
     16
 }
@@ -586,17 +605,10 @@ impl Config {
     /// Called by [`load_config`] so both startup and hot-reload reject bad
     /// values instead of silently misbehaving.
     pub fn validate(&self) -> Result<(), GatewayError> {
-        // KV-cache full-report hit threshold must be a valid ratio in (0.0, 1.0]:
-        //   - <= 0 would never trigger a full report, so the trie never backfills
-        //     and KVC matches degrade to zero (silent failure).
-        //   - > 1 would always trigger a full report (equivalent to disabling the
-        //     optimization); NaN is rejected too since all comparisons are false.
-        let threshold = self.router_settings.kvc_aware.full_report_hit_threshold;
-        if !(threshold > 0.0 && threshold <= 1.0) {
-            return Err(GatewayError::ConfigError(format!(
-                "router_settings.kvc_aware.full_report_hit_threshold must be in (0.0, 1.0], got {threshold}"
-            )));
-        }
+        // Compose per-section validation. Each settings struct owns its own
+        // semantic checks; Config::validate just orchestrates them so new
+        // sections plug in without growing this method.
+        self.router_settings.kvc_aware.validate()?;
         Ok(())
     }
 }

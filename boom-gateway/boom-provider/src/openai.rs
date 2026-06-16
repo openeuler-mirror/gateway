@@ -267,6 +267,7 @@ mod tests {
             logit_bias: None,
             extra: Default::default(),
             gateway_headers,
+            kv_cache_report_full: false,
         }
     }
 

@@ -37,6 +37,13 @@ pub struct TokenPrefixIndex {
     /// Per-block parent tracking: (model, worker, block_hash) → parent_hash.
     /// `None` means root block (first block of a new sequence).
     block_parent: DashMap<(String, String, u64), Option<u64>>,
+    /// Reverse edge of `block_parent`: (model, worker, parent_hash) → child
+    /// hashes. The `None` bucket holds root blocks. Kept in lock-step with
+    /// `block_parent` on every Store/Evict/Remove so `find_children` and
+    /// `collect_descendants` are O(1)/O(|subtree|) instead of O(n) full-table
+    /// scans on the hot Store/Evict paths. Empty buckets are dropped
+    /// immediately to bound memory under high block churn.
+    reverse_children: DashMap<(String, String, Option<u64>), HashSet<u64>>,
     /// Maps vLLM block_hash → trie key (xxhash3-64 of token_ids).
     /// Used by build_path to walk the trie during eviction / repositioning.
     block_trie_key: DashMap<(String, String, u64), u64>,
@@ -93,6 +100,7 @@ impl TokenPrefixIndex {
         Self {
             tries: DashMap::new(),
             block_parent: DashMap::new(),
+            reverse_children: DashMap::new(),
             block_trie_key: DashMap::new(),
             hash_to_tokens: DashMap::new(),
             loads: DashMap::new(),
@@ -170,15 +178,125 @@ impl TokenPrefixIndex {
         worker_id: &str,
         target_hash: u64,
     ) -> Vec<u64> {
-        let m = model.to_string();
-        let w = worker_id.to_string();
-        self.block_parent
-            .iter()
-            .filter(|e| {
-                e.key().0 == m && e.key().1 == w && *e.value() == Some(target_hash)
-            })
-            .map(|e| e.key().2)
-            .collect()
+        // O(1) reverse-index lookup. `block_parent` is a forest (one parent per
+        // child), so a precomputed parent→children map replaces the prior
+        // O(n) full-table scan that ran on every Store.
+        self.reverse_children
+            .get(&(model.to_string(), worker_id.to_string(), Some(target_hash)))
+            .map(|set| set.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// Remove `child` from the `(model, worker, parent)` reverse-children
+    /// bucket, dropping the bucket when it becomes empty. This is the only
+    /// detach entry point for the reverse index; Store uses `entry().or_default()`
+    /// for the attach side and calls this only when a block is re-parented.
+    /// The RefMut is released before the conditional `remove` to avoid a shard
+    /// deadlock.
+    fn reverse_detach(
+        &self,
+        model: &str,
+        worker_id: &str,
+        parent: Option<u64>,
+        child: u64,
+    ) {
+        let bucket_key = (model.to_string(), worker_id.to_string(), parent);
+        let now_empty = if let Some(mut set) = self.reverse_children.get_mut(&bucket_key) {
+            set.remove(&child);
+            set.is_empty()
+        } else {
+            return;
+        };
+        if now_empty {
+            let _ = self.reverse_children.remove(&bucket_key);
+        }
+    }
+
+    /// Compute the full root→block trie path for every block in `to_evict`
+    /// (eviction roots + their descendants, any order, duplicates tolerated).
+    ///
+    /// Incremental construction: a block whose parent is also in the set gets
+    /// `parent_path + own_trie_key` (O(1)); a block whose parent is outside the
+    /// set (an eviction root) is resolved once via `build_path`. This replaces
+    /// the prior O(|to_evict| × depth) scheme that called `build_path` per
+    /// block and re-walked shared prefixes each time — the dominant cost on the
+    /// frequent Evict path under high throughput.
+    fn build_evict_paths(
+        &self,
+        model: &str,
+        worker_id: &str,
+        to_evict: &[u64],
+    ) -> Vec<Vec<u64>> {
+        // Snapshot parent + trie_key for every block (one read each) and the
+        // set membership used to distinguish boundary vs. incremental nodes.
+        let mut parent_of: HashMap<u64, Option<u64>> = HashMap::new();
+        let mut trie_key_of: HashMap<u64, Option<u64>> = HashMap::new();
+        let mut in_set: HashSet<u64> = HashSet::new();
+        for &h in to_evict {
+            in_set.insert(h);
+            let key = (model.to_string(), worker_id.to_string(), h);
+            let p = self.block_parent.get(&key).map(|v| *v).unwrap_or(None);
+            let tk = self.block_trie_key.get(&key).map(|v| *v);
+            parent_of.entry(h).or_insert(p);
+            trie_key_of.entry(h).or_insert(tk);
+        }
+
+        let mut paths: HashMap<u64, Vec<u64>> = HashMap::new();
+        for &h in to_evict {
+            if paths.contains_key(&h) {
+                continue;
+            }
+            // Walk up from h collecting the chain until we leave the set or hit
+            // an already-resolved node. `chain_set` guards against cycles
+            // (defensive; build_path guards too) in O(1) per step.
+            let mut chain: Vec<u64> = vec![h];
+            let mut chain_set: HashSet<u64> = HashSet::new();
+            chain_set.insert(h);
+            let mut cur = parent_of[&h];
+            loop {
+                match cur {
+                    Some(p) if paths.contains_key(&p) => break, // memoized base above
+                    Some(p) if in_set.contains(&p) && chain_set.insert(p) => {
+                        chain.push(p);
+                        cur = parent_of[&p];
+                    }
+                    _ => break, // parent outside set (boundary) or cycle
+                }
+            }
+            // Resolve parent-first so each node's parent path is already known.
+            chain.reverse();
+            for &node in &chain {
+                if paths.contains_key(&node) {
+                    continue;
+                }
+                let path = match (parent_of[&node], trie_key_of[&node]) {
+                    (Some(p), Some(tk)) if paths.contains_key(&p) => {
+                        let mut v = paths[&p].clone();
+                        v.push(tk);
+                        v
+                    }
+                    _ => self.build_path(model, worker_id, Some(node)).0,
+                };
+                paths.insert(node, path);
+            }
+        }
+
+        // Emit deduplicated, non-empty paths in to_evict order. Duplicates in
+        // `to_evict` (e.g. one eviction root being an ancestor of another) are
+        // collapsed; empty paths mean the block was never inserted into the trie.
+        let mut emitted: HashSet<u64> = HashSet::new();
+        let mut out: Vec<Vec<u64>> = Vec::with_capacity(to_evict.len());
+        for &h in to_evict {
+            if !emitted.insert(h) {
+                continue;
+            }
+            if let Some(p) = paths.get(&h) {
+                if !p.is_empty() {
+                    out.push(p.clone());
+                }
+            }
+        }
+        out
     }
 
     /// Re-insert a block and its descendants into the trie at the correct
@@ -321,16 +439,23 @@ impl TokenPrefixIndex {
         target_hash: u64,
         result: &mut Vec<u64>,
     ) {
-        let m = model.to_string();
-        let w = worker_id.to_string();
-        for entry in self.block_parent.iter() {
-            if entry.key().0 == m && entry.key().1 == w {
-                if *entry.value() == Some(target_hash) {
-                    let child_hash = entry.key().2;
-                    if !result.contains(&child_hash) {
-                        result.push(child_hash);
-                        self.collect_descendants(model, worker_id, child_hash, result);
-                    }
+        // Iterative BFS over the reverse index — O(|subtree|) instead of the
+        // prior O(n) recursive full-table scan. No dedup is needed: the reverse
+        // index guarantees each child lives in exactly one parent bucket
+        // (forest invariant), so the subtree contains no duplicates.
+        let mut stack: Vec<Option<u64>> = vec![Some(target_hash)];
+        while let Some(parent) = stack.pop() {
+            if let Some(set) = self
+                .reverse_children
+                .get(&(model.to_string(), worker_id.to_string(), parent))
+            {
+                for &child in set.iter() {
+                    debug_assert!(
+                        !result.contains(&child),
+                        "duplicate child in subtree — reverse index invariant violated"
+                    );
+                    result.push(child);
+                    stack.push(Some(child));
                 }
             }
         }
@@ -374,18 +499,10 @@ impl TokenPrefixIndex {
         self.collect_descendants(model, worker_id, hash, &mut to_evict);
         to_evict.push(hash);
 
-        // 2. Build trie paths BEFORE removing metadata.
-        let paths: Vec<Vec<u64>> = to_evict
-            .iter()
-            .filter_map(|&h| {
-                let (path, _) = self.build_path(model, worker_id, Some(h));
-                if path.is_empty() {
-                    None
-                } else {
-                    Some(path)
-                }
-            })
-            .collect();
+        // 2. Build trie paths BEFORE removing metadata. Incremental: shared
+        //    parent prefixes are walked via build_path at most once per root
+        //    instead of once per block.
+        let paths: Vec<Vec<u64>> = self.build_evict_paths(model, worker_id, &to_evict);
 
         // 3. Remove worker from trie nodes.
         if let Some(trie) = self.tries.get(model) {
@@ -395,12 +512,14 @@ impl TokenPrefixIndex {
             }
         }
 
-        // 4. Clean up block metadata in DashMaps.
+        // 4. Clean up block metadata in DashMaps (+ reverse index).
         for &h in &to_evict {
             let key = (model.to_string(), worker_id.to_string(), h);
-            self.hash_to_tokens.remove(&key);
-            self.block_parent.remove(&key);
+            if let Some((_, old_parent)) = self.block_parent.remove(&key) {
+                self.reverse_detach(model, worker_id, old_parent, h);
+            }
             self.block_trie_key.remove(&key);
+            self.hash_to_tokens.remove(&key);
             self.temp_trie_path.remove(&key);
         }
 
@@ -482,11 +601,21 @@ impl KvIndexBackend for TokenPrefixIndex {
                 // Compute the trie key (xxhash3-64 of token_ids).
                 let trie_key = hash_block_tokens(token_ids);
 
-                // 1. Record parent relationship.
-                self.block_parent.insert(
-                    (model.clone(), worker_id.clone(), effective_hash),
-                    *parent_hash,
-                );
+                // 1. Record parent relationship, keeping the reverse index in
+                //    sync. `block_parent.insert` returns the previous parent so
+                //    we can detach the stale reverse edge on re-parenting (e.g.
+                //    when a delayed parent_block_hash arrives later).
+                let parent_key = (model.clone(), worker_id.clone(), effective_hash);
+                let prev_parent = self.block_parent.insert(parent_key, *parent_hash);
+                if let Some(old) = prev_parent {
+                    if old != *parent_hash {
+                        self.reverse_detach(model, worker_id, old, effective_hash);
+                    }
+                }
+                self.reverse_children
+                    .entry((model.clone(), worker_id.clone(), *parent_hash))
+                    .or_default()
+                    .insert(effective_hash);
 
                 // 2. Record hash → trie key mapping.
                 self.block_trie_key.insert(
@@ -694,18 +823,8 @@ impl KvIndexBackend for TokenPrefixIndex {
                     return;
                 }
 
-                // Build all paths BEFORE removing metadata.
-                let paths: Vec<Vec<u64>> = to_evict
-                    .iter()
-                    .filter_map(|&h| {
-                        let (path, _) = self.build_path(model, worker_id, Some(h));
-                        if path.is_empty() {
-                            None
-                        } else {
-                            Some(path)
-                        }
-                    })
-                    .collect();
+                // Build all paths BEFORE removing metadata (incremental).
+                let paths: Vec<Vec<u64>> = self.build_evict_paths(model, worker_id, &to_evict);
 
                 // Remove worker from trie nodes (unconditional — tier check done above).
                 if let Some(trie) = self.tries.get(model) {
@@ -715,14 +834,16 @@ impl KvIndexBackend for TokenPrefixIndex {
                     }
                 }
 
-                // Clean up block metadata + LRU queue.
+                // Clean up block metadata + reverse index + LRU queue.
                 {
                     let mut lru = self.lru_queue.lock();
                     for &hash in &to_evict {
                         let key = (model.clone(), worker_id.clone(), hash);
-                        self.hash_to_tokens.remove(&key);
-                        self.block_parent.remove(&key);
+                        if let Some((_, old_parent)) = self.block_parent.remove(&key) {
+                            self.reverse_detach(model, worker_id, old_parent, hash);
+                        }
                         self.block_trie_key.remove(&key);
+                        self.hash_to_tokens.remove(&key);
                         self.temp_trie_path.remove(&key);
                         lru.pop(&key);
                     }
@@ -903,6 +1024,7 @@ impl KvIndexBackend for TokenPrefixIndex {
         }
 
         self.block_parent.retain(|k, _| k.1 != worker_id);
+        self.reverse_children.retain(|k, _| k.1 != worker_id);
         self.block_trie_key.retain(|k, _| k.1 != worker_id);
         self.hash_to_tokens.retain(|k, _| k.1 != worker_id);
         self.temp_trie_path.retain(|k, _| k.1 != worker_id);
@@ -1444,5 +1566,126 @@ mod tests {
         assert_eq!(matches[0].best_tier, StorageTier::Cpu);
         // CPU priority_score = 0.7
         assert!((matches[0].tier_score - 0.7).abs() < f64::EPSILON);
+    }
+
+    // ---- Reverse-index invariants ----
+
+    /// Assert `reverse_children` is an exact mirror of `block_parent`: every
+    /// block is in its parent's reverse bucket, no bucket is empty (the leak
+    /// risk under high eviction churn), and every reverse entry points back to a
+    /// real `block_parent` row with a matching parent. Cardinalities must match.
+    fn assert_reverse_invariant(idx: &TokenPrefixIndex) {
+        let mut forward = 0usize;
+        for entry in idx.block_parent.iter() {
+            let (m, w, hash) = entry.key();
+            let parent = entry.value();
+            forward += 1;
+            let bucket = idx
+                .reverse_children
+                .get(&(m.clone(), w.clone(), *parent))
+                .unwrap_or_else(|| {
+                    panic!("reverse bucket missing for parent {parent:?} (child {hash})")
+                });
+            assert!(
+                bucket.contains(hash),
+                "child {hash} missing from reverse bucket of parent {parent:?}"
+            );
+        }
+
+        let mut reverse = 0usize;
+        for entry in idx.reverse_children.iter() {
+            let (m, w, parent) = entry.key();
+            let children = entry.value();
+            assert!(
+                !children.is_empty(),
+                "empty reverse bucket leaked for ({m:?}, {w:?}, {parent:?})"
+            );
+            for &child in children.iter() {
+                reverse += 1;
+                let bp = idx
+                    .block_parent
+                    .get(&(m.clone(), w.clone(), child))
+                    .expect("reverse child has no block_parent row");
+                assert_eq!(
+                    *bp, *parent,
+                    "reverse parent {parent:?} != block_parent parent for child {child}"
+                );
+            }
+        }
+        assert_eq!(forward, reverse, "reverse index cardinality drift");
+    }
+
+    #[test]
+    fn test_reverse_index_consistency_under_structural_ops() {
+        let idx = TokenPrefixIndex::new(4, 0.5, 0.3, 0.2, 500_000);
+
+        // Two branching chains on w0 + a chain on w1.
+        //   w0: 10 → 11 → 12 , 10 → 13
+        //   w1: 20 → 21
+        idx.apply_event(&store_event("m", "w0", 10, None, vec![1, 2, 3, 4]));
+        idx.apply_event(&store_event("m", "w0", 11, Some(10), vec![5, 6, 7, 8]));
+        idx.apply_event(&store_event("m", "w0", 12, Some(11), vec![9, 10, 11, 12]));
+        idx.apply_event(&store_event("m", "w0", 13, Some(10), vec![13, 14, 15, 16]));
+        idx.apply_event(&store_event("m", "w1", 20, None, vec![1, 2, 3, 4]));
+        idx.apply_event(&store_event("m", "w1", 21, Some(20), vec![5, 6, 7, 8]));
+        assert_reverse_invariant(&idx);
+
+        // Cascading subtree eviction: evicting 10 removes 11,12,13 too.
+        idx.apply_event(&evict_event("m", "w0", vec![10]));
+        assert_reverse_invariant(&idx);
+        assert_eq!(
+            idx.find_matches("m", &[1, 2, 3, 4], &["w0".to_string()]).len(),
+            0
+        );
+
+        // Dedup path: evict two roots where one is an ancestor of the other.
+        idx.apply_event(&store_event("m", "w0", 30, None, vec![21, 22, 23, 24]));
+        idx.apply_event(&store_event("m", "w0", 31, Some(30), vec![25, 26, 27, 28]));
+        idx.apply_event(&evict_event("m", "w0", vec![30, 31]));
+        assert_reverse_invariant(&idx);
+
+        // Re-parenting: child arrives before its parent (delayed parent_block_hash).
+        idx.apply_event(&store_event("m", "w0", 50, Some(49), vec![30, 31, 32, 33]));
+        assert_reverse_invariant(&idx);
+        idx.apply_event(&store_event("m", "w0", 49, None, vec![26, 27, 28, 29]));
+        assert_reverse_invariant(&idx);
+
+        // Full worker teardown drops every w1 bucket.
+        idx.apply_event(&remove_event("w1"));
+        assert_reverse_invariant(&idx);
+        for entry in idx.reverse_children.iter() {
+            assert_eq!(entry.key().1, "w0", "w1 bucket survived removal");
+        }
+    }
+
+    #[test]
+    fn test_reverse_index_no_bucket_leak_under_lru_churn() {
+        // Capacity 4 forces an LRU eviction on almost every Store — the worst
+        // case for empty-bucket accumulation in the reverse index.
+        let idx = TokenPrefixIndex::new(4, 0.5, 0.3, 0.2, 4);
+
+        // Seed a small chain, then hammer root Stores across two workers so the
+        // global LRU queue churns repeatedly (evicting subtrees + their buckets).
+        idx.apply_event(&store_event("m", "w0", 1, None, vec![1, 2, 3, 4]));
+        idx.apply_event(&store_event("m", "w0", 2, Some(1), vec![5, 6, 7, 8]));
+        for i in 0..400u64 {
+            let w = if i % 2 == 0 { "w0" } else { "w1" };
+            idx.apply_event(&store_event(
+                "m",
+                w,
+                1000 + i,
+                None,
+                vec![i as u32, i as u32 + 1, i as u32 + 2, i as u32 + 3],
+            ));
+            if i % 64 == 0 {
+                assert_reverse_invariant(&idx);
+            }
+        }
+        assert_reverse_invariant(&idx);
+
+        // After heavy churn no empty bucket may remain anywhere.
+        for entry in idx.reverse_children.iter() {
+            assert!(!entry.value().is_empty(), "empty bucket leaked after churn");
+        }
     }
 }

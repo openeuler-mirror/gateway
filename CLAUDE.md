@@ -114,6 +114,7 @@ Dashboard 需要执行写操作（创建模型、修改配置等）时：
 - `store_model_in_db=true` 模式：只重新 seed `source='yaml'` 的 DB 行，`source='db'` 的行不动。
 - `store_model_in_db=false` 模式：从 YAML 重建所有 store。
 - **热加载不得清除运行时计数器**（limiter、concurrency guard、assignment 等不受影响）。
+- **kv_index 是第三种生命周期**：它放在 AppState 顶层（`Arc<ArcSwap<Option<…>>>`），但与 deployment_store / plan_store 等"跨 reload 内容存活"不同——任何 kvc_aware 配置变化都会**重建空 trie**（旧 trie 随 ArcSwap 替换被 drop，新 subscriber 从空开始重新填充）。这是有意为之的"重建即清缓存"语义，瞬态查询会降级到 lowest-load。
 
 ### 8. 新增模块检查清单
 

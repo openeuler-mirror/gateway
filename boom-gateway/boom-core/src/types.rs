@@ -175,9 +175,12 @@ pub struct ChatCompletionRequest {
     /// in-memory side channel from the route layer to the provider layer.
     #[serde(skip)]
     pub gateway_headers: HashMap<String, String>,
-    /// Internal flag: when true, gateway injects `vllm_xargs.kv_cache_report_mode: "full"`
-    /// into the forwarded request so vLLM reports all cached (reused) prefix blocks,
-    /// not just newly allocated ones. Not set by clients — set by the gateway after routing.
+    /// Internal flag: when true, the gateway asks the upstream inference engine
+    /// to report all currently-cached (reusable) prefix blocks — not just newly
+    /// allocated ones — so the KV-cache index stays in sync with the engine's
+    /// prefix cache. This struct carries only the intent; the concrete
+    /// wire-format injection lives in the provider layer (see OpenAI provider),
+    /// not in this core type. Not set by clients — set by the gateway after routing.
     #[serde(skip, default)]
     pub kv_cache_report_full: bool,
 }
