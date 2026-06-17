@@ -2,6 +2,7 @@ mod admin_command;
 mod extractor;
 mod health_monitor;
 mod request_log;
+mod rewrite;
 mod routes;
 mod state;
 

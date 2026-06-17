@@ -385,6 +385,26 @@ pub struct RouterSettings {
     /// rolling out downstream so that downstream schedulers can read request priority.
     #[serde(default)]
     pub enable_priority_header: bool,
+    /// Strip Claude Code's `x-anthropic-billing-header` attribution block from
+    /// `/v1/messages` request bodies before forwarding upstream.
+    ///
+    /// Why: Claude Code injects a standalone text block whose content begins
+    /// with `x-anthropic-billing-header: cc_version=...; cch=<random>; ...`
+    /// at the head of the system prompt. The per-request `cch=` field
+    /// invalidates byte-exact KV-cache prefix matching on every request,
+    /// causing 100% prefix-cache miss on non-Anthropic backends. Enabling
+    /// this drops the entire block (matching vLLM PR #36829), restoring
+    /// cache hits.
+    ///
+    /// Default `false`. Only enable when routing Claude Code to non-Anthropic
+    /// backends (vLLM, Bedrock, OpenAI-compatible); stripping may trip
+    /// Anthropic's anti-piracy defenses when forwarding to the official API.
+    ///
+    /// Only affects `/v1/messages`. OpenAI `/v1/chat/completions` requests
+    /// are untouched (Claude Code does not inject this header on the OpenAI
+    /// protocol).
+    #[serde(default)]
+    pub strip_claude_code_attribution: bool,
 }
 
 /// Settings for KV-cache aware routing.
