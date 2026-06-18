@@ -172,7 +172,7 @@ impl TokenizerPool {
             }
         };
 
-        tracing::info!(
+        tracing::debug!(
             model,
             tokens = token_ids.len(),
             first_8 = ?&token_ids[..token_ids.len().min(8)],

@@ -409,6 +409,98 @@ impl TokenPrefixIndex {
         false
     }
 
+    /// Check whether `worker_id`'s stored tier for the block identified by
+    /// (`hash`, `trie_key`) equals `required_tier` — used by EvictBlocks swap
+    /// protection.
+    ///
+    /// Walks the actual root→leaf trie path (O(depth)) reconstructed via the
+    /// `block_parent` + `block_trie_key` reverse indexes, instead of
+    /// DFS-scanning the whole subtree from the root (which was O(num_nodes) in
+    /// the worst case — see `check_worker_tier_at_trie_key`). Falls back to the
+    /// subtree scan whenever the indexes are inconsistent with the trie (e.g. a
+    /// delayed event hasn't populated them yet), so behavior is unchanged.
+    fn check_worker_tier(
+        &self,
+        model: &str,
+        worker_id: &str,
+        hash: u64,
+        trie_key: u64,
+        required_tier: StorageTier,
+    ) -> bool {
+        let root_lock = match self.tries.get(model) {
+            Some(r) => r,
+            None => return true, // no trie for this model → allow eviction
+        };
+        let root = root_lock.read();
+
+        // Reconstruct the leaf→root path of trie_keys. block_parent maps
+        // (model, worker, effective_hash) → parent effective_hash; block_trie_key
+        // maps the same key → trie_key. Values are Copy, so each DashMap guard
+        // is dropped immediately to avoid holding it across the next lookup.
+        let mut trie_keys: Vec<u64> = vec![trie_key];
+        let mut cur_hash = hash;
+        let mut inconsistent = false;
+        loop {
+            let parent = self
+                .block_parent
+                .get(&(model.to_string(), worker_id.to_string(), cur_hash))
+                .map(|v| *v);
+            match parent {
+                None => {
+                    inconsistent = true;
+                    break;
+                }
+                Some(None) => break,    // root block — path complete
+                Some(Some(p)) if p == cur_hash => {
+                    inconsistent = true; // defensive: refuse to chase a cycle
+                    break;
+                }
+                Some(Some(p)) => {
+                    let parent_trie_key = self
+                        .block_trie_key
+                        .get(&(model.to_string(), worker_id.to_string(), p))
+                        .map(|v| *v);
+                    match parent_trie_key {
+                        None => {
+                            inconsistent = true;
+                            break;
+                        }
+                        Some(t) => {
+                            trie_keys.push(t);
+                            cur_hash = p;
+                        }
+                    }
+                }
+            }
+        }
+        if inconsistent {
+            return Self::check_worker_tier_at_trie_key(
+                &root, worker_id, trie_key, required_tier,
+            );
+        }
+        trie_keys.reverse(); // root → leaf
+
+        // Walk the trie along the reconstructed path.
+        let mut node: &TrieNode = &root;
+        for k in &trie_keys {
+            match node.children.get(k) {
+                Some(c) => node = c,
+                None => {
+                    // Path not present in the trie → fall back to subtree scan.
+                    return Self::check_worker_tier_at_trie_key(
+                        &root, worker_id, trie_key, required_tier,
+                    );
+                }
+            }
+        }
+        match node.workers.get(worker_id) {
+            Some(t) => *t == required_tier,
+            None => Self::check_worker_tier_at_trie_key(
+                &root, worker_id, trie_key, required_tier,
+            ),
+        }
+    }
+
     /// Walk the trie path and remove the worker from the LEAF node only.
     /// Unlike remove_worker_from_edges which scans the entire trie, this only
     /// touches the single node at the end of the given path — safe for shared
@@ -531,7 +623,7 @@ impl TokenPrefixIndex {
             }
         }
 
-        tracing::info!(
+        tracing::debug!(
             model,
             worker_id,
             hash,
@@ -791,16 +883,14 @@ impl KvIndexBackend for TokenPrefixIndex {
                         let tier_matches = self
                             .block_trie_key
                             .get(&key)
-                            .and_then(|trie_key| {
-                                self.tries.get(model).map(|trie| {
-                                    let root = trie.read();
-                                    Self::check_worker_tier_at_trie_key(
-                                        &root,
-                                        worker_id,
-                                        *trie_key.value(),
-                                        *required_tier,
-                                    )
-                                })
+                            .map(|trie_key| {
+                                self.check_worker_tier(
+                                    model,
+                                    worker_id,
+                                    hash,
+                                    *trie_key.value(),
+                                    *required_tier,
+                                )
                             })
                             .unwrap_or(true); // If metadata missing, allow eviction.
 

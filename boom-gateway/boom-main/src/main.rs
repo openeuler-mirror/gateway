@@ -102,6 +102,12 @@ async fn main() -> anyhow::Result<()> {
             // 1. Signal all background tasks to stop.
             let _ = shutdown_tx.send(());
 
+            // 1a. Let the ZMQ KV subscriber drain its current batch and close
+            //     its SUB sockets cleanly (rather than being torn down mid-recv
+            //     by the runtime drop). It exits via its shutdown.recv() branch
+            //     during the pool.close() window below.
+            let _ = state.kv_shutdown_tx.send(());
+
             // 2. Close DB pool — releases all connections and table locks.
             //    Server future was just dropped by select!, so admin_tx is dropped,
             //    admin_command_handler exits, returns its DB connections.

@@ -288,24 +288,51 @@ impl AppState {
         load_plans_from_config(&self.plan_store, &new_config);
         seed_flow_controller_from_config(&new_config, &self.flow_controller);
 
-        // Rebuild KV-cache subsystem (index + tokenizer pool + subscriber).
-        // Any change to schedule_policy or any kvc_aware setting takes effect
-        // here: the old trie is dropped (rebuilt empty) and the subscriber is
-        // swapped. We stop the old subscriber before swapping the index so no
-        // in-flight batch writes to a trie that is about to be replaced.
-        let new_kvc_enabled = new_config.router_settings.schedule_policy == "kvc_aware";
-        let old_kvc_enabled = self.kv_index.load().is_some();
-        tracing::info!(
-            before = old_kvc_enabled,
-            after = new_kvc_enabled,
-            "KV-aware subsystem reload: rebuilding index (trie will be empty)"
-        );
-        self.stop_kv_subscriber();
-        let (new_kv_index, new_tokenizer_pool) = Self::build_kvc_subsystems(&new_config);
-        self.kv_index.store(Arc::new(new_kv_index));
-        self.tokenizer_pool.store(Arc::new(new_tokenizer_pool));
-        if new_kvc_enabled {
-            self.spawn_kv_subscriber(&new_config);
+        // Rebuild KV-cache subsystem (index + tokenizer pool + subscriber)
+        // ONLY when the kvc-relevant config actually changed. The trie is a
+        // learned cache of vLLM block events; rebuilding wipes it empty, which
+        // forces every subsequent request into full_report + lowest-load until
+        // the trie refills. A reload that only touched models/limits/plans must
+        // not pay that cost. (CLAUDE.md documents kv_index as a separate
+        // lifecycle — this gate narrows "any reload" to "kvc config change".)
+        //
+        // `full_report_hit_threshold` is intentionally excluded: it is read
+        // live at routing time (policy is recreated just below), so changing it
+        // must not invalidate the trie.
+        let old_router = self.inner.load().config.router_settings.clone();
+        let kvc_sig = |r: &boom_config::RouterSettings| {
+            let k = &r.kvc_aware;
+            (
+                r.schedule_policy.clone(),
+                k.block_size,
+                k.cache_weight,
+                k.load_weight,
+                k.tier_weight,
+                k.tokenizer_dir.clone(),
+                k.zmq_endpoints.clone(),
+                k.zmq_topic_prefix.clone(),
+                k.max_blocks,
+            )
+        };
+        if kvc_sig(&old_router) == kvc_sig(&new_config.router_settings) {
+            tracing::info!(
+                "KV-aware subsystem unchanged — preserving trie and subscriber (no rebuild)"
+            );
+        } else {
+            let new_kvc_enabled = new_config.router_settings.schedule_policy == "kvc_aware";
+            let old_kvc_enabled = self.kv_index.load().is_some();
+            tracing::info!(
+                before = old_kvc_enabled,
+                after = new_kvc_enabled,
+                "KV-aware config changed: rebuilding index (trie will be empty)"
+            );
+            self.stop_kv_subscriber();
+            let (new_kv_index, new_tokenizer_pool) = Self::build_kvc_subsystems(&new_config);
+            self.kv_index.store(Arc::new(new_kv_index));
+            self.tokenizer_pool.store(Arc::new(new_tokenizer_pool));
+            if new_kvc_enabled {
+                self.spawn_kv_subscriber(&new_config);
+            }
         }
 
         // Recreate policy (fresh counters etc.) — router reuses same stores.
@@ -444,15 +471,18 @@ impl AppState {
         );
     }
 
-    /// Abort the running KV subscriber task (if any). The subscriber's ZMQ
-    /// sockets are owned by the task and dropped on abort. Called at the start
-    /// of every kvc subsystem rebuild so the old subscriber stops feeding the
-    /// trie that is about to be replaced.
+    /// Stop the running KV subscriber task (if any).
+    ///
+    /// Sends on `kv_shutdown_tx` first so the subscriber can drain its current
+    /// batch and drop its ZMQ sockets cleanly (sends a proper SUB teardown).
+    /// `abort()` is kept as a safety net in case the task is stuck and never
+    /// observes the broadcast (e.g. blocked mid-`handle_message`).
     fn stop_kv_subscriber(&self) {
         let handle = self.kv_subscriber_handle.lock().unwrap().take();
         if let Some(h) = handle {
             if !h.is_finished() {
-                tracing::info!("Aborting previous KV subscriber task before rebuild");
+                let _ = self.kv_shutdown_tx.send(());
+                tracing::info!("Signaling previous KV subscriber to shut down before rebuild");
             }
             h.abort();
         }
