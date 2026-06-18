@@ -73,14 +73,17 @@ impl SchedulePolicy for KvcAwarePolicy {
                 .map(|provider| Selection { provider, kv_hit_ratio: 0.0 });
         }
 
-        // Collect deployment IDs as worker IDs for KV index lookup.
+        // Collect worker IDs (derived from each deployment's api_base host)
+        // for KV index lookup. The trie is keyed by the worker_id vLLM
+        // publishes in its ZMQ topic, which is the upstream host — NOT
+        // model_info.id (that is an opaque deployment label).
         let worker_ids: Vec<String> = candidates
             .iter()
-            .filter_map(|c| c.deployment_id().map(|id| id.to_string()))
+            .filter_map(|c| c.kv_worker_id().map(|id| id.to_string()))
             .collect();
 
         if worker_ids.is_empty() {
-            tracing::debug!(model, "no deployment_id on candidates, fallback to lowest-load");
+            tracing::debug!(model, "no kv_worker_id on candidates, fallback to lowest-load");
             return select_lowest_load(&self.tracker, &self.queue_info, model, candidates)
                 .map(|provider| Selection { provider, kv_hit_ratio: 0.0 });
         }
@@ -102,7 +105,7 @@ impl SchedulePolicy for KvcAwarePolicy {
             );
             // Find the provider matching the best worker.
             if let Some(provider) = candidates.iter().find(|c| {
-                c.deployment_id()
+                c.kv_worker_id()
                     .map(|id| id == best.worker_id.as_str())
                     .unwrap_or(false)
             }) {

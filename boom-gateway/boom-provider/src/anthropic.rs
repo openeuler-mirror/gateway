@@ -20,6 +20,7 @@ pub struct AnthropicProvider {
     base_url: String,
     model: String,
     deployment_id: Option<String>,
+    kv_worker_id: Option<String>,
     api_version: String,
 }
 
@@ -31,6 +32,7 @@ impl AnthropicProvider {
         model: &str,
         deployment_id: Option<String>,
     ) -> Self {
+        let kv_worker_id = crate::kv_worker_id_from_api_base(api_base.as_deref());
         Self {
             client,
             api_key,
@@ -38,6 +40,7 @@ impl AnthropicProvider {
                 .unwrap_or_else(|| "https://api.anthropic.com/v1".to_string()),
             model: model.to_string(),
             deployment_id,
+            kv_worker_id,
             api_version: "2023-06-01".to_string(),
         }
     }
@@ -909,5 +912,9 @@ impl Provider for AnthropicProvider {
 
     fn deployment_id(&self) -> Option<&str> {
         self.deployment_id.as_deref()
+    }
+
+    fn kv_worker_id(&self) -> Option<&str> {
+        self.kv_worker_id.as_deref()
     }
 }

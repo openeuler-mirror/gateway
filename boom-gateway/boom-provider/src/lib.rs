@@ -174,6 +174,38 @@ fn auto_detect_provider(model: &str) -> &'static str {
     }
 }
 
+/// Extract the KV worker ID from an `api_base` URL string.
+///
+/// Returns the pure host (IP or hostname) with scheme, port, and path
+/// stripped, so it matches the `worker_id` vLLM publishes in its ZMQ
+/// topic. Returns None when `api_base` is missing or empty.
+///
+/// Examples:
+///   `http://10.0.0.5:8000/v1` → `10.0.0.5`
+///   `https://worker-0/v1`     → `worker-0`
+///   `10.0.0.5:8000`           → `10.0.0.5`
+pub(crate) fn kv_worker_id_from_api_base(api_base: Option<&str>) -> Option<String> {
+    let raw = api_base?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    // Strip scheme (e.g. `http://`).
+    let after_scheme = match raw.split_once("://") {
+        Some((_, rest)) => rest,
+        None => raw,
+    };
+    // Strip path — keep only the authority component.
+    let authority = after_scheme.split('/').next().unwrap_or("");
+    // Strip port (IPv4/hostname only; IPv6 literals are not expected here).
+    let host = authority.rsplit_once(':').map(|(h, _)| h).unwrap_or(authority);
+    let host = host.trim();
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
+    }
+}
+
 /// Helper: build a default OpenAI-compatible response ID.
 pub(crate) fn generate_response_id() -> String {
     format!("chatcmpl-{}", uuid::Uuid::new_v4().simple())
