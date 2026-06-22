@@ -1955,7 +1955,11 @@ pub async fn toggle_debug(
     Json(req): Json<DebugToggleRequest>,
 ) -> Json<Value> {
     state.debug_store.set_enabled(req.enabled);
-    tracing::info!(enabled = req.enabled, "Debug error recording toggled");
+    // Also toggle raw upstream response capture alongside debug mode.
+    let prompt_cfg = state.prompt_log_writer.config();
+    let new_cfg = prompt_cfg.with_enabled(true).with_capture_raw_upstream(req.enabled);
+    state.prompt_log_writer.update_config(new_cfg);
+    tracing::info!(enabled = req.enabled, "Debug toggled (debug errors + raw upstream capture)");
     Json(json!({
         "ok": true,
         "enabled": req.enabled,

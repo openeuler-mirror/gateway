@@ -505,6 +505,7 @@ impl AnthropicProvider {
                 cache_read_input_tokens: cache_read,
             },
             system_fingerprint: None,
+            raw_response: None,
         }
     }
 }
@@ -677,6 +678,7 @@ impl Provider for AnthropicProvider {
                                                     finish_reason: None,
                                                 }],
                                                 usage: None,
+                                                raw_data: None,
                                             };
                                             if tx.send(Ok(Some(chunk))).await.is_err() {
                                                 return;
@@ -716,6 +718,7 @@ impl Provider for AnthropicProvider {
                                                         finish_reason: None,
                                                     }],
                                                     usage: None,
+                                                    raw_data: None,
                                                 };
                                                 if tx.send(Ok(Some(chunk))).await.is_err() {
                                                     return;
@@ -750,6 +753,7 @@ impl Provider for AnthropicProvider {
                                                     finish_reason: None,
                                                 }],
                                                 usage: None,
+                                                raw_data: None,
                                             };
                                             if tx.send(Ok(Some(chunk))).await.is_err() {
                                                 return;
@@ -775,6 +779,7 @@ impl Provider for AnthropicProvider {
                                                         finish_reason: None,
                                                     }],
                                                     usage: None,
+                                                    raw_data: None,
                                                 };
                                                 if tx.send(Ok(Some(chunk))).await.is_err() {
                                                     return;
@@ -823,6 +828,7 @@ impl Provider for AnthropicProvider {
                                             completion_tokens: Some(output_tokens),
                                             total_tokens: None,
                                         }),
+                                        raw_data: None,
                                     };
                                     if tx.send(Ok(Some(chunk))).await.is_err() {
                                         return;
@@ -859,6 +865,7 @@ impl Provider for AnthropicProvider {
                                             completion_tokens: Some(0),
                                             total_tokens: None,
                                         }),
+                                        raw_data: None,
                                     };
                                     if tx.send(Ok(Some(role_chunk))).await.is_err() {
                                         return;

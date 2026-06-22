@@ -408,7 +408,7 @@ async fn chat_completions_inner(
                     req_body,
                     Some(&client_ip),
                 );
-                let prompt_logged = PromptLogStream::new(logged, sender, prompt_entry, sse_raw_data_extractor());
+                let prompt_logged = PromptLogStream::new(logged, sender, prompt_entry, sse_raw_data_extractor(), None);
                 let response = Sse::new(sse_item_to_event(prompt_logged)).keep_alive(KeepAlive::default());
                 return Ok(response.into_response());
             }
@@ -1351,6 +1351,7 @@ fn sse_stream_from_chat_stream(
                                             finish_reason: None,
                                         }],
                                         usage: None,
+                                        raw_data: None,
                                     };
                                     let data = serde_json::to_string(&flush_chunk).unwrap_or_default();
                                     if tx.send(SseItem { event: Event::default().data(&data), json_data: data }).await.is_err() {
@@ -1408,6 +1409,7 @@ pub async fn messages(
         &identity.key_hash,
         identity.team_id.as_deref(),
     );
+    let prompt_log_capture_raw = prompt_log_should && state.prompt_log_writer.config().capture_raw_upstream;
     let prompt_log_req_body = if prompt_log_should {
         serde_json::to_value(&req).ok()
     } else {
@@ -1543,7 +1545,13 @@ pub async fn messages(
         })?;
         crate::health_monitor::reset_request_failure(&state, &deployment_id);
         let usage = UsageTracker::default();
-        let sse_stream = sse_stream_from_anthropic_chat_stream(stream, model.clone(), usage.clone());
+        // Create shared buffer for raw upstream SSE chunks (before Anthropic transcoding).
+        let raw_upstream_buf = if prompt_log_capture_raw {
+            Some(std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new())))
+        } else {
+            None
+        };
+        let sse_stream = sse_stream_from_anthropic_chat_stream(stream, model.clone(), usage.clone(), raw_upstream_buf.clone());
         let inflight_guard = if let Some(ref did) = deployment_id {
             InFlightGuard::new_for_deployment(state.inflight.clone(), &inflight_model, did, input_chars as u64)
         } else {
@@ -1592,7 +1600,7 @@ pub async fn messages(
                     req_body,
                     Some(&client_ip.as_str()),
                 );
-                let prompt_logged = PromptLogStream::new(logged, sender, prompt_entry, sse_raw_data_extractor());
+                let prompt_logged = PromptLogStream::new(logged, sender, prompt_entry, sse_raw_data_extractor(), raw_upstream_buf);
                 let response = Sse::new(sse_item_to_event(prompt_logged)).keep_alive(KeepAlive::default());
                 return Ok(response.into_response());
             }
@@ -1657,6 +1665,15 @@ pub async fn messages(
                     req_body,
                     Some(client_ip.as_str()),
                 );
+                // Capture raw upstream response (exact bytes from provider, if enabled).
+                if prompt_log_capture_raw {
+                    if let Some(ref raw) = response.raw_response {
+                        prompt_entry.set_raw_upstream_response(
+                            serde_json::from_str::<serde_json::Value>(raw)
+                                .unwrap_or(serde_json::Value::String(raw.clone()))
+                        );
+                    }
+                }
                 prompt_entry.set_response(serde_json::to_value(&anthropic_resp).unwrap_or(serde_json::Value::Null));
                 prompt_entry.set_status(200, duration_ms as u64);
                 let _ = sender.send(prompt_entry);
@@ -1672,6 +1689,7 @@ fn sse_stream_from_anthropic_chat_stream(
     stream: ChatStream,
     model: String,
     usage: UsageTracker,
+    raw_upstream_sink: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
 ) -> impl futures::Stream<Item = Result<SseItem, Infallible>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<SseItem>(64);
 
@@ -1682,6 +1700,14 @@ fn sse_stream_from_anthropic_chat_stream(
         while let Some(result) = stream.next().await {
             match result {
                 Ok(chunk) => {
+                    // Capture raw upstream chunk before transcoding (if enabled).
+                    if let Some(ref sink) = raw_upstream_sink {
+                        if let Some(ref raw) = chunk.raw_data {
+                            if let Ok(mut guard) = sink.lock() {
+                                guard.push(raw.clone());
+                            }
+                        }
+                    }
                     // Extract usage from the chunk (OpenAI sends usage in the final chunk).
                     if let Some(ref u) = chunk.usage {
                         if let Ok(mut g) = usage.lock() {

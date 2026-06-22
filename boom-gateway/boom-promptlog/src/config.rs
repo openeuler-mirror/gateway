@@ -7,6 +7,7 @@ use serde::Deserialize;
 ///   enabled: false
 ///   dir: "/data/prompt_logs"
 ///   max_file_size_mb: 50
+///   capture_raw_upstream: false
 ///   excluded_keys: []
 ///   excluded_teams: []
 /// ```
@@ -18,6 +19,11 @@ pub struct PromptLogConfig {
     pub dir: String,
     #[serde(default = "default_max_file_size")]
     pub max_file_size_mb: u64,
+    /// When true, record the raw upstream response (before any format conversion)
+    /// alongside the converted response. Only applies to endpoints that perform
+    /// format conversion (e.g., `/v1/messages` where OpenAI → Anthropic).
+    #[serde(default)]
+    pub capture_raw_upstream: bool,
     #[serde(default)]
     pub excluded_keys: Vec<String>,
     #[serde(default)]
@@ -30,6 +36,7 @@ impl Default for PromptLogConfig {
             enabled: false,
             dir: default_dir(),
             max_file_size_mb: default_max_file_size(),
+            capture_raw_upstream: false,
             excluded_keys: Vec::new(),
             excluded_teams: Vec::new(),
         }
@@ -65,6 +72,13 @@ impl PromptLogConfig {
     pub fn with_enabled(&self, enabled: bool) -> Self {
         let mut c = self.clone();
         c.enabled = enabled;
+        c
+    }
+
+    /// Builder: return a copy with capture_raw_upstream changed.
+    pub fn with_capture_raw_upstream(&self, capture: bool) -> Self {
+        let mut c = self.clone();
+        c.capture_raw_upstream = capture;
         c
     }
 

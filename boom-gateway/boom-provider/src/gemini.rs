@@ -292,6 +292,7 @@ impl GeminiProvider {
                 cache_read_input_tokens: None,
             },
             system_fingerprint: None,
+            raw_response: None,
         }
     }
 }
@@ -453,6 +454,7 @@ impl Provider for GeminiProvider {
                                                                 finish_reason: None,
                                                             }],
                                                             usage: None,
+                                                            raw_data: None,
                                                         };
                                                         if tx.send(Ok(Some(chunk))).await.is_err() {
                                                             return;
@@ -492,6 +494,7 @@ impl Provider for GeminiProvider {
                                                             finish_reason: None,
                                                         }],
                                                         usage: None,
+                                                        raw_data: None,
                                                     };
                                                     if tx.send(Ok(Some(chunk))).await.is_err() {
                                                         return;
@@ -519,6 +522,7 @@ impl Provider for GeminiProvider {
                                                     finish_reason: Some(finish),
                                                 }],
                                                 usage: stream_usage,
+                                                raw_data: None,
                                             };
                                             if tx.send(Ok(Some(chunk))).await.is_err() {
                                                 return;

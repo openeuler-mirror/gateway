@@ -33,6 +33,14 @@ pub struct PromptLogEntry {
     /// Full response body (non-stream) or raw SSE chunks array (stream).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response: Option<serde_json::Value>,
+    /// Raw upstream response before any gateway format conversion.
+    /// Only populated when `capture_raw_upstream` is enabled and the endpoint
+    /// performs format conversion (e.g., `/v1/messages`).
+    ///
+    /// Non-streaming: the full raw ChatCompletionResponse JSON.
+    /// Streaming: `{"stream": true, "raw_chunks": [...]}` with original SSE data payloads.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_upstream_response: Option<serde_json::Value>,
 }
 
 impl PromptLogEntry {
@@ -64,11 +72,16 @@ impl PromptLogEntry {
             domain_account,
             request: request_body,
             response: None,
+            raw_upstream_response: None,
         }
     }
 
     pub fn set_response(&mut self, response: serde_json::Value) {
         self.response = Some(response);
+    }
+
+    pub fn set_raw_upstream_response(&mut self, raw: serde_json::Value) {
+        self.raw_upstream_response = Some(raw);
     }
 
     pub fn set_status(&mut self, status_code: i32, duration_ms: u64) {

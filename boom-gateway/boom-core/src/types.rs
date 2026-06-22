@@ -65,7 +65,8 @@ pub struct Message {
     pub tool_call_id: Option<String>,
     /// Reasoning content from models like OpenAI o1/o3 (non-streaming).
     /// Carried through the internal format for Anthropic round-tripping.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Accepts `reasoning` as an alias for GLM/zhipu-style upstream responses.
+    #[serde(skip_serializing_if = "Option::is_none", alias = "reasoning")]
     pub reasoning_content: Option<String>,
 }
 
@@ -289,6 +290,10 @@ pub struct ChatCompletionResponse {
     pub usage: Usage,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_fingerprint: Option<String>,
+    /// Raw upstream response text (before any parsing), set by providers.
+    /// Not serialized — only used for logging/observability.
+    #[serde(skip)]
+    pub raw_response: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -326,6 +331,10 @@ pub struct ChatStreamChunk {
     pub choices: Vec<StreamChoice>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<StreamUsage>,
+    /// Raw upstream SSE data string (before parsing), set by providers.
+    /// Not serialized — only used for logging/observability.
+    #[serde(skip)]
+    pub raw_data: Option<String>,
 }
 
 /// Usage stats returned in the last SSE chunk of a stream.
@@ -353,7 +362,8 @@ pub struct StreamDelta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCallDelta>>,
     /// Reasoning content (OpenAI o1/o3 `reasoning_content`, Anthropic `thinking`).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Accepts `reasoning` as an alias for GLM/zhipu-style upstream streams.
+    #[serde(skip_serializing_if = "Option::is_none", alias = "reasoning")]
     pub reasoning_content: Option<String>,
 }
 

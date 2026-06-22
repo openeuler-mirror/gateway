@@ -175,7 +175,35 @@
   }
 
   // ── Login ─────────────────────────────────────────────
+  let isAdminMode = false;
+  function setAdminMode(admin) {
+    isAdminMode = admin;
+    const userIdGroup = document.getElementById("user-id-group");
+    const userIdInput = document.getElementById("user_id");
+    const hint = document.getElementById("login-hint");
+    const apiKeyInput = document.getElementById("api_key");
+    const toggle = document.getElementById("admin-toggle");
+    if (admin) {
+      userIdInput.value = "admin";
+      userIdGroup.classList.remove("hidden");
+      hint.textContent = "Enter the master key to sign in";
+      apiKeyInput.placeholder = "Master Key";
+      toggle.textContent = "← User sign in";
+    } else {
+      userIdInput.value = "";
+      userIdGroup.classList.add("hidden");
+      hint.textContent = "Enter your API Key to sign in";
+      apiKeyInput.placeholder = "API Key (sk-...)";
+      toggle.textContent = "Admin sign in →";
+    }
+  }
+
   function setupLogin() {
+    document.getElementById("admin-toggle").addEventListener("click", (e) => {
+      e.preventDefault();
+      setAdminMode(!isAdminMode);
+    });
+    setAdminMode(false);
     document.getElementById("login-form").addEventListener("submit", async (e) => {
       e.preventDefault();
       const errEl = document.getElementById("login-error");
