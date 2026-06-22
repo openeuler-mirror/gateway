@@ -13,6 +13,7 @@ pub struct OpenAIProvider {
     base_url: String,
     model: String,
     deployment_id: Option<String>,
+    kv_worker_id: Option<String>,
 }
 
 impl OpenAIProvider {
@@ -23,6 +24,7 @@ impl OpenAIProvider {
         model: &str,
         deployment_id: Option<String>,
     ) -> Self {
+        let kv_worker_id = crate::kv_worker_id_from_api_base(api_base.as_deref());
         Self {
             client,
             api_key,
@@ -30,10 +32,14 @@ impl OpenAIProvider {
                 .unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
             model: model.to_string(),
             deployment_id,
+            kv_worker_id,
         }
     }
 
     fn build_request(&self, mut req: ChatCompletionRequest) -> serde_json::Value {
+        // Extract internal flags before serialization (they are skip_serializing).
+        let kv_cache_report_full = req.kv_cache_report_full;
+
         // Replace model name with the actual provider model ID.
         req.model = self.model.clone();
         // Convert internal ContentPart::Reasoning to ContentPart::Text so that
@@ -49,7 +55,19 @@ impl OpenAIProvider {
         }
         // Serialize — skip_serializing on `extra` ensures non-standard fields
         // (service_tier, store, etc.) are NOT forwarded to upstream providers.
-        serde_json::to_value(&req).unwrap_or_default()
+        let mut body = serde_json::to_value(&req).unwrap_or_default();
+
+        // Inject vllm_xargs for KV cache full reporting when requested by gateway.
+        if kv_cache_report_full {
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert(
+                    "vllm_xargs".to_string(),
+                    serde_json::json!({ "kv_cache_report_mode": "full" }),
+                );
+            }
+        }
+
+        body
     }
 }
 
@@ -215,6 +233,10 @@ impl Provider for OpenAIProvider {
     fn deployment_id(&self) -> Option<&str> {
         self.deployment_id.as_deref()
     }
+
+    fn kv_worker_id(&self) -> Option<&str> {
+        self.kv_worker_id.as_deref()
+    }
 }
 
 #[cfg(test)]
@@ -259,6 +281,7 @@ mod tests {
             logit_bias: None,
             extra: Default::default(),
             gateway_headers,
+            kv_cache_report_full: false,
         }
     }
 

@@ -411,6 +411,18 @@ pub struct KvcAwareSettings {
     /// ZMQ topic prefix for subscription filtering. Default: `"kv@"`.
     #[serde(default = "default_zmq_topic_prefix")]
     pub zmq_topic_prefix: String,
+    /// Maximum number of indexed blocks across all models/workers.
+    /// When exceeded, the least recently stored blocks are evicted. Default: 500,000.
+    #[serde(default = "default_max_blocks")]
+    pub max_blocks: usize,
+    /// KV-cache prefix hit ratio at/above which incremental reporting is used
+    /// instead of full. When a request's prefix hit ratio is below this
+    /// threshold the gateway asks vLLM for a full report to backfill the trie
+    /// (the trie is missing part of the reused prefix); otherwise incremental
+    /// suffices because the trie already covers the prefix vLLM will reuse.
+    /// Default: 0.8.
+    #[serde(default = "default_full_report_hit_threshold")]
+    pub full_report_hit_threshold: f64,
 }
 
 impl Default for KvcAwareSettings {
@@ -423,7 +435,28 @@ impl Default for KvcAwareSettings {
             tokenizer_dir: None,
             zmq_endpoints: Vec::new(),
             zmq_topic_prefix: default_zmq_topic_prefix(),
+            max_blocks: default_max_blocks(),
+            full_report_hit_threshold: default_full_report_hit_threshold(),
         }
+    }
+}
+
+impl KvcAwareSettings {
+    /// Validate semantic constraints serde cannot enforce.
+    pub fn validate(&self) -> Result<(), GatewayError> {
+        // full_report_hit_threshold must be a valid ratio in (0.0, 1.0]:
+        //   - <= 0 would never trigger a full report, so the trie never
+        //     backfills and KVC matches degrade to zero (silent failure).
+        //   - > 1 would always trigger a full report (equivalent to disabling
+        //     the optimization); NaN is rejected too since all comparisons
+        //     against NaN are false.
+        let threshold = self.full_report_hit_threshold;
+        if !(threshold > 0.0 && threshold <= 1.0) {
+            return Err(GatewayError::ConfigError(format!(
+                "router_settings.kvc_aware.full_report_hit_threshold must be in (0.0, 1.0], got {threshold}"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -433,6 +466,10 @@ fn default_block_size() -> usize {
 
 fn default_cache_weight() -> f64 {
     0.5
+}
+
+fn default_full_report_hit_threshold() -> f64 {
+    0.8
 }
 
 fn default_load_weight() -> f64 {
@@ -445,6 +482,10 @@ fn default_tier_weight() -> f64 {
 
 fn default_zmq_topic_prefix() -> String {
     "kv@".to_string()
+}
+
+fn default_max_blocks() -> usize {
+    500_000
 }
 
 /// Configuration for the content-based hybrid router.
@@ -557,6 +598,21 @@ pub fn resolve_env_value(value: &str) -> String {
     }
 }
 
+impl Config {
+    /// Validate semantic constraints that serde cannot enforce (e.g. numeric
+    /// ranges). Returns the first violation as a `ConfigError`.
+    ///
+    /// Called by [`load_config`] so both startup and hot-reload reject bad
+    /// values instead of silently misbehaving.
+    pub fn validate(&self) -> Result<(), GatewayError> {
+        // Compose per-section validation. Each settings struct owns its own
+        // semantic checks; Config::validate just orchestrates them so new
+        // sections plug in without growing this method.
+        self.router_settings.kvc_aware.validate()?;
+        Ok(())
+    }
+}
+
 /// Load config from a YAML file with env var resolution.
 /// Compatible with litellm's `proxy_server_config.yaml`.
 pub fn load_config(path: &str) -> Result<Config, GatewayError> {
@@ -568,6 +624,9 @@ pub fn load_config(path: &str) -> Result<Config, GatewayError> {
 
     let mut config: Config = serde_yaml::from_str(&resolved)
         .map_err(|e| GatewayError::ConfigError(format!("Failed to parse config: {}", e)))?;
+
+    // Validate semantic constraints (numeric ranges, etc.) that serde cannot.
+    config.validate()?;
 
     // Resolve env vars in string fields after parsing.
     config.general_settings.master_key = config
@@ -733,5 +792,36 @@ mod tests {
     #[test]
     fn test_auto_detect_gemini() {
         assert_eq!(auto_detect_provider("gemini-2.0-flash"), "gemini");
+    }
+
+    #[test]
+    fn test_validate_full_report_hit_threshold() {
+        // All defaults (threshold = 0.8) should pass.
+        let mut config: Config = serde_yaml::from_str("{}").unwrap();
+        assert!(config.validate().is_ok(), "default threshold should be valid");
+
+        // Boundary: 1.0 is the maximum valid value.
+        config.router_settings.kvc_aware.full_report_hit_threshold = 1.0;
+        assert!(config.validate().is_ok(), "1.0 should be valid");
+
+        // Small positive value is fine.
+        config.router_settings.kvc_aware.full_report_hit_threshold = 0.01;
+        assert!(config.validate().is_ok(), "0.01 should be valid");
+
+        // Zero → reject (would never trigger a full report).
+        config.router_settings.kvc_aware.full_report_hit_threshold = 0.0;
+        assert!(config.validate().is_err(), "0.0 should be rejected");
+
+        // Above 1.0 → reject.
+        config.router_settings.kvc_aware.full_report_hit_threshold = 1.1;
+        assert!(config.validate().is_err(), "1.1 should be rejected");
+
+        // Negative → reject.
+        config.router_settings.kvc_aware.full_report_hit_threshold = -0.5;
+        assert!(config.validate().is_err(), "negative should be rejected");
+
+        // NaN → reject (all comparisons are false).
+        config.router_settings.kvc_aware.full_report_hit_threshold = f64::NAN;
+        assert!(config.validate().is_err(), "NaN should be rejected");
     }
 }

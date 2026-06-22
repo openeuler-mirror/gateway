@@ -39,6 +39,10 @@ pub enum GatewayKvEvent {
         prefix_hash: String,
         /// Block hash from vLLM (used for EvictBlocks removal lookup).
         local_hash: u64,
+        /// Parent block hash. `None` for root blocks (first block of a new sequence),
+        /// `Some(hash)` for continuation blocks that chain to a parent.
+        #[serde(default)]
+        parent_hash: Option<u64>,
         /// Block index within the sequence (0-based).
         block_index: u64,
         /// Token IDs in this block.
@@ -65,6 +69,10 @@ pub enum GatewayKvEvent {
         worker_id: String,
         /// Block hashes that were evicted.
         block_hashes: Vec<u64>,
+        /// The storage tier from which blocks were removed.
+        /// When present, only removes the worker if the tier matches,
+        /// preventing incorrect removal during GPU↔CPU swap.
+        storage_tier: Option<StorageTier>,
     },
 
     /// Load metrics snapshot from a worker.
@@ -135,6 +143,6 @@ pub trait KvIndexBackend: Send + Sync {
     /// Return all model names currently tracked.
     fn model_names(&self) -> HashSet<String>;
 
-    /// Dump index state for debugging: (model, token_ids_sample, workers, tier).
-    fn debug_dump(&self) -> Vec<(String, Vec<u32>, Vec<String>, StorageTier)>;
+    /// Dump index state for debugging: (model, trie_key, workers, tier, depth).
+    fn debug_dump(&self) -> Vec<(String, u64, Vec<String>, StorageTier, u64)>;
 }

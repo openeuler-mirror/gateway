@@ -4,7 +4,7 @@ use boom_core::types::{Message, Tool};
 use std::sync::Arc;
 
 use crate::hybrid_router::HybridRouter;
-use crate::policy::SchedulePolicy;
+use crate::policy::{SchedulePolicy, Selection};
 use crate::{AliasStore, DeploymentStore};
 
 /// Type-erased scheduling policy wrapper for ArcSwap compatibility.
@@ -126,14 +126,15 @@ impl Router {
     }
 
     /// KV-cache aware routing: resolves candidates then delegates to
-    /// `select_with_context()` with token IDs.
+    /// `select_with_context()` with token IDs. Returns a [`Selection`] whose
+    /// `kv_hit_ratio` lets the gateway choose full vs incremental reporting.
     pub fn select_provider_with_prefix(
         &self,
         model: &str,
         key_hash: Option<&str>,
         input_chars: u64,
         token_ids: &[u32],
-    ) -> Option<Arc<dyn Provider>> {
+    ) -> Option<Selection> {
         let candidates = self.resolve_candidates(model)?;
         self.policy.load().inner.select_with_context(model, &candidates, key_hash, input_chars, token_ids)
     }

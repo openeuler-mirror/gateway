@@ -119,38 +119,51 @@ fn handle_message(
     let payload = &multipart[2];
     let batch: VllmEventBatch = vllm_event::parse_vllm_batch(payload)?;
 
-    // Log per-event details.
+    // Per-batch summary at debug; full per-event payloads at trace.
     let mut stored_count = 0usize;
     let mut removed_count = 0usize;
     let mut cleared_count = 0usize;
-    for ev in &batch.events {
+    for (i, ev) in batch.events.iter().enumerate() {
         match ev {
-            vllm_event::VllmKvEvent::BlockStored { block_hashes, medium, .. } => {
+            vllm_event::VllmKvEvent::BlockStored {
+                block_hashes,
+                parent_block_hash,
+                token_ids,
+                block_size,
+                lora_name,
+                medium,
+            } => {
                 stored_count += block_hashes.len();
                 tracing::trace!(
-                    worker_id, model,
-                    hashes = block_hashes.len(),
+                    worker_id, model, i,
+                    block_hashes = ?block_hashes,
+                    parent_block_hash = ?parent_block_hash,
+                    token_ids = ?token_ids,
+                    block_size,
+                    lora_name = ?lora_name.as_deref().unwrap_or(""),
                     medium = ?medium.as_deref().unwrap_or("gpu"),
                     "BlockStored"
                 );
             }
-            vllm_event::VllmKvEvent::BlockRemoved { block_hashes, .. } => {
+            vllm_event::VllmKvEvent::BlockRemoved { block_hashes, medium } => {
                 removed_count += block_hashes.len();
                 tracing::trace!(
-                    worker_id, model,
-                    hashes = block_hashes.len(),
+                    worker_id, model, i,
+                    block_hashes = ?block_hashes,
+                    medium = ?medium.as_deref().unwrap_or("gpu"),
                     "BlockRemoved"
                 );
             }
             vllm_event::VllmKvEvent::AllBlocksCleared => {
                 cleared_count += 1;
-                tracing::trace!(worker_id, model, "AllBlocksCleared");
+                tracing::trace!(worker_id, model, i, "AllBlocksCleared");
             }
         }
     }
     if stored_count > 0 || removed_count > 0 || cleared_count > 0 {
         tracing::debug!(
             worker_id, model,
+            ts = batch.ts,
             stored = stored_count,
             removed = removed_count,
             cleared = cleared_count,

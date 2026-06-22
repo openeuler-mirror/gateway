@@ -30,6 +30,20 @@ pub trait Provider: Send + Sync + 'static {
     fn deployment_id(&self) -> Option<&str> {
         None
     }
+
+    /// Worker ID used to match KV-cache index entries.
+    ///
+    /// Derived from the upstream `api_base` host (pure IP/hostname, with
+    /// scheme/port/path stripped) so it lines up with the `worker_id` vLLM
+    /// publishes in its ZMQ topic (`kv@{worker_id}@{model}`). The KV-aware
+    /// scheduler queries the trie by this id — it must NOT be sourced from
+    /// `model_info.id`, which is an opaque deployment label, not a host.
+    ///
+    /// Returns None for providers that have no upstream host suitable for
+    /// KV-cache matching (e.g. managed endpoints like Bedrock/Gemini).
+    fn kv_worker_id(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// Rate limiter trait — supports per-key and per-model sliding window limits.
