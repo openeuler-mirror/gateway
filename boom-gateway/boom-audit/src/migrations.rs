@@ -71,5 +71,12 @@ pub async fn run_request_log_migration(pool: &sqlx::PgPool) -> Result<(), sqlx::
     )
     .execute(pool)
     .await;
+    // Composite index for dashboard time-window aggregations filtering by api_path.
+    let _ = sqlx::query(
+        r#"CREATE INDEX IF NOT EXISTS idx_request_log_created_apipath
+           ON boom_request_log(created_at DESC, api_path)"#,
+    )
+    .execute(pool)
+    .await;
     Ok(())
 }

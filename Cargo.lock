@@ -330,12 +330,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "boom-ctxaware"
+version = "0.1.0"
+dependencies = [
+ "boom-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "boom-dashboard"
 version = "0.1.0"
 dependencies = [
  "axum",
  "boom-audit",
  "boom-core",
+ "boom-ctxaware",
  "boom-flowcontrol",
  "boom-limiter",
  "boom-promptlog",
@@ -415,6 +425,7 @@ dependencies = [
  "boom-auth",
  "boom-config",
  "boom-core",
+ "boom-ctxaware",
  "boom-dashboard",
  "boom-flowcontrol",
  "boom-kvindex",

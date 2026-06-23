@@ -246,6 +246,9 @@ async fn chat_completions_inner(
 
     tracing::info!(request_id = %request_id, model = %model, stream = is_stream, path = api_path, "chat_completions request started");
 
+    // Agent stats: bucket this request by API path (survives reloads).
+    state.agent_stats.record(api_path);
+
     // Prompt log: check early to avoid unnecessary cloning.
     let prompt_log_should = state.prompt_log_writer.should_capture(
         &identity.key_hash,
@@ -1460,6 +1463,9 @@ pub async fn messages(
     let is_stream = openai_req.stream.unwrap_or(false);
 
     tracing::info!(request_id = %request_id, model = %model, stream = is_stream, "messages request started");
+
+    // Agent stats: bucket this request as Anthropic-native.
+    state.agent_stats.record("/v1/messages");
 
 
     // Prompt log: check early to avoid unnecessary cloning.

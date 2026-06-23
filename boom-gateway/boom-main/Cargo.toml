@@ -16,6 +16,7 @@ boom-limiter = { path = "../boom-limiter" }
 boom-routing = { path = "../boom-routing" }
 boom-audit = { path = "../boom-audit" }
 boom-dashboard = { path = "../boom-dashboard" }
+boom-ctxaware = { path = "../boom-ctxaware" }
 boom-flowcontrol = { path = "../boom-flowcontrol" }
 boom-promptlog = { path = "../boom-promptlog" }
 boom-kvindex = { path = "../boom-kvindex" }

@@ -83,6 +83,7 @@
     setupThemeToggle();
     updateThemeIcons();
     setupViewportTooltip();
+    bindRangeControls();
     window.addEventListener("hashchange", () => { onRoute(); onUserRoute(); });
     checkSession();
   });
@@ -299,6 +300,7 @@
     loadInflight();
     loadRebalanceStats();
     loadRequestRateStats();
+    loadAgentStats();
   }
 
   // ── In-Flight ─────────────────────────────────────────
@@ -375,7 +377,14 @@
 
   function startInflightPoll() {
     stopInflightPoll();
-    inflightTimer = setInterval(() => { loadInflight(); loadRebalanceStats(); loadRequestRateStats(); }, 3000);
+    inflightTimer = setInterval(() => {
+      loadInflight();
+      loadRebalanceStats();
+      // Only poll stats that are in 1h mode — non-1h ranges are DB-backed and
+      // would be needlessly re-queried every 3s otherwise.
+      if (rangeState.rate.range === "1h") loadRequestRateStats();
+      if (rangeState.agent.range === "1h") loadAgentStats();
+    }, 3000);
   }
 
   function stopInflightPoll() {
@@ -432,22 +441,128 @@
     return "linear-gradient(180deg, var(--surface3), var(--surface3))"; // neutral
   }
 
+  // ── Range controls (Agent Statistics + Request Rate) ─────
+  // Each stats chart remembers its own range + custom-window. Only `range=1h`
+  // is served from the in-memory tracker; everything else hits the DB and is
+  // excluded from the 3-second polling loop.
+  const rangeState = {
+    agent: { range: "1h", from: null, to: null },
+    rate:  { range: "1h", from: null, to: null },
+  };
+
+  function buildStatsUrl(base, target) {
+    const s = rangeState[target];
+    if (s.range === "custom" && s.from && s.to) {
+      return `${base}?range=custom&from=${encodeURIComponent(s.from)}&to=${encodeURIComponent(s.to)}`;
+    }
+    return `${base}?range=${s.range}`;
+  }
+
+  function bindRangeControls() {
+    document.querySelectorAll(".range-controls").forEach((controls) => {
+      const target = controls.dataset.target;
+      controls.querySelectorAll(".btn-range").forEach((btn) => {
+        btn.addEventListener("click", () => onRangePick(controls, target, btn.dataset.range));
+      });
+      const apply = controls.querySelector(".range-apply");
+      if (apply) apply.addEventListener("click", () => onRangeApply(controls, target));
+    });
+  }
+
+  function onRangePick(controls, target, range) {
+    const custom = controls.querySelector(".range-custom");
+    const note = controls.querySelector(".range-note");
+    if (range === "custom") {
+      custom.classList.remove("hidden");
+      // Pre-fill inputs with last-1h window if empty (local time, matching datetime-local format).
+      const fromInput = controls.querySelector(".range-from");
+      const toInput = controls.querySelector(".range-to");
+      if (!fromInput.value || !toInput.value) {
+        const now = new Date();
+        const earlier = new Date(now.getTime() - 60 * 60 * 1000);
+        fromInput.value = toLocalDatetimeLocal(earlier);
+        toInput.value = toLocalDatetimeLocal(now);
+      }
+      return;
+    }
+    custom.classList.add("hidden");
+    if (note) note.classList.add("hidden");
+    controls.querySelectorAll(".btn-range").forEach((b) => {
+      b.classList.toggle("active", b.dataset.range === range);
+    });
+    rangeState[target] = { range, from: null, to: null };
+    if (target === "agent") loadAgentStats(); else loadRequestRateStats();
+  }
+
+  function onRangeApply(controls, target) {
+    const fromInput = controls.querySelector(".range-from").value;
+    const toInput = controls.querySelector(".range-to").value;
+    const note = controls.querySelector(".range-note");
+    if (!fromInput || !toInput) {
+      if (note) { note.textContent = "Pick both from and to."; note.classList.remove("hidden"); }
+      return;
+    }
+    const fromMs = new Date(fromInput).getTime();
+    const toMs = new Date(toInput).getTime();
+    if (!(fromMs > 0 && toMs > 0) || toMs <= fromMs) {
+      if (note) { note.textContent = "'to' must be after 'from'."; note.classList.remove("hidden"); }
+      return;
+    }
+    if (note) note.classList.add("hidden");
+    rangeState[target] = {
+      range: "custom",
+      from: new Date(fromMs).toISOString(),
+      to: new Date(toMs).toISOString(),
+    };
+    controls.querySelectorAll(".btn-range").forEach((b) => {
+      b.classList.toggle("active", b.dataset.range === "custom");
+    });
+    if (target === "agent") loadAgentStats(); else loadRequestRateStats();
+  }
+
+  function toLocalDatetimeLocal(d) {
+    const pad = (n) => String(n).padStart(2, "0");
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  }
+
+  // Show ~12 evenly-spaced x-axis labels regardless of bucket count; last bucket is always labeled.
+  function shouldShowLabel(events, idx) {
+    if (idx === events.length - 1) return true;
+    const stride = Math.max(1, Math.ceil(events.length / 12));
+    return idx % stride === 0;
+  }
+
+  // Format a bucket start timestamp for the x-axis. Backend sends UTC ISO 8601;
+  // Date() converts it to the viewer's local timezone, which is what they expect.
+  // Bucket size picks the granularity: ≤1h = "HH:MM", longer = "MM-DD HH:MM".
+  function formatBucketLabel(isoTs, bucketSecs) {
+    const d = new Date(isoTs);
+    if (isNaN(d.getTime())) return "?";
+    const pad = (n) => String(n).padStart(2, "0");
+    const hhmm = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    if (!bucketSecs || bucketSecs <= 3600) return hhmm;
+    return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${hhmm}`;
+  }
+
   // ── Request Rate Charts ──────────────────────────────────
   async function loadRequestRateStats() {
     try {
-      const data = await api("/admin/stats/request_rate");
-      renderRequestRateCharts(data.charts || []);
+      const data = await api(buildStatsUrl("/admin/stats/request_rate", "rate"));
+      renderRequestRateCharts(data.charts || [], data.window);
     } catch (err) {
       console.error("loadRequestRateStats error:", err);
     }
   }
 
-  function renderRequestRateCharts(charts) {
+  function renderRequestRateCharts(charts, window) {
     const wrap = document.getElementById("request-rate-wrap");
     if (!wrap) return;
     if (!charts.length) { wrap.innerHTML = "<p>No data.</p>"; return; }
 
-    var html = "";
+    const windowNote = window
+      ? `<div class="range-window-note">${esc(window.from)} → ${esc(window.to)} · bucket ${(window.bucket_secs / 60).toFixed(0)}min</div>`
+      : "";
+    var html = windowNote;
     charts.forEach(function (chart) {
       var events = chart.events || [];
       if (!events.length) return;
@@ -456,14 +571,15 @@
         ? "ALL MODELS"
         : esc(chart.model) + ":" + esc(chart.deployment_id);
 
-      var bars = events.map(function (e) {
+      var bars = events.map(function (e, idx) {
         var pct = (e.count / maxCount) * 100;
-        var showLabel = e.minute === "now" || e.minute.endsWith("0m") || e.minute.endsWith("5m");
-        var title = e.minute === "now" ? "Current minute" : e.minute.replace("-", "") + " ago: " + e.count + " req(s)";
+        var showLabel = shouldShowLabel(events, idx);
+        var lbl = formatBucketLabel(e.ts, window ? window.bucket_secs : 0);
+        var title = lbl + ": " + e.count + " req(s)";
         return '<div class="rb-bar-col" title="' + esc(title) + '">' +
           '<div class="rb-bar-value' + (e.count === 0 ? " rb-bar-value-zero" : "") + '">' + e.count + '</div>' +
           '<div class="rb-bar" style="height:' + Math.max(pct, 1) + '%;background:' + throughputBarColor(pct) + '"></div>' +
-          '<div class="rb-bar-label' + (showLabel ? "" : " rb-label-hidden") + '">' + esc(e.minute === "now" ? "now" : e.minute.replace("-","")) + '</div>' +
+          '<div class="rb-bar-label' + (showLabel ? "" : " rb-label-hidden") + '">' + esc(lbl) + '</div>' +
           '</div>';
       }).join("");
 
@@ -475,7 +591,91 @@
         '</div></div>';
     });
 
-    wrap.innerHTML = html || "<p>No data.</p>";
+    wrap.innerHTML = html || (windowNote + "<p>No data.</p>");
+  }
+
+  // ── Agent Statistics (anthropic share stacked bar) ───────
+  async function loadAgentStats() {
+    try {
+      const data = await api(buildStatsUrl("/admin/stats/agents", "agent"));
+      renderAgentStats(data || {});
+    } catch (err) {
+      console.error("loadAgentStats error:", err);
+    }
+  }
+
+  function renderAgentStats(data) {
+    const wrap = document.getElementById("agent-stats-wrap");
+    if (!wrap) return;
+
+    const events = data.events || [];
+    const summary = data.summary || { total: 0, anthropic: 0, ratio: 0 };
+    const window = data.window || null;
+    const rangeLabel = rangeState.agent.range === "custom" ? "custom" : rangeState.agent.range;
+
+    // Three summary cards — Total / Anthropic / Ratio over the selected window.
+    const ratioPct = (summary.ratio * 100).toFixed(1);
+    const windowNote = window
+      ? `<div class="range-window-note">${esc(window.from)} → ${esc(window.to)} · bucket ${(window.bucket_secs / 60).toFixed(0)}min</div>`
+      : "";
+    const summaryHtml =
+      '<div class="agent-summary">' +
+        '<div class="agent-summary-card">' +
+          '<div class="agent-summary-label">Total (' + esc(rangeLabel) + ')</div>' +
+          '<div class="agent-summary-value">' + summary.total.toLocaleString() + '</div>' +
+        '</div>' +
+        '<div class="agent-summary-card">' +
+          '<div class="agent-summary-label">Anthropic (' + esc(rangeLabel) + ')</div>' +
+          '<div class="agent-summary-value" style="color:#10b981">' + summary.anthropic.toLocaleString() + '</div>' +
+        '</div>' +
+        '<div class="agent-summary-card">' +
+          '<div class="agent-summary-label">Anthropic Ratio</div>' +
+          '<div class="agent-summary-value" style="color:#10b981">' + ratioPct + '%</div>' +
+        '</div>' +
+      '</div>';
+
+    if (!events.length || summary.total === 0) {
+      wrap.innerHTML = summaryHtml + windowNote + '<p class="loading" style="margin-top:1rem">No data in this window.</p>';
+      return;
+    }
+
+    const maxTotal = Math.max(1, ...events.map((e) => e.total));
+    const bars = events.map((e, idx) => {
+      const total = e.total || 0;
+      const anthropic = e.anthropic || 0;
+      const other = total - anthropic;
+      const totalPct = (total / maxTotal) * 100;             // full bar height
+      const anthropicPctOfTotal = total > 0 ? (anthropic / total) * 100 : 0;  // green segment share within this bar
+      const showLabel = shouldShowLabel(events, idx);
+      const lbl = formatBucketLabel(e.ts, window ? window.bucket_secs : 0);
+      const ratioTxt = total > 0 ? ((anthropic / total) * 100).toFixed(0) : "0";
+      const title =
+        lbl +
+        " — total: " + total + ", anthropic: " + anthropic + " (" + ratioTxt + "%), other: " + other;
+      // Stack: top = other (gray), bottom = anthropic (green). Use flex-basis on anthropic.
+      return '<div class="rb-bar-col" title="' + esc(title) + '">' +
+        '<div class="rb-bar-value' + (total === 0 ? " rb-bar-value-zero" : "") + '">' + total + '</div>' +
+        '<div class="agent-bar" style="height:' + Math.max(totalPct, 1) + '%">' +
+          (other > 0 ? '<div class="agent-bar-other" style="flex: ' + (100 - anthropicPctOfTotal) + '"></div>' : '') +
+          (anthropic > 0 ? '<div class="agent-bar-anthropic" style="flex: ' + anthropicPctOfTotal + '"></div>' : '') +
+        '</div>' +
+        '<div class="rb-bar-label' + (showLabel ? "" : " rb-label-hidden") + '">' +
+          esc(lbl) +
+        '</div>' +
+      '</div>';
+    }).join("");
+
+    const chartHtml =
+      '<div class="rebalance-chart">' +
+        '<div class="rb-y-axis"><span>' + maxTotal + '</span><span>0</span></div>' +
+        '<div class="rb-bars">' + bars + '</div>' +
+      '</div>' +
+      '<div class="agent-legend">' +
+        '<span class="agent-legend-item"><span class="agent-legend-swatch agent-legend-anthropic"></span>Anthropic (/v1/messages)</span>' +
+        '<span class="agent-legend-item"><span class="agent-legend-swatch agent-legend-other"></span>Other (/v1/chat/completions, etc.)</span>' +
+      '</div>';
+
+    wrap.innerHTML = summaryHtml + windowNote + chartHtml;
   }
 
   function renderStatsTable(models) {

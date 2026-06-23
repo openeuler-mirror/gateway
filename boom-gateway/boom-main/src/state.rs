@@ -8,6 +8,7 @@ use boom_core::kv_event::KvIndexBackend;
 use boom_limiter::{PlanStore, RateLimitPlan, ScheduleSlot, SlidingWindowLimiter};
 use boom_flowcontrol::{FlowControlConfig, FlowController};
 use boom_routing::{AliasStore, DeploymentStore, HybridRouter, InFlightTracker, KeyAffinityPolicy, RebalanceCounter, RequestRateTracker, Router, RoundRobinPolicy, SchedulePolicy, StrategyRegistry, TierClassifier};
+use boom_ctxaware::AgentStatsTracker;
 use boom_promptlog::PromptLogWriter;
 use boom_provider;
 use sqlx::PgPool;
@@ -35,6 +36,9 @@ pub struct AppState {
     pub inner: Arc<ArcSwap<AppStateInner>>,
     /// DB pool survives reloads (avoids reconnection).
     pub db_pool: Option<PgPool>,
+    /// Dashboard-only DB pool with tiny max_connections so heavy stats
+    /// aggregations can never starve the forwarding path. max=3, acquire_timeout=10s.
+    pub dashboard_db_pool: Option<PgPool>,
     /// Limiter survives reloads (preserves in-flight counters).
     pub limiter: Arc<SlidingWindowLimiter>,
     /// Plan store survives reloads (preserves plan definitions and key assignments).
@@ -63,6 +67,8 @@ pub struct AppState {
     pub rebalance_counter: Arc<RebalanceCounter>,
     /// Per-deployment request rate tracker (survives reloads).
     pub request_rate: Arc<RequestRateTracker>,
+    /// Agent (client-type) statistics tracker (survives reloads).
+    pub agent_stats: Arc<AgentStatsTracker>,
     /// KV-cache prefix index, hot-swappable across reloads.
     ///
     /// THIRD lifecycle (distinct from AppState's other fields): unlike
@@ -133,6 +139,22 @@ impl AppState {
             }
         };
 
+        // Dashboard-only pool: max=3 so dashboard aggregations cannot starve
+        // forwarding (which uses `db_pool` above with max=30). Same DSN, separate
+        // connection set; the forwarding path never touches this pool.
+        let dashboard_db_pool = match &config.general_settings.database_url {
+            Some(url) => Some(
+                sqlx::postgres::PgPoolOptions::new()
+                    .max_connections(3)
+                    .acquire_timeout(std::time::Duration::from_secs(10))
+                    .idle_timeout(std::time::Duration::from_secs(600))
+                    .max_lifetime(std::time::Duration::from_secs(1800))
+                    .connect(url)
+                    .await?,
+            ),
+            None => None,
+        };
+
         // 2. Limiter survives across reloads.
         let limiter = Arc::new(SlidingWindowLimiter::new());
 
@@ -155,6 +177,7 @@ impl AppState {
         // Rebalance counter survives across reloads.
         let rebalance_counter = Arc::new(RebalanceCounter::new());
         let request_rate = Arc::new(RequestRateTracker::new());
+        let agent_stats = Arc::new(AgentStatsTracker::new());
 
         // KV-cache index + tokenizer pool.
         // Driven by schedule_policy == "kvc_aware", not a separate enabled flag.
@@ -215,6 +238,7 @@ impl AppState {
             config_path,
             inner: Arc::new(ArcSwap::from_pointee(inner)),
             db_pool,
+            dashboard_db_pool,
             limiter,
             plan_store,
             deployment_store,
@@ -229,6 +253,7 @@ impl AppState {
             prompt_log_writer,
             rebalance_counter,
             request_rate,
+            agent_stats,
             kv_index: Arc::new(ArcSwap::from_pointee(kv_index_val)),
             tokenizer_pool: Arc::new(ArcSwap::from_pointee(tokenizer_pool_val)),
             kv_subscriber_handle: Arc::new(std::sync::Mutex::new(None)),

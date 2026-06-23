@@ -170,9 +170,39 @@
 
             <div class="section-header" style="margin-top:2rem">
               <h2>Request Rate (per model)</h2>
-              <span style="font-size:.85em;color:var(--text3)">Last 60 minutes</span>
+              <div class="range-controls" data-target="rate">
+                <button class="btn-range active" data-range="1h">1h</button>
+                <button class="btn-range" data-range="4h">4h</button>
+                <button class="btn-range" data-range="8h">8h</button>
+                <button class="btn-range" data-range="24h">24h</button>
+                <button class="btn-range" data-range="custom">Custom</button>
+                <span class="range-custom hidden">
+                  <input type="datetime-local" class="range-from">
+                  <input type="datetime-local" class="range-to">
+                  <button class="btn-tiny range-apply">Apply</button>
+                </span>
+                <span class="range-note hidden"></span>
+              </div>
             </div>
             <div id="request-rate-wrap"><p class="loading">Loading...</p></div>
+
+            <div class="section-header" style="margin-top:2rem">
+              <h2>Agent Statistics</h2>
+              <div class="range-controls" data-target="agent">
+                <button class="btn-range active" data-range="1h">1h</button>
+                <button class="btn-range" data-range="4h">4h</button>
+                <button class="btn-range" data-range="8h">8h</button>
+                <button class="btn-range" data-range="24h">24h</button>
+                <button class="btn-range" data-range="custom">Custom</button>
+                <span class="range-custom hidden">
+                  <input type="datetime-local" class="range-from">
+                  <input type="datetime-local" class="range-to">
+                  <button class="btn-tiny range-apply">Apply</button>
+                </span>
+                <span class="range-note hidden"></span>
+              </div>
+            </div>
+            <div id="agent-stats-wrap"><p class="loading">Loading...</p></div>
 
             <div class="section-header" style="margin-top:2rem">
               <h2>Model Statistics</h2>

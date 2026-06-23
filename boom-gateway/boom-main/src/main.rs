@@ -185,7 +185,7 @@ fn build_router(state: AppState) -> Router {
     tokio::spawn(admin_command::admin_command_handler(admin_rx, state.clone()));
 
     let dashboard_state = boom_dashboard::DashboardState::new(
-        state.db_pool.clone(),
+        state.dashboard_db_pool.clone(),
         state.plan_store.clone(),
         state.limiter.clone(),
         state.deployment_store.clone(),
@@ -198,6 +198,7 @@ fn build_router(state: AppState) -> Router {
         state.prompt_log_writer.clone(),
         state.rebalance_counter.clone(),
         state.request_rate.clone(),
+        state.agent_stats.clone(),
         key_alias_lookup,
     );
     let dashboard_router = boom_dashboard::build_router(dashboard_state);

@@ -4,6 +4,7 @@ pub mod handlers_static;
 pub mod handlers_user;
 pub mod migrations;
 pub mod state;
+pub mod stats_timeseries;
 
 use axum::routing::{delete, get, post, put};
 use axum::Router;
@@ -137,6 +138,11 @@ pub fn build_router<S: Clone + Send + Sync + 'static>(state: DashboardState) -> 
         .route(
             "/dashboard/api/admin/stats/request_rate",
             get(handlers_admin::get_request_rate_stats),
+        )
+        // Admin — Agent Stats (client-type breakdown, last 60 minutes).
+        .route(
+            "/dashboard/api/admin/stats/agents",
+            get(handlers_admin::get_agent_stats),
         )
         // Admin — Rate Limit Window Reset.
         .route(
