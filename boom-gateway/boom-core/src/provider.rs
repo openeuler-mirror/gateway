@@ -44,6 +44,13 @@ pub trait Provider: Send + Sync + 'static {
     fn kv_worker_id(&self) -> Option<&str> {
         None
     }
+
+    /// Whether to attach the `X-BooM-Client-Type` header to outgoing
+    /// requests routed to this deployment. Driven by the per-deployment
+    /// `client_type_header: bool` config flag; default false.
+    fn client_type_header(&self) -> bool {
+        false
+    }
 }
 
 /// Rate limiter trait — supports per-key and per-model sliding window limits.

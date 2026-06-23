@@ -16,15 +16,17 @@ pub struct GeminiProvider {
     api_key: Option<String>,
     model: String,
     deployment_id: Option<String>,
+    client_type_header: bool,
 }
 
 impl GeminiProvider {
-    pub fn new(client: Client, api_key: Option<String>, model: &str, deployment_id: Option<String>) -> Self {
+    pub fn new(client: Client, api_key: Option<String>, model: &str, deployment_id: Option<String>, client_type_header: bool) -> Self {
         Self {
             client,
             api_key,
             model: model.to_string(),
             deployment_id,
+            client_type_header,
         }
     }
 
@@ -570,5 +572,9 @@ impl Provider for GeminiProvider {
 
     fn deployment_id(&self) -> Option<&str> {
         self.deployment_id.as_deref()
+    }
+
+    fn client_type_header(&self) -> bool {
+        self.client_type_header
     }
 }

@@ -860,6 +860,9 @@ pub struct CreateDeploymentRequest {
     /// Max total input context chars across in-flight requests (flow control, 0 = no limit).
     #[serde(default)]
     pub max_context_len: Option<i64>,
+    /// Attach `X-BooM-Client-Type` header to outgoing requests (default false).
+    #[serde(default)]
+    pub client_type_header: bool,
 }
 
 fn default_timeout() -> i64 {

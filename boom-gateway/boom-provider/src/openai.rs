@@ -14,6 +14,7 @@ pub struct OpenAIProvider {
     model: String,
     deployment_id: Option<String>,
     kv_worker_id: Option<String>,
+    client_type_header: bool,
 }
 
 impl OpenAIProvider {
@@ -23,6 +24,7 @@ impl OpenAIProvider {
         api_base: Option<String>,
         model: &str,
         deployment_id: Option<String>,
+        client_type_header: bool,
     ) -> Self {
         let kv_worker_id = crate::kv_worker_id_from_api_base(api_base.as_deref());
         Self {
@@ -33,6 +35,7 @@ impl OpenAIProvider {
             model: model.to_string(),
             deployment_id,
             kv_worker_id,
+            client_type_header,
         }
     }
 
@@ -237,6 +240,10 @@ impl Provider for OpenAIProvider {
     fn kv_worker_id(&self) -> Option<&str> {
         self.kv_worker_id.as_deref()
     }
+
+    fn client_type_header(&self) -> bool {
+        self.client_type_header
+    }
 }
 
 #[cfg(test)]
@@ -308,7 +315,7 @@ mod tests {
     }
 
     fn provider_for(uri: String, api_key: Option<String>) -> OpenAIProvider {
-        OpenAIProvider::new(Client::new(), api_key, Some(uri), "test-model", None)
+        OpenAIProvider::new(Client::new(), api_key, Some(uri), "test-model", None, false)
     }
 
     #[tokio::test]

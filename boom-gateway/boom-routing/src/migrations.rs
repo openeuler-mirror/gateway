@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS boom_model_deployment (
     auto_disabled     BOOLEAN NOT NULL DEFAULT false,
     source            TEXT    NOT NULL DEFAULT 'yaml',
     deployment_id     TEXT,
+    client_type_header BOOLEAN NOT NULL DEFAULT false,
     created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );

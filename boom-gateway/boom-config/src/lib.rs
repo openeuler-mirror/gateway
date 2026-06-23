@@ -181,6 +181,11 @@ pub struct ModelEntry {
     /// excluded from the in-memory routing table. Default: true.
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Attach `X-BooM-Client-Type: <label>` to every outgoing request routed
+    /// to this deployment. Label is `anthropic` for `/v1/messages`, `anonymous`
+    /// otherwise. Default: false.
+    #[serde(default)]
+    pub client_type_header: bool,
 }
 
 /// Provider params — compatible with litellm's `litellm_params` format.

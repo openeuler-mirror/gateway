@@ -386,7 +386,12 @@ async fn chat_completions_inner(
     };
 
     // Attach gateway-internal headers (e.g. X-Gateway-Priority) when enabled.
-    req.gateway_headers = build_gateway_headers(is_vip, inner.config.router_settings.enable_priority_header);
+    req.gateway_headers = build_gateway_headers(
+        is_vip,
+        inner.config.router_settings.enable_priority_header,
+        api_path,
+        provider.client_type_header(),
+    );
 
     // Capture request body for debug recording if debug mode is enabled.
     let debug_req_body = if state.debug_store.is_enabled() {
@@ -1129,11 +1134,23 @@ fn is_vip_key(metadata: &serde_json::Value) -> bool {
 /// explicitly enabled via `router_settings.enable_priority_header`. This keeps
 /// normal deployments clean and only emits `X-Gateway-Priority` when a
 /// downstream scheduler is being rolled out.
-fn build_gateway_headers(is_vip: bool, enable_priority_header: bool) -> std::collections::HashMap<String, String> {
+fn build_gateway_headers(
+    is_vip: bool,
+    enable_priority_header: bool,
+    api_path: &str,
+    client_type_enabled: bool,
+) -> std::collections::HashMap<String, String> {
     let mut headers = std::collections::HashMap::new();
     if enable_priority_header {
         let priority = if is_vip { 100 } else { 0 };
         headers.insert("X-Gateway-Priority".to_string(), priority.to_string());
+    }
+    if client_type_enabled {
+        let kind = boom_ctxaware::classify(api_path);
+        headers.insert(
+            boom_ctxaware::CLIENT_TYPE_HEADER.to_string(),
+            kind.wire_label().to_string(),
+        );
     }
     headers
 }
@@ -1602,7 +1619,12 @@ pub async fn messages(
     };
 
     // Attach gateway-internal headers (e.g. X-Gateway-Priority) when enabled.
-    openai_req.gateway_headers = build_gateway_headers(is_vip, inner.config.router_settings.enable_priority_header);
+    openai_req.gateway_headers = build_gateway_headers(
+        is_vip,
+        inner.config.router_settings.enable_priority_header,
+        "/v1/messages",
+        provider.client_type_header(),
+    );
 
     // Capture request body for debug recording if debug mode is enabled.
     let debug_req_body = if state.debug_store.is_enabled() {
@@ -2062,25 +2084,49 @@ mod tests {
 
     #[test]
     fn headers_enabled_vip_gives_100() {
-        let headers = build_gateway_headers(true, true);
+        let headers = build_gateway_headers(true, true, "/v1/chat/completions", false);
         assert_eq!(headers.get("X-Gateway-Priority").map(String::as_str), Some("100"));
     }
 
     #[test]
     fn headers_enabled_normal_gives_0() {
-        let headers = build_gateway_headers(false, true);
+        let headers = build_gateway_headers(false, true, "/v1/chat/completions", false);
         assert_eq!(headers.get("X-Gateway-Priority").map(String::as_str), Some("0"));
     }
 
     #[test]
     fn headers_disabled_vip_is_empty() {
-        let headers = build_gateway_headers(true, false);
+        let headers = build_gateway_headers(true, false, "/v1/chat/completions", false);
         assert!(headers.is_empty(), "no header should be injected when disabled");
     }
 
     #[test]
     fn headers_disabled_normal_is_empty() {
-        let headers = build_gateway_headers(false, false);
+        let headers = build_gateway_headers(false, false, "/v1/chat/completions", false);
         assert!(headers.is_empty(), "no header should be injected when disabled");
+    }
+
+    #[test]
+    fn client_type_header_anthropic_on_messages() {
+        let headers = build_gateway_headers(false, false, "/v1/messages", true);
+        assert_eq!(
+            headers.get("X-BooM-Client-Type").map(String::as_str),
+            Some("anthropic"),
+        );
+    }
+
+    #[test]
+    fn client_type_header_anonymous_on_chat_completions() {
+        let headers = build_gateway_headers(false, false, "/v1/chat/completions", true);
+        assert_eq!(
+            headers.get("X-BooM-Client-Type").map(String::as_str),
+            Some("anonymous"),
+        );
+    }
+
+    #[test]
+    fn client_type_header_omitted_when_disabled() {
+        let headers = build_gateway_headers(false, false, "/v1/messages", false);
+        assert!(!headers.contains_key("X-BooM-Client-Type"));
     }
 }
