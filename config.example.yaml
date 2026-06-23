@@ -143,6 +143,16 @@ router_settings:
   #     large:
   #       target_model: "claude-sonnet"   # 复杂请求 → 强力模型
 
+  # 剥离 Claude Code 注入的 x-anthropic-billing-header 块（仅 /v1/messages）。
+  # Claude Code 会在 system prompt 开头注入一个独立 text block：
+  #   x-anthropic-billing-header: cc_version=...; cch=<每请求变化>; ...
+  # 该 block 会让 KV-cache prefix matching 每次都 miss。开启后会整块丢弃，
+  # 恢复 cache 命中（与 vLLM PR #36829 行为一致）。
+  # 默认 false：仅在转发到非 Anthropic backend（vLLM / Bedrock / OpenAI 兼容）
+  # 时才建议开启；若上游是 Anthropic 官方，剥离可能触发反盗版风控。
+  # /v1/chat/completions 不受影响（Claude Code 不会在该协议下注入）。
+  strip_claude_code_attribution: false
+
 # ──────────────────────────────────────────────
 # 服务器设置
 # ──────────────────────────────────────────────

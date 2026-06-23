@@ -1434,14 +1434,28 @@ pub async fn messages(
     auth: RequiredAuth,
     headers: axum::http::HeaderMap,
     ConnectInfo(remote_addr): ConnectInfo<std::net::SocketAddr>,
-    Json(req): Json<AnthropicMessagesRequest>,
+    Json(mut req): Json<AnthropicMessagesRequest>,
 ) -> Result<impl IntoResponse, AnthropicErrorReply> {
     let start = Instant::now();
     let request_id = new_request_id();
-    let mut openai_req = anthropic_request_to_openai(&req);
     let identity = auth.identity();
     let client_ip = extract_client_ip(&headers, Some(remote_addr));
     let inner = state.inner.load();
+
+    // Optional body rewrite: strip Claude Code's attribution block from the
+    // system prompt. Done before anthropic_request_to_openai so that both the
+    // converted openai_req and the prompt-log capture below see the cleaned
+    // body in one shot.
+    if inner.config.router_settings.strip_claude_code_attribution
+        && crate::rewrite::strip_cc_attribution_anthropic(&mut req)
+    {
+        tracing::debug!(
+            request_id = %request_id,
+            "stripped claude code attribution block from anthropic system prompt"
+        );
+    }
+
+    let mut openai_req = anthropic_request_to_openai(&req);
     let model = openai_req.model.clone();
     let is_stream = openai_req.stream.unwrap_or(false);
 
