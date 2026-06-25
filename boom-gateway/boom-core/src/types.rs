@@ -126,43 +126,52 @@ pub struct FunctionCall {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatCompletionRequest {
+    // Identity
     pub model: String,
+    // Core data
     pub messages: Vec<Message>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub temperature: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub top_p: Option<f64>,
+    // Hard constraints
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_completion_tokens: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub stream: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub stop: Option<StopSequence>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub n: Option<u32>,
+    // Tools
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<Tool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<serde_json::Value>,
+    // Output shape
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_format: Option<serde_json::Value>,
-    // Standard OpenAI fields (accepted and forwarded to upstream).
+    // Sampling
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frequency_penalty: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub presence_penalty: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seed: Option<i64>,
+    // Termination
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub user: Option<String>,
+    pub stop: Option<StopSequence>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub n: Option<u32>,
+    // Streaming
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream: Option<bool>,
+    // Debug / observability
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logprobs: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_logprobs: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logit_bias: Option<serde_json::Value>,
+    // Attribution
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
     /// Catch-all: accepts all fields during deserialization so requests are
     /// never rejected for unknown keys, but **skips serialization** so that
     /// non-standard fields (service_tier, store, etc.) are NOT forwarded to
@@ -192,22 +201,29 @@ pub struct ChatCompletionRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompletionRequest {
+    // Identity
     pub model: String,
+    // Core data
     pub prompt: CompletionPrompt,
+    // Hard constraints
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    // Sampling
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_tokens: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub stream: Option<bool>,
+    // Termination
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop: Option<StopSequence>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub n: Option<u32>,
+    // Suffix (legacy completion-specific)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suffix: Option<String>,
+    // Streaming
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream: Option<bool>,
     /// Catch-all for provider-specific parameters.
     #[serde(default, flatten, skip_serializing)]
     pub extra: serde_json::Map<String, serde_json::Value>,
@@ -474,28 +490,39 @@ impl AuthIdentity {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnthropicMessagesRequest {
+    // Identity
     pub model: String,
-    pub messages: Vec<AnthropicMessage>,
+    // Instruction
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system: Option<AnthropicSystemContent>,
+    // Core data
+    pub messages: Vec<AnthropicMessage>,
+    // Hard constraints
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub temperature: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub top_p: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub stream: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub stop_sequences: Option<Vec<String>>,
+    // Tools
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<AnthropicTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<serde_json::Value>,
+    // Reasoning control
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<serde_json::Value>,
+    // Sampling
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f64>,
+    // Termination
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_sequences: Option<Vec<String>>,
+    // Streaming
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream: Option<bool>,
+    // Attribution
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
+    // Catch-all (must be last; serde flatten)
     #[serde(default, flatten, skip_serializing)]
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
