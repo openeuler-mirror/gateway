@@ -2,10 +2,10 @@
 //!
 //! Modelled after `boom_routing::RebalanceCounter`: fixed mapping
 //! `bucket = minute % 60`, lazy eviction on `record`/`snapshot`.
-//! Each bucket carries two counters — total requests and the subset
-//! that hit the Anthropic-native endpoint — so the dashboard can
-//! render a stacked bar (total height = total, green segment =
-//! anthropic share) without a second tracker.
+//! Each bucket carries request counts and token sums (split into
+//! total vs. Anthropic-native) so the dashboard can render a stacked
+//! bar for request volume AND for input/output token share without
+//! a second tracker.
 
 use std::sync::Mutex;
 
@@ -20,6 +20,10 @@ pub struct MinuteBucket {
     pub minute: String,
     pub total: u64,
     pub anthropic: u64,
+    pub input_tokens_total: u64,
+    pub input_tokens_anthropic: u64,
+    pub output_tokens_total: u64,
+    pub output_tokens_anthropic: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -29,6 +33,12 @@ pub struct AgentSummary {
     /// Anthropic share over the last hour, `0.0..=1.0`. `0.0` when
     /// there are no samples to avoid a divide-by-zero on cold start.
     pub ratio: f64,
+    pub input_tokens_total: u64,
+    pub input_tokens_anthropic: u64,
+    pub input_token_ratio: f64,
+    pub output_tokens_total: u64,
+    pub output_tokens_anthropic: u64,
+    pub output_token_ratio: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -42,6 +52,10 @@ pub struct AgentStatsSnapshot {
 struct Bucket {
     total: u64,
     anthropic: u64,
+    input_tokens_total: u64,
+    input_tokens_anthropic: u64,
+    output_tokens_total: u64,
+    output_tokens_anthropic: u64,
 }
 
 pub struct AgentStatsTracker {
@@ -89,6 +103,25 @@ impl AgentStatsTracker {
         }
     }
 
+    /// Accumulate token usage for one request under the current minute's
+    /// bucket. Call this once the response is finalised (after usage is
+    /// known). The api_path determines whether tokens also count toward
+    /// the Anthropic-native subtotal. Safe to call without a prior
+    /// `record` — request count and token sum are independent counters.
+    pub fn record_tokens(&self, api_path: &str, input_tokens: u64, output_tokens: u64) {
+        let now_min = to_minute(now_epoch_secs());
+        let anthropic = is_anthropic_path(api_path);
+        let mut guard = self.inner.lock().unwrap();
+        guard.advance_to(now_min);
+        let slot = &mut guard.buckets[now_min as usize % NUM_BUCKETS];
+        slot.input_tokens_total += input_tokens;
+        slot.output_tokens_total += output_tokens;
+        if anthropic {
+            slot.input_tokens_anthropic += input_tokens;
+            slot.output_tokens_anthropic += output_tokens;
+        }
+    }
+
     /// Return 60 one-minute buckets covering the last hour.
     pub fn snapshot(&self) -> AgentStatsSnapshot {
         let now_min = to_minute(now_epoch_secs());
@@ -99,6 +132,10 @@ impl AgentStatsTracker {
         let mut events = Vec::with_capacity(NUM_BUCKETS);
         let mut total: u64 = 0;
         let mut anthropic: u64 = 0;
+        let mut input_tokens_total: u64 = 0;
+        let mut input_tokens_anthropic: u64 = 0;
+        let mut output_tokens_total: u64 = 0;
+        let mut output_tokens_anthropic: u64 = 0;
         for i in 0..NUM_BUCKETS {
             let min = base + i as u64;
             let slot = guard.buckets[min as usize % NUM_BUCKETS];
@@ -109,10 +146,18 @@ impl AgentStatsTracker {
             };
             total += slot.total;
             anthropic += slot.anthropic;
+            input_tokens_total += slot.input_tokens_total;
+            input_tokens_anthropic += slot.input_tokens_anthropic;
+            output_tokens_total += slot.output_tokens_total;
+            output_tokens_anthropic += slot.output_tokens_anthropic;
             events.push(MinuteBucket {
                 minute: label,
                 total: slot.total,
                 anthropic: slot.anthropic,
+                input_tokens_total: slot.input_tokens_total,
+                input_tokens_anthropic: slot.input_tokens_anthropic,
+                output_tokens_total: slot.output_tokens_total,
+                output_tokens_anthropic: slot.output_tokens_anthropic,
             });
         }
 
@@ -121,6 +166,16 @@ impl AgentStatsTracker {
         } else {
             anthropic as f64 / total as f64
         };
+        let input_token_ratio = if input_tokens_total == 0 {
+            0.0
+        } else {
+            input_tokens_anthropic as f64 / input_tokens_total as f64
+        };
+        let output_token_ratio = if output_tokens_total == 0 {
+            0.0
+        } else {
+            output_tokens_anthropic as f64 / output_tokens_total as f64
+        };
 
         AgentStatsSnapshot {
             events,
@@ -128,6 +183,12 @@ impl AgentStatsTracker {
                 total,
                 anthropic,
                 ratio,
+                input_tokens_total,
+                input_tokens_anthropic,
+                input_token_ratio,
+                output_tokens_total,
+                output_tokens_anthropic,
+                output_token_ratio,
             },
         }
     }
@@ -209,5 +270,49 @@ mod tests {
         }
         let snap = tracker.snapshot();
         assert_eq!(snap.summary.total, 0);
+    }
+
+    #[test]
+    fn record_tokens_accumulates_by_path() {
+        let tracker = AgentStatsTracker::new();
+        tracker.record_tokens("/v1/messages", 100, 200);
+        tracker.record_tokens("/v1/messages", 50, 80);
+        tracker.record_tokens("/v1/chat/completions", 500, 60);
+
+        let snap = tracker.snapshot();
+        assert_eq!(snap.summary.input_tokens_total, 650);
+        assert_eq!(snap.summary.input_tokens_anthropic, 150);
+        assert_eq!(snap.summary.output_tokens_total, 340);
+        assert_eq!(snap.summary.output_tokens_anthropic, 280);
+        assert!((snap.summary.input_token_ratio - (150.0 / 650.0)).abs() < 1e-9);
+        assert!((snap.summary.output_token_ratio - (280.0 / 340.0)).abs() < 1e-9);
+
+        let last = snap.events.last().unwrap();
+        assert_eq!(last.input_tokens_total, 650);
+        assert_eq!(last.input_tokens_anthropic, 150);
+        assert_eq!(last.output_tokens_total, 340);
+        assert_eq!(last.output_tokens_anthropic, 280);
+    }
+
+    #[test]
+    fn token_cold_start_is_zero() {
+        let tracker = AgentStatsTracker::new();
+        let snap = tracker.snapshot();
+        assert_eq!(snap.summary.input_tokens_total, 0);
+        assert_eq!(snap.summary.input_tokens_anthropic, 0);
+        assert_eq!(snap.summary.output_tokens_total, 0);
+        assert_eq!(snap.summary.output_tokens_anthropic, 0);
+        assert_eq!(snap.summary.input_token_ratio, 0.0);
+        assert_eq!(snap.summary.output_token_ratio, 0.0);
+    }
+
+    #[test]
+    fn record_and_record_tokens_are_independent() {
+        // record_tokens without record should bump tokens but not request count.
+        let tracker = AgentStatsTracker::new();
+        tracker.record_tokens("/v1/messages", 100, 200);
+        let snap = tracker.snapshot();
+        assert_eq!(snap.summary.total, 0);
+        assert_eq!(snap.summary.input_tokens_anthropic, 100);
     }
 }

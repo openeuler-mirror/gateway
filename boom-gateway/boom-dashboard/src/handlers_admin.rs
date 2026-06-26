@@ -1862,6 +1862,86 @@ fn aggregate_dispatched_keys(keys: Option<&Vec<boom_flowcontrol::DispatchedKeyEn
 }
 
 // ═══════════════════════════════════════════════════════════
+// Deployment 24h Summary (off the auto-refresh path)
+// ═══════════════════════════════════════════════════════════
+
+#[derive(Debug, sqlx::FromRow)]
+struct DeploymentSummaryRow {
+    deployment_id: String,
+    total_requests: i64,
+    input_count: i64,
+    sum_input_tokens: i64,
+    output_count: i64,
+    sum_output_tokens: i64,
+    ttft_count: i64,
+    sum_ttft_ms: i64,
+}
+
+/// GET /admin/stats/deployments/summary — 24h per-deployment aggregates.
+/// Computed on demand (page load + Refresh button), NOT on the 3s auto-poll.
+pub async fn get_deployment_summary_24h(
+    _session: AdminSession,
+    Extension(state): Extension<Arc<DashboardState>>,
+) -> Response {
+    let pool = match &state.db_pool {
+        Some(p) => p,
+        None => return Json(json!({"error": "Database not available"})).into_response(),
+    };
+
+    let rows_res = async {
+        let mut tx = begin_with_timeout(pool).await?;
+        let rows = sqlx::query_as::<_, DeploymentSummaryRow>(
+            r#"SELECT
+                 deployment_id,
+                 COUNT(*)::bigint AS total_requests,
+                 COUNT(input_tokens)::bigint AS input_count,
+                 COALESCE(SUM(input_tokens), 0)::bigint AS sum_input_tokens,
+                 COUNT(output_tokens)::bigint AS output_count,
+                 COALESCE(SUM(output_tokens), 0)::bigint AS sum_output_tokens,
+                 COUNT(ttft_ms)::bigint AS ttft_count,
+                 COALESCE(SUM(ttft_ms), 0)::bigint AS sum_ttft_ms
+               FROM boom_request_log
+               WHERE created_at >= NOW() - INTERVAL '24 hours'
+                 AND deployment_id IS NOT NULL
+                 AND status_code >= 200 AND status_code < 300
+               GROUP BY deployment_id"#,
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok::<_, sqlx::Error>(rows)
+    }.await;
+
+    let rows = match rows_res {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("Failed to query deployment summary: {}", e);
+            return Json(json!({"error": e.to_string()})).into_response();
+        }
+    };
+
+    let deployments: Vec<serde_json::Value> = rows.into_iter()
+        .map(|r| {
+            let avg = |sum: i64, count: i64| -> Option<f64> {
+                if count == 0 { None } else { Some(sum as f64 / count as f64) }
+            };
+            json!({
+                "deployment_id": r.deployment_id,
+                "total_requests": r.total_requests,
+                "avg_input_tokens": avg(r.sum_input_tokens, r.input_count),
+                "avg_output_tokens": avg(r.sum_output_tokens, r.output_count),
+                "avg_ttft_ms": avg(r.sum_ttft_ms, r.ttft_count),
+            })
+        })
+        .collect();
+
+    Json(json!({
+        "deployments": deployments,
+        "window_hours": 24,
+    })).into_response()
+}
+
+// ═══════════════════════════════════════════════════════════
 // Rebalance Stats
 // ═══════════════════════════════════════════════════════════
 
@@ -1887,6 +1967,10 @@ struct AgentBucketRow {
     bucket_epoch: i64,
     total: i64,
     anthropic: i64,
+    input_tokens_total: i64,
+    input_tokens_anthropic: i64,
+    output_tokens_total: i64,
+    output_tokens_anthropic: i64,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -1973,6 +2057,7 @@ pub async fn get_request_rate_stats(
                  COUNT(*)::bigint AS total
                FROM boom_request_log
                WHERE created_at >= $3 AND created_at < $4
+                 AND status_code = 200
                GROUP BY 1, 2
                ORDER BY 2, 1"#,
         )
@@ -2070,6 +2155,10 @@ pub async fn get_agent_stats(
                 "ts": expected_ts.get(i).cloned().unwrap_or_default(),
                 "total": b.total,
                 "anthropic": b.anthropic,
+                "input_tokens_total": b.input_tokens_total,
+                "input_tokens_anthropic": b.input_tokens_anthropic,
+                "output_tokens_total": b.output_tokens_total,
+                "output_tokens_anthropic": b.output_tokens_anthropic,
             }))
             .collect();
         return Json(json!({
@@ -2096,9 +2185,14 @@ pub async fn get_agent_stats(
             r#"SELECT
                  (FLOOR((EXTRACT(EPOCH FROM created_at) - $1) / $2) * $2 + $1)::bigint AS bucket_epoch,
                  COUNT(*)::bigint AS total,
-                 COUNT(*) FILTER (WHERE api_path LIKE '/v1/messages%')::bigint AS anthropic
+                 COUNT(*) FILTER (WHERE api_path LIKE '/v1/messages%')::bigint AS anthropic,
+                 COALESCE(SUM(input_tokens), 0)::bigint AS input_tokens_total,
+                 COALESCE(SUM(input_tokens) FILTER (WHERE api_path LIKE '/v1/messages%'), 0)::bigint AS input_tokens_anthropic,
+                 COALESCE(SUM(output_tokens), 0)::bigint AS output_tokens_total,
+                 COALESCE(SUM(output_tokens) FILTER (WHERE api_path LIKE '/v1/messages%'), 0)::bigint AS output_tokens_anthropic
                FROM boom_request_log
                WHERE created_at >= $3 AND created_at < $4
+                 AND status_code = 200
                GROUP BY 1
                ORDER BY 1"#,
         )
@@ -2127,21 +2221,50 @@ pub async fn get_agent_stats(
     let mut events: Vec<serde_json::Value> = Vec::new();
     let mut total: u64 = 0;
     let mut anthropic: u64 = 0;
+    let mut input_tokens_total: u64 = 0;
+    let mut input_tokens_anthropic: u64 = 0;
+    let mut output_tokens_total: u64 = 0;
+    let mut output_tokens_anthropic: u64 = 0;
     for ts in window.expected_buckets() {
         let ep = ts.timestamp();
-        let (t, a) = match by_epoch.get(&ep) {
-            Some(r) => (r.total as u64, r.anthropic as u64),
-            None => (0, 0),
+        let (t, a, it, ia, ot, oa) = match by_epoch.get(&ep) {
+            Some(r) => (
+                r.total as u64,
+                r.anthropic as u64,
+                r.input_tokens_total as u64,
+                r.input_tokens_anthropic as u64,
+                r.output_tokens_total as u64,
+                r.output_tokens_anthropic as u64,
+            ),
+            None => (0, 0, 0, 0, 0, 0),
         };
         total += t;
         anthropic += a;
+        input_tokens_total += it;
+        input_tokens_anthropic += ia;
+        output_tokens_total += ot;
+        output_tokens_anthropic += oa;
         events.push(json!({
             "ts": ts.to_rfc3339(),
             "total": t,
             "anthropic": a,
+            "input_tokens_total": it,
+            "input_tokens_anthropic": ia,
+            "output_tokens_total": ot,
+            "output_tokens_anthropic": oa,
         }));
     }
     let ratio = if total == 0 { 0.0 } else { anthropic as f64 / total as f64 };
+    let input_token_ratio = if input_tokens_total == 0 {
+        0.0
+    } else {
+        input_tokens_anthropic as f64 / input_tokens_total as f64
+    };
+    let output_token_ratio = if output_tokens_total == 0 {
+        0.0
+    } else {
+        output_tokens_anthropic as f64 / output_tokens_total as f64
+    };
 
     Json(json!({
         "window": window_json(&window),
@@ -2150,6 +2273,12 @@ pub async fn get_agent_stats(
             "total": total,
             "anthropic": anthropic,
             "ratio": ratio,
+            "input_tokens_total": input_tokens_total,
+            "input_tokens_anthropic": input_tokens_anthropic,
+            "input_token_ratio": input_token_ratio,
+            "output_tokens_total": output_tokens_total,
+            "output_tokens_anthropic": output_tokens_anthropic,
+            "output_token_ratio": output_token_ratio,
         },
     })).into_response()
 }

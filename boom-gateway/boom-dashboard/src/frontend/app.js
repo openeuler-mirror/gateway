@@ -301,10 +301,35 @@
     loadRebalanceStats();
     loadRequestRateStats();
     loadAgentStats();
+    loadDeployment24hSummary();
   }
 
   // ── In-Flight ─────────────────────────────────────────
   let inflightTimer = null;
+
+  // 24h per-deployment aggregates — populated on page load and Refresh button
+  // only; the 3s setInterval auto-poll does NOT touch this. renderInflightTable
+  // reads from this cache so the table shows the last on-demand snapshot.
+  let deployment24hSummary = {};
+
+  async function loadDeployment24hSummary() {
+    try {
+      const data = await api("/admin/stats/deployments/summary");
+      if (data && data.error) {
+        console.error("loadDeployment24hSummary backend error:", data.error);
+        deployment24hSummary = { __error: data.error };
+      } else {
+        const map = {};
+        (data.deployments || []).forEach((d) => { map[d.deployment_id] = d; });
+        deployment24hSummary = map;
+      }
+      loadInflight();
+    } catch (err) {
+      console.error("loadDeployment24hSummary error:", err);
+      deployment24hSummary = { __error: String(err.message || err) };
+      loadInflight();
+    }
+  }
 
   async function loadInflight() {
     try {
@@ -320,13 +345,24 @@
     var deployments = data.deployments || [];
 
     if (!deployments.length) {
-      wrap.innerHTML = "<p>No in-flight requests.</p>";
+      var emptyMsg = "No in-flight requests.";
+      if (deployment24hSummary && deployment24hSummary.__error) {
+        emptyMsg += ' <span style="color:#c00">24h summary load failed: ' + esc(String(deployment24hSummary.__error)) + "</span>";
+      }
+      wrap.innerHTML = "<p>" + emptyMsg + "</p>";
       return;
     }
 
+    var errorBanner = "";
+    if (deployment24hSummary && deployment24hSummary.__error) {
+      errorBanner = '<p style="color:#c00;margin:0 0 6px">24h summary load failed: ' + esc(String(deployment24hSummary.__error)) + "</p>";
+    }
+
     wrap.innerHTML =
+      errorBanner +
       '<table class="data-table"><thead><tr>' +
       "<th>Deployment</th><th>FC QUEUE</th><th>IN-MODEL REQS</th><th>IN-MODEL CONTEXT</th>" +
+      "<th>24H REQS</th><th>AVG IN</th><th>AVG OUT</th><th>AVG TTFT</th>" +
       "</tr></thead><tbody>" +
       deployments
         .map(function (d) {
@@ -362,12 +398,22 @@
             deployCell = '<span class="deploy-model">' + esc(d.model) + '</span>';
           }
 
+          // 24h aggregates — read from cache populated on page load / Refresh button.
+          var s = d.deployment_id ? deployment24hSummary[d.deployment_id] : null;
+          function fmtInt(v) { return (v == null) ? "-" : Math.round(v).toLocaleString(); }
+          function fmtToken(v) { return (v == null) ? "-" : Math.round(v).toLocaleString(); }
+          function fmtTtft(v) { return (v == null) ? "-" : Math.round(v) + "ms"; }
+
           return (
             "<tr>" +
             "<td>" + deployCell + "</td>" +
             "<td>" + fcQueueHtml + "</td>" +
             "<td>" + reqsHtml + "</td>" +
             "<td>" + ctxDisplay + "</td>" +
+            "<td>" + fmtInt(s ? s.total_requests : null) + "</td>" +
+            "<td>" + fmtToken(s ? s.avg_input_tokens : null) + "</td>" +
+            "<td>" + fmtToken(s ? s.avg_output_tokens : null) + "</td>" +
+            "<td>" + fmtTtft(s ? s.avg_ttft_ms : null) + "</td>" +
             "</tr>"
           );
         })
@@ -609,28 +655,45 @@
     if (!wrap) return;
 
     const events = data.events || [];
-    const summary = data.summary || { total: 0, anthropic: 0, ratio: 0 };
+    const summary = data.summary || {
+      total: 0, anthropic: 0, ratio: 0,
+      input_tokens_total: 0, input_tokens_anthropic: 0, input_token_ratio: 0,
+      output_tokens_total: 0, output_tokens_anthropic: 0, output_token_ratio: 0,
+    };
     const window = data.window || null;
     const rangeLabel = rangeState.agent.range === "custom" ? "custom" : rangeState.agent.range;
 
-    // Three summary cards — Total / Anthropic / Ratio over the selected window.
     const ratioPct = (summary.ratio * 100).toFixed(1);
+    const inputRatioPct = (summary.input_token_ratio * 100).toFixed(1);
+    const outputRatioPct = (summary.output_token_ratio * 100).toFixed(1);
     const windowNote = window
       ? `<div class="range-window-note">${esc(window.from)} → ${esc(window.to)} · bucket ${(window.bucket_secs / 60).toFixed(0)}min</div>`
       : "";
+
+    // Five summary cards — Requests (Total / Anthropic / Ratio) + Tokens (Input / Output anthropic share).
     const summaryHtml =
       '<div class="agent-summary">' +
         '<div class="agent-summary-card">' +
-          '<div class="agent-summary-label">Total (' + esc(rangeLabel) + ')</div>' +
+          '<div class="agent-summary-label">Total Requests (' + esc(rangeLabel) + ')</div>' +
           '<div class="agent-summary-value">' + summary.total.toLocaleString() + '</div>' +
         '</div>' +
         '<div class="agent-summary-card">' +
-          '<div class="agent-summary-label">Anthropic (' + esc(rangeLabel) + ')</div>' +
+          '<div class="agent-summary-label">Anthropic Requests</div>' +
           '<div class="agent-summary-value" style="color:#10b981">' + summary.anthropic.toLocaleString() + '</div>' +
         '</div>' +
         '<div class="agent-summary-card">' +
-          '<div class="agent-summary-label">Anthropic Ratio</div>' +
+          '<div class="agent-summary-label">Request Ratio</div>' +
           '<div class="agent-summary-value" style="color:#10b981">' + ratioPct + '%</div>' +
+        '</div>' +
+        '<div class="agent-summary-card">' +
+          '<div class="agent-summary-label">Anthropic Input Tokens</div>' +
+          '<div class="agent-summary-value" style="color:#10b981">' + summary.input_tokens_anthropic.toLocaleString() +
+            ' <span style="font-size:0.7em;color:#6b7280">/ ' + summary.input_tokens_total.toLocaleString() + ' (' + inputRatioPct + '%)</span></div>' +
+        '</div>' +
+        '<div class="agent-summary-card">' +
+          '<div class="agent-summary-label">Anthropic Output Tokens</div>' +
+          '<div class="agent-summary-value" style="color:#10b981">' + summary.output_tokens_anthropic.toLocaleString() +
+            ' <span style="font-size:0.7em;color:#6b7280">/ ' + summary.output_tokens_total.toLocaleString() + ' (' + outputRatioPct + '%)</span></div>' +
         '</div>' +
       '</div>';
 
@@ -639,22 +702,43 @@
       return;
     }
 
-    const maxTotal = Math.max(1, ...events.map((e) => e.total));
+    const bucketSecs = window ? window.bucket_secs : 0;
+    const requestChart = renderAgentBarChart(events, "total", "anthropic", "Requests", bucketSecs, (v) => v.toLocaleString());
+    const inputChart = renderAgentBarChart(events, "input_tokens_total", "input_tokens_anthropic", "Input Tokens", bucketSecs, (v) => v.toLocaleString());
+    const outputChart = renderAgentBarChart(events, "output_tokens_total", "output_tokens_anthropic", "Output Tokens", bucketSecs, (v) => v.toLocaleString());
+
+    const legendHtml =
+      '<div class="agent-legend">' +
+        '<span class="agent-legend-item"><span class="agent-legend-swatch agent-legend-anthropic"></span>Anthropic (/v1/messages)</span>' +
+        '<span class="agent-legend-item"><span class="agent-legend-swatch agent-legend-other"></span>Other (/v1/chat/completions, etc.)</span>' +
+      '</div>';
+
+    wrap.innerHTML = summaryHtml + windowNote +
+      '<div style="margin-top:1rem"><div style="font-weight:600;margin-bottom:0.25rem">Request Volume</div>' + requestChart + '</div>' +
+      '<div style="margin-top:1.5rem"><div style="font-weight:600;margin-bottom:0.25rem">Input Tokens</div>' + inputChart + '</div>' +
+      '<div style="margin-top:1.5rem"><div style="font-weight:600;margin-bottom:0.25rem">Output Tokens</div>' + outputChart + '</div>' +
+      legendHtml;
+  }
+
+  // Render one stacked-bar chart (green anthropic segment over gray other segment).
+  // `totalKey` / `anthropicKey` select which fields to read from each event.
+  // `fmt` formats the raw number for the bar value label and tooltip.
+  function renderAgentBarChart(events, totalKey, anthropicKey, label, bucketSecs, fmt) {
+    const maxTotal = Math.max(1, ...events.map((e) => Number(e[totalKey] || 0)));
     const bars = events.map((e, idx) => {
-      const total = e.total || 0;
-      const anthropic = e.anthropic || 0;
+      const total = Number(e[totalKey] || 0);
+      const anthropic = Number(e[anthropicKey] || 0);
       const other = total - anthropic;
-      const totalPct = (total / maxTotal) * 100;             // full bar height
-      const anthropicPctOfTotal = total > 0 ? (anthropic / total) * 100 : 0;  // green segment share within this bar
+      const totalPct = (total / maxTotal) * 100;
+      const anthropicPctOfTotal = total > 0 ? (anthropic / total) * 100 : 0;
       const showLabel = shouldShowLabel(events, idx);
-      const lbl = formatBucketLabel(e.ts, window ? window.bucket_secs : 0);
+      const lbl = formatBucketLabel(e.ts, bucketSecs);
       const ratioTxt = total > 0 ? ((anthropic / total) * 100).toFixed(0) : "0";
       const title =
-        lbl +
-        " — total: " + total + ", anthropic: " + anthropic + " (" + ratioTxt + "%), other: " + other;
-      // Stack: top = other (gray), bottom = anthropic (green). Use flex-basis on anthropic.
+        lbl + " — " + label + ": " + fmt(total) +
+        ", anthropic: " + fmt(anthropic) + " (" + ratioTxt + "%), other: " + fmt(other);
       return '<div class="rb-bar-col" title="' + esc(title) + '">' +
-        '<div class="rb-bar-value' + (total === 0 ? " rb-bar-value-zero" : "") + '">' + total + '</div>' +
+        '<div class="rb-bar-value' + (total === 0 ? " rb-bar-value-zero" : "") + '">' + fmt(total) + '</div>' +
         '<div class="agent-bar" style="height:' + Math.max(totalPct, 1) + '%">' +
           (other > 0 ? '<div class="agent-bar-other" style="flex: ' + (100 - anthropicPctOfTotal) + '"></div>' : '') +
           (anthropic > 0 ? '<div class="agent-bar-anthropic" style="flex: ' + anthropicPctOfTotal + '"></div>' : '') +
@@ -665,17 +749,10 @@
       '</div>';
     }).join("");
 
-    const chartHtml =
-      '<div class="rebalance-chart">' +
-        '<div class="rb-y-axis"><span>' + maxTotal + '</span><span>0</span></div>' +
-        '<div class="rb-bars">' + bars + '</div>' +
-      '</div>' +
-      '<div class="agent-legend">' +
-        '<span class="agent-legend-item"><span class="agent-legend-swatch agent-legend-anthropic"></span>Anthropic (/v1/messages)</span>' +
-        '<span class="agent-legend-item"><span class="agent-legend-swatch agent-legend-other"></span>Other (/v1/chat/completions, etc.)</span>' +
-      '</div>';
-
-    wrap.innerHTML = summaryHtml + windowNote + chartHtml;
+    return '<div class="rebalance-chart">' +
+      '<div class="rb-y-axis"><span>' + fmt(maxTotal) + '</span><span>0</span></div>' +
+      '<div class="rb-bars">' + bars + '</div>' +
+    '</div>';
   }
 
   function renderStatsTable(models) {
@@ -1654,6 +1731,18 @@
       finally {
         btnReload.disabled = false;
         btnReload.textContent = "Reload Config";
+      }
+    });
+    const btnRefreshInflight = document.getElementById("btn-refresh-inflight");
+    if (btnRefreshInflight) btnRefreshInflight.addEventListener("click", async () => {
+      btnRefreshInflight.disabled = true;
+      btnRefreshInflight.textContent = "Refreshing...";
+      try {
+        await loadDeployment24hSummary();
+      } catch (err) { console.error("Refresh inflight error:", err); }
+      finally {
+        btnRefreshInflight.disabled = false;
+        btnRefreshInflight.textContent = "Refresh";
       }
     });
     const btnDebug = document.getElementById("btn-debug-toggle");

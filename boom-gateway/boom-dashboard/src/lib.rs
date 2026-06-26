@@ -129,6 +129,11 @@ pub fn build_router<S: Clone + Send + Sync + 'static>(state: DashboardState) -> 
             "/dashboard/api/admin/stats/inflight",
             get(handlers_admin::get_inflight_stats),
         )
+        // Admin — Deployment 24h Summary (on-demand, off auto-refresh).
+        .route(
+            "/dashboard/api/admin/stats/deployments/summary",
+            get(handlers_admin::get_deployment_summary_24h),
+        )
         // Admin — Rebalance Events Stats (last 60 minutes).
         .route(
             "/dashboard/api/admin/stats/rebalance",
