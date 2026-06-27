@@ -81,12 +81,42 @@
     setupLogout();
     setupAdminButtons();
     setupThemeToggle();
+    setupLangToggle();
+    updateLangToggle();
     updateThemeIcons();
     setupViewportTooltip();
     bindRangeControls();
     window.addEventListener("hashchange", () => { onRoute(); onUserRoute(); });
+    document.addEventListener("languagechange", () => {
+      // Re-render visible dynamic content so t() picks up the new language.
+      onRoute();
+      onUserRoute();
+    });
     checkSession();
   });
+
+  // ── Language toggle ───────────────────────────────────
+  function setupLangToggle() {
+    document.querySelectorAll(".lang-toggle").forEach(function (btn) {
+      btn.addEventListener("click", toggleLang);
+    });
+  }
+
+  function toggleLang() {
+    const next = (window.__i18n.currentLang() === "en") ? "zh" : "en";
+    window.__i18n.setLang(next);
+    updateLangToggle();
+  }
+
+  function updateLangToggle() {
+    // Show the *other* language's code on the button (the one you'll switch to).
+    const current = window.__i18n.currentLang();
+    const label = current === "en" ? "中" : "EN";
+    document.querySelectorAll(".lang-toggle .lang-current").forEach(function (el) {
+      el.textContent = label;
+    });
+    document.documentElement.setAttribute("lang", current === "en" ? "en" : "zh-CN");
+  }
 
   // ── Viewport-aware tooltip for .cell-tip ──────────────
   // Positions tooltip above or below the element depending on available space.
@@ -187,15 +217,15 @@
     if (admin) {
       userIdInput.value = "admin";
       userIdGroup.classList.remove("hidden");
-      hint.textContent = "Enter the master key to sign in";
-      apiKeyInput.placeholder = "Master Key";
-      toggle.textContent = "← User sign in";
+      hint.textContent = t("login.master_subtitle");
+      apiKeyInput.placeholder = t("login.master_key");
+      toggle.textContent = t("login.user_link");
     } else {
       userIdInput.value = "";
       userIdGroup.classList.add("hidden");
-      hint.textContent = "Enter your API Key to sign in";
-      apiKeyInput.placeholder = "API Key (sk-...)";
-      toggle.textContent = "Admin sign in →";
+      hint.textContent = t("login.subtitle");
+      apiKeyInput.placeholder = t("login.api_key_placeholder");
+      toggle.textContent = t("login.admin_link");
     }
   }
 
@@ -211,7 +241,7 @@
       errEl.classList.add("hidden");
       const btn = document.getElementById("login-btn");
       btn.disabled = true;
-      btn.textContent = "Logging in...";
+      btn.textContent = t("login.logging_in");
       try {
         const userId = document.getElementById("user_id").value.trim();
         const res = await fetch(API + "/auth/login", {
@@ -224,7 +254,7 @@
         });
         if (!res.ok) {
           const data = await res.json().catch(() => ({}));
-          throw new Error(data.error || data.message || "Login failed");
+          throw new Error(data.error || data.message || t("login.failed"));
         }
         const data = await res.json();
         currentUser = data;
@@ -234,7 +264,7 @@
         errEl.classList.remove("hidden");
       } finally {
         btn.disabled = false;
-        btn.textContent = "Login";
+        btn.textContent = t("login.submit");
       }
     });
   }
@@ -340,9 +370,9 @@
     var deployments = data.deployments || [];
 
     if (!deployments.length) {
-      var emptyMsg = "No in-flight requests.";
+      var emptyMsg = t("stats.inflight.no_inflight");
       if (deployment24hSummary && deployment24hSummary.__error) {
-        emptyMsg += ' <span style="color:#c00">24h summary load failed: ' + esc(String(deployment24hSummary.__error)) + "</span>";
+        emptyMsg += ' <span style="color:#c00">' + t("stats.inflight.24h_load_failed", { error: esc(String(deployment24hSummary.__error)) }) + "</span>";
       }
       wrap.innerHTML = "<p>" + emptyMsg + "</p>";
       return;
@@ -350,14 +380,14 @@
 
     var errorBanner = "";
     if (deployment24hSummary && deployment24hSummary.__error) {
-      errorBanner = '<p style="color:#c00;margin:0 0 6px">24h summary load failed: ' + esc(String(deployment24hSummary.__error)) + "</p>";
+      errorBanner = '<p style="color:#c00;margin:0 0 6px">' + t("stats.inflight.24h_load_failed", { error: esc(String(deployment24hSummary.__error)) }) + "</p>";
     }
 
     wrap.innerHTML =
       errorBanner +
       '<table class="data-table"><thead><tr>' +
-      "<th>Deployment</th><th>FC QUEUE</th><th>IN-MODEL REQS</th><th>IN-MODEL CONTEXT</th>" +
-      "<th>24H REQS</th><th>AVG IN</th><th>AVG OUT</th><th>AVG TTFT</th>" +
+      "<th>" + t("stats.inflight.col.deployment") + "</th><th>" + t("stats.inflight.col.fc_queue") + "</th><th>" + t("stats.inflight.col.in_reqs") + "</th><th>" + t("stats.inflight.col.in_context") + "</th>" +
+      "<th>" + t("stats.inflight.col.24h_reqs") + "</th><th>" + t("stats.inflight.col.avg_in") + "</th><th>" + t("stats.inflight.col.avg_out") + "</th><th>" + t("stats.inflight.col.avg_ttft") + "</th>" +
       "</tr></thead><tbody>" +
       deployments
         .map(function (d) {
@@ -447,17 +477,17 @@
   function renderRebalanceChart(events) {
     const wrap = document.getElementById("rebalance-chart-wrap");
     if (!wrap) return;
-    if (!events.length) { wrap.innerHTML = "<p>No data.</p>"; return; }
+    if (!events.length) { wrap.innerHTML = "<p>" + t("common.no_records") + "</p>"; return; }
 
     const maxCount = Math.max(1, ...events.map((e) => e.count));
     const bars = events.map((e) => {
       const pct = (e.count / maxCount) * 100;
       const showLabel = e.minute === "now" || e.minute.endsWith("0m") || e.minute.endsWith("5m");
-      const title = e.minute === "now" ? "Current minute" : e.minute.replace("-", "") + " ago: " + e.count + " rebalance(s)";
+      const title = e.minute === "now" ? t("stats.rebalance.current_minute") : e.minute.replace("-", "") + " " + t("stats.rebalance.ago") + ": " + e.count + " " + t("stats.rebalance.events");
       return '<div class="rb-bar-col" title="' + esc(title) + '">' +
         '<div class="rb-bar-value' + (e.count === 0 ? " rb-bar-value-zero" : "") + '">' + e.count + '</div>' +
         '<div class="rb-bar" style="height:' + Math.max(pct, 1) + '%;background:' + rebalanceBarColor(pct) + '"></div>' +
-        '<div class="rb-bar-label' + (showLabel ? "" : " rb-label-hidden") + '">' + esc(e.minute === "now" ? "now" : e.minute.replace("-","")) + '</div>' +
+        '<div class="rb-bar-label' + (showLabel ? "" : " rb-label-hidden") + '">' + esc(e.minute === "now" ? t("stats.rebalance.now") : e.minute.replace("-","")) + '</div>' +
         '</div>';
     }).join("");
 
@@ -539,13 +569,13 @@
     const toInput = controls.querySelector(".range-to").value;
     const note = controls.querySelector(".range-note");
     if (!fromInput || !toInput) {
-      if (note) { note.textContent = "Pick both from and to."; note.classList.remove("hidden"); }
+      if (note) { note.textContent = t("range.pick_both"); note.classList.remove("hidden"); }
       return;
     }
     const fromMs = new Date(fromInput).getTime();
     const toMs = new Date(toInput).getTime();
     if (!(fromMs > 0 && toMs > 0) || toMs <= fromMs) {
-      if (note) { note.textContent = "'to' must be after 'from'."; note.classList.remove("hidden"); }
+      if (note) { note.textContent = t("range.to_after_from"); note.classList.remove("hidden"); }
       return;
     }
     if (note) note.classList.add("hidden");
@@ -597,7 +627,7 @@
   function renderRequestRateCharts(charts, window) {
     const wrap = document.getElementById("request-rate-wrap");
     if (!wrap) return;
-    if (!charts.length) { wrap.innerHTML = "<p>No data.</p>"; return; }
+    if (!charts.length) { wrap.innerHTML = "<p>" + t("common.no_records") + "</p>"; return; }
 
     const windowNote = window
       ? `<div class="range-window-note">${esc(window.from)} → ${esc(window.to)} · bucket ${(window.bucket_secs / 60).toFixed(0)}min</div>`
@@ -608,14 +638,14 @@
       if (!events.length) return;
       var maxCount = Math.max(1, ...events.map(function (e) { return e.count; }));
       var label = chart.deployment_id === "_total"
-        ? "ALL MODELS"
+        ? t("stats.rate.all_models")
         : esc(chart.model) + ":" + esc(chart.deployment_id);
 
       var bars = events.map(function (e, idx) {
         var pct = (e.count / maxCount) * 100;
         var showLabel = shouldShowLabel(events, idx);
         var lbl = formatBucketLabel(e.ts, window ? window.bucket_secs : 0);
-        var title = lbl + ": " + e.count + " req(s)";
+        var title = lbl + ": " + t("stats.rebalance.req_count", { n: e.count });
         return '<div class="rb-bar-col" title="' + esc(title) + '">' +
           '<div class="rb-bar-value' + (e.count === 0 ? " rb-bar-value-zero" : "") + '">' + e.count + '</div>' +
           '<div class="rb-bar" style="height:' + Math.max(pct, 1) + '%;background:' + throughputBarColor(pct) + '"></div>' +
@@ -631,7 +661,7 @@
         '</div></div>';
     });
 
-    wrap.innerHTML = html || (windowNote + "<p>No data.</p>");
+    wrap.innerHTML = html || (windowNote + "<p>" + t("common.no_records") + "</p>");
   }
 
   // ── Agent Statistics (anthropic share stacked bar) ───────
@@ -668,38 +698,38 @@
     const summaryHtml =
       '<div class="agent-summary">' +
         '<div class="agent-summary-card">' +
-          '<div class="agent-summary-label">Total Requests (' + esc(rangeLabel) + ')</div>' +
+          '<div class="agent-summary-label">' + t("stats.agent.summary.total") + ' (' + esc(rangeLabel) + ')</div>' +
           '<div class="agent-summary-value">' + summary.total.toLocaleString() + '</div>' +
         '</div>' +
         '<div class="agent-summary-card">' +
-          '<div class="agent-summary-label">Anthropic Requests</div>' +
+          '<div class="agent-summary-label">' + t("stats.agent.summary.anthropic") + '</div>' +
           '<div class="agent-summary-value" style="color:#10b981">' + summary.anthropic.toLocaleString() + '</div>' +
         '</div>' +
         '<div class="agent-summary-card">' +
-          '<div class="agent-summary-label">Request Ratio</div>' +
+          '<div class="agent-summary-label">' + t("stats.agent.summary.share") + '</div>' +
           '<div class="agent-summary-value" style="color:#10b981">' + ratioPct + '%</div>' +
         '</div>' +
         '<div class="agent-summary-card">' +
-          '<div class="agent-summary-label">Anthropic Input Tokens</div>' +
+          '<div class="agent-summary-label">' + t("stats.agent.summary.input_anthropic") + '</div>' +
           '<div class="agent-summary-value" style="color:#10b981">' + summary.input_tokens_anthropic.toLocaleString() +
             ' <span style="font-size:0.7em;color:#6b7280">/ ' + summary.input_tokens_total.toLocaleString() + ' (' + inputRatioPct + '%)</span></div>' +
         '</div>' +
         '<div class="agent-summary-card">' +
-          '<div class="agent-summary-label">Anthropic Output Tokens</div>' +
+          '<div class="agent-summary-label">' + t("stats.agent.summary.output_anthropic") + '</div>' +
           '<div class="agent-summary-value" style="color:#10b981">' + summary.output_tokens_anthropic.toLocaleString() +
             ' <span style="font-size:0.7em;color:#6b7280">/ ' + summary.output_tokens_total.toLocaleString() + ' (' + outputRatioPct + '%)</span></div>' +
         '</div>' +
       '</div>';
 
     if (!events.length || summary.total === 0) {
-      wrap.innerHTML = summaryHtml + windowNote + '<p class="loading" style="margin-top:1rem">No data in this window.</p>';
+      wrap.innerHTML = summaryHtml + windowNote + '<p class="loading" style="margin-top:1rem">' + t("common.no_records") + '</p>';
       return;
     }
 
     const bucketSecs = window ? window.bucket_secs : 0;
-    const requestChart = renderAgentBarChart(events, "total", "anthropic", "Requests", bucketSecs, (v) => v.toLocaleString());
-    const inputChart = renderAgentBarChart(events, "input_tokens_total", "input_tokens_anthropic", "Input Tokens", bucketSecs, (v) => v.toLocaleString());
-    const outputChart = renderAgentBarChart(events, "output_tokens_total", "output_tokens_anthropic", "Output Tokens", bucketSecs, (v) => v.toLocaleString());
+    const requestChart = renderAgentBarChart(events, "total", "anthropic", t("stats.agent.chart.requests"), bucketSecs, (v) => v.toLocaleString());
+    const inputChart = renderAgentBarChart(events, "input_tokens_total", "input_tokens_anthropic", t("stats.agent.chart.input_tokens"), bucketSecs, (v) => v.toLocaleString());
+    const outputChart = renderAgentBarChart(events, "output_tokens_total", "output_tokens_anthropic", t("stats.agent.chart.output_tokens"), bucketSecs, (v) => v.toLocaleString());
 
     const legendHtml =
       '<div class="agent-legend">' +
@@ -708,9 +738,9 @@
       '</div>';
 
     wrap.innerHTML = summaryHtml + windowNote +
-      '<div style="margin-top:1rem"><div style="font-weight:600;margin-bottom:0.25rem">Request Volume</div>' + requestChart + '</div>' +
-      '<div style="margin-top:1.5rem"><div style="font-weight:600;margin-bottom:0.25rem">Input Tokens</div>' + inputChart + '</div>' +
-      '<div style="margin-top:1.5rem"><div style="font-weight:600;margin-bottom:0.25rem">Output Tokens</div>' + outputChart + '</div>' +
+      '<div style="margin-top:1rem"><div style="font-weight:600;margin-bottom:0.25rem">' + t("stats.agent.chart.requests") + '</div>' + requestChart + '</div>' +
+      '<div style="margin-top:1.5rem"><div style="font-weight:600;margin-bottom:0.25rem">' + t("stats.agent.chart.input_tokens") + '</div>' + inputChart + '</div>' +
+      '<div style="margin-top:1.5rem"><div style="font-weight:600;margin-bottom:0.25rem">' + t("stats.agent.chart.output_tokens") + '</div>' + outputChart + '</div>' +
       legendHtml;
   }
 
@@ -779,25 +809,25 @@
       renderUserLogsTable(data.logs || []);
       renderUserLogsPagination(data);
     } catch (err) {
-      wrap.innerHTML = `<p class="error-msg">Failed to load logs: ${esc(err.message)}</p>`;
+      wrap.innerHTML = `<p class="error-msg">${t("logs.failed", { message: esc(err.message) })}</p>`;
     }
   }
 
   function renderUserLogsTable(logs) {
     const wrap = document.getElementById("user-logs-table-wrap");
     if (logs.length === 0) {
-      wrap.innerHTML = "<p>No request logs found.</p>";
+      wrap.innerHTML = "<p>" + t("logs.user_empty") + "</p>";
       return;
     }
     wrap.innerHTML = `<table>
-      <tr><th>Time</th><th>IP</th><th>Model</th><th>Path</th><th>Status</th><th>Stream</th><th>Input</th><th>Output</th><th>Duration</th><th>Error</th></tr>
+      <tr><th>${t("logs.col.time")}</th><th>${t("logs.col.ip")}</th><th>${t("logs.col.model")}</th><th>${t("logs.col.path")}</th><th>${t("logs.col.status")}</th><th>${t("logs.col.stream")}</th><th>${t("logs.col.input")}</th><th>${t("logs.col.output")}</th><th>${t("logs.col.duration")}</th><th>${t("logs.col.error")}</th></tr>
       ${logs.map((l) => `<tr>
         <td class="mono">${formatTimestamp(l.created_at)}</td>
         <td class="mono">${esc(l.client_ip || "-")}</td>
         <td class="mono">${esc(l.model)}</td>
         <td class="mono">${esc(l.api_path)}</td>
         <td>${l.status_code >= 400 ? '<span style="color:var(--danger)">' + l.status_code + '</span>' : l.status_code}</td>
-        <td>${l.is_stream ? "Yes" : "No"}</td>
+        <td>${l.is_stream ? t("common.yes") : t("common.no")}</td>
         <td>${l.input_tokens != null ? formatNumber(l.input_tokens) : "-"}</td>
         <td>${l.output_tokens != null ? formatNumber(l.output_tokens) : "-"}</td>
         <td>${l.duration_ms != null ? l.duration_ms + "ms" : "-"}</td>
@@ -813,7 +843,7 @@
     if (pages <= 1) { el.innerHTML = ""; return; }
     el.innerHTML = `
       <button ${data.page <= 1 ? "disabled" : ""} onclick="window._loadUserLogsPage(${data.page - 1})">&lt;</button>
-      <span>Page ${data.page} of ${pages} (${data.total} logs)</span>
+      <span>${t("common.page_of", { page: data.page, total: pages, count: data.total, unit: t("logs.title") })}</span>
       <button ${data.page >= pages ? "disabled" : ""} onclick="window._loadUserLogsPage(${data.page + 1})">&gt;</button>
     `;
   }
@@ -838,14 +868,14 @@
   function renderPlan(plan) {
     const el = document.getElementById("plan-info");
     if (!plan.plan_name) {
-      el.innerHTML = "<p>No plan assigned. Using default limits.</p>";
+      el.innerHTML = "<p>" + t("plans.using_default") + "</p>";
       return;
     }
     const limits = [];
-    if (plan.concurrency_limit) limits.push(`Concurrency: ${plan.concurrency_limit}`);
-    if (plan.rpm_limit) limits.push(`RPM: ${plan.rpm_limit}`);
+    if (plan.concurrency_limit) limits.push(t("plan.limits.concurrency", { n: plan.concurrency_limit }));
+    if (plan.rpm_limit) limits.push(t("plan.limits.rpm", { n: plan.rpm_limit }));
     if (plan.window_limits && plan.window_limits.length > 0) {
-      plan.window_limits.forEach(([l, w]) => limits.push(`${l} requests / ${formatDuration(w)}`));
+      plan.window_limits.forEach(([l, w]) => limits.push(t("plan.limits.window", { n: l, duration: formatDuration(w) })));
     }
     el.innerHTML = `
       <p><strong>${esc(plan.plan_name)}</strong></p>
@@ -862,39 +892,39 @@
     const concCount = usage.concurrency;
     if (concLimit != null) {
       html += `<div class="usage-limit-card">
-        <div class="usage-limit-title">Concurrency</div>
+        <div class="usage-limit-title">${t("req.concurrency")}</div>
         <div class="usage-limit-count">${concCount} / ${concLimit}</div>
-        <div class="usage-limit-reset">Simultaneous requests</div>
+        <div class="usage-limit-reset">${t("req.simultaneous")}</div>
       </div>`;
     } else {
       html += `<div class="usage-limit-card">
-        <div class="usage-limit-title">Concurrency</div>
+        <div class="usage-limit-title">${t("req.concurrency")}</div>
         <div class="usage-limit-count">${concCount}</div>
-        <div class="usage-limit-reset">Unlimited</div>
+        <div class="usage-limit-reset">${t("common.unlimited")}</div>
       </div>`;
     }
 
     // Rate limit window cards
     if (usage.windows.length === 0) {
-      html += '<div class="usage-limit-card"><div class="usage-limit-title">Rate Limits</div><div class="usage-limit-reset">No active windows</div></div>';
+      html += '<div class="usage-limit-card"><div class="usage-limit-title">' + t("req.rate_limits") + '</div><div class="usage-limit-reset">' + t("req.no_active_windows") + '</div></div>';
     } else {
       usage.windows.forEach((w) => {
         const limit = w.limit;
         const isRpm = w.window_secs === 60;
-        const label = isRpm ? "RPM" : formatDuration(w.window_secs) + " limit";
+        const label = isRpm ? "RPM" : t("plan.window_limit_label", { duration: formatDuration(w.window_secs) });
         const remaining = Math.max(0, w.window_secs - w.elapsed_secs);
 
         if (limit != null) {
           html += `<div class="usage-limit-card">
             <div class="usage-limit-title">${esc(label)}</div>
             <div class="usage-limit-count">${w.count} / ${limit}</div>
-            <div class="usage-limit-reset">Resets in ${formatCountdown(remaining)}</div>
+            <div class="usage-limit-reset">${t("req.resets_in", { time: formatCountdown(remaining) })}</div>
           </div>`;
         } else {
           html += `<div class="usage-limit-card">
             <div class="usage-limit-title">${esc(label)}</div>
             <div class="usage-limit-count">${w.count}</div>
-            <div class="usage-limit-reset">Unlimited · resets in ${formatCountdown(remaining)}</div>
+            <div class="usage-limit-reset">${t("req.unlimited_resets", { time: formatCountdown(remaining) })}</div>
           </div>`;
         }
       });
@@ -910,7 +940,7 @@
     const output = info.total_output_tokens;
     // If both are null the SpendLogs table doesn't exist — hide the card.
     if (input == null && output == null) {
-      el.innerHTML = '<p style="color:var(--text3)">Token usage data not available.</p>';
+      el.innerHTML = '<p style="color:var(--text3)">' + t("token.usage_unavailable") + '</p>';
       return;
     }
     const total = (input || 0) + (output || 0);
@@ -919,17 +949,17 @@
     el.innerHTML = `
       <div class="token-stats">
         <div class="token-stat">
-          <div class="token-stat-label">Input Tokens</div>
+          <div class="token-stat-label">${t("token.input")}</div>
           <div class="token-stat-value">${formatNumber(input || 0)}</div>
           <div class="token-stat-pct">${inputPct}%</div>
         </div>
         <div class="token-stat">
-          <div class="token-stat-label">Output Tokens</div>
+          <div class="token-stat-label">${t("token.output")}</div>
           <div class="token-stat-value">${formatNumber(output || 0)}</div>
           <div class="token-stat-pct">${outputPct}%</div>
         </div>
         <div class="token-stat token-stat-total">
-          <div class="token-stat-label">Total</div>
+          <div class="token-stat-label">${t("token.total")}</div>
           <div class="token-stat-value">${formatNumber(total)}</div>
         </div>
       </div>
@@ -940,15 +970,15 @@
     const el = document.getElementById("key-info");
     if (info.error) { el.innerHTML = `<p>${esc(info.error)}</p>`; return; }
     const rows = [
-      ["Key Alias", info.key_alias || "-"],
-      ["Token", info.token_prefix],
-      ["Key Name", info.key_name || "-"],
-      ["Spend", "$" + (info.spend || 0).toFixed(4)],
-      ["Max Budget", info.max_budget != null ? "$" + info.max_budget : "Unlimited"],
-      ["Blocked", info.blocked ? "Yes" : "No"],
-      ["RPM Limit", info.rpm_limit || "Default"],
-      ["Expires", info.expires || "Never"],
-      ["Created", info.created_at || "-"],
+      [t("keyinfo.alias"), info.key_alias || "-"],
+      [t("keyinfo.token"), info.token_prefix],
+      [t("keyinfo.name"), info.key_name || "-"],
+      [t("keyinfo.spend"), "$" + (info.spend || 0).toFixed(4)],
+      [t("keyinfo.max_budget"), info.max_budget != null ? "$" + info.max_budget : t("common.unlimited")],
+      [t("keyinfo.blocked"), info.blocked ? t("common.yes") : t("common.no")],
+      [t("keyinfo.rpm_limit"), info.rpm_limit || t("common.default")],
+      [t("keyinfo.expires"), info.expires || t("common.never")],
+      [t("keyinfo.created"), info.created_at || "-"],
     ];
     el.innerHTML = `<table>${rows.map(([k, v]) => `<tr><td>${esc(k)}</td><td>${esc(String(v))}</td></tr>`).join("")}</table>`;
   }
@@ -976,7 +1006,7 @@
       renderRequestStatus(data.requests || []);
     } catch {
       const el = document.getElementById("request-status-info");
-      if (el) el.innerHTML = '<p style="color:var(--text3)">No active requests.</p>';
+      if (el) el.innerHTML = '<p style="color:var(--text3)">' + t("user.usage.no_active") + '</p>';
     }
   }
 
@@ -984,23 +1014,23 @@
     const el = document.getElementById("request-status-info");
     if (!el) return;
     if (requests.length === 0) {
-      el.innerHTML = '<p style="color:var(--text3)">No active requests.</p>';
+      el.innerHTML = '<p style="color:var(--text3)">' + t("user.usage.no_active") + '</p>';
       return;
     }
     el.innerHTML = '<table class="data-table"><thead><tr>' +
-      '<th>Model</th><th>Status</th><th>Detail</th><th>Total Wait</th>' +
+      '<th>' + t("logs.col.model") + '</th><th>' + t("logs.col.status") + '</th><th>' + t("logs.col.detail") + '</th><th>' + t("logs.col.total_wait") + '</th>' +
       '</tr></thead><tbody>' +
       requests.map(function (r) {
         var statusBadge = r.status === "waiting"
-          ? '<span class="badge badge-blocked">Waiting</span>'
-          : '<span class="badge badge-active">Processing</span>';
+          ? '<span class="badge badge-blocked">' + t("status.waiting") + '</span>'
+          : '<span class="badge badge-active">' + t("status.processing") + '</span>';
         var detail;
         if (r.status === "waiting") {
-          detail = "Queued — " + (r.ahead || 0) + " ahead";
+          detail = t("req.waiting_detail", { ahead: (r.ahead || 0) });
         } else {
           var ps = (r.processing_secs || 0);
-          detail = "Processing — " + (ps < 60 ? ps.toFixed(1) + 's' : (ps / 60).toFixed(1) + 'min')
-            + " (" + (r.parallel_count || 0) + " parallel)";
+          var timeStr = ps < 60 ? ps.toFixed(1) + 's' : (ps / 60).toFixed(1) + 'min';
+          detail = t("req.processing_detail", { time: timeStr, parallel: (r.parallel_count || 0) });
         }
         var waitStr = r.wait_time_secs < 60
           ? r.wait_time_secs.toFixed(1) + 's'
@@ -1026,24 +1056,24 @@
 
   function renderPlansTable(plans) {
     const wrap = document.getElementById("plans-table-wrap");
-    if (plans.length === 0) { wrap.innerHTML = "<p>No plans defined.</p>"; return; }
+    if (plans.length === 0) { wrap.innerHTML = "<p>" + t("plans.empty") + "</p>"; return; }
     wrap.innerHTML = `<table>
-      <tr><th>Name</th><th>Concurrency</th><th>RPM</th><th>Windows</th><th>Actions</th></tr>
+      <tr><th>${t("plans.col.name")}</th><th>${t("plans.col.concurrent")}</th><th>${t("plans.col.rpm")}</th><th>${t("plans.col.windows")}</th><th>${t("plans.col.actions")}</th></tr>
       ${plans.map((p) => `<tr>
         <td><strong>${esc(p.name)}</strong></td>
         <td>${p.concurrency_limit || "-"}</td>
         <td>${p.rpm_limit || "-"}</td>
         <td>${(p.window_limits || []).map(([l, w]) => `${l}/${formatDuration(w)}`).join(", ") || "-"}</td>
         <td>
-          <button class="btn-small" onclick="window._editPlan('${esc(p.name)}')">Edit</button>
-          <button class="btn-danger" onclick="window._deletePlan('${esc(p.name)}')">Delete</button>
+          <button class="btn-small" onclick="window._editPlan('${esc(p.name)}')">${t("action.edit")}</button>
+          <button class="btn-danger" onclick="window._deletePlan('${esc(p.name)}')">${t("action.delete")}</button>
         </td>
       </tr>`).join("")}
     </table>`;
   }
 
   window._deletePlan = async (name) => {
-    if (!confirm(`Delete plan "${name}"?`)) return;
+    if (!confirm(t("confirm.delete_plan", { name }))) return;
     await api(`/admin/plans/${encodeURIComponent(name)}`, { method: "DELETE" });
     loadPlans();
   };
@@ -1086,16 +1116,16 @@
       renderKeysPagination(data);
     } catch (err) {
       const wrap = document.getElementById("keys-table-wrap");
-      if (wrap) wrap.innerHTML = `<p class="error-msg">Failed to load keys: ${esc(err.message)}</p>`;
+      if (wrap) wrap.innerHTML = `<p class="error-msg">${t("common.failed_to_load", { what: t("keys.title"), message: esc(err.message) })}</p>`;
       console.error("loadKeys error:", err);
     }
   }
 
   function renderKeysTable(keys) {
     const wrap = document.getElementById("keys-table-wrap");
-    if (keys.length === 0) { wrap.innerHTML = "<p>No keys found.</p>"; return; }
+    if (keys.length === 0) { wrap.innerHTML = "<p>" + t("keys.empty") + "</p>"; return; }
     wrap.innerHTML = `<table>
-      <tr><th>Token</th><th>Alias</th><th>User</th><th>Plan</th><th>Usage</th><th>Reset</th><th>Spend</th><th>Budget</th><th>Status</th><th>Actions</th></tr>
+      <tr><th>${t("keys.col.token")}</th><th>${t("keys.col.alias")}</th><th>${t("keys.col.user")}</th><th>${t("keys.col.plan")}</th><th>${t("keys.col.usage")}</th><th>${t("keys.col.reset")}</th><th>${t("keys.col.spend")}</th><th>${t("keys.col.budget")}</th><th>${t("keys.col.status")}</th><th>${t("keys.col.actions")}</th></tr>
       ${keys.map((k) => `<tr>
         <td class="mono">${esc(k.token_prefix)}</td>
         <td>${esc(k.key_alias || "-")}</td>
@@ -1106,16 +1136,16 @@
         <td>$${(k.spend || 0).toFixed(4)}</td>
         <td>${k.max_budget != null ? "$" + k.max_budget : "-"}</td>
         <td>${k.blocked
-              ? '<span style="color:var(--danger)">Blocked</span>'
+              ? '<span style="color:var(--danger)">' + t("status.blocked") + '</span>'
               : (k.metadata && k.metadata.vip === true)
-                ? '<span class="badge badge-vip">Active(VIP)</span>'
-                : "Active"}</td>
+                ? '<span class="badge badge-vip">' + t("status.active_vip") + '</span>'
+                : t("status.active")}</td>
         <td>
-          <button class="btn-small" onclick="window._editKey('${esc(k.token_hash)}')">Edit</button>
-          <button class="btn-small" onclick="window._resetKeyLimits('${esc(k.token_hash)}')">Reset Limits</button>
+          <button class="btn-small" onclick="window._editKey('${esc(k.token_hash)}')">${t("action.edit")}</button>
+          <button class="btn-small" onclick="window._resetKeyLimits('${esc(k.token_hash)}')">${t("action.reset_limits")}</button>
           ${k.blocked
-            ? `<button class="btn-small" onclick="window._unblockKey('${esc(k.token_hash)}')">Unblock</button>`
-            : `<button class="btn-danger" onclick="window._blockKey('${esc(k.token_hash)}')">Block</button>`}
+            ? `<button class="btn-small" onclick="window._unblockKey('${esc(k.token_hash)}')">${t("action.unblock")}</button>`
+            : `<button class="btn-danger" onclick="window._blockKey('${esc(k.token_hash)}')">${t("action.block")}</button>`}
         </td>
       </tr>`).join("")}
     </table>`;
@@ -1127,14 +1157,14 @@
     if (pages <= 1) { el.innerHTML = ""; return; }
     el.innerHTML = `
       <button ${data.page <= 1 ? "disabled" : ""} onclick="window._loadKeysPage(${data.page - 1})">&lt;</button>
-      <span>Page ${data.page} of ${pages} (${data.total} keys)</span>
+      <span>${t("common.page_of", { page: data.page, total: pages, count: data.total, unit: t("nav.keys") })}</span>
       <button ${data.page >= pages ? "disabled" : ""} onclick="window._loadKeysPage(${data.page + 1})">&gt;</button>
     `;
   }
 
   window._loadKeysPage = (p) => loadKeys(p);
   window._copyText = function(btn, text) {
-    const done = function() { btn.textContent = "Copied!"; setTimeout(function() { btn.textContent = "Copy"; }, 2000); };
+    const done = function() { btn.textContent = t("toast.copied"); setTimeout(function() { btn.textContent = t("action.copy"); }, 2000); };
     if (navigator.clipboard && window.isSecureContext) {
       navigator.clipboard.writeText(text).then(done).catch(function() {
         // Fallback for non-secure contexts.
@@ -1173,9 +1203,9 @@
     loadKeys();
   };
   window._resetKeyLimits = async (hash) => {
-    if (!confirm("Reset all rate limit windows for this key?")) return;
+    if (!confirm(t("confirm.reset_key"))) return;
     const r = await api(`/admin/limits/reset/${encodeURIComponent(hash)}`, { method: "POST" });
-    alert(r.message || "Done");
+    alert(r.message || t("alert.done"));
   };
 
   // ── Admin: Assignments ────────────────────────────────
@@ -1196,13 +1226,13 @@
 
   function renderAssignmentsTable() {
     const wrap = document.getElementById("assignments-table-wrap");
-    if (assignmentsTotal === 0) { wrap.innerHTML = "<p>No assignments.</p>"; renderAssignmentsPagination(); return; }
+    if (assignmentsTotal === 0) { wrap.innerHTML = "<p>" + t("assignments.empty") + "</p>"; renderAssignmentsPagination(); return; }
     wrap.innerHTML = `<table>
-      <tr><th>Key</th><th>Plan</th><th>Actions</th></tr>
+      <tr><th>${t("assignments.col.key")}</th><th>${t("assignments.col.plan")}</th><th>${t("assignments.col.actions")}</th></tr>
       ${assignmentsData.map((a) => `<tr>
-        <td><span>${esc(a.key_alias || "(no alias)")}</span><br><span class="mono muted">${esc(a.token_prefix || a.key_hash.substring(0, 8) + "...")}</span></td>
+        <td><span>${esc(a.key_alias || t("assignments.no_alias"))}</span><br><span class="mono muted">${esc(a.token_prefix || a.key_hash.substring(0, 8) + "...")}</span></td>
         <td>${esc(a.plan_name)}</td>
-        <td><button class="btn-danger" onclick="window._unassignKey('${esc(a.key_hash)}')">Remove</button></td>
+        <td><button class="btn-danger" onclick="window._unassignKey('${esc(a.key_hash)}')">${t("action.remove")}</button></td>
       </tr>`).join("")}
     </table>`;
     renderAssignmentsPagination();
@@ -1214,7 +1244,7 @@
     if (pages <= 1) { el.innerHTML = ""; return; }
     el.innerHTML = `
       <button ${assignmentsPage <= 1 ? "disabled" : ""} onclick="window._loadAssignmentsPage(${assignmentsPage - 1})">&lt;</button>
-      <span>Page ${assignmentsPage} of ${pages} (${assignmentsTotal} assignments)</span>
+      <span>${t("common.page_of", { page: assignmentsPage, total: pages, count: assignmentsTotal, unit: t("nav.assignments") })}</span>
       <button ${assignmentsPage >= pages ? "disabled" : ""} onclick="window._loadAssignmentsPage(${assignmentsPage + 1})">&gt;</button>
     `;
   }
@@ -1233,24 +1263,24 @@
       renderModelsTable(data.models || []);
     } catch (err) {
       const wrap = document.getElementById("models-table-wrap");
-      if (wrap) wrap.innerHTML = `<p class="error-msg">Failed to load models: ${esc(err.message)}</p>`;
+      if (wrap) wrap.innerHTML = `<p class="error-msg">${t("common.failed_to_load", { what: t("models.title"), message: esc(err.message) })}</p>`;
     }
   }
 
   function renderModelsTable(models) {
     const wrap = document.getElementById("models-table-wrap");
-    if (models.length === 0) { wrap.innerHTML = "<p>No model deployments.</p>"; return; }
+    if (models.length === 0) { wrap.innerHTML = "<p>" + t("models.empty") + "</p>"; return; }
     wrap.innerHTML = `<table>
-      <tr><th>Model Name</th><th>LiteLLM Model</th><th>Base URL</th><th>Quota Ratio</th><th>RPM</th><th>Timeout</th><th>Enabled</th><th>Source</th><th>Actions</th></tr>
+      <tr><th>${t("form.model.name")}</th><th>${t("models.col.litellm_model")}</th><th>${t("models.col.base_url")}</th><th>${t("models.col.ratio")}</th><th>${t("models.col.rpm")}</th><th>${t("models.col.timeout")}</th><th>${t("models.col.enabled")}</th><th>${t("models.col.source")}</th><th>${t("models.col.actions")}</th></tr>
       ${models.map((m) => {
         const isAutoDisabled = !m.enabled && m.auto_disabled;
         const enabledBadge = m.enabled
-          ? '<span class="badge badge-active">Yes</span>'
+          ? '<span class="badge badge-active">' + t("common.yes") + '</span>'
           : isAutoDisabled
-            ? '<span class="badge badge-blocked">No</span><br><span style="color:var(--danger);font-size:0.8em">Auto-disabled</span>'
-            : '<span class="badge badge-blocked">No</span>';
+            ? '<span class="badge badge-blocked">' + t("common.no") + '</span><br><span style="color:var(--danger);font-size:0.8em">' + t("status.auto_disabled") + '</span>'
+            : '<span class="badge badge-blocked">' + t("common.no") + '</span>';
         const warningRow = isAutoDisabled
-          ? `<tr style="background:rgba(255,80,80,0.08)"><td colspan="9" style="padding:4px 8px;font-size:0.85em;color:var(--danger)">Fault auto-disabled: this deployment was automatically disabled due to consecutive failures. Please fix the upstream issue and re-enable it.</td></tr>`
+          ? `<tr style="background:rgba(255,80,80,0.08)"><td colspan="9" style="padding:4px 8px;font-size:0.85em;color:var(--danger)">${t("models.fault_disabled")}</td></tr>`
           : '';
         return `<tr${isAutoDisabled ? ' style="background:rgba(255,80,80,0.04)"' : ''}>
         <td><strong>${esc(m.model_name)}</strong></td>
@@ -1262,8 +1292,8 @@
         <td>${enabledBadge}</td>
         <td><span class="badge badge-plan">${esc(m.source || "-")}</span></td>
         <td>
-          <button class="btn-small" onclick="window._editModel('${m.id}')">Edit</button>
-          <button class="btn-danger" onclick="window._deleteModel('${m.id}','${esc(m.model_name)}')">Delete</button>
+          <button class="btn-small" onclick="window._editModel('${m.id}')">${t("action.edit")}</button>
+          <button class="btn-danger" onclick="window._deleteModel('${m.id}','${esc(m.model_name)}')">${t("action.delete")}</button>
         </td>
       </tr>${warningRow}`;
       }).join("")}
@@ -1273,25 +1303,25 @@
   function showNewModelModal(prefill) {
     const p = prefill || {};
     showModal(`
-      <h3>${p.id ? "Edit" : "Create"} Model Deployment</h3>
-      <div class="form-group"><label>Model Name * ${tip("Client-visible model name. Multiple deployments can share the same name for load balancing.")}</label><input id="m-model-name" value="${esc(p.model_name || "")}" required></div>
-      <div class="form-group"><label>Provider * ${tip("Upstream provider type. Determines API format and authentication.")}</label><select id="m-model-provider"><option value="">-- select --</option><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option><option value="azure">Azure OpenAI</option><option value="gemini">Google Gemini</option><option value="bedrock">AWS Bedrock</option></select></div>
-      <div class="form-group"><label>Model ID * ${tip("Actual model ID at the provider, e.g. gpt-4o, claude-sonnet-4-20250514. Auto-combined with Provider as provider/model-id.")}</label><input id="m-model-id" value="${esc((p.litellm_model || "").includes("/") ? p.litellm_model.split("/").slice(1).join("/") : p.litellm_model || "")}" required></div>
-      <div class="form-group"><label>API Key ${tip("Provider API key. Use os.environ/VAR_NAME for env reference.")}</label><input id="m-model-key" type="password" value="${esc(p.api_key || "")}" placeholder="sk-... or os.environ/VAR"></div>
-      <div class="form-group"><label>API Key is env reference ${tip("Enable if the API Key field contains an environment variable reference like os.environ/VAR_NAME.")}</label><select id="m-model-key-env"><option value="false">No</option><option value="true" ${(p.api_key_env) ? "selected" : ""}>Yes</option></select></div>
-      <div class="form-group"><label>API Base URL ${tip("Override the default provider endpoint, e.g. https://api.openai.com/v1")}</label><input id="m-model-base" value="${esc(p.api_base || "")}" placeholder="https://api.openai.com/v1"></div>
-      <div class="form-group"><label>API Version (Azure) ${tip("Required for Azure OpenAI deployments, e.g. 2024-02-01")}</label><input id="m-model-version" value="${esc(p.api_version || "")}"></div>
-      <div class="form-group"><label>Quota Ratio ${tip("Quota consumption multiplier. Each request counts as this many units against rate limits. E.g. 3 means one request consumes 3 quota. Default: 1.")}</label><input id="m-model-ratio" type="number" min="1" step="1" value="${p.quota_count_ratio || 1}"></div>
-      <div class="form-group"><label>RPM Limit ${tip("Per-deployment RPM limit. Leave empty for unlimited.")}</label><input id="m-model-rpm" type="number" value="${p.rpm || ""}"></div>
-      <div class="form-group"><label>Timeout (seconds) ${tip("Request timeout. Default: 120s.")}</label><input id="m-model-timeout" type="number" value="${p.timeout || 120}"></div>
-      <div class="form-group"><label>Temperature ${tip("Sampling temperature override (0.0-2.0). Leave empty to use provider default.")}</label><input id="m-model-temp" type="number" step="0.1" value="${p.temperature || ""}"></div>
-      <div class="form-group"><label>Max Tokens ${tip("Maximum output tokens. Leave empty for provider default.")}</label><input id="m-model-maxtok" type="number" value="${p.max_tokens || ""}"></div>
-      <div class="form-group"><label>Max Inflight ${tip("Max concurrent in-flight requests for this deployment. 0 or empty = unlimited.")}</label><input id="m-model-maxinflight" type="number" min="0" value="${p.max_inflight_queue_len || ""}"></div>
-      <div class="form-group"><label>Max Context ${tip("Max total input characters across all in-flight requests. 0 or empty = unlimited.")}</label><input id="m-model-maxctx" type="number" min="0" value="${p.max_context_len || ""}"></div>
-      <div class="form-group"><label>Enabled ${tip("Disabled deployments are ignored in routing.")}</label><select id="m-model-enabled"><option value="true" ${p.enabled !== false ? "selected" : ""}>Yes</option><option value="false" ${p.enabled === false ? "selected" : ""}>No</option></select></div>
+      <h3>${p.id ? t("form.model.title_edit") : t("form.model.title_create")}</h3>
+      <div class="form-group"><label>${t("form.model.name")} * ${tip("Client-visible model name. Multiple deployments can share the same name for load balancing.")}</label><input id="m-model-name" value="${esc(p.model_name || "")}" required></div>
+      <div class="form-group"><label>${t("form.model.provider")} * ${tip("Upstream provider type. Determines API format and authentication.")}</label><select id="m-model-provider"><option value="">${t("common.select_placeholder")}</option><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option><option value="azure">Azure OpenAI</option><option value="gemini">Google Gemini</option><option value="bedrock">AWS Bedrock</option></select></div>
+      <div class="form-group"><label>${t("form.model.id")} * ${tip("Actual model ID at the provider, e.g. gpt-4o, claude-sonnet-4-20250514. Auto-combined with Provider as provider/model-id.")}</label><input id="m-model-id" value="${esc((p.litellm_model || "").includes("/") ? p.litellm_model.split("/").slice(1).join("/") : p.litellm_model || "")}" required></div>
+      <div class="form-group"><label>${t("form.model.api_key")} ${tip("Provider API key. Use os.environ/VAR_NAME for env reference.")}</label><input id="m-model-key" type="password" value="${esc(p.api_key || "")}" placeholder="sk-... or os.environ/VAR"></div>
+      <div class="form-group"><label>${t("form.model.api_key_env")} ${tip("Enable if the API Key field contains an environment variable reference like os.environ/VAR_NAME.")}</label><select id="m-model-key-env"><option value="false">${t("common.no")}</option><option value="true" ${(p.api_key_env) ? "selected" : ""}>${t("common.yes")}</option></select></div>
+      <div class="form-group"><label>${t("form.model.base")} ${tip("Override the default provider endpoint, e.g. https://api.openai.com/v1")}</label><input id="m-model-base" value="${esc(p.api_base || "")}" placeholder="https://api.openai.com/v1"></div>
+      <div class="form-group"><label>${t("form.model.version")} ${tip("Required for Azure OpenAI deployments, e.g. 2024-02-01")}</label><input id="m-model-version" value="${esc(p.api_version || "")}"></div>
+      <div class="form-group"><label>${t("form.model.ratio")} ${tip("Quota consumption multiplier. Each request counts as this many units against rate limits. E.g. 3 means one request consumes 3 quota. Default: 1.")}</label><input id="m-model-ratio" type="number" min="1" step="1" value="${p.quota_count_ratio || 1}"></div>
+      <div class="form-group"><label>${t("form.model.rpm")} ${tip("Per-deployment RPM limit. Leave empty for unlimited.")}</label><input id="m-model-rpm" type="number" value="${p.rpm || ""}"></div>
+      <div class="form-group"><label>${t("form.model.timeout")} ${tip("Request timeout. Default: 120s.")}</label><input id="m-model-timeout" type="number" value="${p.timeout || 120}"></div>
+      <div class="form-group"><label>${t("form.model.temp")} ${tip("Sampling temperature override (0.0-2.0). Leave empty to use provider default.")}</label><input id="m-model-temp" type="number" step="0.1" value="${p.temperature || ""}"></div>
+      <div class="form-group"><label>${t("form.model.maxtok")} ${tip("Maximum output tokens. Leave empty for provider default.")}</label><input id="m-model-maxtok" type="number" value="${p.max_tokens || ""}"></div>
+      <div class="form-group"><label>${t("form.model.maxinflight")} ${tip("Max concurrent in-flight requests for this deployment. 0 or empty = unlimited.")}</label><input id="m-model-maxinflight" type="number" min="0" value="${p.max_inflight_queue_len || ""}"></div>
+      <div class="form-group"><label>${t("form.model.maxctx")} ${tip("Max total input characters across all in-flight requests. 0 or empty = unlimited.")}</label><input id="m-model-maxctx" type="number" min="0" value="${p.max_context_len || ""}"></div>
+      <div class="form-group"><label>${t("form.model.enabled")} ${tip("Disabled deployments are ignored in routing.")}</label><select id="m-model-enabled"><option value="true" ${p.enabled !== false ? "selected" : ""}>${t("common.yes")}</option><option value="false" ${p.enabled === false ? "selected" : ""}>${t("common.no")}</option></select></div>
       <div class="modal-actions">
-        <button class="btn-secondary" onclick="hideModal()" style="width:auto">Cancel</button>
-        <button class="btn-primary" id="m-model-submit">${p.id ? "Update" : "Create"}</button>
+        <button class="btn-secondary" onclick="hideModal()" style="width:auto">${t("action.cancel")}</button>
+        <button class="btn-primary" id="m-model-submit">${p.id ? t("action.update") : t("action.create")}</button>
       </div>
     `);
     // Pre-select provider dropdown from litellm_model
@@ -1328,7 +1358,7 @@
         hideModal();
         invalidateCaches();
         loadModels();
-      } catch (err) { alert("Error: " + err.message); }
+      } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
     });
   }
 
@@ -1338,11 +1368,11 @@
       const m = (data.models || []).find((x) => x.id === id);
       if (!m) return;
       showNewModelModal(m);
-    } catch (err) { alert("Error: " + err.message); }
+    } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
   };
 
   window._deleteModel = async (id, name) => {
-    if (!confirm(`Delete model deployment "${name}"?`)) return;
+    if (!confirm(t("confirm.delete_model", { name }))) return;
     await api(`/admin/models/${encodeURIComponent(id)}`, { method: "DELETE" });
     loadModels();
   };
@@ -1354,23 +1384,23 @@
       renderAliasesTable(data.aliases || []);
     } catch (err) {
       const wrap = document.getElementById("aliases-table-wrap");
-      if (wrap) wrap.innerHTML = `<p class="error-msg">Failed to load aliases: ${esc(err.message)}</p>`;
+      if (wrap) wrap.innerHTML = `<p class="error-msg">${t("common.failed_to_load", { what: t("aliases.title"), message: esc(err.message) })}</p>`;
     }
   }
 
   function renderAliasesTable(aliases) {
     const wrap = document.getElementById("aliases-table-wrap");
-    if (aliases.length === 0) { wrap.innerHTML = "<p>No aliases defined.</p>"; return; }
+    if (aliases.length === 0) { wrap.innerHTML = "<p>" + t("aliases.empty") + "</p>"; return; }
     wrap.innerHTML = `<table>
-      <tr><th>Alias</th><th>Target Model</th><th>Hidden</th><th>Source</th><th>Actions</th></tr>
+      <tr><th>${t("aliases.col.alias")}</th><th>${t("aliases.col.target")}</th><th>${t("form.alias.hidden")}</th><th>${t("models.col.source")}</th><th>${t("aliases.col.actions")}</th></tr>
       ${aliases.map((a) => `<tr>
         <td><strong>${esc(a.alias_name)}</strong></td>
         <td class="mono">${esc(a.target_model)}</td>
-        <td>${a.hidden ? "Yes" : "No"}</td>
+        <td>${a.hidden ? t("common.yes") : t("common.no")}</td>
         <td><span class="badge badge-plan">${esc(a.source || "-")}</span></td>
         <td>
-          <button class="btn-small" onclick="window._editAlias('${esc(a.alias_name)}')">Edit</button>
-          <button class="btn-danger" onclick="window._deleteAlias('${esc(a.alias_name)}')">Delete</button>
+          <button class="btn-small" onclick="window._editAlias('${esc(a.alias_name)}')">${t("action.edit")}</button>
+          <button class="btn-danger" onclick="window._deleteAlias('${esc(a.alias_name)}')">${t("action.delete")}</button>
         </td>
       </tr>`).join("")}
     </table>`;
@@ -1379,13 +1409,13 @@
   function showNewAliasModal(prefill) {
     const p = prefill || {};
     showModal(`
-      <h3>${p.alias_name ? "Edit" : "Create"} Alias</h3>
-      <div class="form-group"><label>Alias Name * ${tip("The name clients will use in their request. E.g. 'gpt-4' → routes to 'gpt-4o'.")}</label><input id="m-alias-name" value="${esc(p.alias_name || "")}" ${p.alias_name ? "readonly" : ""}></div>
-      <div class="form-group"><label>Target Model * ${tip("The actual model name to route to. Must match an existing model deployment name.")}</label><input id="m-alias-target" value="${esc(p.target_model || "")}" required list="alias-target-list"><datalist id="alias-target-list"></datalist></div>
-      <div class="form-group"><label>Hidden ${tip("Hidden aliases work for routing but are not listed to users in model discovery endpoints.")}</label><select id="m-alias-hidden"><option value="false" ${!p.hidden ? "selected" : ""}>No</option><option value="true" ${p.hidden ? "selected" : ""}>Yes</option></select></div>
+      <h3>${p.alias_name ? t("form.alias.title_edit") : t("form.alias.title_create")}</h3>
+      <div class="form-group"><label>${t("form.alias.name")} * ${tip("The name clients will use in their request. E.g. 'gpt-4' → routes to 'gpt-4o'.")}</label><input id="m-alias-name" value="${esc(p.alias_name || "")}" ${p.alias_name ? "readonly" : ""}></div>
+      <div class="form-group"><label>${t("form.alias.target")} * ${tip("The actual model name to route to. Must match an existing model deployment name.")}</label><input id="m-alias-target" value="${esc(p.target_model || "")}" required list="alias-target-list"><datalist id="alias-target-list"></datalist></div>
+      <div class="form-group"><label>${t("form.alias.hidden")} ${tip("Hidden aliases work for routing but are not listed to users in model discovery endpoints.")}</label><select id="m-alias-hidden"><option value="false" ${!p.hidden ? "selected" : ""}>${t("common.no")}</option><option value="true" ${p.hidden ? "selected" : ""}>${t("common.yes")}</option></select></div>
       <div class="modal-actions">
-        <button class="btn-secondary" onclick="hideModal()" style="width:auto">Cancel</button>
-        <button class="btn-primary" id="m-alias-submit">${p.alias_name ? "Update" : "Create"}</button>
+        <button class="btn-secondary" onclick="hideModal()" style="width:auto">${t("action.cancel")}</button>
+        <button class="btn-primary" id="m-alias-submit">${p.alias_name ? t("action.update") : t("action.create")}</button>
       </div>
     `);
     // Populate datalist with existing model names
@@ -1406,7 +1436,7 @@
         hideModal();
         invalidateCaches();
         loadAliases();
-      } catch (err) { alert("Error: " + err.message); }
+      } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
     });
   }
 
@@ -1416,11 +1446,11 @@
       const a = (data.aliases || []).find((x) => x.alias_name === name);
       if (!a) return;
       showNewAliasModal(a);
-    } catch (err) { alert("Error: " + err.message); }
+    } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
   };
 
   window._deleteAlias = async (name) => {
-    if (!confirm(`Delete alias "${name}"?`)) return;
+    if (!confirm(t("confirm.delete_alias", { name }))) return;
     await api(`/admin/aliases/${encodeURIComponent(name)}`, { method: "DELETE" });
     loadAliases();
   };
@@ -1432,20 +1462,20 @@
       renderConfigTable(data.config || {});
     } catch (err) {
       const wrap = document.getElementById("config-table-wrap");
-      if (wrap) wrap.innerHTML = `<p class="error-msg">Failed to load config: ${esc(err.message)}</p>`;
+      if (wrap) wrap.innerHTML = `<p class="error-msg">${t("common.failed_to_load", { what: t("config.title"), message: esc(err.message) })}</p>`;
     }
   }
 
   function renderConfigTable(config) {
     const wrap = document.getElementById("config-table-wrap");
     const keys = Object.keys(config);
-    if (keys.length === 0) { wrap.innerHTML = "<p>No configuration entries.</p>"; return; }
+    if (keys.length === 0) { wrap.innerHTML = "<p>" + t("config.empty") + "</p>"; return; }
     wrap.innerHTML = `<table>
-      <tr><th>Key</th><th>Value</th><th>Actions</th></tr>
+      <tr><th>${t("config.col.key")}</th><th>${t("config.col.value")}</th><th>${t("config.col.actions")}</th></tr>
       ${keys.map((k) => `<tr>
         <td><strong>${esc(k)}</strong></td>
         <td class="mono" style="max-width:400px;word-break:break-all;white-space:pre-wrap">${esc(JSON.stringify(config[k], null, 2))}</td>
-        <td><button class="btn-small" onclick="window._editConfig('${esc(k)}')">Edit</button></td>
+        <td><button class="btn-small" onclick="window._editConfig('${esc(k)}')">${t("action.edit")}</button></td>
       </tr>`).join("")}
     </table>`;
   }
@@ -1453,12 +1483,12 @@
   function showNewConfigModal(prefill) {
     const p = prefill || {};
     showModal(`
-      <h3>${p.key ? "Edit" : "Set"} Configuration</h3>
-      <div class="form-group"><label>Key * ${tip("Configuration key name, e.g. 'general_settings' or a custom key.")}</label><input id="m-config-key" value="${esc(p.key || "")}" ${p.key ? "readonly" : ""}></div>
-      <div class="form-group"><label>Value (JSON) * ${tip("Configuration value as valid JSON. E.g. {\"store_model_in_db\": true}")}</label><textarea id="m-config-value" rows="6">${esc(p.value ? JSON.stringify(p.value, null, 2) : "")}</textarea></div>
+      <h3>${p.key ? t("form.config.title_edit") : t("form.config.title_create")}</h3>
+      <div class="form-group"><label>${t("form.config.key")} * ${tip("Configuration key name, e.g. 'general_settings' or a custom key.")}</label><input id="m-config-key" value="${esc(p.key || "")}" ${p.key ? "readonly" : ""}></div>
+      <div class="form-group"><label>${t("form.config.value")} * ${tip("Configuration value as valid JSON. E.g. {\"store_model_in_db\": true}")}</label><textarea id="m-config-value" rows="6">${esc(p.value ? JSON.stringify(p.value, null, 2) : "")}</textarea></div>
       <div class="modal-actions">
-        <button class="btn-secondary" onclick="hideModal()" style="width:auto">Cancel</button>
-        <button class="btn-primary" id="m-config-submit">Save</button>
+        <button class="btn-secondary" onclick="hideModal()" style="width:auto">${t("action.cancel")}</button>
+        <button class="btn-primary" id="m-config-submit">${t("action.save")}</button>
       </div>
     `);
     document.getElementById("m-config-submit").addEventListener("click", async () => {
@@ -1473,7 +1503,7 @@
         });
         hideModal();
         loadConfig();
-      } catch (err) { alert("Error: " + err.message); }
+      } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
     });
   }
 
@@ -1484,7 +1514,7 @@
       if (config[key] !== undefined) {
         showNewConfigModal({ key, value: config[key] });
       }
-    } catch (err) { alert("Error: " + err.message); }
+    } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
   };
 
   // ── Admin: Debug Error Recording ─────────────────────
@@ -1502,7 +1532,7 @@
 
   function updateDebugButton(btn) {
     if (!btn) return;
-    btn.textContent = debugEnabled ? "Debug: ON" : "Debug: OFF";
+    btn.textContent = debugEnabled ? t("logs.debug.on") : t("logs.debug.off");
     if (debugEnabled) {
       btn.style.background = "var(--danger)";
       btn.style.color = "#fff";
@@ -1524,14 +1554,14 @@
       });
       debugEnabled = data.enabled;
       updateDebugButton(btn);
-    } catch (err) { alert("Error: " + err.message); }
+    } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
   }
 
   async function showDebugError(requestId) {
     try {
       const data = await api("/admin/debug/errors/" + requestId);
       showModal("<pre style='max-height:60vh;overflow:auto'>" + esc(JSON.stringify(data, null, 2)) + "</pre>");
-    } catch (err) { alert("Error: " + err.message); }
+    } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
   }
 
   // ── Prompt Log toggle (same pattern as Debug toggle) ──
@@ -1550,7 +1580,7 @@
 
   function updatePromptLogButton(btn) {
     if (!btn) return;
-    btn.textContent = promptLogEnabled ? "Prompt Log: ON" : "Prompt Log: OFF";
+    btn.textContent = promptLogEnabled ? t("logs.prompt_log.on") : t("logs.prompt_log.off");
     if (promptLogEnabled) {
       btn.style.background = "var(--info)";
       btn.style.color = "#fff";
@@ -1572,7 +1602,7 @@
       });
       promptLogEnabled = data.enabled;
       updatePromptLogButton(btn);
-    } catch (err) { alert("Error: " + err.message); }
+    } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
   }
 
   // Check if a team is excluded from prompt logging.
@@ -1592,23 +1622,23 @@
         body: JSON.stringify({ team_id: teamId, excluded: !excluded }),
       });
       loadTeams();
-    } catch (err) { alert("Error: " + err.message); }
+    } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
   }
 
   async function showDebugError(requestId) {
     try {
       const data = await api("/admin/debug/errors/" + encodeURIComponent(requestId));
       const e = data.debug_error;
-      if (!e) { alert("Debug entry not found"); return; }
+      if (!e) { alert(t("debug.entry_not_found")); return; }
 
       let upstreamHtml = "";
       if (e.upstream_status != null) {
         upstreamHtml = `
           <div class="debug-section">
-            <h4>Upstream Response</h4>
+            <h4>${t("debug.upstream_response")}</h4>
             <table>
-              <tr><td style="width:120px">Status</td><td>${e.upstream_status}</td></tr>
-              <tr><td>Body</td><td><pre class="debug-json">${esc(formatJson(e.upstream_body || "-"))}</pre></td></tr>
+              <tr><td style="width:120px">${t("debug.status")}</td><td>${e.upstream_status}</td></tr>
+              <tr><td>${t("logs.col.error")}</td><td><pre class="debug-json">${esc(formatJson(e.upstream_body || "-"))}</pre></td></tr>
             </table>
           </div>`;
       }
@@ -1617,30 +1647,30 @@
       if (e.request_body) {
         requestHtml = `
           <div class="debug-section">
-            <h4>Original Request</h4>
+            <h4>${t("debug.original_request")}</h4>
             <pre class="debug-json">${esc(formatJson(e.request_body))}</pre>
           </div>`;
       }
 
       showModal(`
-        <h3>Debug: ${esc(e.error_type)}</h3>
+        <h3>${t("nav.debug")}: ${esc(e.error_type)}</h3>
         <table>
-          <tr><td style="width:120px">Request ID</td><td class="mono">${esc(e.request_id)}</td></tr>
-          <tr><td>Key</td><td>${esc(e.key_alias || e.key_hash.substring(0, 12) + "...")}</td></tr>
-          <tr><td>Model</td><td class="mono">${esc(e.model)}</td></tr>
-          <tr><td>Path</td><td class="mono">${esc(e.api_path)}</td></tr>
-          <tr><td>Stream</td><td>${e.is_stream ? "Yes" : "No"}</td></tr>
-          <tr><td>Time</td><td>${formatTimestamp(e.created_at)}</td></tr>
-          <tr><td>Status</td><td>${e.status_code}</td></tr>
-          <tr><td>Error</td><td>${esc(e.error_message)}</td></tr>
+          <tr><td style="width:120px">${t("debug.request_id")}</td><td class="mono">${esc(e.request_id)}</td></tr>
+          <tr><td>${t("debug.key")}</td><td>${esc(e.key_alias || e.key_hash.substring(0, 12) + "...")}</td></tr>
+          <tr><td>${t("debug.model")}</td><td class="mono">${esc(e.model)}</td></tr>
+          <tr><td>${t("debug.path")}</td><td class="mono">${esc(e.api_path)}</td></tr>
+          <tr><td>${t("debug.stream")}</td><td>${e.is_stream ? t("common.yes") : t("common.no")}</td></tr>
+          <tr><td>${t("debug.time")}</td><td>${formatTimestamp(e.created_at)}</td></tr>
+          <tr><td>${t("debug.status")}</td><td>${e.status_code}</td></tr>
+          <tr><td>${t("debug.error")}</td><td>${esc(e.error_message)}</td></tr>
         </table>
         ${upstreamHtml}
         ${requestHtml}
         <div class="modal-actions">
-          <button class="btn-secondary" onclick="hideModal()" style="width:auto">Close</button>
+          <button class="btn-secondary" onclick="hideModal()" style="width:auto">${t("action.close")}</button>
         </div>
       `);
-    } catch (err) { alert("Error: " + err.message); }
+    } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
   }
 
   window._showDebugError = showDebugError;
@@ -1654,9 +1684,9 @@
     document.getElementById("btn-new-plan").addEventListener("click", showNewPlanModal);
     const btnResetAll = document.getElementById("btn-reset-all-limits");
     if (btnResetAll) btnResetAll.addEventListener("click", async () => {
-      if (!confirm("Reset ALL rate limit windows for ALL keys?")) return;
+      if (!confirm(t("confirm.reset_all"))) return;
       const r = await api("/admin/limits/reset", { method: "POST" });
-      alert(r.message || "Done");
+      alert(r.message || t("alert.done"));
     });
     document.getElementById("btn-new-key").addEventListener("click", showNewKeyModal);
     const btnVipFilter = document.getElementById("btn-vip-filter");
@@ -1683,29 +1713,29 @@
     if (btnConfig) btnConfig.addEventListener("click", showNewConfigModal);
     const btnReload = document.getElementById("btn-reload-config");
     if (btnReload) btnReload.addEventListener("click", async () => {
-      if (!confirm("Hot-reload config.yaml without restart?")) return;
+      if (!confirm(t("confirm.reload"))) return;
       btnReload.disabled = true;
-      btnReload.textContent = "Reloading...";
+      btnReload.textContent = t("action.reloading");
       try {
         const data = await api("/admin/config/reload", { method: "POST" });
-        alert(data.message || "Config reloaded successfully");
+        alert(data.message || t("alert.config_reloaded"));
         onRoute();
-      } catch (err) { alert("Reload error: " + err.message); }
+      } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
       finally {
         btnReload.disabled = false;
-        btnReload.textContent = "Reload Config";
+        btnReload.textContent = t("action.reload_config");
       }
     });
     const btnRefreshInflight = document.getElementById("btn-refresh-inflight");
     if (btnRefreshInflight) btnRefreshInflight.addEventListener("click", async () => {
       btnRefreshInflight.disabled = true;
-      btnRefreshInflight.textContent = "Refreshing...";
+      btnRefreshInflight.textContent = t("action.refreshing");
       try {
         await loadDeployment24hSummary();
       } catch (err) { console.error("Refresh inflight error:", err); }
       finally {
         btnRefreshInflight.disabled = false;
-        btnRefreshInflight.textContent = "Refresh";
+        btnRefreshInflight.textContent = t("action.refresh");
       }
     });
     const btnDebug = document.getElementById("btn-debug-toggle");
@@ -1739,14 +1769,14 @@
   function showNewPlanModal(prefill) {
     const p = prefill || {};
     showModal(`
-      <h3>${p.name ? "Edit" : "Create"} Plan</h3>
-      <div class="form-group"><label>Name ${tip("Unique plan name. Used when assigning keys to plans.")}</label><input id="m-plan-name" value="${esc(p.name || "")}" ${p.name ? "readonly" : ""} required></div>
-      <div class="form-group"><label>Concurrency Limit ${tip("Maximum simultaneous requests per key in this plan. Leave empty for unlimited.")}</label><input id="m-plan-concurrency" type="number" value="${p.concurrency_limit || ""}"></div>
-      <div class="form-group"><label>RPM Limit ${tip("Maximum requests per minute per key. Leave empty for unlimited.")}</label><input id="m-plan-rpm" type="number" value="${p.rpm_limit || ""}"></div>
-      <div class="form-group"><label>Window Limits ${tip("Custom time windows as JSON array: [[count, seconds], ...]. E.g. [[100,18000]] = 100 requests per 5 hours. Each request's quota consumption is multiplied by the model's Quota Ratio.")}</label><textarea id="m-plan-windows" rows="2">${JSON.stringify(p.window_limits || [])}</textarea></div>
+      <h3>${p.name ? t("form.plan.title_edit") : t("form.plan.title_create")}</h3>
+      <div class="form-group"><label>${t("form.plan.name")} ${tip("Unique plan name. Used when assigning keys to plans.")}</label><input id="m-plan-name" value="${esc(p.name || "")}" ${p.name ? "readonly" : ""} required></div>
+      <div class="form-group"><label>${t("form.plan.concurrency")} ${tip("Maximum simultaneous requests per key in this plan. Leave empty for unlimited.")}</label><input id="m-plan-concurrency" type="number" value="${p.concurrency_limit || ""}"></div>
+      <div class="form-group"><label>${t("form.plan.rpm")} ${tip("Maximum requests per minute per key. Leave empty for unlimited.")}</label><input id="m-plan-rpm" type="number" value="${p.rpm_limit || ""}"></div>
+      <div class="form-group"><label>${t("form.plan.windows")} ${tip("Custom time windows as JSON array: [[count, seconds], ...]. E.g. [[100,18000]] = 100 requests per 5 hours. Each request's quota consumption is multiplied by the model's Quota Ratio.")}</label><textarea id="m-plan-windows" rows="2">${JSON.stringify(p.window_limits || [])}</textarea></div>
       <div class="modal-actions">
-        <button class="btn-secondary" onclick="hideModal()" style="width:auto">Cancel</button>
-        <button class="btn-primary" id="m-plan-submit">${p.name ? "Update" : "Create"}</button>
+        <button class="btn-secondary" onclick="hideModal()" style="width:auto">${t("action.cancel")}</button>
+        <button class="btn-primary" id="m-plan-submit">${p.name ? t("action.update") : t("action.create")}</button>
       </div>
     `);
     document.getElementById("m-plan-submit").addEventListener("click", async () => {
@@ -1764,7 +1794,7 @@
         hideModal();
         invalidateCaches();
         loadPlans();
-      } catch (err) { alert("Error: " + err.message); }
+      } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
     });
   }
 
@@ -1774,22 +1804,22 @@
       const p = (data.plans || []).find((x) => x.name === name);
       if (!p) return;
       showNewPlanModal(p);
-    } catch (err) { alert("Error: " + err.message); }
+    } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
   };
 
   function showNewKeyModal() {
     showModal(`
-      <h3>Create API Key</h3>
-      <div class="form-group"><label>Key Alias ${tip("Short unique identifier for this key, e.g. 'alice' or 'team-api'. Used for display in dashboard and debug logging.")}</label><input id="m-key-alias"></div>
-      <div class="form-group"><label>User ID ${tip("Optional user identifier for tracking.")}</label><input id="m-key-user"></div>
-      <div class="form-group"><label>Team ${tip("Optional team assignment.")}</label><select id="m-key-team"><option value="">-- None --</option></select></div>
-      <div class="form-group"><label>Models ${tip("Select model access. Check 'all-team-models' for full access, or pick specific models.")}</label><div class="model-check-combo" id="m-key-models-combo"></div></div>
-      <div class="form-group"><label>Max Budget ${tip("Maximum budget in USD. Leave empty for unlimited.")}</label><input id="m-key-budget" type="number" step="0.01"></div>
-      <div class="form-group"><label>RPM Limit ${tip("Per-key RPM override. Leave empty to use plan or default limits.")}</label><input id="m-key-rpm" type="number"></div>
-      <div class="form-group"><label>Plan ${tip("Assign this key to a rate limit plan. Leave empty for default plan.")}</label><select id="m-key-plan"><option value="">-- Default --</option></select></div>
+      <h3>${t("form.key.title_create")}</h3>
+      <div class="form-group"><label>${t("form.key.alias")} ${tip("Short unique identifier for this key, e.g. 'alice' or 'team-api'. Used for display in dashboard and debug logging.")}</label><input id="m-key-alias"></div>
+      <div class="form-group"><label>${t("form.key.user_id")} ${tip("Optional user identifier for tracking.")}</label><input id="m-key-user"></div>
+      <div class="form-group"><label>${t("form.key.team")} ${tip("Optional team assignment.")}</label><select id="m-key-team"><option value="">${t("common.none_option")}</option></select></div>
+      <div class="form-group"><label>${t("form.key.models")} ${tip("Select model access. Check 'all-team-models' for full access, or pick specific models.")}</label><div class="model-check-combo" id="m-key-models-combo"></div></div>
+      <div class="form-group"><label>${t("form.key.max_budget")} ${tip("Maximum budget in USD. Leave empty for unlimited.")}</label><input id="m-key-budget" type="number" step="0.01"></div>
+      <div class="form-group"><label>${t("form.key.rpm")} ${tip("Per-key RPM override. Leave empty to use plan or default limits.")}</label><input id="m-key-rpm" type="number"></div>
+      <div class="form-group"><label>${t("form.key.plan")} ${tip("Assign this key to a rate limit plan. Leave empty for default plan.")}</label><select id="m-key-plan"><option value="">${t("common.default_option")}</option></select></div>
       <div class="modal-actions">
-        <button class="btn-secondary" onclick="hideModal()" style="width:auto">Cancel</button>
-        <button class="btn-primary" id="m-key-submit">Create</button>
+        <button class="btn-secondary" onclick="hideModal()" style="width:auto">${t("action.cancel")}</button>
+        <button class="btn-primary" id="m-key-submit">${t("action.create")}</button>
       </div>
     `);
     // Populate model checkbox combo
@@ -1831,15 +1861,15 @@
         const rawKey = data.key;
         hideModal();
         showModal(`
-          <h3>Key Created</h3>
-          <p class="key-warning">Copy this key now. It will NOT be shown again.</p>
+          <h3>${t("form.key.created_title")}</h3>
+          <p class="key-warning">${t("form.key.copy_warning")}</p>
           <div class="key-display">${esc(rawKey)}</div>
           <div class="modal-actions" style="justify-content:space-between">
-            <button class="btn-secondary" style="width:auto" onclick="window._copyText(this,'${esc(rawKey)}')">Copy</button>
-            <button class="btn-primary" onclick="hideModal(); window._loadKeysPage();">Done</button>
+            <button class="btn-secondary" style="width:auto" onclick="window._copyText(this,'${esc(rawKey)}')">${t("action.copy")}</button>
+            <button class="btn-primary" onclick="hideModal(); window._loadKeysPage();">${t("action.done")}</button>
           </div>
         `);
-      } catch (err) { alert("Error: " + err.message); }
+      } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
     });
   }
 
@@ -1848,18 +1878,18 @@
     const isVip = key.metadata && key.metadata.vip === true;
     const isPromptLogExcluded = (window._promptLogExcludedKeys || []).includes(key.token_hash);
     showModal(`
-      <h3>Edit Key</h3>
-      <div class="form-group"><label>Alias ${tip("Short unique identifier for this key, e.g. 'alice'. Used for dashboard display and debug logging.")}</label><input id="m-edit-alias" value="${esc(key.key_alias || "")}"></div>
-      <div class="form-group"><label>User ID ${tip("Optional user identifier.")}</label><input id="m-edit-user" value="${esc(key.user_id || "")}"></div>
-      <div class="form-group"><label>Models ${tip("Select model access. Check 'all-team-models' for full access, or pick specific models.")}</label><div class="model-check-combo" id="m-edit-models-combo"></div></div>
-      <div class="form-group"><label>Max Budget ${tip("Maximum budget in USD. Leave empty for unlimited.")}</label><input id="m-edit-budget" type="number" step="0.01" value="${key.max_budget != null ? key.max_budget : ""}"></div>
-      <div class="form-group"><label>RPM Limit ${tip("Per-key RPM override. Leave empty to use plan limits.")}</label><input id="m-edit-rpm" type="number" value="${key.rpm_limit || ""}"></div>
-      <div class="form-group"><label>Plan ${tip("Rate limit plan assigned to this key. Change via Assignments page.")}</label><input value="${esc(key.plan_name || "Default")}" readonly style="background:var(--surface3);cursor:not-allowed"></div>
-      <div class="form-group"><label>VIP ${tip("VIP keys get priority in flow control queues when deployments are at capacity.")}</label><div style="display:flex;align-items:center;gap:8px;padding-top:4px"><input type="checkbox" id="m-edit-vip" ${isVip ? "checked" : ""}><span style="font-weight:600;color:#b45309;white-space:nowrap">Priority queue access</span></div></div>
-      <div class="form-group"><label>Prompt Log ${tip("Disable prompt logging for this key. When the global prompt log switch is ON, this key will be excluded from capture.")}</label><div style="display:flex;align-items:center;gap:8px;padding-top:4px"><input type="checkbox" id="m-edit-no-prompt-log" ${isPromptLogExcluded ? "checked" : ""}><span style="font-weight:600;color:#dc2626;white-space:nowrap">Disable prompt logging</span></div></div>
+      <h3>${t("form.key.title_edit")}</h3>
+      <div class="form-group"><label>${t("form.key.alias")} ${tip("Short unique identifier for this key, e.g. 'alice'. Used for dashboard display and debug logging.")}</label><input id="m-edit-alias" value="${esc(key.key_alias || "")}"></div>
+      <div class="form-group"><label>${t("form.key.user_id")} ${tip("Optional user identifier.")}</label><input id="m-edit-user" value="${esc(key.user_id || "")}"></div>
+      <div class="form-group"><label>${t("form.key.models")} ${tip("Select model access. Check 'all-team-models' for full access, or pick specific models.")}</label><div class="model-check-combo" id="m-edit-models-combo"></div></div>
+      <div class="form-group"><label>${t("form.key.max_budget")} ${tip("Maximum budget in USD. Leave empty for unlimited.")}</label><input id="m-edit-budget" type="number" step="0.01" value="${key.max_budget != null ? key.max_budget : ""}"></div>
+      <div class="form-group"><label>${t("form.key.rpm")} ${tip("Per-key RPM override. Leave empty to use plan limits.")}</label><input id="m-edit-rpm" type="number" value="${key.rpm_limit || ""}"></div>
+      <div class="form-group"><label>${t("form.key.plan_locked")} ${tip("Rate limit plan assigned to this key. Change via Assignments page.")}</label><input value="${esc(key.plan_name || t("common.default"))}" readonly style="background:var(--surface3);cursor:not-allowed"></div>
+      <div class="form-group"><label>${t("form.key.vip")} ${tip("VIP keys get priority in flow control queues when deployments are at capacity.")}</label><div style="display:flex;align-items:center;gap:8px;padding-top:4px"><input type="checkbox" id="m-edit-vip" ${isVip ? "checked" : ""}><span style="font-weight:600;color:#b45309;white-space:nowrap">${t("form.key.vip_label")}</span></div></div>
+      <div class="form-group"><label>${t("form.key.prompt_log")} ${tip("Disable prompt logging for this key. When the global prompt log switch is ON, this key will be excluded from capture.")}</label><div style="display:flex;align-items:center;gap:8px;padding-top:4px"><input type="checkbox" id="m-edit-no-prompt-log" ${isPromptLogExcluded ? "checked" : ""}><span style="font-weight:600;color:#dc2626;white-space:nowrap">${t("form.key.prompt_log_label")}</span></div></div>
       <div class="modal-actions">
-        <button class="btn-secondary" onclick="hideModal()" style="width:auto">Cancel</button>
-        <button class="btn-primary" id="m-edit-submit">Save</button>
+        <button class="btn-secondary" onclick="hideModal()" style="width:auto">${t("action.cancel")}</button>
+        <button class="btn-primary" id="m-edit-submit">${t("action.save")}</button>
       </div>
     `);
     // Populate model checkbox combo with existing models pre-checked
@@ -1897,22 +1927,22 @@
         }
         hideModal();
         loadKeys();
-      } catch (err) { alert("Error: " + err.message); }
+      } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
     });
   }
 
   function showNewAssignmentModal() {
     showModal(`
-      <h3>Assign Key to Plan</h3>
-      <div class="form-group"><label>Key ${tip("Search by key alias or token prefix, then select from the list.")}</label>
-        <input id="m-asgn-search" placeholder="Type to search keys..." autocomplete="off">
+      <h3>${t("form.asgn.title")}</h3>
+      <div class="form-group"><label>${t("form.asgn.key")} ${tip("Search by key alias or token prefix, then select from the list.")}</label>
+        <input id="m-asgn-search" placeholder="${t("common.search_keys_ph")}" autocomplete="off">
         <div id="m-asgn-key-list" class="key-select-list"></div>
         <input type="hidden" id="m-asgn-hash">
       </div>
-      <div class="form-group"><label>Plan ${tip("Select an existing plan to assign this key to.")}</label><select id="m-asgn-plan" required><option value="">-- Select Plan --</option></select></div>
+      <div class="form-group"><label>${t("form.asgn.plan")} ${tip("Select an existing plan to assign this key to.")}</label><select id="m-asgn-plan" required><option value="">${t("common.select_plan")}</option></select></div>
       <div class="modal-actions">
-        <button class="btn-secondary" onclick="hideModal()" style="width:auto">Cancel</button>
-        <button class="btn-primary" id="m-asgn-submit">Assign</button>
+        <button class="btn-secondary" onclick="hideModal()" style="width:auto">${t("action.cancel")}</button>
+        <button class="btn-primary" id="m-asgn-submit">${t("action.assign")}</button>
       </div>
     `);
     // Populate plan dropdown
@@ -1928,11 +1958,11 @@
 
     function renderKeyResults(keys) {
       if (keys.length === 0) {
-        listEl.innerHTML = '<div class="key-select-empty">No matching keys</div>';
+        listEl.innerHTML = '<div class="key-select-empty">' + t("common.no_matching_keys") + '</div>';
         return;
       }
       listEl.innerHTML = keys.map((k) => {
-        const alias = k.key_alias || "(no alias)";
+        const alias = k.key_alias || t("assignments.no_alias");
         const prefix = k.token_prefix || (k.token_hash || "").substring(0, 12) + "...";
         return `<div class="key-select-item" data-hash="${esc(k.token_hash)}" data-alias="${esc(k.key_alias || "")}" data-prefix="${esc(k.token_prefix || "")}">
           <span class="key-select-alias">${esc(alias)}</span>
@@ -1958,13 +1988,13 @@
           const data = await api(`/admin/keys?per_page=12&search=${encodeURIComponent(q)}`);
           renderKeyResults(data.keys || []);
         } catch (err) {
-          listEl.innerHTML = '<div class="key-select-empty">Search failed</div>';
+          listEl.innerHTML = '<div class="key-select-empty">' + t("common.search_failed") + '</div>';
         }
       }, 200);
     });
 
     document.getElementById("m-asgn-submit").addEventListener("click", async () => {
-      if (!hashInput.value) { alert("Please select a key from the search results."); return; }
+      if (!hashInput.value) { alert(t("confirm.select_key")); return; }
       try {
         await api("/admin/assignments", {
           method: "POST",
@@ -1975,7 +2005,7 @@
         });
         hideModal();
         loadAssignments();
-      } catch (err) { alert("Error: " + err.message); }
+      } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
     });
   }
 
@@ -1991,32 +2021,32 @@
       renderTeamsTable(data.teams || []);
     } catch (err) {
       const wrap = document.getElementById("teams-table-wrap");
-      if (wrap) wrap.innerHTML = `<p class="error-msg">Failed to load teams: ${esc(err.message)}</p>`;
+      if (wrap) wrap.innerHTML = `<p class="error-msg">${t("common.failed_to_load", { what: t("teams.title"), message: esc(err.message) })}</p>`;
     }
   }
 
   function renderTeamsTable(teams) {
     const wrap = document.getElementById("teams-table-wrap");
-    if (teams.length === 0) { wrap.innerHTML = "<p>No teams found.</p>"; return; }
+    if (teams.length === 0) { wrap.innerHTML = "<p>" + t("teams.empty") + "</p>"; return; }
     wrap.innerHTML = `<table>
-      <tr><th>Team Alias</th><th>Team ID</th><th>Models</th><th>Keys</th><th>Requests</th><th>Input Tokens</th><th>Output Tokens</th><th>Total Tokens</th><th>Prompt Log</th><th>Actions</th></tr>
-      ${teams.map((t) => {
-        const isExcluded = (window._promptLogExcludedTeams || []).includes(t.team_id);
+      <tr><th>${t("teams.col.alias")}</th><th>${t("teams.col.team_id")}</th><th>${t("teams.col.models")}</th><th>${t("teams.col.keys_count")}</th><th>${t("teams.col.requests")}</th><th>${t("teams.col.input_tokens")}</th><th>${t("teams.col.output_tokens")}</th><th>${t("teams.col.total_tokens")}</th><th>${t("teams.col.prompt_log")}</th><th>${t("teams.col.actions")}</th></tr>
+      ${teams.map((tm) => {
+        const isExcluded = (window._promptLogExcludedTeams || []).includes(tm.team_id);
         const logBtnClass = isExcluded ? "btn-secondary" : "btn-primary";
         const logBtnText = isExcluded ? "OFF" : "ON";
         return `<tr>
-        <td>${esc(t.team_alias || "-")}</td>
-        <td class="mono" title="${esc(t.team_id)}">${esc((t.team_id || "").substring(0, 12))}</td>
-        <td class="mono">${esc(formatTeamModels(t.models))}</td>
-        <td>${t.key_count}</td>
-        <td>${formatNumber(t.request_count)}</td>
-        <td>${formatNumber(t.total_input_tokens || 0)}</td>
-        <td>${formatNumber(t.total_output_tokens || 0)}</td>
-        <td>${formatNumber((t.total_input_tokens || 0) + (t.total_output_tokens || 0))}</td>
-        <td><button class="${logBtnClass} btn-sm" onclick='window._toggleTeamPromptLog(${JSON.stringify(t.team_id)}, ${isExcluded})'>${logBtnText}</button></td>
+        <td>${esc(tm.team_alias || "-")}</td>
+        <td class="mono" title="${esc(tm.team_id)}">${esc((tm.team_id || "").substring(0, 12))}</td>
+        <td class="mono">${esc(formatTeamModels(tm.models))}</td>
+        <td>${tm.key_count}</td>
+        <td>${formatNumber(tm.request_count)}</td>
+        <td>${formatNumber(tm.total_input_tokens || 0)}</td>
+        <td>${formatNumber(tm.total_output_tokens || 0)}</td>
+        <td>${formatNumber((tm.total_input_tokens || 0) + (tm.total_output_tokens || 0))}</td>
+        <td><button class="${logBtnClass} btn-sm" onclick='window._toggleTeamPromptLog(${JSON.stringify(tm.team_id)}, ${isExcluded})'>${logBtnText}</button></td>
         <td>
-          <button class="btn-secondary btn-sm" onclick='window._editTeam(${JSON.stringify(t.team_id)})'>Edit</button>
-          <button class="btn-danger btn-sm" onclick='window._deleteTeam(${JSON.stringify(t.team_id)}, ${t.key_count})'>Delete</button>
+          <button class="btn-secondary btn-sm" onclick='window._editTeam(${JSON.stringify(tm.team_id)})'>${t("action.edit")}</button>
+          <button class="btn-danger btn-sm" onclick='window._deleteTeam(${JSON.stringify(tm.team_id)}, ${tm.key_count})'>${t("action.delete")}</button>
         </td>
       </tr>`;
       }).join("")}
@@ -2032,13 +2062,13 @@
   window.showCreateTeamModal = function(prefill) {
     const p = prefill || {};
     showModal(`
-      <h3>${p.team_id ? "Edit" : "Create"} Team</h3>
-      <div class="form-group"><label>Team ID ${tip("Unique identifier for this team. Cannot be changed after creation.")}</label><input id="m-team-id" value="${esc(p.team_id || "")}" ${p.team_id ? "readonly" : ""} required></div>
-      <div class="form-group"><label>Team Alias ${tip("Display name for this team. Can be non-unique.")}</label><input id="m-team-alias" value="${esc(p.team_alias || "")}"></div>
-      <div class="form-group"><label>Models ${tip("Select model access for this team. Check 'all-team-models' for full access to all current and future models, or pick specific models.")}</label><div class="model-check-combo" id="m-team-models-combo"></div></div>
+      <h3>${p.team_id ? t("form.team.title_edit") : t("form.team.title_create")}</h3>
+      <div class="form-group"><label>${t("form.team.id")} ${tip("Unique identifier for this team. Cannot be changed after creation.")}</label><input id="m-team-id" value="${esc(p.team_id || "")}" ${p.team_id ? "readonly" : ""} required></div>
+      <div class="form-group"><label>${t("form.team.alias")} ${tip("Display name for this team. Can be non-unique.")}</label><input id="m-team-alias" value="${esc(p.team_alias || "")}"></div>
+      <div class="form-group"><label>${t("form.team.models")} ${tip("Select model access for this team. Check 'all-team-models' for full access to all current and future models, or pick specific models.")}</label><div class="model-check-combo" id="m-team-models-combo"></div></div>
       <div class="modal-actions">
-        <button class="btn-secondary" onclick="hideModal()" style="width:auto">Cancel</button>
-        <button class="btn-primary" id="m-team-submit">${p.team_id ? "Update" : "Create"}</button>
+        <button class="btn-secondary" onclick="hideModal()" style="width:auto">${t("action.cancel")}</button>
+        <button class="btn-primary" id="m-team-submit">${p.team_id ? t("action.update") : t("action.create")}</button>
       </div>
     `);
     getModelNames().then((names) => {
@@ -2066,31 +2096,31 @@
         }
         hideModal();
         loadTeams();
-      } catch (err) { alert("Error: " + err.message); }
+      } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
     });
   };
 
   window._editTeam = async (teamId) => {
     try {
       const data = await api("/admin/teams");
-      const t = (data.teams || []).find((x) => x.team_id === teamId);
-      if (!t) return;
+      const tm = (data.teams || []).find((x) => x.team_id === teamId);
+      if (!tm) return;
       // Fetch full team record with models from DB.
       // list_teams doesn't return models, so we pass what we have.
-      showCreateTeamModal(t);
-    } catch (err) { alert("Error: " + err.message); }
+      showCreateTeamModal(tm);
+    } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
   };
 
   window._deleteTeam = async (teamId, keyCount) => {
     if (keyCount > 0) {
-      alert(`Cannot delete team: ${keyCount} key(s) still assigned.`);
+      alert(t("alert.cannot_delete_team", { count: keyCount }));
       return;
     }
-    if (!confirm(`Delete team "${teamId}"?`)) return;
+    if (!confirm(t("confirm.delete_team", { name: teamId }))) return;
     try {
       await api("/admin/teams/" + encodeURIComponent(teamId), { method: "DELETE" });
       loadTeams();
-    } catch (err) { alert("Error: " + err.message); }
+    } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
   };
 
 
@@ -2101,7 +2131,7 @@
         body: JSON.stringify({ team_id: teamId, excluded: !isExcluded }),
       });
       loadTeams();
-    } catch (err) { alert('Error: ' + err.message); }
+    } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
   };
 
   // ── Admin: Logs ──────────────────────────────────────
@@ -2151,7 +2181,7 @@
       renderLogsPagination(data);
     } catch (err) {
       const tbody = document.getElementById("logs-tbody");
-      if (tbody) tbody.innerHTML = `<tr><td colspan="11" class="no-results">Failed to load logs: ${esc(err.message)}</td></tr>`;
+      if (tbody) tbody.innerHTML = `<tr><td colspan="14" class="no-results">${t("logs.failed", { message: esc(err.message) })}</td></tr>`;
     }
   }
 
@@ -2159,7 +2189,7 @@
     const tbody = document.getElementById("logs-tbody");
     if (!tbody) return;
     if (logs.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="14" class="no-results">No matching logs found.</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="14" class="no-results">' + t("common.no_matching", { what: t("logs.title").toLowerCase() }) + '</td></tr>';
       return;
     }
     tbody.innerHTML = logs.map((l) => {
@@ -2173,7 +2203,7 @@
             : '<span style="color:var(--danger)" title="' + esc(l.error_message) + '">' + esc(etype.substring(0, 20)) + '</span>')
           : "-";
         const detailCell = promptLogEnabled && l.request_id
-          ? '<button class="btn-small" onclick="window._viewPromptLog(\'' + esc(l.request_id) + '\',\'' + esc(l.key_hash) + '\',\'' + esc(l.team_alias || "") + '\')">View</button>'
+          ? '<button class="btn-small" onclick="window._viewPromptLog(\'' + esc(l.request_id) + '\',\'' + esc(l.key_hash) + '\',\'' + esc(l.team_alias || "") + '\')">' + t("action.view") + '</button>'
           : "-";
         // Timestamp: muted mono badge
         var tsCell = '<span class="log-ts">' + formatTimestamp(l.created_at) + '</span>';
@@ -2198,7 +2228,7 @@
         <td>${modelCell}</td>
         <td class="mono">${esc(l.api_path)}</td>
         <td>${l.status_code >= 400 ? '<span style="color:var(--danger)">' + l.status_code + '</span>' : l.status_code}</td>
-        <td>${l.is_stream ? "Yes" : "No"}</td>
+        <td>${l.is_stream ? t("common.yes") : t("common.no")}</td>
         <td>${l.input_tokens != null ? formatNumber(l.input_tokens) : "-"}</td>
         <td>${l.output_tokens != null ? formatNumber(l.output_tokens) : "-"}</td>
         <td>${l.duration_ms != null ? l.duration_ms + "ms" : "-"}</td>
@@ -2213,7 +2243,7 @@
     const el = document.getElementById("logs-pagination");
     el.innerHTML = `
       <button ${data.page <= 1 ? "disabled" : ""} onclick="window._loadLogsPage(${data.page - 1})">&lt;</button>
-      <span>Page ${data.page}</span>
+      <span>${t("common.page_only", { page: data.page })}</span>
       <button ${!data.has_next ? "disabled" : ""} onclick="window._loadLogsPage(${data.page + 1})">&gt;</button>
     `;
   }
@@ -2226,7 +2256,7 @@
     const modalEl = overlay ? overlay.querySelector(".modal") : null;
     // Widen modal for JSON viewing via CSS class (cleared on hideModal).
     if (modalEl) modalEl.classList.add("modal-wide");
-    showModal('<div style="text-align:center;padding:40px">Loading...</div>');
+    showModal('<div style="text-align:center;padding:40px">' + t("common.loading") + '</div>');
     try {
       const params = new URLSearchParams({ key_hash: keyHash });
       if (teamAlias) params.set("team_alias", teamAlias);
@@ -2234,11 +2264,11 @@
       const containerId = "plj-" + Date.now();
       showModal(
         '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">' +
-        '<h3 style="margin:0">Prompt Log Detail</h3>' +
+        '<h3 style="margin:0">' + t("logs.detail_title") + '</h3>' +
         '<div style="display:flex;gap:6px">' +
-        '<button class="btn-small" id="' + containerId + '-collapse">Collapse All</button>' +
-        '<button class="btn-small" id="' + containerId + '-expand">Expand All</button>' +
-        '<button class="btn-small" id="' + containerId + '-raw">Raw JSON</button>' +
+        '<button class="btn-small" id="' + containerId + '-collapse">' + t("action.collapse_all") + '</button>' +
+        '<button class="btn-small" id="' + containerId + '-expand">' + t("action.expand_all") + '</button>' +
+        '<button class="btn-small" id="' + containerId + '-raw">' + t("action.raw_json") + '</button>' +
         '</div></div>' +
         '<div id="' + containerId + '" style="max-height:72vh;overflow:auto;background:var(--surface2);color:var(--text);padding:16px;border-radius:8px;font-size:13px;line-height:1.5;font-family:var(--mono)"></div>' +
         '<pre id="' + containerId + '-rawpre" style="display:none;max-height:72vh;overflow:auto;background:var(--surface2);color:var(--text);padding:16px;border-radius:8px;font-size:13px;line-height:1.5;white-space:pre-wrap;word-break:break-word;font-family:var(--mono)">' + esc(JSON.stringify(data, null, 2)) + '</pre>'
@@ -2256,10 +2286,10 @@
         const showing = rawPre.style.display !== "none";
         rawPre.style.display = showing ? "none" : "block";
         tree.style.display = showing ? "block" : "none";
-        e.target.textContent = showing ? "Raw JSON" : "Tree View";
+        e.target.textContent = showing ? t("action.raw_json") : t("action.tree_view");
       };
     } catch (err) {
-      showModal('<div style="padding:20px;color:var(--danger)">Failed to load prompt log: ' + esc(err.message) + '</div>');
+      showModal('<div style="padding:20px;color:var(--danger)">' + t("logs.failed_prompt", { message: esc(err.message) }) + '</div>');
     }
   };
 
@@ -2280,8 +2310,8 @@
       if (val.length > 500) {
         const short = document.createElement("span");
         short.className = "jvt-str-preview";
-        short.textContent = JSON.stringify(val.substring(0, 200)) + ' … (' + val.length + ' chars)';
-        short.title = "Click to show full string";
+        short.textContent = JSON.stringify(val.substring(0, 200)) + ' … (' + t("common.char_count", { n: val.length }) + ')';
+        short.title = t("common.click_to_show");
         short.style.cursor = "pointer";
         short.style.color = "var(--info)";
         const full = document.createElement("span");
@@ -2319,7 +2349,7 @@
 
     const summary = document.createElement("span");
     summary.className = "jvt-summary";
-    summary.textContent = isArr ? "[" + entries.length + " items]" : "{" + entries.length + " keys}";
+    summary.textContent = isArr ? "[" + t("common.items_count", { n: entries.length }) + "]" : "{" + t("common.keys_count", { n: entries.length }) + "}";
     summary.style.color = "var(--text3)";
     summary.style.marginRight = "4px";
     summary.style.display = depth < maxDepth ? "none" : "inline";
@@ -2377,9 +2407,9 @@
 
     // Build HTML
     container.innerHTML = `
-      <div class="mcc-display">${isFullAccess ? "all-team-models (Full Access)" : (existingModels || []).map((m) => esc(m)).join(", ") || "No models"}</div>
+      <div class="mcc-display">${isFullAccess ? t("plans.full_access") : (existingModels || []).map((m) => esc(m)).join(", ") || t("plans.no_models")}</div>
       <div class="mcc-dropdown hidden">
-        <label class="mcc-item mcc-item-all"><input type="checkbox" value="all-team-models" ${isFullAccess ? "checked" : ""}> all-team-models (Full Access)</label>
+        <label class="mcc-item mcc-item-all"><input type="checkbox" value="all-team-models" ${isFullAccess ? "checked" : ""}> ${t("plans.full_access")}</label>
         <div class="mcc-divider"></div>
         ${allNames.map((n) => `<label class="mcc-item"><input type="checkbox" value="${esc(n)}" ${!isFullAccess && checked.has(n) ? "checked" : ""}> ${esc(n)}</label>`).join("")}
       </div>
@@ -2436,10 +2466,10 @@
 
     function refreshDisplay() {
       if (allCb.checked) {
-        display.textContent = "all-team-models (Full Access)";
+        display.textContent = t("plans.full_access");
       } else {
         const selected = Array.from(modelCbs).filter((c) => c.checked).map((c) => c.value);
-        display.textContent = selected.length > 0 ? selected.join(", ") : "No models selected";
+        display.textContent = selected.length > 0 ? selected.join(", ") : t("plans.no_models_selected");
       }
     }
   }
@@ -2470,16 +2500,6 @@
     if (secs < 3600) return (secs / 60) + "min";
     if (secs < 86400) return (secs / 3600) + "h";
     return (secs / 86400) + "d";
-  }
-
-  function formatHMS(secs) {
-    secs = Math.round(secs);
-    const h = Math.floor(secs / 3600);
-    const m = Math.floor((secs % 3600) / 60);
-    const s = secs % 60;
-    if (h > 0) return h + "时" + m + "分" + s + "秒";
-    if (m > 0) return m + "分" + s + "秒";
-    return s + "秒";
   }
 
   function formatCountdown(secs) {

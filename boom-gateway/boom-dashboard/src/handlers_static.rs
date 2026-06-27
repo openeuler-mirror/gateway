@@ -5,6 +5,7 @@ use axum::response::{Html, IntoResponse, Response};
 const INDEX_HTML: &str = include_str!("frontend/index.html");
 const STYLE_CSS: &str = include_str!("frontend/style.css");
 const APP_JS: &str = include_str!("frontend/app.js");
+const I18N_JS: &str = include_str!("frontend/i18n.js");
 
 /// Redirect `/` to `/dashboard`.
 pub async fn redirect_root() -> Response {
@@ -31,6 +32,14 @@ pub async fn app_js() -> Response {
     (
         [(header::CONTENT_TYPE, "application/javascript; charset=utf-8")],
         APP_JS,
+    )
+        .into_response()
+}
+
+pub async fn i18n_js() -> Response {
+    (
+        [(header::CONTENT_TYPE, "application/javascript; charset=utf-8")],
+        I18N_JS,
     )
         .into_response()
 }

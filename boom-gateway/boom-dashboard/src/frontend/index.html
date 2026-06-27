@@ -1,9 +1,9 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="en" data-lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>BooMGateway Dashboard</title>
+  <title data-i18n="brand.title">BooMGateway Dashboard</title>
   <link rel="stylesheet" href="/dashboard/style.css">
   <script>
     (function(){
@@ -12,6 +12,7 @@
       else if(matchMedia('(prefers-color-scheme:dark)').matches)document.documentElement.dataset.theme='dark';
     })();
   </script>
+  <script src="/dashboard/i18n.js" defer></script>
 </head>
 <body>
   <div id="app">
@@ -22,21 +23,21 @@
       <div class="sea-creature sc-3"></div>
       <div class="login-card">
         <div class="login-brand">
-          <div class="brand-name">BooM</div>
-          <div class="brand-tagline">Gateway Dashboard</div>
+          <div class="brand-name" data-i18n="brand.name">BooM</div>
+          <div class="brand-tagline" data-i18n="brand.tagline">Gateway Dashboard</div>
         </div>
         <form id="login-form">
-          <p class="login-hint" id="login-hint">Enter your API Key to sign in</p>
+          <p class="login-hint" id="login-hint" data-i18n="login.subtitle">Enter your API Key to sign in</p>
           <div class="form-group hidden" id="user-id-group">
-            <label for="user_id">Username</label>
+            <label for="user_id" data-i18n="login.username">Username</label>
             <input type="text" id="user_id" placeholder="admin" value="">
           </div>
           <div class="form-group">
-            <input type="password" id="api_key" placeholder="API Key (sk-...)" required>
+            <input type="password" id="api_key" data-i18n-ph="login.api_key_placeholder" placeholder="API Key (sk-...)" required>
           </div>
-          <button type="submit" id="login-btn">Login</button>
+          <button type="submit" id="login-btn" data-i18n="login.submit">Login</button>
           <p id="login-error" class="error-msg hidden"></p>
-          <a href="#" class="admin-toggle" id="admin-toggle">Admin sign in →</a>
+          <a href="#" class="admin-toggle" id="admin-toggle" data-i18n="login.admin_link">Admin sign in →</a>
         </form>
       </div>
     </div>
@@ -45,20 +46,25 @@
     <div id="page-dashboard" class="page">
       <div class="layout">
         <aside class="sidebar">
-          <h2 id="user-sidebar-title">Dashboard</h2>
+          <div class="sidebar-top">
+            <h2 id="user-sidebar-title" data-i18n="user.sidebar_title">Dashboard</h2>
+            <button class="lang-toggle" id="lang-toggle-user" data-i18n-title="action.toggle_lang" title="Switch language">
+              <span class="lang-current">EN</span>
+            </button>
+          </div>
           <nav>
             <a href="#/dashboard" class="nav-link active" data-section="user-overview">
               <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="1.5" y="1.5" width="5.5" height="5.5" rx="1"/><rect x="9" y="1.5" width="5.5" height="5.5" rx="1"/><rect x="1.5" y="9" width="5.5" height="5.5" rx="1"/><rect x="9" y="9" width="5.5" height="5.5" rx="1"/></svg>
-              <span>Overview</span>
+              <span data-i18n="nav.overview">Overview</span>
             </a>
             <a href="#/dashboard/logs" class="nav-link" data-section="user-logs">
               <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 4h12M2 8h12M2 12h8"/></svg>
-              <span>Request Logs</span>
+              <span data-i18n="nav.user_logs">Request Logs</span>
             </a>
           </nav>
           <div class="sidebar-footer">
-            <button class="btn-secondary" id="logout-btn">Logout</button>
-            <button class="theme-toggle" id="theme-toggle-user" title="Toggle theme">
+            <button class="btn-secondary" id="logout-btn" data-i18n="action.logout">Logout</button>
+            <button class="theme-toggle" id="theme-toggle-user" data-i18n-title="action.toggle_theme" title="Toggle theme">
               <svg class="icon-sun" viewBox="0 0 20 20" fill="currentColor"><circle cx="10" cy="10" r="4"/><path d="M10 0v3M10 17v3M0 10h3M17 10h3M2.93 2.93l2.12 2.12M14.95 14.95l2.12 2.12M2.93 17.07l2.12-2.12M14.95 5.05l2.12-2.12" stroke="currentColor" stroke-width="1.5" fill="none"/></svg>
               <svg class="icon-moon" viewBox="0 0 20 20" fill="currentColor" style="display:none"><path d="M17.293 13.293A8 8 0 016.707 2.707a8.001 8.001 0 1010.586 10.586z"/></svg>
             </button>
@@ -66,33 +72,33 @@
         </aside>
         <main class="main-content">
           <section id="user-overview" class="section active">
-            <h2>Plan & Usage</h2>
+            <h2 data-i18n="nav.plan_usage">Plan &amp; Usage</h2>
             <div id="plan-card" class="card">
-              <h3>Current Plan</h3>
-              <div id="plan-info"><p class="loading">Loading...</p></div>
+              <h3 data-i18n="user.plan.current">Current Plan</h3>
+              <div id="plan-info"><p class="loading" data-i18n="common.loading">Loading...</p></div>
             </div>
             <div class="card">
-              <h3>Real-time Usage</h3>
-              <div id="usage-info"><p class="loading">Loading...</p></div>
+              <h3 data-i18n="user.usage.realtime">Real-time Usage</h3>
+              <div id="usage-info"><p class="loading" data-i18n="common.loading">Loading...</p></div>
             </div>
             <div class="card">
-              <h3>Active Requests</h3>
-              <div id="request-status-info"><p style="color:var(--text3)">No active requests.</p></div>
+              <h3 data-i18n="user.usage.active">Active Requests</h3>
+              <div id="request-status-info"><p style="color:var(--text3)" data-i18n="user.usage.no_active">No active requests.</p></div>
             </div>
             <div class="card">
-              <h3>Token Usage</h3>
-              <div id="token-info"><p class="loading">Loading...</p></div>
+              <h3 data-i18n="user.usage.tokens">Token Usage</h3>
+              <div id="token-info"><p class="loading" data-i18n="common.loading">Loading...</p></div>
             </div>
             <div class="card">
-              <h3>Key Information</h3>
-              <div id="key-info"><p class="loading">Loading...</p></div>
+              <h3 data-i18n="user.key.info">Key Information</h3>
+              <div id="key-info"><p class="loading" data-i18n="common.loading">Loading...</p></div>
             </div>
           </section>
 
           <!-- User: Request Logs -->
           <section id="user-logs" class="section">
-            <h2>Request Logs</h2>
-            <div id="user-logs-table-wrap"><p class="loading">Loading...</p></div>
+            <h2 data-i18n="nav.user_logs">Request Logs</h2>
+            <div id="user-logs-table-wrap"><p class="loading" data-i18n="common.loading">Loading...</p></div>
             <div id="user-logs-pagination" class="pagination"></div>
           </section>
         </main>
@@ -103,52 +109,57 @@
     <div id="page-admin" class="page">
       <div class="layout">
         <aside class="sidebar">
-          <h2>Admin Panel</h2>
+          <div class="sidebar-top">
+            <h2 data-i18n="admin.sidebar_title">Admin Panel</h2>
+            <button class="lang-toggle" id="lang-toggle-admin" data-i18n-title="action.toggle_lang" title="Switch language">
+              <span class="lang-current">EN</span>
+            </button>
+          </div>
           <nav>
             <a href="#/admin/stats" class="nav-link" data-section="admin-stats">
               <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 14V7h3v7H2zM6.5 14V3h3v11h-3zM11 14V5h3v9h-3z"/></svg>
-              <span>Stats</span>
+              <span data-i18n="nav.stats">Stats</span>
             </a>
             <a href="#/admin/models" class="nav-link" data-section="admin-models">
               <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 3h12v9a2 2 0 01-2 2H4a2 2 0 01-2-2V3zM5 3V1.5M11 3V1.5M2 7h12"/></svg>
-              <span>Models</span>
+              <span data-i18n="nav.models">Models</span>
             </a>
             <a href="#/admin/aliases" class="nav-link" data-section="admin-aliases">
               <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M6.5 3L12 8l-5.5 5"/><path d="M2 3l5.5 5L2 13"/></svg>
-              <span>Aliases</span>
+              <span data-i18n="nav.aliases">Aliases</span>
             </a>
             <a href="#/admin/plans" class="nav-link" data-section="admin-plans">
               <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="1.5" y="1.5" width="13" height="13" rx="2"/><path d="M5 5h6M5 8h4M5 11h2"/></svg>
-              <span>Plans</span>
+              <span data-i18n="nav.plans">Plans</span>
             </a>
             <a href="#/admin/keys" class="nav-link" data-section="admin-keys">
               <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="6" cy="6" r="3.5"/><path d="M9 6l5.5 5.5M12 9.5l1.5 1.5M6 8.5v5M4.5 12h3"/></svg>
-              <span>Keys</span>
+              <span data-i18n="nav.keys">Keys</span>
             </a>
             <a href="#/admin/teams" class="nav-link" data-section="admin-teams">
               <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="5.5" cy="4.5" r="2.5"/><path d="M1 14c0-2.5 2-4.5 4.5-4.5S10 11.5 10 14"/><circle cx="11" cy="5" r="2"/><path d="M11 9.5c1.5 0 3 1 3.5 3"/></svg>
-              <span>Teams</span>
+              <span data-i18n="nav.teams">Teams</span>
             </a>
             <a href="#/admin/logs" class="nav-link" data-section="admin-logs">
               <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 4h12M2 8h12M2 12h8"/><circle cx="14" cy="12" r="1.5"/></svg>
-              <span>Logs</span>
+              <span data-i18n="nav.logs">Logs</span>
             </a>
             <a href="#/admin/assignments" class="nav-link" data-section="admin-assignments">
               <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M6 3h8M6 8h8M6 13h8M2 3h2M2 8h2M2 13h2"/></svg>
-              <span>Assignments</span>
+              <span data-i18n="nav.assignments">Assignments</span>
             </a>
             <a href="#/admin/config" class="nav-link" data-section="admin-config">
               <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="2.5"/><path d="M8 1v2M8 13v2M1 8h2M13 8h2M3.05 3.05l1.41 1.41M11.54 11.54l1.41 1.41M3.05 12.95l1.41-1.41M11.54 4.46l1.41-1.41"/></svg>
-              <span>Config</span>
+              <span data-i18n="nav.config">Config</span>
             </a>
             <a href="#/admin/debug" class="nav-link" data-section="admin-debug">
               <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M4 4l8 8M12 4l-8 8M8 1v2M8 13v2M1 8h2M13 8h2"/></svg>
-              <span>Debug</span>
+              <span data-i18n="nav.debug">Debug</span>
             </a>
           </nav>
           <div class="sidebar-footer">
-            <button class="btn-secondary" id="logout-btn-admin">Logout</button>
-            <button class="theme-toggle" id="theme-toggle-admin" title="Toggle theme">
+            <button class="btn-secondary" id="logout-btn-admin" data-i18n="action.logout">Logout</button>
+            <button class="theme-toggle" id="theme-toggle-admin" data-i18n-title="action.toggle_theme" title="Toggle theme">
               <svg class="icon-sun" viewBox="0 0 20 20" fill="currentColor"><circle cx="10" cy="10" r="4"/><path d="M10 0v3M10 17v3M0 10h3M17 10h3M2.93 2.93l2.12 2.12M14.95 14.95l2.12 2.12M2.93 17.07l2.12-2.12M14.95 5.05l2.12-2.12" stroke="currentColor" stroke-width="1.5" fill="none"/></svg>
               <svg class="icon-moon" viewBox="0 0 20 20" fill="currentColor" style="display:none"><path d="M17.293 13.293A8 8 0 016.707 2.707a8.001 8.001 0 1010.586 10.586z"/></svg>
             </button>
@@ -158,144 +169,144 @@
           <!-- Stats Section -->
           <section id="admin-stats" class="section">
             <div class="section-header">
-              <h2>In-Flight Requests</h2>
+              <h2 data-i18n="stats.inflight.title">In-Flight Requests</h2>
               <div style="display:flex;gap:8px">
-                <button class="btn-small" id="btn-reload-config" title="Hot-reload config.yaml without restart">Reload Config</button>
-                <button class="btn-small" id="btn-refresh-inflight">Refresh</button>
+                <button class="btn-small" id="btn-reload-config" title="Hot-reload config.yaml without restart" data-i18n="action.reload_config">Reload Config</button>
+                <button class="btn-small" id="btn-refresh-inflight" data-i18n="action.refresh">Refresh</button>
               </div>
             </div>
-            <div id="inflight-table-wrap"><p class="loading">Loading...</p></div>
+            <div id="inflight-table-wrap"><p class="loading" data-i18n="common.loading">Loading...</p></div>
 
             <div class="section-header" style="margin-top:2rem">
-              <h2>Key Rebalance Events</h2>
-              <span style="font-size:.85em;color:var(--text3)">Last 60 minutes</span>
+              <h2 data-i18n="stats.rebalance.title">Key Rebalance Events</h2>
+              <span style="font-size:.85em;color:var(--text3)" data-i18n="stats.rebalance.subtitle">Last 60 minutes</span>
             </div>
-            <div id="rebalance-chart-wrap"><p class="loading">Loading...</p></div>
+            <div id="rebalance-chart-wrap"><p class="loading" data-i18n="common.loading">Loading...</p></div>
 
             <div class="section-header" style="margin-top:2rem">
-              <h2>Request Rate (per model)</h2>
+              <h2 data-i18n="stats.rate.title">Request Rate (per model)</h2>
               <div class="range-controls" data-target="rate">
                 <button class="btn-range active" data-range="1h">1h</button>
                 <button class="btn-range" data-range="4h">4h</button>
                 <button class="btn-range" data-range="8h">8h</button>
                 <button class="btn-range" data-range="24h">24h</button>
-                <button class="btn-range" data-range="custom">Custom</button>
+                <button class="btn-range" data-range="custom" data-i18n="range.custom">Custom</button>
                 <span class="range-custom hidden">
                   <input type="datetime-local" class="range-from">
                   <input type="datetime-local" class="range-to">
-                  <button class="btn-tiny range-apply">Apply</button>
+                  <button class="btn-tiny range-apply" data-i18n="action.apply">Apply</button>
                 </span>
                 <span class="range-note hidden"></span>
               </div>
             </div>
-            <div id="request-rate-wrap"><p class="loading">Loading...</p></div>
+            <div id="request-rate-wrap"><p class="loading" data-i18n="common.loading">Loading...</p></div>
           </section>
 
           <!-- Debug Section -->
           <section id="admin-debug" class="section">
-            <div class="debug-banner">
-              供调试信息显示，版本更新可能变动或删除。
+            <div class="debug-banner" data-i18n="debug.banner">
+              Debug-only — content may change or be removed between versions.
             </div>
 
             <div class="section-header">
-              <h2>Agent Statistics</h2>
+              <h2 data-i18n="stats.agent.title">Agent Statistics</h2>
               <div class="range-controls" data-target="agent">
                 <button class="btn-range active" data-range="1h">1h</button>
                 <button class="btn-range" data-range="4h">4h</button>
                 <button class="btn-range" data-range="8h">8h</button>
                 <button class="btn-range" data-range="24h">24h</button>
-                <button class="btn-range" data-range="custom">Custom</button>
+                <button class="btn-range" data-range="custom" data-i18n="range.custom">Custom</button>
                 <span class="range-custom hidden">
                   <input type="datetime-local" class="range-from">
                   <input type="datetime-local" class="range-to">
-                  <button class="btn-tiny range-apply">Apply</button>
+                  <button class="btn-tiny range-apply" data-i18n="action.apply">Apply</button>
                 </span>
                 <span class="range-note hidden"></span>
               </div>
             </div>
-            <div id="agent-stats-wrap"><p class="loading">Loading...</p></div>
+            <div id="agent-stats-wrap"><p class="loading" data-i18n="common.loading">Loading...</p></div>
           </section>
 
           <!-- Models Section -->
           <section id="admin-models" class="section">
             <div class="section-header">
-              <h2>Model Deployments</h2>
-              <button class="btn-primary" id="btn-new-model">+ Add Model</button>
+              <h2 data-i18n="models.title">Model Deployments</h2>
+              <button class="btn-primary" id="btn-new-model" data-i18n="models.add">+ Add Model</button>
             </div>
-            <div id="models-table-wrap"><p class="loading">Loading...</p></div>
+            <div id="models-table-wrap"><p class="loading" data-i18n="common.loading">Loading...</p></div>
           </section>
 
           <!-- Aliases Section -->
           <section id="admin-aliases" class="section">
             <div class="section-header">
-              <h2>Model Aliases</h2>
-              <button class="btn-primary" id="btn-new-alias">+ Add Alias</button>
+              <h2 data-i18n="aliases.title">Model Aliases</h2>
+              <button class="btn-primary" id="btn-new-alias" data-i18n="aliases.add">+ Add Alias</button>
             </div>
-            <div id="aliases-table-wrap"><p class="loading">Loading...</p></div>
+            <div id="aliases-table-wrap"><p class="loading" data-i18n="common.loading">Loading...</p></div>
           </section>
 
           <!-- Plans Section -->
           <section id="admin-plans" class="section">
             <div class="section-header">
-              <h2>Plans</h2>
+              <h2 data-i18n="plans.title">Plans</h2>
               <div>
-                <button class="btn-danger" id="btn-reset-all-limits">Reset All Limits</button>
+                <button class="btn-danger" id="btn-reset-all-limits" data-i18n="plans.reset_all">Reset All Limits</button>
                 <button class="btn-primary" id="btn-new-plan">+ New Plan</button>
               </div>
             </div>
-            <div id="plans-table-wrap"><p class="loading">Loading...</p></div>
+            <div id="plans-table-wrap"><p class="loading" data-i18n="common.loading">Loading...</p></div>
           </section>
 
           <!-- Keys Section -->
           <section id="admin-keys" class="section">
             <div class="section-header">
-              <h2>API Keys</h2>
+              <h2 data-i18n="keys.title">API Keys</h2>
               <div class="keys-toolbar">
-                <input type="text" id="keys-search" placeholder="Search alias, name, user, token..." class="search-input">
-                <button class="btn-small" id="btn-vip-filter">VIP Only</button>
+                <input type="text" id="keys-search" data-i18n-ph="keys.search_placeholder" placeholder="Search alias, name, user, token..." class="search-input">
+                <button class="btn-small" id="btn-vip-filter" data-i18n="keys.vip_only">VIP Only</button>
                 <button class="btn-primary" id="btn-new-key">+ Create Key</button>
               </div>
             </div>
-            <div id="keys-table-wrap"><p class="loading">Loading...</p></div>
+            <div id="keys-table-wrap"><p class="loading" data-i18n="common.loading">Loading...</p></div>
             <div id="keys-pagination" class="pagination"></div>
           </section>
 
           <!-- Assignments Section -->
           <section id="admin-assignments" class="section">
             <div class="section-header">
-              <h2>Key-Plan Assignments</h2>
+              <h2 data-i18n="assignments.title">Key-Plan Assignments</h2>
               <button class="btn-primary" id="btn-new-assignment">+ Assign</button>
             </div>
-            <div id="assignments-table-wrap"><p class="loading">Loading...</p></div>
+            <div id="assignments-table-wrap"><p class="loading" data-i18n="common.loading">Loading...</p></div>
             <div id="assignments-pagination" class="pagination"></div>
           </section>
 
           <!-- Config Section -->
           <section id="admin-config" class="section">
             <div class="section-header">
-              <h2>Configuration</h2>
+              <h2 data-i18n="config.title">Configuration</h2>
               <button class="btn-primary" id="btn-new-config">+ Set Value</button>
             </div>
-            <div id="config-table-wrap"><p class="loading">Loading...</p></div>
+            <div id="config-table-wrap"><p class="loading" data-i18n="common.loading">Loading...</p></div>
           </section>
 
           <!-- Teams Section -->
           <section id="admin-teams" class="section">
             <div class="section-header">
-              <h2>Teams</h2>
-              <button class="btn-primary" onclick="showCreateTeamModal()">Create Team</button>
+              <h2 data-i18n="teams.title">Teams</h2>
+              <button class="btn-primary" onclick="showCreateTeamModal()" data-i18n="teams.create">Create Team</button>
             </div>
-            <div id="teams-table-wrap"><p class="loading">Loading...</p></div>
+            <div id="teams-table-wrap"><p class="loading" data-i18n="common.loading">Loading...</p></div>
           </section>
 
           <!-- Logs Section -->
           <section id="admin-logs" class="section">
             <div class="section-header">
-              <h2>Request Logs</h2>
+              <h2 data-i18n="logs.title">Request Logs</h2>
               <div>
-                <button class="btn-small" id="btn-prompt-log-toggle">Prompt Log: OFF</button>
-                <button class="btn-small" id="btn-debug-toggle">Debug: OFF</button>
-                <button class="btn-small" id="btn-reset-logs-filters">Reset Filters</button>
+                <button class="btn-small" id="btn-prompt-log-toggle" data-i18n="logs.prompt_log.off">Prompt Log: OFF</button>
+                <button class="btn-small" id="btn-debug-toggle" data-i18n="logs.debug.off">Debug: OFF</button>
+                <button class="btn-small" id="btn-reset-logs-filters" data-i18n="logs.reset_filters">Reset Filters</button>
               </div>
             </div>
             <div id="logs-table-wrap">
@@ -303,22 +314,37 @@
                 <thead>
                   <tr class="filter-row">
                     <td></td>
-                    <td><input class="col-filter" data-col="client_ip" placeholder="filter"></td>
-                    <td><input class="col-filter" data-col="team_alias" placeholder="filter"></td>
-                    <td><input class="col-filter" data-col="key_alias" placeholder="filter"></td>
-                    <td><input class="col-filter" data-col="model" placeholder="filter"></td>
-                    <td><input class="col-filter" data-col="api_path" placeholder="filter"></td>
-                    <td><input class="col-filter" data-col="status_code" placeholder="filter"></td>
-                    <td><input class="col-filter" data-col="stream" placeholder="filter"></td>
+                    <td><input class="col-filter" data-col="client_ip" data-i18n-ph="logs.filter_placeholder" placeholder="filter"></td>
+                    <td><input class="col-filter" data-col="team_alias" data-i18n-ph="logs.filter_placeholder" placeholder="filter"></td>
+                    <td><input class="col-filter" data-col="key_alias" data-i18n-ph="logs.filter_placeholder" placeholder="filter"></td>
+                    <td><input class="col-filter" data-col="model" data-i18n-ph="logs.filter_placeholder" placeholder="filter"></td>
+                    <td><input class="col-filter" data-col="api_path" data-i18n-ph="logs.filter_placeholder" placeholder="filter"></td>
+                    <td><input class="col-filter" data-col="status_code" data-i18n-ph="logs.filter_placeholder" placeholder="filter"></td>
+                    <td><input class="col-filter" data-col="stream" data-i18n-ph="logs.filter_placeholder" placeholder="filter"></td>
                     <td></td>
                     <td></td>
                     <td></td>
-                    <td><input class="col-filter" data-col="error" placeholder="filter"></td>
+                    <td><input class="col-filter" data-col="error" data-i18n-ph="logs.filter_placeholder" placeholder="filter"></td>
                     <td></td>
                   </tr>
-                  <tr><th>Time</th><th>IP</th><th>Team</th><th>Key Alias</th><th>Model</th><th>Path</th><th>Status</th><th>Stream</th><th>Input</th><th>Output</th><th>Duration</th><th>TTFT</th><th>Error</th><th>Detail</th></tr>
+                  <tr>
+                    <th data-i18n="logs.col.time">Time</th>
+                    <th data-i18n="logs.col.ip">IP</th>
+                    <th data-i18n="logs.col.team">Team</th>
+                    <th data-i18n="logs.col.key_alias">Key Alias</th>
+                    <th data-i18n="logs.col.model">Model</th>
+                    <th data-i18n="logs.col.path">Path</th>
+                    <th data-i18n="logs.col.status">Status</th>
+                    <th data-i18n="logs.col.stream">Stream</th>
+                    <th data-i18n="logs.col.input">Input</th>
+                    <th data-i18n="logs.col.output">Output</th>
+                    <th data-i18n="logs.col.duration">Duration</th>
+                    <th data-i18n="logs.col.ttft">TTFT</th>
+                    <th data-i18n="logs.col.error">Error</th>
+                    <th data-i18n="logs.col.detail">Detail</th>
+                  </tr>
                 </thead>
-                <tbody id="logs-tbody"><tr><td colspan="14" class="loading">Loading...</td></tr></tbody>
+                <tbody id="logs-tbody"><tr><td colspan="14" class="loading" data-i18n="common.loading">Loading...</td></tr></tbody>
               </table>
             </div>
             <div id="logs-pagination" class="pagination"></div>

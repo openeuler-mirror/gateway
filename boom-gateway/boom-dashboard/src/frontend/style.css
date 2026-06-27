@@ -427,6 +427,33 @@ input, select, textarea { font-family: var(--font); font-size: 14px; }
 }
 .theme-toggle svg { width: 18px; height: 18px; }
 
+/* ── Sidebar Top (title + lang toggle) ───────────────────── */
+.sidebar-top {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 8px; padding: 16px 20px 14px;
+  border-bottom: 1px solid var(--sidebar-border);
+}
+.sidebar-top h2 {
+  padding: 0; margin: 0; font-size: 13px; letter-spacing: 1.2px;
+  color: var(--sidebar-text); font-weight: 600; text-transform: uppercase;
+}
+
+/* ── Language Toggle ─────────────────────────────────────── */
+.lang-toggle {
+  width: 36px; height: 36px; border-radius: var(--radius-sm);
+  background: var(--sidebar-hover); border: 1px solid var(--sidebar-border);
+  color: var(--sidebar-text);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 0.85rem; font-weight: 600; line-height: 1;
+  transition: all var(--transition); flex-shrink: 0; cursor: pointer;
+  font-family: var(--font-ui, inherit);
+}
+.lang-toggle:hover {
+  background: var(--sidebar-active); color: var(--sidebar-text-active);
+  border-color: rgba(232,116,12,.3);
+}
+.lang-toggle .lang-current { display: inline-block; }
+
 /* ── Main Content ───────────────────────────────────────── */
 .main-content {
   flex: 1; padding: 32px; overflow-y: auto; background: var(--bg);
@@ -746,6 +773,8 @@ tr.filter-row td { padding: 3px 4px; background: var(--surface2); border-bottom:
 @media (max-width: 768px) {
   .sidebar { width: 56px; }
   .sidebar h2, .sidebar .nav-link span, .sidebar-footer { display: none; }
+  .sidebar-top { padding: 12px 8px; justify-content: center; }
+  .lang-toggle { display: none; }
   .nav-link { justify-content: center; padding: 12px; }
   .nav-link svg { margin: 0; }
   .theme-toggle { display: none; }
@@ -966,4 +995,14 @@ input[list] {
 .toast.toast-out { animation: toastOut .2s ease forwards; }
 @keyframes toastOut {
   to { opacity: 0; transform: translateX(20px); }
+}
+
+/* ── CJK font optimization (when language is Chinese) ──── */
+[data-lang="zh"] {
+  --font: "DM Sans", -apple-system, BlinkMacSystemFont, "Segoe UI",
+          "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei",
+          "Noto Sans CJK SC", sans-serif;
+  --heading: "Space Grotesk", "DM Sans",
+             "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei",
+             "Noto Sans CJK SC", sans-serif;
 }
