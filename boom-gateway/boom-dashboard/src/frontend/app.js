@@ -91,6 +91,9 @@
       // Re-render visible dynamic content so t() picks up the new language.
       onRoute();
       onUserRoute();
+      // User sidebar title is dynamic (key alias), not in the i18n dict —
+      // re-apply after applyI18n() so it isn't stuck on the default label.
+      applyUserSidebarTitle();
     });
     checkSession();
   });
@@ -196,13 +199,22 @@
       document.getElementById("page-admin").classList.add("active");
       onRoute();
     } else {
-      const titleEl = document.getElementById("user-sidebar-title");
-      if (titleEl && currentUser) titleEl.textContent = currentUser.user_id || "Dashboard";
+      applyUserSidebarTitle();
       document.getElementById("page-dashboard").classList.add("active");
       loadUserData();
       startUsageRefresh();
       onUserRoute();
     }
+  }
+
+  // User sidebar title shows the logged-in user's key alias (fallback user_id),
+  // served by the backend as currentUser.user_id. It is NOT in the i18n
+  // dictionary — this helper is the single source of truth so language
+  // switches don't clobber it.
+  function applyUserSidebarTitle() {
+    const titleEl = document.getElementById("user-sidebar-title");
+    if (!titleEl || !currentUser) return;
+    titleEl.textContent = currentUser.user_id || t("user.sidebar_title");
   }
 
   // ── Login ─────────────────────────────────────────────
