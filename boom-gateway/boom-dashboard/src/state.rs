@@ -4,6 +4,7 @@ use boom_flowcontrol::FlowController;
 use boom_limiter::{PlanStore, SlidingWindowLimiter};
 use boom_promptlog::PromptLogWriter;
 use boom_routing::{AliasStore, DeploymentStore, InFlightTracker, RebalanceCounter, RequestRateTracker};
+use boom_ctxaware::AgentStatsTracker;
 use dashmap::DashMap;
 use serde_json::Value;
 use sqlx::PgPool;
@@ -59,6 +60,8 @@ pub type AdminTx = mpsc::Sender<AdminCommand>;
 /// Independent from boom-gateway's AppState to avoid type coupling.
 #[derive(Clone)]
 pub struct DashboardState {
+    /// Dashboard-only DB pool (max=3), isolated from the forwarding path's
+    /// pool (max=30). Heavy stats aggregations cannot starve request forwarding.
     pub db_pool: Option<PgPool>,
     pub plan_store: Arc<PlanStore>,
     pub limiter: Arc<SlidingWindowLimiter>,
@@ -86,6 +89,8 @@ pub struct DashboardState {
     pub rebalance_counter: Arc<RebalanceCounter>,
     /// Per-deployment request rate tracker for dashboard stats.
     pub request_rate: Arc<RequestRateTracker>,
+    /// Agent (client-type) statistics tracker for dashboard stats.
+    pub agent_stats: Arc<AgentStatsTracker>,
     /// Authenticator — used for key alias lookups (reads boom_verification_token).
     pub auth: Arc<dyn KeyAliasLookup>,
 }
@@ -105,6 +110,7 @@ impl DashboardState {
         prompt_log_writer: PromptLogWriter,
         rebalance_counter: Arc<RebalanceCounter>,
         request_rate: Arc<RequestRateTracker>,
+        agent_stats: Arc<AgentStatsTracker>,
         auth: Arc<dyn KeyAliasLookup>,
     ) -> Self {
         // Derive JWT secret from master_key, or use a random fallback.
@@ -128,6 +134,7 @@ impl DashboardState {
             prompt_log_writer,
             rebalance_counter,
             request_rate,
+            agent_stats,
             auth,
         }
     }

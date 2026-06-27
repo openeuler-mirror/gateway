@@ -4,6 +4,7 @@ pub mod handlers_static;
 pub mod handlers_user;
 pub mod migrations;
 pub mod state;
+pub mod stats_timeseries;
 
 use axum::routing::{delete, get, post, put};
 use axum::Router;
@@ -27,6 +28,7 @@ pub fn build_router<S: Clone + Send + Sync + 'static>(state: DashboardState) -> 
         .route("/dashboard/", get(handlers_static::index))
         .route("/dashboard/style.css", get(handlers_static::style_css))
         .route("/dashboard/app.js", get(handlers_static::app_js))
+        .route("/dashboard/i18n.js", get(handlers_static::i18n_js))
         // Auth endpoints.
         .route("/dashboard/api/auth/login", post(auth::login))
         .route("/dashboard/api/auth/logout", post(auth::logout))
@@ -118,15 +120,15 @@ pub fn build_router<S: Clone + Send + Sync + 'static>(state: DashboardState) -> 
             "/dashboard/api/admin/logs",
             get(handlers_admin::list_logs),
         )
-        // Admin — Model Statistics.
-        .route(
-            "/dashboard/api/admin/stats/models",
-            get(handlers_admin::get_model_stats),
-        )
         // Admin — In-Flight Request Stats (real-time, includes flow control).
         .route(
             "/dashboard/api/admin/stats/inflight",
             get(handlers_admin::get_inflight_stats),
+        )
+        // Admin — Deployment 24h Summary (on-demand, off auto-refresh).
+        .route(
+            "/dashboard/api/admin/stats/deployments/summary",
+            get(handlers_admin::get_deployment_summary_24h),
         )
         // Admin — Rebalance Events Stats (last 60 minutes).
         .route(
@@ -137,6 +139,11 @@ pub fn build_router<S: Clone + Send + Sync + 'static>(state: DashboardState) -> 
         .route(
             "/dashboard/api/admin/stats/request_rate",
             get(handlers_admin::get_request_rate_stats),
+        )
+        // Admin — Agent Stats (client-type breakdown, last 60 minutes).
+        .route(
+            "/dashboard/api/admin/stats/agents",
+            get(handlers_admin::get_agent_stats),
         )
         // Admin — Rate Limit Window Reset.
         .route(

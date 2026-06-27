@@ -8,6 +8,7 @@ members = [
     "boom-gateway/boom-limiter",
     "boom-gateway/boom-routing",
     "boom-gateway/boom-audit",
+    "boom-gateway/boom-ctxaware",
     "boom-gateway/boom-flowcontrol",
     "boom-gateway/boom-main",
     "boom-gateway/boom-dashboard",

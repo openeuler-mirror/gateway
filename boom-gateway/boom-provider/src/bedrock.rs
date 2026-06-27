@@ -14,15 +14,17 @@ pub struct BedrockProvider {
     model: String,
     region: String,
     deployment_id: Option<String>,
+    client_type_header: bool,
 }
 
 impl BedrockProvider {
-    pub fn new(client: Client, model: &str, region: &str, deployment_id: Option<String>) -> Self {
+    pub fn new(client: Client, model: &str, region: &str, deployment_id: Option<String>, client_type_header: bool) -> Self {
         Self {
             client,
             model: model.to_string(),
             region: region.to_string(),
             deployment_id,
+            client_type_header,
         }
     }
 
@@ -62,5 +64,9 @@ impl Provider for BedrockProvider {
 
     fn deployment_id(&self) -> Option<&str> {
         self.deployment_id.as_deref()
+    }
+
+    fn client_type_header(&self) -> bool {
+        self.client_type_header
     }
 }

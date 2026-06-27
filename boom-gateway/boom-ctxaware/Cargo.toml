@@ -1,0 +1,9 @@
+[package]
+name = "boom-ctxaware"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+boom-core = { path = "../boom-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }

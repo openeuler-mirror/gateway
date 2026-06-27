@@ -427,6 +427,33 @@ input, select, textarea { font-family: var(--font); font-size: 14px; }
 }
 .theme-toggle svg { width: 18px; height: 18px; }
 
+/* ── Sidebar Top (title + lang toggle) ───────────────────── */
+.sidebar-top {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 8px; padding: 16px 20px 14px;
+  border-bottom: 1px solid var(--sidebar-border);
+}
+.sidebar-top h2 {
+  padding: 0; margin: 0; font-size: 13px; letter-spacing: 1.2px;
+  color: var(--sidebar-text); font-weight: 600; text-transform: uppercase;
+}
+
+/* ── Language Toggle ─────────────────────────────────────── */
+.lang-toggle {
+  width: 36px; height: 36px; border-radius: var(--radius-sm);
+  background: var(--sidebar-hover); border: 1px solid var(--sidebar-border);
+  color: var(--sidebar-text);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 0.85rem; font-weight: 600; line-height: 1;
+  transition: all var(--transition); flex-shrink: 0; cursor: pointer;
+  font-family: var(--font-ui, inherit);
+}
+.lang-toggle:hover {
+  background: var(--sidebar-active); color: var(--sidebar-text-active);
+  border-color: rgba(232,116,12,.3);
+}
+.lang-toggle .lang-current { display: inline-block; }
+
 /* ── Main Content ───────────────────────────────────────── */
 .main-content {
   flex: 1; padding: 32px; overflow-y: auto; background: var(--bg);
@@ -446,6 +473,17 @@ input, select, textarea { font-family: var(--font); font-size: 14px; }
 }
 .section-header h2 { font-size: 20px; color: var(--text); font-weight: 700; letter-spacing: -.2px; }
 .section-header > div { display: flex; gap: 8px; align-items: center; }
+
+.debug-banner {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent, #f0a020);
+  padding: 10px 14px;
+  margin-bottom: 22px;
+  font-size: 13px;
+  color: var(--text3);
+  border-radius: 4px;
+}
 
 /* ── Cards ──────────────────────────────────────────────── */
 .card {
@@ -494,6 +532,42 @@ input, select, textarea { font-family: var(--font); font-size: 14px; }
   box-shadow: 0 1px 2px rgba(0,0,0,.04);
 }
 .btn-small:hover { border-color: var(--primary); color: var(--primary); background: var(--primary-bg); box-shadow: 0 1px 4px rgba(0,0,0,.08); }
+
+/* Range selector for time-windowed stats (Agent / Request Rate) */
+.range-controls {
+  display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap;
+  font-size: 12px;
+}
+.btn-range {
+  padding: 4px 10px; font-size: 11px; border-radius: var(--radius-xs);
+  border: 1px solid var(--border); background: var(--surface); color: var(--text2);
+  font-weight: 500; cursor: pointer; transition: all var(--transition);
+}
+.btn-range:hover { border-color: var(--primary); color: var(--primary); }
+.btn-range.active {
+  background: var(--primary); color: #fff; border-color: var(--primary);
+  box-shadow: 0 1px 4px rgba(0,0,0,.12);
+}
+.range-custom {
+  display: inline-flex; align-items: center; gap: 4px;
+}
+.range-custom input[type="datetime-local"] {
+  padding: 3px 6px; font-size: 11px; border-radius: var(--radius-xs);
+  border: 1px solid var(--border); background: var(--surface); color: var(--text2);
+}
+.btn-tiny {
+  padding: 3px 9px; font-size: 11px; border-radius: var(--radius-xs);
+  border: 1px solid var(--primary); background: var(--primary); color: #fff;
+  font-weight: 500; cursor: pointer;
+}
+.btn-tiny:hover { opacity: .9; }
+.range-note {
+  color: var(--danger); font-size: 11px; padding-left: 4px;
+}
+.range-window-note {
+  font-size: 11px; color: var(--text3); margin: 2px 0 6px 0;
+  font-family: ui-monospace, SFMono-Regular, monospace;
+}
 
 /* ── Tables ─────────────────────────────────────────────── */
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
@@ -699,6 +773,8 @@ tr.filter-row td { padding: 3px 4px; background: var(--surface2); border-bottom:
 @media (max-width: 768px) {
   .sidebar { width: 56px; }
   .sidebar h2, .sidebar .nav-link span, .sidebar-footer { display: none; }
+  .sidebar-top { padding: 12px 8px; justify-content: center; }
+  .lang-toggle { display: none; }
   .nav-link { justify-content: center; padding: 12px; }
   .nav-link svg { margin: 0; }
   .theme-toggle { display: none; }
@@ -846,6 +922,48 @@ input[list] {
 .rb-bar-label { font-size: 10px; color: var(--text3); margin-top: 3px; white-space: nowrap; }
 .rb-label-hidden { visibility: hidden; }
 
+/* ── Agent Statistics (stacked bar: anthropic vs other) ─── */
+.agent-summary {
+  display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px; margin-bottom: 1rem;
+}
+.agent-summary-card {
+  background: var(--surface2); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); padding: 12px 16px;
+}
+.agent-summary-label {
+  font-size: 11px; color: var(--text3);
+  text-transform: uppercase; letter-spacing: .04em; margin-bottom: 4px;
+}
+.agent-summary-value {
+  font-size: 24px; font-weight: 700; color: var(--text); line-height: 1.1;
+}
+.agent-bar {
+  width: 100%; min-height: 1px;
+  display: flex; flex-direction: column;
+  border-radius: 3px 3px 0 0; overflow: hidden;
+  transition: height .3s ease;
+}
+.agent-bar-anthropic {
+  background: linear-gradient(180deg, #34d399, #10b981);  /* emerald-400 → emerald-500 */
+  flex: 0; min-height: 0;
+}
+.agent-bar-other {
+  background: linear-gradient(180deg, #cbd5e1, #94a3b8);  /* slate-300 → slate-400 */
+  flex: 0; min-height: 0;
+}
+.agent-legend {
+  display: flex; gap: 20px; margin-top: 8px;
+  font-size: 11px; color: var(--text3);
+}
+.agent-legend-item { display: inline-flex; align-items: center; gap: 6px; }
+.agent-legend-swatch {
+  display: inline-block; width: 10px; height: 10px;
+  border-radius: 2px;
+}
+.agent-legend-anthropic { background: #10b981; }
+.agent-legend-other { background: #94a3b8; }
+
 /* ── Skeleton Loading ───────────────────────────────────── */
 .skeleton {
   background: linear-gradient(90deg, var(--surface2) 25%, var(--surface3) 50%, var(--surface2) 75%);
@@ -877,4 +995,14 @@ input[list] {
 .toast.toast-out { animation: toastOut .2s ease forwards; }
 @keyframes toastOut {
   to { opacity: 0; transform: translateX(20px); }
+}
+
+/* ── CJK font optimization (when language is Chinese) ──── */
+[data-lang="zh"] {
+  --font: "DM Sans", -apple-system, BlinkMacSystemFont, "Segoe UI",
+          "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei",
+          "Noto Sans CJK SC", sans-serif;
+  --heading: "Space Grotesk", "DM Sans",
+             "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei",
+             "Noto Sans CJK SC", sans-serif;
 }

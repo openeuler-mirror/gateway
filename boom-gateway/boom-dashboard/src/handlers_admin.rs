@@ -860,6 +860,9 @@ pub struct CreateDeploymentRequest {
     /// Max total input context chars across in-flight requests (flow control, 0 = no limit).
     #[serde(default)]
     pub max_context_len: Option<i64>,
+    /// Attach `X-BooM-Client-Type` header to outgoing requests (default false).
+    #[serde(default)]
+    pub client_type_header: bool,
 }
 
 fn default_timeout() -> i64 {
@@ -1701,56 +1704,6 @@ pub async fn delete_team(
 }
 
 // ═══════════════════════════════════════════════════════════
-// Model Statistics
-// ═══════════════════════════════════════════════════════════
-
-#[derive(Debug, serde::Serialize, sqlx::FromRow)]
-struct ModelStatsRow {
-    model: String,
-    total_requests: i64,
-    success_count: i64,
-    error_count: i64,
-    total_input_tokens: i64,
-    total_output_tokens: i64,
-    avg_duration_ms: i32,
-    last_request_at: Option<chrono::DateTime<chrono::Utc>>,
-}
-
-pub async fn get_model_stats(
-    _session: AdminSession,
-    Extension(state): Extension<std::sync::Arc<DashboardState>>,
-) -> Response {
-    let pool = match &state.db_pool {
-        Some(p) => p,
-        None => return Json(json!({"error": "Database not available"})).into_response(),
-    };
-
-    let stats = sqlx::query_as::<_, ModelStatsRow>(
-        r#"SELECT COALESCE(model_name, model) AS model,
-                  COUNT(*) as total_requests,
-                  COUNT(*) FILTER (WHERE status_code = 200) as success_count,
-                  COUNT(*) FILTER (WHERE status_code != 200) as error_count,
-                  COALESCE(SUM(input_tokens), 0) as total_input_tokens,
-                  COALESCE(SUM(output_tokens), 0) as total_output_tokens,
-                  COALESCE(AVG(duration_ms), 0)::int as avg_duration_ms,
-                  MAX(created_at) as last_request_at
-           FROM boom_request_log
-           GROUP BY COALESCE(model_name, model)
-           ORDER BY total_requests DESC"#,
-    )
-    .fetch_all(pool)
-    .await;
-
-    match stats {
-        Ok(rows) => Json(json!({"models": rows})).into_response(),
-        Err(e) => {
-            tracing::error!("Failed to query model stats: {}", e);
-            Json(json!({"error": e.to_string()})).into_response()
-        }
-    }
-}
-
-// ═══════════════════════════════════════════════════════════
 // In-Flight Request Stats (real-time)
 // ═══════════════════════════════════════════════════════════
 
@@ -1859,6 +1812,86 @@ fn aggregate_dispatched_keys(keys: Option<&Vec<boom_flowcontrol::DispatchedKeyEn
 }
 
 // ═══════════════════════════════════════════════════════════
+// Deployment 24h Summary (off the auto-refresh path)
+// ═══════════════════════════════════════════════════════════
+
+#[derive(Debug, sqlx::FromRow)]
+struct DeploymentSummaryRow {
+    deployment_id: String,
+    total_requests: i64,
+    input_count: i64,
+    sum_input_tokens: i64,
+    output_count: i64,
+    sum_output_tokens: i64,
+    ttft_count: i64,
+    sum_ttft_ms: i64,
+}
+
+/// GET /admin/stats/deployments/summary — 24h per-deployment aggregates.
+/// Computed on demand (page load + Refresh button), NOT on the 3s auto-poll.
+pub async fn get_deployment_summary_24h(
+    _session: AdminSession,
+    Extension(state): Extension<Arc<DashboardState>>,
+) -> Response {
+    let pool = match &state.db_pool {
+        Some(p) => p,
+        None => return Json(json!({"error": "Database not available"})).into_response(),
+    };
+
+    let rows_res = async {
+        let mut tx = begin_with_timeout(pool).await?;
+        let rows = sqlx::query_as::<_, DeploymentSummaryRow>(
+            r#"SELECT
+                 deployment_id,
+                 COUNT(*)::bigint AS total_requests,
+                 COUNT(input_tokens)::bigint AS input_count,
+                 COALESCE(SUM(input_tokens), 0)::bigint AS sum_input_tokens,
+                 COUNT(output_tokens)::bigint AS output_count,
+                 COALESCE(SUM(output_tokens), 0)::bigint AS sum_output_tokens,
+                 COUNT(ttft_ms)::bigint AS ttft_count,
+                 COALESCE(SUM(ttft_ms), 0)::bigint AS sum_ttft_ms
+               FROM boom_request_log
+               WHERE created_at >= NOW() - INTERVAL '24 hours'
+                 AND deployment_id IS NOT NULL
+                 AND status_code >= 200 AND status_code < 300
+               GROUP BY deployment_id"#,
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok::<_, sqlx::Error>(rows)
+    }.await;
+
+    let rows = match rows_res {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("Failed to query deployment summary: {}", e);
+            return Json(json!({"error": e.to_string()})).into_response();
+        }
+    };
+
+    let deployments: Vec<serde_json::Value> = rows.into_iter()
+        .map(|r| {
+            let avg = |sum: i64, count: i64| -> Option<f64> {
+                if count == 0 { None } else { Some(sum as f64 / count as f64) }
+            };
+            json!({
+                "deployment_id": r.deployment_id,
+                "total_requests": r.total_requests,
+                "avg_input_tokens": avg(r.sum_input_tokens, r.input_count),
+                "avg_output_tokens": avg(r.sum_output_tokens, r.output_count),
+                "avg_ttft_ms": avg(r.sum_ttft_ms, r.ttft_count),
+            })
+        })
+        .collect();
+
+    Json(json!({
+        "deployments": deployments,
+        "window_hours": 24,
+    })).into_response()
+}
+
+// ═══════════════════════════════════════════════════════════
 // Rebalance Stats
 // ═══════════════════════════════════════════════════════════
 
@@ -1874,27 +1907,330 @@ pub async fn get_rebalance_stats(
 }
 
 // ═══════════════════════════════════════════════════════════
-// Request Rate Stats (per deployment, last 60 minutes)
+// Time-windowed Stats (Agent Statistics + Request Rate)
 // ═══════════════════════════════════════════════════════════
+
+use crate::stats_timeseries::{ResolvedRange, StatsRangeQuery, TimeWindow};
+
+#[derive(Debug, sqlx::FromRow)]
+struct AgentBucketRow {
+    bucket_epoch: i64,
+    total: i64,
+    anthropic: i64,
+    input_tokens_total: i64,
+    input_tokens_anthropic: i64,
+    output_tokens_total: i64,
+    output_tokens_anthropic: i64,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct RateBucketRow {
+    bucket_epoch: i64,
+    deployment_id: Option<String>,
+    total: i64,
+}
+
+fn window_json(w: &TimeWindow) -> serde_json::Value {
+    json!({
+        "from": w.from.to_rfc3339(),
+        "to": w.to.to_rfc3339(),
+        "bucket_secs": w.bucket_secs,
+    })
+}
+
+/// Begin a dashboard-query transaction with a hard `statement_timeout`.
+/// SET LOCAL scopes the timeout to this transaction only, so it never leaks
+/// into other queries sharing the dashboard pool.
+async fn begin_with_timeout(pool: &sqlx::PgPool) -> Result<sqlx::Transaction<'_, sqlx::Postgres>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET LOCAL statement_timeout = '10s'")
+        .execute(&mut *tx)
+        .await?;
+    Ok(tx)
+}
 
 pub async fn get_request_rate_stats(
     _session: AdminSession,
     Extension(state): Extension<Arc<DashboardState>>,
+    Query(q): Query<StatsRangeQuery>,
 ) -> Response {
-    let all = state.request_rate.snapshot_all();
-    let charts: Vec<serde_json::Value> = all.into_iter().map(|(dep_id, data)| {
-        let model = if dep_id == "_total" {
-            "ALL".to_string()
-        } else {
-            state.deployment_store.find_model_by_deployment_id(&dep_id)
-                .unwrap_or_else(|| "-".to_string())
-        };
-        let events: Vec<serde_json::Value> = data.into_iter()
-            .map(|(label, count)| json!({ "minute": label, "count": count }))
+    let parsed = match ResolvedRange::parse(&q) {
+        Ok(p) => p,
+        Err(e) => return Json(json!({"error": e})).into_response(),
+    };
+
+    if parsed.use_memory {
+        let window = parsed.resolved.to_window();
+        let all = state.request_rate.snapshot_all();
+        let expected_ts: Vec<String> = window.expected_buckets().into_iter()
+            .map(|t| t.to_rfc3339()).collect();
+        let charts: Vec<serde_json::Value> = all.into_iter().map(|(dep_id, data)| {
+            let model = if dep_id == "_total" {
+                "ALL".to_string()
+            } else {
+                state.deployment_store.find_model_by_deployment_id(&dep_id)
+                    .unwrap_or_else(|| "-".to_string())
+            };
+            // Tracker has exactly 60 buckets aligned to (now - 59min) .. now,
+            // which matches the 1h TimeWindow's expected_buckets ordering.
+            let events: Vec<serde_json::Value> = data.into_iter().enumerate()
+                .map(|(i, (_, count))| json!({
+                    "ts": expected_ts.get(i).cloned().unwrap_or_default(),
+                    "count": count,
+                }))
+                .collect();
+            json!({ "deployment_id": dep_id, "model": model, "events": events })
+        }).collect();
+        return Json(json!({
+            "window": window_json(&window),
+            "charts": charts,
+        })).into_response();
+    }
+
+    let window = parsed.resolved.to_window();
+    let pool = match &state.db_pool {
+        Some(p) => p,
+        None => return Json(json!({"error": "Database not available"})).into_response(),
+    };
+
+    let bucket_secs = window.bucket_secs;
+    let from = window.from;
+    let to = window.to;
+    let from_epoch = from.timestamp();
+
+    let rows_res = async {
+        let mut tx = begin_with_timeout(pool).await?;
+        let rows = sqlx::query_as::<_, RateBucketRow>(
+            r#"SELECT
+                 (FLOOR((EXTRACT(EPOCH FROM created_at) - $1) / $2) * $2 + $1)::bigint AS bucket_epoch,
+                 deployment_id,
+                 COUNT(*)::bigint AS total
+               FROM boom_request_log
+               WHERE created_at >= $3 AND created_at < $4
+                 AND status_code = 200
+               GROUP BY 1, 2
+               ORDER BY 2, 1"#,
+        )
+        .bind(from_epoch)
+        .bind(bucket_secs)
+        .bind(from)
+        .bind(to)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok::<_, sqlx::Error>(rows)
+    }.await;
+
+    let rows = match rows_res {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("Failed to query request_rate stats: {}", e);
+            return Json(json!({"error": e.to_string()})).into_response();
+        }
+    };
+
+    let expected: Vec<i64> = window.expected_buckets().into_iter().map(|t| t.timestamp()).collect();
+
+    // Group rows by deployment_id, preserving order of first appearance.
+    let mut dep_order: Vec<String> = Vec::new();
+    let mut by_dep: std::collections::HashMap<String, std::collections::HashMap<i64, i64>> = std::collections::HashMap::new();
+    let mut total_by_bucket: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+    for row in rows {
+        let dep = row.deployment_id.clone().unwrap_or_else(|| "_unknown".to_string());
+        if !by_dep.contains_key(&dep) {
+            dep_order.push(dep.clone());
+        }
+        let map = by_dep.entry(dep).or_default();
+        map.insert(row.bucket_epoch, row.total);
+        *total_by_bucket.entry(row.bucket_epoch).or_insert(0) += row.total;
+    }
+
+    let mut charts: Vec<serde_json::Value> = Vec::new();
+
+    // _total first — matches the memory-path ordering.
+    {
+        let events = build_rate_events(&expected, &total_by_bucket);
+        charts.push(json!({ "deployment_id": "_total", "model": "ALL", "events": events }));
+    }
+    for dep in &dep_order {
+        let map = by_dep.get(dep).unwrap();
+        let model = state.deployment_store.find_model_by_deployment_id(dep)
+            .unwrap_or_else(|| "-".to_string());
+        let events = build_rate_events(&expected, map);
+        charts.push(json!({ "deployment_id": dep, "model": model, "events": events }));
+    }
+
+    Json(json!({
+        "window": window_json(&window),
+        "charts": charts,
+    })).into_response()
+}
+
+fn build_rate_events(
+    expected: &[i64],
+    counts: &std::collections::HashMap<i64, i64>,
+) -> Vec<serde_json::Value> {
+    expected.iter().map(|ep| {
+        let ts = chrono::DateTime::<chrono::Utc>::from_timestamp(*ep, 0)
+            .unwrap_or_else(chrono::Utc::now);
+        json!({
+            "ts": ts.to_rfc3339(),
+            "count": counts.get(ep).copied().unwrap_or(0),
+        })
+    }).collect()
+}
+
+// ═══════════════════════════════════════════════════════════
+// Agent Stats (client-type breakdown)
+// ═══════════════════════════════════════════════════════════
+
+pub async fn get_agent_stats(
+    _session: AdminSession,
+    Extension(state): Extension<Arc<DashboardState>>,
+    Query(q): Query<StatsRangeQuery>,
+) -> Response {
+    let parsed = match ResolvedRange::parse(&q) {
+        Ok(p) => p,
+        Err(e) => return Json(json!({"error": e})).into_response(),
+    };
+
+    if parsed.use_memory {
+        let snap = state.agent_stats.snapshot();
+        let window = parsed.resolved.to_window();
+        let expected_ts: Vec<String> = window.expected_buckets().into_iter()
+            .map(|t| t.to_rfc3339()).collect();
+        // Tracker has 60 buckets aligned to (now - 59min) .. now; pair each by index.
+        let events: Vec<serde_json::Value> = snap.events.into_iter().enumerate()
+            .map(|(i, b)| json!({
+                "ts": expected_ts.get(i).cloned().unwrap_or_default(),
+                "total": b.total,
+                "anthropic": b.anthropic,
+                "input_tokens_total": b.input_tokens_total,
+                "input_tokens_anthropic": b.input_tokens_anthropic,
+                "output_tokens_total": b.output_tokens_total,
+                "output_tokens_anthropic": b.output_tokens_anthropic,
+            }))
             .collect();
-        json!({ "deployment_id": dep_id, "model": model, "events": events })
-    }).collect();
-    Json(json!({ "charts": charts })).into_response()
+        return Json(json!({
+            "window": window_json(&window),
+            "events": events,
+            "summary": serde_json::to_value(&snap.summary).unwrap_or_default(),
+        })).into_response();
+    }
+
+    let window = parsed.resolved.to_window();
+    let pool = match &state.db_pool {
+        Some(p) => p,
+        None => return Json(json!({"error": "Database not available"})).into_response(),
+    };
+
+    let bucket_secs = window.bucket_secs;
+    let from = window.from;
+    let to = window.to;
+    let from_epoch = from.timestamp();
+
+    let rows_res = async {
+        let mut tx = begin_with_timeout(pool).await?;
+        let rows = sqlx::query_as::<_, AgentBucketRow>(
+            r#"SELECT
+                 (FLOOR((EXTRACT(EPOCH FROM created_at) - $1) / $2) * $2 + $1)::bigint AS bucket_epoch,
+                 COUNT(*)::bigint AS total,
+                 COUNT(*) FILTER (WHERE api_path LIKE '/v1/messages%')::bigint AS anthropic,
+                 COALESCE(SUM(input_tokens), 0)::bigint AS input_tokens_total,
+                 COALESCE(SUM(input_tokens) FILTER (WHERE api_path LIKE '/v1/messages%'), 0)::bigint AS input_tokens_anthropic,
+                 COALESCE(SUM(output_tokens), 0)::bigint AS output_tokens_total,
+                 COALESCE(SUM(output_tokens) FILTER (WHERE api_path LIKE '/v1/messages%'), 0)::bigint AS output_tokens_anthropic
+               FROM boom_request_log
+               WHERE created_at >= $3 AND created_at < $4
+                 AND status_code = 200
+               GROUP BY 1
+               ORDER BY 1"#,
+        )
+        .bind(from_epoch)
+        .bind(bucket_secs)
+        .bind(from)
+        .bind(to)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok::<_, sqlx::Error>(rows)
+    }.await;
+
+    let rows = match rows_res {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("Failed to query agent stats: {}", e);
+            return Json(json!({"error": e.to_string()})).into_response();
+        }
+    };
+
+    let by_epoch: std::collections::HashMap<i64, AgentBucketRow> = rows.into_iter()
+        .map(|r| (r.bucket_epoch, r))
+        .collect();
+
+    let mut events: Vec<serde_json::Value> = Vec::new();
+    let mut total: u64 = 0;
+    let mut anthropic: u64 = 0;
+    let mut input_tokens_total: u64 = 0;
+    let mut input_tokens_anthropic: u64 = 0;
+    let mut output_tokens_total: u64 = 0;
+    let mut output_tokens_anthropic: u64 = 0;
+    for ts in window.expected_buckets() {
+        let ep = ts.timestamp();
+        let (t, a, it, ia, ot, oa) = match by_epoch.get(&ep) {
+            Some(r) => (
+                r.total as u64,
+                r.anthropic as u64,
+                r.input_tokens_total as u64,
+                r.input_tokens_anthropic as u64,
+                r.output_tokens_total as u64,
+                r.output_tokens_anthropic as u64,
+            ),
+            None => (0, 0, 0, 0, 0, 0),
+        };
+        total += t;
+        anthropic += a;
+        input_tokens_total += it;
+        input_tokens_anthropic += ia;
+        output_tokens_total += ot;
+        output_tokens_anthropic += oa;
+        events.push(json!({
+            "ts": ts.to_rfc3339(),
+            "total": t,
+            "anthropic": a,
+            "input_tokens_total": it,
+            "input_tokens_anthropic": ia,
+            "output_tokens_total": ot,
+            "output_tokens_anthropic": oa,
+        }));
+    }
+    let ratio = if total == 0 { 0.0 } else { anthropic as f64 / total as f64 };
+    let input_token_ratio = if input_tokens_total == 0 {
+        0.0
+    } else {
+        input_tokens_anthropic as f64 / input_tokens_total as f64
+    };
+    let output_token_ratio = if output_tokens_total == 0 {
+        0.0
+    } else {
+        output_tokens_anthropic as f64 / output_tokens_total as f64
+    };
+
+    Json(json!({
+        "window": window_json(&window),
+        "events": events,
+        "summary": {
+            "total": total,
+            "anthropic": anthropic,
+            "ratio": ratio,
+            "input_tokens_total": input_tokens_total,
+            "input_tokens_anthropic": input_tokens_anthropic,
+            "input_token_ratio": input_token_ratio,
+            "output_tokens_total": output_tokens_total,
+            "output_tokens_anthropic": output_tokens_anthropic,
+            "output_token_ratio": output_token_ratio,
+        },
+    })).into_response()
 }
 
 // ═══════════════════════════════════════════════════════════

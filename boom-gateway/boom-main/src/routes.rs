@@ -11,6 +11,7 @@ use boom_core::anthropic::{
 use boom_core::provider::RateLimiter;
 use boom_core::types::*;
 use boom_core::GatewayError;
+use boom_ctxaware::AgentStatsTracker;
 use boom_flowcontrol::{FlowControlError, FlowControlledStream};
 use boom_limiter::{ConcurrencyGuard, GuardedStream, PlanStore, RateLimitPlan};
 use boom_promptlog::{PromptLogEntry, PromptLogStream};
@@ -171,10 +172,18 @@ struct LoggedStream<S> {
     start: Instant,
     first_token_at: Option<Instant>,
     usage: UsageTracker,
+    agent_stats: Option<Arc<AgentStatsTracker>>,
 }
 
 impl<S> LoggedStream<S> {
-    fn new(inner: S, pool: Option<PgPool>, log: RequestLog, start: Instant, usage: UsageTracker) -> Self {
+    fn new(
+        inner: S,
+        pool: Option<PgPool>,
+        log: RequestLog,
+        start: Instant,
+        usage: UsageTracker,
+        agent_stats: Option<Arc<AgentStatsTracker>>,
+    ) -> Self {
         Self {
             inner,
             pool,
@@ -182,6 +191,7 @@ impl<S> LoggedStream<S> {
             start,
             first_token_at: None,
             usage,
+            agent_stats,
         }
     }
 }
@@ -195,6 +205,14 @@ impl<S> Drop for LoggedStream<S> {
             if let Ok(guard) = self.usage.lock() {
                 log.input_tokens = guard.0;
                 log.output_tokens = guard.1;
+            }
+            // Account tokens to agent stats before moving log into log_request.
+            if let Some(tracker) = &self.agent_stats {
+                let input = log.input_tokens.unwrap_or(0) as u64;
+                let output = log.output_tokens.unwrap_or(0) as u64;
+                if input > 0 || output > 0 {
+                    tracker.record_tokens(&log.api_path, input, output);
+                }
             }
             log_request(self.pool.clone(), log);
         }
@@ -352,11 +370,6 @@ async fn chat_completions_inner(
     let deployment_id = provider.deployment_id().map(|s| s.to_string());
     let inflight_model = state.router.resolve_model_name(&resolved_model);
 
-    // 3.1. Record request rate per deployment.
-    if let Some(ref did) = deployment_id {
-        state.request_rate.record(did);
-    }
-
     // 3.2. Determine KV-cache reporting mode.
     //      Full reporting is needed when kvc-aware is enabled so the trie
     //      stays in sync with vLLM's internal prefix cache — vLLM reuses
@@ -383,7 +396,12 @@ async fn chat_completions_inner(
     };
 
     // Attach gateway-internal headers (e.g. X-Gateway-Priority) when enabled.
-    req.gateway_headers = build_gateway_headers(is_vip, inner.config.router_settings.enable_priority_header);
+    req.gateway_headers = build_gateway_headers(
+        is_vip,
+        inner.config.router_settings.enable_priority_header,
+        api_path,
+        provider.client_type_header(),
+    );
 
     // Capture request body for debug recording if debug mode is enabled.
     let debug_req_body = if state.debug_store.is_enabled() {
@@ -416,6 +434,12 @@ async fn chat_completions_inner(
         };
         let guarded = GuardedStream::new(flow_controlled, guard);
 
+        // Provider returned a stream — count as a successfully handled request.
+        state.agent_stats.record(api_path);
+        if let Some(ref did) = deployment_id {
+            state.request_rate.record(did);
+        }
+
         let api_path_owned = api_path.to_string();
         let logged = LoggedStream::new(guarded, state.db_pool.clone(), RequestLog {
             request_id: Some(request_id),
@@ -436,7 +460,7 @@ async fn chat_completions_inner(
             ttft_ms: None,
             deployment_id,
             client_ip: Some(client_ip.clone()),
-        }, start, usage);
+        }, start, usage, Some(state.agent_stats.clone()));
 
         // Wrap with prompt log stream if enabled, then wrap in Sse.
         if let Some(sender) = prompt_log_sender {
@@ -477,6 +501,12 @@ async fn chat_completions_inner(
         let input_tokens = response.usage.prompt_tokens as i32;
         let output_tokens = response.usage.completion_tokens as i32;
 
+        // Provider returned a response — count as a successfully handled request.
+        state.agent_stats.record(api_path);
+        if let Some(ref did) = deployment_id {
+            state.request_rate.record(did);
+        }
+
         log_request(
             state.db_pool.clone(),
             RequestLog {
@@ -500,6 +530,7 @@ async fn chat_completions_inner(
                 client_ip: Some(client_ip.clone()),
             },
         );
+        state.agent_stats.record_tokens(api_path, input_tokens as u64, output_tokens as u64);
 
         // Normalize internal ContentPart::Reasoning to standard OpenAI `reasoning_content`
         // field so clients receive {"reasoning_content": "..."} instead of non-standard
@@ -1126,11 +1157,23 @@ fn is_vip_key(metadata: &serde_json::Value) -> bool {
 /// explicitly enabled via `router_settings.enable_priority_header`. This keeps
 /// normal deployments clean and only emits `X-Gateway-Priority` when a
 /// downstream scheduler is being rolled out.
-fn build_gateway_headers(is_vip: bool, enable_priority_header: bool) -> std::collections::HashMap<String, String> {
+fn build_gateway_headers(
+    is_vip: bool,
+    enable_priority_header: bool,
+    api_path: &str,
+    client_type_enabled: bool,
+) -> std::collections::HashMap<String, String> {
     let mut headers = std::collections::HashMap::new();
     if enable_priority_header {
         let priority = if is_vip { 100 } else { 0 };
         headers.insert("X-Gateway-Priority".to_string(), priority.to_string());
+    }
+    if client_type_enabled {
+        let kind = boom_ctxaware::classify(api_path);
+        headers.insert(
+            boom_ctxaware::CLIENT_TYPE_HEADER.to_string(),
+            kind.wire_label().to_string(),
+        );
     }
     headers
 }
@@ -1461,7 +1504,6 @@ pub async fn messages(
 
     tracing::info!(request_id = %request_id, model = %model, stream = is_stream, "messages request started");
 
-
     // Prompt log: check early to avoid unnecessary cloning.
     let prompt_log_should = state.prompt_log_writer.should_capture(
         &identity.key_hash,
@@ -1569,11 +1611,6 @@ pub async fn messages(
     let deployment_id = provider.deployment_id().map(|s| s.to_string());
     let inflight_model = state.router.resolve_model_name(&resolved_model);
 
-    // 3.1. Record request rate per deployment.
-    if let Some(ref did) = deployment_id {
-        state.request_rate.record(did);
-    }
-
     // 3.2. Determine KV-cache reporting mode (same logic as OpenAI path).
     openai_req.kv_cache_report_full = need_full_kv_report(
         state.kv_index.load().is_some(),
@@ -1596,7 +1633,12 @@ pub async fn messages(
     };
 
     // Attach gateway-internal headers (e.g. X-Gateway-Priority) when enabled.
-    openai_req.gateway_headers = build_gateway_headers(is_vip, inner.config.router_settings.enable_priority_header);
+    openai_req.gateway_headers = build_gateway_headers(
+        is_vip,
+        inner.config.router_settings.enable_priority_header,
+        "/v1/messages",
+        provider.client_type_header(),
+    );
 
     // Capture request body for debug recording if debug mode is enabled.
     let debug_req_body = if state.debug_store.is_enabled() {
@@ -1634,6 +1676,12 @@ pub async fn messages(
         };
         let guarded = GuardedStream::new(flow_controlled, guard);
 
+        // Provider returned a stream — count as a successfully handled request.
+        state.agent_stats.record("/v1/messages");
+        if let Some(ref did) = deployment_id {
+            state.request_rate.record(did);
+        }
+
         // Wrap with LoggedStream — log is written when stream finishes (Drop).
         let logged = LoggedStream::new(guarded, state.db_pool.clone(), RequestLog {
             request_id: Some(request_id),
@@ -1654,7 +1702,7 @@ pub async fn messages(
             ttft_ms: None,
             deployment_id,
             client_ip: Some(client_ip.clone()),
-        }, start, usage);
+        }, start, usage, Some(state.agent_stats.clone()));
 
         // Wrap with prompt log stream if enabled, then wrap in Sse.
         if let Some(sender) = prompt_log_sender {
@@ -1695,6 +1743,12 @@ pub async fn messages(
         let input_tokens = response.usage.prompt_tokens as i32;
         let output_tokens = response.usage.completion_tokens as i32;
 
+        // Provider returned a response — count as a successfully handled request.
+        state.agent_stats.record("/v1/messages");
+        if let Some(ref did) = deployment_id {
+            state.request_rate.record(did);
+        }
+
         log_request(
             state.db_pool.clone(),
             RequestLog {
@@ -1718,6 +1772,7 @@ pub async fn messages(
                 client_ip: Some(client_ip.clone()),
             },
         );
+        state.agent_stats.record_tokens("/v1/messages", input_tokens as u64, output_tokens as u64);
 
         let anthropic_resp = openai_response_to_anthropic(&response);
 
@@ -2056,25 +2111,49 @@ mod tests {
 
     #[test]
     fn headers_enabled_vip_gives_100() {
-        let headers = build_gateway_headers(true, true);
+        let headers = build_gateway_headers(true, true, "/v1/chat/completions", false);
         assert_eq!(headers.get("X-Gateway-Priority").map(String::as_str), Some("100"));
     }
 
     #[test]
     fn headers_enabled_normal_gives_0() {
-        let headers = build_gateway_headers(false, true);
+        let headers = build_gateway_headers(false, true, "/v1/chat/completions", false);
         assert_eq!(headers.get("X-Gateway-Priority").map(String::as_str), Some("0"));
     }
 
     #[test]
     fn headers_disabled_vip_is_empty() {
-        let headers = build_gateway_headers(true, false);
+        let headers = build_gateway_headers(true, false, "/v1/chat/completions", false);
         assert!(headers.is_empty(), "no header should be injected when disabled");
     }
 
     #[test]
     fn headers_disabled_normal_is_empty() {
-        let headers = build_gateway_headers(false, false);
+        let headers = build_gateway_headers(false, false, "/v1/chat/completions", false);
         assert!(headers.is_empty(), "no header should be injected when disabled");
+    }
+
+    #[test]
+    fn client_type_header_anthropic_on_messages() {
+        let headers = build_gateway_headers(false, false, "/v1/messages", true);
+        assert_eq!(
+            headers.get("X-BooM-Client-Type").map(String::as_str),
+            Some("anthropic"),
+        );
+    }
+
+    #[test]
+    fn client_type_header_anonymous_on_chat_completions() {
+        let headers = build_gateway_headers(false, false, "/v1/chat/completions", true);
+        assert_eq!(
+            headers.get("X-BooM-Client-Type").map(String::as_str),
+            Some("anonymous"),
+        );
+    }
+
+    #[test]
+    fn client_type_header_omitted_when_disabled() {
+        let headers = build_gateway_headers(false, false, "/v1/messages", false);
+        assert!(!headers.contains_key("X-BooM-Client-Type"));
     }
 }

@@ -78,6 +78,7 @@ async fn handle_create_model(
         quota_count_ratio: req.quota_count_ratio.unwrap_or(1),
         max_inflight_queue_len: req.max_inflight_queue_len,
         max_context_len: req.max_context_len,
+        client_type_header: req.client_type_header,
     };
 
     let id = DeploymentStore::create_db(db_pool, &input)
@@ -129,6 +130,7 @@ async fn handle_update_model(
         quota_count_ratio: req.quota_count_ratio.unwrap_or(1),
         max_inflight_queue_len: req.max_inflight_queue_len,
         max_context_len: req.max_context_len,
+        client_type_header: req.client_type_header,
     };
 
     let updated = DeploymentStore::update_db(db_pool, id, &input)
@@ -307,6 +309,7 @@ fn build_provider_from_row(row: &boom_routing::DeploymentProviderRow) -> Option<
         row.timeout as u64,
         &extra,
         row.deployment_id.clone(),
+        row.client_type_header.unwrap_or(false),
     ) {
         Ok(provider) => Some(provider),
         Err(e) => {
@@ -342,6 +345,7 @@ fn build_provider(req: &boom_dashboard::handlers_admin::CreateDeploymentRequest)
         req.timeout as u64,
         &extra,
         req.deployment_id.clone(),
+        req.client_type_header,
     ) {
         Ok(provider) => Some(provider),
         Err(e) => {
