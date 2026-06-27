@@ -119,11 +119,6 @@ pub fn build_router<S: Clone + Send + Sync + 'static>(state: DashboardState) -> 
             "/dashboard/api/admin/logs",
             get(handlers_admin::list_logs),
         )
-        // Admin — Model Statistics.
-        .route(
-            "/dashboard/api/admin/stats/models",
-            get(handlers_admin::get_model_stats),
-        )
         // Admin — In-Flight Request Stats (real-time, includes flow control).
         .route(
             "/dashboard/api/admin/stats/inflight",

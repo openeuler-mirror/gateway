@@ -141,6 +141,10 @@
               <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="2.5"/><path d="M8 1v2M8 13v2M1 8h2M13 8h2M3.05 3.05l1.41 1.41M11.54 11.54l1.41 1.41M3.05 12.95l1.41-1.41M11.54 4.46l1.41-1.41"/></svg>
               <span>Config</span>
             </a>
+            <a href="#/admin/debug" class="nav-link" data-section="admin-debug">
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M4 4l8 8M12 4l-8 8M8 1v2M8 13v2M1 8h2M13 8h2"/></svg>
+              <span>Debug</span>
+            </a>
           </nav>
           <div class="sidebar-footer">
             <button class="btn-secondary" id="logout-btn-admin">Logout</button>
@@ -185,8 +189,15 @@
               </div>
             </div>
             <div id="request-rate-wrap"><p class="loading">Loading...</p></div>
+          </section>
 
-            <div class="section-header" style="margin-top:2rem">
+          <!-- Debug Section -->
+          <section id="admin-debug" class="section">
+            <div class="debug-banner">
+              供调试信息显示，版本更新可能变动或删除。
+            </div>
+
+            <div class="section-header">
               <h2>Agent Statistics</h2>
               <div class="range-controls" data-target="agent">
                 <button class="btn-range active" data-range="1h">1h</button>
@@ -203,11 +214,6 @@
               </div>
             </div>
             <div id="agent-stats-wrap"><p class="loading">Loading...</p></div>
-
-            <div class="section-header" style="margin-top:2rem">
-              <h2>Model Statistics</h2>
-            </div>
-            <div id="stats-table-wrap"><p class="loading">Loading...</p></div>
           </section>
 
           <!-- Models Section -->

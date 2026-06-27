@@ -274,6 +274,7 @@
     else if (section === "admin-teams") loadTeams();
     else if (section === "admin-logs") { setupLogsFilters(); loadLogs(); }
     else if (section === "admin-config") loadConfig();
+    else if (section === "admin-debug") loadAgentStats();
   }
 
   function sectionFromHash(hash) {
@@ -286,21 +287,15 @@
     if (hash.includes("/admin/assignments")) return "admin-assignments";
     if (hash.includes("/admin/logs")) return "admin-logs";
     if (hash.includes("/admin/config")) return "admin-config";
+    if (hash.includes("/admin/debug")) return "admin-debug";
     return "admin-models";
   }
 
   // ── Stats ─────────────────────────────────────────────
-  async function loadStats() {
-    try {
-      const data = await api("/admin/stats/models");
-      renderStatsTable(data.models || []);
-    } catch (err) {
-      console.error("loadStats error:", err);
-    }
+  function loadStats() {
     loadInflight();
     loadRebalanceStats();
     loadRequestRateStats();
-    loadAgentStats();
     loadDeployment24hSummary();
   }
 
@@ -429,7 +424,6 @@
       // Only poll stats that are in 1h mode — non-1h ranges are DB-backed and
       // would be needlessly re-queried every 3s otherwise.
       if (rangeState.rate.range === "1h") loadRequestRateStats();
-      if (rangeState.agent.range === "1h") loadAgentStats();
     }, 3000);
   }
 
@@ -753,37 +747,6 @@
       '<div class="rb-y-axis"><span>' + fmt(maxTotal) + '</span><span>0</span></div>' +
       '<div class="rb-bars">' + bars + '</div>' +
     '</div>';
-  }
-
-  function renderStatsTable(models) {
-    const wrap = document.getElementById("stats-table-wrap");
-    if (!models.length) {
-      wrap.innerHTML = "<p>No data yet.</p>";
-      return;
-    }
-    wrap.innerHTML =
-      '<table class="data-table"><thead><tr>' +
-      "<th>Model</th><th>Requests</th><th>Success</th><th>Errors</th>" +
-      "<th>Input Tokens</th><th>Output Tokens</th><th>Avg Duration (ms)</th>" +
-      "<th>Last Request</th>" +
-      "</tr></thead><tbody>" +
-      models
-        .map(function (m) {
-          return (
-            "<tr>" +
-            "<td>" + esc(m.model) + "</td>" +
-            "<td>" + m.total_requests + "</td>" +
-            "<td>" + m.success_count + "</td>" +
-            "<td>" + m.error_count + "</td>" +
-            "<td>" + m.total_input_tokens.toLocaleString() + "</td>" +
-            "<td>" + m.total_output_tokens.toLocaleString() + "</td>" +
-            "<td>" + m.avg_duration_ms + "</td>" +
-            "<td>" + (m.last_request_at || "-") + "</td>" +
-            "</tr>"
-          );
-        })
-        .join("") +
-      "</tbody></table>";
   }
 
   // ── User Dashboard ────────────────────────────────────

@@ -447,6 +447,17 @@ input, select, textarea { font-family: var(--font); font-size: 14px; }
 .section-header h2 { font-size: 20px; color: var(--text); font-weight: 700; letter-spacing: -.2px; }
 .section-header > div { display: flex; gap: 8px; align-items: center; }
 
+.debug-banner {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent, #f0a020);
+  padding: 10px 14px;
+  margin-bottom: 22px;
+  font-size: 13px;
+  color: var(--text3);
+  border-radius: 4px;
+}
+
 /* ── Cards ──────────────────────────────────────────────── */
 .card {
   background: var(--surface); border: 1px solid var(--border);
