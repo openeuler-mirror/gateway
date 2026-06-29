@@ -62,6 +62,8 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
     )
     .execute(&mut *conn)
     .await?;
+    // NOTE: cached_tokens is owned by boom-audit (boom_request_log DDL owner) —
+    // added there in run_request_log_migration. Not duplicated here.
     tracing::info!("Migration 1/7: done");
 
     // 2. Model deployments + aliases (boom-routing).

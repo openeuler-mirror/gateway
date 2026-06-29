@@ -339,6 +339,20 @@ pub struct Usage {
     pub cache_creation_input_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_read_input_tokens: Option<u32>,
+    /// OpenAI-style prompt token breakdown. vLLM populates
+    /// `cached_tokens` here with the real KV-cache hit (local HBM prefix
+    /// cache + external KV transfer), used by the gateway for DFX.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+/// Breakdown of prompt tokens (OpenAI `prompt_tokens_details`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PromptTokensDetails {
+    /// Tokens that hit the KV cache (skipped prefill). From vLLM this is the
+    /// real cache hit (HBM + external store).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_tokens: Option<u32>,
 }
 
 // ============================================================
@@ -369,6 +383,8 @@ pub struct StreamUsage {
     pub completion_tokens: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_tokens: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens_details: Option<PromptTokensDetails>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

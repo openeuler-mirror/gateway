@@ -35,6 +35,9 @@ pub struct RequestLog {
     pub ttft_ms: Option<i32>,
     pub deployment_id: Option<String>,
     pub client_ip: Option<String>,
+    /// vLLM-reported real KV-cache hit (HBM + external store), from the final
+    /// usage chunk's prompt_tokens_details.cached_tokens.
+    pub cached_tokens: Option<i64>,
 }
 
 /// Fire-and-forget: spawn a tokio task to INSERT the log record.
@@ -49,8 +52,9 @@ pub fn log_request(pool: Option<PgPool>, log: RequestLog) {
                     r#"INSERT INTO boom_request_log
                        (request_id, key_hash, key_name, key_alias, team_id, model, model_name, api_path,
                         is_stream, status_code, error_type, error_message,
-                        input_tokens, output_tokens, duration_ms, deployment_id, client_ip, ttft_ms)
-                       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)"#,
+                        input_tokens, output_tokens, duration_ms, deployment_id, client_ip, ttft_ms,
+                        cached_tokens)
+                       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)"#,
                 )
                 .bind(&log.request_id)
                 .bind(&log.key_hash)
@@ -70,6 +74,7 @@ pub fn log_request(pool: Option<PgPool>, log: RequestLog) {
                 .bind(&log.deployment_id)
                 .bind(&log.client_ip)
                 .bind(log.ttft_ms)
+                .bind(log.cached_tokens)
                 .execute(&pool),
             )
             .await;
@@ -137,6 +142,7 @@ pub fn log_error(
             ttft_ms: None,
             deployment_id,
             client_ip: client_ip.clone(),
+            cached_tokens: None,
         },
     );
 

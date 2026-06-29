@@ -509,6 +509,7 @@ impl AnthropicProvider {
                 total_tokens: input_tokens + output_tokens,
                 cache_creation_input_tokens: cache_creation,
                 cache_read_input_tokens: cache_read,
+                prompt_tokens_details: None,
             },
             system_fingerprint: None,
             raw_response: None,
@@ -833,6 +834,7 @@ impl Provider for AnthropicProvider {
                                             prompt_tokens: None,
                                             completion_tokens: Some(output_tokens),
                                             total_tokens: None,
+                                            prompt_tokens_details: None,
                                         }),
                                         raw_data: None,
                                     };
@@ -870,6 +872,7 @@ impl Provider for AnthropicProvider {
                                             prompt_tokens: Some(it),
                                             completion_tokens: Some(0),
                                             total_tokens: None,
+                                            prompt_tokens_details: None,
                                         }),
                                         raw_data: None,
                                     };

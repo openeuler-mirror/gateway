@@ -159,7 +159,17 @@ impl<S: futures::Stream + Unpin> futures::Stream for InFlightStream<S> {
 // LoggedStream — delays log write until the stream is fully consumed
 // ============================================================
 
-type UsageTracker = std::sync::Arc<std::sync::Mutex<(Option<i32>, Option<i32>)>>;
+type UsageTracker = std::sync::Arc<std::sync::Mutex<UsageTrackerState>>;
+
+/// Accumulated usage from the upstream stream, read by LoggedStream on drop.
+#[derive(Default, Clone)]
+struct UsageTrackerState {
+    prompt_tokens: Option<i32>,
+    completion_tokens: Option<i32>,
+    /// Real KV-cache hit reported by vLLM in the final usage chunk
+    /// (prompt_tokens_details.cached_tokens). None if the chunk didn't carry it.
+    cached_tokens: Option<i32>,
+}
 
 /// Wrapper stream that writes the request log when dropped (i.e. when the
 /// stream has been fully consumed or the connection is torn down).
@@ -203,8 +213,9 @@ impl<S> Drop for LoggedStream<S> {
             log.ttft_ms = self.first_token_at.map(|t| (t - self.start).as_millis() as i32);
             // Read accumulated usage from tracker (written by stream mapper).
             if let Ok(guard) = self.usage.lock() {
-                log.input_tokens = guard.0;
-                log.output_tokens = guard.1;
+                log.input_tokens = guard.prompt_tokens;
+                log.output_tokens = guard.completion_tokens;
+                log.cached_tokens = guard.cached_tokens.map(|c| c as i64);
             }
             // Account tokens to agent stats before moving log into log_request.
             if let Some(tracker) = &self.agent_stats {
@@ -460,6 +471,7 @@ async fn chat_completions_inner(
             ttft_ms: None,
             deployment_id,
             client_ip: Some(client_ip.clone()),
+            cached_tokens: None,
         }, start, usage, Some(state.agent_stats.clone()));
 
         // Wrap with prompt log stream if enabled, then wrap in Sse.
@@ -500,6 +512,12 @@ async fn chat_completions_inner(
         let duration_ms = start.elapsed().as_millis() as i32;
         let input_tokens = response.usage.prompt_tokens as i32;
         let output_tokens = response.usage.completion_tokens as i32;
+        let cached_tokens = response
+            .usage
+            .prompt_tokens_details
+            .as_ref()
+            .and_then(|d| d.cached_tokens)
+            .map(|c| c as i64);
 
         // Provider returned a response — count as a successfully handled request.
         state.agent_stats.record(api_path);
@@ -528,6 +546,7 @@ async fn chat_completions_inner(
                 ttft_ms: None,
                 deployment_id,
                 client_ip: Some(client_ip.clone()),
+                cached_tokens,
             },
         );
         state.agent_stats.record_tokens(api_path, input_tokens as u64, output_tokens as u64);
@@ -1372,8 +1391,13 @@ fn sse_stream_from_chat_stream(
                 Ok(mut chunk) => {
                     if let Some(ref u) = chunk.usage {
                         if let Ok(mut g) = usage.lock() {
-                            g.0 = u.prompt_tokens;
-                            g.1 = u.completion_tokens;
+                            g.prompt_tokens = u.prompt_tokens;
+                            g.completion_tokens = u.completion_tokens;
+                            g.cached_tokens = u
+                                .prompt_tokens_details
+                                .as_ref()
+                                .and_then(|d| d.cached_tokens)
+                                .map(|c| c as i32);
                         }
                     }
 
@@ -1702,6 +1726,7 @@ pub async fn messages(
             ttft_ms: None,
             deployment_id,
             client_ip: Some(client_ip.clone()),
+            cached_tokens: None,
         }, start, usage, Some(state.agent_stats.clone()));
 
         // Wrap with prompt log stream if enabled, then wrap in Sse.
@@ -1742,6 +1767,12 @@ pub async fn messages(
         let duration_ms = start.elapsed().as_millis() as i32;
         let input_tokens = response.usage.prompt_tokens as i32;
         let output_tokens = response.usage.completion_tokens as i32;
+        let cached_tokens = response
+            .usage
+            .prompt_tokens_details
+            .as_ref()
+            .and_then(|d| d.cached_tokens)
+            .map(|c| c as i64);
 
         // Provider returned a response — count as a successfully handled request.
         state.agent_stats.record("/v1/messages");
@@ -1770,6 +1801,7 @@ pub async fn messages(
                 ttft_ms: None,
                 deployment_id,
                 client_ip: Some(client_ip.clone()),
+                cached_tokens,
             },
         );
         state.agent_stats.record_tokens("/v1/messages", input_tokens as u64, output_tokens as u64);
@@ -1836,8 +1868,13 @@ fn sse_stream_from_anthropic_chat_stream(
                     // Extract usage from the chunk (OpenAI sends usage in the final chunk).
                     if let Some(ref u) = chunk.usage {
                         if let Ok(mut g) = usage.lock() {
-                            g.0 = u.prompt_tokens;
-                            g.1 = u.completion_tokens;
+                            g.prompt_tokens = u.prompt_tokens;
+                            g.completion_tokens = u.completion_tokens;
+                            g.cached_tokens = u
+                                .prompt_tokens_details
+                                .as_ref()
+                                .and_then(|d| d.cached_tokens)
+                                .map(|c| c as i32);
                         }
                     }
                     let events = transcoder.transcode(&chunk);
