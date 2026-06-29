@@ -8,7 +8,6 @@ use axum::Json;
 use boom_core::anthropic::{
     anthropic_request_to_openai, openai_response_to_anthropic, AnthropicStreamTranscoder,
 };
-use boom_core::provider::RateLimiter;
 use boom_core::types::*;
 use boom_core::GatewayError;
 use boom_ctxaware::AgentStatsTracker;
@@ -311,7 +310,7 @@ async fn chat_completions_inner(
         .collect();
     let weight = resolve_quota_weight(&req.model, &state);
 
-    let (guard, rl_info) = check_plan_or_default_limits(
+    let mut plan_charge = check_plan_limits(
         &state.plan_store,
         &state.limiter,
         &identity.key_hash,
@@ -336,7 +335,7 @@ async fn chat_completions_inner(
     }).sum();
     log_request_summary(
         &request_id, identity, &model, input_chars, is_stream,
-        api_path, &rl_info,
+        api_path, &plan_charge,
     );
 
     // 3. Select provider deployment.
@@ -361,7 +360,6 @@ async fn chat_completions_inner(
         .ok_or_else(|| {
             let e = GatewayError::ModelNotFound(resolved_model.clone());
             log_error(&state, &identity, &model, api_path, is_stream, start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()));
-            rollback_plan_quota(&state.limiter, &rl_info);
             GatewayErrorReply(e, false)
         })?;
     let provider = selection.provider;
@@ -412,12 +410,17 @@ async fn chat_completions_inner(
 
     // 4. Route to provider (streaming or non-streaming).
     if is_stream {
-        let stream = provider.chat_stream(req).await.map_err(|e| {
-            log_error(&state, &identity, &model, api_path, true, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()));
-            crate::health_monitor::record_request_failure(&state, &deployment_id, &e);
-            rollback_plan_quota(&state.limiter, &rl_info);
-            GatewayErrorReply(e, true)
-        })?;
+        let stream = match provider.chat_stream(req).await {
+            Ok(s) => s,
+            Err(e) => {
+                log_error(&state, &identity, &model, api_path, true, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()));
+                crate::health_monitor::record_request_failure(&state, &deployment_id, &e);
+                // plan_charge drops here without commit — no quota consumed.
+                return Err(GatewayErrorReply(e, true));
+            }
+        };
+        // Provider accepted the request — commit the plan charge now.
+        let _decision = plan_charge.commit();
         crate::health_monitor::reset_request_failure(&state, &deployment_id);
         let usage = UsageTracker::default();
         let sse_stream = sse_stream_from_chat_stream(stream, usage.clone());
@@ -432,7 +435,7 @@ async fn chat_completions_inner(
             Some(g) => FlowControlledStream::new(tracked, g),
             None => FlowControlledStream::passthrough(tracked),
         };
-        let guarded = GuardedStream::new(flow_controlled, guard);
+        let guarded = GuardedStream::new(flow_controlled, plan_charge.take_concurrency_guard());
 
         // Provider returned a stream — count as a successfully handled request.
         state.agent_stats.record(api_path);
@@ -489,12 +492,20 @@ async fn chat_completions_inner(
         } else {
             InFlightGuard::new(state.inflight.clone(), &inflight_model, input_chars as u64)
         };
-        let response = provider.chat(req).await.map_err(|e| {
-            log_error(&state, &identity, &model, api_path, false, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()));
-            crate::health_monitor::record_request_failure(&state, &deployment_id, &e);
-            rollback_plan_quota(&state.limiter, &rl_info);
-            GatewayErrorReply(e, false)
-        })?;
+        let response = match provider.chat(req).await {
+            Ok(r) => r,
+            Err(e) => {
+                log_error(&state, &identity, &model, api_path, false, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()));
+                crate::health_monitor::record_request_failure(&state, &deployment_id, &e);
+                // plan_charge drops here without commit — no quota consumed.
+                return Err(GatewayErrorReply(e, false));
+            }
+        };
+        // Provider accepted the request — commit the plan charge now.
+        let _decision = plan_charge.commit();
+        // Release concurrency guard now (non-streaming: response is already complete,
+        // concurrency slot no longer needed once we have the full response).
+        drop(plan_charge.take_concurrency_guard());
         crate::health_monitor::reset_request_failure(&state, &deployment_id);
 
         let duration_ms = start.elapsed().as_millis() as i32;
@@ -1109,28 +1120,76 @@ fn check_model_access(
 // Plan-based Rate Limiting Helper
 // ============================================================
 
-/// Rate-limit check result returned on success.
-struct RateLimitInfo {
-    /// Name of the plan applied (if any).
-    plan_name: Option<String>,
-    /// RPM remaining (from the sliding window decision).
-    rpm_remaining: u64,
-    /// RPM limit.
-    rpm_limit: u64,
-    /// Current concurrency count for this key.
-    concurrency: u32,
-    /// Concurrency limit (if plan has one).
-    concurrency_limit: Option<u32>,
-    /// Info needed to rollback plan window counters if the upstream request fails.
-    /// RPM counters are never rolled back (DDoS protection).
-    plan_rollback: Option<PlanRollback>,
-}
-
-/// Carries the info needed to rollback plan window counters on upstream failure.
-struct PlanRollback {
+/// A pending plan charge: created by `check_plan_limits` (peek-only, no
+/// counters incremented), committed by `PlanCharge::commit` once the upstream
+/// provider has accepted the request. If dropped without commit, no quota is
+/// consumed — the ConcurrencyGuard is released via its own Drop.
+///
+/// This implements principle 1: "未服务不计费" — plan counters are only
+/// incremented after `provider.chat_stream`/`provider.chat` returns Ok.
+pub struct PlanCharge {
+    limiter: Arc<boom_limiter::SlidingWindowLimiter>,
     key: RateLimitKey,
+    rpm_limit: Option<u64>,
     window_limits: Vec<(u64, u64)>,
     weight: u64,
+    /// Held until `take_concurrency_guard` moves it onto GuardedStream.
+    /// Drop releases the concurrency slot (RAII).
+    concurrency_guard: Option<ConcurrencyGuard>,
+    /// For display in log_request_summary.
+    plan_name: Option<String>,
+    rpm_limit_display: u64,
+    concurrency_display: u32,
+    concurrency_limit_display: Option<u32>,
+    /// Pre-commit peek remaining (for log before commit).
+    peek_remaining: u64,
+    committed: bool,
+    /// Post-commit remaining (filled by commit()).
+    committed_remaining: Option<u64>,
+}
+
+impl PlanCharge {
+    /// Commit the charge: increment RPM + window counters by `weight`.
+    /// MUST be called only after `provider.chat_stream`/`provider.chat`
+    /// returned Ok — this is the moment the request is truly sent to the
+    /// upstream and "已服务" semantics begin.
+    pub fn commit(&mut self) -> RateLimitDecision {
+        let decision = self.limiter.commit_record(
+            &self.key,
+            self.rpm_limit,
+            &self.window_limits,
+            self.weight,
+        );
+        self.committed = true;
+        self.committed_remaining = Some(decision.remaining);
+        decision
+    }
+
+    /// Move the ConcurrencyGuard out so it can be attached to GuardedStream
+    /// and released when the stream ends. Called after `commit()`.
+    pub fn take_concurrency_guard(&mut self) -> Option<ConcurrencyGuard> {
+        self.concurrency_guard.take()
+    }
+
+    /// Remaining RPM for display. Post-commit value if committed, else peek.
+    pub fn display_remaining(&self) -> u64 {
+        self.committed_remaining.unwrap_or(self.peek_remaining)
+    }
+}
+
+impl Drop for PlanCharge {
+    fn drop(&mut self) {
+        // If not committed, no counters were ever incremented — nothing to
+        // roll back. The ConcurrencyGuard (if still held) releases itself
+        // via its own Drop as part of our field's drop.
+        if !self.committed {
+            tracing::debug!(
+                key = ?self.key,
+                committed = false,
+                "PlanCharge dropped without commit — no quota consumed"
+            );
+        }
+    }
 }
 
 /// Resolve the quota weight for a model, handling alias resolution.
@@ -1178,24 +1237,15 @@ fn build_gateway_headers(
     headers
 }
 
-/// Rollback plan window counters when an upstream request fails.
-/// RPM counters are NOT rolled back (DDoS protection).
-fn rollback_plan_quota(limiter: &Arc<boom_limiter::SlidingWindowLimiter>, rl_info: &RateLimitInfo) {
-    if let Some(ref rollback) = rl_info.plan_rollback {
-        tracing::debug!(
-            key = ?rollback.key,
-            windows = rollback.window_limits.len(),
-            weight = rollback.weight,
-            "Rolling back plan window counters (upstream failure)"
-        );
-        limiter.rollback_plan_windows(&rollback.key, &rollback.window_limits, rollback.weight);
-    }
-}
-
-/// Check plan-based limits if a plan is assigned, otherwise fall back to
-/// default per-model rate limits.
-/// `weight` is the quota consumption multiplier for this request.
-async fn check_plan_or_default_limits(
+/// Check plan-based limits (peek-only, no counters incremented) if a plan is
+/// assigned, otherwise fall back to default per-model rate limits.
+///
+/// Returns a `PlanCharge` that holds the pending charge info + ConcurrencyGuard.
+/// The caller MUST call `PlanCharge::commit()` after the upstream provider
+/// accepts the request (returns Ok from chat_stream/chat). If the provider
+/// returns Err or the request is cancelled (client disconnect, flow control
+/// timeout), the PlanCharge is dropped without commit — no quota consumed.
+async fn check_plan_limits(
     plan_store: &Arc<PlanStore>,
     limiter: &Arc<boom_limiter::SlidingWindowLimiter>,
     key_hash: &str,
@@ -1203,14 +1253,14 @@ async fn check_plan_or_default_limits(
     rpm_limit: Option<u64>,
     window_limits: &[(u64, u64)],
     weight: u64,
-) -> Result<(Option<ConcurrencyGuard>, RateLimitInfo), GatewayError> {
+) -> Result<PlanCharge, GatewayError> {
     let plan = plan_store
         .resolve_plan(key_hash)
         .or_else(|| plan_store.get_default_plan());
 
     match plan {
         Some(plan) => {
-            let (concurrency_limit, rpm_limit, window_limits, stale_limits) = plan.effective_limits();
+            let (concurrency_limit, plan_rpm_limit, plan_window_limits, stale_limits) = plan.effective_limits();
             tracing::debug!(
                 key_hash = %key_hash,
                 plan = %plan.name,
@@ -1243,8 +1293,8 @@ async fn check_plan_or_default_limits(
             }
 
             let decision = limiter
-                .check_and_record(&rl_key, rpm_limit, &window_limits, weight)
-                .await?;
+                .peek_only(&rl_key, plan_rpm_limit, &plan_window_limits, weight)
+                .await;
 
             if !decision.allowed {
                 drop(guard);
@@ -1260,21 +1310,21 @@ async fn check_plan_or_default_limits(
             }
 
             let concurrency = plan_store.get_concurrency(key_hash);
-            Ok((guard, RateLimitInfo {
+            Ok(PlanCharge {
+                limiter: limiter.clone(),
+                key: rl_key,
+                rpm_limit: plan_rpm_limit,
+                window_limits: plan_window_limits,
+                weight,
+                concurrency_guard: guard,
                 plan_name: Some(plan.name.clone()),
-                rpm_remaining: decision.remaining,
-                rpm_limit: decision.limit,
-                concurrency,
-                concurrency_limit,
-                plan_rollback: Some(PlanRollback {
-                    key: RateLimitKey {
-                        key_hash: key_hash.to_string(),
-                        model: "__plan__".to_string(),
-                    },
-                    window_limits: window_limits.clone(),
-                    weight,
-                }),
-            }))
+                rpm_limit_display: decision.limit,
+                concurrency_display: concurrency,
+                concurrency_limit_display: concurrency_limit,
+                peek_remaining: decision.remaining,
+                committed: false,
+                committed_remaining: None,
+            })
         }
         None => {
             let rl_key = RateLimitKey {
@@ -1283,8 +1333,8 @@ async fn check_plan_or_default_limits(
             };
 
             let decision = limiter
-                .check_and_record(&rl_key, rpm_limit, window_limits, weight)
-                .await?;
+                .peek_only(&rl_key, rpm_limit, window_limits, weight)
+                .await;
 
             if !decision.allowed {
                 let limit_type = match decision.rejected_window_secs {
@@ -1298,25 +1348,21 @@ async fn check_plan_or_default_limits(
                 });
             }
 
-            Ok((None, RateLimitInfo {
+            Ok(PlanCharge {
+                limiter: limiter.clone(),
+                key: rl_key,
+                rpm_limit,
+                window_limits: window_limits.to_vec(),
+                weight,
+                concurrency_guard: None,
                 plan_name: None,
-                rpm_remaining: decision.remaining,
-                rpm_limit: decision.limit,
-                concurrency: 0,
-                concurrency_limit: None,
-                plan_rollback: if window_limits.is_empty() {
-                    None
-                } else {
-                    Some(PlanRollback {
-                        key: RateLimitKey {
-                            key_hash: key_hash.to_string(),
-                            model: model.to_string(),
-                        },
-                        window_limits: window_limits.to_vec(),
-                        weight,
-                    })
-                },
-            }))
+                rpm_limit_display: decision.limit,
+                concurrency_display: 0,
+                concurrency_limit_display: None,
+                peek_remaining: decision.remaining,
+                committed: false,
+                committed_remaining: None,
+            })
         }
     }
 }
@@ -1333,15 +1379,15 @@ fn log_request_summary(
     input_chars: usize,
     is_stream: bool,
     api_path: &str,
-    rl_info: &RateLimitInfo,
+    plan_charge: &PlanCharge,
 ) {
     let key_display = identity.key_alias.as_deref()
         .or(identity.key_name.as_deref())
         .or(identity.user_id.as_deref())
         .unwrap_or("-");
-    let plan_display = rl_info.plan_name.as_deref().unwrap_or("-");
-    let concurrency_display = match rl_info.concurrency_limit {
-        Some(limit) => format!("{}/{}", rl_info.concurrency, limit),
+    let plan_display = plan_charge.plan_name.as_deref().unwrap_or("-");
+    let concurrency_display = match plan_charge.concurrency_limit_display {
+        Some(limit) => format!("{}/{}", plan_charge.concurrency_display, limit),
         None => "-".to_string(),
     };
     tracing::info!(
@@ -1352,8 +1398,8 @@ fn log_request_summary(
         is_stream,
         key_display,
         plan_display,
-        rl_info.rpm_remaining,
-        rl_info.rpm_limit,
+        plan_charge.display_remaining(),
+        plan_charge.rpm_limit_display,
         input_chars,
         concurrency_display,
     );
@@ -1552,7 +1598,7 @@ pub async fn messages(
         .collect();
     let weight = resolve_quota_weight(&openai_req.model, &state);
 
-    let (guard, rl_info) = check_plan_or_default_limits(
+    let mut plan_charge = check_plan_limits(
         &state.plan_store,
         &state.limiter,
         &identity.key_hash,
@@ -1576,7 +1622,7 @@ pub async fn messages(
     }).sum();
     log_request_summary(
         &request_id, identity, &model, input_chars, is_stream,
-        "/v1/messages", &rl_info,
+        "/v1/messages", &plan_charge,
     );
 
     // 3. Select provider deployment.
@@ -1602,7 +1648,6 @@ pub async fn messages(
         .ok_or_else(|| {
             let e = GatewayError::ModelNotFound(resolved_model.clone());
             log_error(&state, &identity, &model, "/v1/messages", is_stream, start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()));
-            rollback_plan_quota(&state.limiter, &rl_info);
             AnthropicErrorReply(e, is_stream)
         })?;
     let provider = selection.provider;
@@ -1649,12 +1694,17 @@ pub async fn messages(
 
     // 4. Route to provider.
     if is_stream {
-        let stream = provider.chat_stream(openai_req).await.map_err(|e| {
-            log_error(&state, &identity, &model, "/v1/messages", true, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()));
-            crate::health_monitor::record_request_failure(&state, &deployment_id, &e);
-            rollback_plan_quota(&state.limiter, &rl_info);
-            AnthropicErrorReply(e, true)
-        })?;
+        let stream = match provider.chat_stream(openai_req).await {
+            Ok(s) => s,
+            Err(e) => {
+                log_error(&state, &identity, &model, "/v1/messages", true, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()));
+                crate::health_monitor::record_request_failure(&state, &deployment_id, &e);
+                // plan_charge drops here without commit — no quota consumed.
+                return Err(AnthropicErrorReply(e, true));
+            }
+        };
+        // Provider accepted the request — commit the plan charge now.
+        let _decision = plan_charge.commit();
         crate::health_monitor::reset_request_failure(&state, &deployment_id);
         let usage = UsageTracker::default();
         // Create shared buffer for raw upstream SSE chunks (before Anthropic transcoding).
@@ -1674,7 +1724,7 @@ pub async fn messages(
             Some(g) => FlowControlledStream::new(tracked, g),
             None => FlowControlledStream::passthrough(tracked),
         };
-        let guarded = GuardedStream::new(flow_controlled, guard);
+        let guarded = GuardedStream::new(flow_controlled, plan_charge.take_concurrency_guard());
 
         // Provider returned a stream — count as a successfully handled request.
         state.agent_stats.record("/v1/messages");
@@ -1731,12 +1781,19 @@ pub async fn messages(
         } else {
             InFlightGuard::new(state.inflight.clone(), &inflight_model, input_chars as u64)
         };
-        let response = provider.chat(openai_req).await.map_err(|e| {
-            log_error(&state, &identity, &model, "/v1/messages", false, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()));
-            crate::health_monitor::record_request_failure(&state, &deployment_id, &e);
-            rollback_plan_quota(&state.limiter, &rl_info);
-            AnthropicErrorReply(e, false)
-        })?;
+        let response = match provider.chat(openai_req).await {
+            Ok(r) => r,
+            Err(e) => {
+                log_error(&state, &identity, &model, "/v1/messages", false, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()));
+                crate::health_monitor::record_request_failure(&state, &deployment_id, &e);
+                // plan_charge drops here without commit — no quota consumed.
+                return Err(AnthropicErrorReply(e, false));
+            }
+        };
+        // Provider accepted the request — commit the plan charge now.
+        let _decision = plan_charge.commit();
+        // Release concurrency guard now (non-streaming: response is already complete).
+        drop(plan_charge.take_concurrency_guard());
         crate::health_monitor::reset_request_failure(&state, &deployment_id);
 
         let duration_ms = start.elapsed().as_millis() as i32;
