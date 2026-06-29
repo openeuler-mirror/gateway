@@ -57,6 +57,10 @@
               <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="1.5" y="1.5" width="5.5" height="5.5" rx="1"/><rect x="9" y="1.5" width="5.5" height="5.5" rx="1"/><rect x="1.5" y="9" width="5.5" height="5.5" rx="1"/><rect x="9" y="9" width="5.5" height="5.5" rx="1"/></svg>
               <span data-i18n="nav.overview">Overview</span>
             </a>
+            <a href="#/dashboard/chat" class="nav-link" data-section="user-chat">
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 3h12v8H6l-3 3v-3H2z"/></svg>
+              <span data-i18n="nav.chat">Chat</span>
+            </a>
             <a href="#/dashboard/logs" class="nav-link" data-section="user-logs">
               <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 4h12M2 8h12M2 12h8"/></svg>
               <span data-i18n="nav.user_logs">Request Logs</span>
@@ -92,6 +96,21 @@
             <div class="card">
               <h3 data-i18n="user.key.info">Key Information</h3>
               <div id="key-info"><p class="loading" data-i18n="common.loading">Loading...</p></div>
+            </div>
+          </section>
+
+          <!-- User: Chat -->
+          <section id="user-chat" class="section">
+            <div class="chat-toolbar">
+              <select id="chat-model" class="chat-model-select"></select>
+              <button class="btn-small" id="chat-prompt-btn" data-i18n="chat.prompt_btn">⚙ System Prompt</button>
+              <span id="chat-quota" class="chat-quota"></span>
+            </div>
+            <div id="chat-queue-status" class="chat-queue hidden"></div>
+            <div id="chat-messages" class="chat-messages"></div>
+            <div class="chat-input-row">
+              <textarea id="chat-input" rows="2" data-i18n-ph="chat.input_placeholder" placeholder="Type a message... (Enter to send, Shift+Enter for newline)"></textarea>
+              <button class="btn-primary" id="chat-send-btn" data-i18n="chat.send">Send</button>
             </div>
           </section>
 

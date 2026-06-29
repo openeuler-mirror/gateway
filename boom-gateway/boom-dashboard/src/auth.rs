@@ -144,6 +144,10 @@ pub struct LoginRequest {
 pub struct LoginResponse {
     pub role: String,
     pub user_id: String,
+    /// Original API key, returned only for user logins so the dashboard chat
+    /// window can call /v1/chat/completions with a Bearer header. None for admin.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -304,7 +308,7 @@ pub async fn login(
 
         clear_login_failures(&state, &client_ip);
         tracing::info!(ip = %client_ip, "Admin login success");
-        return sign_and_respond(&state, "admin".to_string(), "admin".to_string(), String::new());
+        return sign_and_respond(&state, "admin".to_string(), "admin".to_string(), String::new(), None);
     }
 
     // 4. User login: hash the key, then lookup in DB.
@@ -386,7 +390,7 @@ pub async fn login(
         .or(uid)
         .unwrap_or_else(|| "user".to_string());
 
-    sign_and_respond(&state, display_name, "user".to_string(), token_hash)
+    sign_and_respond(&state, display_name, "user".to_string(), token_hash, Some(api_key.clone()))
 }
 
 fn sign_and_respond(
@@ -394,6 +398,7 @@ fn sign_and_respond(
     user_id: String,
     role: String,
     key_hash: String,
+    api_key: Option<String>,
 ) -> Response {
     let now = Utc::now().timestamp();
     let claims = DashboardClaims {
@@ -424,7 +429,7 @@ fn sign_and_respond(
         SESSION_COOKIE_NAME, token, SESSION_DURATION_SECS
     );
 
-    let body = Json(LoginResponse { role, user_id });
+    let body = Json(LoginResponse { role, user_id, api_key });
 
     ([(SET_COOKIE, cookie)], body).into_response()
 }

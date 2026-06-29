@@ -270,6 +270,7 @@
         }
         const data = await res.json();
         currentUser = data;
+        if (data.api_key) sessionStorage.setItem("boom_chat_api_key", data.api_key);
         navigateToDashboard(data.role);
       } catch (err) {
         errEl.textContent = err.message;
@@ -288,6 +289,7 @@
   }
 
   async function doLogout() {
+    sessionStorage.removeItem("boom_chat_api_key");
     await fetch(API + "/auth/logout", { method: "POST" }).catch(() => {});
     showLogin();
   }
@@ -807,11 +809,283 @@
     });
     const section = userSectionFromHash(hash);
     if (section === "user-logs") loadUserLogs();
+    else if (section === "user-chat") initChatPage();
   }
 
   function userSectionFromHash(hash) {
+    if (hash.includes("/dashboard/chat")) return "user-chat";
     if (hash.includes("/dashboard/logs")) return "user-logs";
     return "user-overview";
+  }
+
+  // ── User: Chat ───────────────────────────────────────
+  const CHAT_KEY_STORAGE = "boom_chat_api_key";
+  const CHAT_PROMPT_STORAGE = "boom_chat_system_prompt";
+  let chatModelsLoaded = false;
+  let chatHistory = []; // [{role, content}]
+  let chatQueueTimer = null;
+  let chatAbort = null;
+  let chatFirstTokenArrived = false;
+
+  function getChatKey() { return sessionStorage.getItem(CHAT_KEY_STORAGE); }
+  function getChatPrompt() { return localStorage.getItem(CHAT_PROMPT_STORAGE) || ""; }
+
+  function initChatPage() {
+    const sendBtn = document.getElementById("chat-send-btn");
+    const input = document.getElementById("chat-input");
+    const promptBtn = document.getElementById("chat-prompt-btn");
+    // Wire up controls once.
+    if (!sendBtn.dataset.wired) {
+      sendBtn.dataset.wired = "1";
+      sendBtn.addEventListener("click", sendChatMessage);
+      input.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" && !e.shiftKey) {
+          e.preventDefault();
+          sendChatMessage();
+        }
+      });
+      promptBtn.addEventListener("click", showSystemPromptModal);
+    }
+    if (!chatModelsLoaded) loadChatModels();
+    loadChatQuota();
+    renderChatHistory();
+  }
+
+  async function loadChatModels() {
+    const sel = document.getElementById("chat-model");
+    if (!sel) return;
+    const key = getChatKey();
+    if (!key) {
+      sel.innerHTML = `<option value="">${t("chat.no_key")}</option>`;
+      return;
+    }
+    try {
+      const res = await fetch("/v1/models", { headers: { Authorization: "Bearer " + key } });
+      if (res.status === 401) { showLogin(); return; }
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      const data = await res.json();
+      const names = (data.data || []).map((m) => m.id);
+      const prev = sel.value;
+      sel.innerHTML = names.length
+        ? names.map((n) => `<option value="${esc(n)}">${esc(n)}</option>`).join("")
+        : `<option value="">${t("chat.no_models")}</option>`;
+      if (prev && names.includes(prev)) sel.value = prev;
+      chatModelsLoaded = true;
+    } catch (err) {
+      sel.innerHTML = `<option value="">${t("chat.models_failed", { error: esc(String(err.message || err)) })}</option>`;
+    }
+  }
+
+  async function loadChatQuota() {
+    const el = document.getElementById("chat-quota");
+    if (!el) return;
+    try {
+      const [plan, usage] = await Promise.all([api("/user/plan"), api("/user/usage")]);
+      const rpmWindow = (usage.windows || []).find((w) => w.window_secs === 60);
+      const rpmUsed = rpmWindow ? rpmWindow.count : 0;
+      const rpmLimit = plan.rpm_limit;
+      const concUsed = usage.concurrency || 0;
+      const concLimit = plan.concurrency_limit;
+      const fmt = (u, l) => (l == null ? `${u}/∞` : `${u}/${l}`);
+      el.textContent = `RPM ${fmt(rpmUsed, rpmLimit)} · ${t("chat.concurrency")} ${fmt(concUsed, concLimit)}`;
+    } catch {
+      el.textContent = "";
+    }
+  }
+
+  function renderChatHistory() {
+    const box = document.getElementById("chat-messages");
+    if (!box) return;
+    if (chatHistory.length === 0) {
+      box.innerHTML = `<p class="chat-empty">${t("chat.empty")}</p>`;
+      return;
+    }
+    box.innerHTML = chatHistory.map((m) => chatBubbleHtml(m.role, m.content)).join("");
+    box.scrollTop = box.scrollHeight;
+  }
+
+  function chatBubbleHtml(role, content) {
+    const cls = role === "user" ? "chat-bubble-user" : "chat-bubble-assistant";
+    const aligned = role === "user" ? "chat-row-user" : "chat-row-assistant";
+    return `<div class="${aligned}"><div class="chat-bubble ${cls}">${esc(content)}</div></div>`;
+  }
+
+  async function sendChatMessage() {
+    const input = document.getElementById("chat-input");
+    const sendBtn = document.getElementById("chat-send-btn");
+    const text = (input.value || "").trim();
+    if (!text) return;
+    const key = getChatKey();
+    if (!key) { showLogin(); return; }
+    const model = document.getElementById("chat-model").value;
+    if (!model) { showToast(t("chat.no_model_selected")); return; }
+
+    input.value = "";
+    input.style.height = "";
+    sendBtn.disabled = true;
+    sendBtn.textContent = t("chat.sending");
+
+    // Build messages: optional system prompt + history + new user message.
+    const sysPrompt = getChatPrompt();
+    const messages = [];
+    if (sysPrompt) messages.push({ role: "system", content: sysPrompt });
+    for (const m of chatHistory) messages.push(m);
+    messages.push({ role: "user", content: text });
+    chatHistory.push({ role: "user", content: text });
+    chatHistory.push({ role: "assistant", content: "" });
+
+    const box = document.getElementById("chat-messages");
+    if (box.querySelector(".chat-empty")) box.innerHTML = "";
+    const row = document.createElement("div");
+    row.className = "chat-row-user";
+    row.innerHTML = `<div class="chat-bubble chat-bubble-user">${esc(text)}</div>`;
+    box.appendChild(row);
+    const aRow = document.createElement("div");
+    aRow.className = "chat-row-assistant";
+    const aBubble = document.createElement("div");
+    aBubble.className = "chat-bubble chat-bubble-assistant";
+    aBubble.innerHTML = `<span class="chat-cursor">▌</span>`;
+    aRow.appendChild(aBubble);
+    box.appendChild(aRow);
+    box.scrollTop = box.scrollHeight;
+
+    chatFirstTokenArrived = false;
+    startQueuePolling(model);
+    chatAbort = new AbortController();
+    let buf = "";
+    try {
+      const res = await fetch("/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Bearer " + key,
+        },
+        body: JSON.stringify({ model, messages, stream: true }),
+        signal: chatAbort.signal,
+      });
+      if (!res.ok) {
+        const errBody = await res.json().catch(() => ({}));
+        throw new Error(errBody.error?.message || errBody.error || errBody.message || ("HTTP " + res.status));
+      }
+      if (!res.body) throw new Error("No response body");
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let acc = "";
+      let done = false;
+      while (!done) {
+        const { value, done: rDone } = await reader.read();
+        if (rDone) break;
+        acc += decoder.decode(value, { stream: true });
+        const lines = acc.split("\n");
+        acc = lines.pop() || "";
+        for (const raw of lines) {
+          const line = raw.trim();
+          if (!line || !line.startsWith("data:")) continue;
+          const payload = line.slice(5).trim();
+          if (payload === "[DONE]") { done = true; break; }
+          try {
+            const evt = JSON.parse(payload);
+            const delta = evt.choices?.[0]?.delta?.content;
+            if (delta) {
+              if (!chatFirstTokenArrived) {
+                chatFirstTokenArrived = true;
+                stopQueuePolling();
+                aBubble.innerHTML = "";
+              }
+              buf += delta;
+              aBubble.textContent = buf;
+              // Re-append cursor for live feel.
+              const cur = document.createElement("span");
+              cur.className = "chat-cursor";
+              cur.textContent = "▌";
+              aBubble.appendChild(cur);
+              box.scrollTop = box.scrollHeight;
+            }
+          } catch {}
+        }
+      }
+      // Stream ended — strip cursor, finalize bubble.
+      aBubble.textContent = buf;
+      chatHistory[chatHistory.length - 1].content = buf;
+    } catch (err) {
+      if (err.name === "AbortError") {
+        // User navigated away or aborted — keep partial.
+      } else {
+        aBubble.classList.add("chat-bubble-error");
+        aBubble.textContent = String(err.message || err);
+        showToast(String(err.message || err));
+        // Roll back the empty assistant placeholder we pushed.
+        if (chatHistory.length && chatHistory[chatHistory.length - 1].content === "") {
+          chatHistory.pop();
+        }
+      }
+    } finally {
+      stopQueuePolling();
+      sendBtn.disabled = false;
+      sendBtn.textContent = t("chat.send");
+      loadChatQuota();
+      chatAbort = null;
+    }
+  }
+
+  function startQueuePolling(model) {
+    stopQueuePolling();
+    const el = document.getElementById("chat-queue-status");
+    if (!el) return;
+    el.classList.remove("hidden");
+    const tick = async () => {
+      try {
+        const data = await api("/user/request-status");
+        const reqs = (data.requests || []).filter((r) => r.model === model || !r.model);
+        if (reqs.length === 0) {
+          el.classList.add("hidden");
+          return;
+        }
+        el.classList.remove("hidden");
+        const r = reqs[0];
+        if (r.status === "waiting") {
+          el.textContent = t("chat.queue_waiting", { ahead: r.ahead || 0, secs: (r.wait_time_secs || 0).toFixed(1) });
+        } else {
+          el.textContent = t("chat.queue_processing", { parallel: r.parallel_count || 0, secs: (r.processing_secs || 0).toFixed(1) });
+        }
+      } catch {
+        el.classList.add("hidden");
+      }
+    };
+    tick();
+    chatQueueTimer = setInterval(tick, 500);
+  }
+
+  function stopQueuePolling() {
+    if (chatQueueTimer) { clearInterval(chatQueueTimer); chatQueueTimer = null; }
+    const el = document.getElementById("chat-queue-status");
+    if (el) el.classList.add("hidden");
+  }
+
+  function showSystemPromptModal() {
+    const current = getChatPrompt();
+    showModal(`
+      <h3>${t("chat.system_prompt_title")}</h3>
+      <p class="modal-hint">${t("chat.system_prompt_hint")}</p>
+      <textarea id="chat-prompt-input" rows="8" placeholder="${esc(t("chat.system_prompt_placeholder"))}">${esc(current)}</textarea>
+      <div class="modal-actions">
+        <button class="btn-secondary" onclick="hideModal()">${t("action.cancel")}</button>
+        <button class="btn-danger" id="chat-prompt-clear">${t("chat.system_prompt_clear")}</button>
+        <button class="btn-primary" id="chat-prompt-save">${t("chat.system_prompt_save")}</button>
+      </div>
+    `);
+    document.getElementById("chat-prompt-save").addEventListener("click", () => {
+      const v = document.getElementById("chat-prompt-input").value;
+      if (v && v.trim()) localStorage.setItem(CHAT_PROMPT_STORAGE, v);
+      else localStorage.removeItem(CHAT_PROMPT_STORAGE);
+      hideModal();
+      showToast(t("chat.system_prompt_saved"));
+    });
+    document.getElementById("chat-prompt-clear").addEventListener("click", () => {
+      localStorage.removeItem(CHAT_PROMPT_STORAGE);
+      document.getElementById("chat-prompt-input").value = "";
+      showToast(t("chat.system_prompt_cleared"));
+    });
   }
 
   async function loadUserLogs(page) {
