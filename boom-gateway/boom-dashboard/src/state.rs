@@ -3,7 +3,7 @@ use boom_core::DebugErrorStore;
 use boom_flowcontrol::FlowController;
 use boom_limiter::{PlanStore, SlidingWindowLimiter};
 use boom_promptlog::PromptLogWriter;
-use boom_routing::{AliasStore, DeploymentStore, InFlightTracker, RebalanceCounter, RequestRateTracker};
+use boom_routing::{AliasStore, DeploymentStore, InFlightTracker, RebalanceMoveTracker, RequestRateTracker};
 use boom_ctxaware::AgentStatsTracker;
 use dashmap::DashMap;
 use serde_json::Value;
@@ -85,8 +85,8 @@ pub struct DashboardState {
     pub debug_store: Arc<DebugErrorStore>,
     /// Prompt log writer — shared with boom-main for runtime config control.
     pub prompt_log_writer: PromptLogWriter,
-    /// Key-affinity rebalance event counter for dashboard stats.
-    pub rebalance_counter: Arc<RebalanceCounter>,
+    /// Per-deployment rebalance move tracker (in/out) for dashboard debug page.
+    pub rebalance_move_tracker: Arc<RebalanceMoveTracker>,
     /// Per-deployment request rate tracker for dashboard stats.
     pub request_rate: Arc<RequestRateTracker>,
     /// Agent (client-type) statistics tracker for dashboard stats.
@@ -108,7 +108,7 @@ impl DashboardState {
         master_key: Option<String>,
         debug_store: Arc<DebugErrorStore>,
         prompt_log_writer: PromptLogWriter,
-        rebalance_counter: Arc<RebalanceCounter>,
+        rebalance_move_tracker: Arc<RebalanceMoveTracker>,
         request_rate: Arc<RequestRateTracker>,
         agent_stats: Arc<AgentStatsTracker>,
         auth: Arc<dyn KeyAliasLookup>,
@@ -132,7 +132,7 @@ impl DashboardState {
             login_attempts: Arc::new(DashMap::new()),
             debug_store,
             prompt_log_writer,
-            rebalance_counter,
+            rebalance_move_tracker,
             request_rate,
             agent_stats,
             auth,

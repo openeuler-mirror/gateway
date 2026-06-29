@@ -7,7 +7,7 @@ use boom_kvindex::{spawn_kv_subscriber, KvSubscriberConfig, TokenPrefixIndex, To
 use boom_core::kv_event::KvIndexBackend;
 use boom_limiter::{PlanStore, RateLimitPlan, ScheduleSlot, SlidingWindowLimiter};
 use boom_flowcontrol::{FlowControlConfig, FlowController};
-use boom_routing::{AliasStore, DeploymentStore, HybridRouter, InFlightTracker, KeyAffinityPolicy, RebalanceCounter, RequestRateTracker, Router, RoundRobinPolicy, SchedulePolicy, StrategyRegistry, TierClassifier};
+use boom_routing::{AliasStore, DeploymentStore, HybridRouter, InFlightTracker, KeyAffinityPolicy, RebalanceMoveTracker, RequestRateTracker, Router, RoundRobinPolicy, SchedulePolicy, StrategyRegistry, TierClassifier};
 use boom_ctxaware::AgentStatsTracker;
 use boom_promptlog::PromptLogWriter;
 use boom_provider;
@@ -63,8 +63,8 @@ pub struct AppState {
     pub debug_store: Arc<DebugErrorStore>,
     /// Prompt log writer — captures full request/response for audit.
     pub prompt_log_writer: PromptLogWriter,
-    /// Key-affinity rebalance event counter (survives reloads).
-    pub rebalance_counter: Arc<RebalanceCounter>,
+    /// Per-deployment rebalance move tracker (in/out counts, survives reloads).
+    pub rebalance_move_tracker: Arc<RebalanceMoveTracker>,
     /// Per-deployment request rate tracker (survives reloads).
     pub request_rate: Arc<RequestRateTracker>,
     /// Agent (client-type) statistics tracker (survives reloads).
@@ -174,8 +174,8 @@ impl AppState {
         // Debug error store survives across reloads.
         let debug_store = Arc::new(DebugErrorStore::new());
 
-        // Rebalance counter survives across reloads.
-        let rebalance_counter = Arc::new(RebalanceCounter::new());
+        // Rebalance move tracker survives across reloads (lifetime cumulative).
+        let rebalance_move_tracker = Arc::new(RebalanceMoveTracker::new());
         let request_rate = Arc::new(RequestRateTracker::new());
         let agent_stats = Arc::new(AgentStatsTracker::new());
 
@@ -185,8 +185,8 @@ impl AppState {
         // to kvc_aware settings rebuilds an empty trie, so the old trie is dropped.
         let (kv_index_val, tokenizer_pool_val) = Self::build_kvc_subsystems(&config);
 
-        // Create scheduling policy from config (may reference inflight, rebalance_counter, kv_index).
-        let policy = create_policy(&config, &inflight, &flow_controller, &rebalance_counter, &kv_index_val);
+        // Create scheduling policy from config (may reference inflight, rebalance_move_tracker, kv_index).
+        let policy = create_policy(&config, &inflight, &flow_controller, &rebalance_move_tracker, &kv_index_val);
 
         // Build hybrid router classifier (optional, content-based model routing).
         let hybrid_classifier = build_hybrid_router(&config);
@@ -251,7 +251,7 @@ impl AppState {
             flow_controller,
             debug_store,
             prompt_log_writer,
-            rebalance_counter,
+            rebalance_move_tracker,
             request_rate,
             agent_stats,
             kv_index: Arc::new(ArcSwap::from_pointee(kv_index_val)),
@@ -366,7 +366,7 @@ impl AppState {
             &new_config,
             &self.inflight,
             &self.flow_controller,
-            &self.rebalance_counter,
+            &self.rebalance_move_tracker,
             &**self.kv_index.load(),
         );
         self.router.set_policy(new_policy);
@@ -997,7 +997,7 @@ fn create_policy(
     config: &Config,
     inflight: &Arc<InFlightTracker>,
     flow_controller: &Arc<FlowController>,
-    rebalance_counter: &Arc<RebalanceCounter>,
+    rebalance_move_tracker: &Arc<RebalanceMoveTracker>,
     kv_index: &Option<Arc<dyn KvIndexBackend>>,
 ) -> Arc<dyn SchedulePolicy> {
     match config.router_settings.schedule_policy.as_str() {
@@ -1014,7 +1014,7 @@ fn create_policy(
                 inflight.clone(),
                 ctx_threshold,
                 rebalance_threshold,
-                Some(rebalance_counter.clone()),
+                Some(rebalance_move_tracker.clone()),
             );
             policy.set_queue_info(flow_controller.clone());
             Arc::new(policy)

@@ -196,7 +196,7 @@ fn build_router(state: AppState) -> Router {
         master_key,
         state.debug_store.clone(),
         state.prompt_log_writer.clone(),
-        state.rebalance_counter.clone(),
+        state.rebalance_move_tracker.clone(),
         state.request_rate.clone(),
         state.agent_stats.clone(),
         key_alias_lookup,

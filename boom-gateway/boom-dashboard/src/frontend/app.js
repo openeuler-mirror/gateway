@@ -316,7 +316,7 @@
     else if (section === "admin-teams") loadTeams();
     else if (section === "admin-logs") { setupLogsFilters(); loadLogs(); }
     else if (section === "admin-config") loadConfig();
-    else if (section === "admin-debug") loadAgentStats();
+    else if (section === "admin-debug") { loadAgentStats(); loadRebalanceMoves(); }
   }
 
   function sectionFromHash(hash) {
@@ -336,7 +336,6 @@
   // ── Stats ─────────────────────────────────────────────
   function loadStats() {
     loadInflight();
-    loadRebalanceStats();
     loadRequestRateStats();
     loadDeployment24hSummary();
   }
@@ -462,7 +461,6 @@
     stopInflightPoll();
     inflightTimer = setInterval(() => {
       loadInflight();
-      loadRebalanceStats();
       // Only poll stats that are in 1h mode — non-1h ranges are DB-backed and
       // would be needlessly re-queried every 3s otherwise.
       if (rangeState.rate.range === "1h") loadRequestRateStats();
@@ -476,51 +474,11 @@
     }
   }
 
-  // ── Rebalance Chart ──────────────────────────────────
-  async function loadRebalanceStats() {
-    try {
-      const data = await api("/admin/stats/rebalance");
-      renderRebalanceChart(data.rebalance_events || []);
-    } catch (err) {
-      console.error("loadRebalanceStats error:", err);
-    }
-  }
-
-  function renderRebalanceChart(events) {
-    const wrap = document.getElementById("rebalance-chart-wrap");
-    if (!wrap) return;
-    if (!events.length) { wrap.innerHTML = "<p>" + t("common.no_records") + "</p>"; return; }
-
-    const maxCount = Math.max(1, ...events.map((e) => e.count));
-    const bars = events.map((e) => {
-      const pct = (e.count / maxCount) * 100;
-      const showLabel = e.minute === "now" || e.minute.endsWith("0m") || e.minute.endsWith("5m");
-      const title = e.minute === "now" ? t("stats.rebalance.current_minute") : e.minute.replace("-", "") + " " + t("stats.rebalance.ago") + ": " + e.count + " " + t("stats.rebalance.events");
-      return '<div class="rb-bar-col" title="' + esc(title) + '">' +
-        '<div class="rb-bar-value' + (e.count === 0 ? " rb-bar-value-zero" : "") + '">' + e.count + '</div>' +
-        '<div class="rb-bar" style="height:' + Math.max(pct, 1) + '%;background:' + rebalanceBarColor(pct) + '"></div>' +
-        '<div class="rb-bar-label' + (showLabel ? "" : " rb-label-hidden") + '">' + esc(e.minute === "now" ? t("stats.rebalance.now") : e.minute.replace("-","")) + '</div>' +
-        '</div>';
-    }).join("");
-
-    wrap.innerHTML =
-      '<div class="rebalance-chart">' +
-      '<div class="rb-y-axis"><span>' + maxCount + '</span><span>0</span></div>' +
-      '<div class="rb-bars">' + bars + '</div>' +
-      '</div>';
-  }
-
   // Throughput chart colors — cool cyan/teal palette suggesting high traffic
   function throughputBarColor(pct) {
     if (pct > 75) return "linear-gradient(180deg, #06b6d4, #0891b2)"; // cyan-500 → cyan-600
     if (pct > 40) return "linear-gradient(180deg, #22d3ee, #06b6d4)"; // cyan-400 → cyan-500
     return "linear-gradient(180deg, #67e8f9, #22d3ee)";                // cyan-300 → cyan-400
-  }
-  // Rebalance chart colors — muted, subtle, suggesting rare events
-  function rebalanceBarColor(pct) {
-    if (pct > 75) return "linear-gradient(180deg, #f87171, #ef4444)";  // red-400 → red-500
-    if (pct > 0)  return "linear-gradient(180deg, #fca5a5, #f87171)";  // red-300 → red-400
-    return "linear-gradient(180deg, var(--surface3), var(--surface3))"; // neutral
   }
 
   // ── Range controls (Agent Statistics + Request Rate) ─────
@@ -674,6 +632,50 @@
     });
 
     wrap.innerHTML = html || (windowNote + "<p>" + t("common.no_records") + "</p>");
+  }
+
+  // ── Rebalance Moves (per deployment, lifetime cumulative) ──
+  async function loadRebalanceMoves() {
+    try {
+      const data = await api("/admin/stats/rebalance-moves");
+      renderRebalanceMovesChart(data.moves || []);
+    } catch (err) {
+      console.error("loadRebalanceMoves error:", err);
+    }
+  }
+
+  function renderRebalanceMovesChart(moves) {
+    const wrap = document.getElementById("rebalance-moves-wrap");
+    if (!wrap) return;
+    if (!moves.length) { wrap.innerHTML = "<p>" + t("debug.rebalance_moves.no_data") + "</p>"; return; }
+
+    moves.sort((a, b) => a.deployment_id.localeCompare(b.deployment_id));
+
+    const maxCount = Math.max(1, ...moves.flatMap((m) => [m.in_count, m.out_count]));
+    const cols = moves.map((m) => {
+      const outPct = (m.out_count / maxCount) * 100;
+      const inPct = (m.in_count / maxCount) * 100;
+      const title = esc(m.deployment_id) + " — " +
+        t("debug.rebalance_moves.out") + ": " + m.out_count + ", " +
+        t("debug.rebalance_moves.in") + ": " + m.in_count;
+      return '<div class="rbm-col" title="' + title + '">' +
+        '<div class="rbm-bars">' +
+        '<div class="rbm-bar rbm-bar-out" style="height:' + Math.max(outPct, 1) + '%"></div>' +
+        '<div class="rbm-bar rbm-bar-in"  style="height:' + Math.max(inPct, 1) + '%"></div>' +
+        '</div>' +
+        '<div class="rbm-label">' + esc(m.deployment_id) + '</div>' +
+        '</div>';
+    }).join("");
+
+    wrap.innerHTML =
+      '<div class="rebalance-moves-chart">' +
+      '<div class="rbm-y-axis"><span>' + maxCount + '</span><span>0</span></div>' +
+      '<div class="rbm-cols">' + cols + '</div>' +
+      '</div>' +
+      '<div class="rbm-legend">' +
+      '<span class="rbm-legend-item"><span class="rbm-swatch rbm-bar-out"></span>' + t("debug.rebalance_moves.out") + '</span>' +
+      '<span class="rbm-legend-item"><span class="rbm-swatch rbm-bar-in"></span>'  + t("debug.rebalance_moves.in")  + '</span>' +
+      '</div>';
   }
 
   // ── Agent Statistics (anthropic share stacked bar) ───────

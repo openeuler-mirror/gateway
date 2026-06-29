@@ -922,6 +922,42 @@ input[list] {
 .rb-bar-label { font-size: 10px; color: var(--text3); margin-top: 3px; white-space: nowrap; }
 .rb-label-hidden { visibility: hidden; }
 
+/* ── Rebalance Moves (per deployment, in/out paired bars) ── */
+.rebalance-moves-chart { display: flex; align-items: stretch; height: 200px; gap: 0; }
+.rbm-y-axis {
+  display: flex; flex-direction: column; justify-content: space-between;
+  padding: 0 8px 48px 0; font-size: 11px; color: var(--text3);
+  text-align: right; min-width: 32px;
+}
+.rbm-cols {
+  display: flex; align-items: flex-end; flex: 1; gap: 6px;
+  padding-bottom: 48px; border-bottom: 1px solid var(--border);
+  overflow-x: auto;
+}
+.rbm-col {
+  display: flex; flex-direction: column; align-items: center;
+  height: 100%; justify-content: flex-end; min-width: 48px; flex: 1;
+}
+.rbm-bars { display: flex; gap: 2px; align-items: flex-end; height: 100%; width: 100%; justify-content: center; }
+.rbm-bar {
+  width: 14px; min-height: 1px; border-radius: 3px 3px 0 0;
+  transition: height .3s ease; position: relative;
+}
+.rbm-bar::after {
+  content: ""; position: absolute; inset: 0; border-radius: inherit;
+  background: linear-gradient(180deg, rgba(255,255,255,.15) 0%, transparent 60%);
+}
+.rbm-bar-out { background: linear-gradient(180deg, #f87171, #ef4444); } /* red-400 → red-500 */
+.rbm-bar-in  { background: linear-gradient(180deg, #4ade80, #22c55e); } /* green-400 → green-500 */
+.rbm-label {
+  font-size: 10px; color: var(--text3); margin-top: 6px;
+  white-space: nowrap; text-align: center;
+  transform: rotate(-45deg); transform-origin: right top;
+}
+.rbm-legend { display: flex; gap: 16px; margin-top: 8px; font-size: 12px; color: var(--text3); }
+.rbm-legend-item { display: flex; align-items: center; gap: 4px; }
+.rbm-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; }
+
 /* ── Agent Statistics (stacked bar: anthropic vs other) ─── */
 .agent-summary {
   display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));

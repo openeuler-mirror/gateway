@@ -1892,18 +1892,15 @@ pub async fn get_deployment_summary_24h(
 }
 
 // ═══════════════════════════════════════════════════════════
-// Rebalance Stats
+// Rebalance Move Stats (per deployment, in/out counts)
 // ═══════════════════════════════════════════════════════════
 
-pub async fn get_rebalance_stats(
+pub async fn get_rebalance_moves(
     _session: AdminSession,
     Extension(state): Extension<Arc<DashboardState>>,
 ) -> Response {
-    let data = state.rebalance_counter.snapshot();
-    let points: Vec<serde_json::Value> = data.into_iter()
-        .map(|(label, count)| json!({ "minute": label, "count": count }))
-        .collect();
-    Json(json!({ "rebalance_events": points })).into_response()
+    let moves = state.rebalance_move_tracker.snapshot();
+    Json(json!({ "moves": moves })).into_response()
 }
 
 // ═══════════════════════════════════════════════════════════

@@ -94,15 +94,6 @@
       "stats.inflight.no_inflight": "No in-flight requests.",
       "stats.inflight.24h_load_failed": "24h summary load failed: {error}",
 
-      "stats.rebalance.title": "Key Rebalance Events",
-      "stats.rebalance.subtitle": "Last 60 minutes",
-      "stats.rebalance.no_data": "No rebalance events.",
-      "stats.rebalance.now": "now",
-      "stats.rebalance.current_minute": "Current minute",
-      "stats.rebalance.ago": "ago",
-      "stats.rebalance.events": "rebalance(s)",
-      "stats.rebalance.req_count": "{n} req(s)",
-
       "stats.rate.title": "Request Rate (per model)",
       "stats.rate.no_data": "No data.",
       "stats.rate.all_models": "ALL MODELS",
@@ -120,6 +111,12 @@
       "stats.agent.chart.output_tokens": "Output Tokens",
 
       "debug.banner": "Debug-only — content may change or be removed between versions.",
+
+      "debug.rebalance_moves.title": "Rebalance Moves (per deployment)",
+      "debug.rebalance_moves.subtitle": "Process lifetime cumulative",
+      "debug.rebalance_moves.no_data": "No rebalance moves recorded.",
+      "debug.rebalance_moves.in": "Migrated in",
+      "debug.rebalance_moves.out": "Migrated out",
 
       "models.title": "Model Deployments",
       "models.add": "+ Add Model",
@@ -520,15 +517,6 @@
       "stats.inflight.no_inflight": "暂无在途请求。",
       "stats.inflight.24h_load_failed": "24小时汇总加载失败：{error}",
 
-      "stats.rebalance.title": "密钥再平衡事件",
-      "stats.rebalance.subtitle": "最近 60 分钟",
-      "stats.rebalance.no_data": "暂无再平衡事件。",
-      "stats.rebalance.now": "当前",
-      "stats.rebalance.current_minute": "当前分钟",
-      "stats.rebalance.ago": "前",
-      "stats.rebalance.events": "次再平衡",
-      "stats.rebalance.req_count": "{n} 个请求",
-
       "stats.rate.title": "请求速率（按模型）",
       "stats.rate.no_data": "暂无数据。",
       "stats.rate.all_models": "全部模型",
@@ -546,6 +534,12 @@
       "stats.agent.chart.output_tokens": "输出 Tokens",
 
       "debug.banner": "仅供调试使用，版本更新可能调整或删除。",
+
+      "debug.rebalance_moves.title": "再平衡迁移（按部署）",
+      "debug.rebalance_moves.subtitle": "进程生命周期累计",
+      "debug.rebalance_moves.no_data": "暂无再平衡迁移记录。",
+      "debug.rebalance_moves.in": "迁入",
+      "debug.rebalance_moves.out": "迁出",
 
       "models.title": "模型部署",
       "models.add": "+ 新增模型",

@@ -178,12 +178,6 @@
             <div id="inflight-table-wrap"><p class="loading" data-i18n="common.loading">Loading...</p></div>
 
             <div class="section-header" style="margin-top:2rem">
-              <h2 data-i18n="stats.rebalance.title">Key Rebalance Events</h2>
-              <span style="font-size:.85em;color:var(--text3)" data-i18n="stats.rebalance.subtitle">Last 60 minutes</span>
-            </div>
-            <div id="rebalance-chart-wrap"><p class="loading" data-i18n="common.loading">Loading...</p></div>
-
-            <div class="section-header" style="margin-top:2rem">
               <h2 data-i18n="stats.rate.title">Request Rate (per model)</h2>
               <div class="range-controls" data-target="rate">
                 <button class="btn-range active" data-range="1h">1h</button>
@@ -207,6 +201,12 @@
             <div class="debug-banner" data-i18n="debug.banner">
               Debug-only — content may change or be removed between versions.
             </div>
+
+            <div class="section-header" style="margin-top:1.5rem">
+              <h2 data-i18n="debug.rebalance_moves.title">Rebalance Moves (per deployment)</h2>
+              <span style="font-size:.85em;color:var(--text3)" data-i18n="debug.rebalance_moves.subtitle">Process lifetime cumulative</span>
+            </div>
+            <div id="rebalance-moves-wrap"><p class="loading" data-i18n="common.loading">Loading...</p></div>
 
             <div class="section-header">
               <h2 data-i18n="stats.agent.title">Agent Statistics</h2>
