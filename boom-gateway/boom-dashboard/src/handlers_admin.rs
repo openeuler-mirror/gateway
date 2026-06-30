@@ -1268,6 +1268,7 @@ struct LogRow {
     created_at: Option<chrono::DateTime<chrono::Utc>>,
     deployment_id: Option<String>,
     client_ip: Option<String>,
+    cached_tokens: Option<i64>,
 }
 
 pub async fn list_logs(
@@ -1362,7 +1363,7 @@ pub async fn list_logs(
                   rl.model, rl.api_path,
                   rl.is_stream, rl.status_code, rl.error_type, rl.error_message,
                   rl.input_tokens, rl.output_tokens, rl.duration_ms, rl.ttft_ms, rl.created_at,
-                  rl.deployment_id, rl.client_ip
+                  rl.deployment_id, rl.client_ip, rl.cached_tokens
            FROM boom_request_log rl
            LEFT JOIN boom_team_table bt ON rl.team_id = bt.team_id
            {where_sql}
@@ -1454,6 +1455,10 @@ pub async fn list_logs(
                 "error_message": r.error_message,
                 "input_tokens": r.input_tokens,
                 "output_tokens": r.output_tokens,
+                // vLLM-reported real KV-cache hit (prompt_tokens_details.cached_tokens).
+                // Frontend "Prefix Hit Rate" = cached_tokens / total_tokens
+                // (total = input + output), computed client-side.
+                "cached_tokens": r.cached_tokens,
                 "duration_ms": r.duration_ms,
                 "ttft_ms": r.ttft_ms,
                 "created_at": r.created_at.map(|d| d.to_rfc3339()),
