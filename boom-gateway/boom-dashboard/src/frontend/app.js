@@ -833,6 +833,31 @@
   let chatFirstTokenArrived = false;
 
   function getChatKey() { return sessionStorage.getItem(CHAT_KEY_STORAGE); }
+
+  // Per-key chat history in localStorage. Keyed by a short prefix of the API
+  // key so different keys' histories don't bleed into each other. Never sent
+  // to the server.
+  function chatHistoryStorageKey() {
+    const k = getChatKey() || "anon";
+    return "boom_chat_history_" + k.slice(0, 12);
+  }
+  function loadChatHistory() {
+    try {
+      const raw = localStorage.getItem(chatHistoryStorageKey());
+      if (!raw) return [];
+      const arr = JSON.parse(raw);
+      return Array.isArray(arr) ? arr.filter((m) => m && m.role && typeof m.content === "string") : [];
+    } catch { return []; }
+  }
+  function saveChatHistory() {
+    try {
+      localStorage.setItem(chatHistoryStorageKey(), JSON.stringify(chatHistory));
+    } catch {} // quota exceeded etc — silently drop
+  }
+  function clearChatHistory() {
+    chatHistory = [];
+    try { localStorage.removeItem(chatHistoryStorageKey()); } catch {}
+  }
   function getChatPrompt() { return localStorage.getItem(CHAT_PROMPT_STORAGE) || ""; }
   function getChatTemperature() {
     const v = parseFloat(localStorage.getItem(CHAT_TEMPERATURE_STORAGE));
@@ -868,6 +893,8 @@
       });
     }
     if (!chatModelsLoaded) loadChatModels();
+    // Load persisted history from localStorage (per-key).
+    if (chatHistory.length === 0) chatHistory = loadChatHistory();
     loadChatPlan();
     renderChatHistory();
     updateParamChip();
@@ -987,20 +1014,44 @@
     return `<div class="${aligned}"><div class="chat-bubble ${cls}">${shown}</div></div>`;
   }
 
-  // Strip tool-calling tags (e.g. <tool>...</tool>, <antml:invoke>...</antml:invoke>,
-  // <function_calls>...</function_calls>) when tool filter is enabled.
+  // Render assistant content based on the tool-filter toggle:
+  //   - ON  : strip tool-call tags entirely (filterToolTags).
+  //   - OFF : keep them but wrap in a muted .chat-tool-block so they read as
+  //           dimmed metadata, like Claude Code / Cursor style.
   function renderAssistantContent(raw) {
     if (!raw) return "";
-    let s = raw;
+    return getChatToolFilter() ? esc(filterToolTags(raw)) : highlightToolTags(raw);
+  }
+
+  // Stream-time variant: same rendering rules, but during streaming an opening
+  // tag may not yet have its closer. When filter is ON we strip the partial
+  // opener so it never flashes; when OFF we still dim it (it'll be rewrapped
+  // cleanly once the closer arrives).
+  function renderStreamContent(buf) {
     if (getChatToolFilter()) {
-      s = s.replace(/<tool>[\s\S]*?<\/tool>/gi, "")
-           .replace(/<function_calls>[\s\S]*?<\/function_calls>/gi, "")
-           .replace(/<antml:invoke[\s\S]*?<\/antml:invoke>/gi, "")
-           .replace(/<antml:parameter[\s\S]*?<\/antml:parameter>/gi, "")
-           .replace(/<\/?antml:[^>]*>/gi, "");
-      s = s.replace(/\n{3,}/g, "\n\n").trim();
+      return esc(filterToolTags(buf));
     }
-    return esc(s);
+    return highlightToolTags(buf);
+  }
+
+  // Escape, then wrap tool-call tag blocks in a muted span. Operates on the
+  // escaped string so no raw HTML from the model ever reaches the DOM.
+  function highlightToolTags(raw) {
+    const e = esc(raw || "");
+    const wrap = (s) => '<span class="chat-tool-block">' + s + "</span>";
+    return e
+      .replace(/&lt;tool&gt;[\s\S]*?&lt;\/tool&gt;/gi, wrap)
+      .replace(/&lt;function_calls&gt;[\s\S]*?&lt;\/function_calls&gt;/gi, wrap)
+      .replace(/&lt;antml:invoke[\s\S]*?&lt;\/antml:invoke&gt;/gi, wrap)
+      .replace(/&lt;antml:parameter[\s\S]*?&lt;\/antml:parameter&gt;/gi, wrap)
+      .replace(/(&lt;\/?antml:[^&]*?&gt;)/gi, wrap)
+      // Unclosed opener at end-of-buffer (streaming): dim it too.
+      .replace(/&lt;tool(\s[^&]*?)?&gt;[^&]*$/gi, wrap)
+      .replace(/&lt;function_calls(\s[^&]*?)?&gt;[^&]*$/gi, wrap)
+      .replace(/&lt;antml:invoke(\s[^&]*?)?&gt;[^&]*$/gi, wrap)
+      .replace(/&lt;antml:parameter(\s[^&]*?)?&gt;[^&]*$/gi, wrap)
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
   }
 
   async function sendChatMessage() {
@@ -1027,6 +1078,7 @@
     messages.push({ role: "user", content: text });
     chatHistory.push({ role: "user", content: text });
     chatHistory.push({ role: "assistant", content: "" });
+    saveChatHistory();
 
     const body = {
       model,
@@ -1055,7 +1107,6 @@
     startQueuePolling(model);
     chatAbort = new AbortController();
     let buf = "";
-    let filtered = "";
     try {
       const res = await fetch("/v1/chat/completions", {
         method: "POST",
@@ -1095,9 +1146,9 @@
                 stopQueuePolling();
               }
               buf += delta;
-              // Re-filter full buffer on each delta — tags can span chunks.
-              filtered = getChatToolFilter() ? filterToolTags(buf) : buf;
-              aBubble.innerHTML = esc(filtered) + '<span class="chat-cursor">▌</span>';
+              // Re-render full buffer on each delta — tags can span chunks,
+              // and when filter is OFF we want the dimmed style to apply live.
+              aBubble.innerHTML = renderStreamContent(buf) + '<span class="chat-cursor">▌</span>';
               box.scrollTop = box.scrollHeight;
             }
           } catch {}
@@ -1123,20 +1174,28 @@
       stopQueuePolling();
       sendBtn.disabled = false;
       if (sendLabel) sendLabel.textContent = t("chat.send");
+      saveChatHistory();
       loadChatPlan();
       chatAbort = null;
     }
   }
 
   function filterToolTags(s) {
-    return s
+    let r = s
       .replace(/<tool>[\s\S]*?<\/tool>/gi, "")
       .replace(/<function_calls>[\s\S]*?<\/function_calls>/gi, "")
       .replace(/<antml:invoke[\s\S]*?<\/antml:invoke>/gi, "")
       .replace(/<antml:parameter[\s\S]*?<\/antml:parameter>/gi, "")
-      .replace(/<\/?antml:[^>]*>/gi, "")
-      .replace(/\n{3,}/g, "\n\n")
-      .trim();
+      .replace(/<\/?antml:[^>]*>/gi, "");
+    // During streaming, an opening tag may have arrived without its closer yet.
+    // Strip from the last unclosed opener to end-of-buffer so partial tag text
+    // never flashes in the bubble. Once the closer arrives, the rule above
+    // removes the whole block cleanly.
+    r = r.replace(/<tool(\s[^>]*)?>[^<>]*$/gi, "")
+          .replace(/<function_calls(\s[^>]*)?>[^<>]*$/gi, "")
+          .replace(/<antml:invoke(\s[^>]*)?>[^<>]*$/gi, "")
+          .replace(/<antml:parameter(\s[^>]*)?>[^<>]*$/gi, "");
+    return r.replace(/\n{3,}/g, "\n\n").trim();
   }
 
   function startQueuePolling(model) {
@@ -1217,6 +1276,12 @@
         </label>
       </div>
 
+      <div class="chat-settings-section chat-settings-danger">
+        <label class="chat-settings-label">${t("chat.history_label")}</label>
+        <p class="modal-hint">${t("chat.history_hint")}</p>
+        <button class="btn-danger" id="chat-clear-history-btn">${t("chat.clear_history")}</button>
+      </div>
+
       <div class="modal-actions">
         <button class="btn-danger" id="chat-reset-btn">${t("chat.settings_reset")}</button>
         <button class="btn-secondary" id="chat-cancel-btn">${t("action.cancel")}</button>
@@ -1270,6 +1335,13 @@
       maxSlider.value = DEFAULT_MAX_TOKENS; maxInput.value = DEFAULT_MAX_TOKENS;
       document.getElementById("chat-filter-checkbox").checked = true;
       showToast(t("chat.settings_reset_done"));
+    });
+    document.getElementById("chat-clear-history-btn").addEventListener("click", () => {
+      if (!confirm(t("chat.confirm_clear_history"))) return;
+      clearChatHistory();
+      renderChatHistory();
+      hideModal();
+      showToast(t("chat.history_cleared"));
     });
   }
 
