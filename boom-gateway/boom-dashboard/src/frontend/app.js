@@ -821,6 +821,11 @@
   // ── User: Chat ───────────────────────────────────────
   const CHAT_KEY_STORAGE = "boom_chat_api_key";
   const CHAT_PROMPT_STORAGE = "boom_chat_system_prompt";
+  const CHAT_TEMPERATURE_STORAGE = "boom_chat_temperature";
+  const CHAT_MAX_TOKENS_STORAGE = "boom_chat_max_tokens";
+  const CHAT_TOOL_FILTER_STORAGE = "boom_chat_tool_filter";
+  const DEFAULT_TEMPERATURE = 0.7;
+  const DEFAULT_MAX_TOKENS = 32768;
   let chatModelsLoaded = false;
   let chatHistory = []; // [{role, content}]
   let chatQueueTimer = null;
@@ -829,12 +834,23 @@
 
   function getChatKey() { return sessionStorage.getItem(CHAT_KEY_STORAGE); }
   function getChatPrompt() { return localStorage.getItem(CHAT_PROMPT_STORAGE) || ""; }
+  function getChatTemperature() {
+    const v = parseFloat(localStorage.getItem(CHAT_TEMPERATURE_STORAGE));
+    return Number.isFinite(v) ? v : DEFAULT_TEMPERATURE;
+  }
+  function getChatMaxTokens() {
+    const v = parseInt(localStorage.getItem(CHAT_MAX_TOKENS_STORAGE), 10);
+    return Number.isFinite(v) && v > 0 ? v : DEFAULT_MAX_TOKENS;
+  }
+  function getChatToolFilter() {
+    const v = localStorage.getItem(CHAT_TOOL_FILTER_STORAGE);
+    return v === null ? true : v === "1"; // default ON
+  }
 
   function initChatPage() {
     const sendBtn = document.getElementById("chat-send-btn");
     const input = document.getElementById("chat-input");
-    const promptBtn = document.getElementById("chat-prompt-btn");
-    // Wire up controls once.
+    const settingsBtn = document.getElementById("chat-settings-btn");
     if (!sendBtn.dataset.wired) {
       sendBtn.dataset.wired = "1";
       sendBtn.addEventListener("click", sendChatMessage);
@@ -844,11 +860,17 @@
           sendChatMessage();
         }
       });
-      promptBtn.addEventListener("click", showSystemPromptModal);
+      settingsBtn.addEventListener("click", showChatSettingsModal);
+      // Auto-grow textarea.
+      input.addEventListener("input", () => {
+        input.style.height = "auto";
+        input.style.height = Math.min(input.scrollHeight, 160) + "px";
+      });
     }
     if (!chatModelsLoaded) loadChatModels();
-    loadChatQuota();
+    loadChatPlan();
     renderChatHistory();
+    updateParamChip();
   }
 
   async function loadChatModels() {
@@ -870,27 +892,81 @@
         ? names.map((n) => `<option value="${esc(n)}">${esc(n)}</option>`).join("")
         : `<option value="">${t("chat.no_models")}</option>`;
       if (prev && names.includes(prev)) sel.value = prev;
+      else if (names.length) sel.value = names[0];
       chatModelsLoaded = true;
     } catch (err) {
       sel.innerHTML = `<option value="">${t("chat.models_failed", { error: esc(String(err.message || err)) })}</option>`;
     }
   }
 
-  async function loadChatQuota() {
-    const el = document.getElementById("chat-quota");
+  // ── Plan + Usage card ─────────────────────────────────
+  async function loadChatPlan() {
+    const el = document.getElementById("chat-plan-bar");
     if (!el) return;
     try {
       const [plan, usage] = await Promise.all([api("/user/plan"), api("/user/usage")]);
-      const rpmWindow = (usage.windows || []).find((w) => w.window_secs === 60);
-      const rpmUsed = rpmWindow ? rpmWindow.count : 0;
-      const rpmLimit = plan.rpm_limit;
+      const planName = plan.plan_name || t("chat.no_plan");
       const concUsed = usage.concurrency || 0;
       const concLimit = plan.concurrency_limit;
-      const fmt = (u, l) => (l == null ? `${u}/∞` : `${u}/${l}`);
-      el.textContent = `RPM ${fmt(rpmUsed, rpmLimit)} · ${t("chat.concurrency")} ${fmt(concUsed, concLimit)}`;
+      const windows = (usage.windows || []).slice().sort((a, b) => a.window_secs - b.window_secs);
+      // RPM is the 60s window if present.
+      const rpmWindow = windows.find((w) => w.window_secs === 60);
+
+      const fmtLimit = (l) => (l == null ? "∞" : String(l));
+      const pct = (u, l) => (l == null || l === 0 ? 0 : Math.min(100, Math.round((u / l) * 100)));
+
+      // Concurrency meter.
+      const concHtml = meterHtml(
+        t("chat.concurrency"),
+        `${concUsed} / ${fmtLimit(concLimit)}`,
+        pct(concUsed, concLimit)
+      );
+      // RPM meter (60s).
+      const rpmUsed = rpmWindow ? rpmWindow.count : 0;
+      const rpmLimit = plan.rpm_limit;
+      const rpmHtml = meterHtml(
+        "RPM",
+        `${rpmUsed} / ${fmtLimit(rpmLimit)}`,
+        pct(rpmUsed, rpmLimit)
+      );
+      // Other windows (skip 60s — already shown as RPM).
+      const otherWindows = windows.filter((w) => w.window_secs !== 60);
+      const otherHtml = otherWindows.map((w) => {
+        const label = formatDuration(w.window_secs);
+        return meterHtml(label, `${w.count} / ${fmtLimit(w.limit)}`, pct(w.count, w.limit));
+      }).join("");
+
+      el.innerHTML = `
+        <div class="chat-plan-head">
+          <span class="chat-plan-label">${t("chat.plan_label")}</span>
+          <span class="chat-plan-name">${esc(planName)}</span>
+        </div>
+        <div class="chat-plan-meters">${concHtml}${rpmHtml}${otherHtml}</div>
+      `;
+      el.classList.remove("hidden");
     } catch {
-      el.textContent = "";
+      el.innerHTML = `<span class="chat-plan-error">${t("chat.plan_load_failed")}</span>`;
+      el.classList.remove("hidden");
     }
+  }
+
+  function meterHtml(label, valueText, percent) {
+    const tone = percent >= 90 ? "danger" : (percent >= 70 ? "warn" : "ok");
+    return `
+      <div class="chat-meter">
+        <div class="chat-meter-head"><span class="chat-meter-label">${esc(label)}</span><span class="chat-meter-value">${esc(valueText)}</span></div>
+        <div class="chat-meter-track"><div class="chat-meter-fill tone-${tone}" style="width:${percent}%"></div></div>
+      </div>`;
+  }
+
+  function updateParamChip() {
+    const el = document.getElementById("chat-param-chip");
+    if (!el) return;
+    const temp = getChatTemperature();
+    const mt = getChatMaxTokens();
+    const tempStr = Number.isInteger(temp) ? String(temp) : temp.toFixed(2).replace(/0$/, "");
+    el.textContent = `T=${tempStr} · max=${mt >= 1024 ? (mt / 1024) + "k" : mt}`;
+    el.title = t("chat.param_chip_tip");
   }
 
   function renderChatHistory() {
@@ -907,12 +983,30 @@
   function chatBubbleHtml(role, content) {
     const cls = role === "user" ? "chat-bubble-user" : "chat-bubble-assistant";
     const aligned = role === "user" ? "chat-row-user" : "chat-row-assistant";
-    return `<div class="${aligned}"><div class="chat-bubble ${cls}">${esc(content)}</div></div>`;
+    const shown = role === "assistant" ? renderAssistantContent(content) : esc(content);
+    return `<div class="${aligned}"><div class="chat-bubble ${cls}">${shown}</div></div>`;
+  }
+
+  // Strip tool-calling tags (e.g. <tool>...</tool>, <antml:invoke>...</antml:invoke>,
+  // <function_calls>...</function_calls>) when tool filter is enabled.
+  function renderAssistantContent(raw) {
+    if (!raw) return "";
+    let s = raw;
+    if (getChatToolFilter()) {
+      s = s.replace(/<tool>[\s\S]*?<\/tool>/gi, "")
+           .replace(/<function_calls>[\s\S]*?<\/function_calls>/gi, "")
+           .replace(/<antml:invoke[\s\S]*?<\/antml:invoke>/gi, "")
+           .replace(/<antml:parameter[\s\S]*?<\/antml:parameter>/gi, "")
+           .replace(/<\/?antml:[^>]*>/gi, "");
+      s = s.replace(/\n{3,}/g, "\n\n").trim();
+    }
+    return esc(s);
   }
 
   async function sendChatMessage() {
     const input = document.getElementById("chat-input");
     const sendBtn = document.getElementById("chat-send-btn");
+    const sendLabel = sendBtn.querySelector("span");
     const text = (input.value || "").trim();
     if (!text) return;
     const key = getChatKey();
@@ -923,7 +1017,7 @@
     input.value = "";
     input.style.height = "";
     sendBtn.disabled = true;
-    sendBtn.textContent = t("chat.sending");
+    if (sendLabel) sendLabel.textContent = t("chat.sending");
 
     // Build messages: optional system prompt + history + new user message.
     const sysPrompt = getChatPrompt();
@@ -933,6 +1027,14 @@
     messages.push({ role: "user", content: text });
     chatHistory.push({ role: "user", content: text });
     chatHistory.push({ role: "assistant", content: "" });
+
+    const body = {
+      model,
+      messages,
+      stream: true,
+      temperature: getChatTemperature(),
+      max_tokens: getChatMaxTokens(),
+    };
 
     const box = document.getElementById("chat-messages");
     if (box.querySelector(".chat-empty")) box.innerHTML = "";
@@ -953,6 +1055,7 @@
     startQueuePolling(model);
     chatAbort = new AbortController();
     let buf = "";
+    let filtered = "";
     try {
       const res = await fetch("/v1/chat/completions", {
         method: "POST",
@@ -960,7 +1063,7 @@
           "Content-Type": "application/json",
           Authorization: "Bearer " + key,
         },
-        body: JSON.stringify({ model, messages, stream: true }),
+        body: JSON.stringify(body),
         signal: chatAbort.signal,
       });
       if (!res.ok) {
@@ -990,31 +1093,28 @@
               if (!chatFirstTokenArrived) {
                 chatFirstTokenArrived = true;
                 stopQueuePolling();
-                aBubble.innerHTML = "";
               }
               buf += delta;
-              aBubble.textContent = buf;
-              // Re-append cursor for live feel.
-              const cur = document.createElement("span");
-              cur.className = "chat-cursor";
-              cur.textContent = "▌";
-              aBubble.appendChild(cur);
+              // Re-filter full buffer on each delta — tags can span chunks.
+              filtered = getChatToolFilter() ? filterToolTags(buf) : buf;
+              aBubble.innerHTML = esc(filtered) + '<span class="chat-cursor">▌</span>';
               box.scrollTop = box.scrollHeight;
             }
           } catch {}
         }
       }
-      // Stream ended — strip cursor, finalize bubble.
-      aBubble.textContent = buf;
+      // Stream ended — finalize. Store RAW in history (so toggling filter re-renders).
       chatHistory[chatHistory.length - 1].content = buf;
+      aBubble.innerHTML = renderAssistantContent(buf);
     } catch (err) {
       if (err.name === "AbortError") {
-        // User navigated away or aborted — keep partial.
+        // Keep partial — finalize what we have.
+        chatHistory[chatHistory.length - 1].content = buf;
+        aBubble.innerHTML = renderAssistantContent(buf);
       } else {
         aBubble.classList.add("chat-bubble-error");
         aBubble.textContent = String(err.message || err);
         showToast(String(err.message || err));
-        // Roll back the empty assistant placeholder we pushed.
         if (chatHistory.length && chatHistory[chatHistory.length - 1].content === "") {
           chatHistory.pop();
         }
@@ -1022,10 +1122,21 @@
     } finally {
       stopQueuePolling();
       sendBtn.disabled = false;
-      sendBtn.textContent = t("chat.send");
-      loadChatQuota();
+      if (sendLabel) sendLabel.textContent = t("chat.send");
+      loadChatPlan();
       chatAbort = null;
     }
+  }
+
+  function filterToolTags(s) {
+    return s
+      .replace(/<tool>[\s\S]*?<\/tool>/gi, "")
+      .replace(/<function_calls>[\s\S]*?<\/function_calls>/gi, "")
+      .replace(/<antml:invoke[\s\S]*?<\/antml:invoke>/gi, "")
+      .replace(/<antml:parameter[\s\S]*?<\/antml:parameter>/gi, "")
+      .replace(/<\/?antml:[^>]*>/gi, "")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
   }
 
   function startQueuePolling(model) {
@@ -1044,9 +1155,9 @@
         el.classList.remove("hidden");
         const r = reqs[0];
         if (r.status === "waiting") {
-          el.textContent = t("chat.queue_waiting", { ahead: r.ahead || 0, secs: (r.wait_time_secs || 0).toFixed(1) });
+          el.innerHTML = `<span class="chat-queue-dot"></span>${esc(t("chat.queue_waiting", { ahead: r.ahead || 0, secs: (r.wait_time_secs || 0).toFixed(1) }))}`;
         } else {
-          el.textContent = t("chat.queue_processing", { parallel: r.parallel_count || 0, secs: (r.processing_secs || 0).toFixed(1) });
+          el.innerHTML = `<span class="chat-queue-dot dot-active"></span>${esc(t("chat.queue_processing", { parallel: r.parallel_count || 0, secs: (r.processing_secs || 0).toFixed(1) }))}`;
         }
       } catch {
         el.classList.add("hidden");
@@ -1062,31 +1173,106 @@
     if (el) el.classList.add("hidden");
   }
 
-  function showSystemPromptModal() {
-    const current = getChatPrompt();
+  // ── Settings modal (system prompt + temperature + max_tokens + tool filter) ─
+  function showChatSettingsModal() {
+    const currentPrompt = getChatPrompt();
+    const currentTemp = getChatTemperature();
+    const currentMax = getChatMaxTokens();
+    const currentFilter = getChatToolFilter();
     showModal(`
-      <h3>${t("chat.system_prompt_title")}</h3>
-      <p class="modal-hint">${t("chat.system_prompt_hint")}</p>
-      <textarea id="chat-prompt-input" rows="8" placeholder="${esc(t("chat.system_prompt_placeholder"))}">${esc(current)}</textarea>
+      <h3>${t("chat.settings_title")}</h3>
+
+      <div class="chat-settings-section">
+        <label class="chat-settings-label" for="chat-prompt-input">${t("chat.system_prompt_title")}</label>
+        <p class="modal-hint">${t("chat.system_prompt_hint")}</p>
+        <textarea id="chat-prompt-input" rows="5" placeholder="${esc(t("chat.system_prompt_placeholder"))}">${esc(currentPrompt)}</textarea>
+      </div>
+
+      <div class="chat-settings-section">
+        <label class="chat-settings-label" for="chat-temp-input">${t("chat.temperature_label")}</label>
+        <p class="modal-hint">${t("chat.temperature_hint")}</p>
+        <div class="chat-slider-row">
+          <input type="range" id="chat-temp-slider" min="0" max="2" step="0.05" value="${currentTemp}">
+          <input type="number" id="chat-temp-input" class="chat-num-input" min="0" max="2" step="0.05" value="${currentTemp}">
+        </div>
+      </div>
+
+      <div class="chat-settings-section">
+        <label class="chat-settings-label" for="chat-max-input">${t("chat.max_tokens_label")}</label>
+        <p class="modal-hint">${t("chat.max_tokens_hint")}</p>
+        <div class="chat-slider-row">
+          <input type="range" id="chat-max-slider" min="1024" max="131072" step="1024" value="${currentMax}">
+          <input type="number" id="chat-max-input" class="chat-num-input" min="1024" max="131072" step="1024" value="${currentMax}">
+        </div>
+      </div>
+
+      <div class="chat-settings-section">
+        <label class="chat-settings-toggle">
+          <input type="checkbox" id="chat-filter-checkbox" ${currentFilter ? "checked" : ""}>
+          <span class="chat-toggle-track"><span class="chat-toggle-thumb"></span></span>
+          <span class="chat-toggle-label">
+            <strong>${t("chat.tool_filter_label")}</strong>
+            <span class="modal-hint">${t("chat.tool_filter_hint")}</span>
+          </span>
+        </label>
+      </div>
+
       <div class="modal-actions">
-        <button class="btn-secondary" onclick="hideModal()">${t("action.cancel")}</button>
-        <button class="btn-danger" id="chat-prompt-clear">${t("chat.system_prompt_clear")}</button>
-        <button class="btn-primary" id="chat-prompt-save">${t("chat.system_prompt_save")}</button>
+        <button class="btn-danger" id="chat-reset-btn">${t("chat.settings_reset")}</button>
+        <button class="btn-secondary" id="chat-cancel-btn">${t("action.cancel")}</button>
+        <button class="btn-primary" id="chat-save-btn">${t("chat.settings_save")}</button>
       </div>
     `);
-    document.getElementById("chat-prompt-save").addEventListener("click", () => {
-      const v = document.getElementById("chat-prompt-input").value;
-      if (v && v.trim()) localStorage.setItem(CHAT_PROMPT_STORAGE, v);
-      else localStorage.removeItem(CHAT_PROMPT_STORAGE);
-      hideModal();
-      showToast(t("chat.system_prompt_saved"));
+    // Wire slider ↔ number input sync.
+    const tempSlider = document.getElementById("chat-temp-slider");
+    const tempInput = document.getElementById("chat-temp-input");
+    tempSlider.addEventListener("input", () => { tempInput.value = tempSlider.value; });
+    tempInput.addEventListener("input", () => {
+      const v = parseFloat(tempInput.value);
+      if (Number.isFinite(v)) tempSlider.value = Math.max(0, Math.min(2, v));
     });
-    document.getElementById("chat-prompt-clear").addEventListener("click", () => {
+    const maxSlider = document.getElementById("chat-max-slider");
+    const maxInput = document.getElementById("chat-max-input");
+    maxSlider.addEventListener("input", () => { maxInput.value = maxSlider.value; });
+    maxInput.addEventListener("input", () => {
+      const v = parseInt(maxInput.value, 10);
+      if (Number.isFinite(v) && v > 0) maxSlider.value = Math.max(1024, Math.min(131072, v));
+    });
+
+    document.getElementById("chat-cancel-btn").addEventListener("click", hideModal);
+    document.getElementById("chat-save-btn").addEventListener("click", () => {
+      const prompt = document.getElementById("chat-prompt-input").value;
+      if (prompt && prompt.trim()) localStorage.setItem(CHAT_PROMPT_STORAGE, prompt);
+      else localStorage.removeItem(CHAT_PROMPT_STORAGE);
+      const temp = parseFloat(tempInput.value);
+      if (Number.isFinite(temp) && temp >= 0 && temp <= 2) {
+        localStorage.setItem(CHAT_TEMPERATURE_STORAGE, String(temp));
+      }
+      const max = parseInt(maxInput.value, 10);
+      if (Number.isFinite(max) && max > 0) {
+        localStorage.setItem(CHAT_MAX_TOKENS_STORAGE, String(max));
+      }
+      const filter = document.getElementById("chat-filter-checkbox").checked;
+      localStorage.setItem(CHAT_TOOL_FILTER_STORAGE, filter ? "1" : "0");
+      hideModal();
+      updateParamChip();
+      // Re-render existing assistant bubbles since filter toggle changes display.
+      renderChatHistory();
+      showToast(t("chat.settings_saved"));
+    });
+    document.getElementById("chat-reset-btn").addEventListener("click", () => {
       localStorage.removeItem(CHAT_PROMPT_STORAGE);
+      localStorage.removeItem(CHAT_TEMPERATURE_STORAGE);
+      localStorage.removeItem(CHAT_MAX_TOKENS_STORAGE);
+      localStorage.removeItem(CHAT_TOOL_FILTER_STORAGE);
       document.getElementById("chat-prompt-input").value = "";
-      showToast(t("chat.system_prompt_cleared"));
+      tempSlider.value = DEFAULT_TEMPERATURE; tempInput.value = DEFAULT_TEMPERATURE;
+      maxSlider.value = DEFAULT_MAX_TOKENS; maxInput.value = DEFAULT_MAX_TOKENS;
+      document.getElementById("chat-filter-checkbox").checked = true;
+      showToast(t("chat.settings_reset_done"));
     });
   }
+
 
   async function loadUserLogs(page) {
     if (page !== undefined) userLogsPage = page;

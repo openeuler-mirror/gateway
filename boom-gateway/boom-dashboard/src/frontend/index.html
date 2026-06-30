@@ -101,16 +101,21 @@
 
           <!-- User: Chat -->
           <section id="user-chat" class="section">
+            <div class="chat-plan-bar" id="chat-plan-bar"></div>
             <div class="chat-toolbar">
               <select id="chat-model" class="chat-model-select"></select>
-              <button class="btn-small" id="chat-prompt-btn" data-i18n="chat.prompt_btn">⚙ System Prompt</button>
-              <span id="chat-quota" class="chat-quota"></span>
+              <span class="chat-toolbar-spacer"></span>
+              <span class="chat-param-chip" id="chat-param-chip"></span>
+              <button class="btn-small" id="chat-settings-btn" data-i18n="chat.settings_btn">⚙ Settings</button>
             </div>
             <div id="chat-queue-status" class="chat-queue hidden"></div>
             <div id="chat-messages" class="chat-messages"></div>
             <div class="chat-input-row">
               <textarea id="chat-input" rows="2" data-i18n-ph="chat.input_placeholder" placeholder="Type a message... (Enter to send, Shift+Enter for newline)"></textarea>
-              <button class="btn-primary" id="chat-send-btn" data-i18n="chat.send">Send</button>
+              <button class="btn-primary chat-send-btn" id="chat-send-btn">
+                <svg class="chat-send-icon" viewBox="0 0 20 20" fill="currentColor"><path d="M3 3l14 7-14 7 3-7-3-7z"/></svg>
+                <span data-i18n="chat.send">Send</span>
+              </button>
             </div>
           </section>
 
