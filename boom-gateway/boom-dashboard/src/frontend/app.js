@@ -2766,6 +2766,13 @@
         } else {
           modelCell = '<span class="log-model-name">' + modelVal + '</span>';
         }
+        // Prefix hit rate = cached_tokens / total_tokens, where
+        // total_tokens = input_tokens (prompt) + output_tokens (completion).
+        // "-" when upstream didn't report cached_tokens.
+        var kvTotal = (l.input_tokens || 0) + (l.output_tokens || 0);
+        var kvCell = (l.cached_tokens != null && kvTotal > 0)
+          ? esc((l.cached_tokens / kvTotal * 100).toFixed(1) + "%")
+          : "-";
         return `<tr>
         <td>${tsCell}</td>
         <td>${ipCell}</td>
@@ -2773,6 +2780,7 @@
         <td>${esc(l.key_alias || l.key_name || "-")}</td>
         <td>${modelCell}</td>
         <td class="mono">${esc(l.api_path)}</td>
+        <td class="mono">${kvCell}</td>
         <td>${l.status_code >= 400 ? '<span style="color:var(--danger)">' + l.status_code + '</span>' : l.status_code}</td>
         <td>${l.is_stream ? t("common.yes") : t("common.no")}</td>
         <td>${l.input_tokens != null ? formatNumber(l.input_tokens) : "-"}</td>

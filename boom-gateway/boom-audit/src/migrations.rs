@@ -78,5 +78,11 @@ pub async fn run_request_log_migration(pool: &sqlx::PgPool) -> Result<(), sqlx::
     )
     .execute(pool)
     .await;
+    // cached_tokens: vLLM-reported real KV-cache hit (from final usage chunk).
+    let _ = sqlx::query(
+        r#"ALTER TABLE boom_request_log ADD COLUMN IF NOT EXISTS cached_tokens BIGINT"#,
+    )
+    .execute(pool)
+    .await;
     Ok(())
 }
