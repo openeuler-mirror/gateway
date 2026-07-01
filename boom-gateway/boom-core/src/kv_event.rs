@@ -95,8 +95,12 @@ pub enum GatewayKvEvent {
 pub struct KvMatchResult {
     /// Worker ID with the best match.
     pub worker_id: String,
-    /// Number of consecutive prefix blocks matched.
+    /// Number of consecutive prefix blocks matched (hit blocks).
     pub match_depth: u64,
+    /// Total prefix blocks in the request (input blocks). hit_ratio =
+    /// match_depth / total_blocks. Stored raw so the dashboard can derive
+    /// the ratio without re-tokenizing.
+    pub total_blocks: u64,
     /// Hit ratio: matched_blocks / total_blocks.
     pub hit_ratio: f64,
     /// Best storage tier where the matched prefix resides.
@@ -140,9 +144,31 @@ pub trait KvIndexBackend: Send + Sync {
     /// Total number of indexed blocks.
     fn block_count(&self) -> usize;
 
+    /// Number of prefix blocks the request's token_ids hash into (the input
+    /// block count for DFX). Same as request_hashes.len() inside find_matches;
+    /// exposed so callers can record it even when no worker matched (empty
+    /// find_matches result). Default 0 for backends without a block notion.
+    fn prefix_block_count(&self, _token_ids: &[u32]) -> u64 {
+        0
+    }
+
     /// Return all model names currently tracked.
     fn model_names(&self) -> HashSet<String>;
 
     /// Dump index state for debugging: (model, trie_key, workers, tier, depth).
     fn debug_dump(&self) -> Vec<(String, u64, Vec<String>, StorageTier, u64)>;
+
+    /// Latest reported scheduling queue depth for a worker (from LoadMetrics
+    /// events). Used to load-balance auxiliary calls (e.g. `/tokenize`) across
+    /// vLLM endpoints. Returns None when no metrics have arrived yet.
+    fn queue_depth_for(&self, _worker_id: &str) -> Option<u64> {
+        None
+    }
+
+    /// Maximum number of blocks the index can hold (LRU capacity). 0 if the
+    /// backend doesn't enforce a limit. Reported in the selection log so
+    /// `block_count / block_capacity` shows how close the trie is to evicting.
+    fn block_capacity(&self) -> usize {
+        0
+    }
 }

@@ -4,6 +4,7 @@ use lru::LruCache;
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 
 use super::KvIndexBackend;
 
@@ -19,6 +20,10 @@ struct TrieNode {
     /// Workers that have cached the full prefix up to this node,
     /// mapped to their storage tier for this specific block.
     workers: HashMap<String, StorageTier>,
+    /// Token IDs of the block on the edge INTO this node (populated at Store).
+    /// Used by the break-point diagnostic to dump the cached child's tokens
+    /// alongside the request block, so divergences are visible at a glance.
+    tokens: Vec<u32>,
 }
 
 /// Token-prefix index using a per-model trie.
@@ -64,6 +69,9 @@ pub struct TokenPrefixIndex {
     /// instead of the global remove_worker_from_edges which can corrupt other chains.
     /// Key: (model, worker_id, block_hash) → Value: full trie path [key0, …, trie_key]
     temp_trie_path: DashMap<(String, String, u64), Vec<u64>>,
+    /// Optional tokenizer pool for break-point diagnostics (decodes the
+    /// diverging request block and cached child back to text). None in tests.
+    tokenizer_pool: Option<Arc<crate::tokenizer::TokenizerPool>>,
 }
 
 /// Compute a xxhash3-64 hash of a token block.
@@ -110,7 +118,13 @@ impl TokenPrefixIndex {
             tier_weight,
             load_weight,
             temp_trie_path: DashMap::new(),
+            tokenizer_pool: None,
         }
+    }
+
+    /// Inject the tokenizer pool for break-point text decoding (diagnostics).
+    pub fn set_tokenizer_pool(&mut self, pool: Arc<crate::tokenizer::TokenizerPool>) {
+        self.tokenizer_pool = Some(pool);
     }
 
     fn load_score_for(&self, worker_id: &str) -> f64 {
@@ -356,6 +370,20 @@ impl TokenPrefixIndex {
                 .or_insert_with(|| Box::default())
                 .workers
                 .insert(worker_id.to_string(), tier);
+            // Preserve tokens for break-point diagnostics during repositioning.
+            if node
+                .children
+                .get(&trie_key)
+                .map(|c| c.tokens.is_empty())
+                .unwrap_or(true)
+            {
+                if let Some(t) = self
+                    .hash_to_tokens
+                    .get(&(model.to_string(), worker_id.to_string(), block_hash))
+                {
+                    node.children.get_mut(&trie_key).unwrap().tokens = t.value().clone();
+                }
+            }
         }
 
         // Recursively reinsert children.
@@ -668,10 +696,31 @@ impl KvIndexBackend for TokenPrefixIndex {
                 token_ids,
                 parent_hash,
                 storage_tier,
+                block_size,
                 ..
             } => {
                 if token_ids.is_empty() {
+                    // Tier-swap store (e.g. HBM→mooncake emits BlockStored with
+                    // token_ids=[] since the connector knows only the block hash).
+                    // Nothing to index — drop silently.
                     return;
+                }
+
+                // [DIAG] block_size alignment check — the #1 cause of "stuck at
+                // shallow match_depth". If vLLM's per-block token count != the
+                // gateway's configured block_size, every block hash misaligns and
+                // find_matches can only match the few blocks that happen to line up.
+                // Warn loudly (once-per-mismatch is enough; the value is constant).
+                if *block_size as usize != self.block_size {
+                    tracing::warn!(
+                        model,
+                        worker_id,
+                        vllm_block_size = *block_size,
+                        gateway_block_size = self.block_size,
+                        token_len = token_ids.len(),
+                        "[DIAG] block_size MISMATCH — vLLM block_size != gateway block_size, \
+                         deep prefix hashes will not align"
+                    );
                 }
 
                 // Handle the case where local_hash is 0 (vLLM sent empty block_hashes).
@@ -784,6 +833,12 @@ impl KvIndexBackend for TokenPrefixIndex {
                             .or_insert_with(|| Box::default())
                             .workers
                             .insert(worker_id.clone(), *storage_tier);
+                        // Record this block's tokens on the leaf for break-point
+                        // diagnostics (dumps cached child tokens for comparison).
+                        node.children
+                            .get_mut(&trie_key)
+                            .unwrap()
+                            .tokens = token_ids.clone();
                     }
 
                     // Always log trie insertion at debug level for depth diagnosis.
@@ -992,15 +1047,6 @@ impl KvIndexBackend for TokenPrefixIndex {
         if let Some(root_lock) = trie_roots {
             let root = root_lock.read();
 
-            tracing::debug!(
-                model,
-                gateway_block_size = self.block_size,
-                req_block0_trie_key = request_hashes[0],
-                req_num_blocks = request_hashes.len(),
-                root_num_children = root.children.len(),
-                "[FIND_MATCHES] request hash[0] vs trie root children"
-            );
-
             // BFS: at each depth, track which trie nodes we're at and which workers matched.
             let mut current_nodes: Vec<&TrieNode> = vec![&root];
             let mut matched_workers: HashSet<&str> = candidate_set;
@@ -1008,9 +1054,6 @@ impl KvIndexBackend for TokenPrefixIndex {
             for (depth, &hash_key) in request_hashes.iter().enumerate() {
                 let mut next_nodes = Vec::new();
                 let mut next_workers = HashSet::new();
-
-                let start = depth * self.block_size;
-                let end = std::cmp::min(start + self.block_size, token_ids.len());
 
                 for node in &current_nodes {
                     if let Some(child) = node.children.get(&hash_key) {
@@ -1031,32 +1074,15 @@ impl KvIndexBackend for TokenPrefixIndex {
                 }
 
                 if next_nodes.is_empty() || next_workers.is_empty() {
-                    // Normal: request prefix extends past the cached depth.
-                    tracing::debug!(
-                        depth,
-                        token_range = ?(start, end),
-                        req_hash = hash_key,
-                        "[FIND_MATCHES] mismatch at depth — request hash not in trie children"
-                    );
+                    // Matching stopped at `depth`: either the cached prefix ends
+                    // here (no deeper blocks) or no child matches this block's
+                    // hash. The matched depth for each surviving worker was
+                    // recorded above; the selection layer reports the final hit.
                     break;
-                } else if depth < 3 || depth >= request_hashes.len().saturating_sub(2) {
-                    // Log first few and last few matched depths for context.
-                    tracing::debug!(
-                        depth,
-                        token_range = ?(start, end),
-                        req_hash = hash_key,
-                        matched_workers = next_workers.len(),
-                        "[FIND_MATCHES] matched"
-                    );
                 }
                 current_nodes = next_nodes;
                 matched_workers = next_workers;
             }
-        } else {
-            tracing::debug!(
-                model,
-                "[FIND_MATCHES] no trie root found for model"
-            );
         }
 
         let total_blocks = request_hashes.len() as f64;
@@ -1081,6 +1107,7 @@ impl KvIndexBackend for TokenPrefixIndex {
             results.push(KvMatchResult {
                 worker_id: wid.clone(),
                 match_depth: *depth,
+                total_blocks: total_blocks as u64,
                 hit_ratio,
                 best_tier: tier,
                 tier_score,
@@ -1138,6 +1165,19 @@ impl KvIndexBackend for TokenPrefixIndex {
         self.hash_to_tokens.iter().count()
     }
 
+    fn prefix_block_count(&self, token_ids: &[u32]) -> u64 {
+        if token_ids.is_empty() {
+            return 0;
+        }
+        // Guard against a misconfigured block_size of 0 — chunks(0) would
+        // panic at runtime. find_matches has the same guard on its own path.
+        if self.block_size == 0 {
+            return 0;
+        }
+        // Same chunking find_matches uses to build request_hashes.
+        token_ids.chunks(self.block_size).count() as u64
+    }
+
     fn model_names(&self) -> HashSet<String> {
         self.tries.iter().map(|e| e.key().clone()).collect()
     }
@@ -1150,6 +1190,15 @@ impl KvIndexBackend for TokenPrefixIndex {
             Self::walk_trie(&root, &model, &mut result);
         }
         result
+    }
+
+    fn queue_depth_for(&self, worker_id: &str) -> Option<u64> {
+        self.loads.get(worker_id).map(|l| l.queue_depth)
+    }
+
+    fn block_capacity(&self) -> usize {
+        // The LRU queue's capacity is the configured max_blocks.
+        self.lru_queue.lock().cap().get()
     }
 }
 
