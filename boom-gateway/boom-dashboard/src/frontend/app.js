@@ -1366,19 +1366,28 @@
       return;
     }
     wrap.innerHTML = `<table>
-      <tr><th>${t("logs.col.time")}</th><th>${t("logs.col.ip")}</th><th>${t("logs.col.model")}</th><th>${t("logs.col.path")}</th><th>${t("logs.col.status")}</th><th>${t("logs.col.stream")}</th><th>${t("logs.col.input")}</th><th>${t("logs.col.output")}</th><th>${t("logs.col.duration")}</th><th>${t("logs.col.error")}</th></tr>
-      ${logs.map((l) => `<tr>
+      <tr><th>${t("logs.col.time")}</th><th>${t("logs.col.ip")}</th><th>${t("logs.col.model")}</th><th>${t("logs.col.path")}</th><th>${t("logs.col.status")}</th><th>${t("logs.col.stream")}</th><th>${t("logs.col.in_out")}</th><th>${t("logs.col.prefix_hit_rate")}</th><th>${t("logs.col.duration")}</th><th>${t("logs.col.error")}</th></tr>
+      ${logs.map((l) => {
+        // Prefix hit rate = cached_tokens / (input + output). "-" if missing.
+        var kvTotal = (l.input_tokens || 0) + (l.output_tokens || 0);
+        var kvCell = (l.cached_tokens != null && kvTotal > 0)
+          ? esc((l.cached_tokens / kvTotal * 100).toFixed(1) + "%")
+          : "-";
+        var inOutCell = (l.input_tokens != null || l.output_tokens != null)
+          ? formatNumber(l.input_tokens) + " / " + formatNumber(l.output_tokens)
+          : "- / -";
+        return `<tr>
         <td class="mono">${formatTimestamp(l.created_at)}</td>
         <td class="mono">${esc(l.client_ip || "-")}</td>
         <td class="mono">${esc(l.model)}</td>
         <td class="mono">${esc(l.api_path)}</td>
         <td>${l.status_code >= 400 ? '<span style="color:var(--danger)">' + l.status_code + '</span>' : l.status_code}</td>
         <td>${l.is_stream ? t("common.yes") : t("common.no")}</td>
-        <td>${l.input_tokens != null ? formatNumber(l.input_tokens) : "-"}</td>
-        <td>${l.output_tokens != null ? formatNumber(l.output_tokens) : "-"}</td>
+        <td class="mono">${inOutCell}</td>
+        <td class="mono">${kvCell}</td>
         <td>${l.duration_ms != null ? l.duration_ms + "ms" : "-"}</td>
         <td>${l.error_message ? '<span style="color:var(--danger)" title="' + esc(l.error_message) + '">' + esc((l.error_type || "").substring(0, 20)) + '</span>' : "-"}</td>
-      </tr>`).join("")}
+      </tr>`}).join("")}
     </table>`;
   }
 
@@ -2773,6 +2782,10 @@
         var kvCell = (l.cached_tokens != null && kvTotal > 0)
           ? esc((l.cached_tokens / kvTotal * 100).toFixed(1) + "%")
           : "-";
+        // IN/OUT: show input and output tokens in one cell, slash-separated.
+        var inOutCell = (l.input_tokens != null || l.output_tokens != null)
+          ? formatNumber(l.input_tokens) + " / " + formatNumber(l.output_tokens)
+          : "- / -";
         return `<tr>
         <td>${tsCell}</td>
         <td>${ipCell}</td>
@@ -2780,11 +2793,10 @@
         <td>${esc(l.key_alias || l.key_name || "-")}</td>
         <td>${modelCell}</td>
         <td class="mono">${esc(l.api_path)}</td>
-        <td class="mono">${kvCell}</td>
         <td>${l.status_code >= 400 ? '<span style="color:var(--danger)">' + l.status_code + '</span>' : l.status_code}</td>
         <td>${l.is_stream ? t("common.yes") : t("common.no")}</td>
-        <td>${l.input_tokens != null ? formatNumber(l.input_tokens) : "-"}</td>
-        <td>${l.output_tokens != null ? formatNumber(l.output_tokens) : "-"}</td>
+        <td class="mono">${inOutCell}</td>
+        <td class="mono">${kvCell}</td>
         <td>${l.duration_ms != null ? l.duration_ms + "ms" : "-"}</td>
         <td>${l.ttft_ms != null ? l.ttft_ms + "ms" : "-"}</td>
         <td>${errorCell}</td>
