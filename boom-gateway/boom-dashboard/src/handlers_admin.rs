@@ -1830,6 +1830,7 @@ struct DeploymentSummaryRow {
     sum_output_tokens: i64,
     ttft_count: i64,
     sum_ttft_ms: i64,
+    avg_prefix_hit_rate: Option<f64>,
 }
 
 /// GET /admin/stats/deployments/summary — 24h per-deployment aggregates.
@@ -1854,7 +1855,16 @@ pub async fn get_deployment_summary_24h(
                  COUNT(output_tokens)::bigint AS output_count,
                  COALESCE(SUM(output_tokens), 0)::bigint AS sum_output_tokens,
                  COUNT(ttft_ms)::bigint AS ttft_count,
-                 COALESCE(SUM(ttft_ms), 0)::bigint AS sum_ttft_ms
+                 COALESCE(SUM(ttft_ms), 0)::bigint AS sum_ttft_ms,
+                 AVG(
+                   CASE
+                     WHEN cached_tokens IS NOT NULL
+                      AND COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0) > 0
+                     THEN cached_tokens::double precision
+                          / (COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0))
+                          * 100.0
+                   END
+                 ) AS avg_prefix_hit_rate
                FROM boom_request_log
                WHERE created_at >= NOW() - INTERVAL '24 hours'
                  AND deployment_id IS NOT NULL
@@ -1886,6 +1896,7 @@ pub async fn get_deployment_summary_24h(
                 "avg_input_tokens": avg(r.sum_input_tokens, r.input_count),
                 "avg_output_tokens": avg(r.sum_output_tokens, r.output_count),
                 "avg_ttft_ms": avg(r.sum_ttft_ms, r.ttft_count),
+                "avg_prefix_hit_rate": r.avg_prefix_hit_rate,
             })
         })
         .collect();

@@ -132,6 +132,7 @@
       "stats.inflight.col.avg_in": "AVG IN",
       "stats.inflight.col.avg_out": "AVG OUT",
       "stats.inflight.col.avg_ttft": "AVG TTFT",
+      "stats.inflight.col.avg_prefix_hit_rate": "AVG PREFIX HIT",
       "stats.inflight.no_inflight": "No in-flight requests.",
       "stats.inflight.24h_load_failed": "24h summary load failed: {error}",
 
@@ -598,6 +599,7 @@
       "stats.inflight.col.avg_in": "平均输入",
       "stats.inflight.col.avg_out": "平均输出",
       "stats.inflight.col.avg_ttft": "平均首字",
+      "stats.inflight.col.avg_prefix_hit_rate": "平均前缀命中率",
       "stats.inflight.no_inflight": "暂无在途请求。",
       "stats.inflight.24h_load_failed": "24小时汇总加载失败：{error}",
 

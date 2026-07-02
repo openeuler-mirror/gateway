@@ -400,7 +400,7 @@
       errorBanner +
       '<table class="data-table"><thead><tr>' +
       "<th>" + t("stats.inflight.col.deployment") + "</th><th>" + t("stats.inflight.col.fc_queue") + "</th><th>" + t("stats.inflight.col.in_reqs") + "</th><th>" + t("stats.inflight.col.in_context") + "</th>" +
-      "<th>" + t("stats.inflight.col.24h_reqs") + "</th><th>" + t("stats.inflight.col.avg_in") + "</th><th>" + t("stats.inflight.col.avg_out") + "</th><th>" + t("stats.inflight.col.avg_ttft") + "</th>" +
+      "<th>" + t("stats.inflight.col.24h_reqs") + "</th><th>" + t("stats.inflight.col.avg_in") + "</th><th>" + t("stats.inflight.col.avg_out") + "</th><th>" + t("stats.inflight.col.avg_ttft") + "</th><th>" + t("stats.inflight.col.avg_prefix_hit_rate") + "</th>" +
       "</tr></thead><tbody>" +
       deployments
         .map(function (d) {
@@ -441,6 +441,7 @@
           function fmtInt(v) { return (v == null) ? "-" : Math.round(v).toLocaleString(); }
           function fmtToken(v) { return (v == null) ? "-" : Math.round(v).toLocaleString(); }
           function fmtTtft(v) { return (v == null) ? "-" : Math.round(v) + "ms"; }
+          function fmtHit(v) { return (v == null) ? "-" : v.toFixed(1) + "%"; }
 
           return (
             "<tr>" +
@@ -452,6 +453,7 @@
             "<td>" + fmtToken(s ? s.avg_input_tokens : null) + "</td>" +
             "<td>" + fmtToken(s ? s.avg_output_tokens : null) + "</td>" +
             "<td>" + fmtTtft(s ? s.avg_ttft_ms : null) + "</td>" +
+            "<td>" + fmtHit(s ? s.avg_prefix_hit_rate : null) + "</td>" +
             "</tr>"
           );
         })
