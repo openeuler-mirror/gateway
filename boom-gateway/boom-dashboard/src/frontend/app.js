@@ -441,7 +441,6 @@
           function fmtInt(v) { return (v == null) ? "-" : Math.round(v).toLocaleString(); }
           function fmtToken(v) { return (v == null) ? "-" : Math.round(v).toLocaleString(); }
           function fmtTtft(v) { return (v == null) ? "-" : Math.round(v) + "ms"; }
-          function fmtHit(v) { return (v == null) ? "-" : v.toFixed(1) + "%"; }
 
           return (
             "<tr>" +
@@ -453,7 +452,7 @@
             "<td>" + fmtToken(s ? s.avg_input_tokens : null) + "</td>" +
             "<td>" + fmtToken(s ? s.avg_output_tokens : null) + "</td>" +
             "<td>" + fmtTtft(s ? s.avg_ttft_ms : null) + "</td>" +
-            "<td>" + fmtHit(s ? s.avg_prefix_hit_rate : null) + "</td>" +
+            "<td>" + fmtPrefixHit(s ? s.avg_prefix_hit_rate : null) + "</td>" +
             "</tr>"
           );
         })
@@ -1370,10 +1369,10 @@
     wrap.innerHTML = `<table>
       <tr><th>${t("logs.col.time")}</th><th>${t("logs.col.ip")}</th><th>${t("logs.col.model")}</th><th>${t("logs.col.path")}</th><th>${t("logs.col.status")}</th><th>${t("logs.col.stream")}</th><th>${t("logs.col.in_out")}</th><th>${t("logs.col.prefix_hit_rate")}</th><th>${t("logs.col.duration")}</th><th>${t("logs.col.error")}</th></tr>
       ${logs.map((l) => {
-        // Prefix hit rate = cached_tokens / (input + output). "-" if missing.
-        var kvTotal = (l.input_tokens || 0) + (l.output_tokens || 0);
-        var kvCell = (l.cached_tokens != null && kvTotal > 0)
-          ? esc((l.cached_tokens / kvTotal * 100).toFixed(1) + "%")
+        // Prefix hit rate = cached_tokens / input_tokens * 100, truncated to
+        // 1 decimal and capped at 99.9 (no rounding to 100%). "-" if missing.
+        var kvCell = (l.cached_tokens != null && l.input_tokens > 0)
+          ? esc(fmtPrefixHit(l.cached_tokens / l.input_tokens * 100))
           : "-";
         var inOutCell = (l.input_tokens != null || l.output_tokens != null)
           ? formatNumber(l.input_tokens) + " / " + formatNumber(l.output_tokens)
@@ -2777,12 +2776,10 @@
         } else {
           modelCell = '<span class="log-model-name">' + modelVal + '</span>';
         }
-        // Prefix hit rate = cached_tokens / total_tokens, where
-        // total_tokens = input_tokens (prompt) + output_tokens (completion).
-        // "-" when upstream didn't report cached_tokens.
-        var kvTotal = (l.input_tokens || 0) + (l.output_tokens || 0);
-        var kvCell = (l.cached_tokens != null && kvTotal > 0)
-          ? esc((l.cached_tokens / kvTotal * 100).toFixed(1) + "%")
+        // Prefix hit rate = cached_tokens / input_tokens * 100, truncated to
+        // 1 decimal and capped at 99.9 (no rounding to 100%). "-" if missing.
+        var kvCell = (l.cached_tokens != null && l.input_tokens > 0)
+          ? esc(fmtPrefixHit(l.cached_tokens / l.input_tokens * 100))
           : "-";
         // IN/OUT: show input and output tokens in one cell, slash-separated.
         var inOutCell = (l.input_tokens != null || l.output_tokens != null)
@@ -3091,5 +3088,15 @@
     const pad = (n) => String(n).padStart(2, "0");
     return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ` +
            `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  }
+
+  // Format a prefix hit-rate percentage. Truncate to 1 decimal (no rounding)
+  // and cap at 99.9 so we never display "100%" — cached_tokens can equal
+  // input_tokens in healthy cases, but rounding 99.95 upward would mislead.
+  function fmtPrefixHit(num) {
+    if (num == null) return "-";
+    var v = Math.floor(num * 10) / 10;
+    if (v > 99.9) v = 99.9;
+    return v.toFixed(1) + "%";
   }
 })();

@@ -1859,9 +1859,9 @@ pub async fn get_deployment_summary_24h(
                  AVG(
                    CASE
                      WHEN cached_tokens IS NOT NULL
-                      AND COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0) > 0
+                      AND COALESCE(input_tokens, 0) > 0
                      THEN cached_tokens::double precision
-                          / (COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0))
+                          / COALESCE(input_tokens, 0)
                           * 100.0
                    END
                  ) AS avg_prefix_hit_rate
