@@ -922,6 +922,34 @@ input[list] {
 .rb-bar-label { font-size: 10px; color: var(--text3); margin-top: 3px; white-space: nowrap; }
 .rb-label-hidden { visibility: hidden; }
 
+/* Stacked variant — per-model request-rate chart. */
+.rb-bar-stacked {
+  display: flex; flex-direction: column-reverse;
+  overflow: hidden; background: transparent;
+}
+.rb-bar-stacked::after { display: none; }
+.rb-bar-seg {
+  width: 100%;
+  transition: height .3s ease;
+}
+.rb-bar-seg:first-child { border-radius: 0 0 0 0; }
+.rb-bar-seg:last-child { border-radius: 3px 3px 0 0; }
+.rb-bar-stacked .rb-bar-seg + .rb-bar-seg {
+  /* tiny separator so adjacent segments stay readable even at full pastel */
+  border-top: 1px solid rgba(255,255,255,.35);
+}
+
+/* Legend under each per-model chart. */
+.rb-legend {
+  display: flex; flex-wrap: wrap; gap: 8px 14px;
+  margin-top: 6px; font-size: 11px; color: var(--text3);
+}
+.rb-legend-item { display: inline-flex; align-items: center; gap: 4px; }
+.rb-legend-swatch {
+  display: inline-block; width: 10px; height: 10px;
+  border-radius: 2px; border: 1px solid rgba(0,0,0,.08);
+}
+
 /* ── Rebalance Moves (per deployment, in/out paired bars) ── */
 .rebalance-moves-chart { display: flex; align-items: stretch; height: 200px; gap: 0; }
 .rbm-y-axis {

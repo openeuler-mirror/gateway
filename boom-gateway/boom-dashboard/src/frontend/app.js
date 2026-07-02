@@ -609,29 +609,96 @@
     charts.forEach(function (chart) {
       var events = chart.events || [];
       if (!events.length) return;
-      var maxCount = Math.max(1, ...events.map(function (e) { return e.count; }));
-      var label = chart.deployment_id === "_total"
-        ? t("stats.rate.all_models")
-        : esc(chart.model) + ":" + esc(chart.deployment_id);
+      var isTotal = chart.deployment_id === "_total" || chart.model === "ALL";
+      var label = isTotal ? t("stats.rate.all_models") : esc(chart.model);
+      // Fixed segment order from the backend (alphabetical deployment_id).
+      var segmentOrder = chart.deployments || [];
 
-      var bars = events.map(function (e, idx) {
-        var pct = (e.count / maxCount) * 100;
-        var showLabel = shouldShowLabel(events, idx);
-        var lbl = formatBucketLabel(e.ts, window ? window.bucket_secs : 0);
-        var title = lbl + ": " + t("stats.rebalance.req_count", { n: e.count });
-        return '<div class="rb-bar-col" title="' + esc(title) + '">' +
-          '<div class="rb-bar-value' + (e.count === 0 ? " rb-bar-value-zero" : "") + '">' + e.count + '</div>' +
-          '<div class="rb-bar" style="height:' + Math.max(pct, 1) + '%;background:' + throughputBarColor(pct) + '"></div>' +
-          '<div class="rb-bar-label' + (showLabel ? "" : " rb-label-hidden") + '">' + esc(lbl) + '</div>' +
+      if (isTotal) {
+        // No segments — render a single-color bar chart.
+        var maxCount = Math.max(1, ...events.map(function (e) { return e.count || 0; }));
+        var bars = events.map(function (e, idx) {
+          var count = e.count || 0;
+          var pct = (count / maxCount) * 100;
+          var showLabel = shouldShowLabel(events, idx);
+          var lbl = formatBucketLabel(e.ts, window ? window.bucket_secs : 0);
+          var title = lbl + ": " + t("stats.rebalance.req_count", { n: count });
+          return '<div class="rb-bar-col" title="' + esc(title) + '">' +
+            '<div class="rb-bar-value' + (count === 0 ? " rb-bar-value-zero" : "") + '">' + count + '</div>' +
+            '<div class="rb-bar" style="height:' + Math.max(pct, 1) + '%;background:' + throughputBarColor(pct) + '"></div>' +
+            '<div class="rb-bar-label' + (showLabel ? "" : " rb-label-hidden") + '">' + esc(lbl) + '</div>' +
+            '</div>';
+        }).join("");
+        html += '<div style="margin-bottom:0.8rem">' +
+          '<div style="font-size:0.85em;font-weight:600;margin-bottom:2px;color:var(--text2)">' + label + '</div>' +
+          '<div class="rebalance-chart">' +
+          '<div class="rb-y-axis"><span>' + maxCount + '</span><span>0</span></div>' +
+          '<div class="rb-bars">' + bars + '</div>' +
+          '</div></div>';
+      } else {
+        // Per-model stacked bar: each bucket is a column; segments stack from
+        // bottom (first in segmentOrder) upward. Bar height is the bucket's
+        // total relative to the model's max bucket total — so visually taller
+        // = busier bucket. Segment height within a bar = count / bucketTotal.
+        var bucketTotals = events.map(function (e) {
+          return (e.segments || []).reduce(function (s, seg) { return s + (seg.count || 0); }, 0);
+        });
+        var maxTotal = Math.max(1, ...bucketTotals);
+
+        var bars = events.map(function (e, idx) {
+          var segs = e.segments || [];
+          var total = bucketTotals[idx];
+          var heightPct = (total / maxTotal) * 100;
+          var showLabel = shouldShowLabel(events, idx);
+          var lbl = formatBucketLabel(e.ts, window ? window.bucket_secs : 0);
+
+          // Tooltip: bucket label, total, then per-deployment lines in the
+          // FIXED segment order (not sorted by count — order matches the
+          // colored stack so the user can map a color to its deployment).
+          var tipLines = [lbl + " · total " + total];
+          segmentOrder.forEach(function (depId) {
+            var seg = segs.find(function (s) { return s.deployment_id === depId; });
+            var c = seg ? (seg.count || 0) : 0;
+            var share = total > 0 ? (c / total * 100) : 0;
+            tipLines.push(depId + " — " + c + " (" + share.toFixed(1) + "%)");
+          });
+          var title = esc(tipLines.join("&#10;"));
+
+          // Stack segments bottom-up: reverse so first in order sits at bottom.
+          var stackHtml = segmentOrder.slice().reverse().map(function (depId) {
+            var seg = segs.find(function (s) { return s.deployment_id === depId; });
+            var c = seg ? (seg.count || 0) : 0;
+            var segPct = total > 0 ? (c / total * 100) : 0;
+            var color = deploymentColor(depId);
+            // 0-count segments still render a 1px sliver so the stack ordering
+            // is visually consistent across buckets.
+            var segHeight = c === 0 ? "1px" : (segPct + "%");
+            return '<div class="rb-bar-seg" style="height:' + segHeight + ';background:' + color + '"></div>';
+          }).join("");
+
+          return '<div class="rb-bar-col" title="' + title + '">' +
+            '<div class="rb-bar-value' + (total === 0 ? " rb-bar-value-zero" : "") + '">' + total + '</div>' +
+            '<div class="rb-bar rb-bar-stacked" style="height:' + Math.max(heightPct, 1) + '%">' + stackHtml + '</div>' +
+            '<div class="rb-bar-label' + (showLabel ? "" : " rb-label-hidden") + '">' + esc(lbl) + '</div>' +
+            '</div>';
+        }).join("");
+
+        html += '<div style="margin-bottom:0.8rem">' +
+          '<div style="font-size:0.85em;font-weight:600;margin-bottom:2px;color:var(--text2)">' + label + '</div>' +
+          '<div class="rebalance-chart">' +
+          '<div class="rb-y-axis"><span>' + maxTotal + '</span><span>0</span></div>' +
+          '<div class="rb-bars">' + bars + '</div>' +
+          '</div>' +
+          '<div class="rb-legend">' +
+            segmentOrder.map(function (depId) {
+              return '<span class="rb-legend-item">' +
+                '<span class="rb-legend-swatch" style="background:' + deploymentColor(depId) + '"></span>' +
+                esc(depId) +
+              '</span>';
+            }).join("") +
+          '</div>' +
           '</div>';
-      }).join("");
-
-      html += '<div style="margin-bottom:0.8rem">' +
-        '<div style="font-size:0.85em;font-weight:600;margin-bottom:2px;color:var(--text2)">' + label + '</div>' +
-        '<div class="rebalance-chart">' +
-        '<div class="rb-y-axis"><span>' + maxCount + '</span><span>0</span></div>' +
-        '<div class="rb-bars">' + bars + '</div>' +
-        '</div></div>';
+      }
     });
 
     wrap.innerHTML = html || (windowNote + "<p>" + t("common.no_records") + "</p>");
@@ -3098,5 +3165,26 @@
     var v = Math.floor(num * 10) / 10;
     if (v > 99.9) v = 99.9;
     return v.toFixed(1) + "%";
+  }
+
+  // Stable pastel color for a deployment_id. Same id → same color across all
+  // charts. Low saturation / high lightness keep it easy on the eyes; the
+  // hue is derived from a 32-bit FNV-1a hash of the id so similar ids do not
+  // collapse to the same hue.
+  var __deploymentColorCache = {};
+  function deploymentColor(deploymentId) {
+    if (__deploymentColorCache[deploymentId]) return __deploymentColorCache[deploymentId];
+    var h = 0x811c9dc5;
+    for (var i = 0; i < deploymentId.length; i++) {
+      h ^= deploymentId.charCodeAt(i);
+      h = (h + ((h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24))) >>> 0;
+    }
+    var hue = h % 360;
+    // Pastel: 38-45% saturation, 64-70% lightness.
+    var sat = 38 + (h % 8);       // 38..45
+    var light = 64 + ((h >> 4) % 7); // 64..70
+    var c = "hsl(" + hue + ", " + sat + "%, " + light + "%)";
+    __deploymentColorCache[deploymentId] = c;
+    return c;
   }
 })();
