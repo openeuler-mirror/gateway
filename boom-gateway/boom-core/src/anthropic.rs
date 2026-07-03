@@ -550,7 +550,7 @@ impl AnthropicStreamTranscoder {
 // Internal Helpers
 // ============================================================
 
-pub fn extract_system_text(system: &AnthropicSystemContent) -> String {
+fn extract_system_text(system: &AnthropicSystemContent) -> String {
     match system {
         AnthropicSystemContent::Text(t) => t.clone(),
         AnthropicSystemContent::Blocks(blocks) => blocks

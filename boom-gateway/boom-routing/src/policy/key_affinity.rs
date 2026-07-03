@@ -117,26 +117,14 @@ impl SchedulePolicy for KeyAffinityPolicy {
                 let load_preferred = load_for_deployment(&self.tracker, &self.queue_info, model, provider.as_ref());
                 let (min_load, least_loaded) = min_load_candidate(&self.tracker, &self.queue_info, model, candidates);
 
-                if should_rebalance(load_preferred, min_load, self.rebalance_threshold as u64) {
+                if load_preferred > min_load + self.rebalance_threshold as u64 {
                     // Rebalance to least loaded.
                     if let Some(ref counter) = self.rebalance_counter {
                         counter.record();
                     }
-                    let from_id = preferred_id.clone();
-                    let to_id = least_loaded.deployment_id().map(|s| s.to_string());
-                    if let Some(did) = &to_id {
-                        self.affinity.insert(affinity_key, did.clone());
+                    if let Some(did) = least_loaded.deployment_id() {
+                        self.affinity.insert(affinity_key, did.to_string());
                     }
-                    tracing::info!(
-                        model,
-                        key = %short_key(key_hash),
-                        from = %from_id,
-                        to = ?to_id,
-                        load_preferred_pct = load_preferred,
-                        min_load_pct = min_load,
-                        threshold = self.rebalance_threshold,
-                        "key_affinity rebalance: migrated key (load gap exceeds threshold)"
-                    );
                     return Some(least_loaded);
                 }
 
@@ -150,12 +138,6 @@ impl SchedulePolicy for KeyAffinityPolicy {
         if let Some(ref p) = provider {
             if let Some(did) = p.deployment_id() {
                 self.affinity.insert(affinity_key, did.to_string());
-                tracing::info!(
-                    model,
-                    key = %short_key(key_hash),
-                    assigned_to = %did,
-                    "key_affinity: initial assignment (no prior affinity)"
-                );
             }
         }
         provider
@@ -166,13 +148,7 @@ impl SchedulePolicy for KeyAffinityPolicy {
     }
 }
 
-use super::load_helpers::{deployment_load, min_load_candidate, select_lowest_load, should_rebalance};
-
-/// First 8 chars of the key hash — enough to correlate logs for the same user
-/// without logging the full key hash (privacy / log noise).
-fn short_key(key_hash: &str) -> String {
-    key_hash.chars().take(8).collect()
-}
+use super::load_helpers::{deployment_load, min_load_candidate, select_lowest_load};
 
 /// Get the load for a specific deployment (used in rebalance check).
 fn load_for_deployment(
