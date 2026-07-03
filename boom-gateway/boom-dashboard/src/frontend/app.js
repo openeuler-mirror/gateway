@@ -2201,7 +2201,7 @@
     const tbody = document.getElementById("logs-tbody");
     if (!tbody) return;
     if (logs.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="15" class="no-results">' + t("common.no_matching", { what: t("logs.title").toLowerCase() }) + '</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="14" class="no-results">' + t("common.no_matching", { what: t("logs.title").toLowerCase() }) + '</td></tr>';
       return;
     }
     tbody.innerHTML = logs.map((l) => {
@@ -2232,38 +2232,13 @@
         } else {
           modelCell = '<span class="log-model-name">' + modelVal + '</span>';
         }
-        // Prefix Hit Rate = cached_tokens / input_tokens (prefix only, not
-        // total). cached_tokens is a subset of the prompt (input), so the
-        // denominator is input_tokens. Always shown. DEBUG ON stacks dfx
-        // details (Sched / Trie-Hit / Trie) under it — Trie-Hit is the gateway
-        // trie-estimated ratio, distinct from the real hit above.
-        var pct = (l.cached_tokens != null && l.input_tokens != null && l.input_tokens > 0)
-          ? (l.cached_tokens / l.input_tokens * 100).toFixed(1) + "%"
+        // Prefix hit rate = cached_tokens / total_tokens, where
+        // total_tokens = input_tokens (prompt) + output_tokens (completion).
+        // "-" when upstream didn't report cached_tokens.
+        var kvTotal = (l.input_tokens || 0) + (l.output_tokens || 0);
+        var kvCell = (l.cached_tokens != null && kvTotal > 0)
+          ? esc((l.cached_tokens / kvTotal * 100).toFixed(1) + "%")
           : "-";
-        var dfxLine = (label, val) => (val == null || val === "")
-          ? ""
-          : '<span><span style="color:var(--grey,#888)">' + label + " </span>" + esc(String(val)) + "</span>";
-        // Trie-Hit = hit_blocks / input_blocks (1 decimal). Trie fill =
-        // trie_blocks / trie_max_blocks (2 decimals). Both derived from raw.
-        var trieHit = (l.kv_hit_blocks != null && l.kv_input_blocks != null && l.kv_input_blocks > 0)
-          ? (l.kv_hit_blocks / l.kv_input_blocks * 100).toFixed(1) + "%"
-          : null;
-        var trieFill = (l.trie_blocks != null && l.trie_max_blocks != null && l.trie_max_blocks > 0)
-          ? (l.trie_blocks / l.trie_max_blocks * 100).toFixed(2) + "%"
-          : null;
-        var hasDfx = l.schedule_policy != null || l.kv_hit_blocks != null
-                  || l.kv_input_blocks != null || l.trie_blocks != null;
-        var kvCell;
-        if (debugEnabled && hasDfx) {
-          kvCell = '<div style="display:flex;flex-direction:column;gap:2px;font-size:11px;line-height:1.3">' +
-            '<span class="mono">' + esc(pct) + "</span>" +
-            dfxLine("Sched", l.policy || l.schedule_policy) +
-            dfxLine("Trie-Hit", trieHit) +
-            dfxLine("Trie", trieFill) +
-            "</div>";
-        } else {
-          kvCell = '<span class="mono">' + esc(pct) + "</span>";
-        }
         return `<tr>
         <td>${tsCell}</td>
         <td>${ipCell}</td>

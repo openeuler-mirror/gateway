@@ -1,5 +1,5 @@
 use crate::extractor::RequiredAuth;
-use crate::request_log::{log_error, log_request, RequestDfx, RequestLog};
+use crate::request_log::{log_error, log_request, RequestLog};
 use crate::state::AppState;
 use axum::extract::{ConnectInfo, Path, State};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -49,201 +49,6 @@ fn need_full_kv_report(
     // kvc-aware enabled: full report only when the trie doesn't yet
     // cover enough of the request's prefix.
     kv_hit_ratio < threshold
-}
-
-/// Fallback local tokenization using the gateway's minijinja-rendered chat
-/// template. Used only when a deployment's `/tokenize` endpoint is unavailable;
-/// the upstream path is preferred because it matches vLLM's tokens exactly.
-fn tokenize_locally(
-    state: &AppState,
-    resolved_model: &str,
-    req: &ChatCompletionRequest,
-) -> Vec<u32> {
-    let pool_guard = state.tokenizer_pool.load();
-    match &**pool_guard {
-        Some(pool) => {
-            let msgs: Vec<serde_json::Value> = req
-                .messages
-                .iter()
-                .map(|m| serde_json::to_value(m).unwrap_or_default())
-                .collect();
-            let tools_vals: Option<Vec<serde_json::Value>> = req
-                .tools
-                .as_ref()
-                .map(|t| t.iter().map(|tool| serde_json::to_value(tool).unwrap_or_default()).collect());
-            pool.tokenize_openai(resolved_model, &msgs, tools_vals.as_deref()).token_ids
-        }
-        None => Vec::new(),
-    }
-}
-
-/// Shared HTTP client for vLLM `/tokenize` pool calls.
-static TOKENIZE_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-fn tokenize_client() -> reqwest::Client {
-    TOKENIZE_CLIENT
-        .get_or_init(|| {
-            reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
-                .build()
-                .expect("tokenize http client")
-        })
-        .clone()
-}
-
-/// Extract the host (no scheme/port/path) from a base URL, to match against
-/// worker_ids reported in KV LoadMetrics events (which are bare hosts).
-/// Tokenize via a per-model pool of vLLM `/tokenize` endpoints (config:
-/// `kvc_aware.vllm_tokenize_endpoints`). Picks the least-loaded endpoint by
-/// gateway inflight (inflight/capacity %, same signal as routing) and fails
-/// over to the next on any error / 404 / empty result. Returns None if no pool
-/// is configured for the model or all endpoints failed (caller falls back to
-/// local tokenization).
-async fn tokenize_via_vllm_pool(
-    state: &AppState,
-    resolved_model: &str,
-    req: &ChatCompletionRequest,
-    candidates: &[Arc<dyn boom_core::provider::Provider>],
-) -> Option<Vec<u32>> {
-    let endpoints = {
-        let inner = state.inner.load();
-        inner
-            .config
-            .router_settings
-            .kvc_aware
-            .vllm_tokenize_endpoints
-            .get(resolved_model)
-            .cloned()?
-    };
-    if endpoints.is_empty() {
-        return None;
-    }
-
-    // Rank endpoints by gateway inflight load (same signal as kvc routing):
-    // map each endpoint's host to the candidate whose kv_worker_id matches,
-    // and use its deployment_load (inflight/capacity %). Endpoints with no
-    // matching candidate sort last (u64::MAX). This keeps tokenize-pool LB
-    // consistent with routing LB and doesn't depend on vLLM LoadMetrics.
-    let queue_info: Option<Arc<dyn boom_core::provider::DeploymentQueueInfo>> =
-        Some(state.flow_controller.clone());
-    let mut ranked: Vec<(u64, String)> = endpoints
-        .iter()
-        .map(|url| {
-            let host = match boom_core::normalize::host_of_api_base(url) {
-                Some(h) => h,
-                None => return (u64::MAX, url.clone()),
-            };
-            let load_pct = candidates
-                .iter()
-                .find(|c| c.kv_worker_id().map(|w| w == host).unwrap_or(false))
-                .map(|c| {
-                    boom_routing::policy::load_helpers::deployment_load(
-                        &state.inflight,
-                        &queue_info,
-                        resolved_model,
-                        c.as_ref(),
-                    )
-                })
-                .unwrap_or(u64::MAX);
-            (load_pct, url.clone())
-        })
-        .collect();
-    ranked.sort_by_key(|(lp, _)| *lp);
-
-    let client = tokenize_client();
-    // Include tools when present: vLLM's chat template renders tool definitions
-    // into the prompt, so /tokenize MUST include them to produce the exact
-    // prefill token sequence. Without tools the tokens diverge from vLLM's
-    // actual prefill (tool section missing), capping trie match depth.
-    let mut body = serde_json::json!({
-        "model": resolved_model,
-        "messages": req.messages,
-        "add_generation_prompt": true,
-    });
-    if let Some(tools) = &req.tools {
-        if !tools.is_empty() {
-            if let Ok(v) = serde_json::to_value(tools) {
-                body["tools"] = v;
-            }
-        }
-    }
-
-    for (load_pct, base) in ranked {
-        let root = base.trim_end_matches('/');
-        let root = root.strip_suffix("/v1").unwrap_or(root);
-        let url = format!("{root}/tokenize");
-        let attempt = client
-            .post(&url)
-            .json(&body)
-            .send()
-            .await
-            .ok()
-            .and_then(|resp| {
-                if resp.status().is_success() {
-                    // status known; body parsed below
-                    Some(resp)
-                } else {
-                    tracing::debug!(
-                        model = resolved_model,
-                        url = %url,
-                        status = %resp.status(),
-                        load_pct = load_pct,
-                        "vllm /tokenize endpoint non-2xx, failing over"
-                    );
-                    None
-                }
-            });
-        let resp = match attempt {
-            Some(r) => r,
-            None => continue, // network error or non-2xx → next endpoint
-        };
-        match resp.json::<serde_json::Value>().await {
-            Ok(v) => {
-                let tokens: Vec<u32> = v
-                    .get("tokens")
-                    .and_then(|t| t.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|x| x.as_u64().map(|n| n as u32))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                if !tokens.is_empty() {
-                    tracing::debug!(
-                        model = resolved_model,
-                        url = %url,
-                        tokens = tokens.len(),
-                        first_4_tokens = ?tokens.iter().take(4).copied().collect::<Vec<_>>(),
-                        // u64::MAX = no matching candidate (e.g. messages path
-                        // passes empty candidates), so load is unknown — don't
-                        // log the raw sentinel.
-                        load_pct = %if load_pct == u64::MAX {
-                            "unknown".to_string()
-                        } else {
-                            load_pct.to_string()
-                        },
-                        "tokenized via vllm pool"
-                    );
-                    return Some(tokens);
-                }
-            }
-            Err(e) => {
-                tracing::debug!(
-                    model = resolved_model, url = %url, error = %e,
-                    "vllm /tokenize bad body, failing over"
-                );
-            }
-        }
-    }
-    // All endpoints in the pool failed (non-2xx / bad body / empty tokens on
-    // every one). Surface as warn so it's visible without debug: tokenization
-    // is unavailable, the request will fall back to the local tokenizer (which
-    // may diverge from vLLM's tokens) and KV-affinity matching can break.
-    tracing::warn!(
-        model = resolved_model,
-        endpoint_count = endpoints.len(),
-        "vllm /tokenize pool exhausted: all endpoints failed, falling back to local tokenizer"
-    );
-    None
 }
 
 /// Extract client IP from request headers with TCP fallback.
@@ -545,75 +350,25 @@ async fn chat_completions_inner(
         api_path, &rl_info,
     );
 
-    // 3. KV-cache prefix matching.
-    // Resolve candidates first so we can ask a deployment's vLLM to tokenize
-    // the prompt via `/tokenize` — those are the EXACT tokens vLLM will prefill
-    // (same chat template + content normalization), so the gateway's prefix
-    // query matches the trie byte-for-byte, eliminating any rendering drift
-    // between the gateway's local tokenizer and vLLM. Tokenization is
-    // model-level (identical across deployments of the same model), so any
-    // candidate works. Falls back to local tokenization on error.
-    let candidates = state.router.candidates_for(&resolved_model);
-    // Skip the /tokenize call when the trie has no blocks for this model yet
-    // (cold start): an empty trie can't match regardless, so the tokens would
-    // be wasted work. BUT we still want this request to trigger a full KV
-    // report so vLLM backfills the trie — otherwise the trie can only be
-    // populated by someone else's traffic (cold-start chicken-and-egg). The
-    // `trie_was_empty` flag forces a full report below regardless of what the
-    // policy reports for kv_match_attempted (the empty-token_ids degradation
-    // path sets kv_match_attempted=false, which would suppress the report).
-    let trie_was_empty = match &**state.kv_index.load() {
-        Some(k) => !k.model_names().contains(&resolved_model),
-        None => true,
-    };
-    let token_ids = if trie_was_empty {
-        tracing::debug!(
-            model = %resolved_model,
-            "trie empty for model, skipping tokenize (will force full report)"
-        );
-        Vec::new()
-    } else if let Some(ids) = tokenize_via_vllm_pool(
-        &state,
-        &resolved_model,
-        &req,
-        candidates.as_ref().map(|c| c.as_slice()).unwrap_or(&[]),
-    )
-    .await
-    {
-        ids
-    } else {
-        match candidates.as_ref().and_then(|cs| cs.first().cloned()) {
-            Some(p) => match p.tokenize_prompt(&req).await {
-                Ok(ids) => {
-                    tracing::debug!(
-                        model = %resolved_model,
-                        tokens = ids.len(),
-                        via = "candidate_tokenize",
-                        "request tokenized"
-                    );
-                    ids
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        model = %resolved_model, error = %e,
-                        "upstream /tokenize failed, falling back to local tokenizer"
-                    );
-                    tokenize_locally(&state, &resolved_model, &req)
-                }
-            },
-            None => tokenize_locally(&state, &resolved_model, &req),
+    // 3. Select provider deployment.
+    // Tokenize request if tokenizer pool is available (for KV-cache prefix matching).
+    let token_ids = {
+        let pool_guard = state.tokenizer_pool.load();
+        match &**pool_guard {
+            Some(pool) => {
+                let msgs: Vec<serde_json::Value> = req.messages.iter().map(|m| serde_json::to_value(m).unwrap_or_default()).collect();
+                let tools_vals: Option<Vec<serde_json::Value>> = req.tools.as_ref().map(|t| t.iter().map(|tool| serde_json::to_value(tool).unwrap_or_default()).collect());
+                let result = pool.tokenize_openai(&resolved_model, &msgs, tools_vals.as_deref());
+                tracing::debug!(model = %resolved_model, tokens = result.token_ids.len(), "request tokenized");
+                result.token_ids
+            }
+            None => Vec::new(),
         }
     };
 
     let selection = state
         .router
-        .select_with_candidates(
-            &resolved_model,
-            candidates.as_ref().map(|c| c.as_slice()).unwrap_or(&[]),
-            Some(&identity.key_hash),
-            input_chars as u64,
-            &token_ids,
-        )
+        .select_provider_with_prefix(&resolved_model, Some(&identity.key_hash), input_chars as u64, &token_ids)
         .ok_or_else(|| {
             let e = GatewayError::ModelNotFound(resolved_model.clone());
             log_error(&state, &identity, &model, api_path, is_stream, start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()));
@@ -624,68 +379,18 @@ async fn chat_completions_inner(
     let kv_hit_ratio = selection.kv_hit_ratio;
 
     let deployment_id = provider.deployment_id().map(|s| s.to_string());
-    // DFX: capture scheduling signals for the request log. schedule_policy is
-    // the configured policy name (kvc_aware / key_affinity / round_robin);
-    // trie_blocks is the KV index fill level at request time; request_tokens
-    // is the tokenized prompt length (0 when tokenization was skipped).
-    // DFX policy label: configured policy name, suffixed with the actual
-    // branch taken when kvc_aware degrades (e.g. "kvc_aware→key_affinity").
-    // The dashboard shortens this to "kvc→key" so it's visible at a glance
-    // whether a request actually used KV affinity or fell back to sticky.
-    let schedule_policy = {
-        let base = state.router.policy_name();
-        if selection.degraded && base == "kvc_aware" {
-            "kvc_aware→key_affinity".to_string()
-        } else {
-            base
-        }
-    };
-    // DFX raw block counts (stored raw; dashboard derives ratios/percents):
-    //   kv_hit_blocks / kv_input_blocks = trie-estimated prefix hit ratio
-    //   trie_blocks / trie_max_blocks   = trie capacity fill at request time
-    let kv_hit_blocks = selection.kv_hit_blocks;
-    let kv_input_blocks = selection.kv_input_blocks;
-    let trie_max_blocks = inner.config.router_settings.kvc_aware.max_blocks.max(0) as i64;
-    let trie_blocks = match &**state.kv_index.load() {
-        Some(k) => Some(k.block_count() as i64),
-        None => None,
-    };
-    let request_tokens = Some(token_ids.len() as i64);
     let inflight_model = state.router.resolve_model_name(&resolved_model);
 
     // 3.2. Determine KV-cache reporting mode.
-    //      Full reporting is requested only when the policy actually queried
-    //      the KV index (`kv_match_attempted`) AND the trie is missing enough
-    //      of the prefix (hit_ratio < threshold). When KV-aware routing was a
-    //      no-op (single candidate, no tokenizer, non-KV policy) we must NOT
-    //      ask vLLM for a full report — there is no routing benefit and it
-    //      only adds overhead. vLLM then uses its default incremental mode.
-    //
-    //      EXCEPTION: if the trie was empty for this model at request time
-    //      (cold start), force a full report anyway — the empty-token_ids
-    //      degradation path leaves kv_match_attempted=false, which would
-    //      suppress the report and leave the trie empty forever (only other
-    //      users' traffic could populate it). Forcing it here lets this very
-    //      request trigger vLLM to backfill the trie.
-    req.kv_cache_report_full = trie_was_empty
-        || (selection.kv_match_attempted
-            && need_full_kv_report(
-                true,
-                kv_hit_ratio,
-                inner.config.router_settings.kvc_aware.full_report_hit_threshold,
-            ));
-    // Log only when a full KV report is requested (the actionable case — the
-    // gateway is asking vLLM to backfill the trie). The common case (no full
-    // report, hit was high enough) is silent to avoid per-request noise.
-    if req.kv_cache_report_full {
-        tracing::info!(
-            model = %resolved_model,
-            kv_hit_ratio = format!("{:.3}", kv_hit_ratio),
-            trie_was_empty,
-            deployment = ?deployment_id,
-            "KV full report requested (asking vLLM to backfill trie)"
-        );
-    }
+    //      Full reporting is needed when kvc-aware is enabled so the trie
+    //      stays in sync with vLLM's internal prefix cache — vLLM reuses
+    //      cached blocks without reporting them in incremental mode.
+    //      When kvc-aware is disabled, vLLM uses its default incremental mode.
+    req.kv_cache_report_full = need_full_kv_report(
+        state.kv_index.load().is_some(),
+        kv_hit_ratio,
+        inner.config.router_settings.kvc_aware.full_report_hit_threshold,
+    );
 
     // 3.5. Flow control — queue if per-deployment limits exceeded.
     let is_vip = is_vip_key(&identity.metadata);
@@ -767,14 +472,6 @@ async fn chat_completions_inner(
             deployment_id,
             client_ip: Some(client_ip.clone()),
             cached_tokens: None,
-            dfx: Some(RequestDfx {
-                schedule_policy: Some(schedule_policy.clone()),
-                kv_hit_blocks: Some(kv_hit_blocks as i64),
-                kv_input_blocks: Some(kv_input_blocks as i64),
-                trie_blocks,
-                trie_max_blocks: Some(trie_max_blocks),
-                request_tokens,
-            }),
         }, start, usage, Some(state.agent_stats.clone()));
 
         // Wrap with prompt log stream if enabled, then wrap in Sse.
@@ -850,14 +547,6 @@ async fn chat_completions_inner(
                 deployment_id,
                 client_ip: Some(client_ip.clone()),
                 cached_tokens,
-                dfx: Some(RequestDfx {
-                    schedule_policy: Some(schedule_policy.clone()),
-                    kv_hit_blocks: Some(kv_hit_blocks as i64),
-                    kv_input_blocks: Some(kv_input_blocks as i64),
-                    trie_blocks,
-                    trie_max_blocks: Some(trie_max_blocks),
-                    request_tokens,
-                }),
             },
         );
         state.agent_stats.record_tokens(api_path, input_tokens as u64, output_tokens as u64);
@@ -1915,39 +1604,20 @@ pub async fn messages(
     );
 
     // 3. Select provider deployment.
-    // Tokenize for KV-cache prefix matching via vLLM's own /tokenize (exact
-    // prefill tokens) so the trie query matches what vLLM caches. The local
-    // tokenizer diverged from vLLM after ~16 blocks, capping match depth.
-    // No fallback: if no vLLM /tokenize endpoint is configured, token_ids is
-    // empty (no trie query).
-    //
-    // trie_was_empty short-circuit (mirrors the OpenAI path): if the trie has
-    // no entry for this model, skip the /tokenize HTTP round-trip — an empty
-    // trie matches nothing regardless. trie_was_empty also forces a full KV
-    // report below so this very request backfills the trie.
-    let trie_was_empty = match &**state.kv_index.load() {
-        Some(k) => !k.model_names().contains(&resolved_model),
-        None => true,
-    };
-    let token_ids = if trie_was_empty {
-        tracing::debug!(
-            model = %resolved_model,
-            "trie empty for model, skipping tokenize (will force full report)"
-        );
-        Vec::new()
-    } else {
-        tokenize_via_vllm_pool(
-            &state,
-            &resolved_model,
-            &openai_req,
-            // candidates aren't resolved until after selection (which needs the
-            // token_ids); pass empty — tokenize_via_vllm_pool only uses them for
-            // load-based endpoint ranking, not correctness, so endpoints are tried
-            // in config order.
-            &[],
-        )
-        .await
-        .unwrap_or_default()
+    // Tokenize request if tokenizer pool is available (for KV-cache prefix matching).
+    let token_ids = {
+        let pool_guard = state.tokenizer_pool.load();
+        match &**pool_guard {
+            Some(pool) => {
+                let system_str = req.system.as_ref().and_then(|s| match s {
+                    boom_core::types::AnthropicSystemContent::Text(t) => Some(t.as_str()),
+                    _ => None,
+                });
+                let msgs: Vec<serde_json::Value> = req.messages.iter().map(|m| serde_json::to_value(m).unwrap_or_default()).collect();
+                pool.tokenize_anthropic(&resolved_model, system_str, &msgs).token_ids
+            }
+            None => Vec::new(),
+        }
     };
 
     let selection = state
@@ -1961,45 +1631,16 @@ pub async fn messages(
         })?;
     let provider = selection.provider;
     let kv_hit_ratio = selection.kv_hit_ratio;
-    let kv_match_attempted = selection.kv_match_attempted;
 
     let deployment_id = provider.deployment_id().map(|s| s.to_string());
     let inflight_model = state.router.resolve_model_name(&resolved_model);
-    // DFX: scheduling signals for the request log (mirror the OpenAI path).
-    // DFX policy label: configured policy name, suffixed with the actual
-    // branch taken when kvc_aware degrades (e.g. "kvc_aware→key_affinity").
-    // The dashboard shortens this to "kvc→key" so it's visible at a glance
-    // whether a request actually used KV affinity or fell back to sticky.
-    let schedule_policy = {
-        let base = state.router.policy_name();
-        if selection.degraded && base == "kvc_aware" {
-            "kvc_aware→key_affinity".to_string()
-        } else {
-            base
-        }
-    };
-    // DFX raw block counts (stored raw; dashboard derives ratios/percents):
-    //   kv_hit_blocks / kv_input_blocks = trie-estimated prefix hit ratio
-    //   trie_blocks / trie_max_blocks   = trie capacity fill at request time
-    let kv_hit_blocks = selection.kv_hit_blocks;
-    let kv_input_blocks = selection.kv_input_blocks;
-    let trie_max_blocks = inner.config.router_settings.kvc_aware.max_blocks.max(0) as i64;
-    let trie_blocks = match &**state.kv_index.load() {
-        Some(k) => Some(k.block_count() as i64),
-        None => None,
-    };
-    let request_tokens = Some(token_ids.len() as i64);
 
-    // 3.2. Determine KV-cache reporting mode (same logic as OpenAI path):
-    //      only request a full report when KV-aware routing actually queried
-    //      the index (kv_match_attempted) AND the trie is missing the prefix.
-    openai_req.kv_cache_report_full = trie_was_empty
-        || (kv_match_attempted
-            && need_full_kv_report(
-                true,
-                kv_hit_ratio,
-                inner.config.router_settings.kvc_aware.full_report_hit_threshold,
-            ));
+    // 3.2. Determine KV-cache reporting mode (same logic as OpenAI path).
+    openai_req.kv_cache_report_full = need_full_kv_report(
+        state.kv_index.load().is_some(),
+        kv_hit_ratio,
+        inner.config.router_settings.kvc_aware.full_report_hit_threshold,
+    );
 
     // 3.5. Flow control — queue if per-deployment limits exceeded.
     let is_vip = is_vip_key(&identity.metadata);
@@ -2086,14 +1727,6 @@ pub async fn messages(
             deployment_id,
             client_ip: Some(client_ip.clone()),
             cached_tokens: None,
-            dfx: Some(RequestDfx {
-                schedule_policy: Some(schedule_policy.clone()),
-                kv_hit_blocks: Some(kv_hit_blocks as i64),
-                kv_input_blocks: Some(kv_input_blocks as i64),
-                trie_blocks,
-                trie_max_blocks: Some(trie_max_blocks),
-                request_tokens,
-            }),
         }, start, usage, Some(state.agent_stats.clone()));
 
         // Wrap with prompt log stream if enabled, then wrap in Sse.
@@ -2169,14 +1802,6 @@ pub async fn messages(
                 deployment_id,
                 client_ip: Some(client_ip.clone()),
                 cached_tokens,
-                dfx: Some(RequestDfx {
-                    schedule_policy: Some(schedule_policy.clone()),
-                    kv_hit_blocks: Some(kv_hit_blocks as i64),
-                    kv_input_blocks: Some(kv_input_blocks as i64),
-                    trie_blocks,
-                    trie_max_blocks: Some(trie_max_blocks),
-                    request_tokens,
-                }),
             },
         );
         state.agent_stats.record_tokens("/v1/messages", input_tokens as u64, output_tokens as u64);

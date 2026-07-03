@@ -206,24 +206,6 @@ impl AppState {
         seed_flow_controller_from_config(&config, &flow_controller);
 
         if let Some(ref pool) = db_pool {
-            // Run migrations (all tables). boom_request_log (and the dfx
-            // table) DDL is owned by boom-audit per the architecture rules;
-            // run its migration first, then boom-dashboard's remaining tables.
-            // Acquire a single connection and SET lock_timeout so every DDL
-            // statement in the audit migration runs with the lock timeout
-            // active (PgPool multiplexes across connections, so a SET on one
-            // connection does NOT carry over to statements run on another).
-            match pool.acquire().await {
-                Ok(mut conn) => {
-                    let _ = sqlx::query("SET lock_timeout = '10s'")
-                        .execute(&mut *conn)
-                        .await;
-                    if let Err(e) = boom_audit::migrations::run_request_log_migration(&mut conn).await {
-                        tracing::error!("Failed to run boom-audit migration: {}", e);
-                    }
-                }
-                Err(e) => tracing::error!("Failed to acquire connection for audit migration: {}", e),
-            }
             // Run migrations (all tables).
             if let Err(e) = boom_dashboard::migrations::run_migrations(pool).await {
                 tracing::error!("Failed to run migrations: {}", e);
@@ -447,6 +429,13 @@ impl AppState {
         }
 
         let kv_settings = &config.router_settings.kvc_aware;
+        let index: Arc<dyn KvIndexBackend> = Arc::new(TokenPrefixIndex::new(
+            kv_settings.block_size,
+            kv_settings.cache_weight,
+            kv_settings.tier_weight,
+            kv_settings.load_weight,
+            kv_settings.max_blocks,
+        ));
         let pool = match &kv_settings.tokenizer_dir {
             Some(dir) => {
                 let p = TokenizerPool::new(dir.into());
@@ -462,19 +451,6 @@ impl AppState {
                 None
             }
         };
-        let mut index_inner = TokenPrefixIndex::new(
-            kv_settings.block_size,
-            kv_settings.cache_weight,
-            kv_settings.tier_weight,
-            kv_settings.load_weight,
-            kv_settings.max_blocks,
-        );
-        // Inject the tokenizer pool so find_matches can decode the diverging
-        // request/cached blocks to text at the break point (drift diagnostics).
-        if let Some(p) = &pool {
-            index_inner.set_tokenizer_pool(p.clone());
-        }
-        let index: Arc<dyn KvIndexBackend> = Arc::new(index_inner);
         tracing::info!(
             cache_weight = kv_settings.cache_weight,
             load_weight = kv_settings.load_weight,
@@ -507,11 +483,8 @@ impl AppState {
             tracing::warn!("kvc_aware enabled but no zmq_endpoints configured — no KV events will be received");
             return;
         }
-        // zmq_endpoints is grouped (Vec<Vec<String>>); the subscriber needs a
-        // flat list of every endpoint to subscribe to.
-        let flat_endpoints: Vec<String> = kv_settings.zmq_endpoints.iter().flatten().cloned().collect();
         let sub_config = KvSubscriberConfig {
-            endpoints: flat_endpoints,
+            endpoints: kv_settings.zmq_endpoints.clone(),
             topic_prefix: kv_settings.zmq_topic_prefix.clone(),
         };
         let handle = spawn_kv_subscriber(sub_config, kv_index, self.kv_shutdown_tx.subscribe());
@@ -804,9 +777,6 @@ fn build_deployments_from_config(config: &Config, deployment_store: &Arc<Deploym
         if let Some(ref r) = p.aws_region_name {
             extra.insert("aws_region_name".to_string(), r.clone());
         }
-        if let Some(ref t) = p.tokenize_api_base {
-            extra.insert("tokenize_api_base".to_string(), t.clone());
-        }
 
         let deployment_id = entry.model_info.as_ref().and_then(|mi| mi.id.clone());
 
@@ -1034,7 +1004,7 @@ fn create_policy(
         "round_robin" | "" => Arc::new(RoundRobinPolicy::new()),
         "key_affinity" => {
             let ctx_threshold = config.router_settings.key_affinity_context_threshold;
-            let rebalance_threshold = config.router_settings.rebalance_threshold;
+            let rebalance_threshold = config.router_settings.key_affinity_rebalance_threshold;
             tracing::info!(
                 "Using key_affinity policy: context_threshold={}, rebalance_threshold={}",
                 ctx_threshold,
@@ -1060,85 +1030,6 @@ fn create_policy(
             tracing::info!("Using kvc_aware policy");
             let mut policy = boom_routing::KvcAwarePolicy::new(kv, inflight.clone());
             policy.set_queue_info(flow_controller.clone());
-            // Fallback for models with no KV index (no events): degrade to
-            // key_affinity (key-sticky + load rebalance) so they still get
-            // session locality without tokenize / KV-event overhead. Built from
-            // the same global key_affinity_* settings as the standalone policy.
-            {
-                let mut ka = KeyAffinityPolicy::new(
-                    inflight.clone(),
-                    config.router_settings.key_affinity_context_threshold,
-                    config.router_settings.rebalance_threshold,
-                    Some(rebalance_counter.clone()),
-                );
-                ka.set_queue_info(flow_controller.clone());
-                policy.set_fallback_key_affinity(ka);
-            }
-            // Build KV-cache sharing groups in worker_id (host) space. Two
-            // sources, merged + deduped (a cluster may appear in both during
-            // migration from the old zmq_endpoints form):
-            //   1. model_list entries with a `kvc:` block — authoritative
-            //      per-deployment topology: [api_base host] + peer hosts. This
-            //      links the request-entry master to its peers even when the
-            //      master itself doesn't report ZMQ (zmq_port absent, peers
-            //      present) — without it, routing to the master would never
-            //      see the peers' reported cache.
-            //   2. explicitly-configured zmq_endpoints groups (backward compat).
-            let kvc = &config.router_settings.kvc_aware;
-            let mut groups: Vec<Vec<String>> = Vec::new();
-            for entry in &config.model_list {
-                let Some(kvc_entry) = &entry.kvc else { continue };
-                let Some(master) = entry
-                    .litellm_params
-                    .api_base
-                    .as_deref()
-                    .and_then(|s| boom_provider::kv_worker_id_from_api_base(Some(s)))
-                else {
-                    continue;
-                };
-                let mut g: Vec<String> = vec![master];
-                for peer in &kvc_entry.peers {
-                    if let Some(h) = boom_provider::kv_worker_id_from_api_base(Some(peer)) {
-                        g.push(h);
-                    }
-                }
-                groups.push(g);
-            }
-            for group in &kvc.zmq_endpoints {
-                let g: Vec<String> = group
-                    .iter()
-                    .filter_map(|url| boom_provider::kv_worker_id_from_api_base(Some(url)))
-                    .collect();
-                groups.push(g);
-            }
-            // Dedup groups that are the same set of hosts (sorted-key compare).
-            let mut seen: std::collections::HashSet<Vec<String>> =
-                std::collections::HashSet::new();
-            let kv_worker_groups: Vec<Vec<String>> = groups
-                .into_iter()
-                .map(|mut g| {
-                    g.sort();
-                    g.dedup();
-                    g
-                })
-                .filter(|g| seen.insert(g.clone()))
-                .collect();
-            let sharing_groups: Vec<&Vec<String>> =
-                kv_worker_groups.iter().filter(|g| g.len() > 1).collect();
-            if !sharing_groups.is_empty() {
-                tracing::info!(?sharing_groups, "kvc_aware: KV-cache sharing groups active");
-            }
-            policy.set_kv_groups(kv_worker_groups);
-            // Unified-score weights + hard overload gate. cache_weight/load_weight
-            // are shared with TokenPrefixIndex (find_matches internal scoring);
-            // overload gate uses gateway inflight as % of capacity.
-            policy.set_scoring(
-                kvc.cache_weight,
-                kvc.load_weight,
-                kvc.overload_threshold_pct,
-                kvc.degrade_hit_threshold,
-                config.router_settings.rebalance_threshold as u64,
-            );
             Arc::new(policy)
         }
         other => {

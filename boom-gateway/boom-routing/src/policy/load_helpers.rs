@@ -36,15 +36,6 @@ pub fn min_load_candidate(
     (best_load, best)
 }
 
-/// Rebalance decision: should the preferred candidate hand off to the
-/// least-loaded one? True when the preferred's load_pct exceeds the minimum
-/// by more than `threshold` (all in 0..100 percentage points). Shared by
-/// kvc_aware (per-request, at scoring stage) and key_affinity (per-key
-/// migration) so both use identical rebalance semantics.
-pub fn should_rebalance(preferred_load: u64, min_load: u64, threshold: u64) -> bool {
-    preferred_load > min_load + threshold
-}
-
 /// Get the normalized utilization for a deployment (percentage, 0..100).
 ///
 /// Formula: `raw_load * 100 / max_inflight`

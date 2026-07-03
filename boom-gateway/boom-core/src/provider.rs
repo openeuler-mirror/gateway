@@ -51,22 +51,6 @@ pub trait Provider: Send + Sync + 'static {
     fn client_type_header(&self) -> bool {
         false
     }
-
-    /// Tokenize a chat request using the provider's OWN tokenizer + chat
-    /// template (e.g. vLLM's `/tokenize` endpoint). Returns the exact
-    /// `prompt_token_ids` the upstream will prefill, so the gateway's KV-prefix
-    /// query uses the same tokens that populate the trie — eliminating any
-    /// rendering divergence between the gateway's local tokenizer and the
-    /// upstream. Providers without a tokenize endpoint return an error; callers
-    /// fall back to local tokenization.
-    async fn tokenize_prompt(
-        &self,
-        _req: &ChatCompletionRequest,
-    ) -> Result<Vec<u32>, GatewayError> {
-        Err(GatewayError::ProviderError(
-            "tokenize_prompt not supported by this provider".to_string(),
-        ))
-    }
 }
 
 /// Rate limiter trait — supports per-key and per-model sliding window limits.

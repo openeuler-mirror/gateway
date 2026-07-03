@@ -11,10 +11,6 @@ pub struct OpenAIProvider {
     client: Client,
     api_key: Option<String>,
     base_url: String,
-    /// Dedicated endpoint for vLLM `/tokenize` (kvc_aware routing). None → use
-    /// `base_url`. Set when `api_base` points at a PD router that doesn't
-    /// forward `/tokenize`; e.g. base_url=router:8100, tokenize_base=vLLM:7100.
-    tokenize_base_url: Option<String>,
     model: String,
     deployment_id: Option<String>,
     kv_worker_id: Option<String>,
@@ -29,7 +25,6 @@ impl OpenAIProvider {
         model: &str,
         deployment_id: Option<String>,
         client_type_header: bool,
-        tokenize_api_base: Option<String>,
     ) -> Self {
         let kv_worker_id = crate::kv_worker_id_from_api_base(api_base.as_deref());
         Self {
@@ -37,7 +32,6 @@ impl OpenAIProvider {
             api_key,
             base_url: api_base
                 .unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
-            tokenize_base_url: tokenize_api_base,
             model: model.to_string(),
             deployment_id,
             kv_worker_id,
@@ -250,80 +244,6 @@ impl Provider for OpenAIProvider {
     fn client_type_header(&self) -> bool {
         self.client_type_header
     }
-
-    /// Tokenize via the upstream's `/tokenize` endpoint (vLLM applies the chat
-    /// template + content-format normalization identically to a real chat
-    /// completion, so the returned ids are the exact prefill tokens). Used for
-    /// KV-cache-aware routing so the gateway's prefix query matches the trie.
-    async fn tokenize_prompt(
-        &self,
-        req: &ChatCompletionRequest,
-    ) -> Result<Vec<u32>, GatewayError> {
-        // Minimal body: vLLM's TokenizeChatRequest wants messages/tools +
-        // add_generation_prompt. Use the deployment's upstream model name so
-        // vLLM recognizes it (same as build_request forwarding). Include tools
-        // when present: the chat template renders tool definitions into the
-        // prompt, so /tokenize must include them to match the actual prefill.
-        let mut body = serde_json::json!({
-            "model": self.model,
-            "messages": req.messages,
-            "add_generation_prompt": true,
-        });
-        if let Some(tools) = &req.tools {
-            if !tools.is_empty() {
-                if let Ok(v) = serde_json::to_value(tools) {
-                    body["tools"] = v;
-                }
-            }
-        }
-        // vLLM mounts `/tokenize` at the server ROOT (not under `/v1`). If a
-        // dedicated `tokenize_base_url` is configured (e.g. the vLLM direct
-        // port when `api_base` is a PD router that doesn't forward /tokenize),
-        // use it; otherwise derive from `base_url` by stripping `/v1`.
-        let base = self
-            .tokenize_base_url
-            .as_deref()
-            .unwrap_or(self.base_url.as_str());
-        let root = base.trim_end_matches('/');
-        let root = root.strip_suffix("/v1").unwrap_or(root);
-        let url = format!("{root}/tokenize");
-        let mut builder = self.client.post(&url);
-        if let Some(ref key) = self.api_key {
-            builder = builder.bearer_auth(key);
-        }
-        let resp = builder
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| {
-                tracing::warn!("upstream /tokenize request failed: {e}");
-                GatewayError::ProviderError("upstream /tokenize unavailable".to_string())
-            })?;
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(GatewayError::ProviderError(format!(
-                "upstream /tokenize status {status}"
-            )));
-        }
-        let v: serde_json::Value = resp.json().await.map_err(|e| {
-            GatewayError::ProviderError(format!("upstream /tokenize bad body: {e}"))
-        })?;
-        let tokens: Vec<u32> = v
-            .get("tokens")
-            .and_then(|t| t.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|x| x.as_u64().map(|n| n as u32))
-                    .collect()
-            })
-            .unwrap_or_default();
-        if tokens.is_empty() {
-            return Err(GatewayError::ProviderError(
-                "upstream /tokenize returned no tokens".to_string(),
-            ));
-        }
-        Ok(tokens)
-    }
 }
 
 #[cfg(test)]
@@ -395,7 +315,7 @@ mod tests {
     }
 
     fn provider_for(uri: String, api_key: Option<String>) -> OpenAIProvider {
-        OpenAIProvider::new(Client::new(), api_key, Some(uri), "test-model", None, false, None)
+        OpenAIProvider::new(Client::new(), api_key, Some(uri), "test-model", None, false)
     }
 
     #[tokio::test]
