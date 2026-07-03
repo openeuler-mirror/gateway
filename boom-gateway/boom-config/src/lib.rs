@@ -186,6 +186,38 @@ pub struct ModelEntry {
     /// otherwise. Default: false.
     #[serde(default)]
     pub client_type_header: bool,
+    /// Per-deployment kvc_aware endpoint ports. Lets ZMQ report + tokenize
+    /// endpoints live next to api_base (host reused, only ports specified)
+    /// instead of repeating full URLs under `kvc_aware.zmq_endpoints` /
+    /// `vllm_tokenize_endpoints`. load_config derives the full endpoint lists
+    /// from these + api_base.
+    #[serde(default)]
+    pub kvc: Option<KvcEndpointEntry>,
+}
+
+/// Per-deployment kvc_aware endpoint config, placed on a `ModelEntry`.
+///
+/// The master host is taken from `litellm_params.api_base`, so only ports
+/// need to be specified here:
+///   - `zmq_port`        → `tcp://<api_base_host>:<zmq_port>` (KV-event report)
+///   - `tokenize_port`   → `http://<api_base_host>:<tokenize_port>` (vLLM /tokenize)
+///
+/// `peers` are PD peers (full ZMQ URLs, different hosts) that report KV events
+/// for this cluster but don't receive requests (e.g. a 2P1D peer). They are
+/// appended to the master's ZMQ group so the gateway knows they share the
+/// cluster's cache.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct KvcEndpointEntry {
+    /// ZMQ report port for this deployment's master.
+    #[serde(default)]
+    pub zmq_port: Option<u16>,
+    /// vLLM /tokenize port for this deployment's master (optional — only
+    /// deployments that can tokenize set this).
+    #[serde(default)]
+    pub tokenize_port: Option<u16>,
+    /// PD peers (full `tcp://host:port` URLs) reporting KV for this cluster.
+    #[serde(default)]
+    pub peers: Vec<String>,
 }
 
 /// Provider params — compatible with litellm's `litellm_params` format.
@@ -228,6 +260,12 @@ pub struct ProviderParams {
     pub temperature: Option<f64>,
     /// Max tokens override.
     pub max_tokens: Option<u32>,
+    /// Dedicated endpoint for KV-tokenization (vLLM `/tokenize`), used by
+    /// kvc_aware routing to obtain the exact prompt tokens. Needed when
+    /// `api_base` points at a PD router / frontend that doesn't forward
+    /// `/tokenize` (e.g. `api_base`=router:8100, `tokenize_api_base`=vLLM:7100).
+    /// If unset, the provider's `api_base` is used (with `/v1` stripped).
+    pub tokenize_api_base: Option<String>,
 }
 
 impl ProviderParams {
@@ -372,12 +410,17 @@ pub struct RouterSettings {
     #[serde(default)]
     pub key_affinity_context_threshold: u64,
     /// Key-affinity: rebalance threshold (percentage, 1..=100).
-    /// If the preferred provider's utilization exceeds the least-loaded
-    /// by more than this percentage, reassign to the least-loaded provider.
-    /// Utilization = (in-flight + queued) * 100 / max_inflight per deployment.
-    /// Default: 20 (20% utilization difference triggers rebalance).
-    #[serde(default = "default_rebalance_threshold")]
-    pub key_affinity_rebalance_threshold: u8,
+    /// Shared rebalance threshold for key_affinity AND kvc_aware: if the
+    /// preferred/winning provider's utilization exceeds the least-loaded
+    /// candidate's by more than this percentage, hand off to the least-loaded
+    /// (so it can build cache / spread load by capacity). Utilization =
+    /// (in-flight + queued) * 100 / max_inflight per deployment.
+    /// key_affinity applies it per-key (migration); kvc_aware applies it
+    /// per-request at the scoring stage. Default: 20.
+    /// (serde alias keeps the old `key_affinity_rebalance_threshold` name
+    /// working for existing configs.)
+    #[serde(default = "default_rebalance_threshold", alias = "key_affinity_rebalance_threshold")]
+    pub rebalance_threshold: u8,
     /// Content-based hybrid router (optional dynamic model alias).
     #[serde(default)]
     pub hybrid_router: Option<HybridRouterConfig>,
@@ -430,9 +473,20 @@ pub struct KvcAwareSettings {
     /// Directory containing tokenizer.json files ({tokenizer_dir}/{model}/tokenizer.json).
     #[serde(default)]
     pub tokenizer_dir: Option<String>,
-    /// ZMQ endpoints for KV event subscription (e.g., `["tcp://worker-0:5557"]`).
-    #[serde(default)]
-    pub zmq_endpoints: Vec<String>,
+    /// ZMQ endpoints for KV event subscription, grouped by KV-cache sharing.
+    ///
+    /// Each element is one "KV-sharing group" — workers whose caches are
+    /// shared (e.g. 2 prefill workers behind a shared KV pool / RDMA fabric).
+    /// When routing to a deployment in a group, prefix matching queries the
+    /// whole group's cache, so a peer's cached prefix counts as a hit.
+    ///
+    /// Two element forms are accepted (can be mixed):
+    ///   - bare string  `"tcp://h:5557"`         → single-worker group (no peers)
+    ///   - string list  `["tcp://h1:5557", ...]` → shared-KV group
+    /// A flat list of strings (legacy config) is still accepted: each endpoint
+    /// becomes its own single-worker group (no sharing) — fully backward compatible.
+    #[serde(default, deserialize_with = "deserialize_zmq_endpoint_groups")]
+    pub zmq_endpoints: Vec<Vec<String>>,
     /// ZMQ topic prefix for subscription filtering. Default: `"kv@"`.
     #[serde(default = "default_zmq_topic_prefix")]
     pub zmq_topic_prefix: String,
@@ -448,6 +502,31 @@ pub struct KvcAwareSettings {
     /// Default: 0.8.
     #[serde(default = "default_full_report_hit_threshold")]
     pub full_report_hit_threshold: f64,
+    /// Hit-ratio threshold below which kvc_aware stops differentiating
+    /// candidates by the (near-zero) cache hit and degrades to key_affinity
+    /// (key-sticky + load rebalance) for the request. A very low hit means the
+    /// matched prefix is too shallow to be a meaningful affinity signal (only a
+    /// few shared blocks, e.g. a common system prompt), and picking the winner
+    /// by tiny hit differences (0.02 vs 0.019) causes traffic to drift between
+    /// workers instead of sticking to one for vLLM-local cache reuse. Set to 0
+    /// to disable (only degrade on exactly hit==0). Default: 0.2.
+    #[serde(default = "default_degrade_hit_threshold")]
+    pub degrade_hit_threshold: f64,
+    /// Per-model pool of vLLM HTTP endpoints that can serve `/tokenize` for
+    /// KV-aware routing. Used when `api_base` points at a PD router / frontend
+    /// that doesn't forward `/tokenize`. The gateway picks the least-loaded
+    /// endpoint (by reported queue depth) and fails over to the next on error
+    /// / 404. Each entry is a bare base URL (host:port); `/tokenize` is
+    /// appended at the server root.
+    /// Example: `{ "MiniMax-M2.7": ["http://7.150.7.202:7100", "http://7.150.2.142:7100"] }`
+    #[serde(default)]
+    pub vllm_tokenize_endpoints: HashMap<String, Vec<String>>,
+    /// Overload gate for kvc_aware routing: a candidate whose gateway-side
+    /// inflight load ≥ this percentage of its capacity is HARD-EXCLUDED from
+    /// selection (load_pct from inflight/capacity). 100 disables the gate.
+    /// Default: 90.
+    #[serde(default = "default_overload_threshold_pct")]
+    pub overload_threshold_pct: u64,
 }
 
 impl Default for KvcAwareSettings {
@@ -462,6 +541,9 @@ impl Default for KvcAwareSettings {
             zmq_topic_prefix: default_zmq_topic_prefix(),
             max_blocks: default_max_blocks(),
             full_report_hit_threshold: default_full_report_hit_threshold(),
+            degrade_hit_threshold: default_degrade_hit_threshold(),
+            vllm_tokenize_endpoints: HashMap::new(),
+            overload_threshold_pct: default_overload_threshold_pct(),
         }
     }
 }
@@ -481,6 +563,26 @@ impl KvcAwareSettings {
                 "router_settings.kvc_aware.full_report_hit_threshold must be in (0.0, 1.0], got {threshold}"
             )));
         }
+        // degrade_hit_threshold must be in [0.0, 1.0): 0 disables the low-hit
+        // degradation (only degrade on hit==0); >= 1 would degrade always,
+        // making kvc_aware behave as pure key_affinity; NaN breaks comparisons.
+        let degrade = self.degrade_hit_threshold;
+        if !(degrade >= 0.0 && degrade < 1.0) {
+            return Err(GatewayError::ConfigError(format!(
+                "router_settings.kvc_aware.degrade_hit_threshold must be in [0.0, 1.0), got {degrade}"
+            )));
+        }
+        // overload_threshold_pct: 1..=100. 100 disables the overload gate;
+        // values >100 are silently a no-op (load_pct is capped at 100, so
+        // load_pct >= 150 is never true) — reject to avoid a misleading
+        // "configured but ineffective" state. 0 would hard-exclude every
+        // candidate (load_pct >= 0 always true), also rejected.
+        let otp = self.overload_threshold_pct;
+        if !(1..=100).contains(&otp) {
+            return Err(GatewayError::ConfigError(format!(
+                "router_settings.kvc_aware.overload_threshold_pct must be in 1..=100 (100 disables), got {otp}"
+            )));
+        }
         Ok(())
     }
 }
@@ -489,12 +591,49 @@ fn default_block_size() -> usize {
     16
 }
 
+/// Deserialize `zmq_endpoints` accepting both grouped and flat forms.
+///
+/// Each YAML element may be either:
+///   - a bare scalar string (single-worker group), or
+///   - a sequence of strings (shared-KV group).
+/// Produces `Vec<Vec<String>>` — one inner vec per KV-sharing group. A bare
+/// string becomes a single-element group. Untagged dispatch tries the sequence
+/// form first so a single-element array `["a"]` stays a group of one.
+fn deserialize_zmq_endpoint_groups<'de, D>(deserializer: D) -> Result<Vec<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Entry {
+        Group(Vec<String>),
+        Single(String),
+    }
+
+    let entries = Vec::<Entry>::deserialize(deserializer)?;
+    Ok(entries
+        .into_iter()
+        .map(|e| match e {
+            Entry::Group(v) => v,
+            Entry::Single(s) => vec![s],
+        })
+        .collect())
+}
+
 fn default_cache_weight() -> f64 {
     0.5
 }
 
+fn default_overload_threshold_pct() -> u64 {
+    90
+}
+
 fn default_full_report_hit_threshold() -> f64 {
     0.8
+}
+
+fn default_degrade_hit_threshold() -> f64 {
+    0.2
 }
 
 fn default_load_weight() -> f64 {
@@ -548,6 +687,13 @@ fn default_schedule_policy() -> String {
 
 fn default_rebalance_threshold() -> u8 {
     20
+}
+
+/// Delegate to boom_core::normalize::host_of_api_base (single, IPv6-correct
+/// implementation shared across crates). Kept as a thin local alias so call
+/// sites in this file read naturally.
+fn host_of_api_base(api_base: &str) -> Option<String> {
+    boom_core::normalize::host_of_api_base(api_base)
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -669,6 +815,7 @@ pub fn load_config(path: &str) -> Result<Config, GatewayError> {
         let p = &mut entry.litellm_params;
         p.api_key = p.api_key.take().map(|v| resolve_env_value(&v));
         p.api_base = p.api_base.take().map(|v| resolve_env_value(&v));
+        p.tokenize_api_base = p.tokenize_api_base.take().map(|v| resolve_env_value(&v));
         p.aws_access_key_id = p.aws_access_key_id.take().map(|v| resolve_env_value(&v));
         p.aws_secret_access_key = p.aws_secret_access_key.take().map(|v| resolve_env_value(&v));
         for v in p.headers.values_mut() {
@@ -676,12 +823,52 @@ pub fn load_config(path: &str) -> Result<Config, GatewayError> {
         }
     }
 
-    // Validate key-affinity rebalance threshold when policy is key_affinity.
-    if config.router_settings.schedule_policy == "key_affinity" {
-        let t = config.router_settings.key_affinity_rebalance_threshold;
+    // Derive kvc_aware zmq_endpoints / vllm_tokenize_endpoints from model_list
+    // entries that carry a `kvc:` block. The master host comes from each
+    // entry's api_base; only ports (and PD peers) are specified per-deployment.
+    // Derived endpoints are appended to any explicitly-configured ones, so the
+    // two forms can coexist during migration.
+    for entry in &config.model_list {
+        let Some(kvc) = &entry.kvc else { continue };
+        let Some(host) = entry
+            .litellm_params
+            .api_base
+            .as_deref()
+            .and_then(host_of_api_base)
+        else {
+            continue;
+        };
+        if kvc.zmq_port.is_some() || !kvc.peers.is_empty() {
+            // Subscription group: master ZMQ URL (only when it reports) + peers.
+            // When the master itself doesn't report (zmq_port absent) but peers
+            // do, the group is peers-only — the master is still linked into the
+            // KV-sharing group for routing via the model_list derivation in
+            // state.rs (so routing to the master considers the peers' cache).
+            let mut group: Vec<String> = Vec::new();
+            if let Some(zport) = kvc.zmq_port {
+                group.push(format!("tcp://{host}:{zport}"));
+            }
+            group.extend(kvc.peers.iter().cloned());
+            config.router_settings.kvc_aware.zmq_endpoints.push(group);
+        }
+        if let Some(tport) = kvc.tokenize_port {
+            config
+                .router_settings
+                .kvc_aware
+                .vllm_tokenize_endpoints
+                .entry(entry.model_name.clone())
+                .or_default()
+                .push(format!("http://{host}:{tport}"));
+        }
+    }
+
+    // Validate the shared rebalance threshold when a policy that uses it is
+    // active (key_affinity applies it per-key; kvc_aware at scoring stage).
+    if matches!(config.router_settings.schedule_policy.as_str(), "key_affinity" | "kvc_aware") {
+        let t = config.router_settings.rebalance_threshold;
         if t == 0 || t > 100 {
             return Err(GatewayError::ConfigError(format!(
-                "key_affinity_rebalance_threshold must be 1..=100 (percentage), got {}",
+                "rebalance_threshold must be 1..=100 (percentage), got {}",
                 t
             )));
         }
@@ -766,6 +953,54 @@ mod tests {
     use super::*;
 
     #[test]
+    fn zmq_endpoints_accepts_grouped_flat_and_mixed() {
+        // Deserialize through KvcAwareSettings so the field's custom
+        // deserialize_with (string | string-list per element) is exercised.
+
+        // Fully backward-compatible flat list: each endpoint → its own group.
+        let flat: KvcAwareSettings = serde_yaml::from_str(
+            r#"
+zmq_endpoints:
+  - "tcp://10.0.0.1:5557"
+  - "tcp://10.0.0.2:5557"
+"#,
+        )
+        .unwrap();
+        assert_eq!(flat.zmq_endpoints, vec![
+            vec!["tcp://10.0.0.1:5557".to_string()],
+            vec!["tcp://10.0.0.2:5557".to_string()],
+        ]);
+
+        // Grouped (shared KV): a multi-element list is one group.
+        let grouped: KvcAwareSettings = serde_yaml::from_str(
+            r#"
+zmq_endpoints:
+  - ["tcp://10.0.0.1:5557", "tcp://10.0.0.2:5557"]
+  - ["tcp://10.0.0.3:5557"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(grouped.zmq_endpoints, vec![
+            vec!["tcp://10.0.0.1:5557".to_string(), "tcp://10.0.0.2:5557".to_string()],
+            vec!["tcp://10.0.0.3:5557".to_string()],
+        ]);
+
+        // Mixed: bare strings and arrays together.
+        let mixed: KvcAwareSettings = serde_yaml::from_str(
+            r#"
+zmq_endpoints:
+  - "tcp://10.0.0.9:5557"
+  - ["tcp://10.0.0.1:5557", "tcp://10.0.0.2:5557"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(mixed.zmq_endpoints, vec![
+            vec!["tcp://10.0.0.9:5557".to_string()],
+            vec!["tcp://10.0.0.1:5557".to_string(), "tcp://10.0.0.2:5557".to_string()],
+        ]);
+    }
+
+    #[test]
     fn test_explicit_provider_prefix() {
         let params = ProviderParams {
             model: "openai/gpt-4-turbo".to_string(),
@@ -781,6 +1016,7 @@ mod tests {
             headers: HashMap::new(),
             temperature: None,
             max_tokens: None,
+            tokenize_api_base: None,
         };
         let (provider, model) = params.resolve_provider_and_model();
         assert_eq!(provider, "openai");
@@ -803,6 +1039,7 @@ mod tests {
             headers: HashMap::new(),
             temperature: None,
             max_tokens: None,
+            tokenize_api_base: None,
         };
         let (provider, model) = params.resolve_provider_and_model();
         assert_eq!(provider, "openai");

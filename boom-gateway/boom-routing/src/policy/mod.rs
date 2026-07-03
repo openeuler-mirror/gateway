@@ -14,6 +14,27 @@ pub struct Selection {
     /// request. `0.0` when the policy has no KV context (e.g. round_robin)
     /// or no prefix match was found.
     pub kv_hit_ratio: f64,
+    /// Raw hit blocks (matched prefix blocks) for DFX. 0 when no KV match.
+    pub kv_hit_blocks: u64,
+    /// Raw input blocks (total prefix blocks in the request) for DFX.
+    /// 0 when the request wasn't tokenized / no KV query.
+    pub kv_input_blocks: u64,
+    /// Whether the policy actually queried the KV index (`find_matches`) for
+    /// this request. The gateway only requests a full KV-cache report from
+    /// vLLM when this is `true` AND `kv_hit_ratio` is below threshold.
+    ///
+    /// `false` for all paths where KV-aware routing was a no-op: single
+    /// candidate (no routing decision), missing tokenizer (no token_ids),
+    /// candidates without a `kv_worker_id`, and non-KV policies. In a single-
+    /// deployment setup the gateway must NOT ask vLLM for a full report —
+    /// there is only one node, prefix affinity is pointless, and internal
+    /// disaggregation scheduling (e.g. 2P1D) handles reuse on its own.
+    pub kv_match_attempted: bool,
+    /// Whether kvc_aware degraded to key_affinity for this request (hit below
+    /// threshold, or empty token_ids). Used by the DFX log/dashboard to show
+    /// the actual routing behavior (e.g. "kvc→key") rather than just the
+    /// configured policy name.
+    pub degraded: bool,
 }
 
 /// Trait for scheduling policies. Each policy decides which provider
@@ -45,7 +66,7 @@ pub trait SchedulePolicy: Send + Sync {
         _token_ids: &[u32],
     ) -> Option<Selection> {
         self.select(model, candidates, key_hash, input_chars)
-            .map(|provider| Selection { provider, kv_hit_ratio: 0.0 })
+            .map(|provider| Selection { provider, kv_hit_ratio: 0.0, kv_hit_blocks: 0, kv_input_blocks: 0, kv_match_attempted: false, degraded: false })
     }
 
     /// Policy name (for display / config validation).

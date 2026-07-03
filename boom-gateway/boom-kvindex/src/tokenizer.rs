@@ -1,3 +1,4 @@
+use minijinja::value::{Enumerator, Object, ObjectRepr};
 use minijinja::{Environment, Value};
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -131,54 +132,15 @@ impl TokenizerPool {
         PrefixTokens { token_ids }
     }
 
-    /// Tokenize Anthropic messages using the model's chat_template.
-    pub fn tokenize_anthropic(
-        &self,
-        model: &str,
-        system: Option<&str>,
-        messages: &[serde_json::Value],
-    ) -> PrefixTokens {
-        let Some(assets) = self.get_assets(model) else {
-            return PrefixTokens { token_ids: Vec::new() };
-        };
-
-        // Build a merged message list: system as a system message + rest.
-        let mut all_messages: Vec<serde_json::Value> = Vec::new();
-        if let Some(sys) = system {
-            all_messages.push(serde_json::json!({
-                "role": "system",
-                "content": sys
-            }));
+    /// Decode token IDs back to text for a model. Used by break-point
+    /// diagnostics to surface the actual diverging text. Returns None if the
+    /// model's tokenizer isn't loaded or decoding fails.
+    pub fn decode(&self, model: &str, token_ids: &[u32]) -> Option<String> {
+        let assets = self.get_assets(model)?;
+        if let Ok(s) = assets.tokenizer.decode(token_ids, false) {
+            return Some(s);
         }
-        all_messages.extend_from_slice(messages);
-
-        let text = if let Some(ref tmpl) = assets.chat_template {
-            match render_chat_template(tmpl, &assets.bos_token, &assets.eos_token, &all_messages, true, None) {
-                Ok(t) => t,
-                Err(e) => {
-                    tracing::warn!(model, error = %e, "chat_template render failed, falling back to simple format");
-                    format_anthropic_chat(system, messages)
-                }
-            }
-        } else {
-            format_anthropic_chat(system, messages)
-        };
-
-        let token_ids = match assets.tokenizer.encode(text.as_str(), false) {
-            Ok(enc) => enc.get_ids().to_vec(),
-            Err(e) => {
-                tracing::warn!(model, "tokenization failed: {}", e);
-                return PrefixTokens { token_ids: Vec::new() };
-            }
-        };
-
-        tracing::debug!(
-            model,
-            tokens = token_ids.len(),
-            first_8 = ?&token_ids[..token_ids.len().min(8)],
-            "anthropic tokenized"
-        );
-        PrefixTokens { token_ids }
+        assets.tokenizer.decode(token_ids, true).ok()
     }
 }
 
@@ -273,6 +235,151 @@ fn extract_token_str(config: &serde_json::Value, key: &str) -> String {
     }
 }
 
+/// A minijinja Map object that preserves JSON insertion order.
+///
+/// minijinja deserializes maps into a `BTreeMap` (`ValueMap` in value/mod.rs),
+/// which sorts keys alphabetically — but vLLM (Python dicts) preserves
+/// insertion order. To make the gateway's `| tojson` output byte-identical to
+/// vLLM's, objects that may be serialized via `| tojson` are wrapped in this
+/// type instead of going through `Value::from_serialize`.
+///
+/// Why it works: `Serialize for Value` serializes a Map object by iterating
+/// `try_iter_pairs()`, which yields keys from `enumerate()` and values from
+/// `get_value()` in the SAME order the enumerator emits. `Enumerator::Values`
+/// emits the keys here verbatim in insertion order, so the resulting JSON keeps
+/// insertion order. Field access (`tool.function`) resolves via `get_value`,
+/// so templates that do `{{ tool.function | tojson }}` (MiniMax) work too.
+#[derive(Debug)]
+struct OrderedObject(Vec<(Arc<str>, Value)>);
+
+impl Object for OrderedObject {
+    fn repr(self: &Arc<Self>) -> ObjectRepr {
+        ObjectRepr::Map
+    }
+    fn enumerate(self: &Arc<Self>) -> Enumerator {
+        let keys: Vec<Value> = self.0.iter().map(|(k, _)| Value::from(k.to_string())).collect();
+        Enumerator::Values(keys)
+    }
+    fn get_value(self: &Arc<Self>, key: &Value) -> Option<Value> {
+        let k = key.as_str()?;
+        self.0.iter().find_map(|(name, v)| (&**name == k).then(|| v.clone()))
+    }
+    fn enumerator_len(self: &Arc<Self>) -> Option<usize> {
+        Some(self.0.len())
+    }
+}
+
+/// A minijinja Seq object wrapping a fixed `Vec<Value>` without going through
+/// serde (which would re-sort any Map elements). Used so the `tools` array can
+/// hold `OrderedObject` elements and stay iterable as a sequence.
+#[derive(Debug)]
+struct OrderedSeq(Vec<Value>);
+
+impl Object for OrderedSeq {
+    fn repr(self: &Arc<Self>) -> ObjectRepr {
+        ObjectRepr::Seq
+    }
+    fn enumerate(self: &Arc<Self>) -> Enumerator {
+        Enumerator::Seq(self.0.len())
+    }
+    fn get_value(self: &Arc<Self>, key: &Value) -> Option<Value> {
+        let idx = key.as_usize()?;
+        self.0.get(idx).cloned()
+    }
+    fn enumerator_len(self: &Arc<Self>) -> Option<usize> {
+        Some(self.0.len())
+    }
+}
+
+/// Convert a serde_json::Value into a minijinja Value that preserves object
+/// insertion order. Objects become `OrderedObject`, arrays become `OrderedSeq`,
+/// scalars become plain values. Used for any data a template may emit via
+/// `| tojson` (tools, and recursively their nested fields).
+fn serde_to_ordered(v: &serde_json::Value) -> Value {
+    match v {
+        serde_json::Value::Null => Value::default(),
+        serde_json::Value::Bool(b) => Value::from(*b),
+        serde_json::Value::Number(n) => {
+            if let Some(u) = n.as_u64() {
+                Value::from(u)
+            } else if let Some(i) = n.as_i64() {
+                Value::from(i)
+            } else {
+                Value::from(n.as_f64().unwrap_or(0.0))
+            }
+        }
+        serde_json::Value::String(s) => Value::from(s),
+        serde_json::Value::Array(arr) => {
+            Value::from_object(OrderedSeq(arr.iter().map(serde_to_ordered).collect()))
+        }
+        serde_json::Value::Object(obj) => {
+            let pairs = obj
+                .iter()
+                .map(|(k, val)| {
+                    // OpenAI encodes tool-call arguments as a JSON *string*
+                    // (`function.arguments = "{\"cmd\":\"...\"}"`), but chat
+                    // templates iterate them as a dict (e.g. MiniMax:
+                    // `{% for k, v in tool_call.arguments.items() %}`). vLLM/HF
+                    // parse the string to a dict before rendering; mirror that
+                    // here so `.items()` yields parameters instead of nothing.
+                    let converted = if k == "arguments" {
+                        if let Some(s) = val.as_str() {
+                            serde_json::from_str::<serde_json::Value>(s)
+                                .ok()
+                                .filter(|p| p.is_object() || p.is_array())
+                                .map(|p| serde_to_ordered(&p))
+                                .unwrap_or_else(|| serde_to_ordered(val))
+                        } else {
+                            serde_to_ordered(val)
+                        }
+                    } else {
+                        serde_to_ordered(val)
+                    };
+                    (Arc::<str>::from(k.as_str()), converted)
+                })
+                .collect();
+            Value::from_object(OrderedObject(pairs))
+        }
+    }
+}
+
+/// Build the template context (`Value`) feeding `messages` through serde
+/// (templates access messages field-by-field, so key order is irrelevant) but
+/// feeding `tools` as order-preserving `OrderedObject`s (templates serialize
+/// tools via `| tojson`, where key order must match vLLM).
+///
+/// Built with `Value::from_object` rather than the `context!` macro — the
+/// macro routes every value through `Value::from_serialize`, which would
+/// re-sort the OrderedObjects back into a BTreeMap.
+fn build_template_context(
+    messages: &[serde_json::Value],
+    add_generation_prompt: bool,
+    bos_token: &str,
+    eos_token: &str,
+    tools: Option<&[serde_json::Value]>,
+) -> Value {
+    let tools_value = match tools {
+        Some(t) => Value::from_object(OrderedSeq(t.iter().map(serde_to_ordered).collect())),
+        None => Value::default(),
+    };
+    let ctx = OrderedObject(vec![
+        (
+            Arc::<str>::from("messages"),
+            Value::from_object(OrderedSeq(
+                messages.iter().map(|m| serde_to_ordered(m)).collect(),
+            )),
+        ),
+        (
+            Arc::<str>::from("add_generation_prompt"),
+            Value::from(add_generation_prompt),
+        ),
+        (Arc::<str>::from("bos_token"), Value::from(bos_token)),
+        (Arc::<str>::from("eos_token"), Value::from(eos_token)),
+        (Arc::<str>::from("tools"), tools_value),
+    ]);
+    Value::from_object(ctx)
+}
+
 /// Render messages through a Jinja2 chat template (HuggingFace format).
 fn render_chat_template(
     template: &str,
@@ -292,13 +399,36 @@ fn render_chat_template(
     env.set_trim_blocks(true);
     env.set_lstrip_blocks(true);
 
+    // Jinja2 dicts have a built-in `.items()` method; minijinja does not. Some
+    // chat templates call it (e.g. MiniMax renders tool-call arguments via
+    // `{% for k, v in tool_call.arguments.items() %}`). Register a callback
+    // that routes `.items()` on a Map to minijinja's `|items` filter, matching
+    // vLLM/Python behavior.
+    env.set_unknown_method_callback(|state, value, method, _args| {
+        if value.kind() == minijinja::value::ValueKind::Map && method == "items" {
+            state.apply_filter("items", &[value.clone()])
+        } else {
+            Err(minijinja::Error::new(
+                minijinja::ErrorKind::UnknownMethod,
+                format!("unknown method {method}"),
+            ))
+        }
+    });
+
     // Add custom filters for Python str method compatibility.
     // Match vLLM/HuggingFace tojson filter: sort_keys=False + separators=(', ', ': ')
     // so that gateway tokenization produces identical output to vLLM's rendering.
-    // NOTE: minijinja internally uses BTreeMap for objects, which sorts keys.
-    // To preserve insertion order, tools are pre-serialized to JSON strings
-    // before being passed to the template. This filter detects such pre-rendered
-    // JSON strings and passes them through without re-serialization.
+    //
+    // Object key order is preserved by feeding tools (and any other tojson'd
+    // object) as `OrderedObject`s (see build_template_context). minijinja's
+    // `Serialize for Value` walks a Map object via its own `try_iter_pairs`,
+    // which follows the object's enumerator order — so an insertion-ordered
+    // enumerator yields insertion-ordered JSON. This makes BOTH template styles
+    // produce byte-identical output to vLLM:
+    //   - whole-object:  `{{ tool | tojson }}`            (Qwen3, GLM, …)
+    //   - field-access:  `{{ tool.function | tojson }}`   (MiniMax-M2.7)
+    // The legacy pre-serialized-string passthrough below is retained only as a
+    // defensive fast path and is no longer how tools are supplied.
     env.add_filter("tojson", |v: Value, _ensure_ascii: Option<bool>| {
         if let Some(s) = v.as_str() {
             let trimmed = s.trim();
@@ -360,28 +490,7 @@ fn render_chat_template(
         .get_template("chat")
         .map_err(|e| format!("get template: {e}"))?;
 
-    let messages_value = Value::from_serialize(messages);
-
-    // Pre-serialize tools to JSON strings preserving key insertion order.
-    // minijinja internally uses BTreeMap for objects which sorts keys alphabetically,
-    // but vLLM preserves the original JSON key insertion order. By pre-serializing
-    // here with serde_json (preserve_order + python_compat_json), the tojson filter
-    // in the template will detect these pre-rendered JSON strings and pass them
-    // through without re-serialization.
-    let tools_json: Option<Vec<String>> = tools.map(|t| {
-        t.iter().map(|tool| {
-            let compact = serde_json::to_string(tool).unwrap_or_default();
-            python_compat_json(&compact)
-        }).collect()
-    });
-
-    let ctx = Value::from_serialize(serde_json::json!({
-        "messages": messages_value,
-        "add_generation_prompt": add_generation_prompt,
-        "bos_token": bos_token,
-        "eos_token": eos_token,
-        "tools": tools_json,
-    }));
+    let ctx = build_template_context(messages, add_generation_prompt, bos_token, eos_token, tools);
 
     tmpl.render(ctx)
         .map_err(|e| format!("render: {e}"))
@@ -401,7 +510,7 @@ fn render_chat_template(
 /// - `.startswith(prefix)` method → `|startswith(prefix)` filter
 /// - `.endswith(suffix)` method → `|endswith(suffix)` filter
 /// - `[::-1]` reverse slice → `|reverse` filter (built-in)
-/// - `.items()` method → `[]` (skip iteration)
+/// - `.items()` method → supported natively via unknown_method_callback (NOT stripped)
 /// - `tojson(ensure_ascii=False)` → `tojson`
 /// - `raise_exception(...)` → `''`
 fn preprocess_template(template: &str) -> String {
@@ -445,7 +554,11 @@ fn preprocess_template(template: &str) -> String {
     result = ENDSWITH_RE.replace_all(&result, r#"|endswith($1)"#).into_owned();
     result = REVERSE_SLICE_RE.replace_all(&result, "|reverse").into_owned();
     result = CHAINED_SPLIT_RE.replace_all(&result, "]").into_owned();
-    result = ITEMS_RE.replace_all(&result, "[]").into_owned();
+    // NOTE: `.items()` is NOT stripped — it is supported at render time via the
+    // unknown_method_callback registered in render_chat_template (routed to the
+    // `|items` filter). Stripping it here would drop dict iteration used by
+    // templates like MiniMax (`{% for k, v in args.items() %}`).
+    let _ = &ITEMS_RE; // keep the static defined for reference / potential future use
     result = RAISE_RE.replace_all(&result, "''").into_owned();
     result = TOJSON_RE.replace_all(&result, "| tojson").into_owned();
 
@@ -502,23 +615,105 @@ fn format_openai_chat(messages: &[serde_json::Value]) -> String {
     parts
 }
 
-fn format_anthropic_chat(system: Option<&str>, messages: &[serde_json::Value]) -> String {
-    let mut parts = String::new();
-    if let Some(sys) = system {
-        parts.push_str(sys);
-        parts.push('\n');
-    }
-    for msg in messages {
-        let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
-        let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
-        parts.push_str(&format!("{}: {}\n", role, content));
-    }
-    parts
-}
-
 #[cfg(test)]
 mod tojson_tests {
     use super::*;
+
+    /// A tool whose keys (name, description, parameters, ...) are intentionally
+    /// NOT in alphabetical order — pins insertion-order preservation.
+    fn sample_tool() -> serde_json::Value {
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get weather info",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}
+            }
+        })
+    }
+
+    #[test]
+    fn whole_object_tojson_preserves_insertion_order_qwen_style() {
+        // Qwen3 / GLM style: `{{ tool | tojson }}` (whole object).
+        let tools = vec![sample_tool()];
+        let template = "{% for tool in tools %}{{ tool | tojson }}{% endfor %}";
+        let rendered = render_chat_template(template, "", "", &[], true, Some(&tools)).unwrap();
+        // type must precede function (insertion order, not alphabetical).
+        let type_pos = rendered.find("\"type\"").unwrap();
+        let func_pos = rendered.find("\"function\"").unwrap();
+        assert!(type_pos < func_pos, "type must precede function: {rendered}");
+        let name_pos = rendered.find("\"name\"").unwrap();
+        let desc_pos = rendered.find("\"description\"").unwrap();
+        let params_pos = rendered.find("\"parameters\"").unwrap();
+        assert!(name_pos < desc_pos && desc_pos < params_pos,
+            "function keys must keep insertion order name<description<parameters: {rendered}");
+    }
+
+    #[test]
+    fn field_access_tojson_preserves_insertion_order_minimax_style() {
+        // MiniMax style: `{{ tool.function | tojson }}` (field access). A JSON
+        // string has no `.function` (would render null) — this pins that tools
+        // reach the template as objects with resolvable, ordered sub-fields.
+        let tools = vec![sample_tool()];
+        let template = "{% for tool in tools %}<tool>{{ tool.function | tojson(ensure_ascii=False) }}</tool>{% endfor %}";
+        let rendered = render_chat_template(template, "", "", &[], true, Some(&tools)).unwrap();
+        assert!(!rendered.contains("null"), "field access yielded null: {rendered}");
+        let name_pos = rendered.find("\"name\"").unwrap();
+        let desc_pos = rendered.find("\"description\"").unwrap();
+        let params_pos = rendered.find("\"parameters\"").unwrap();
+        assert!(name_pos < desc_pos && desc_pos < params_pos,
+            "function keys must keep insertion order: {rendered}");
+    }
+
+    #[test]
+    fn both_styles_render_identical_function_json() {
+        // Cross-model compatibility crux: the function object rendered via
+        // field access (MiniMax) must be byte-identical to the function object
+        // embedded inside the whole-tool rendering (Qwen3) — one mechanism,
+        // both template styles.
+        let tools = vec![sample_tool()];
+        let via_field = render_chat_template(
+            "{% for tool in tools %}{{ tool.function | tojson }}{% endfor %}",
+            "", "", &[], true, Some(&tools),
+        ).unwrap();
+        let whole = render_chat_template(
+            "{% for tool in tools %}{{ tool | tojson }}{% endfor %}",
+            "", "", &[], true, Some(&tools),
+        ).unwrap();
+        // The field-rendered function JSON must appear verbatim inside the
+        // whole-tool rendering (i.e. the same bytes, same key order).
+        assert!(
+            whole.contains(&via_field),
+            "field-access output must be a substring of whole-tool output.\n\
+             field: {via_field}\nwhole: {whole}"
+        );
+    }
+
+    #[test]
+    fn assistant_tool_call_arguments_render_as_parameters() {
+        // MiniMax renders assistant tool_calls via dict `.items()` on
+        // `tool_call.arguments` (a JSON *string* in OpenAI format). vLLM/HF
+        // parse the string to a dict first; the gateway must too, or the
+        // parameters vanish and the rendered `<invoke>` is empty (diverging
+        // from vLLM's cache at every assistant tool call).
+        let arguments = r#"{"command": "git clone x", "description": "Clone repo"}"#;
+        let messages = vec![serde_json::json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "bash", "arguments": arguments}
+            }]
+        })];
+        // Mirrors the MiniMax tool-call rendering: iterate arguments.items().
+        let template = "{% for m in messages %}{% for tc in m.tool_calls %}{% set fn = tc.function %}<invoke name=\"{{ fn.name }}\">{% for k, v in fn.arguments.items() %}<parameter name=\"{{ k }}\">{{ v }}</parameter>{% endfor %}</invoke>{% endfor %}{% endfor %}";
+        let rendered = render_chat_template(template, "", "", &messages, true, None).unwrap();
+        assert!(rendered.contains("<parameter name=\"command\">git clone x</parameter>"),
+            "arguments not rendered as parameters (string not parsed to dict?): {rendered}");
+        assert!(rendered.contains("<parameter name=\"description\">Clone repo</parameter>"),
+            "missing description parameter: {rendered}");
+    }
 
     #[test]
     fn test_tojson_matches_vllm() {

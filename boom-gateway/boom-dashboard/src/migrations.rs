@@ -24,47 +24,12 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
         .execute(&mut *conn)
         .await;
 
-    // 1. Request logs (boom-audit).
-    tracing::info!("Migration 1/7: request_log...");
-    run_ddl_on_conn(&mut conn, boom_audit::migrations::request_log_ddl()).await?;
-    // Add key_alias column (no-op if already present).
-    let _ = sqlx::query(
-        r#"ALTER TABLE boom_request_log ADD COLUMN IF NOT EXISTS key_alias TEXT"#,
-    )
-    .execute(&mut *conn)
-    .await;
-    // Add deployment_id column (no-op if already present).
-    let _ = sqlx::query(
-        r#"ALTER TABLE boom_request_log ADD COLUMN IF NOT EXISTS deployment_id TEXT"#,
-    )
-    .execute(&mut *conn)
-    .await;
-    // Add model_name column for resolved deployment name (no-op if already present).
-    let _ = sqlx::query(
-        r#"ALTER TABLE boom_request_log ADD COLUMN IF NOT EXISTS model_name TEXT"#,
-    )
-    .execute(&mut *conn)
-    .await;
-    // Add client_ip column for tracking client IP address (no-op if already present).
-    let _ = sqlx::query(
-        r#"ALTER TABLE boom_request_log ADD COLUMN IF NOT EXISTS client_ip TEXT"#,
-    )
-    .execute(&mut *conn)
-    .await;
-    let _ = sqlx::query(
-        r#"CREATE INDEX IF NOT EXISTS idx_request_log_model_name ON boom_request_log(model_name)"#,
-    )
-    .execute(&mut *conn)
-    .await;
-    // Add ttft_ms column for streaming Time-To-First-Token tracking (no-op if already present).
-    sqlx::query(
-        r#"ALTER TABLE boom_request_log ADD COLUMN IF NOT EXISTS ttft_ms INTEGER"#,
-    )
-    .execute(&mut *conn)
-    .await?;
-    // NOTE: cached_tokens is owned by boom-audit (boom_request_log DDL owner) —
-    // added there in run_request_log_migration. Not duplicated here.
-    tracing::info!("Migration 1/7: done");
+    // 1. Request logs (boom-audit) — owned by boom-audit. Its
+    //    run_request_log_migration (CREATE boom_request_log + all column
+    //    ALTERs incl. cached_tokens, plus the boom_request_dfx table) is
+    //    invoked at startup from state.rs, so this dashboard migration no
+    //    longer touches boom_request_log / boom_request_dfx DDL.
+    tracing::info!("Migration 1/7: request_log (owned by boom-audit, run separately)");
 
     // 2. Model deployments + aliases (boom-routing).
     tracing::info!("Migration 2/7: deployment...");

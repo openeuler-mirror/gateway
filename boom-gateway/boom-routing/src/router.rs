@@ -70,6 +70,13 @@ impl Router {
         self.policy.store(Arc::new(PolicyHolder { inner: policy }));
     }
 
+    /// Current scheduling policy name (e.g. "kvc_aware" / "key_affinity" /
+    /// "round_robin"). Used for DFX logging so each request record shows which
+    /// policy handled it.
+    pub fn policy_name(&self) -> String {
+        self.policy.load().inner.name().to_string()
+    }
+
     /// Hot-swap the hybrid router classifier (e.g. on config reload).
     pub fn set_classifier(&self, classifier: Option<Arc<HybridRouter>>) {
         self.classifier
@@ -137,6 +144,34 @@ impl Router {
     ) -> Option<Selection> {
         let candidates = self.resolve_candidates(model)?;
         self.policy.load().inner.select_with_context(model, &candidates, key_hash, input_chars, token_ids)
+    }
+
+    /// Public access to candidate providers for a model. Used by KV-aware
+    /// routing to obtain a deployment's vLLM endpoint for `/tokenize` BEFORE
+    /// the routing decision (tokenization is model-level, identical across
+    /// deployments of the same model, so any candidate suffices).
+    pub fn candidates_for(&self, model: &str) -> Option<Vec<Arc<dyn Provider>>> {
+        self.resolve_candidates(model)
+    }
+
+    /// KV-aware selection with pre-resolved candidates (pairs with
+    /// `candidates_for` so the caller can tokenize via a candidate's vLLM
+    /// between resolving candidates and selecting).
+    pub fn select_with_candidates(
+        &self,
+        model: &str,
+        candidates: &[Arc<dyn Provider>],
+        key_hash: Option<&str>,
+        input_chars: u64,
+        token_ids: &[u32],
+    ) -> Option<Selection> {
+        if candidates.is_empty() {
+            return None;
+        }
+        self.policy
+            .load()
+            .inner
+            .select_with_context(model, candidates, key_hash, input_chars, token_ids)
     }
 
     /// Resolve model name to a list of candidate providers.

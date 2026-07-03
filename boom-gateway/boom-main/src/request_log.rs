@@ -38,6 +38,28 @@ pub struct RequestLog {
     /// vLLM-reported real KV-cache hit (HBM + external store), from the final
     /// usage chunk's prompt_tokens_details.cached_tokens.
     pub cached_tokens: Option<i64>,
+    /// DFX scheduling observability. Stored in a separate `boom_request_dfx`
+    /// table (isolated from the main request log); None when no routing/dfx
+    /// info applies (e.g. errors before routing, or non-kvc_aware policies).
+    pub dfx: Option<RequestDfx>,
+}
+
+/// DFX scheduling observability for a single request. Persisted to
+/// `boom_request_dfx`, joined back to `boom_request_log` by `request_id`.
+pub struct RequestDfx {
+    /// Which policy handled the request (kvc_aware / key_affinity / round_robin).
+    pub schedule_policy: Option<String>,
+    /// Raw hit blocks (matched prefix blocks) for the request.
+    pub kv_hit_blocks: Option<i64>,
+    /// Raw input blocks (total prefix blocks in the request).
+    pub kv_input_blocks: Option<i64>,
+    /// Raw trie block count at request time (how full the trie was).
+    pub trie_blocks: Option<i64>,
+    /// Trie capacity (max_blocks config) at request time, so the fill % can be
+    /// derived at read time as trie_blocks / trie_max_blocks.
+    pub trie_max_blocks: Option<i64>,
+    /// Token count of the request prompt.
+    pub request_tokens: Option<i64>,
 }
 
 /// Fire-and-forget: spawn a tokio task to INSERT the log record.
@@ -83,6 +105,34 @@ pub fn log_request(pool: Option<PgPool>, log: RequestLog) {
                 Ok(Err(e)) => tracing::debug!("Failed to insert request log: {}", e),
                 Err(_) => tracing::warn!("Request log write timed out after 5s, dropping"),
                 Ok(Ok(_)) => {}
+            }
+
+            // Best-effort DFX write to the isolated boom_request_dfx table.
+            // Joined back by request_id. Failures here must not affect the main
+            // log record (already written above) — only a debug log line.
+            if let (Some(dfx), Some(rid)) = (log.dfx.as_ref(), log.request_id.as_ref()) {
+                if let Err(e) = sqlx::query(
+                    r#"INSERT INTO boom_request_dfx
+                       (request_id, schedule_policy, kv_hit_blocks, kv_input_blocks,
+                        trie_blocks, trie_max_blocks, request_tokens)
+                       VALUES ($1, $2, $3, $4, $5, $6, $7)"#,
+                )
+                .bind(rid)
+                .bind(&dfx.schedule_policy)
+                .bind(dfx.kv_hit_blocks)
+                .bind(dfx.kv_input_blocks)
+                .bind(dfx.trie_blocks)
+                .bind(dfx.trie_max_blocks)
+                .bind(dfx.request_tokens)
+                .execute(&pool)
+                .await
+                {
+                    // warn (not debug): a persistent failure here surfaces as
+                    // "Prefix Hit Rate has no data" in the dashboard, which
+                    // looks like an upstream issue but is really this write
+                    // failing. Make it visible.
+                    tracing::warn!("Failed to insert request dfx: {}", e);
+                }
             }
         });
     }
@@ -143,6 +193,7 @@ pub fn log_error(
             deployment_id,
             client_ip: client_ip.clone(),
             cached_tokens: None,
+            dfx: None,
         },
     );
 
