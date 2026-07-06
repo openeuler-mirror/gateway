@@ -14,7 +14,8 @@ use boom_ctxaware::AgentStatsTracker;
 use boom_flowcontrol::{FlowControlError, FlowControlledStream};
 use boom_limiter::{ConcurrencyGuard, GuardedStream, PlanStore, RateLimitPlan};
 use boom_promptlog::{PromptLogEntry, PromptLogStream};
-use boom_routing::{InFlightGuard, Router};
+use boom_quota::{CumulativeKind, QuotaScope, QuotaStore};
+use boom_routing::{InFlightGuard, ModelCostRate, Router};
 use futures::StreamExt;
 use sqlx::PgPool;
 use std::convert::Infallible;
@@ -114,6 +115,9 @@ async fn acquire_fc_guard<E>(
                 retry_after_secs: None,
                 message: format!("Request context ({} chars) exceeds deployment max_context limit ({} chars)", context_chars, max_context),
                 limit_type: "flow_control_context",
+                scope: None,
+                scope_id: None,
+                plan_name: None,
             };
             log_error(state, identity, model, api_path, is_stream, start, &e, Some(request_id.to_string()), Some(deployment_id.to_string()), None, client_ip);
             Err(err_wrap(e, is_stream))
@@ -174,6 +178,9 @@ struct UsageTrackerState {
 /// stream has been fully consumed or the connection is torn down).
 /// This captures the *real* duration for streaming requests instead of
 /// recording the time at which the stream *started*.
+///
+/// Also settles the `PlanCharge` (token + cost attribution) on drop, using
+/// the final usage from `usage_tracker` once the stream has completed.
 struct LoggedStream<S> {
     inner: S,
     pool: Option<PgPool>,
@@ -182,6 +189,9 @@ struct LoggedStream<S> {
     first_token_at: Option<Instant>,
     usage: UsageTracker,
     agent_stats: Option<Arc<AgentStatsTracker>>,
+    /// Plan charge to settle on drop. None when running without quota tracking
+    /// (e.g. legacy per-model RPM path with no plan).
+    plan_charge: Option<PlanCharge>,
 }
 
 impl<S> LoggedStream<S> {
@@ -201,7 +211,18 @@ impl<S> LoggedStream<S> {
             first_token_at: None,
             usage,
             agent_stats,
+            plan_charge: None,
         }
+    }
+
+    /// Attach a `PlanCharge` to be settled on drop. Caller MUST have already
+    /// called `commit()` on the charge (so limiter counters are incremented)
+    /// and `take_concurrency_guard()` (so the concurrency guard is attached
+    /// to the inner GuardedStream). The remaining settle step (token + cost
+    /// attribution) is performed here when the stream finishes.
+    fn with_plan_charge(mut self, charge: PlanCharge) -> Self {
+        self.plan_charge = Some(charge);
+        self
     }
 }
 
@@ -225,6 +246,23 @@ impl<S> Drop for LoggedStream<S> {
                 }
             }
             log_request(self.pool.clone(), log);
+        }
+        // Settle the plan charge with real token counts from the stream.
+        // If the stream errored or was cancelled before the final usage
+        // chunk arrived, input/output will be 0 — settle is a no-op on
+        // cumulative counters (cost will be $0), which is the desired
+        // "未拿到 usage 不计费" behavior.
+        if let Some(mut charge) = self.plan_charge.take() {
+            let (input, cached, output) = if let Ok(guard) = self.usage.lock() {
+                (
+                    guard.prompt_tokens.unwrap_or(0) as u64,
+                    guard.cached_tokens.unwrap_or(0).max(0) as u64,
+                    guard.completion_tokens.unwrap_or(0) as u64,
+                )
+            } else {
+                (0u64, 0u64, 0u64)
+            };
+            charge.settle(input, cached, output);
         }
     }
 }
@@ -306,26 +344,35 @@ async fn chat_completions_inner(
     );
 
     // 2. Plan-based or default rate limiting.
-    let window_limits: Vec<(u64, u64)> = inner
+    let window_limits: Vec<boom_core::types::WindowLimit> = inner
         .config
         .rate_limit
         .window_limits
         .iter()
         .filter_map(|w| {
             if w.len() >= 2 {
-                Some((w[0], w[1]))
+                Some(boom_core::types::WindowLimit {
+                    counts: Some(w[0]),
+                    tokens: None,
+                    costs: None,
+                    window_secs: w[1],
+                })
             } else {
                 None
             }
         })
         .collect();
     let weight = resolve_quota_weight(&req.model, &state);
+    let resolved_model_for_quota = resolve_model_name(&req.model, &state);
 
     let mut plan_charge = check_plan_limits(
+        &state,
         &state.plan_store,
         &state.limiter,
         &identity.key_hash,
+        identity.team_id.as_deref(),
         &req.model,
+        &resolved_model_for_quota,
         identity.rpm_limit,
         &window_limits,
         weight,
@@ -475,7 +522,8 @@ async fn chat_completions_inner(
             deployment_id,
             client_ip: Some(client_ip.clone()),
             cached_tokens: None,
-        }, start, usage, Some(state.agent_stats.clone()));
+        }, start, usage, Some(state.agent_stats.clone()))
+        .with_plan_charge(plan_charge);
 
         // Wrap with prompt log stream if enabled, then wrap in Sse.
         if let Some(sender) = prompt_log_sender {
@@ -523,12 +571,21 @@ async fn chat_completions_inner(
         let duration_ms = start.elapsed().as_millis() as i32;
         let input_tokens = response.usage.prompt_tokens as i32;
         let output_tokens = response.usage.completion_tokens as i32;
-        let cached_tokens = response
+        // Settle quota: real token counts from vLLM go to key + team cumulative
+        // and 1-min TPM windows. Cost is computed from the model's cost_rate;
+        // cached_tokens get the discounted rate when configured.
+        let cached_tokens_i64 = response
             .usage
             .prompt_tokens_details
             .as_ref()
             .and_then(|d| d.cached_tokens)
-            .map(|c| c as i64);
+            .unwrap_or(0);
+        plan_charge.settle(
+            input_tokens as u64,
+            cached_tokens_i64.max(0) as u64,
+            output_tokens as u64,
+        );
+        let cached_tokens = Some(cached_tokens_i64 as i64);
 
         // Provider returned a response — count as a successfully handled request.
         state.agent_stats.record(api_path);
@@ -1144,19 +1201,44 @@ fn check_model_access(
 /// provider has accepted the request. If dropped without commit, no quota is
 /// consumed — the ConcurrencyGuard is released via its own Drop.
 ///
+/// Settle is called separately (after the response is fully consumed) to
+/// record token/cost usage against key + team quota counters.
+///
 /// This implements principle 1: "未服务不计费" — plan counters are only
 /// incremented after `provider.chat_stream`/`provider.chat` returns Ok.
+#[allow(dead_code)]
 pub struct PlanCharge {
     limiter: Arc<boom_limiter::SlidingWindowLimiter>,
     key: RateLimitKey,
     rpm_limit: Option<u64>,
-    window_limits: Vec<(u64, u64)>,
+    /// Multi-dimensional window limits as resolved from the plan (shorthand
+    /// merged in). The `counts` dimension is enforced via `limiter`'s
+    /// SlidingWindowLimiter; `tokens` / `costs` dimensions are enforced via
+    /// `QuotaStore` windows.
+    window_limits: Vec<boom_core::types::WindowLimit>,
     weight: u64,
     /// Held until `take_concurrency_guard` moves it onto GuardedStream.
-    /// Drop releases the concurrency slot (RAII).
+    /// Drop releases the key concurrency slot (RAII).
     concurrency_guard: Option<ConcurrencyGuard>,
+    /// Team concurrency guard — separate field so it can have its own RAII
+    /// drop semantics independently of the key guard.
+    team_concurrency_guard: Option<ConcurrencyGuard>,
+
+    /// Resolved model name (post-alias) for cost rate lookup at settle time.
+    resolved_model: String,
+    /// team_id if the key belongs to a team (for team quota attribution).
+    team_id: Option<String>,
+    /// Quota store reference for settle. None when running in no-DB mode
+    /// (no persistent quota tracking — settle becomes a no-op).
+    quota_store: Option<Arc<QuotaStore>>,
+    /// Per-model cost rate (input + output cost per token in USD).
+    /// Zero if no rate is configured for this model.
+    cost_rate: ModelCostRate,
+
     /// For display in log_request_summary.
     plan_name: Option<String>,
+    /// Team plan name (if team plan was applied).
+    team_plan_name: Option<String>,
     rpm_limit_display: u64,
     concurrency_display: u32,
     concurrency_limit_display: Option<u32>,
@@ -1165,18 +1247,31 @@ pub struct PlanCharge {
     committed: bool,
     /// Post-commit remaining (filled by commit()).
     committed_remaining: Option<u64>,
+    /// True after settle has been called. Prevents double-settle.
+    settled: bool,
 }
 
 impl PlanCharge {
-    /// Commit the charge: increment RPM + window counters by `weight`.
+    /// Commit the charge: increment RPM + counts-windows by `weight`.
     /// MUST be called only after `provider.chat_stream`/`provider.chat`
     /// returned Ok — this is the moment the request is truly sent to the
     /// upstream and "已服务" semantics begin.
+    ///
+    /// Tokens/costs windows are NOT incremented here — they're rolled forward
+    /// in `settle` once real token counts are known. This split mirrors the
+    /// three-phase rate-limit contract (peek → commit → settle): counts
+    /// dimension is request-rate (increment on accept), tokens/costs are
+    /// usage-rate (increment after the upstream returns real usage).
     pub fn commit(&mut self) -> RateLimitDecision {
+        let counts_only: Vec<(u64, u64)> = self
+            .window_limits
+            .iter()
+            .filter_map(|w| w.counts.map(|c| (c, w.window_secs)))
+            .collect();
         let decision = self.limiter.commit_record(
             &self.key,
             self.rpm_limit,
-            &self.window_limits,
+            &counts_only,
             self.weight,
         );
         self.committed = true;
@@ -1194,18 +1289,62 @@ impl PlanCharge {
     pub fn display_remaining(&self) -> u64 {
         self.committed_remaining.unwrap_or(self.peek_remaining)
     }
+
+    /// Settle the request: add input/output tokens + cost to the key and
+    /// (if set) the team's cumulative + multi-window counters. Idempotent —
+    /// a second call is a no-op. Only valid after `commit()`.
+    ///
+    /// `cached_tokens` is the KV-cache hit count reported by vLLM in
+    /// `prompt_tokens_details.cached_tokens`. When the model's cost rate
+    /// has a separate `cached_input_cost_per_token`, cached hits are billed
+    /// at the discounted rate; otherwise at the regular input rate.
+    pub fn settle(&mut self, input_tokens: u64, cached_tokens: u64, output_tokens: u64) {
+        if !self.committed || self.settled {
+            return;
+        }
+        self.settled = true;
+        if let Some(ref store) = self.quota_store {
+            let cost = self.cost_rate.compute_cost(input_tokens, cached_tokens, output_tokens);
+            // Roll forward every configured window_secs — tokens and cost
+            // both get added to each window. Dedup so multiple dimensions on
+            // the same window_secs only produce one window per kind.
+            let mut secs_set: Vec<u64> = Vec::new();
+            for w in &self.window_limits {
+                if !secs_set.contains(&w.window_secs) {
+                    secs_set.push(w.window_secs);
+                }
+            }
+            store.settle_usage(
+                &self.key.key_hash,
+                self.team_id.as_deref(),
+                &self.resolved_model,
+                input_tokens,
+                output_tokens,
+                cost,
+                &secs_set,
+            );
+        }
+    }
 }
 
 impl Drop for PlanCharge {
     fn drop(&mut self) {
-        // If not committed, no counters were ever incremented — nothing to
-        // roll back. The ConcurrencyGuard (if still held) releases itself
-        // via its own Drop as part of our field's drop.
         if !self.committed {
             tracing::debug!(
                 key = ?self.key,
                 committed = false,
                 "PlanCharge dropped without commit — no quota consumed"
+            );
+        } else if !self.settled {
+            // Committed but never settled (e.g. provider error after commit,
+            // or streaming dropped mid-flight without a final usage chunk).
+            // The limiter counters (RPM / window) were already incremented
+            // by commit() and will expire naturally — no rollback needed.
+            // Cumulative token/cost counters are NOT incremented (settle
+            // was never called), so team/key TPM windows stay uncounted.
+            tracing::debug!(
+                key = ?self.key,
+                "PlanCharge dropped without settle — limiter counters stay, quota counters untouched"
             );
         }
     }
@@ -1218,6 +1357,13 @@ fn resolve_quota_weight(model: &str, state: &AppState) -> u64 {
     let resolved = state.router.resolve_model(model)
         .unwrap_or_else(|| model.to_string());
     state.deployment_store.get_quota_ratio(&resolved)
+}
+
+/// Resolve the model name for cost-rate / quota attribution. Alias-resolved
+/// so the cost rate matches the actual upstream deployment.
+fn resolve_model_name(model: &str, state: &AppState) -> String {
+    state.router.resolve_model(model)
+        .unwrap_or_else(|| model.to_string())
 }
 
 /// Check if a key has VIP status from metadata.
@@ -1256,134 +1402,619 @@ fn build_gateway_headers(
     headers
 }
 
+/// Build a RateLimitExceeded error with full scope info.
+fn rate_limit_exceeded(
+    retry_after_secs: Option<u64>,
+    message: String,
+    limit_type: &'static str,
+    scope: &'static str,
+    scope_id: String,
+    plan_name: Option<String>,
+) -> GatewayError {
+    GatewayError::RateLimitExceeded {
+        retry_after_secs,
+        message,
+        limit_type,
+        scope: Some(scope),
+        scope_id: Some(scope_id),
+        plan_name,
+    }
+}
+
+/// Peek the total cost counter (stored as integer micros) against a Decimal
+/// cost limit. Converts the limit to micros for comparison.
+/// Returns Some(error) if exceeded, None if OK.
+fn peek_cost_limit(
+    store: &QuotaStore,
+    scope: &QuotaScope,
+    limit: rust_decimal::Decimal,
+    scope_label: &'static str,
+    scope_id: &str,
+    plan_name: Option<&str>,
+    limit_type: &'static str,
+) -> Option<GatewayError> {
+    let limit_micros = boom_quota::decimal_to_micros(limit);
+    let current_micros = store.peek_cumulative(scope, CumulativeKind::TotalCost);
+    if current_micros >= limit_micros {
+        let plan_str = plan_name.map(|n| format!("Plan '{}', ", n)).unwrap_or_default();
+        Some(rate_limit_exceeded(
+            None,
+            format!(
+                "{}Total cost limit exceeded. Current: ${}, Limit: ${}",
+                plan_str,
+                boom_quota::micros_to_decimal(current_micros),
+                limit
+            ),
+            limit_type,
+            scope_label,
+            scope_id.to_string(),
+            plan_name.map(|s| s.to_string()),
+        ))
+    } else {
+        None
+    }
+}
+
+/// Peek a token-window against a limit. Returns Some(error) if exceeded.
+///
+/// `window_secs` selects which sliding window to read — typically 60 for the
+/// shorthand `tpm_limit`, or the entry's `window_secs` for the multi-dim
+/// `window_limits`.
+fn peek_tokens_window(
+    store: &QuotaStore,
+    scope: &QuotaScope,
+    model: &str,
+    window_secs: u64,
+    limit: u64,
+    scope_label: &'static str,
+    scope_id: &str,
+    plan_name: Option<&str>,
+    limit_type: &'static str,
+) -> Option<GatewayError> {
+    let snap = store.peek_window(scope, model, boom_quota::WindowKind::Tokens, window_secs);
+    if snap.count >= limit {
+        let plan_str = plan_name.map(|n| format!("Plan '{}', ", n)).unwrap_or_default();
+        Some(rate_limit_exceeded(
+            Some(window_secs.saturating_sub(snap.elapsed_secs)),
+            format!(
+                "{}Token window limit exceeded ({}s). Current: {}, Limit: {} per {}s",
+                plan_str, window_secs, snap.count, limit, window_secs
+            ),
+            limit_type,
+            scope_label,
+            scope_id.to_string(),
+            plan_name.map(|s| s.to_string()),
+        ))
+    } else {
+        None
+    }
+}
+
+/// Peek a cost-window against a limit. Returns Some(error) if exceeded.
+///
+/// `window_secs` selects which sliding window to read; `limit` is in USD
+/// (Decimal) — internally converted to micros for comparison.
+fn peek_cost_window(
+    store: &QuotaStore,
+    scope: &QuotaScope,
+    model: &str,
+    window_secs: u64,
+    limit: rust_decimal::Decimal,
+    scope_label: &'static str,
+    scope_id: &str,
+    plan_name: Option<&str>,
+    limit_type: &'static str,
+) -> Option<GatewayError> {
+    let limit_micros = boom_quota::decimal_to_micros(limit);
+    let snap = store.peek_window(scope, model, boom_quota::WindowKind::CostMicros, window_secs);
+    if snap.count >= limit_micros {
+        let plan_str = plan_name.map(|n| format!("Plan '{}', ", n)).unwrap_or_default();
+        Some(rate_limit_exceeded(
+            Some(window_secs.saturating_sub(snap.elapsed_secs)),
+            format!(
+                "{}Cost window limit exceeded ({}s). Current: ${}, Limit: ${} per {}s",
+                plan_str,
+                window_secs,
+                boom_quota::micros_to_decimal(snap.count),
+                limit,
+                window_secs
+            ),
+            limit_type,
+            scope_label,
+            scope_id.to_string(),
+            plan_name.map(|s| s.to_string()),
+        ))
+    } else {
+        None
+    }
+}
+
 /// Check plan-based limits (peek-only, no counters incremented) if a plan is
 /// assigned, otherwise fall back to default per-model rate limits.
 ///
+/// Double-layer check:
+/// 1. Team layer (if key has team_id and team has a plan assigned):
+///    - concurrency_limit, rpm_limit, window_limits (multi-dim)
+///    - total_tpm_limit, total_cost_limit
+/// 2. Key layer:
+///    - concurrency_limit, rpm_limit, window_limits (multi-dim)
+///    - total_tpm_limit, total_cost_limit
+///
+/// A plan is a generic template — the same set of fields applies whether it
+/// is assigned to a key or a team. The `type` field (key/team) only gates
+/// assignment, not which fields are read.
+///
+/// For each `WindowLimit` entry:
+///   - `counts` dimension → SlidingWindowLimiter peek (request-rate semantics)
+///   - `tokens` dimension → QuotaStore Tokens window peek (current cumulative
+///     vs limit; the request that pushes the counter past the limit is allowed
+///     through, the next one is rejected)
+///   - `costs` dimension → QuotaStore CostMicros window peek (same semantics)
+///
+/// Reject if EITHER layer exceeds ANY configured limit. Team layer is checked
+/// first because that's the outer box.
+///
 /// Returns a `PlanCharge` that holds the pending charge info + ConcurrencyGuard.
 /// The caller MUST call `PlanCharge::commit()` after the upstream provider
-/// accepts the request (returns Ok from chat_stream/chat). If the provider
-/// returns Err or the request is cancelled (client disconnect, flow control
-/// timeout), the PlanCharge is dropped without commit — no quota consumed.
+/// accepts the request, and `PlanCharge::settle(input, output)` after the
+/// response is fully consumed (with real token counts from vLLM).
 async fn check_plan_limits(
+    state: &AppState,
     plan_store: &Arc<PlanStore>,
     limiter: &Arc<boom_limiter::SlidingWindowLimiter>,
     key_hash: &str,
-    model: &str,
+    team_id: Option<&str>,
+    requested_model: &str,
+    resolved_model: &str,
     rpm_limit: Option<u64>,
-    window_limits: &[(u64, u64)],
+    window_limits: &[boom_core::types::WindowLimit],
     weight: u64,
 ) -> Result<PlanCharge, GatewayError> {
-    let plan = plan_store
-        .resolve_plan(key_hash)
-        .or_else(|| plan_store.get_default_plan());
-
-    match plan {
-        Some(plan) => {
-            let (concurrency_limit, plan_rpm_limit, plan_window_limits, stale_limits) = plan.effective_limits();
-            tracing::debug!(
+    // ── Resolve key plan (with default_plan fallback) ──
+    // If key has no assignment, use default_plan. If the resolved plan is
+    // type=Team (misconfiguration), warn and fall back to default_plan.
+    let key_plan: Option<RateLimitPlan> = match plan_store.resolve_plan(key_hash) {
+        Some(p) if p.r#type == boom_core::types::PlanType::Team => {
+            tracing::warn!(
                 key_hash = %key_hash,
-                plan = %plan.name,
-                "Using plan-based rate limits"
+                plan = %p.name,
+                "Key is assigned a type=team plan — falling back to default_plan. \
+                 Team plans cannot be assigned to individual keys."
             );
-
-            let guard = if let Some(limit) = concurrency_limit {
-                Some(plan_store.try_acquire(key_hash, limit).ok_or_else(|| {
-                    GatewayError::ConcurrencyExceeded {
-                        limit,
-                        message: format!(
-                            "Concurrency limit exceeded. Plan: {}, Limit: {}",
-                            plan.name, limit
-                        ),
-                    }
-                })?)
-            } else {
-                None
-            };
-
-            let rl_key = RateLimitKey {
-                key_hash: key_hash.to_string(),
-                model: "__plan__".to_string(),
-            };
-
-            // Clear stale counters from the other schedule period so the user
-            // starts fresh on every schedule switch.
-            if !stale_limits.is_empty() {
-                limiter.clear_windows(&rl_key, &stale_limits);
-            }
-
-            let decision = limiter
-                .peek_only(&rl_key, plan_rpm_limit, &plan_window_limits, weight)
-                .await;
-
-            if !decision.allowed {
-                drop(guard);
-                let limit_type = match decision.rejected_window_secs {
-                    Some(60) | None => ("plan_rpm_limit", format!("Plan '{}' RPM limit exceeded. Limit: {}/min", plan.name, decision.limit)),
-                    Some(secs) => ("plan_window_limit", format!("Plan '{}' window limit exceeded. Limit: {} per {}s", plan.name, decision.limit, secs)),
-                };
-                return Err(GatewayError::RateLimitExceeded {
-                    retry_after_secs: decision.retry_after_secs,
-                    message: limit_type.1,
-                    limit_type: limit_type.0,
-                });
-            }
-
-            let concurrency = plan_store.get_concurrency(key_hash);
-            Ok(PlanCharge {
-                limiter: limiter.clone(),
-                key: rl_key,
-                rpm_limit: plan_rpm_limit,
-                window_limits: plan_window_limits,
-                weight,
-                concurrency_guard: guard,
-                plan_name: Some(plan.name.clone()),
-                rpm_limit_display: decision.limit,
-                concurrency_display: concurrency,
-                concurrency_limit_display: concurrency_limit,
-                peek_remaining: decision.remaining,
-                committed: false,
-                committed_remaining: None,
-            })
+            plan_store.get_default_plan()
         }
-        None => {
-            let rl_key = RateLimitKey {
-                key_hash: key_hash.to_string(),
-                model: model.to_string(),
+        Some(p) => Some(p),
+        None => plan_store.get_default_plan(),
+    };
+
+    // ── Resolve team plan (if team_id is set) ──
+    let team_plan: Option<RateLimitPlan> = team_id
+        .and_then(|tid| plan_store.resolve_team_plan(tid));
+
+    // If neither key nor team has a plan → fall back to legacy per-model RPM limits.
+    if key_plan.is_none() && team_plan.is_none() {
+        let rl_key = RateLimitKey {
+            key_hash: key_hash.to_string(),
+            model: requested_model.to_string(),
+        };
+        let counts_only: Vec<(u64, u64)> = window_limits
+            .iter()
+            .filter_map(|w| w.counts.map(|c| (c, w.window_secs)))
+            .collect();
+
+        let decision = limiter
+            .peek_only(&rl_key, rpm_limit, &counts_only, weight)
+            .await;
+
+        if !decision.allowed {
+            let (limit_type, message) = match decision.rejected_window_secs {
+                Some(60) | None => (
+                    "rpm_limit",
+                    format!("RPM limit exceeded. Model: {}, Limit: {}/min", requested_model, decision.limit),
+                ),
+                Some(secs) => (
+                    "window_limit",
+                    format!("Window limit exceeded. Model: {}, Limit: {} per {}s", requested_model, decision.limit, secs),
+                ),
             };
-
-            let decision = limiter
-                .peek_only(&rl_key, rpm_limit, window_limits, weight)
-                .await;
-
-            if !decision.allowed {
-                let limit_type = match decision.rejected_window_secs {
-                    Some(60) | None => ("rpm_limit", format!("RPM limit exceeded. Model: {}, Limit: {}/min", model, decision.limit)),
-                    Some(secs) => ("window_limit", format!("Window limit exceeded. Model: {}, Limit: {} per {}s", model, decision.limit, secs)),
-                };
-                return Err(GatewayError::RateLimitExceeded {
-                    retry_after_secs: decision.retry_after_secs,
-                    message: limit_type.1,
-                    limit_type: limit_type.0,
-                });
-            }
-
-            Ok(PlanCharge {
-                limiter: limiter.clone(),
-                key: rl_key,
-                rpm_limit,
-                window_limits: window_limits.to_vec(),
-                weight,
-                concurrency_guard: None,
+            return Err(GatewayError::RateLimitExceeded {
+                retry_after_secs: decision.retry_after_secs,
+                message,
+                limit_type,
+                scope: Some("key"),
+                scope_id: Some(key_hash.to_string()),
                 plan_name: None,
-                rpm_limit_display: decision.limit,
-                concurrency_display: 0,
-                concurrency_limit_display: None,
-                peek_remaining: decision.remaining,
-                committed: false,
-                committed_remaining: None,
-            })
+            });
+        }
+
+        // Per-window tokens/costs peek (QuotaStore).
+        let key_scope = QuotaScope::Key { key_hash: key_hash.to_string() };
+        for w in window_limits {
+            if let Some(tok_limit) = w.tokens {
+                if let Some(e) = peek_tokens_window(
+                    &state.quota_store,
+                    &key_scope,
+                    resolved_model,
+                    w.window_secs,
+                    tok_limit,
+                    "key",
+                    key_hash,
+                    None,
+                    "key_window_tokens",
+                ) {
+                    return Err(e);
+                }
+            }
+            if let Some(cost_limit) = w.costs {
+                if let Some(e) = peek_cost_window(
+                    &state.quota_store,
+                    &key_scope,
+                    resolved_model,
+                    w.window_secs,
+                    cost_limit,
+                    "key",
+                    key_hash,
+                    None,
+                    "key_window_cost",
+                ) {
+                    return Err(e);
+                }
+            }
+        }
+
+        let cost_rate = state.deployment_store.get_cost_rate(resolved_model);
+        return Ok(PlanCharge {
+            limiter: limiter.clone(),
+            key: rl_key,
+            rpm_limit,
+            window_limits: window_limits.to_vec(),
+            weight,
+            concurrency_guard: None,
+            team_concurrency_guard: None,
+            resolved_model: resolved_model.to_string(),
+            team_id: team_id.map(|s| s.to_string()),
+            quota_store: Some(state.quota_store.clone()),
+            cost_rate,
+            plan_name: None,
+            team_plan_name: None,
+            rpm_limit_display: decision.limit,
+            concurrency_display: 0,
+            concurrency_limit_display: None,
+            peek_remaining: decision.remaining,
+            committed: false,
+            committed_remaining: None,
+            settled: false,
+        });
+    }
+
+    // ── Plan-based path: team layer first, then key layer ──
+    let key_plan_ref = key_plan.as_ref();
+    let team_plan_ref = team_plan.as_ref();
+
+    // 1a. Team concurrency guard
+    let team_concurrency_guard = if let (Some(tp), Some(tid)) = (team_plan_ref, team_id) {
+        let (tc_limit, _, _, _) = tp.effective_limits();
+        if let Some(limit) = tc_limit {
+            Some(plan_store.try_acquire_team(tid, limit).ok_or_else(|| {
+                GatewayError::ConcurrencyExceeded {
+                    limit,
+                    message: format!(
+                        "Team concurrency limit exceeded. Team: {}, Plan: {}, Limit: {}",
+                        tid, tp.name, limit
+                    ),
+                }
+            })?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // 1b. Team RPM / counts-window / tokens-window / cost-window peek
+    let team_plan_name = team_plan_ref.map(|p| p.name.clone());
+    if let (Some(tp), Some(tid)) = (team_plan_ref, team_id) {
+        let (_, team_rpm, team_windows, team_stale) = tp.effective_limits();
+
+        let team_rl_key = RateLimitKey {
+            key_hash: format!("__team__{}", tid),
+            model: "__plan__".to_string(),
+        };
+
+        // Clear stale team counters whose window_secs is no longer active.
+        if !team_stale.is_empty() {
+            limiter.clear_windows(&team_rl_key, &team_stale);
+        }
+
+        // Counts dimension: extract (limit, secs) pairs and let SlidingWindowLimiter peek.
+        let team_counts: Vec<(u64, u64)> = team_windows
+            .iter()
+            .filter_map(|w| w.counts.map(|c| (c, w.window_secs)))
+            .collect();
+
+        let team_decision = limiter
+            .peek_only(&team_rl_key, team_rpm, &team_counts, weight)
+            .await;
+
+        if !team_decision.allowed {
+            drop(team_concurrency_guard);
+            let (limit_type, message) = match team_decision.rejected_window_secs {
+                Some(60) | None => (
+                    "team_rpm_limit",
+                    format!("Team '{}' RPM limit exceeded. Plan: {}, Limit: {}/min", tid, tp.name, team_decision.limit),
+                ),
+                Some(secs) => (
+                    "team_window_limit",
+                    format!("Team '{}' window limit exceeded. Plan: {}, Limit: {} per {}s", tid, tp.name, team_decision.limit, secs),
+                ),
+            };
+            return Err(GatewayError::RateLimitExceeded {
+                retry_after_secs: team_decision.retry_after_secs,
+                message,
+                limit_type,
+                scope: Some("team"),
+                scope_id: Some(tid.to_string()),
+                plan_name: Some(tp.name.clone()),
+            });
+        }
+
+        // Tokens / costs dimensions per window entry.
+        let team_scope = QuotaScope::Team { team_id: tid.to_string() };
+        for w in &team_windows {
+            if let Some(tok_limit) = w.tokens {
+                if let Some(e) = peek_tokens_window(
+                    &state.quota_store,
+                    &team_scope,
+                    resolved_model,
+                    w.window_secs,
+                    tok_limit,
+                    "team",
+                    tid,
+                    Some(&tp.name),
+                    "team_window_tokens",
+                ) {
+                    drop(team_concurrency_guard);
+                    return Err(e);
+                }
+            }
+            if let Some(cost_limit) = w.costs {
+                if let Some(e) = peek_cost_window(
+                    &state.quota_store,
+                    &team_scope,
+                    resolved_model,
+                    w.window_secs,
+                    cost_limit,
+                    "team",
+                    tid,
+                    Some(&tp.name),
+                    "team_window_cost",
+                ) {
+                    drop(team_concurrency_guard);
+                    return Err(e);
+                }
+            }
+        }
+
+        // 1c. Team cumulative total-TPM / total-cost peeks
+        if let Some(limit) = tp.total_tpm_limit {
+            let input = state.quota_store.peek_cumulative(&team_scope, CumulativeKind::TotalInputTokens);
+            let output = state.quota_store.peek_cumulative(&team_scope, CumulativeKind::TotalOutputTokens);
+            if input + output >= limit {
+                drop(team_concurrency_guard);
+                return Err(rate_limit_exceeded(
+                    None,
+                    format!(
+                        "Plan '{}' Total TPM limit exceeded. Current: {}, Limit: {}",
+                        tp.name, input + output, limit
+                    ),
+                    "team_total_tpm",
+                    "team",
+                    tid.to_string(),
+                    Some(tp.name.clone()),
+                ));
+            }
+        }
+        if let Some(limit) = tp.total_cost_limit {
+            if let Some(e) = peek_cost_limit(
+                &state.quota_store,
+                &team_scope,
+                limit,
+                "team",
+                tid,
+                Some(&tp.name),
+                "team_total_cost",
+            ) {
+                drop(team_concurrency_guard);
+                return Err(e);
+            }
         }
     }
+
+    // 2a. Key concurrency guard
+    let (concurrency_limit, plan_rpm_limit, plan_window_limits, stale_limits) = match key_plan_ref {
+        Some(p) => p.effective_limits(),
+        None => (None, None, Vec::new(), Vec::new()),
+    };
+    let plan_name = key_plan_ref.map(|p| p.name.clone());
+
+    let key_concurrency_guard = if let (Some(limit), Some(_kp)) = (concurrency_limit, key_plan_ref) {
+        Some(plan_store.try_acquire(key_hash, limit).ok_or_else(|| {
+            let msg = if let Some(pn) = plan_name.as_ref() {
+                format!("Concurrency limit exceeded. Plan: {}, Limit: {}", pn, limit)
+            } else {
+                format!("Concurrency limit exceeded. Limit: {}", limit)
+            };
+            GatewayError::ConcurrencyExceeded {
+                limit,
+                message: msg,
+            }
+        })?)
+    } else {
+        None
+    };
+
+    // 2b. Key RPM / counts-window peek
+    let key_rl_key = RateLimitKey {
+        key_hash: key_hash.to_string(),
+        model: "__plan__".to_string(),
+    };
+
+    if !stale_limits.is_empty() {
+        limiter.clear_windows(&key_rl_key, &stale_limits);
+    }
+
+    // Counts dimension: extract (limit, secs) pairs for SlidingWindowLimiter.
+    let key_counts: Vec<(u64, u64)> = plan_window_limits
+        .iter()
+        .filter_map(|w| w.counts.map(|c| (c, w.window_secs)))
+        .collect();
+
+    let key_decision = if let Some(_kp) = key_plan_ref {
+        limiter.peek_only(&key_rl_key, plan_rpm_limit, &key_counts, weight).await
+    } else {
+        // No key plan, only team plan: still allow per-model RPM fallback for key.
+        let counts_fallback: Vec<(u64, u64)> = window_limits
+            .iter()
+            .filter_map(|w| w.counts.map(|c| (c, w.window_secs)))
+            .collect();
+        limiter.peek_only(&RateLimitKey {
+            key_hash: key_hash.to_string(),
+            model: requested_model.to_string(),
+        }, rpm_limit, &counts_fallback, weight).await
+    };
+
+    if !key_decision.allowed {
+        drop(key_concurrency_guard);
+        drop(team_concurrency_guard);
+        let (limit_type, message) = match key_decision.rejected_window_secs {
+            Some(60) | None => {
+                if let Some(ref pn) = plan_name {
+                    ("plan_rpm_limit", format!("Plan '{}' RPM limit exceeded. Limit: {}/min", pn, key_decision.limit))
+                } else {
+                    ("rpm_limit", format!("RPM limit exceeded. Model: {}, Limit: {}/min", requested_model, key_decision.limit))
+                }
+            }
+            Some(secs) => {
+                if let Some(ref pn) = plan_name {
+                    ("plan_window_limit", format!("Plan '{}' window limit exceeded. Limit: {} per {}s", pn, key_decision.limit, secs))
+                } else {
+                    ("window_limit", format!("Window limit exceeded. Model: {}, Limit: {} per {}s", requested_model, key_decision.limit, secs))
+                }
+            }
+        };
+        let plan_name_for_err = plan_name.clone();
+        return Err(GatewayError::RateLimitExceeded {
+            retry_after_secs: key_decision.retry_after_secs,
+            message,
+            limit_type,
+            scope: Some("key"),
+            scope_id: Some(key_hash.to_string()),
+            plan_name: plan_name_for_err,
+        });
+    }
+
+    // 2c. Key tokens-window / cost-window / cumulative peeks
+    if let Some(kp) = key_plan_ref {
+        let key_scope = QuotaScope::Key { key_hash: key_hash.to_string() };
+
+        for w in &plan_window_limits {
+            if let Some(tok_limit) = w.tokens {
+                if let Some(e) = peek_tokens_window(
+                    &state.quota_store,
+                    &key_scope,
+                    resolved_model,
+                    w.window_secs,
+                    tok_limit,
+                    "key",
+                    key_hash,
+                    Some(&kp.name),
+                    "key_window_tokens",
+                ) {
+                    drop(key_concurrency_guard);
+                    drop(team_concurrency_guard);
+                    return Err(e);
+                }
+            }
+            if let Some(cost_limit) = w.costs {
+                if let Some(e) = peek_cost_window(
+                    &state.quota_store,
+                    &key_scope,
+                    resolved_model,
+                    w.window_secs,
+                    cost_limit,
+                    "key",
+                    key_hash,
+                    Some(&kp.name),
+                    "key_window_cost",
+                ) {
+                    drop(key_concurrency_guard);
+                    drop(team_concurrency_guard);
+                    return Err(e);
+                }
+            }
+        }
+        if let Some(limit) = kp.total_tpm_limit {
+            let input = state.quota_store.peek_cumulative(&key_scope, CumulativeKind::TotalInputTokens);
+            let output = state.quota_store.peek_cumulative(&key_scope, CumulativeKind::TotalOutputTokens);
+            if input + output >= limit {
+                drop(key_concurrency_guard);
+                drop(team_concurrency_guard);
+                return Err(rate_limit_exceeded(
+                    None,
+                    format!(
+                        "Plan '{}' Total TPM limit exceeded. Current: {}, Limit: {}",
+                        kp.name, input + output, limit
+                    ),
+                    "key_total_tpm",
+                    "key",
+                    key_hash.to_string(),
+                    Some(kp.name.clone()),
+                ));
+            }
+        }
+        if let Some(limit) = kp.total_cost_limit {
+            if let Some(e) = peek_cost_limit(
+                &state.quota_store,
+                &key_scope,
+                limit,
+                "key",
+                key_hash,
+                Some(&kp.name),
+                "key_total_cost",
+            ) {
+                drop(key_concurrency_guard);
+                drop(team_concurrency_guard);
+                return Err(e);
+            }
+        }
+    }
+
+    // ── All checks passed — assemble PlanCharge ──
+    let cost_rate = state.deployment_store.get_cost_rate(resolved_model);
+    let concurrency_display = plan_store.get_concurrency(key_hash);
+
+    Ok(PlanCharge {
+        limiter: limiter.clone(),
+        key: key_rl_key,
+        rpm_limit: plan_rpm_limit.or(rpm_limit),
+        window_limits: if key_plan_ref.is_some() { plan_window_limits } else { window_limits.to_vec() },
+        weight,
+        concurrency_guard: key_concurrency_guard,
+        team_concurrency_guard,
+        resolved_model: resolved_model.to_string(),
+        team_id: team_id.map(|s| s.to_string()),
+        quota_store: Some(state.quota_store.clone()),
+        cost_rate,
+        plan_name,
+        team_plan_name,
+        rpm_limit_display: key_decision.limit,
+        concurrency_display,
+        concurrency_limit_display: concurrency_limit,
+        peek_remaining: key_decision.remaining,
+        committed: false,
+        committed_remaining: None,
+        settled: false,
+    })
 }
 
 // ============================================================
@@ -1607,26 +2238,35 @@ pub async fn messages(
     );
 
     // 2. Plan-based or default rate limiting.
-    let window_limits: Vec<(u64, u64)> = inner
+    let window_limits: Vec<boom_core::types::WindowLimit> = inner
         .config
         .rate_limit
         .window_limits
         .iter()
         .filter_map(|w| {
             if w.len() >= 2 {
-                Some((w[0], w[1]))
+                Some(boom_core::types::WindowLimit {
+                    counts: Some(w[0]),
+                    tokens: None,
+                    costs: None,
+                    window_secs: w[1],
+                })
             } else {
                 None
             }
         })
         .collect();
     let weight = resolve_quota_weight(&openai_req.model, &state);
+    let resolved_model_for_quota = resolve_model_name(&openai_req.model, &state);
 
     let mut plan_charge = check_plan_limits(
+        &state,
         &state.plan_store,
         &state.limiter,
         &identity.key_hash,
+        identity.team_id.as_deref(),
         &openai_req.model,
+        &resolved_model_for_quota,
         identity.rpm_limit,
         &window_limits,
         weight,
@@ -1777,7 +2417,8 @@ pub async fn messages(
             deployment_id,
             client_ip: Some(client_ip.clone()),
             cached_tokens: None,
-        }, start, usage, Some(state.agent_stats.clone()));
+        }, start, usage, Some(state.agent_stats.clone()))
+        .with_plan_charge(plan_charge);
 
         // Wrap with prompt log stream if enabled, then wrap in Sse.
         if let Some(sender) = prompt_log_sender {
@@ -1824,12 +2465,21 @@ pub async fn messages(
         let duration_ms = start.elapsed().as_millis() as i32;
         let input_tokens = response.usage.prompt_tokens as i32;
         let output_tokens = response.usage.completion_tokens as i32;
-        let cached_tokens = response
+        // Settle quota: real token counts from vLLM go to key + team cumulative
+        // and 1-min TPM windows. Cost is computed from the model's cost_rate;
+        // cached_tokens get the discounted rate when configured.
+        let cached_tokens_i64 = response
             .usage
             .prompt_tokens_details
             .as_ref()
             .and_then(|d| d.cached_tokens)
-            .map(|c| c as i64);
+            .unwrap_or(0);
+        plan_charge.settle(
+            input_tokens as u64,
+            cached_tokens_i64.max(0) as u64,
+            output_tokens as u64,
+        );
+        let cached_tokens = Some(cached_tokens_i64 as i64);
 
         // Provider returned a response — count as a successfully handled request.
         state.agent_stats.record("/v1/messages");

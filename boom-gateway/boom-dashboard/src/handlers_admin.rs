@@ -28,11 +28,26 @@ pub async fn list_plans(
 pub struct UpsertPlanRequest {
     pub name: String,
     #[serde(default)]
+    pub r#type: boom_limiter::PlanType,
+    #[serde(default)]
+    pub member_plan: Option<String>,
+    #[serde(default)]
     pub concurrency_limit: Option<u32>,
     #[serde(default)]
     pub rpm_limit: Option<u64>,
     #[serde(default)]
-    pub window_limits: Vec<(u64, u64)>,
+    pub tpm_limit: Option<u64>,
+    #[serde(default)]
+    pub cost_limit: Option<rust_decimal::Decimal>,
+    #[serde(
+        default,
+        deserialize_with = "boom_core::types::deserialize_window_limit_vec"
+    )]
+    pub window_limits: Vec<boom_core::types::WindowLimit>,
+    #[serde(default)]
+    pub total_tpm_limit: Option<u64>,
+    #[serde(default)]
+    pub total_cost_limit: Option<rust_decimal::Decimal>,
     #[serde(default)]
     pub schedule: Vec<boom_limiter::ScheduleSlot>,
 }
@@ -44,9 +59,15 @@ pub async fn upsert_plan(
 ) -> Json<Value> {
     let plan = boom_limiter::RateLimitPlan {
         name: req.name.clone(),
+        r#type: req.r#type,
+        member_plan: req.member_plan,
         concurrency_limit: req.concurrency_limit,
         rpm_limit: req.rpm_limit,
+        tpm_limit: req.tpm_limit,
+        cost_limit: req.cost_limit,
         window_limits: req.window_limits,
+        total_tpm_limit: req.total_tpm_limit,
+        total_cost_limit: req.total_cost_limit,
         schedule: req.schedule.clone(),
     };
 
@@ -2603,6 +2624,540 @@ pub async fn get_prompt_log_entry(
         Json(json!({"error": "Request not found in prompt logs"})),
     )
         .into_response()
+}
+
+// ═══════════════════════════════════════════════════════════
+// Quota management — team-organized view of cumulative / window
+// counters across all keys & teams. Reads boom_rate_limit_cumulative
+// via SQL JOIN (avoids scanning the whole QuotaStore DashMap).
+// ═══════════════════════════════════════════════════════════
+
+#[derive(Debug, sqlx::FromRow)]
+struct QuotaTeamOverviewRow {
+    team_id: String,
+    team_alias: Option<String>,
+    key_count: i64,
+    total_input_tokens: i64,
+    total_output_tokens: i64,
+    total_cost_micros: i64,
+}
+
+/// GET /admin/quota/overview — list every team with key_count + cumulative
+/// totals, plus a synthetic "no_team" entry for keys without a team.
+pub async fn quota_overview(
+    _session: AdminSession,
+    Extension(state): Extension<std::sync::Arc<DashboardState>>,
+) -> Response {
+    let db_pool = match &state.db_pool {
+        Some(pool) => pool,
+        None => return Json(json!({"error": "Database not available"})).into_response(),
+    };
+
+    // Team rows: one SELECT with LEFT JOINs on boom_rate_limit_cumulative.
+    let team_sql = r#"
+        SELECT bt.team_id,
+               bt.team_alias,
+               COALESCE(kc.cnt, 0)                    AS key_count,
+               COALESCE(tin.value, 0)                 AS total_input_tokens,
+               COALESCE(tout.value, 0)                AS total_output_tokens,
+               COALESCE(tcost.value, 0)               AS total_cost_micros
+        FROM boom_team_table bt
+        LEFT JOIN (
+            SELECT team_id, COUNT(*) AS cnt
+            FROM boom_verification_token GROUP BY team_id
+        ) kc ON bt.team_id = kc.team_id
+        LEFT JOIN boom_rate_limit_cumulative tin
+               ON tin.cache_key  = 'tc:' || bt.team_id || ':tin'
+        LEFT JOIN boom_rate_limit_cumulative tout
+               ON tout.cache_key = 'tc:' || bt.team_id || ':tout'
+        LEFT JOIN boom_rate_limit_cumulative tcost
+               ON tcost.cache_key = 'tc:' || bt.team_id || ':tcost'
+        ORDER BY total_cost_micros DESC, total_input_tokens DESC
+    "#;
+
+    let team_rows: Vec<QuotaTeamOverviewRow> = match sqlx::query_as(team_sql).fetch_all(db_pool).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("quota_overview team query failed: {}", e);
+            return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response();
+        }
+    };
+
+    // team → plan_name lookup.
+    let team_plans: std::collections::HashMap<String, String> = state
+        .plan_store
+        .list_team_assignments()
+        .into_iter()
+        .collect();
+
+    let teams: Vec<Value> = team_rows
+        .into_iter()
+        .map(|r| {
+            json!({
+                "team_id": r.team_id,
+                "team_alias": r.team_alias,
+                "key_count": r.key_count,
+                "plan_name": team_plans.get(&r.team_id).cloned(),
+                "total_input_tokens": r.total_input_tokens.max(0),
+                "total_output_tokens": r.total_output_tokens.max(0),
+                "total_cost_micros": r.total_cost_micros.max(0),
+                "total_cost": boom_quota::micros_to_decimal(r.total_cost_micros.max(0) as u64).to_string(),
+            })
+        })
+        .collect();
+
+    // No-team aggregate: SQL count + LEFT JOIN cumulative per key.
+    let no_team_sql = r#"
+        SELECT COUNT(*)                          AS key_count,
+               COALESCE(SUM(tin.value), 0)       AS total_input_tokens,
+               COALESCE(SUM(tout.value), 0)      AS total_output_tokens,
+               COALESCE(SUM(tcost.value), 0)     AS total_cost_micros
+        FROM boom_verification_token vt
+        LEFT JOIN boom_rate_limit_cumulative tin
+               ON tin.cache_key  = 'kc:' || vt.token || ':tin'
+        LEFT JOIN boom_rate_limit_cumulative tout
+               ON tout.cache_key = 'kc:' || vt.token || ':tout'
+        LEFT JOIN boom_rate_limit_cumulative tcost
+               ON tcost.cache_key = 'kc:' || vt.token || ':tcost'
+        WHERE vt.team_id IS NULL
+    "#;
+    let no_team_row: (i64, i64, i64, i64) = match sqlx::query_as(no_team_sql).fetch_one(db_pool).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("quota_overview no_team query failed: {}", e);
+            return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response();
+        }
+    };
+    let no_team = json!({
+        "team_id": null,
+        "team_alias": null,
+        "key_count": no_team_row.0,
+        "plan_name": null,
+        "total_input_tokens": no_team_row.1.max(0),
+        "total_output_tokens": no_team_row.2.max(0),
+        "total_cost_micros": no_team_row.3.max(0),
+        "total_cost": boom_quota::micros_to_decimal(no_team_row.3.max(0) as u64).to_string(),
+    });
+
+    Json(json!({ "teams": teams, "no_team": no_team })).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct QuotaKeysQuery {
+    #[serde(default = "default_page")]
+    pub page: i64,
+    #[serde(default = "default_per_page_50")]
+    pub per_page: i64,
+    #[serde(default)]
+    pub search: Option<String>,
+    /// cost | tokens | alias. Default: cost.
+    #[serde(default)]
+    pub sort: Option<String>,
+}
+
+fn default_per_page_50() -> i64 {
+    50
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct QuotaKeyRow {
+    token: String,
+    key_alias: Option<String>,
+    key_name: Option<String>,
+    user_id: Option<String>,
+    blocked: Option<bool>,
+    created_at: Option<NaiveDateTime>,
+    total_input_tokens: i64,
+    total_output_tokens: i64,
+    total_cost_micros: i64,
+}
+
+/// GET /admin/quota/team/{team_id} — paginated keys within one team.
+pub async fn quota_team_keys(
+    _session: AdminSession,
+    Extension(state): Extension<std::sync::Arc<DashboardState>>,
+    Path(team_id): Path<String>,
+    Query(q): Query<QuotaKeysQuery>,
+) -> Response {
+    quota_keys_inner(&state, Some(team_id), &q).await
+}
+
+/// GET /admin/quota/unassigned — paginated keys with no team.
+pub async fn quota_unassigned_keys(
+    _session: AdminSession,
+    Extension(state): Extension<std::sync::Arc<DashboardState>>,
+    Query(q): Query<QuotaKeysQuery>,
+) -> Response {
+    quota_keys_inner(&state, None, &q).await
+}
+
+async fn quota_keys_inner(
+    state: &DashboardState,
+    team_id: Option<String>,
+    q: &QuotaKeysQuery,
+) -> Response {
+    let db_pool = match &state.db_pool {
+        Some(pool) => pool,
+        None => return Json(json!({"error": "Database not available"})).into_response(),
+    };
+    let (page, per_page) = normalize_pagination(q.page, q.per_page);
+    let offset = (page - 1) * per_page;
+
+    let sort_clause = match q.sort.as_deref().unwrap_or("cost") {
+        "tokens" => "(COALESCE(tin.value,0) + COALESCE(tout.value,0)) DESC",
+        "alias" => "COALESCE(vt.key_alias, vt.key_name, vt.token) ASC",
+        // default: cost
+        _ => "COALESCE(tcost.value, 0) DESC",
+    };
+
+    let search_pattern = q.search.as_deref().map(|s| {
+        format!("%{}%", s.replace('%', "\\%").replace('_', "\\_"))
+    });
+
+    let base_sql = r#"
+        SELECT vt.token,
+               vt.key_alias,
+               vt.key_name,
+               vt.user_id,
+               vt.blocked,
+               vt.created_at,
+               COALESCE(tin.value, 0)   AS total_input_tokens,
+               COALESCE(tout.value, 0)  AS total_output_tokens,
+               COALESCE(tcost.value, 0) AS total_cost_micros
+        FROM boom_verification_token vt
+        LEFT JOIN boom_rate_limit_cumulative tin
+               ON tin.cache_key  = 'kc:' || vt.token || ':tin'
+        LEFT JOIN boom_rate_limit_cumulative tout
+               ON tout.cache_key = 'kc:' || vt.token || ':tout'
+        LEFT JOIN boom_rate_limit_cumulative tcost
+               ON tcost.cache_key = 'kc:' || vt.token || ':tcost'
+    "#;
+
+    // Build WHERE + parameters dynamically.
+    // Args order: $1 team_id (if Some), $2 search, $3 limit, $4 offset.
+    let where_clause = match (&team_id, &search_pattern) {
+        (Some(_), Some(_)) => " WHERE vt.team_id = $1 AND (vt.key_alias ILIKE $2 OR vt.key_name ILIKE $2 OR vt.user_id ILIKE $2 OR vt.token ILIKE $2)",
+        (Some(_), None) => " WHERE vt.team_id = $1",
+        (None, Some(_)) => " WHERE vt.team_id IS NULL AND (vt.key_alias ILIKE $1 OR vt.key_name ILIKE $1 OR vt.user_id ILIKE $1 OR vt.token ILIKE $1)",
+        (None, None) => " WHERE vt.team_id IS NULL",
+    };
+
+    let limit_idx = if team_id.is_some() && search_pattern.is_some() {
+        3
+    } else if team_id.is_some() || search_pattern.is_some() {
+        2
+    } else {
+        1
+    };
+    let offset_idx = limit_idx + 1;
+    let sql = format!(
+        "{base_sql}{where_clause} ORDER BY {sort_clause} LIMIT ${limit_idx} OFFSET ${offset_idx}"
+    );
+
+    let mut query = sqlx::query_as::<_, QuotaKeyRow>(&sql);
+    if let Some(tid) = &team_id {
+        query = query.bind(tid);
+    }
+    if let Some(pat) = &search_pattern {
+        query = query.bind(pat);
+    }
+    query = query.bind(per_page).bind(offset);
+
+    let rows: Vec<QuotaKeyRow> = match query.fetch_all(db_pool).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("quota_keys_inner query failed: {}", e);
+            return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response();
+        }
+    };
+
+    // Total count with same WHERE.
+    let count_sql = format!(
+        "SELECT COUNT(*) FROM boom_verification_token vt{where_clause}"
+    );
+    let mut count_query = sqlx::query_scalar::<_, i64>(&count_sql);
+    if let Some(tid) = &team_id {
+        count_query = count_query.bind(tid);
+    }
+    if let Some(pat) = &search_pattern {
+        count_query = count_query.bind(pat);
+    }
+    let total: i64 = match count_query.fetch_one(db_pool).await {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::error!("quota_keys_inner count failed: {}", e);
+            return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response();
+        }
+    };
+
+    let keys: Vec<Value> = rows
+        .into_iter()
+        .map(|r| {
+            let key_hash = r.token.clone();
+            let plan_name = state
+                .plan_store
+                .resolve_plan(&key_hash)
+                .or_else(|| state.plan_store.get_default_plan())
+                .map(|p| p.name);
+            let concurrency = state.plan_store.get_concurrency(&key_hash);
+            json!({
+                "token": r.token,
+                "token_prefix": format!("{}...", &r.token[..8.min(r.token.len())]),
+                "key_alias": r.key_alias,
+                "key_name": r.key_name,
+                "user_id": r.user_id,
+                "blocked": r.blocked.unwrap_or(false),
+                "created_at": r.created_at.map(|d| d.to_string()),
+                "plan_name": plan_name,
+                "concurrency": concurrency,
+                "total_input_tokens": r.total_input_tokens.max(0),
+                "total_output_tokens": r.total_output_tokens.max(0),
+                "total_cost_micros": r.total_cost_micros.max(0),
+                "total_cost": boom_quota::micros_to_decimal(r.total_cost_micros.max(0) as u64).to_string(),
+            })
+        })
+        .collect();
+
+    Json(json!({
+        "keys": keys,
+        "page": page,
+        "per_page": per_page,
+        "total": total,
+        "team_id": team_id,
+    }))
+    .into_response()
+}
+
+/// GET /admin/quota/key/{key_hash}/windows — current per-window consumption
+/// for one key (lazy-loaded when admin expands a row).
+pub async fn quota_key_windows(
+    _session: AdminSession,
+    Extension(state): Extension<std::sync::Arc<DashboardState>>,
+    Path(key_hash): Path<String>,
+) -> Response {
+    // Resolve plan limits for this key.
+    let plan = state
+        .plan_store
+        .resolve_plan(&key_hash)
+        .or_else(|| state.plan_store.get_default_plan());
+    let (_, plan_rpm, plan_window_limits, _) = plan
+        .as_ref()
+        .map(|p| p.effective_limits())
+        .unwrap_or((None, None, vec![], vec![]));
+
+    // counts dimension
+    let mut counts_by_secs: std::collections::HashMap<u64, (u64, u64)> =
+        std::collections::HashMap::new();
+    for w in state.limiter.get_usage_for_key(&key_hash) {
+        let remaining = w.window_secs.saturating_sub(w.elapsed_secs);
+        counts_by_secs
+            .entry(w.window_secs)
+            .and_modify(|e| e.0 = e.0.saturating_add(w.count))
+            .or_insert((w.count, remaining));
+    }
+
+    // tokens / costs from QuotaStore
+    let mut tokens_by_secs: std::collections::HashMap<u64, (u64, u64)> =
+        std::collections::HashMap::new();
+    let mut costs_by_secs: std::collections::HashMap<u64, (u64, u64)> =
+        std::collections::HashMap::new();
+    for w in state.quota_store.peek_key_windows(&key_hash) {
+        let entry = match w.kind {
+            boom_quota::WindowKind::Tokens => tokens_by_secs
+                .entry(w.window_secs)
+                .or_insert((0, w.remaining_secs)),
+            boom_quota::WindowKind::CostMicros => costs_by_secs
+                .entry(w.window_secs)
+                .or_insert((0, w.remaining_secs)),
+        };
+        entry.0 = entry.0.saturating_add(w.count);
+        if w.remaining_secs < entry.1 {
+            entry.1 = w.remaining_secs;
+        }
+    }
+
+    let mut seen_secs: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+    for wl in &plan_window_limits {
+        seen_secs.insert(wl.window_secs);
+    }
+    for &s in counts_by_secs.keys() {
+        seen_secs.insert(s);
+    }
+    for &s in tokens_by_secs.keys() {
+        seen_secs.insert(s);
+    }
+    for &s in costs_by_secs.keys() {
+        seen_secs.insert(s);
+    }
+
+    let windows: Vec<Value> = seen_secs
+        .iter()
+        .map(|&secs| {
+            let wl = plan_window_limits.iter().find(|w| w.window_secs == secs);
+            let counts_limit = wl.and_then(|w| w.counts).or(if secs == 60 { plan_rpm } else { None });
+            let tokens_limit = wl.and_then(|w| w.tokens);
+            let costs_limit = wl.and_then(|w| w.costs);
+
+            let mut dims = serde_json::Map::new();
+            if let Some(&(cur, _)) = counts_by_secs.get(&secs) {
+                dims.insert("counts".to_string(), json!({ "current": cur, "limit": counts_limit }));
+            } else if counts_limit.is_some() {
+                dims.insert("counts".to_string(), json!({ "current": 0u64, "limit": counts_limit }));
+            }
+            if let Some(&(cur, _)) = tokens_by_secs.get(&secs) {
+                dims.insert("tokens".to_string(), json!({ "current": cur, "limit": tokens_limit }));
+            } else if tokens_limit.is_some() {
+                dims.insert("tokens".to_string(), json!({ "current": 0u64, "limit": tokens_limit }));
+            }
+            if let Some(&(cur_micros, _)) = costs_by_secs.get(&secs) {
+                dims.insert(
+                    "costs".to_string(),
+                    json!({
+                        "current_micros": cur_micros,
+                        "current": boom_quota::micros_to_decimal(cur_micros).to_string(),
+                        "limit": costs_limit.map(|d| d.to_string()),
+                        "limit_micros": costs_limit.map(boom_quota::decimal_to_micros),
+                    }),
+                );
+            } else if costs_limit.is_some() {
+                let lim = costs_limit.unwrap();
+                dims.insert(
+                    "costs".to_string(),
+                    json!({
+                        "current_micros": 0u64,
+                        "current": "0",
+                        "limit": lim.to_string(),
+                        "limit_micros": boom_quota::decimal_to_micros(lim),
+                    }),
+                );
+            }
+
+            let remaining = counts_by_secs
+                .get(&secs)
+                .map(|(_, r)| *r)
+                .or_else(|| tokens_by_secs.get(&secs).map(|(_, r)| *r))
+                .or_else(|| costs_by_secs.get(&secs).map(|(_, r)| *r))
+                .unwrap_or(secs);
+
+            json!({
+                "window_secs": secs,
+                "remaining_secs": remaining,
+                "dims": dims,
+            })
+        })
+        .collect();
+
+    // Cumulative counters for this key.
+    let key_scope = boom_quota::QuotaScope::Key {
+        key_hash: key_hash.clone(),
+    };
+    let total_in = state
+        .quota_store
+        .peek_cumulative(&key_scope, boom_quota::CumulativeKind::TotalInputTokens);
+    let total_out = state
+        .quota_store
+        .peek_cumulative(&key_scope, boom_quota::CumulativeKind::TotalOutputTokens);
+    let total_cost_micros = state
+        .quota_store
+        .peek_cumulative(&key_scope, boom_quota::CumulativeKind::TotalCost);
+
+    Json(json!({
+        "key_hash": key_hash,
+        "windows": windows,
+        "cumulative": {
+            "total_input_tokens": total_in,
+            "total_output_tokens": total_out,
+            "total_tokens": total_in.saturating_add(total_out),
+            "total_cost_micros": total_cost_micros,
+            "total_cost": boom_quota::micros_to_decimal(total_cost_micros).to_string(),
+            "total_tpm_limit": plan.as_ref().and_then(|p| p.total_tpm_limit),
+            "total_cost_limit": plan.as_ref().and_then(|p| p.total_cost_limit).map(|d| d.to_string()),
+        },
+    }))
+    .into_response()
+}
+
+/// POST /admin/quota/reset/key/{key_hash} — clear one key's cumulative +
+/// window counters (memory + DB). Returns previous cumulative values.
+pub async fn quota_reset_key(
+    _session: AdminSession,
+    Extension(state): Extension<std::sync::Arc<DashboardState>>,
+    Path(key_hash): Path<String>,
+) -> Response {
+    let db_pool = match &state.db_pool {
+        Some(pool) => pool,
+        None => return Json(json!({"error": "Database not available"})).into_response(),
+    };
+    match state.quota_store.clear_key_all(db_pool, &key_hash).await {
+        Ok((tin, tout, tcost)) => {
+            tracing::info!(key_hash = %key_hash, "Admin reset key quota");
+            Json(json!({
+                "key_hash": key_hash,
+                "previous": {
+                    "total_input_tokens": tin,
+                    "total_output_tokens": tout,
+                    "total_cost_micros": tcost,
+                    "total_cost": boom_quota::micros_to_decimal(tcost).to_string(),
+                },
+            }))
+            .into_response()
+        }
+        Err(e) => {
+            tracing::error!("quota_reset_key failed: {}", e);
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("Reset failed: {}", e)})),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// POST /admin/quota/reset/team/{team_id} — clear team + all member keys.
+pub async fn quota_reset_team(
+    _session: AdminSession,
+    Extension(state): Extension<std::sync::Arc<DashboardState>>,
+    Path(team_id): Path<String>,
+) -> Response {
+    let db_pool = match &state.db_pool {
+        Some(pool) => pool,
+        None => return Json(json!({"error": "Database not available"})).into_response(),
+    };
+
+    // Fetch member key hashes for cascade reset.
+    let member_keys: Vec<String> = match sqlx::query_scalar::<_, String>(
+        r#"SELECT token FROM boom_verification_token WHERE team_id = $1"#,
+    )
+    .bind(&team_id)
+    .fetch_all(db_pool)
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!("quota_reset_team member fetch failed: {}", e);
+            return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response();
+        }
+    };
+
+    let member_count = member_keys.len();
+    match state.quota_store.reset_team_all(db_pool, &team_id, &member_keys).await {
+        Ok(()) => {
+            tracing::info!(team_id = %team_id, member_count, "Admin reset team quota");
+            Json(json!({
+                "team_id": team_id,
+                "member_keys_reset": member_count,
+            }))
+            .into_response()
+        }
+        Err(e) => {
+            tracing::error!("quota_reset_team failed: {}", e);
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("Reset failed: {}", e)})),
+            )
+                .into_response()
+        }
+    }
 }
 
 #[cfg(test)]

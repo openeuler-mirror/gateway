@@ -163,6 +163,31 @@ pub fn build_router<S: Clone + Send + Sync + 'static>(state: DashboardState) -> 
             "/dashboard/api/admin/teams/{team_id}",
             put(handlers_admin::update_team).delete(handlers_admin::delete_team),
         )
+        // Admin — Quota management (team-organized).
+        .route(
+            "/dashboard/api/admin/quota/overview",
+            get(handlers_admin::quota_overview),
+        )
+        .route(
+            "/dashboard/api/admin/quota/team/{team_id}",
+            get(handlers_admin::quota_team_keys),
+        )
+        .route(
+            "/dashboard/api/admin/quota/unassigned",
+            get(handlers_admin::quota_unassigned_keys),
+        )
+        .route(
+            "/dashboard/api/admin/quota/key/{key_hash}/windows",
+            get(handlers_admin::quota_key_windows),
+        )
+        .route(
+            "/dashboard/api/admin/quota/reset/key/{key_hash}",
+            post(handlers_admin::quota_reset_key),
+        )
+        .route(
+            "/dashboard/api/admin/quota/reset/team/{team_id}",
+            post(handlers_admin::quota_reset_team),
+        )
         // Admin — Debug error recording.
         .route(
             "/dashboard/api/admin/debug/status",

@@ -1493,3 +1493,117 @@ input[list] {
   padding: 8px 16px;
 }
 
+/* ── Multi-dim Usage Card (wide) ──────────────────────── */
+.usage-limit-card.usage-limit-wide {
+  padding: 16px 18px;
+}
+.usage-limit-card.usage-limit-wide .usage-limit-title {
+  font-size: .9em;
+  margin-bottom: 10px;
+}
+.dim-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 8px 0;
+}
+.dim-label {
+  flex: 0 0 90px;
+  font-size: 12px;
+  color: var(--text3);
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: .03em;
+}
+.dim-value {
+  flex: 1 1 auto;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  font-family: var(--mono);
+}
+.dim-row .progress-bar {
+  flex: 1 1 auto;
+  margin-bottom: 0;
+}
+
+/* ── Admin Quota Management ───────────────────────────── */
+.quota-section-title {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text);
+  margin: 18px 0 12px;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+}
+.quota-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 14px;
+  margin-bottom: 24px;
+}
+.quota-card {
+  padding: 16px 18px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  transition: border-color var(--transition), box-shadow var(--transition);
+}
+.quota-card:hover {
+  border-color: var(--border2);
+  box-shadow: var(--shadow);
+}
+.quota-card-header {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.quota-card-header strong {
+  font-size: 15px;
+  color: var(--text);
+  font-family: var(--heading);
+}
+.quota-card-stats {
+  display: flex;
+  gap: 18px;
+  flex-wrap: wrap;
+  font-size: 13px;
+}
+.quota-card-stats > div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.quota-card-stats strong {
+  font-family: var(--mono);
+  font-size: 14px;
+}
+.quota-card-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 4px;
+}
+.quota-toolbar {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  margin-bottom: 14px;
+  flex-wrap: wrap;
+}
+.quota-key-row td {
+  vertical-align: middle;
+}
+.quota-windows-row td {
+  padding: 0;
+  background: var(--surface2) !important;
+}
+.quota-windows-content {
+  padding: 12px 16px;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 10px;
+}
+

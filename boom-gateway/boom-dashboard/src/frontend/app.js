@@ -316,6 +316,7 @@
     else if (section === "admin-keys") { setupKeysSearch(); loadKeys(); }
     else if (section === "admin-assignments") loadAssignments();
     else if (section === "admin-teams") loadTeams();
+    else if (section === "admin-quota") loadQuota();
     else if (section === "admin-logs") { setupLogsFilters(); loadLogs(); }
     else if (section === "admin-config") loadConfig();
     else if (section === "admin-debug") { loadAgentStats(); loadRebalanceMoves(); }
@@ -328,6 +329,7 @@
     if (hash.includes("/admin/plans")) return "admin-plans";
     if (hash.includes("/admin/keys")) return "admin-keys";
     if (hash.includes("/admin/teams")) return "admin-teams";
+    if (hash.includes("/admin/quota")) return "admin-quota";
     if (hash.includes("/admin/assignments")) return "admin-assignments";
     if (hash.includes("/admin/logs")) return "admin-logs";
     if (hash.includes("/admin/config")) return "admin-config";
@@ -1497,9 +1499,19 @@
     const limits = [];
     if (plan.concurrency_limit) limits.push(t("plan.limits.concurrency", { n: plan.concurrency_limit }));
     if (plan.rpm_limit) limits.push(t("plan.limits.rpm", { n: plan.rpm_limit }));
-    if (plan.window_limits && plan.window_limits.length > 0) {
-      plan.window_limits.forEach(([l, w]) => limits.push(t("plan.limits.window", { n: l, duration: formatDuration(w) })));
-    }
+    if (plan.tpm_limit) limits.push(t("plan.limits.tpm", { n: plan.tpm_limit }));
+    if (plan.cost_limit != null) limits.push(t("plan.limits.cost", { n: plan.cost_limit }));
+    if (plan.total_tpm_limit) limits.push(t("plan.limits.total_tpm", { n: plan.total_tpm_limit }));
+    if (plan.total_cost_limit != null) limits.push(t("plan.limits.total_cost", { n: plan.total_cost_limit }));
+    (plan.window_limits || []).forEach((raw) => {
+      const w = normalizeWindowLimit(raw);
+      if (!w) return;
+      const parts = [];
+      if (w.counts != null) parts.push(t("plan.dim.counts", { n: w.counts }));
+      if (w.tokens != null) parts.push(t("plan.dim.tokens", { n: w.tokens }));
+      if (w.costs != null) parts.push(t("plan.dim.costs", { n: w.costs }));
+      if (parts.length) limits.push(t("plan.limits.window", { dims: parts.join(" / "), duration: formatDuration(w.window_secs) }));
+    });
     el.innerHTML = `
       <p><strong>${esc(plan.plan_name)}</strong></p>
       <ul>${limits.map((l) => `<li>${esc(l)}</li>`).join("")}</ul>
@@ -1512,11 +1524,13 @@
 
     // Concurrency card
     const concLimit = usage.concurrency_limit;
-    const concCount = usage.concurrency;
+    const concCount = usage.concurrency || 0;
     if (concLimit != null) {
+      const pct = concLimit > 0 ? Math.min(100, (concCount / concLimit) * 100) : 0;
       html += `<div class="usage-limit-card">
         <div class="usage-limit-title">${t("req.concurrency")}</div>
         <div class="usage-limit-count">${concCount} / ${concLimit}</div>
+        <div class="progress-bar"><div class="progress-fill ${pct >= 90 ? "danger" : pct >= 70 ? "warn" : ""}" style="width:${pct}%"></div></div>
         <div class="usage-limit-reset">${t("req.simultaneous")}</div>
       </div>`;
     } else {
@@ -1527,30 +1541,100 @@
       </div>`;
     }
 
-    // Rate limit window cards
-    if (usage.windows.length === 0) {
-      html += '<div class="usage-limit-card"><div class="usage-limit-title">' + t("req.rate_limits") + '</div><div class="usage-limit-reset">' + t("req.no_active_windows") + '</div></div>';
+    // Window cards: one per window_secs. Each card holds multi-dim progress
+    // bars (counts / tokens / costs — whichever the plan configured).
+    if (!usage.windows || usage.windows.length === 0) {
+      html += '<div class="usage-limit-card usage-limit-wide"><div class="usage-limit-title">' +
+        t("req.rate_limits") + '</div><div class="usage-limit-reset">' +
+        t("req.no_active_windows") + '</div></div>';
     } else {
       usage.windows.forEach((w) => {
-        const limit = w.limit;
         const isRpm = w.window_secs === 60;
-        const label = isRpm ? "RPM" : t("plan.window_limit_label", { duration: formatDuration(w.window_secs) });
-        const remaining = Math.max(0, w.window_secs - w.elapsed_secs);
+        const label = isRpm ? "RPM (60s)" : t("plan.window_limit_label", { duration: formatDuration(w.window_secs) });
+        const remaining = w.remaining_secs || 0;
+        const dims = w.dims || {};
+        const dimKeys = ["counts", "tokens", "costs"].filter((k) => dims[k]);
+        if (dimKeys.length === 0) return; // nothing configured, skip
 
-        if (limit != null) {
-          html += `<div class="usage-limit-card">
-            <div class="usage-limit-title">${esc(label)}</div>
-            <div class="usage-limit-count">${w.count} / ${limit}</div>
-            <div class="usage-limit-reset">${t("req.resets_in", { time: formatCountdown(remaining) })}</div>
-          </div>`;
-        } else {
-          html += `<div class="usage-limit-card">
-            <div class="usage-limit-title">${esc(label)}</div>
-            <div class="usage-limit-count">${w.count}</div>
-            <div class="usage-limit-reset">${t("req.unlimited_resets", { time: formatCountdown(remaining) })}</div>
-          </div>`;
-        }
+        let dimHtml = "";
+        dimKeys.forEach((k) => {
+          const d = dims[k];
+          let cur, limit, display;
+          if (k === "costs") {
+            cur = Number(d.current_micros || 0);
+            limit = Number(d.limit_micros || 0);
+            display = "$" + (d.current || "0") + " / " + (limit > 0 ? "$" + (d.limit || "0") : t("common.unlimited"));
+          } else {
+            cur = Number(d.current || 0);
+            limit = Number(d.limit || 0);
+            display = formatNumber(cur) + " / " + (limit > 0 ? formatNumber(limit) : t("common.unlimited"));
+          }
+          const pct = limit > 0 ? Math.min(100, (cur / limit) * 100) : 0;
+          const cls = pct >= 90 ? "danger" : pct >= 70 ? "warn" : "";
+          dimHtml += `
+            <div class="dim-row">
+              <span class="dim-label">${esc(t("plan.dim." + k))}</span>
+              <div class="progress-bar"><div class="progress-fill ${cls}" style="width:${pct}%"></div></div>
+              <span class="dim-value">${esc(display)}</span>
+            </div>`;
+        });
+
+        html += `<div class="usage-limit-card usage-limit-wide">
+          <div class="usage-limit-title">${esc(label)}</div>
+          ${dimHtml}
+          <div class="usage-limit-reset">${t("req.resets_in", { time: formatCountdown(remaining) })}</div>
+        </div>`;
       });
+    }
+
+    // Cumulative card (if plan has any total_*_limit or any cumulative usage > 0).
+    const c = usage.cumulative || {};
+    const hasCumLimit = c.total_tpm_limit != null || c.total_cost_limit != null;
+    const hasCumUsage = (c.total_tokens || 0) > 0 || (c.total_cost_micros || 0) > 0;
+    if (hasCumLimit || hasCumUsage) {
+      let dimHtml = "";
+      if (c.total_tpm_limit != null) {
+        const cur = Number(c.total_tokens || 0);
+        const limit = Number(c.total_tpm_limit);
+        const pct = limit > 0 ? Math.min(100, (cur / limit) * 100) : 0;
+        const cls = pct >= 90 ? "danger" : pct >= 70 ? "warn" : "";
+        dimHtml += `
+          <div class="dim-row">
+            <span class="dim-label">${esc(t("plan.dim.total_tokens"))}</span>
+            <div class="progress-bar"><div class="progress-fill ${cls}" style="width:${pct}%"></div></div>
+            <span class="dim-value">${formatNumber(cur)} / ${formatNumber(limit)}</span>
+          </div>`;
+      } else if ((c.total_tokens || 0) > 0) {
+        dimHtml += `
+          <div class="dim-row">
+            <span class="dim-label">${esc(t("plan.dim.total_tokens"))}</span>
+            <div class="dim-value">${formatNumber(c.total_tokens)}</div>
+          </div>`;
+      }
+      if (c.total_cost_limit != null) {
+        const cur = Number(c.total_cost_micros || 0);
+        const limitMicros = Math.round(Number(c.total_cost_limit) * 1_000_000);
+        const pct = limitMicros > 0 ? Math.min(100, (cur / limitMicros) * 100) : 0;
+        const cls = pct >= 90 ? "danger" : pct >= 70 ? "warn" : "";
+        dimHtml += `
+          <div class="dim-row">
+            <span class="dim-label">${esc(t("plan.dim.total_cost"))}</span>
+            <div class="progress-bar"><div class="progress-fill ${cls}" style="width:${pct}%"></div></div>
+            <span class="dim-value">$${esc(c.total_cost || "0")} / $${esc(c.total_cost_limit)}</span>
+          </div>`;
+      } else if ((c.total_cost_micros || 0) > 0) {
+        dimHtml += `
+          <div class="dim-row">
+            <span class="dim-label">${esc(t("plan.dim.total_cost"))}</span>
+            <div class="dim-value">$${esc(c.total_cost || "0")}</div>
+          </div>`;
+      }
+      if (dimHtml) {
+        html += `<div class="usage-limit-card usage-limit-wide">
+          <div class="usage-limit-title">${esc(t("plan.cumulative_title"))}</div>
+          ${dimHtml}
+        </div>`;
+      }
     }
 
     html += '</div>';
@@ -1681,17 +1765,40 @@
     const wrap = document.getElementById("plans-table-wrap");
     if (plans.length === 0) { wrap.innerHTML = "<p>" + t("plans.empty") + "</p>"; return; }
     wrap.innerHTML = `<table>
-      <tr><th>${t("plans.col.name")}</th><th>${t("plans.col.concurrent")}</th><th>${t("plans.col.rpm")}</th><th>${t("plans.col.windows")}</th><th>${t("plans.col.actions")}</th></tr>
-      ${plans.map((p) => `<tr>
-        <td><strong>${esc(p.name)}</strong></td>
-        <td>${p.concurrency_limit || "-"}</td>
-        <td>${p.rpm_limit || "-"}</td>
-        <td>${(p.window_limits || []).map(([l, w]) => `${l}/${formatDuration(w)}`).join(", ") || "-"}</td>
-        <td>
-          <button class="btn-small" onclick="window._editPlan('${esc(p.name)}')">${t("action.edit")}</button>
-          <button class="btn-danger" onclick="window._deletePlan('${esc(p.name)}')">${t("action.delete")}</button>
-        </td>
-      </tr>`).join("")}
+      <tr>
+        <th>${t("plans.col.name")}</th>
+        <th>${t("plans.col.type")}</th>
+        <th>${t("plans.col.concurrent")}</th>
+        <th>${t("plans.col.rpm")}</th>
+        <th>${t("plans.col.windows")}</th>
+        <th>${t("plans.col.actions")}</th>
+      </tr>
+      ${plans.map((p) => {
+        const wlSummary = (p.window_limits || [])
+          .map((raw) => {
+            const w = normalizeWindowLimit(raw);
+            if (!w) return null;
+            const dims = [];
+            if (w.counts != null) dims.push(t("plan.dim.counts", { n: w.counts }));
+            if (w.tokens != null) dims.push(t("plan.dim.tokens", { n: w.tokens }));
+            if (w.costs != null) dims.push(t("plan.dim.costs", { n: w.costs }));
+            return dims.length ? dims.join("/") + " / " + formatDuration(w.window_secs) : null;
+          })
+          .filter(Boolean)
+          .join(", ");
+        const typeLabel = p.type === "team" ? t("plans.type.team") : t("plans.type.key");
+        return `<tr>
+          <td><strong>${esc(p.name)}</strong>${p.member_plan ? `<br><span class="muted">${esc(t("plans.member_plan_prefix"))} ${esc(p.member_plan)}</span>` : ""}</td>
+          <td>${esc(typeLabel)}</td>
+          <td>${p.concurrency_limit || "-"}</td>
+          <td>${p.rpm_limit || "-"}</td>
+          <td>${wlSummary || "-"}</td>
+          <td>
+            <button class="btn-small" onclick="window._editPlan('${esc(p.name)}')">${t("action.edit")}</button>
+            <button class="btn-danger" onclick="window._deletePlan('${esc(p.name)}')">${t("action.delete")}</button>
+          </td>
+        </tr>`;
+      }).join("")}
     </table>`;
   }
 
@@ -2632,6 +2739,305 @@
     });
   }
 
+  // ── Admin: Quota Management ───────────────────────────
+  // Two views share the same #admin-quota section:
+  //   #/admin/quota                       → overview (team cards)
+  //   #/admin/quota/team/{team_id}        → team detail (paginated keys)
+  //   #/admin/quota/unassigned            → unassigned keys (paginated)
+
+  let quotaKeysPage = 1;
+  let quotaKeysSearch = "";
+  let quotaKeysSort = "cost";
+  let quotaKeysSearchTimer = null;
+
+  async function loadQuota() {
+    const hash = location.hash || "";
+    if (hash.includes("/admin/quota/team/")) {
+      const m = hash.match(/\/admin\/quota\/team\/([^/?#]+)/);
+      const tid = m ? decodeURIComponent(m[1]) : null;
+      if (tid) { renderQuotaTeamDetail(tid); return; }
+    } else if (hash.includes("/admin/quota/unassigned")) {
+      renderQuotaUnassigned();
+      return;
+    }
+    loadQuotaOverview();
+  }
+
+  async function loadQuotaOverview() {
+    const wrap = document.getElementById("quota-overview-wrap");
+    if (!wrap) return;
+    wrap.innerHTML = '<p class="loading">' + t("common.loading") + '</p>';
+    try {
+      const data = await api("/admin/quota/overview");
+      renderQuotaOverview(data);
+    } catch (err) {
+      wrap.innerHTML = `<p class="error-msg">${t("common.failed_to_load", { what: t("quota.title"), message: esc(err.message) })}</p>`;
+    }
+  }
+
+  function renderQuotaOverview(data) {
+    const wrap = document.getElementById("quota-overview-wrap");
+    const teams = data.teams || [];
+    const noTeam = data.no_team || {};
+
+    const teamCard = (t1) => {
+      const tokens = Number(t1.total_input_tokens || 0) + Number(t1.total_output_tokens || 0);
+      return `<div class="quota-card">
+        <div class="quota-card-header">
+          <strong>${esc(t1.team_alias || t1.team_id)}</strong>
+          ${t1.plan_name ? `<span class="muted">${esc(t("quota.col.plan"))}: ${esc(t1.plan_name)}</span>` : ""}
+        </div>
+        <div class="quota-card-stats">
+          <div><span class="muted">${esc(t("teams.col.keys_count") || "Keys")}</span> <strong>${t1.key_count || 0}</strong></div>
+          <div><span class="muted">${esc(t("quota.col.tokens"))}</span> <strong>${formatNumber(tokens)}</strong></div>
+          <div><span class="muted">${esc(t("quota.col.cost"))}</span> <strong>$${esc(t1.total_cost || "0")}</strong></div>
+        </div>
+        <div class="quota-card-actions">
+          <button class="btn-small" onclick="location.hash='#/admin/quota/team/${encodeURIComponent(t1.team_id)}'">${t("quota.view_detail")}</button>
+          <button class="btn-danger" onclick="window._quotaResetTeam('${esc(t1.team_id)}')">${t("quota.reset_team")}</button>
+        </div>
+      </div>`;
+    };
+
+    let html = "";
+    if (teams.length > 0) {
+      html += `<h3 class="quota-section-title">${t("quota.teams_header")}</h3>`;
+      html += `<div class="quota-grid">${teams.map(teamCard).join("")}</div>`;
+    }
+
+    // No-team card.
+    const ntTokens = Number(noTeam.total_input_tokens || 0) + Number(noTeam.total_output_tokens || 0);
+    html += `<h3 class="quota-section-title">${t("quota.no_team_header")}</h3>`;
+    html += `<div class="quota-grid"><div class="quota-card">
+      <div class="quota-card-header">
+        <strong>${t("quota.no_team_header")}</strong>
+      </div>
+      <div class="quota-card-stats">
+        <div><span class="muted">${esc(t("teams.col.keys_count") || "Keys")}</span> <strong>${noTeam.key_count || 0}</strong></div>
+        <div><span class="muted">${esc(t("quota.col.tokens"))}</span> <strong>${formatNumber(ntTokens)}</strong></div>
+        <div><span class="muted">${esc(t("quota.col.cost"))}</span> <strong>$${esc(noTeam.total_cost || "0")}</strong></div>
+      </div>
+      <div class="quota-card-actions">
+        <button class="btn-small" onclick="location.hash='#/admin/quota/unassigned'">${t("quota.view_detail")}</button>
+      </div>
+    </div></div>`;
+
+    wrap.innerHTML = html;
+  }
+
+  async function renderQuotaTeamDetail(teamId) {
+    await _renderQuotaKeysView({ teamId, titleSuffix: t("quota.teams_header") });
+  }
+
+  async function renderQuotaUnassigned() {
+    await _renderQuotaKeysView({ teamId: null, titleSuffix: t("quota.no_team_header") });
+  }
+
+  async function _renderQuotaKeysView({ teamId, titleSuffix }) {
+    const wrap = document.getElementById("quota-overview-wrap");
+    if (!wrap) return;
+    quotaKeysPage = 1;
+    quotaKeysSearch = "";
+
+    const backHref = "#/admin/quota";
+    wrap.innerHTML = `
+      <div class="section-header">
+        <h3>${esc(titleSuffix)} ${teamId ? "· " + esc(teamId) : ""}</h3>
+        <a href="${backHref}" class="btn-small" style="text-decoration:none;display:inline-block">${t("quota.back_to_overview")}</a>
+      </div>
+      <div class="keys-toolbar" style="margin-bottom:12px">
+        <input type="text" id="quota-keys-search" placeholder="${esc(t("keys.search_placeholder"))}" class="search-input">
+        <select id="quota-keys-sort" class="search-input" style="max-width:160px">
+          <option value="cost">${t("quota.sort.cost")}</option>
+          <option value="tokens">${t("quota.sort.tokens")}</option>
+          <option value="alias">${t("quota.sort.alias")}</option>
+        </select>
+        ${teamId ? `<button class="btn-danger" id="quota-reset-team-top">${t("quota.reset_team")}</button>` : ""}
+      </div>
+      <div id="quota-keys-table-wrap"></div>
+      <div id="quota-keys-pagination" class="pagination"></div>
+    `;
+
+    document.getElementById("quota-keys-search").addEventListener("input", (e) => {
+      clearTimeout(quotaKeysSearchTimer);
+      quotaKeysSearchTimer = setTimeout(() => {
+        quotaKeysSearch = e.target.value.trim();
+        quotaKeysPage = 1;
+        _loadQuotaKeys(teamId);
+      }, 300);
+    });
+    document.getElementById("quota-keys-sort").value = quotaKeysSort;
+    document.getElementById("quota-keys-sort").addEventListener("change", (e) => {
+      quotaKeysSort = e.target.value;
+      quotaKeysPage = 1;
+      _loadQuotaKeys(teamId);
+    });
+    if (teamId) {
+      document.getElementById("quota-reset-team-top").addEventListener("click", () => window._quotaResetTeam(teamId));
+    }
+
+    await _loadQuotaKeys(teamId);
+  }
+
+  async function _loadQuotaKeys(teamId) {
+    const wrap = document.getElementById("quota-keys-table-wrap");
+    if (!wrap) return;
+    wrap.innerHTML = '<p class="loading">' + t("common.loading") + '</p>';
+    let url = teamId
+      ? `/admin/quota/team/${encodeURIComponent(teamId)}?page=${quotaKeysPage}&per_page=50&sort=${encodeURIComponent(quotaKeysSort)}`
+      : `/admin/quota/unassigned?page=${quotaKeysPage}&per_page=50&sort=${encodeURIComponent(quotaKeysSort)}`;
+    if (quotaKeysSearch) url += `&search=${encodeURIComponent(quotaKeysSearch)}`;
+    try {
+      const data = await api(url);
+      _renderQuotaKeysTable(data, teamId);
+      _renderQuotaKeysPagination(data);
+    } catch (err) {
+      wrap.innerHTML = `<p class="error-msg">${t("common.failed_to_load", { what: t("quota.title"), message: esc(err.message) })}</p>`;
+    }
+  }
+
+  function _renderQuotaKeysTable(data, teamId) {
+    const wrap = document.getElementById("quota-keys-table-wrap");
+    const keys = data.keys || [];
+    if (keys.length === 0) {
+      wrap.innerHTML = "<p>" + (teamId ? t("quota.empty") : t("quota.empty_no_team")) + "</p>";
+      return;
+    }
+    wrap.innerHTML = `<table>
+      <tr>
+        <th>${t("quota.col.alias")}</th>
+        <th>${t("quota.col.plan")}</th>
+        <th>${t("quota.col.concurrency")}</th>
+        <th>${t("quota.col.tokens")}</th>
+        <th>${t("quota.col.cost")}</th>
+        <th>${t("quota.col.actions")}</th>
+      </tr>
+      ${keys.map((k) => {
+        const tokens = Number(k.total_input_tokens || 0) + Number(k.total_output_tokens || 0);
+        return `<tr class="quota-key-row" data-token="${esc(k.token)}">
+          <td>
+            <strong>${esc(k.key_alias || k.key_name || k.token_prefix)}</strong>
+            ${k.user_id ? `<br><span class="muted">${esc(k.user_id)}</span>` : ""}
+            ${k.blocked ? `<br><span class="badge-danger">blocked</span>` : ""}
+          </td>
+          <td>${esc(k.plan_name || "-")}</td>
+          <td>${k.concurrency || 0}</td>
+          <td>${formatNumber(tokens)}</td>
+          <td>$${esc(k.total_cost || "0")}</td>
+          <td>
+            <button class="btn-small" onclick="window._quotaToggleWindows('${esc(k.token)}', this)">${t("quota.expand_windows")}</button>
+            <button class="btn-danger" onclick="window._quotaResetKey('${esc(k.token)}')">${t("quota.reset_key")}</button>
+          </td>
+        </tr>
+        <tr class="quota-windows-row" id="quota-windows-${esc(k.token)}" style="display:none">
+          <td colspan="6"><div class="quota-windows-content"><span class="loading">${esc(t("common.loading"))}</span></div></td>
+        </tr>`;
+      }).join("")}
+    </table>`;
+  }
+
+  function _renderQuotaKeysPagination(data) {
+    const el = document.getElementById("quota-keys-pagination");
+    if (!el) return;
+    const pages = Math.ceil((data.total || 0) / (data.per_page || 50));
+    if (pages <= 1) { el.innerHTML = ""; return; }
+    el.innerHTML = `
+      <button ${data.page <= 1 ? "disabled" : ""} onclick="window._quotaKeysPrev()">&lt;</button>
+      <span>${t("common.page_of", { page: data.page, total: pages, count: data.total, unit: t("keys.title") })}</span>
+      <button ${data.page >= pages ? "disabled" : ""} onclick="window._quotaKeysNext()">&gt;</button>
+    `;
+  }
+
+  window._quotaKeysPrev = () => { quotaKeysPage = Math.max(1, quotaKeysPage - 1); _loadQuotaKeys(_currentQuotaTeamId()); };
+  window._quotaKeysNext = () => { quotaKeysPage += 1; _loadQuotaKeys(_currentQuotaTeamId()); };
+  function _currentQuotaTeamId() {
+    const hash = location.hash || "";
+    const m = hash.match(/\/admin\/quota\/team\/([^/?#]+)/);
+    return m ? decodeURIComponent(m[1]) : null;
+  }
+
+  window._quotaToggleWindows = async (token, btn) => {
+    const row = document.getElementById("quota-windows-" + token);
+    if (!row) return;
+    const showing = row.style.display !== "none";
+    if (showing) {
+      row.style.display = "none";
+      btn.textContent = t("quota.expand_windows");
+      return;
+    }
+    row.style.display = "";
+    btn.textContent = t("quota.collapse_windows");
+    const content = row.querySelector(".quota-windows-content");
+    content.innerHTML = '<span class="loading">' + t("common.loading") + '</span>';
+    try {
+      const data = await api(`/admin/quota/key/${encodeURIComponent(token)}/windows`);
+      content.innerHTML = _renderWindowsBlock(data);
+    } catch (err) {
+      content.innerHTML = `<span class="error-msg">${esc(err.message)}</span>`;
+    }
+  };
+
+  // Reuse the user-side multi-dim window card layout.
+  function _renderWindowsBlock(data) {
+    const windows = data.windows || [];
+    if (windows.length === 0) return '<p class="muted">' + t("req.no_active_windows") + '</p>';
+    return windows.map((w) => {
+      const isRpm = w.window_secs === 60;
+      const label = isRpm ? "RPM (60s)" : t("plan.window_limit_label", { duration: formatDuration(w.window_secs) });
+      const remaining = w.remaining_secs || 0;
+      const dims = w.dims || {};
+      const dimKeys = ["counts", "tokens", "costs"].filter((k) => dims[k]);
+      const dimHtml = dimKeys.map((k) => {
+        const d = dims[k];
+        let cur, limit, display;
+        if (k === "costs") {
+          cur = Number(d.current_micros || 0);
+          limit = Number(d.limit_micros || 0);
+          display = "$" + (d.current || "0") + " / " + (limit > 0 ? "$" + (d.limit || "0") : t("common.unlimited"));
+        } else {
+          cur = Number(d.current || 0);
+          limit = Number(d.limit || 0);
+          display = formatNumber(cur) + " / " + (limit > 0 ? formatNumber(limit) : t("common.unlimited"));
+        }
+        const pct = limit > 0 ? Math.min(100, (cur / limit) * 100) : 0;
+        const cls = pct >= 90 ? "danger" : pct >= 70 ? "warn" : "";
+        return `
+          <div class="dim-row">
+            <span class="dim-label">${esc(t("plan.dim." + k))}</span>
+            <div class="progress-bar"><div class="progress-fill ${cls}" style="width:${pct}%"></div></div>
+            <span class="dim-value">${esc(display)}</span>
+          </div>`;
+      }).join("");
+      return `<div class="usage-limit-card usage-limit-wide">
+        <div class="usage-limit-title">${esc(label)}</div>
+        ${dimHtml}
+        <div class="usage-limit-reset">${t("req.resets_in", { time: formatCountdown(remaining) })}</div>
+      </div>`;
+    }).join("");
+  }
+
+  window._quotaResetKey = async (token) => {
+    if (!confirm(t("quota.confirm_reset_key"))) return;
+    try {
+      await api(`/admin/quota/reset/key/${encodeURIComponent(token)}`, { method: "POST" });
+      const tid = _currentQuotaTeamId();
+      _loadQuotaKeys(tid);
+    } catch (err) {
+      alert("Reset failed: " + err.message);
+    }
+  };
+
+  window._quotaResetTeam = async (teamId) => {
+    if (!confirm(t("quota.confirm_reset_team"))) return;
+    try {
+      await api(`/admin/quota/reset/team/${encodeURIComponent(teamId)}`, { method: "POST" });
+      // Stay on detail page; just refresh.
+      _loadQuotaKeys(teamId);
+    } catch (err) {
+      alert("Reset failed: " + err.message);
+    }
+  };
+
   // ── Admin: Teams ──────────────────────────────────────
   async function loadTeams() {
     try {
@@ -3132,6 +3538,33 @@
     if (secs < 3600) return (secs / 60) + "min";
     if (secs < 86400) return (secs / 3600) + "h";
     return (secs / 86400) + "d";
+  }
+
+  // Normalize a window_limits entry into {counts, tokens, costs, window_secs}.
+  // Accepts the verbose object form ({counts, tokens, costs, window_secs}),
+  // the 4-element compact array ([counts, tokens, costs, window_secs]), and
+  // the legacy 2-element array ([count, window_secs]) for backward compat.
+  // Returns null if the entry is not a usable shape.
+  function normalizeWindowLimit(w) {
+    if (w == null) return null;
+    if (Array.isArray(w)) {
+      if (w.length === 4) {
+        return { counts: w[0], tokens: w[1], costs: w[2], window_secs: w[3] };
+      }
+      if (w.length === 2) {
+        return { counts: w[0], tokens: null, costs: null, window_secs: w[1] };
+      }
+      return null;
+    }
+    if (typeof w === "object") {
+      return {
+        counts: w.counts ?? null,
+        tokens: w.tokens ?? null,
+        costs: w.costs == null ? null : w.costs,
+        window_secs: w.window_secs,
+      };
+    }
+    return null;
   }
 
   function formatCountdown(secs) {

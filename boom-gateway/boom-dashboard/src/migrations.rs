@@ -73,15 +73,22 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
     tracing::info!("Migration 3/7: done");
 
     // 3. Rate limit state + assignments + plans (boom-limiter).
-    tracing::info!("Migration 4/7: rate_limit_state...");
+    tracing::info!("Migration 4/13: rate_limit_state...");
     run_ddl_on_conn(&mut conn, boom_limiter::migrations::rate_limit_state_ddl()).await?;
-    tracing::info!("Migration 4/7: done");
-    tracing::info!("Migration 5/7: assignment...");
+    tracing::info!("Migration 4/13: done");
+    tracing::info!("Migration 5/13: assignment...");
     run_ddl_on_conn(&mut conn, boom_limiter::migrations::assignment_ddl()).await?;
-    tracing::info!("Migration 5/7: done");
-    tracing::info!("Migration 6/7: plan...");
+    tracing::info!("Migration 5/13: done");
+    tracing::info!("Migration 6/13: plan...");
     run_ddl_on_conn(&mut conn, boom_limiter::migrations::plan_ddl()).await?;
-    tracing::info!("Migration 6/7: done");
+    run_ddl_on_conn(&mut conn, boom_limiter::migrations::plan_alter_ddl()).await?;
+    tracing::info!("Migration 6/13: done");
+    tracing::info!("Migration 6b/13: team_assignment...");
+    run_ddl_on_conn(&mut conn, boom_limiter::migrations::team_assignment_ddl()).await?;
+    tracing::info!("Migration 6b/13: done");
+    tracing::info!("Migration 6c/13: quota cumulative...");
+    run_ddl_on_conn(&mut conn, boom_quota::migrations::cumulative_ddl()).await?;
+    tracing::info!("Migration 6c/13: done");
 
     // 4. KV config store (dashboard-owned).
     tracing::info!("Migration 7/8: boom_config...");
