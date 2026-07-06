@@ -57,6 +57,10 @@
               <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="1.5" y="1.5" width="5.5" height="5.5" rx="1"/><rect x="9" y="1.5" width="5.5" height="5.5" rx="1"/><rect x="1.5" y="9" width="5.5" height="5.5" rx="1"/><rect x="9" y="9" width="5.5" height="5.5" rx="1"/></svg>
               <span data-i18n="nav.overview">Overview</span>
             </a>
+            <a href="#/dashboard/chat" class="nav-link" data-section="user-chat">
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 3h12v8H6l-3 3v-3H2z"/></svg>
+              <span data-i18n="nav.chat">Chat</span>
+            </a>
             <a href="#/dashboard/logs" class="nav-link" data-section="user-logs">
               <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 4h12M2 8h12M2 12h8"/></svg>
               <span data-i18n="nav.user_logs">Request Logs</span>
@@ -92,6 +96,26 @@
             <div class="card">
               <h3 data-i18n="user.key.info">Key Information</h3>
               <div id="key-info"><p class="loading" data-i18n="common.loading">Loading...</p></div>
+            </div>
+          </section>
+
+          <!-- User: Chat -->
+          <section id="user-chat" class="section">
+            <div class="chat-plan-bar" id="chat-plan-bar"></div>
+            <div class="chat-toolbar">
+              <select id="chat-model" class="chat-model-select"></select>
+              <span class="chat-toolbar-spacer"></span>
+              <span class="chat-param-chip" id="chat-param-chip"></span>
+              <button class="btn-small" id="chat-settings-btn" data-i18n="chat.settings_btn">⚙ Settings</button>
+            </div>
+            <div id="chat-queue-status" class="chat-queue hidden"></div>
+            <div id="chat-messages" class="chat-messages"></div>
+            <div class="chat-input-row">
+              <textarea id="chat-input" rows="2" data-i18n-ph="chat.input_placeholder" placeholder="Type a message... (Enter to send, Shift+Enter for newline)"></textarea>
+              <button class="btn-primary chat-send-btn" id="chat-send-btn">
+                <svg class="chat-send-icon" viewBox="0 0 20 20" fill="currentColor"><path d="M3 3l14 7-14 7 3-7-3-7z"/></svg>
+                <span data-i18n="chat.send">Send</span>
+              </button>
             </div>
           </section>
 
@@ -178,12 +202,6 @@
             <div id="inflight-table-wrap"><p class="loading" data-i18n="common.loading">Loading...</p></div>
 
             <div class="section-header" style="margin-top:2rem">
-              <h2 data-i18n="stats.rebalance.title">Key Rebalance Events</h2>
-              <span style="font-size:.85em;color:var(--text3)" data-i18n="stats.rebalance.subtitle">Last 60 minutes</span>
-            </div>
-            <div id="rebalance-chart-wrap"><p class="loading" data-i18n="common.loading">Loading...</p></div>
-
-            <div class="section-header" style="margin-top:2rem">
               <h2 data-i18n="stats.rate.title">Request Rate (per model)</h2>
               <div class="range-controls" data-target="rate">
                 <button class="btn-range active" data-range="1h">1h</button>
@@ -207,6 +225,12 @@
             <div class="debug-banner" data-i18n="debug.banner">
               Debug-only — content may change or be removed between versions.
             </div>
+
+            <div class="section-header" style="margin-top:1.5rem">
+              <h2 data-i18n="debug.rebalance_moves.title">Rebalance Moves (per deployment)</h2>
+              <span style="font-size:.85em;color:var(--text3)" data-i18n="debug.rebalance_moves.subtitle">Process lifetime cumulative</span>
+            </div>
+            <div id="rebalance-moves-wrap"><p class="loading" data-i18n="common.loading">Loading...</p></div>
 
             <div class="section-header">
               <h2 data-i18n="stats.agent.title">Agent Statistics</h2>
@@ -319,7 +343,6 @@
                     <td><input class="col-filter" data-col="key_alias" data-i18n-ph="logs.filter_placeholder" placeholder="filter"></td>
                     <td><input class="col-filter" data-col="model" data-i18n-ph="logs.filter_placeholder" placeholder="filter"></td>
                     <td><input class="col-filter" data-col="api_path" data-i18n-ph="logs.filter_placeholder" placeholder="filter"></td>
-                    <td></td>
                     <td><input class="col-filter" data-col="status_code" data-i18n-ph="logs.filter_placeholder" placeholder="filter"></td>
                     <td><input class="col-filter" data-col="stream" data-i18n-ph="logs.filter_placeholder" placeholder="filter"></td>
                     <td></td>
@@ -336,18 +359,17 @@
                     <th data-i18n="logs.col.key_alias">Key Alias</th>
                     <th data-i18n="logs.col.model">Model</th>
                     <th data-i18n="logs.col.path">Path</th>
-                    <th data-i18n="logs.col.prefix_hit_rate">Prefix Hit Rate</th>
                     <th data-i18n="logs.col.status">Status</th>
                     <th data-i18n="logs.col.stream">Stream</th>
-                    <th data-i18n="logs.col.input">Input</th>
-                    <th data-i18n="logs.col.output">Output</th>
+                    <th data-i18n="logs.col.in_out">IN/OUT</th>
+                    <th data-i18n="logs.col.prefix_hit_rate">Prefix Hit Rate</th>
                     <th data-i18n="logs.col.duration">Duration</th>
                     <th data-i18n="logs.col.ttft">TTFT</th>
                     <th data-i18n="logs.col.error">Error</th>
                     <th data-i18n="logs.col.detail">Detail</th>
                   </tr>
                 </thead>
-                <tbody id="logs-tbody"><tr><td colspan="15" class="loading" data-i18n="common.loading">Loading...</td></tr></tbody>
+                <tbody id="logs-tbody"><tr><td colspan="14" class="loading" data-i18n="common.loading">Loading...</td></tr></tbody>
               </table>
             </div>
             <div id="logs-pagination" class="pagination"></div>

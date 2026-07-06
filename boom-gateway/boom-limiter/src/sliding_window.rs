@@ -119,32 +119,6 @@ impl SlidingWindowLimiter {
             });
     }
 
-    /// Decrement a single window counter by `weight` (undo a previous record).
-    /// Used to rollback plan window counters when an upstream request fails
-    /// after the rate limit check passed.
-    fn unrecord_window(&self, cache_key: &str, weight: u64) {
-        self.windows
-            .entry(cache_key.to_string())
-            .and_modify(|c| {
-                c.count = c.count.saturating_sub(weight);
-            });
-    }
-
-    /// Rollback plan window counters for a rate limit key.
-    /// Call this when an upstream request fails after `check_and_record` already
-    /// incremented the counters. RPM counters are NOT rolled back (DDoS protection).
-    pub fn rollback_plan_windows(
-        &self,
-        key: &RateLimitKey,
-        window_limits: &[(u64, u64)],
-        weight: u64,
-    ) {
-        for &(_, window_secs) in window_limits {
-            let win_key = Self::cache_key(key, window_secs);
-            self.unrecord_window(&win_key, weight);
-        }
-    }
-
     // ── Read-only query methods (for dashboard) ────────────
 
     /// Read the current counter for a specific cache key.
@@ -252,7 +226,7 @@ impl SlidingWindowLimiter {
     /// Used to reset stale counters when schedule switches.
     pub fn clear_windows(&self, key: &RateLimitKey, window_limits: &[(u64, u64)]) {
         for &(_, window_secs) in window_limits {
-            let win_key = Self::cache_key(key, window_secs);
+            let win_key = SlidingWindowLimiter::cache_key(key, window_secs);
             self.windows.remove(&win_key);
         }
     }
@@ -350,10 +324,29 @@ impl RateLimiter for SlidingWindowLimiter {
         window_limits: &[(u64, u64)],
         weight: u64,
     ) -> Result<RateLimitDecision, GatewayError> {
-        // Phase 1: Read-only check ALL windows. No counters incremented yet.
-        // If any window rejects, we return immediately without recording anything.
+        let decision = self.peek_only(key, rpm_limit, window_limits, weight).await;
+        if !decision.allowed {
+            return Ok(decision);
+        }
+        Ok(self.commit_record(key, rpm_limit, window_limits, weight))
+    }
+}
+
+impl SlidingWindowLimiter {
+    /// Phase 1 only: read-only check of ALL windows. No counters incremented.
+    /// Returns a `RateLimitDecision` with `allowed: false` if any window rejects,
+    /// or `allowed: true` if the request would fit. Counter state is unchanged.
+    ///
+    /// Call `commit_record` afterwards to actually increment the counters.
+    pub async fn peek_only(
+        &self,
+        key: &RateLimitKey,
+        rpm_limit: Option<u64>,
+        window_limits: &[(u64, u64)],
+        weight: u64,
+    ) -> RateLimitDecision {
         if let Some(rpm) = rpm_limit {
-            let rpm_key = Self::cache_key(key, 60);
+            let rpm_key = SlidingWindowLimiter::cache_key(key, 60);
             let (allowed, _count, limit, reset_at) = self.peek_window(&rpm_key, rpm, 60, weight);
 
             if !allowed {
@@ -364,19 +357,19 @@ impl RateLimiter for SlidingWindowLimiter {
                     .unwrap_or(0);
                 let retry_after = 60u64.saturating_sub(elapsed);
 
-                return Ok(RateLimitDecision {
+                return RateLimitDecision {
                     allowed: false,
                     remaining: 0,
                     limit,
                     reset_at,
                     retry_after_secs: Some(retry_after),
                     rejected_window_secs: Some(60),
-                });
+                };
             }
         }
 
         for &(limit, window_secs) in window_limits {
-            let win_key = Self::cache_key(key, window_secs);
+            let win_key = SlidingWindowLimiter::cache_key(key, window_secs);
             let (allowed, _count, _, reset_at) = self.peek_window(&win_key, limit, window_secs, weight);
 
             if !allowed {
@@ -387,32 +380,61 @@ impl RateLimiter for SlidingWindowLimiter {
                     .unwrap_or(0);
                 let retry_after = window_secs.saturating_sub(elapsed);
 
-                return Ok(RateLimitDecision {
+                return RateLimitDecision {
                     allowed: false,
                     remaining: 0,
                     limit,
                     reset_at,
                     retry_after_secs: Some(retry_after),
                     rejected_window_secs: Some(window_secs),
-                });
+                };
             }
         }
 
-        // Phase 2: All checks passed — increment all counters atomically.
-        if let Some(_) = rpm_limit {
-            let rpm_key = Self::cache_key(key, 60);
+        // All checks passed — compute remaining as if we will record.
+        let rpm_remaining = rpm_limit
+            .map(|rpm| {
+                let rpm_key = SlidingWindowLimiter::cache_key(key, 60);
+                self.windows
+                    .get(&rpm_key)
+                    .map(|c| rpm.saturating_sub(c.count).saturating_sub(weight))
+                    .unwrap_or(rpm.saturating_sub(weight))
+            })
+            .unwrap_or(u64::MAX);
+
+        RateLimitDecision {
+            allowed: true,
+            remaining: rpm_remaining,
+            limit: rpm_limit.unwrap_or(0),
+            reset_at: chrono::Utc::now() + chrono::Duration::seconds(60),
+            retry_after_secs: None,
+            rejected_window_secs: None,
+        }
+    }
+
+    /// Phase 2 only: increment all counters (RPM + window_limits) by `weight`.
+    /// MUST be called only after `peek_only` returned `allowed: true`.
+    /// Returns the post-record decision with updated `remaining`.
+    pub fn commit_record(
+        &self,
+        key: &RateLimitKey,
+        rpm_limit: Option<u64>,
+        window_limits: &[(u64, u64)],
+        weight: u64,
+    ) -> RateLimitDecision {
+        if rpm_limit.is_some() {
+            let rpm_key = SlidingWindowLimiter::cache_key(key, 60);
             self.record_window(&rpm_key, 60, weight);
         }
 
         for &(_, window_secs) in window_limits {
-            let win_key = Self::cache_key(key, window_secs);
+            let win_key = SlidingWindowLimiter::cache_key(key, window_secs);
             self.record_window(&win_key, window_secs, weight);
         }
 
-        // Calculate remaining for response.
         let rpm_remaining = rpm_limit
             .map(|rpm| {
-                let rpm_key = Self::cache_key(key, 60);
+                let rpm_key = SlidingWindowLimiter::cache_key(key, 60);
                 self.windows
                     .get(&rpm_key)
                     .map(|c| rpm.saturating_sub(c.count))
@@ -420,14 +442,14 @@ impl RateLimiter for SlidingWindowLimiter {
             })
             .unwrap_or(u64::MAX);
 
-        Ok(RateLimitDecision {
+        RateLimitDecision {
             allowed: true,
             remaining: rpm_remaining,
             limit: rpm_limit.unwrap_or(0),
             reset_at: chrono::Utc::now() + chrono::Duration::seconds(60),
             retry_after_secs: None,
             rejected_window_secs: None,
-        })
+        }
     }
 }
 
@@ -587,5 +609,107 @@ mod tests {
 
         let removed = limiter.cleanup_expired();
         assert_eq!(removed, 1);
+    }
+
+    // ── peek_only / commit_record tests ──
+
+    #[tokio::test]
+    async fn test_peek_only_does_not_record() {
+        // peek_only must NOT increment any counter.
+        let limiter = SlidingWindowLimiter::new();
+        let key = RateLimitKey {
+            key_hash: "peek_key".to_string(),
+            model: "gpt-4".to_string(),
+        };
+        let windows = vec![(5u64, 18000u64)];
+
+        let d = limiter.peek_only(&key, Some(10), &windows, 1).await;
+        assert!(d.allowed);
+
+        // Counters should not exist — peek_only never creates a counter.
+        assert!(limiter.get_usage(&SlidingWindowLimiter::cache_key(&key, 60)).is_none(), "peek_only must not create RPM counter");
+        assert!(limiter.get_usage(&SlidingWindowLimiter::cache_key(&key, 18000)).is_none(), "peek_only must not create window counter");
+    }
+
+    #[tokio::test]
+    async fn test_commit_record_increments() {
+        let limiter = SlidingWindowLimiter::new();
+        let key = RateLimitKey {
+            key_hash: "commit_key".to_string(),
+            model: "gpt-4".to_string(),
+        };
+        let windows = vec![(5u64, 18000u64)];
+
+        // Commit twice — both counters should reflect 2.
+        limiter.commit_record(&key, Some(10), &windows, 1);
+        limiter.commit_record(&key, Some(10), &windows, 1);
+
+        let rpm_usage = limiter.get_usage(&SlidingWindowLimiter::cache_key(&key, 60)).unwrap();
+        assert_eq!(rpm_usage.count, 2);
+        let win_usage = limiter.get_usage(&SlidingWindowLimiter::cache_key(&key, 18000)).unwrap();
+        assert_eq!(win_usage.count, 2);
+    }
+
+    #[tokio::test]
+    async fn test_peek_then_commit_matches_check_and_record() {
+        // peek + commit should leave the limiter in the same state as check_and_record.
+        let limiter_a = SlidingWindowLimiter::new();
+        let limiter_b = SlidingWindowLimiter::new();
+        let key_a = RateLimitKey {
+            key_hash: "a".to_string(),
+            model: "gpt-4".to_string(),
+        };
+        let key_b = RateLimitKey {
+            key_hash: "b".to_string(),
+            model: "gpt-4".to_string(),
+        };
+        let windows = vec![(5u64, 18000u64)];
+
+        // Path A: peek + commit.
+        let d_a = limiter_a.peek_only(&key_a, Some(10), &windows, 1).await;
+        assert!(d_a.allowed);
+        let d_a_after = limiter_a.commit_record(&key_a, Some(10), &windows, 1);
+
+        // Path B: check_and_record (peek + commit combined).
+        let d_b = limiter_b.check_and_record(&key_b, Some(10), &windows, 1).await.unwrap();
+        assert!(d_b.allowed);
+
+        // Both paths should report the same remaining after recording.
+        assert_eq!(d_a_after.remaining, d_b.remaining);
+        assert_eq!(d_a_after.limit, d_b.limit);
+
+        // And the actual counter values should match.
+        let rpm_a = limiter_a.get_usage(&SlidingWindowLimiter::cache_key(&key_a, 60)).unwrap();
+        let rpm_b = limiter_b.get_usage(&SlidingWindowLimiter::cache_key(&key_b, 60)).unwrap();
+        assert_eq!(rpm_a.count, rpm_b.count);
+    }
+
+    #[tokio::test]
+    async fn test_peek_rejected_does_not_allow_commit() {
+        // If peek says not allowed, the caller should not commit. Verify peek
+        // correctly rejects when the window is full, and that NOT committing
+        // leaves counters clean.
+        let limiter = SlidingWindowLimiter::new();
+        let key = RateLimitKey {
+            key_hash: "reject_key".to_string(),
+            model: "gpt-4".to_string(),
+        };
+        let windows = vec![(1u64, 18000u64)];
+
+        // First request fits.
+        let d1 = limiter.peek_only(&key, Some(10), &windows, 1).await;
+        assert!(d1.allowed);
+        limiter.commit_record(&key, Some(10), &windows, 1);
+
+        // Second request: custom window (1/18000s) rejects; RPM has room.
+        let d2 = limiter.peek_only(&key, Some(10), &windows, 1).await;
+        assert!(!d2.allowed);
+        assert_eq!(d2.rejected_window_secs, Some(18000));
+
+        // Caller honors the rejection — does NOT commit. RPM counter stays at 1.
+        let rpm_usage = limiter.get_usage(&SlidingWindowLimiter::cache_key(&key, 60)).unwrap();
+        assert_eq!(rpm_usage.count, 1, "rejected peek must not bump RPM");
+        let win_usage = limiter.get_usage(&SlidingWindowLimiter::cache_key(&key, 18000)).unwrap();
+        assert_eq!(win_usage.count, 1, "rejected peek must not bump window");
     }
 }

@@ -21,6 +21,6 @@ pub use policy::SchedulePolicy;
 pub use policy::round_robin::RoundRobinPolicy;
 pub use policy::key_affinity::KeyAffinityPolicy;
 pub use policy::kvc_aware::KvcAwarePolicy;
-pub use rebalance::RebalanceCounter;
+pub use rebalance::{RebalanceCounter, RebalanceMove, RebalanceMoveTracker};
 pub use request_rate::RequestRateTracker;
 pub use router::Router;

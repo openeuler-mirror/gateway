@@ -1779,13 +1779,20 @@ pub async fn get_inflight_stats(
         }));
     }
 
-    // Sort by model then deployment_id for stable display.
+    // Sort: deployments resolvable to a model come first (alphabetical),
+    // then deployments whose model is "-" (no longer in deployment_store,
+    // i.e. disabled/removed config) sink to the bottom — still alphabetical
+    // among themselves.
     let mut result: Vec<_> = rows.into_values().collect();
     result.sort_by(|a, b| {
         let am = a["model"].as_str().unwrap_or("");
         let bm = b["model"].as_str().unwrap_or("");
-        am.cmp(bm).then_with(|| {
-            a["deployment_id"].as_str().unwrap_or("").cmp(b["deployment_id"].as_str().unwrap_or(""))
+        let a_disabled = am == "-";
+        let b_disabled = bm == "-";
+        a_disabled.cmp(&b_disabled).then_with(|| {
+            am.cmp(bm).then_with(|| {
+                a["deployment_id"].as_str().unwrap_or("").cmp(b["deployment_id"].as_str().unwrap_or(""))
+            })
         })
     });
 
@@ -1830,6 +1837,7 @@ struct DeploymentSummaryRow {
     sum_output_tokens: i64,
     ttft_count: i64,
     sum_ttft_ms: i64,
+    avg_prefix_hit_rate: Option<f64>,
 }
 
 /// GET /admin/stats/deployments/summary — 24h per-deployment aggregates.
@@ -1854,7 +1862,16 @@ pub async fn get_deployment_summary_24h(
                  COUNT(output_tokens)::bigint AS output_count,
                  COALESCE(SUM(output_tokens), 0)::bigint AS sum_output_tokens,
                  COUNT(ttft_ms)::bigint AS ttft_count,
-                 COALESCE(SUM(ttft_ms), 0)::bigint AS sum_ttft_ms
+                 COALESCE(SUM(ttft_ms), 0)::bigint AS sum_ttft_ms,
+                 AVG(
+                   CASE
+                     WHEN cached_tokens IS NOT NULL
+                      AND COALESCE(input_tokens, 0) > 0
+                     THEN cached_tokens::double precision
+                          / COALESCE(input_tokens, 0)
+                          * 100.0
+                   END
+                 ) AS avg_prefix_hit_rate
                FROM boom_request_log
                WHERE created_at >= NOW() - INTERVAL '24 hours'
                  AND deployment_id IS NOT NULL
@@ -1886,6 +1903,7 @@ pub async fn get_deployment_summary_24h(
                 "avg_input_tokens": avg(r.sum_input_tokens, r.input_count),
                 "avg_output_tokens": avg(r.sum_output_tokens, r.output_count),
                 "avg_ttft_ms": avg(r.sum_ttft_ms, r.ttft_count),
+                "avg_prefix_hit_rate": r.avg_prefix_hit_rate,
             })
         })
         .collect();
@@ -1897,18 +1915,15 @@ pub async fn get_deployment_summary_24h(
 }
 
 // ═══════════════════════════════════════════════════════════
-// Rebalance Stats
+// Rebalance Move Stats (per deployment, in/out counts)
 // ═══════════════════════════════════════════════════════════
 
-pub async fn get_rebalance_stats(
+pub async fn get_rebalance_moves(
     _session: AdminSession,
     Extension(state): Extension<Arc<DashboardState>>,
 ) -> Response {
-    let data = state.rebalance_counter.snapshot();
-    let points: Vec<serde_json::Value> = data.into_iter()
-        .map(|(label, count)| json!({ "minute": label, "count": count }))
-        .collect();
-    Json(json!({ "rebalance_events": points })).into_response()
+    let moves = state.rebalance_move_tracker.snapshot();
+    Json(json!({ "moves": moves })).into_response()
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -1969,23 +1984,56 @@ pub async fn get_request_rate_stats(
         let all = state.request_rate.snapshot_all();
         let expected_ts: Vec<String> = window.expected_buckets().into_iter()
             .map(|t| t.to_rfc3339()).collect();
-        let charts: Vec<serde_json::Value> = all.into_iter().map(|(dep_id, data)| {
-            let model = if dep_id == "_total" {
-                "ALL".to_string()
-            } else {
-                state.deployment_store.find_model_by_deployment_id(&dep_id)
-                    .unwrap_or_else(|| "-".to_string())
-            };
+
+        // Reshape per-deployment snapshots into per-model groups. Each model
+        // group carries a fixed, alphabetically-ordered deployment_id list and
+        // per-bucket segments aligned to that order — so the frontend can
+        // render stacked bars with stable segment positions across buckets.
+        let mut total_counts: Vec<u64> = vec![0u64; expected_ts.len()];
+        // model -> (deployment_id -> bucket counts)
+        let mut by_model: std::collections::BTreeMap<String, std::collections::HashMap<String, Vec<u64>>> =
+            std::collections::BTreeMap::new();
+
+        for (dep_id, data) in all.into_iter() {
             // Tracker has exactly 60 buckets aligned to (now - 59min) .. now,
             // which matches the 1h TimeWindow's expected_buckets ordering.
-            let events: Vec<serde_json::Value> = data.into_iter().enumerate()
-                .map(|(i, (_, count))| json!({
-                    "ts": expected_ts.get(i).cloned().unwrap_or_default(),
-                    "count": count,
-                }))
+            let counts: Vec<u64> = data.into_iter().map(|(_, c)| c).collect();
+            if dep_id == "_total" {
+                total_counts = counts;
+                continue;
+            }
+            // Pad / truncate to expected length just in case.
+            let mut v = counts;
+            v.resize(expected_ts.len(), 0u64);
+            let model = state.deployment_store.find_model_by_deployment_id(&dep_id)
+                .unwrap_or_else(|| "-".to_string());
+            by_model.entry(model).or_default().insert(dep_id, v);
+        }
+
+        let mut charts: Vec<serde_json::Value> = Vec::new();
+
+        // _total first — single color, no segments.
+        charts.push(json!({
+            "model": "ALL",
+            "deployment_id": "_total",
+            "events": build_rate_events_simple(&expected_ts, &total_counts),
+        }));
+
+        for (model, dep_counts) in by_model.iter() {
+            // Fixed segment order: deployment_id alphabetical. Stable across
+            // buckets and across reloads.
+            let mut dep_order: Vec<String> = dep_counts.keys().cloned().collect();
+            dep_order.sort();
+            let segments_per_dep: Vec<(String, &Vec<u64>)> = dep_order.iter()
+                .map(|d| (d.clone(), dep_counts.get(d).unwrap()))
                 .collect();
-            json!({ "deployment_id": dep_id, "model": model, "events": events })
-        }).collect();
+            charts.push(json!({
+                "model": model,
+                "deployments": dep_order,
+                "events": build_rate_events_segmented(&expected_ts, &segments_per_dep),
+            }));
+        }
+
         return Json(json!({
             "window": window_json(&window),
             "charts": charts,
@@ -2036,33 +2084,50 @@ pub async fn get_request_rate_stats(
 
     let expected: Vec<i64> = window.expected_buckets().into_iter().map(|t| t.timestamp()).collect();
 
-    // Group rows by deployment_id, preserving order of first appearance.
-    let mut dep_order: Vec<String> = Vec::new();
-    let mut by_dep: std::collections::HashMap<String, std::collections::HashMap<i64, i64>> = std::collections::HashMap::new();
+    // Group by model → deployment_id → bucket count. Deployments are ordered
+    // alphabetically per model so stacked-bar segment positions are stable.
     let mut total_by_bucket: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+    // model -> (deployment_id -> (bucket_epoch -> count))
+    let mut by_model: std::collections::BTreeMap<String, std::collections::HashMap<String, std::collections::HashMap<i64, i64>>> =
+        std::collections::BTreeMap::new();
+
     for row in rows {
         let dep = row.deployment_id.clone().unwrap_or_else(|| "_unknown".to_string());
-        if !by_dep.contains_key(&dep) {
-            dep_order.push(dep.clone());
-        }
-        let map = by_dep.entry(dep).or_default();
-        map.insert(row.bucket_epoch, row.total);
+        let model = state.deployment_store.find_model_by_deployment_id(&dep)
+            .unwrap_or_else(|| "-".to_string());
+        by_model.entry(model).or_default()
+            .entry(dep).or_default()
+            .insert(row.bucket_epoch, row.total);
         *total_by_bucket.entry(row.bucket_epoch).or_insert(0) += row.total;
     }
 
     let mut charts: Vec<serde_json::Value> = Vec::new();
 
-    // _total first — matches the memory-path ordering.
-    {
-        let events = build_rate_events(&expected, &total_by_bucket);
-        charts.push(json!({ "deployment_id": "_total", "model": "ALL", "events": events }));
-    }
-    for dep in &dep_order {
-        let map = by_dep.get(dep).unwrap();
-        let model = state.deployment_store.find_model_by_deployment_id(dep)
-            .unwrap_or_else(|| "-".to_string());
-        let events = build_rate_events(&expected, map);
-        charts.push(json!({ "deployment_id": dep, "model": model, "events": events }));
+    // _total first — single color, no segments.
+    charts.push(json!({
+        "model": "ALL",
+        "deployment_id": "_total",
+        "events": build_rate_events(&expected, &total_by_bucket),
+    }));
+
+    for (model, dep_map) in by_model.iter() {
+        let mut dep_order: Vec<String> = dep_map.keys().cloned().collect();
+        dep_order.sort();
+        // For each expected bucket, build a segment array in dep_order.
+        let events: Vec<serde_json::Value> = expected.iter().map(|ep| {
+            let ts = chrono::DateTime::<chrono::Utc>::from_timestamp(*ep, 0)
+                .unwrap_or_else(chrono::Utc::now);
+            let segments: Vec<serde_json::Value> = dep_order.iter().map(|d| {
+                let cnt = dep_map.get(d).and_then(|m| m.get(ep)).copied().unwrap_or(0);
+                json!({ "deployment_id": d, "count": cnt })
+            }).collect();
+            json!({ "ts": ts.to_rfc3339(), "segments": segments })
+        }).collect();
+        charts.push(json!({
+            "model": model,
+            "deployments": dep_order,
+            "events": events,
+        }));
     }
 
     Json(json!({
@@ -2082,6 +2147,30 @@ fn build_rate_events(
             "ts": ts.to_rfc3339(),
             "count": counts.get(ep).copied().unwrap_or(0),
         })
+    }).collect()
+}
+
+/// Build events for the _total chart (no segments).
+fn build_rate_events_simple(expected_ts: &[String], counts: &[u64]) -> Vec<serde_json::Value> {
+    expected_ts.iter().enumerate().map(|(i, ts)| {
+        let c = counts.get(i).copied().unwrap_or(0);
+        json!({ "ts": ts, "count": c })
+    }).collect()
+}
+
+/// Build events for a per-model chart with per-deployment segments.
+/// `segments_per_dep` is an ordered list of (deployment_id, per-bucket counts);
+/// the order is the fixed segment order used across all buckets.
+fn build_rate_events_segmented(
+    expected_ts: &[String],
+    segments_per_dep: &[(String, &Vec<u64>)],
+) -> Vec<serde_json::Value> {
+    expected_ts.iter().enumerate().map(|(i, ts)| {
+        let segs: Vec<serde_json::Value> = segments_per_dep.iter().map(|(dep, counts)| {
+            let c = counts.get(i).copied().unwrap_or(0);
+            json!({ "deployment_id": dep, "count": c })
+        }).collect();
+        json!({ "ts": ts, "segments": segs })
     }).collect()
 }
 

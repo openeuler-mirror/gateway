@@ -3,7 +3,7 @@ use dashmap::DashMap;
 use std::sync::Arc;
 
 use crate::inflight::InFlightTracker;
-use crate::rebalance::RebalanceCounter;
+use crate::rebalance::RebalanceMoveTracker;
 use super::SchedulePolicy;
 
 /// Key-affinity scheduling: route requests from the same API key to the same
@@ -32,8 +32,8 @@ pub struct KeyAffinityPolicy {
     /// the minimum by more than this percentage (1..=100), reassign to the
     /// least loaded provider.
     rebalance_threshold: u8,
-    /// Optional counter to track rebalance events for dashboard stats.
-    rebalance_counter: Option<Arc<RebalanceCounter>>,
+    /// Optional tracker for per-deployment rebalance move counts (in/out).
+    rebalance_move_tracker: Option<Arc<RebalanceMoveTracker>>,
 }
 
 impl KeyAffinityPolicy {
@@ -41,7 +41,7 @@ impl KeyAffinityPolicy {
         tracker: Arc<InFlightTracker>,
         context_threshold: u64,
         rebalance_threshold: u8,
-        rebalance_counter: Option<Arc<RebalanceCounter>>,
+        rebalance_move_tracker: Option<Arc<RebalanceMoveTracker>>,
     ) -> Self {
         Self {
             tracker,
@@ -49,7 +49,7 @@ impl KeyAffinityPolicy {
             affinity: DashMap::new(),
             context_threshold,
             rebalance_threshold,
-            rebalance_counter,
+            rebalance_move_tracker,
         }
     }
 
@@ -119,8 +119,11 @@ impl SchedulePolicy for KeyAffinityPolicy {
 
                 if load_preferred > min_load + self.rebalance_threshold as u64 {
                     // Rebalance to least loaded.
-                    if let Some(ref counter) = self.rebalance_counter {
-                        counter.record();
+                    if let Some(ref tracker) = self.rebalance_move_tracker {
+                        tracker.record_move(
+                            provider.deployment_id(),
+                            least_loaded.deployment_id(),
+                        );
                     }
                     if let Some(did) = least_loaded.deployment_id() {
                         self.affinity.insert(affinity_key, did.to_string());

@@ -270,6 +270,7 @@
         }
         const data = await res.json();
         currentUser = data;
+        if (data.api_key) sessionStorage.setItem("boom_chat_api_key", data.api_key);
         navigateToDashboard(data.role);
       } catch (err) {
         errEl.textContent = err.message;
@@ -288,6 +289,7 @@
   }
 
   async function doLogout() {
+    sessionStorage.removeItem("boom_chat_api_key");
     await fetch(API + "/auth/logout", { method: "POST" }).catch(() => {});
     showLogin();
   }
@@ -316,7 +318,7 @@
     else if (section === "admin-teams") loadTeams();
     else if (section === "admin-logs") { setupLogsFilters(); loadLogs(); }
     else if (section === "admin-config") loadConfig();
-    else if (section === "admin-debug") loadAgentStats();
+    else if (section === "admin-debug") { loadAgentStats(); loadRebalanceMoves(); }
   }
 
   function sectionFromHash(hash) {
@@ -336,7 +338,6 @@
   // ── Stats ─────────────────────────────────────────────
   function loadStats() {
     loadInflight();
-    loadRebalanceStats();
     loadRequestRateStats();
     loadDeployment24hSummary();
   }
@@ -399,7 +400,7 @@
       errorBanner +
       '<table class="data-table"><thead><tr>' +
       "<th>" + t("stats.inflight.col.deployment") + "</th><th>" + t("stats.inflight.col.fc_queue") + "</th><th>" + t("stats.inflight.col.in_reqs") + "</th><th>" + t("stats.inflight.col.in_context") + "</th>" +
-      "<th>" + t("stats.inflight.col.24h_reqs") + "</th><th>" + t("stats.inflight.col.avg_in") + "</th><th>" + t("stats.inflight.col.avg_out") + "</th><th>" + t("stats.inflight.col.avg_ttft") + "</th>" +
+      "<th>" + t("stats.inflight.col.24h_reqs") + "</th><th>" + t("stats.inflight.col.avg_in") + "</th><th>" + t("stats.inflight.col.avg_out") + "</th><th>" + t("stats.inflight.col.avg_ttft") + "</th><th>" + t("stats.inflight.col.avg_prefix_hit_rate") + "</th>" +
       "</tr></thead><tbody>" +
       deployments
         .map(function (d) {
@@ -451,6 +452,7 @@
             "<td>" + fmtToken(s ? s.avg_input_tokens : null) + "</td>" +
             "<td>" + fmtToken(s ? s.avg_output_tokens : null) + "</td>" +
             "<td>" + fmtTtft(s ? s.avg_ttft_ms : null) + "</td>" +
+            "<td>" + fmtPrefixHit(s ? s.avg_prefix_hit_rate : null) + "</td>" +
             "</tr>"
           );
         })
@@ -462,7 +464,6 @@
     stopInflightPoll();
     inflightTimer = setInterval(() => {
       loadInflight();
-      loadRebalanceStats();
       // Only poll stats that are in 1h mode — non-1h ranges are DB-backed and
       // would be needlessly re-queried every 3s otherwise.
       if (rangeState.rate.range === "1h") loadRequestRateStats();
@@ -476,51 +477,11 @@
     }
   }
 
-  // ── Rebalance Chart ──────────────────────────────────
-  async function loadRebalanceStats() {
-    try {
-      const data = await api("/admin/stats/rebalance");
-      renderRebalanceChart(data.rebalance_events || []);
-    } catch (err) {
-      console.error("loadRebalanceStats error:", err);
-    }
-  }
-
-  function renderRebalanceChart(events) {
-    const wrap = document.getElementById("rebalance-chart-wrap");
-    if (!wrap) return;
-    if (!events.length) { wrap.innerHTML = "<p>" + t("common.no_records") + "</p>"; return; }
-
-    const maxCount = Math.max(1, ...events.map((e) => e.count));
-    const bars = events.map((e) => {
-      const pct = (e.count / maxCount) * 100;
-      const showLabel = e.minute === "now" || e.minute.endsWith("0m") || e.minute.endsWith("5m");
-      const title = e.minute === "now" ? t("stats.rebalance.current_minute") : e.minute.replace("-", "") + " " + t("stats.rebalance.ago") + ": " + e.count + " " + t("stats.rebalance.events");
-      return '<div class="rb-bar-col" title="' + esc(title) + '">' +
-        '<div class="rb-bar-value' + (e.count === 0 ? " rb-bar-value-zero" : "") + '">' + e.count + '</div>' +
-        '<div class="rb-bar" style="height:' + Math.max(pct, 1) + '%;background:' + rebalanceBarColor(pct) + '"></div>' +
-        '<div class="rb-bar-label' + (showLabel ? "" : " rb-label-hidden") + '">' + esc(e.minute === "now" ? t("stats.rebalance.now") : e.minute.replace("-","")) + '</div>' +
-        '</div>';
-    }).join("");
-
-    wrap.innerHTML =
-      '<div class="rebalance-chart">' +
-      '<div class="rb-y-axis"><span>' + maxCount + '</span><span>0</span></div>' +
-      '<div class="rb-bars">' + bars + '</div>' +
-      '</div>';
-  }
-
   // Throughput chart colors — cool cyan/teal palette suggesting high traffic
   function throughputBarColor(pct) {
     if (pct > 75) return "linear-gradient(180deg, #06b6d4, #0891b2)"; // cyan-500 → cyan-600
     if (pct > 40) return "linear-gradient(180deg, #22d3ee, #06b6d4)"; // cyan-400 → cyan-500
     return "linear-gradient(180deg, #67e8f9, #22d3ee)";                // cyan-300 → cyan-400
-  }
-  // Rebalance chart colors — muted, subtle, suggesting rare events
-  function rebalanceBarColor(pct) {
-    if (pct > 75) return "linear-gradient(180deg, #f87171, #ef4444)";  // red-400 → red-500
-    if (pct > 0)  return "linear-gradient(180deg, #fca5a5, #f87171)";  // red-300 → red-400
-    return "linear-gradient(180deg, var(--surface3), var(--surface3))"; // neutral
   }
 
   // ── Range controls (Agent Statistics + Request Rate) ─────
@@ -648,32 +609,143 @@
     charts.forEach(function (chart) {
       var events = chart.events || [];
       if (!events.length) return;
-      var maxCount = Math.max(1, ...events.map(function (e) { return e.count; }));
-      var label = chart.deployment_id === "_total"
-        ? t("stats.rate.all_models")
-        : esc(chart.model) + ":" + esc(chart.deployment_id);
+      var isTotal = chart.deployment_id === "_total" || chart.model === "ALL";
+      var label = isTotal ? t("stats.rate.all_models") : esc(chart.model);
+      // Fixed segment order from the backend (alphabetical deployment_id).
+      var segmentOrder = chart.deployments || [];
 
-      var bars = events.map(function (e, idx) {
-        var pct = (e.count / maxCount) * 100;
-        var showLabel = shouldShowLabel(events, idx);
-        var lbl = formatBucketLabel(e.ts, window ? window.bucket_secs : 0);
-        var title = lbl + ": " + t("stats.rebalance.req_count", { n: e.count });
-        return '<div class="rb-bar-col" title="' + esc(title) + '">' +
-          '<div class="rb-bar-value' + (e.count === 0 ? " rb-bar-value-zero" : "") + '">' + e.count + '</div>' +
-          '<div class="rb-bar" style="height:' + Math.max(pct, 1) + '%;background:' + throughputBarColor(pct) + '"></div>' +
-          '<div class="rb-bar-label' + (showLabel ? "" : " rb-label-hidden") + '">' + esc(lbl) + '</div>' +
+      if (isTotal) {
+        // No segments — render a single-color bar chart.
+        var maxCount = Math.max(1, ...events.map(function (e) { return e.count || 0; }));
+        var bars = events.map(function (e, idx) {
+          var count = e.count || 0;
+          var pct = (count / maxCount) * 100;
+          var showLabel = shouldShowLabel(events, idx);
+          var lbl = formatBucketLabel(e.ts, window ? window.bucket_secs : 0);
+          var title = lbl + ": " + t("stats.rebalance.req_count", { n: count });
+          return '<div class="rb-bar-col" title="' + esc(title) + '">' +
+            '<div class="rb-bar-value' + (count === 0 ? " rb-bar-value-zero" : "") + '">' + count + '</div>' +
+            '<div class="rb-bar" style="height:' + Math.max(pct, 1) + '%;background:' + throughputBarColor(pct) + '"></div>' +
+            '<div class="rb-bar-label' + (showLabel ? "" : " rb-label-hidden") + '">' + esc(lbl) + '</div>' +
+            '</div>';
+        }).join("");
+        html += '<div style="margin-bottom:0.8rem">' +
+          '<div style="font-size:0.85em;font-weight:600;margin-bottom:2px;color:var(--text2)">' + label + '</div>' +
+          '<div class="rebalance-chart">' +
+          '<div class="rb-y-axis"><span>' + maxCount + '</span><span>0</span></div>' +
+          '<div class="rb-bars">' + bars + '</div>' +
+          '</div></div>';
+      } else {
+        // Per-model stacked bar: each bucket is a column; segments stack from
+        // bottom (first in segmentOrder) upward. Bar height is the bucket's
+        // total relative to the model's max bucket total — so visually taller
+        // = busier bucket. Segment height within a bar = count / bucketTotal.
+        var bucketTotals = events.map(function (e) {
+          return (e.segments || []).reduce(function (s, seg) { return s + (seg.count || 0); }, 0);
+        });
+        var maxTotal = Math.max(1, ...bucketTotals);
+
+        var bars = events.map(function (e, idx) {
+          var segs = e.segments || [];
+          var total = bucketTotals[idx];
+          var heightPct = (total / maxTotal) * 100;
+          var showLabel = shouldShowLabel(events, idx);
+          var lbl = formatBucketLabel(e.ts, window ? window.bucket_secs : 0);
+
+          // Tooltip: bucket label, total, then per-deployment lines in the
+          // FIXED segment order (not sorted by count — order matches the
+          // colored stack so the user can map a color to its deployment).
+          var tipLines = [lbl + " · total " + total];
+          segmentOrder.forEach(function (depId) {
+            var seg = segs.find(function (s) { return s.deployment_id === depId; });
+            var c = seg ? (seg.count || 0) : 0;
+            var share = total > 0 ? (c / total * 100) : 0;
+            tipLines.push(depId + " — " + c + " (" + share.toFixed(1) + "%)");
+          });
+          var title = esc(tipLines.join("&#10;"));
+
+          // Stack segments bottom-up: reverse so first in order sits at bottom.
+          var stackHtml = segmentOrder.slice().reverse().map(function (depId) {
+            var seg = segs.find(function (s) { return s.deployment_id === depId; });
+            var c = seg ? (seg.count || 0) : 0;
+            var segPct = total > 0 ? (c / total * 100) : 0;
+            var color = deploymentColor(depId);
+            // 0-count segments still render a 1px sliver so the stack ordering
+            // is visually consistent across buckets.
+            var segHeight = c === 0 ? "1px" : (segPct + "%");
+            return '<div class="rb-bar-seg" style="height:' + segHeight + ';background:' + color + '"></div>';
+          }).join("");
+
+          return '<div class="rb-bar-col" title="' + title + '">' +
+            '<div class="rb-bar-value' + (total === 0 ? " rb-bar-value-zero" : "") + '">' + total + '</div>' +
+            '<div class="rb-bar rb-bar-stacked" style="height:' + Math.max(heightPct, 1) + '%">' + stackHtml + '</div>' +
+            '<div class="rb-bar-label' + (showLabel ? "" : " rb-label-hidden") + '">' + esc(lbl) + '</div>' +
+            '</div>';
+        }).join("");
+
+        html += '<div style="margin-bottom:0.8rem">' +
+          '<div style="font-size:0.85em;font-weight:600;margin-bottom:2px;color:var(--text2)">' + label + '</div>' +
+          '<div class="rebalance-chart">' +
+          '<div class="rb-y-axis"><span>' + maxTotal + '</span><span>0</span></div>' +
+          '<div class="rb-bars">' + bars + '</div>' +
+          '</div>' +
+          '<div class="rb-legend">' +
+            segmentOrder.map(function (depId) {
+              return '<span class="rb-legend-item">' +
+                '<span class="rb-legend-swatch" style="background:' + deploymentColor(depId) + '"></span>' +
+                esc(depId) +
+              '</span>';
+            }).join("") +
+          '</div>' +
           '</div>';
-      }).join("");
-
-      html += '<div style="margin-bottom:0.8rem">' +
-        '<div style="font-size:0.85em;font-weight:600;margin-bottom:2px;color:var(--text2)">' + label + '</div>' +
-        '<div class="rebalance-chart">' +
-        '<div class="rb-y-axis"><span>' + maxCount + '</span><span>0</span></div>' +
-        '<div class="rb-bars">' + bars + '</div>' +
-        '</div></div>';
+      }
     });
 
     wrap.innerHTML = html || (windowNote + "<p>" + t("common.no_records") + "</p>");
+  }
+
+  // ── Rebalance Moves (per deployment, lifetime cumulative) ──
+  async function loadRebalanceMoves() {
+    try {
+      const data = await api("/admin/stats/rebalance-moves");
+      renderRebalanceMovesChart(data.moves || []);
+    } catch (err) {
+      console.error("loadRebalanceMoves error:", err);
+    }
+  }
+
+  function renderRebalanceMovesChart(moves) {
+    const wrap = document.getElementById("rebalance-moves-wrap");
+    if (!wrap) return;
+    if (!moves.length) { wrap.innerHTML = "<p>" + t("debug.rebalance_moves.no_data") + "</p>"; return; }
+
+    moves.sort((a, b) => a.deployment_id.localeCompare(b.deployment_id));
+
+    const maxCount = Math.max(1, ...moves.flatMap((m) => [m.in_count, m.out_count]));
+    const cols = moves.map((m) => {
+      const outPct = (m.out_count / maxCount) * 100;
+      const inPct = (m.in_count / maxCount) * 100;
+      const title = esc(m.deployment_id) + " — " +
+        t("debug.rebalance_moves.out") + ": " + m.out_count + ", " +
+        t("debug.rebalance_moves.in") + ": " + m.in_count;
+      return '<div class="rbm-col" title="' + title + '">' +
+        '<div class="rbm-bars">' +
+        '<div class="rbm-bar rbm-bar-out" style="height:' + Math.max(outPct, 1) + '%"></div>' +
+        '<div class="rbm-bar rbm-bar-in"  style="height:' + Math.max(inPct, 1) + '%"></div>' +
+        '</div>' +
+        '<div class="rbm-label">' + esc(m.deployment_id) + '</div>' +
+        '</div>';
+    }).join("");
+
+    wrap.innerHTML =
+      '<div class="rebalance-moves-chart">' +
+      '<div class="rbm-y-axis"><span>' + maxCount + '</span><span>0</span></div>' +
+      '<div class="rbm-cols">' + cols + '</div>' +
+      '</div>' +
+      '<div class="rbm-legend">' +
+      '<span class="rbm-legend-item"><span class="rbm-swatch rbm-bar-out"></span>' + t("debug.rebalance_moves.out") + '</span>' +
+      '<span class="rbm-legend-item"><span class="rbm-swatch rbm-bar-in"></span>'  + t("debug.rebalance_moves.in")  + '</span>' +
+      '</div>';
   }
 
   // ── Agent Statistics (anthropic share stacked bar) ───────
@@ -805,12 +877,542 @@
     });
     const section = userSectionFromHash(hash);
     if (section === "user-logs") loadUserLogs();
+    else if (section === "user-chat") initChatPage();
   }
 
   function userSectionFromHash(hash) {
+    if (hash.includes("/dashboard/chat")) return "user-chat";
     if (hash.includes("/dashboard/logs")) return "user-logs";
     return "user-overview";
   }
+
+  // ── User: Chat ───────────────────────────────────────
+  const CHAT_KEY_STORAGE = "boom_chat_api_key";
+  const CHAT_PROMPT_STORAGE = "boom_chat_system_prompt";
+  const CHAT_TEMPERATURE_STORAGE = "boom_chat_temperature";
+  const CHAT_MAX_TOKENS_STORAGE = "boom_chat_max_tokens";
+  const CHAT_TOOL_FILTER_STORAGE = "boom_chat_tool_filter";
+  const DEFAULT_TEMPERATURE = 0.7;
+  const DEFAULT_MAX_TOKENS = 32768;
+  let chatModelsLoaded = false;
+  let chatHistory = []; // [{role, content}]
+  let chatQueueTimer = null;
+  let chatAbort = null;
+  let chatFirstTokenArrived = false;
+
+  function getChatKey() { return sessionStorage.getItem(CHAT_KEY_STORAGE); }
+
+  // Per-key chat history in localStorage. Keyed by a short prefix of the API
+  // key so different keys' histories don't bleed into each other. Never sent
+  // to the server.
+  function chatHistoryStorageKey() {
+    const k = getChatKey() || "anon";
+    return "boom_chat_history_" + k.slice(0, 12);
+  }
+  function loadChatHistory() {
+    try {
+      const raw = localStorage.getItem(chatHistoryStorageKey());
+      if (!raw) return [];
+      const arr = JSON.parse(raw);
+      return Array.isArray(arr) ? arr.filter((m) => m && m.role && typeof m.content === "string") : [];
+    } catch { return []; }
+  }
+  function saveChatHistory() {
+    try {
+      localStorage.setItem(chatHistoryStorageKey(), JSON.stringify(chatHistory));
+    } catch {} // quota exceeded etc — silently drop
+  }
+  function clearChatHistory() {
+    chatHistory = [];
+    try { localStorage.removeItem(chatHistoryStorageKey()); } catch {}
+  }
+  function getChatPrompt() { return localStorage.getItem(CHAT_PROMPT_STORAGE) || ""; }
+  function getChatTemperature() {
+    const v = parseFloat(localStorage.getItem(CHAT_TEMPERATURE_STORAGE));
+    return Number.isFinite(v) ? v : DEFAULT_TEMPERATURE;
+  }
+  function getChatMaxTokens() {
+    const v = parseInt(localStorage.getItem(CHAT_MAX_TOKENS_STORAGE), 10);
+    return Number.isFinite(v) && v > 0 ? v : DEFAULT_MAX_TOKENS;
+  }
+  function getChatToolFilter() {
+    const v = localStorage.getItem(CHAT_TOOL_FILTER_STORAGE);
+    return v === null ? true : v === "1"; // default ON
+  }
+
+  function initChatPage() {
+    const sendBtn = document.getElementById("chat-send-btn");
+    const input = document.getElementById("chat-input");
+    const settingsBtn = document.getElementById("chat-settings-btn");
+    if (!sendBtn.dataset.wired) {
+      sendBtn.dataset.wired = "1";
+      sendBtn.addEventListener("click", sendChatMessage);
+      input.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" && !e.shiftKey) {
+          e.preventDefault();
+          sendChatMessage();
+        }
+      });
+      settingsBtn.addEventListener("click", showChatSettingsModal);
+      // Auto-grow textarea.
+      input.addEventListener("input", () => {
+        input.style.height = "auto";
+        input.style.height = Math.min(input.scrollHeight, 160) + "px";
+      });
+    }
+    if (!chatModelsLoaded) loadChatModels();
+    // Load persisted history from localStorage (per-key).
+    if (chatHistory.length === 0) chatHistory = loadChatHistory();
+    loadChatPlan();
+    renderChatHistory();
+    updateParamChip();
+  }
+
+  async function loadChatModels() {
+    const sel = document.getElementById("chat-model");
+    if (!sel) return;
+    const key = getChatKey();
+    if (!key) {
+      sel.innerHTML = `<option value="">${t("chat.no_key")}</option>`;
+      return;
+    }
+    try {
+      const res = await fetch("/v1/models", { headers: { Authorization: "Bearer " + key } });
+      if (res.status === 401) { showLogin(); return; }
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      const data = await res.json();
+      const names = (data.data || []).map((m) => m.id);
+      const prev = sel.value;
+      sel.innerHTML = names.length
+        ? names.map((n) => `<option value="${esc(n)}">${esc(n)}</option>`).join("")
+        : `<option value="">${t("chat.no_models")}</option>`;
+      if (prev && names.includes(prev)) sel.value = prev;
+      else if (names.length) sel.value = names[0];
+      chatModelsLoaded = true;
+    } catch (err) {
+      sel.innerHTML = `<option value="">${t("chat.models_failed", { error: esc(String(err.message || err)) })}</option>`;
+    }
+  }
+
+  // ── Plan + Usage card ─────────────────────────────────
+  async function loadChatPlan() {
+    const el = document.getElementById("chat-plan-bar");
+    if (!el) return;
+    try {
+      const [plan, usage] = await Promise.all([api("/user/plan"), api("/user/usage")]);
+      const planName = plan.plan_name || t("chat.no_plan");
+      const concUsed = usage.concurrency || 0;
+      const concLimit = plan.concurrency_limit;
+      const windows = (usage.windows || []).slice().sort((a, b) => a.window_secs - b.window_secs);
+      // RPM is the 60s window if present.
+      const rpmWindow = windows.find((w) => w.window_secs === 60);
+
+      const fmtLimit = (l) => (l == null ? "∞" : String(l));
+      const pct = (u, l) => (l == null || l === 0 ? 0 : Math.min(100, Math.round((u / l) * 100)));
+
+      // Concurrency meter.
+      const concHtml = meterHtml(
+        t("chat.concurrency"),
+        `${concUsed} / ${fmtLimit(concLimit)}`,
+        pct(concUsed, concLimit)
+      );
+      // RPM meter (60s).
+      const rpmUsed = rpmWindow ? rpmWindow.count : 0;
+      const rpmLimit = plan.rpm_limit;
+      const rpmHtml = meterHtml(
+        "RPM",
+        `${rpmUsed} / ${fmtLimit(rpmLimit)}`,
+        pct(rpmUsed, rpmLimit)
+      );
+      // Other windows (skip 60s — already shown as RPM).
+      const otherWindows = windows.filter((w) => w.window_secs !== 60);
+      const otherHtml = otherWindows.map((w) => {
+        const label = formatDuration(w.window_secs);
+        return meterHtml(label, `${w.count} / ${fmtLimit(w.limit)}`, pct(w.count, w.limit));
+      }).join("");
+
+      el.innerHTML = `
+        <div class="chat-plan-head">
+          <span class="chat-plan-label">${t("chat.plan_label")}</span>
+          <span class="chat-plan-name">${esc(planName)}</span>
+        </div>
+        <div class="chat-plan-meters">${concHtml}${rpmHtml}${otherHtml}</div>
+      `;
+      el.classList.remove("hidden");
+    } catch {
+      el.innerHTML = `<span class="chat-plan-error">${t("chat.plan_load_failed")}</span>`;
+      el.classList.remove("hidden");
+    }
+  }
+
+  function meterHtml(label, valueText, percent) {
+    const tone = percent >= 90 ? "danger" : (percent >= 70 ? "warn" : "ok");
+    return `
+      <div class="chat-meter">
+        <div class="chat-meter-head"><span class="chat-meter-label">${esc(label)}</span><span class="chat-meter-value">${esc(valueText)}</span></div>
+        <div class="chat-meter-track"><div class="chat-meter-fill tone-${tone}" style="width:${percent}%"></div></div>
+      </div>`;
+  }
+
+  function updateParamChip() {
+    const el = document.getElementById("chat-param-chip");
+    if (!el) return;
+    const temp = getChatTemperature();
+    const mt = getChatMaxTokens();
+    const tempStr = Number.isInteger(temp) ? String(temp) : temp.toFixed(2).replace(/0$/, "");
+    el.textContent = `T=${tempStr} · max=${mt >= 1024 ? (mt / 1024) + "k" : mt}`;
+    el.title = t("chat.param_chip_tip");
+  }
+
+  function renderChatHistory() {
+    const box = document.getElementById("chat-messages");
+    if (!box) return;
+    if (chatHistory.length === 0) {
+      box.innerHTML = `<p class="chat-empty">${t("chat.empty")}</p>`;
+      return;
+    }
+    box.innerHTML = chatHistory.map((m) => chatBubbleHtml(m.role, m.content)).join("");
+    box.scrollTop = box.scrollHeight;
+  }
+
+  function chatBubbleHtml(role, content) {
+    const cls = role === "user" ? "chat-bubble-user" : "chat-bubble-assistant";
+    const aligned = role === "user" ? "chat-row-user" : "chat-row-assistant";
+    const shown = role === "assistant" ? renderAssistantContent(content) : esc(content);
+    return `<div class="${aligned}"><div class="chat-bubble ${cls}">${shown}</div></div>`;
+  }
+
+  // Render assistant content based on the tool-filter toggle:
+  //   - ON  : strip tool-call tags entirely (filterToolTags).
+  //   - OFF : keep them but wrap in a muted .chat-tool-block so they read as
+  //           dimmed metadata, like Claude Code / Cursor style.
+  function renderAssistantContent(raw) {
+    if (!raw) return "";
+    return getChatToolFilter() ? esc(filterToolTags(raw)) : highlightToolTags(raw);
+  }
+
+  // Stream-time variant: same rendering rules, but during streaming an opening
+  // tag may not yet have its closer. When filter is ON we strip the partial
+  // opener so it never flashes; when OFF we still dim it (it'll be rewrapped
+  // cleanly once the closer arrives).
+  function renderStreamContent(buf) {
+    if (getChatToolFilter()) {
+      return esc(filterToolTags(buf));
+    }
+    return highlightToolTags(buf);
+  }
+
+  // Escape, then wrap tool-call tag blocks in a muted span. Operates on the
+  // escaped string so no raw HTML from the model ever reaches the DOM.
+  function highlightToolTags(raw) {
+    const e = esc(raw || "");
+    const wrap = (s) => '<span class="chat-tool-block">' + s + "</span>";
+    return e
+      .replace(/&lt;tool&gt;[\s\S]*?&lt;\/tool&gt;/gi, wrap)
+      .replace(/&lt;function_calls&gt;[\s\S]*?&lt;\/function_calls&gt;/gi, wrap)
+      .replace(/&lt;antml:invoke[\s\S]*?&lt;\/antml:invoke&gt;/gi, wrap)
+      .replace(/&lt;antml:parameter[\s\S]*?&lt;\/antml:parameter&gt;/gi, wrap)
+      .replace(/(&lt;\/?antml:[^&]*?&gt;)/gi, wrap)
+      // Unclosed opener at end-of-buffer (streaming): dim it too.
+      .replace(/&lt;tool(\s[^&]*?)?&gt;[^&]*$/gi, wrap)
+      .replace(/&lt;function_calls(\s[^&]*?)?&gt;[^&]*$/gi, wrap)
+      .replace(/&lt;antml:invoke(\s[^&]*?)?&gt;[^&]*$/gi, wrap)
+      .replace(/&lt;antml:parameter(\s[^&]*?)?&gt;[^&]*$/gi, wrap)
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+  }
+
+  async function sendChatMessage() {
+    const input = document.getElementById("chat-input");
+    const sendBtn = document.getElementById("chat-send-btn");
+    const sendLabel = sendBtn.querySelector("span");
+    const text = (input.value || "").trim();
+    if (!text) return;
+    const key = getChatKey();
+    if (!key) { showLogin(); return; }
+    const model = document.getElementById("chat-model").value;
+    if (!model) { showToast(t("chat.no_model_selected")); return; }
+
+    input.value = "";
+    input.style.height = "";
+    sendBtn.disabled = true;
+    if (sendLabel) sendLabel.textContent = t("chat.sending");
+
+    // Build messages: optional system prompt + history + new user message.
+    const sysPrompt = getChatPrompt();
+    const messages = [];
+    if (sysPrompt) messages.push({ role: "system", content: sysPrompt });
+    for (const m of chatHistory) messages.push(m);
+    messages.push({ role: "user", content: text });
+    chatHistory.push({ role: "user", content: text });
+    chatHistory.push({ role: "assistant", content: "" });
+    saveChatHistory();
+
+    const body = {
+      model,
+      messages,
+      stream: true,
+      temperature: getChatTemperature(),
+      max_tokens: getChatMaxTokens(),
+    };
+
+    const box = document.getElementById("chat-messages");
+    if (box.querySelector(".chat-empty")) box.innerHTML = "";
+    const row = document.createElement("div");
+    row.className = "chat-row-user";
+    row.innerHTML = `<div class="chat-bubble chat-bubble-user">${esc(text)}</div>`;
+    box.appendChild(row);
+    const aRow = document.createElement("div");
+    aRow.className = "chat-row-assistant";
+    const aBubble = document.createElement("div");
+    aBubble.className = "chat-bubble chat-bubble-assistant";
+    aBubble.innerHTML = `<span class="chat-cursor">▌</span>`;
+    aRow.appendChild(aBubble);
+    box.appendChild(aRow);
+    box.scrollTop = box.scrollHeight;
+
+    chatFirstTokenArrived = false;
+    startQueuePolling(model);
+    chatAbort = new AbortController();
+    let buf = "";
+    try {
+      const res = await fetch("/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Bearer " + key,
+        },
+        body: JSON.stringify(body),
+        signal: chatAbort.signal,
+      });
+      if (!res.ok) {
+        const errBody = await res.json().catch(() => ({}));
+        throw new Error(errBody.error?.message || errBody.error || errBody.message || ("HTTP " + res.status));
+      }
+      if (!res.body) throw new Error("No response body");
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let acc = "";
+      let done = false;
+      while (!done) {
+        const { value, done: rDone } = await reader.read();
+        if (rDone) break;
+        acc += decoder.decode(value, { stream: true });
+        const lines = acc.split("\n");
+        acc = lines.pop() || "";
+        for (const raw of lines) {
+          const line = raw.trim();
+          if (!line || !line.startsWith("data:")) continue;
+          const payload = line.slice(5).trim();
+          if (payload === "[DONE]") { done = true; break; }
+          try {
+            const evt = JSON.parse(payload);
+            const delta = evt.choices?.[0]?.delta?.content;
+            if (delta) {
+              if (!chatFirstTokenArrived) {
+                chatFirstTokenArrived = true;
+                stopQueuePolling();
+              }
+              buf += delta;
+              // Re-render full buffer on each delta — tags can span chunks,
+              // and when filter is OFF we want the dimmed style to apply live.
+              aBubble.innerHTML = renderStreamContent(buf) + '<span class="chat-cursor">▌</span>';
+              box.scrollTop = box.scrollHeight;
+            }
+          } catch {}
+        }
+      }
+      // Stream ended — finalize. Store RAW in history (so toggling filter re-renders).
+      chatHistory[chatHistory.length - 1].content = buf;
+      aBubble.innerHTML = renderAssistantContent(buf);
+    } catch (err) {
+      if (err.name === "AbortError") {
+        // Keep partial — finalize what we have.
+        chatHistory[chatHistory.length - 1].content = buf;
+        aBubble.innerHTML = renderAssistantContent(buf);
+      } else {
+        aBubble.classList.add("chat-bubble-error");
+        aBubble.textContent = String(err.message || err);
+        showToast(String(err.message || err));
+        if (chatHistory.length && chatHistory[chatHistory.length - 1].content === "") {
+          chatHistory.pop();
+        }
+      }
+    } finally {
+      stopQueuePolling();
+      sendBtn.disabled = false;
+      if (sendLabel) sendLabel.textContent = t("chat.send");
+      saveChatHistory();
+      loadChatPlan();
+      chatAbort = null;
+    }
+  }
+
+  function filterToolTags(s) {
+    let r = s
+      .replace(/<tool>[\s\S]*?<\/tool>/gi, "")
+      .replace(/<function_calls>[\s\S]*?<\/function_calls>/gi, "")
+      .replace(/<antml:invoke[\s\S]*?<\/antml:invoke>/gi, "")
+      .replace(/<antml:parameter[\s\S]*?<\/antml:parameter>/gi, "")
+      .replace(/<\/?antml:[^>]*>/gi, "");
+    // During streaming, an opening tag may have arrived without its closer yet.
+    // Strip from the last unclosed opener to end-of-buffer so partial tag text
+    // never flashes in the bubble. Once the closer arrives, the rule above
+    // removes the whole block cleanly.
+    r = r.replace(/<tool(\s[^>]*)?>[^<>]*$/gi, "")
+          .replace(/<function_calls(\s[^>]*)?>[^<>]*$/gi, "")
+          .replace(/<antml:invoke(\s[^>]*)?>[^<>]*$/gi, "")
+          .replace(/<antml:parameter(\s[^>]*)?>[^<>]*$/gi, "");
+    return r.replace(/\n{3,}/g, "\n\n").trim();
+  }
+
+  function startQueuePolling(model) {
+    stopQueuePolling();
+    const el = document.getElementById("chat-queue-status");
+    if (!el) return;
+    el.classList.remove("hidden");
+    const tick = async () => {
+      try {
+        const data = await api("/user/request-status");
+        const reqs = (data.requests || []).filter((r) => r.model === model || !r.model);
+        if (reqs.length === 0) {
+          el.classList.add("hidden");
+          return;
+        }
+        el.classList.remove("hidden");
+        const r = reqs[0];
+        if (r.status === "waiting") {
+          el.innerHTML = `<span class="chat-queue-dot"></span>${esc(t("chat.queue_waiting", { ahead: r.ahead || 0, secs: (r.wait_time_secs || 0).toFixed(1) }))}`;
+        } else {
+          el.innerHTML = `<span class="chat-queue-dot dot-active"></span>${esc(t("chat.queue_processing", { parallel: r.parallel_count || 0, secs: (r.processing_secs || 0).toFixed(1) }))}`;
+        }
+      } catch {
+        el.classList.add("hidden");
+      }
+    };
+    tick();
+    chatQueueTimer = setInterval(tick, 500);
+  }
+
+  function stopQueuePolling() {
+    if (chatQueueTimer) { clearInterval(chatQueueTimer); chatQueueTimer = null; }
+    const el = document.getElementById("chat-queue-status");
+    if (el) el.classList.add("hidden");
+  }
+
+  // ── Settings modal (system prompt + temperature + max_tokens + tool filter) ─
+  function showChatSettingsModal() {
+    const currentPrompt = getChatPrompt();
+    const currentTemp = getChatTemperature();
+    const currentMax = getChatMaxTokens();
+    const currentFilter = getChatToolFilter();
+    showModal(`
+      <h3>${t("chat.settings_title")}</h3>
+
+      <div class="chat-settings-section">
+        <label class="chat-settings-label" for="chat-prompt-input">${t("chat.system_prompt_title")}</label>
+        <p class="modal-hint">${t("chat.system_prompt_hint")}</p>
+        <textarea id="chat-prompt-input" rows="5" placeholder="${esc(t("chat.system_prompt_placeholder"))}">${esc(currentPrompt)}</textarea>
+      </div>
+
+      <div class="chat-settings-section">
+        <label class="chat-settings-label" for="chat-temp-input">${t("chat.temperature_label")}</label>
+        <p class="modal-hint">${t("chat.temperature_hint")}</p>
+        <div class="chat-slider-row">
+          <input type="range" id="chat-temp-slider" min="0" max="2" step="0.05" value="${currentTemp}">
+          <input type="number" id="chat-temp-input" class="chat-num-input" min="0" max="2" step="0.05" value="${currentTemp}">
+        </div>
+      </div>
+
+      <div class="chat-settings-section">
+        <label class="chat-settings-label" for="chat-max-input">${t("chat.max_tokens_label")}</label>
+        <p class="modal-hint">${t("chat.max_tokens_hint")}</p>
+        <div class="chat-slider-row">
+          <input type="range" id="chat-max-slider" min="1024" max="131072" step="1024" value="${currentMax}">
+          <input type="number" id="chat-max-input" class="chat-num-input" min="1024" max="131072" step="1024" value="${currentMax}">
+        </div>
+      </div>
+
+      <div class="chat-settings-section">
+        <label class="chat-settings-toggle">
+          <input type="checkbox" id="chat-filter-checkbox" ${currentFilter ? "checked" : ""}>
+          <span class="chat-toggle-track"><span class="chat-toggle-thumb"></span></span>
+          <span class="chat-toggle-label">
+            <strong>${t("chat.tool_filter_label")}</strong>
+            <span class="modal-hint">${t("chat.tool_filter_hint")}</span>
+          </span>
+        </label>
+      </div>
+
+      <div class="chat-settings-section chat-settings-danger">
+        <label class="chat-settings-label">${t("chat.history_label")}</label>
+        <p class="modal-hint">${t("chat.history_hint")}</p>
+        <button class="btn-danger" id="chat-clear-history-btn">${t("chat.clear_history")}</button>
+      </div>
+
+      <div class="modal-actions">
+        <button class="btn-danger" id="chat-reset-btn">${t("chat.settings_reset")}</button>
+        <button class="btn-secondary" id="chat-cancel-btn">${t("action.cancel")}</button>
+        <button class="btn-primary" id="chat-save-btn">${t("chat.settings_save")}</button>
+      </div>
+    `);
+    // Wire slider ↔ number input sync.
+    const tempSlider = document.getElementById("chat-temp-slider");
+    const tempInput = document.getElementById("chat-temp-input");
+    tempSlider.addEventListener("input", () => { tempInput.value = tempSlider.value; });
+    tempInput.addEventListener("input", () => {
+      const v = parseFloat(tempInput.value);
+      if (Number.isFinite(v)) tempSlider.value = Math.max(0, Math.min(2, v));
+    });
+    const maxSlider = document.getElementById("chat-max-slider");
+    const maxInput = document.getElementById("chat-max-input");
+    maxSlider.addEventListener("input", () => { maxInput.value = maxSlider.value; });
+    maxInput.addEventListener("input", () => {
+      const v = parseInt(maxInput.value, 10);
+      if (Number.isFinite(v) && v > 0) maxSlider.value = Math.max(1024, Math.min(131072, v));
+    });
+
+    document.getElementById("chat-cancel-btn").addEventListener("click", hideModal);
+    document.getElementById("chat-save-btn").addEventListener("click", () => {
+      const prompt = document.getElementById("chat-prompt-input").value;
+      if (prompt && prompt.trim()) localStorage.setItem(CHAT_PROMPT_STORAGE, prompt);
+      else localStorage.removeItem(CHAT_PROMPT_STORAGE);
+      const temp = parseFloat(tempInput.value);
+      if (Number.isFinite(temp) && temp >= 0 && temp <= 2) {
+        localStorage.setItem(CHAT_TEMPERATURE_STORAGE, String(temp));
+      }
+      const max = parseInt(maxInput.value, 10);
+      if (Number.isFinite(max) && max > 0) {
+        localStorage.setItem(CHAT_MAX_TOKENS_STORAGE, String(max));
+      }
+      const filter = document.getElementById("chat-filter-checkbox").checked;
+      localStorage.setItem(CHAT_TOOL_FILTER_STORAGE, filter ? "1" : "0");
+      hideModal();
+      updateParamChip();
+      // Re-render existing assistant bubbles since filter toggle changes display.
+      renderChatHistory();
+      showToast(t("chat.settings_saved"));
+    });
+    document.getElementById("chat-reset-btn").addEventListener("click", () => {
+      localStorage.removeItem(CHAT_PROMPT_STORAGE);
+      localStorage.removeItem(CHAT_TEMPERATURE_STORAGE);
+      localStorage.removeItem(CHAT_MAX_TOKENS_STORAGE);
+      localStorage.removeItem(CHAT_TOOL_FILTER_STORAGE);
+      document.getElementById("chat-prompt-input").value = "";
+      tempSlider.value = DEFAULT_TEMPERATURE; tempInput.value = DEFAULT_TEMPERATURE;
+      maxSlider.value = DEFAULT_MAX_TOKENS; maxInput.value = DEFAULT_MAX_TOKENS;
+      document.getElementById("chat-filter-checkbox").checked = true;
+      showToast(t("chat.settings_reset_done"));
+    });
+    document.getElementById("chat-clear-history-btn").addEventListener("click", () => {
+      if (!confirm(t("chat.confirm_clear_history"))) return;
+      clearChatHistory();
+      renderChatHistory();
+      hideModal();
+      showToast(t("chat.history_cleared"));
+    });
+  }
+
 
   async function loadUserLogs(page) {
     if (page !== undefined) userLogsPage = page;
@@ -832,19 +1434,28 @@
       return;
     }
     wrap.innerHTML = `<table>
-      <tr><th>${t("logs.col.time")}</th><th>${t("logs.col.ip")}</th><th>${t("logs.col.model")}</th><th>${t("logs.col.path")}</th><th>${t("logs.col.status")}</th><th>${t("logs.col.stream")}</th><th>${t("logs.col.input")}</th><th>${t("logs.col.output")}</th><th>${t("logs.col.duration")}</th><th>${t("logs.col.error")}</th></tr>
-      ${logs.map((l) => `<tr>
+      <tr><th>${t("logs.col.time")}</th><th>${t("logs.col.ip")}</th><th>${t("logs.col.model")}</th><th>${t("logs.col.path")}</th><th>${t("logs.col.status")}</th><th>${t("logs.col.stream")}</th><th>${t("logs.col.in_out")}</th><th>${t("logs.col.prefix_hit_rate")}</th><th>${t("logs.col.duration")}</th><th>${t("logs.col.error")}</th></tr>
+      ${logs.map((l) => {
+        // Prefix hit rate = cached_tokens / input_tokens * 100, truncated to
+        // 1 decimal and capped at 99.9 (no rounding to 100%). "-" if missing.
+        var kvCell = (l.cached_tokens != null && l.input_tokens > 0)
+          ? esc(fmtPrefixHit(l.cached_tokens / l.input_tokens * 100))
+          : "-";
+        var inOutCell = (l.input_tokens != null || l.output_tokens != null)
+          ? formatNumber(l.input_tokens) + " / " + formatNumber(l.output_tokens)
+          : "- / -";
+        return `<tr>
         <td class="mono">${formatTimestamp(l.created_at)}</td>
         <td class="mono">${esc(l.client_ip || "-")}</td>
         <td class="mono">${esc(l.model)}</td>
         <td class="mono">${esc(l.api_path)}</td>
         <td>${l.status_code >= 400 ? '<span style="color:var(--danger)">' + l.status_code + '</span>' : l.status_code}</td>
         <td>${l.is_stream ? t("common.yes") : t("common.no")}</td>
-        <td>${l.input_tokens != null ? formatNumber(l.input_tokens) : "-"}</td>
-        <td>${l.output_tokens != null ? formatNumber(l.output_tokens) : "-"}</td>
+        <td class="mono">${inOutCell}</td>
+        <td class="mono">${kvCell}</td>
         <td>${l.duration_ms != null ? l.duration_ms + "ms" : "-"}</td>
         <td>${l.error_message ? '<span style="color:var(--danger)" title="' + esc(l.error_message) + '">' + esc((l.error_type || "").substring(0, 20)) + '</span>' : "-"}</td>
-      </tr>`).join("")}
+      </tr>`}).join("")}
     </table>`;
   }
 
@@ -2232,13 +2843,15 @@
         } else {
           modelCell = '<span class="log-model-name">' + modelVal + '</span>';
         }
-        // Prefix hit rate = cached_tokens / total_tokens, where
-        // total_tokens = input_tokens (prompt) + output_tokens (completion).
-        // "-" when upstream didn't report cached_tokens.
-        var kvTotal = (l.input_tokens || 0) + (l.output_tokens || 0);
-        var kvCell = (l.cached_tokens != null && kvTotal > 0)
-          ? esc((l.cached_tokens / kvTotal * 100).toFixed(1) + "%")
+        // Prefix hit rate = cached_tokens / input_tokens * 100, truncated to
+        // 1 decimal and capped at 99.9 (no rounding to 100%). "-" if missing.
+        var kvCell = (l.cached_tokens != null && l.input_tokens > 0)
+          ? esc(fmtPrefixHit(l.cached_tokens / l.input_tokens * 100))
           : "-";
+        // IN/OUT: show input and output tokens in one cell, slash-separated.
+        var inOutCell = (l.input_tokens != null || l.output_tokens != null)
+          ? formatNumber(l.input_tokens) + " / " + formatNumber(l.output_tokens)
+          : "- / -";
         return `<tr>
         <td>${tsCell}</td>
         <td>${ipCell}</td>
@@ -2246,11 +2859,10 @@
         <td>${esc(l.key_alias || l.key_name || "-")}</td>
         <td>${modelCell}</td>
         <td class="mono">${esc(l.api_path)}</td>
-        <td class="mono">${kvCell}</td>
         <td>${l.status_code >= 400 ? '<span style="color:var(--danger)">' + l.status_code + '</span>' : l.status_code}</td>
         <td>${l.is_stream ? t("common.yes") : t("common.no")}</td>
-        <td>${l.input_tokens != null ? formatNumber(l.input_tokens) : "-"}</td>
-        <td>${l.output_tokens != null ? formatNumber(l.output_tokens) : "-"}</td>
+        <td class="mono">${inOutCell}</td>
+        <td class="mono">${kvCell}</td>
         <td>${l.duration_ms != null ? l.duration_ms + "ms" : "-"}</td>
         <td>${l.ttft_ms != null ? l.ttft_ms + "ms" : "-"}</td>
         <td>${errorCell}</td>
@@ -2543,5 +3155,36 @@
     const pad = (n) => String(n).padStart(2, "0");
     return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ` +
            `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  }
+
+  // Format a prefix hit-rate percentage. Truncate to 1 decimal (no rounding)
+  // and cap at 99.9 so we never display "100%" — cached_tokens can equal
+  // input_tokens in healthy cases, but rounding 99.95 upward would mislead.
+  function fmtPrefixHit(num) {
+    if (num == null) return "-";
+    var v = Math.floor(num * 10) / 10;
+    if (v > 99.9) v = 99.9;
+    return v.toFixed(1) + "%";
+  }
+
+  // Stable pastel color for a deployment_id. Same id → same color across all
+  // charts. Low saturation / high lightness keep it easy on the eyes; the
+  // hue is derived from a 32-bit FNV-1a hash of the id so similar ids do not
+  // collapse to the same hue.
+  var __deploymentColorCache = {};
+  function deploymentColor(deploymentId) {
+    if (__deploymentColorCache[deploymentId]) return __deploymentColorCache[deploymentId];
+    var h = 0x811c9dc5;
+    for (var i = 0; i < deploymentId.length; i++) {
+      h ^= deploymentId.charCodeAt(i);
+      h = (h + ((h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24))) >>> 0;
+    }
+    var hue = h % 360;
+    // Pastel: 38-45% saturation, 64-70% lightness.
+    var sat = 38 + (h % 8);       // 38..45
+    var light = 64 + ((h >> 4) % 7); // 64..70
+    var c = "hsl(" + hue + ", " + sat + "%, " + light + "%)";
+    __deploymentColorCache[deploymentId] = c;
+    return c;
   }
 })();

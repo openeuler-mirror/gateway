@@ -130,10 +130,10 @@ pub fn build_router<S: Clone + Send + Sync + 'static>(state: DashboardState) -> 
             "/dashboard/api/admin/stats/deployments/summary",
             get(handlers_admin::get_deployment_summary_24h),
         )
-        // Admin — Rebalance Events Stats (last 60 minutes).
+        // Admin — Rebalance Move Stats (per deployment, in/out counts, lifetime).
         .route(
-            "/dashboard/api/admin/stats/rebalance",
-            get(handlers_admin::get_rebalance_stats),
+            "/dashboard/api/admin/stats/rebalance-moves",
+            get(handlers_admin::get_rebalance_moves),
         )
         // Admin — Request Rate Stats per deployment (last 60 minutes).
         .route(

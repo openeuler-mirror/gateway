@@ -26,63 +26,75 @@ CREATE INDEX IF NOT EXISTS idx_request_log_model ON boom_request_log(model);
 "#
 }
 
-/// Run the request_log migration (DDL is idempotent).
-pub async fn run_request_log_migration(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
-    // Split on ";" to execute each statement separately —
-    // CREATE TABLE and each CREATE INDEX are individual statements.
+/// Run the request_log migration on a single connection (DDL is idempotent).
+///
+/// The caller is expected to have set `lock_timeout` on `conn` already —
+/// `boom_dashboard::migrations::run_migrations` does this for the whole
+/// migration sequence. All `boom_request_log` DDL lives here, the sole owner
+/// of that table per the architecture rules.
+pub async fn run_request_log_migration(conn: &mut sqlx::PgConnection) -> Result<(), sqlx::Error> {
+    // CREATE TABLE + base indexes.
     for stmt in request_log_ddl().split(';') {
         let trimmed = stmt.trim();
         if !trimmed.is_empty() {
-            sqlx::query(trimmed).execute(pool).await?;
+            sqlx::query(trimmed).execute(&mut *conn).await?;
         }
     }
-    // Add key_alias column to existing tables (no-op if already present).
-    let _ = sqlx::query(
+    // key_alias: litellm-compatible alias for display.
+    execute_alter(
+        conn,
         r#"ALTER TABLE boom_request_log ADD COLUMN IF NOT EXISTS key_alias TEXT"#,
     )
-    .execute(pool)
     .await;
-    // Add deployment_id column to existing tables (no-op if already present).
-    let _ = sqlx::query(
+    // deployment_id: resolved deployment id at request time.
+    execute_alter(
+        conn,
         r#"ALTER TABLE boom_request_log ADD COLUMN IF NOT EXISTS deployment_id TEXT"#,
     )
-    .execute(pool)
     .await;
-    // Add model_name column for resolved deployment model name (no-op if already present).
-    let _ = sqlx::query(
+    // model_name: resolved deployment model name (may differ from requested model).
+    execute_alter(
+        conn,
         r#"ALTER TABLE boom_request_log ADD COLUMN IF NOT EXISTS model_name TEXT"#,
     )
-    .execute(pool)
     .await;
-    // Add client_ip column for tracking client IP address (no-op if already present).
-    let _ = sqlx::query(
+    // client_ip: tracking the originating client IP.
+    execute_alter(
+        conn,
         r#"ALTER TABLE boom_request_log ADD COLUMN IF NOT EXISTS client_ip TEXT"#,
     )
-    .execute(pool)
     .await;
     let _ = sqlx::query(
         r#"CREATE INDEX IF NOT EXISTS idx_request_log_model_name ON boom_request_log(model_name)"#,
     )
-    .execute(pool)
+    .execute(&mut *conn)
     .await;
-    // Add ttft_ms column for streaming Time-To-First-Token tracking (no-op if already present).
-    let _ = sqlx::query(
+    // ttft_ms: streaming Time-To-First-Token.
+    execute_alter(
+        conn,
         r#"ALTER TABLE boom_request_log ADD COLUMN IF NOT EXISTS ttft_ms INTEGER"#,
     )
-    .execute(pool)
     .await;
     // Composite index for dashboard time-window aggregations filtering by api_path.
     let _ = sqlx::query(
         r#"CREATE INDEX IF NOT EXISTS idx_request_log_created_apipath
            ON boom_request_log(created_at DESC, api_path)"#,
     )
-    .execute(pool)
+    .execute(&mut *conn)
     .await;
-    // cached_tokens: vLLM-reported real KV-cache hit (from final usage chunk).
-    let _ = sqlx::query(
+    // cached_tokens: vLLM-reported real KV-cache hit (prompt_tokens_details.cached_tokens).
+    execute_alter(
+        conn,
         r#"ALTER TABLE boom_request_log ADD COLUMN IF NOT EXISTS cached_tokens BIGINT"#,
     )
-    .execute(pool)
     .await;
     Ok(())
+}
+
+/// Run an idempotent `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` best-effort:
+/// returns Ok even if the DB refuses the statement (some PG-compatible
+/// backends reject `IF NOT EXISTS`). Errors on the base `CREATE TABLE`
+/// above are propagated, but column additions are non-fatal.
+async fn execute_alter(conn: &mut sqlx::PgConnection, sql: &str) {
+    let _ = sqlx::query(sql).execute(&mut *conn).await;
 }

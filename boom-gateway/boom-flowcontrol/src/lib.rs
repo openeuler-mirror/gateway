@@ -855,3 +855,135 @@ impl<S: Stream + Unpin> Stream for FlowControlledStream<S> {
         result
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_fc(max_inflight: u32) -> FlowController {
+        let fc = FlowController::new();
+        fc.ensure_slot("dep1", &FlowControlConfig {
+            max_inflight,
+            max_context: 0,
+        });
+        fc
+    }
+
+    #[tokio::test]
+    async fn test_acquire_basic() {
+        // Single request: enqueues, dispatches immediately (max_inflight >= 1),
+        // grant fires, guard drops cleanly.
+        let fc = make_fc(1);
+        let g = fc.acquire("dep1", 100, Duration::from_secs(5), false, None, None, None).await;
+        assert!(g.is_ok(), "first acquire should succeed immediately");
+        drop(g.unwrap());
+
+        // After drop, slot is free again — second acquire works.
+        let g2 = fc.acquire("dep1", 100, Duration::from_secs(5), false, None, None, None).await;
+        assert!(g2.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_acquire_timeout() {
+        // max_inflight=1, first request holds the slot, second times out.
+        let fc = make_fc(1);
+        let _g1 = fc.acquire("dep1", 100, Duration::from_secs(60), false, None, None, None).await.unwrap();
+
+        // Second request — very short timeout, should fail.
+        let r = fc.acquire("dep1", 100, Duration::from_millis(50), false, None, None, None).await;
+        assert!(matches!(r, Err(FlowControlError::Timeout { .. })));
+
+        // Queue should be empty after timeout (request was removed).
+        let stats = fc.get_stats();
+        assert_eq!(stats[0].waiters, 0, "timed-out request must be removed from queue");
+    }
+
+    #[tokio::test]
+    async fn test_acquire_future_dropped_removes_from_queue() {
+        // CORE TEST for principle 2: if the client disconnects (handler future
+        // dropped) while waiting in the queue, the queued request MUST be
+        // removed by AcquireCleanup::drop.
+        //
+        // We own the acquire future in an Option, poll it once to enqueue the
+        // request, then take()+drop it — exactly what axum does when a handler
+        // future is dropped on client disconnect.
+        let fc = make_fc(1);
+        // Hold the slot with a long-lived guard.
+        let _g1 = fc.acquire("dep1", 100, Duration::from_secs(60), false, None, None, None).await.unwrap();
+
+        // Create the acquire future, owned in an Option, pinned on the heap.
+        let mut acquire_fut = Some(Box::pin(fc.acquire("dep1", 100, Duration::from_secs(60), false, None, None, None)));
+
+        // Poll once to ensure the request is enqueued.
+        {
+            let waker = futures::task::noop_waker();
+            let mut cx = std::task::Context::from_waker(&waker);
+            use std::future::Future;
+            let fut = acquire_fut.as_mut().unwrap();
+            let _ = fut.as_mut().poll(&mut cx);
+        }
+
+        // Verify the request is queued.
+        let stats = fc.get_stats();
+        assert_eq!(stats[0].waiters, 1, "request should be queued before drop");
+
+        // Take the future out of the Option and drop it — simulates client
+        // disconnect dropping the handler future.
+        drop(acquire_fut.take().unwrap());
+
+        // The queued request must be gone.
+        let stats = fc.get_stats();
+        assert_eq!(stats[0].waiters, 0, "dropped future must remove queued request (principle 2)");
+    }
+
+    #[tokio::test]
+    async fn test_vip_inserts_before_normal() {
+        // VIP queue is dispatched entirely before normal queue.
+        let fc = FlowController::new();
+        fc.ensure_slot("dep1", &FlowControlConfig {
+            max_inflight: 1,
+            max_context: 0,
+        });
+
+        // Hold the slot.
+        let g1 = fc.acquire("dep1", 100, Duration::from_secs(60), false, None, None, None).await.unwrap();
+
+        // Enqueue a normal request first, then a VIP request.
+        let normal_fut = fc.acquire("dep1", 100, Duration::from_secs(60), false, None, None, None);
+        let vip_fut = fc.acquire("dep1", 100, Duration::from_secs(60), true, None, None, None);
+        tokio::pin!(normal_fut);
+        tokio::pin!(vip_fut);
+
+        // Poll both to enqueue.
+        {
+            let waker = futures::task::noop_waker();
+            let mut cx = std::task::Context::from_waker(&waker);
+            use std::future::Future;
+            let _ = std::pin::Pin::new(&mut normal_fut).poll(&mut cx);
+            let _ = std::pin::Pin::new(&mut vip_fut).poll(&mut cx);
+        }
+
+        let stats = fc.get_stats();
+        assert_eq!(stats[0].waiters, 1, "1 normal waiting");
+        assert_eq!(stats[0].vip_waiters, 1, "1 vip waiting");
+
+        // Release the slot — dispatch should pick VIP first.
+        drop(g1);
+        fc.periodic_dispatch();
+
+        let stats = fc.get_stats();
+        assert_eq!(stats[0].vip_waiters, 0, "VIP should be dispatched first");
+        assert_eq!(stats[0].waiters, 1, "normal still waiting");
+
+        // Drain the VIP future to retrieve its guard and release the slot.
+        {
+            let waker = futures::task::noop_waker();
+            let mut cx = std::task::Context::from_waker(&waker);
+            use std::future::Future;
+            let _ = std::pin::Pin::new(&mut vip_fut).poll(&mut cx);
+        }
+
+        drop(normal_fut);
+        drop(vip_fut);
+    }
+}
