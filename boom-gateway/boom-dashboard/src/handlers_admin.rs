@@ -708,6 +708,80 @@ pub async fn unassign_key(
     Json(json!({"ok": removed}))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct AssignTeamRequest {
+    pub team_id: String,
+    pub plan_name: String,
+}
+
+pub async fn assign_team_plan(
+    _session: AdminSession,
+    Extension(state): Extension<std::sync::Arc<DashboardState>>,
+    Json(req): Json<AssignTeamRequest>,
+) -> Response {
+    if let Some(ref pool) = state.db_pool {
+        match state
+            .plan_store
+            .assign_team_db(pool, &req.team_id, &req.plan_name)
+            .await
+        {
+            Ok(()) => {
+                let _ = state
+                    .admin_tx
+                    .send(crate::state::AdminCommand::ConfigChanged)
+                    .await;
+                Json(json!({"ok": true})).into_response()
+            }
+            Err(e) => (axum::http::StatusCode::BAD_REQUEST, e).into_response(),
+        }
+    } else {
+        match state
+            .plan_store
+            .assign_team(&req.team_id, &req.plan_name)
+        {
+            Ok(()) => {
+                let _ = state
+                    .admin_tx
+                    .send(crate::state::AdminCommand::ConfigChanged)
+                    .await;
+                Json(json!({"ok": true})).into_response()
+            }
+            Err(e) => (axum::http::StatusCode::BAD_REQUEST, e).into_response(),
+        }
+    }
+}
+
+pub async fn unassign_team_plan(
+    _session: AdminSession,
+    Extension(state): Extension<std::sync::Arc<DashboardState>>,
+    Path(team_id): Path<String>,
+) -> Response {
+    let removed = if let Some(ref pool) = state.db_pool {
+        match state.plan_store.unassign_team_db(pool, &team_id).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("Failed to delete team assignment from DB: {}", e);
+                return (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("unassign_team_db failed: {e}"),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        state.plan_store.unassign_team(&team_id)
+    };
+
+    if removed {
+        let _ = state
+            .admin_tx
+            .send(crate::state::AdminCommand::ConfigChanged)
+            .await;
+    }
+
+    Json(json!({"ok": removed})).into_response()
+}
+
 // ═══════════════════════════════════════════════════════════
 // Usage query
 // ═══════════════════════════════════════════════════════════
@@ -1557,15 +1631,28 @@ pub async fn list_teams(
             tracing::error!("Dashboard list_teams query failed: {}", e);
             return (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                "Internal error",
+                format!("list_teams query failed: {e}"),
             )
                 .into_response();
         }
     };
 
+    // Effective plan name per team — explicit assignment first, fall back to
+    // default_team_plan. Also expose the explicit-only map so the front-end
+    // can tell the two states apart.
+    let explicit_assignments = state.plan_store.list_team_assignments();
+    let explicit_map: std::collections::HashMap<String, String> = explicit_assignments
+        .into_iter()
+        .collect();
+    let default_team_plan = state.plan_store.get_default_team_plan_name();
+
     let teams: Vec<Value> = rows
         .into_iter()
         .map(|r| {
+            let explicit_plan = explicit_map.get(&r.team_id);
+            let effective_plan = explicit_plan
+                .cloned()
+                .or_else(|| default_team_plan.clone());
             json!({
                 "team_id": r.team_id,
                 "team_alias": r.team_alias,
@@ -1574,11 +1661,18 @@ pub async fn list_teams(
                 "total_input_tokens": r.total_input_tokens,
                 "total_output_tokens": r.total_output_tokens,
                 "request_count": r.request_count,
+                "plan_name": effective_plan,
+                "plan_explicit": explicit_plan.is_some(),
             })
         })
         .collect();
 
-    Json(json!({ "teams": teams })).into_response()
+    Json(json!({
+        "teams": teams,
+        "default_team_plan": default_team_plan,
+        "team_assignments": explicit_map,
+    }))
+        .into_response()
 }
 
 #[derive(Debug, Deserialize)]

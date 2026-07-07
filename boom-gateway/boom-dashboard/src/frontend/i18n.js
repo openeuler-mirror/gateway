@@ -272,6 +272,11 @@
       "teams.col.name": "Team Name",
       "teams.col.keys": "Keys",
       "teams.col.actions": "Actions",
+      "teams.col.plan": "Plan",
+      "teams.plan_default": "{name} (default)",
+      "teams.plan_none": "No plan",
+      "teams.plan_use_default": "Use default_team_plan",
+      "teams.plan_unassign": "Remove explicit plan assignment",
       "teams.empty": "No teams found.",
 
       "config.title": "Configuration",
@@ -779,6 +784,11 @@
       "teams.col.name": "团队名称",
       "teams.col.keys": "密钥数",
       "teams.col.actions": "操作",
+      "teams.col.plan": "套餐",
+      "teams.plan_default": "{name} (默认)",
+      "teams.plan_none": "无限制",
+      "teams.plan_use_default": "使用 default_team_plan",
+      "teams.plan_unassign": "取消显式套餐分配",
       "teams.empty": "未找到团队。",
 
       "config.title": "配置",

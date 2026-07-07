@@ -1022,6 +1022,35 @@ fn load_plans_from_config(plan_store: &Arc<PlanStore>, config: &Config) {
             tracing::warn!("没有默认套餐配置，所有用户将无套餐限制。");
         }
     }
+
+    match &config.plan_settings.default_team_plan {
+        Some(dtp) => {
+            if let Some(plan) = plan_store.get_plan(dtp) {
+                if plan.r#type == boom_core::types::PlanType::Team {
+                    plan_store.set_default_team_plan(Some(dtp.clone()));
+                    tracing::info!(default_team_plan = %dtp, "Default team plan set");
+                } else {
+                    tracing::warn!(
+                        default_team_plan = %dtp,
+                        "default_team_plan '{}' is not type=team, ignoring",
+                        dtp
+                    );
+                    plan_store.set_default_team_plan(None);
+                }
+            } else {
+                tracing::warn!(
+                    default_team_plan = %dtp,
+                    "default_team_plan '{}' not found in configured plans, ignoring",
+                    dtp
+                );
+                plan_store.set_default_team_plan(None);
+            }
+        }
+        None => {
+            plan_store.set_default_team_plan(None);
+            tracing::info!("没有默认 team 套餐配置，未显式分配 plan 的 team 将不受 team 维度限制。");
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════

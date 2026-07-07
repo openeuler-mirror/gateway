@@ -72,6 +72,16 @@
     return cachedPlanNames;
   }
 
+  // Return plan names filtered to type=team (for team modal dropdown).
+  async function getTeamPlanNames() {
+    try {
+      const data = await api("/admin/plans");
+      return (data.plans || [])
+        .filter((p) => !p.type || p.type === "team")
+        .map((p) => p.name);
+    } catch { return []; }
+  }
+
   // Invalidate caches after mutations
   function invalidateCaches() { cachedModelNames = null; cachedPlanNames = null; }
 
@@ -3047,6 +3057,11 @@
         window._promptLogExcludedTeams = plData.excluded_teams || [];
       } catch { window._promptLogExcludedTeams = []; }
       const data = await api("/admin/teams");
+      // Stash default_team_plan + explicit assignments map for renderer.
+      window._teamPlanState = {
+        default_team_plan: data.default_team_plan || null,
+        assignments: data.team_assignments || {},
+      };
       renderTeamsTable(data.teams || []);
     } catch (err) {
       const wrap = document.getElementById("teams-table-wrap");
@@ -3057,16 +3072,28 @@
   function renderTeamsTable(teams) {
     const wrap = document.getElementById("teams-table-wrap");
     if (teams.length === 0) { wrap.innerHTML = "<p>" + t("teams.empty") + "</p>"; return; }
+    const tps = window._teamPlanState || { default_team_plan: null, assignments: {} };
     wrap.innerHTML = `<table>
-      <tr><th>${t("teams.col.alias")}</th><th>${t("teams.col.team_id")}</th><th>${t("teams.col.models")}</th><th>${t("teams.col.keys_count")}</th><th>${t("teams.col.requests")}</th><th>${t("teams.col.input_tokens")}</th><th>${t("teams.col.output_tokens")}</th><th>${t("teams.col.total_tokens")}</th><th>${t("teams.col.prompt_log")}</th><th>${t("teams.col.actions")}</th></tr>
+      <tr><th>${t("teams.col.alias")}</th><th>${t("teams.col.team_id")}</th><th>${t("teams.col.models")}</th><th>${t("teams.col.plan")}</th><th>${t("teams.col.keys_count")}</th><th>${t("teams.col.requests")}</th><th>${t("teams.col.input_tokens")}</th><th>${t("teams.col.output_tokens")}</th><th>${t("teams.col.total_tokens")}</th><th>${t("teams.col.prompt_log")}</th><th>${t("teams.col.actions")}</th></tr>
       ${teams.map((tm) => {
         const isExcluded = (window._promptLogExcludedTeams || []).includes(tm.team_id);
         const logBtnClass = isExcluded ? "btn-secondary" : "btn-primary";
         const logBtnText = isExcluded ? "OFF" : "ON";
+        // Plan cell: explicit badge (with unassign X) / default muted / none muted.
+        let planCell;
+        const explicit = tps.assignments[tm.team_id];
+        if (explicit) {
+          planCell = `<span class="badge badge-plan">${esc(explicit)}</span> <button class="btn-secondary btn-sm" title="${esc(t("teams.plan_unassign"))}" onclick='window._unassignTeamPlan(${JSON.stringify(tm.team_id)})'>×</button>`;
+        } else if (tps.default_team_plan) {
+          planCell = `<span class="muted">${esc(t("teams.plan_default", { name: tps.default_team_plan }))}</span>`;
+        } else {
+          planCell = `<span class="muted">${esc(t("teams.plan_none"))}</span>`;
+        }
         return `<tr>
         <td>${esc(tm.team_alias || "-")}</td>
         <td class="mono" title="${esc(tm.team_id)}">${esc((tm.team_id || "").substring(0, 12))}</td>
         <td class="mono">${esc(formatTeamModels(tm.models))}</td>
+        <td>${planCell}</td>
         <td>${tm.key_count}</td>
         <td>${formatNumber(tm.request_count)}</td>
         <td>${formatNumber(tm.total_input_tokens || 0)}</td>
@@ -3090,11 +3117,19 @@
 
   window.showCreateTeamModal = function(prefill) {
     const p = prefill || {};
+    // Pre-existing explicit plan assignment (only meaningful in edit mode).
+    const tps = window._teamPlanState || { default_team_plan: null, assignments: {} };
+    const currentExplicit = p.team_id ? (tps.assignments[p.team_id] || "") : "";
     showModal(`
       <h3>${p.team_id ? t("form.team.title_edit") : t("form.team.title_create")}</h3>
       <div class="form-group"><label>${t("form.team.id")} ${tip("Unique identifier for this team. Cannot be changed after creation.")}</label><input id="m-team-id" value="${esc(p.team_id || "")}" ${p.team_id ? "readonly" : ""} required></div>
       <div class="form-group"><label>${t("form.team.alias")} ${tip("Display name for this team. Can be non-unique.")}</label><input id="m-team-alias" value="${esc(p.team_alias || "")}"></div>
       <div class="form-group"><label>${t("form.team.models")} ${tip("Select model access for this team. Check 'all-team-models' for full access to all current and future models, or pick specific models.")}</label><div class="model-check-combo" id="m-team-models-combo"></div></div>
+      <div class="form-group"><label>${t("teams.col.plan")} ${tip("Pick a type=team plan, or leave on default to fall back to default_team_plan (YAML-configured).")}</label>
+        <select id="m-team-plan">
+          <option value="">${esc(t("teams.plan_use_default"))}${tps.default_team_plan ? " (" + tps.default_team_plan + ")" : ""}</option>
+        </select>
+      </div>
       <div class="modal-actions">
         <button class="btn-secondary" onclick="hideModal()" style="width:auto">${t("action.cancel")}</button>
         <button class="btn-primary" id="m-team-submit">${p.team_id ? t("action.update") : t("action.create")}</button>
@@ -3104,6 +3139,19 @@
       const container = document.getElementById("m-team-models-combo");
       if (container) initModelCombo(container, p.models || [], names);
     });
+    // Populate team-plan dropdown with type=team plans, preselecting the
+    // current explicit assignment (if any).
+    getTeamPlanNames().then((names) => {
+      const sel = document.getElementById("m-team-plan");
+      if (!sel) return;
+      names.forEach((n) => {
+        const o = document.createElement("option");
+        o.value = n;
+        o.textContent = n;
+        if (n === currentExplicit) o.selected = true;
+        sel.appendChild(o);
+      });
+    });
     document.getElementById("m-team-submit").addEventListener("click", async () => {
       try {
         const modelsVal = getComboModels("m-team-models-combo");
@@ -3112,6 +3160,7 @@
           team_alias: document.getElementById("m-team-alias").value.trim() || null,
           models: modelsVal || ["all-team-models"],
         };
+        const selectedPlan = document.getElementById("m-team-plan").value;
         if (p.team_id) {
           await api("/admin/teams/" + encodeURIComponent(p.team_id), {
             method: "PUT",
@@ -3120,13 +3169,37 @@
               models: body.models,
             }),
           });
+          // Reconcile plan assignment: POST if changed/new, DELETE if cleared.
+          if (selectedPlan && selectedPlan !== currentExplicit) {
+            await api("/admin/team-assignments", {
+              method: "POST",
+              body: JSON.stringify({ team_id: p.team_id, plan_name: selectedPlan }),
+            });
+          } else if (!selectedPlan && currentExplicit) {
+            await api("/admin/team-assignments/" + encodeURIComponent(p.team_id), {
+              method: "DELETE",
+            });
+          }
         } else {
           await api("/admin/teams", { method: "POST", body: JSON.stringify(body) });
+          if (selectedPlan) {
+            await api("/admin/team-assignments", {
+              method: "POST",
+              body: JSON.stringify({ team_id: body.team_id, plan_name: selectedPlan }),
+            });
+          }
         }
         hideModal();
         loadTeams();
       } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
     });
+  };
+
+  window._unassignTeamPlan = async (teamId) => {
+    try {
+      await api("/admin/team-assignments/" + encodeURIComponent(teamId), { method: "DELETE" });
+      loadTeams();
+    } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
   };
 
   window._editTeam = async (teamId) => {

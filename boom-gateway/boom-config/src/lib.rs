@@ -207,6 +207,7 @@ pub struct ScheduleSlotConfig {
 /// ```yaml
 /// plan_settings:
 ///   default_plan: "basic"
+///   default_team_plan: "team_basic"
 ///   plans:
 ///     basic:
 ///       concurrency_limit: 4
@@ -217,6 +218,8 @@ pub struct ScheduleSlotConfig {
 pub struct PlanSettings {
     /// Name of the plan to use for keys without an explicit assignment.
     pub default_plan: Option<String>,
+    /// Name of the plan to use for teams without an explicit assignment.
+    pub default_team_plan: Option<String>,
     /// Plan name → plan definition.
     #[serde(default)]
     pub plans: HashMap<String, PlanConfig>,

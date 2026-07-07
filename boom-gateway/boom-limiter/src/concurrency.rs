@@ -257,6 +257,7 @@ pub struct PlanStore {
     key_concurrency_counters: DashMap<String, Arc<AtomicU32>>,
     team_concurrency_counters: DashMap<String, Arc<AtomicU32>>,
     default_plan_name: std::sync::Mutex<Option<String>>,
+    default_team_plan_name: std::sync::Mutex<Option<String>>,
 }
 
 impl PlanStore {
@@ -268,6 +269,7 @@ impl PlanStore {
             key_concurrency_counters: DashMap::new(),
             team_concurrency_counters: DashMap::new(),
             default_plan_name: std::sync::Mutex::new(None),
+            default_team_plan_name: std::sync::Mutex::new(None),
         }
     }
 
@@ -293,6 +295,26 @@ impl PlanStore {
         self.plans.get(&name).map(|r| r.value().clone())
     }
 
+    /// Set the default team plan name (called during config load / reload).
+    pub fn set_default_team_plan(&self, name: Option<String>) {
+        let mut guard = self.default_team_plan_name.lock().unwrap();
+        *guard = name;
+    }
+
+    /// Get the default team plan name (raw string).
+    pub fn get_default_team_plan_name(&self) -> Option<String> {
+        self.default_team_plan_name.lock().unwrap().clone()
+    }
+
+    /// Get the default team plan (if configured and the plan actually exists).
+    pub fn get_default_team_plan(&self) -> Option<RateLimitPlan> {
+        let name = {
+            let guard = self.default_team_plan_name.lock().unwrap();
+            guard.clone()
+        }?;
+        self.plans.get(&name).map(|r| r.value().clone())
+    }
+
     /// Resolve the plan assigned to a key.
     pub fn resolve_plan(&self, key_hash: &str) -> Option<RateLimitPlan> {
         let plan_name = self.key_assignments.get(key_hash)?;
@@ -301,10 +323,14 @@ impl PlanStore {
     }
 
     /// Resolve the plan assigned to a team.
+    /// Falls back to default_team_plan when the team has no explicit assignment.
     pub fn resolve_team_plan(&self, team_id: &str) -> Option<RateLimitPlan> {
-        let plan_name = self.team_assignments.get(team_id)?;
-        let plan = self.plans.get(plan_name.value())?;
-        Some(plan.value().clone())
+        if let Some(plan_name) = self.team_assignments.get(team_id) {
+            if let Some(plan) = self.plans.get(plan_name.value()) {
+                return Some(plan.value().clone());
+            }
+        }
+        self.get_default_team_plan()
     }
 
     /// Get the plan name assigned to a key (for display purposes).
@@ -315,6 +341,13 @@ impl PlanStore {
     /// Get the plan name assigned to a team (for display purposes).
     pub fn get_team_plan_name(&self, team_id: &str) -> Option<String> {
         self.team_assignments.get(team_id).map(|n| n.value().clone())
+    }
+
+    /// Get the effective plan name for a team — explicit assignment if any,
+    /// otherwise the default_team_plan. Returns None when neither is set.
+    pub fn get_team_plan_name_effective(&self, team_id: &str) -> Option<String> {
+        self.get_team_plan_name(team_id)
+            .or_else(|| self.get_default_team_plan_name())
     }
 
     /// Try to acquire a concurrency slot for a key.
@@ -496,12 +529,14 @@ impl PlanStore {
         self.team_assignments.remove(team_id).is_some()
     }
 
-    /// Clear all plan definitions and default_plan, but keep key/team assignments
-    /// and concurrency counters intact. Used during hot-reload.
+    /// Clear all plan definitions and default_plan/default_team_plan, but keep
+    /// key/team assignments and concurrency counters intact. Used during hot-reload.
     pub fn clear_plans(&self) {
         self.plans.clear();
         let mut guard = self.default_plan_name.lock().unwrap();
         *guard = None;
+        let mut team_guard = self.default_team_plan_name.lock().unwrap();
+        *team_guard = None;
     }
 
     /// Remove assignments pointing to plans that no longer exist.

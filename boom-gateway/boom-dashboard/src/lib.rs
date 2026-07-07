@@ -163,6 +163,15 @@ pub fn build_router<S: Clone + Send + Sync + 'static>(state: DashboardState) -> 
             "/dashboard/api/admin/teams/{team_id}",
             put(handlers_admin::update_team).delete(handlers_admin::delete_team),
         )
+        // Admin — Team plan assignments (explicit per-team plan).
+        .route(
+            "/dashboard/api/admin/team-assignments",
+            post(handlers_admin::assign_team_plan),
+        )
+        .route(
+            "/dashboard/api/admin/team-assignments/{team_id}",
+            delete(handlers_admin::unassign_team_plan),
+        )
         // Admin — Quota management (team-organized).
         .route(
             "/dashboard/api/admin/quota/overview",
