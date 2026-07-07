@@ -149,16 +149,16 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
 }
 
 /// Execute a multi-statement DDL string on a single connection.
+///
+/// Uses sqlx's raw simple-query protocol so PL/pgSQL `DO $$ ... $$` blocks
+/// (which contain semicolons) are sent to the server as one unit instead of
+/// being split client-side. The previous `split(';')` approach broke dollar
+/// quoting — `DO $$ BEGIN ... ; ... END $$` got cut into unterminated pieces.
 async fn run_ddl_on_conn(
     conn: &mut sqlx::PgConnection,
     ddl: &str,
 ) -> Result<(), sqlx::Error> {
-    for stmt in ddl.split(';') {
-        let trimmed = stmt.trim();
-        if !trimmed.is_empty() {
-            sqlx::query(trimmed).execute(&mut *conn).await?;
-        }
-    }
+    sqlx::raw_sql(ddl).execute(&mut *conn).await?;
     Ok(())
 }
 

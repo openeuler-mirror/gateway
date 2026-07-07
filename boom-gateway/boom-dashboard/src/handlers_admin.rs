@@ -229,7 +229,13 @@ pub async fn list_keys(
         .map(|r| {
             let token_prefix = format!("{}...", &r.token[..8.min(r.token.len())]);
             let (usage_count, usage_reset_secs) = all_usage.get(&r.token).copied().unwrap_or((0, 0));
-            let plan_name = state.plan_store.get_plan_name(&r.token);
+            // Effective plan: explicit assignment → default plan → null.
+            // get_plan_name only returns explicit assignments; we fall back to
+            // the configured default so the UI shows *what's actually applied*.
+            let plan_name = state
+                .plan_store
+                .get_plan_name(&r.token)
+                .or_else(|| state.plan_store.get_default_plan_name());
 
             json!({
                 "token_prefix": token_prefix,
