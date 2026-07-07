@@ -88,6 +88,17 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
     tracing::info!("Migration 6b/13: done");
     tracing::info!("Migration 6c/13: quota cumulative...");
     run_ddl_on_conn(&mut conn, boom_quota::migrations::cumulative_ddl()).await?;
+    // GaussDB distributed: mark as REPLICATION so the table is copied to
+    // every datanode. Without this, single-table queries still get routed
+    // to a datanode where the table doesn't exist ("relation does not exist
+    // on datanode"). Idempotent — REPLICATION is a no-op if already set.
+    // Errors are swallowed: vanilla Postgres / single-node openGauss don't
+    // support DISTRIBUTE BY syntax.
+    let _ = sqlx::query(
+        "ALTER TABLE boom_rate_limit_cumulative DISTRIBUTE BY REPLICATION",
+    )
+    .execute(&mut *conn)
+    .await;
     tracing::info!("Migration 6c/13: done");
 
     // 4. KV config store (dashboard-owned).
