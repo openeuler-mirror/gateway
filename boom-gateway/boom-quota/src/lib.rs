@@ -21,6 +21,6 @@ pub mod migrations;
 pub mod store;
 
 pub use store::{
-    decimal_to_micros, micros_to_decimal, CumulativeKind, QuotaScope, QuotaStore,
-    TeamRecomputeResult, WindowInfo, WindowKind, WindowSnapshot,
+    decimal_to_micros, micros_to_decimal, CumulativeKind, CumulativeSnapshot, QuotaScope,
+    QuotaStore, TeamRecomputeResult, WindowInfo, WindowKind, WindowSnapshot,
 };

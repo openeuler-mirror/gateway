@@ -325,7 +325,6 @@
     else if (section === "admin-plans") loadPlans();
     else if (section === "admin-keys") { setupKeysSearch(); loadKeys(); }
     else if (section === "admin-assignments") loadAssignments();
-    else if (section === "admin-teams") loadTeams();
     else if (section === "admin-quota") loadQuota();
     else if (section === "admin-logs") { setupLogsFilters(); loadLogs(); }
     else if (section === "admin-config") loadConfig();
@@ -338,7 +337,6 @@
     if (hash.includes("/admin/aliases")) return "admin-aliases";
     if (hash.includes("/admin/plans")) return "admin-plans";
     if (hash.includes("/admin/keys")) return "admin-keys";
-    if (hash.includes("/admin/teams")) return "admin-teams";
     if (hash.includes("/admin/quota")) return "admin-quota";
     if (hash.includes("/admin/assignments")) return "admin-assignments";
     if (hash.includes("/admin/logs")) return "admin-logs";
@@ -1523,8 +1521,10 @@
       if (parts.length) limits.push(t("plan.limits.window", { dims: parts.join(" / "), duration: formatDuration(w.window_secs) }));
     });
     el.innerHTML = `
-      <p><strong>${esc(plan.plan_name)}</strong></p>
-      <ul>${limits.map((l) => `<li>${esc(l)}</li>`).join("")}</ul>
+      <div class="plan-card">
+        <div class="plan-name-badge">${esc(plan.plan_name)}</div>
+        <div class="plan-limits">${limits.map((l) => `<div class="plan-limit-row">${esc(l)}</div>`).join("") || `<div class="muted">${esc(t("common.unlimited"))}</div>`}</div>
+      </div>
     `;
   }
 
@@ -1639,6 +1639,29 @@
             <div class="dim-value">$${esc(c.total_cost || "0")}</div>
           </div>`;
       }
+      // Cost breakdown (cached / non-cached / output). Only show when the
+      // relevant component is non-zero — keeps the card minimal for fresh keys.
+      if ((c.regular_input_cost_micros || 0) > 0) {
+        dimHtml += `
+          <div class="dim-row">
+            <span class="dim-label">${esc(t("plan.dim.regular_input_cost"))}</span>
+            <div class="dim-value">$${esc(c.regular_input_cost || "0")}</div>
+          </div>`;
+      }
+      if ((c.cached_input_cost_micros || 0) > 0) {
+        dimHtml += `
+          <div class="dim-row">
+            <span class="dim-label">${esc(t("plan.dim.cached_input_cost"))}</span>
+            <div class="dim-value">$${esc(c.cached_input_cost || "0")}</div>
+          </div>`;
+      }
+      if ((c.output_cost_micros || 0) > 0) {
+        dimHtml += `
+          <div class="dim-row">
+            <span class="dim-label">${esc(t("plan.dim.output_cost"))}</span>
+            <div class="dim-value">$${esc(c.output_cost || "0")}</div>
+          </div>`;
+      }
       if (dimHtml) {
         html += `<div class="usage-limit-card usage-limit-wide">
           <div class="usage-limit-title">${esc(t("plan.cumulative_title"))}</div>
@@ -1693,7 +1716,6 @@
       [t("keyinfo.spend"), "$" + (info.spend || 0).toFixed(4)],
       [t("keyinfo.max_budget"), info.max_budget != null ? "$" + info.max_budget : t("common.unlimited")],
       [t("keyinfo.blocked"), info.blocked ? t("common.yes") : t("common.no")],
-      [t("keyinfo.rpm_limit"), info.rpm_limit || t("common.default")],
       [t("keyinfo.expires"), info.expires || t("common.never")],
       [t("keyinfo.created"), info.created_at || "-"],
     ];
@@ -1774,13 +1796,25 @@
   function renderPlansTable(plans) {
     const wrap = document.getElementById("plans-table-wrap");
     if (plans.length === 0) { wrap.innerHTML = "<p>" + t("plans.empty") + "</p>"; return; }
+    const fmtOptInt = (v) => (v == null ? "-" : Number(v).toLocaleString());
+    const fmtOptCost = (v) => (v == null ? "-" : "$" + String(v));
+    const fmtSchedule = (slots) => {
+      if (!Array.isArray(slots) || slots.length === 0) return "-";
+      return slots.map((s) => esc(s.hours || "")).join(", ");
+    };
     wrap.innerHTML = `<table>
       <tr>
         <th>${t("plans.col.name")}</th>
         <th>${t("plans.col.type")}</th>
         <th>${t("plans.col.concurrent")}</th>
         <th>${t("plans.col.rpm")}</th>
+        <th>${t("plans.col.tpm")}</th>
+        <th>${t("plans.col.cost_limit")}</th>
         <th>${t("plans.col.windows")}</th>
+        <th>${t("plans.col.total_tpm")}</th>
+        <th>${t("plans.col.total_cost")}</th>
+        <th>${t("plans.col.member_plan")}</th>
+        <th>${t("plans.col.schedule")}</th>
         <th>${t("plans.col.actions")}</th>
       </tr>
       ${plans.map((p) => {
@@ -1798,11 +1832,17 @@
           .join(", ");
         const typeLabel = p.type === "team" ? t("plans.type.team") : t("plans.type.key");
         return `<tr>
-          <td><strong>${esc(p.name)}</strong>${p.member_plan ? `<br><span class="muted">${esc(t("plans.member_plan_prefix"))} ${esc(p.member_plan)}</span>` : ""}</td>
+          <td><strong>${esc(p.name)}</strong></td>
           <td>${esc(typeLabel)}</td>
-          <td>${p.concurrency_limit || "-"}</td>
-          <td>${p.rpm_limit || "-"}</td>
+          <td>${fmtOptInt(p.concurrency_limit)}</td>
+          <td>${fmtOptInt(p.rpm_limit)}</td>
+          <td>${fmtOptInt(p.tpm_limit)}</td>
+          <td>${fmtOptCost(p.cost_limit)}</td>
           <td>${wlSummary || "-"}</td>
+          <td>${fmtOptInt(p.total_tpm_limit)}</td>
+          <td>${fmtOptCost(p.total_cost_limit)}</td>
+          <td>${p.member_plan ? esc(p.member_plan) : "-"}</td>
+          <td>${fmtSchedule(p.schedule)}</td>
           <td>
             <button class="btn-small" onclick="window._editPlan('${esc(p.name)}')">${t("action.edit")}</button>
             <button class="btn-danger" onclick="window._deletePlan('${esc(p.name)}')">${t("action.delete")}</button>
@@ -1864,15 +1904,27 @@
   function renderKeysTable(keys) {
     const wrap = document.getElementById("keys-table-wrap");
     if (keys.length === 0) { wrap.innerHTML = "<p>" + t("keys.empty") + "</p>"; return; }
+    const fmtTokens = (n) => {
+      const v = Number(n) || 0;
+      if (v >= 1e9) return (v / 1e9).toFixed(2) + "B";
+      if (v >= 1e6) return (v / 1e6).toFixed(2) + "M";
+      if (v >= 1e3) return (v / 1e3).toFixed(2) + "K";
+      return String(v);
+    };
+    const fmtCost = (s) => {
+      const v = Number(s) || 0;
+      if (v >= 1) return "$" + v.toFixed(2);
+      if (v > 0) return "$" + v.toFixed(4);
+      return "$0";
+    };
     wrap.innerHTML = `<table>
-      <tr><th>${t("keys.col.token")}</th><th>${t("keys.col.alias")}</th><th>${t("keys.col.user")}</th><th>${t("keys.col.plan")}</th><th>${t("keys.col.usage")}</th><th>${t("keys.col.reset")}</th><th>${t("keys.col.spend")}</th><th>${t("keys.col.budget")}</th><th>${t("keys.col.status")}</th><th>${t("keys.col.actions")}</th></tr>
+      <tr><th>${t("keys.col.token")}</th><th>${t("keys.col.alias")}</th><th>${t("keys.col.user")}</th><th>${t("keys.col.plan")}</th><th>${t("keys.col.usage")}</th><th>${t("keys.col.spend")}</th><th>${t("keys.col.budget")}</th><th>${t("keys.col.status")}</th><th>${t("keys.col.actions")}</th></tr>
       ${keys.map((k) => `<tr>
         <td class="mono">${esc(k.token_prefix)}</td>
         <td>${esc(k.key_alias || "-")}</td>
         <td>${esc(k.user_id || "-")}</td>
         <td>${esc(k.plan_name || "-")}</td>
-        <td>${k.usage_count || 0}</td>
-        <td>${formatCountdown(k.usage_reset_secs || 0)}</td>
+        <td><span class="mono">${k.usage_count || 0}/${fmtTokens(k.usage_tokens)}/${fmtCost(k.usage_cost)}</span><br><span class="muted" style="font-size:11px">${formatCountdown(k.usage_reset_secs || 0)}</span></td>
         <td>$${(k.spend || 0).toFixed(4)}</td>
         <td>${k.max_budget != null ? "$" + k.max_budget : "-"}</td>
         <td>${k.blocked
@@ -2267,7 +2319,13 @@
       const data = await api("/admin/debug/status");
       debugEnabled = data.enabled;
       updateDebugButton(btn);
-    } catch {}
+    } catch {
+      // Release builds compile out debug endpoints — hide the toggle button
+      // and the Debug nav-link (404 → catch branch).
+      btn.style.display = "none";
+      document.querySelectorAll('.nav-link[data-section="admin-debug"]')
+        .forEach((el) => el.style.display = "none");
+    }
   }
 
   function updateDebugButton(btn) {
@@ -2353,16 +2411,6 @@
       // We don't get the full list from status; load from config if needed.
       // For now, we'll just track via the team toggle state per-row.
     } catch {}
-  }
-
-  async function toggleTeamPromptLog(teamId, excluded) {
-    try {
-      await api("/admin/prompt-log/team", {
-        method: "POST",
-        body: JSON.stringify({ team_id: teamId, excluded: !excluded }),
-      });
-      loadTeams();
-    } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
   }
 
   async function showDebugError(requestId) {
@@ -2778,11 +2826,83 @@
     if (!wrap) return;
     wrap.innerHTML = '<p class="loading">' + t("common.loading") + '</p>';
     try {
+      // Load prompt-log status alongside — to know which teams are excluded.
+      try {
+        const plData = await api("/admin/prompt-log/status");
+        window._promptLogExcludedTeams = plData.excluded_teams || [];
+      } catch { window._promptLogExcludedTeams = []; }
+      // Cache default_team_plan + explicit assignments for the create/edit modal.
+      // We don't have list_teams anymore — derive from quota overview teams.
       const data = await api("/admin/quota/overview");
+      const assignments = {};
+      const defaultTeamPlan = (data.default_team_plan) || null;
+      (data.teams || []).forEach((tm) => {
+        if (tm.plan_explicit && tm.plan_name) assignments[tm.team_id] = tm.plan_name;
+      });
+      window._teamPlanState = { default_team_plan: defaultTeamPlan, assignments };
+      // Cache the team-plan names list once for the plan dropdowns.
+      if (!window._teamPlanNames) {
+        try {
+          window._teamPlanNames = await getTeamPlanNames();
+        } catch { window._teamPlanNames = []; }
+      }
       renderQuotaOverview(data);
     } catch (err) {
       wrap.innerHTML = `<p class="error-msg">${t("common.failed_to_load", { what: t("quota.title"), message: esc(err.message) })}</p>`;
     }
+  }
+
+  // Render effective_limits as a compact spec block (no progress bar — team
+  // dimension has no current data, only limit spec).
+  function renderTeamEffectiveLimits(el) {
+    if (!el) return "";
+    const rows = [];
+    if (el.concurrency_limit != null) {
+      rows.push(`<div class="dim-row"><span class="dim-label">${esc(t("plan.dim.concurrency"))}</span><span class="dim-value">${formatNumber(el.concurrency_limit)}</span></div>`);
+    }
+    // Window limits: array of [counts, tokens, costs, window_secs]. Each non-null
+    // dimension on a window_secs produces a row. Aggregate same secs together.
+    const bySecs = new Map();
+    (el.window_limits || []).forEach((w) => {
+      const [counts, tokens, costs, secs] = w;
+      if (!bySecs.has(secs)) bySecs.set(secs, {});
+      const e = bySecs.get(secs);
+      if (counts != null) e.counts = counts;
+      if (tokens != null) e.tokens = tokens;
+      if (costs != null) e.costs = costs;
+    });
+    // RPM (60s counts) is rendered separately from window_limits when present.
+    if (el.rpm_limit != null && !bySecs.has(60)) {
+      bySecs.set(60, { counts: el.rpm_limit });
+    }
+    const sortedSecs = [...bySecs.keys()].sort((a, b) => a - b);
+    sortedSecs.forEach((secs) => {
+      const e = bySecs.get(secs);
+      const label = secs === 60 ? "RPM" : t("plan.window_limit_label", { duration: formatDuration(secs) });
+      const parts = [];
+      if (e.counts != null) parts.push(`${formatNumber(e.counts)} ${t("quota.col.counts_short") || "req"}`);
+      if (e.tokens != null) parts.push(`${formatNumber(e.tokens)} tok`);
+      if (e.costs != null) parts.push(`$${e.costs}`);
+      rows.push(`<div class="dim-row"><span class="dim-label">${esc(label)}</span><span class="dim-value">${esc(parts.join(" / "))}</span></div>`);
+    });
+    if (rows.length === 0) return "";
+    return `<div class="team-limits-block">
+      <div class="team-limits-title">${esc(t("quota.team_limits_title"))}</div>
+      ${rows.join("")}
+    </div>`;
+  }
+
+  // Render a <select> for plan choice. value="" = use default_team_plan.
+  function renderTeamPlanSelect(teamId, currentPlan, isExplicit) {
+    const names = window._teamPlanNames || [];
+    const opts = [`<option value="">${esc(t("quota.team_plan_default"))}</option>`];
+    names.forEach((n) => {
+      const sel = (isExplicit && n === currentPlan) ? "selected" : "";
+      opts.push(`<option value="${esc(n)}" ${sel}>${esc(n)}</option>`);
+    });
+    return `<select class="search-input" style="max-width:160px" onchange="window._changeTeamPlan('${esc(teamId)}', this.value)">
+      ${opts.join("")}
+    </select>`;
   }
 
   function renderQuotaOverview(data) {
@@ -2792,18 +2912,29 @@
 
     const teamCard = (t1) => {
       const tokens = Number(t1.total_input_tokens || 0) + Number(t1.total_output_tokens || 0);
+      const planBadge = t1.plan_name
+        ? `<span class="badge ${t1.plan_explicit ? "badge-plan" : "badge-default"}">${esc(t1.plan_name)}</span>`
+        : `<span class="muted">${esc(t("quota.team_plan_none"))}</span>`;
+      const isExcluded = (window._promptLogExcludedTeams || []).includes(t1.team_id);
+      const promptLogBtn = `<button class="btn-small ${isExcluded ? "btn-secondary" : "btn-primary"}" onclick="window._toggleTeamPromptLog('${esc(t1.team_id)}', ${isExcluded})">${isExcluded ? t("quota.prompt_log_off") : t("quota.prompt_log_on")}</button>`;
+      const planSelect = renderTeamPlanSelect(t1.team_id, t1.plan_name, t1.plan_explicit);
+      const limitsHtml = renderTeamEffectiveLimits(t1.effective_limits);
       return `<div class="quota-card">
         <div class="quota-card-header">
           <strong>${esc(t1.team_alias || t1.team_id)}</strong>
-          ${t1.plan_name ? `<span class="muted">${esc(t("quota.col.plan"))}: ${esc(t1.plan_name)}</span>` : ""}
+          ${planBadge}
         </div>
         <div class="quota-card-stats">
           <div><span class="muted">${esc(t("teams.col.keys_count") || "Keys")}</span> <strong>${t1.key_count || 0}</strong></div>
           <div><span class="muted">${esc(t("quota.col.tokens"))}</span> <strong>${formatNumber(tokens)}</strong></div>
           <div><span class="muted">${esc(t("quota.col.cost"))}</span> <strong>$${esc(t1.total_cost || "0")}</strong></div>
         </div>
+        ${limitsHtml}
         <div class="quota-card-actions">
           <button class="btn-small" onclick="location.hash='#/admin/quota/team/${encodeURIComponent(t1.team_id)}'">${t("quota.view_detail")}</button>
+          ${planSelect}
+          ${promptLogBtn}
+          <button class="btn-danger btn-small" onclick="window._deleteTeam('${esc(t1.team_id)}', ${t1.key_count || 0})">${t("action.delete")}</button>
           <select class="search-input" style="max-width:140px" onchange="window._quotaTeamAction('${esc(t1.team_id)}', this.value); this.value=''">
             <option value="">${esc(t("quota.actions_label"))}</option>
             <option value="cumulative">${esc(t("quota.reset_cumulative"))}</option>
@@ -3078,67 +3209,7 @@
     }
   };
 
-  // ── Admin: Teams ──────────────────────────────────────
-  async function loadTeams() {
-    try {
-      // Load prompt log status alongside teams to know excluded teams.
-      try {
-        const plData = await api("/admin/prompt-log/status");
-        window._promptLogExcludedTeams = plData.excluded_teams || [];
-      } catch { window._promptLogExcludedTeams = []; }
-      const data = await api("/admin/teams");
-      // Stash default_team_plan + explicit assignments map for renderer.
-      window._teamPlanState = {
-        default_team_plan: data.default_team_plan || null,
-        assignments: data.team_assignments || {},
-      };
-      renderTeamsTable(data.teams || []);
-    } catch (err) {
-      const wrap = document.getElementById("teams-table-wrap");
-      if (wrap) wrap.innerHTML = `<p class="error-msg">${t("common.failed_to_load", { what: t("teams.title"), message: esc(err.message) })}</p>`;
-    }
-  }
-
-  function renderTeamsTable(teams) {
-    const wrap = document.getElementById("teams-table-wrap");
-    if (teams.length === 0) { wrap.innerHTML = "<p>" + t("teams.empty") + "</p>"; return; }
-    const tps = window._teamPlanState || { default_team_plan: null, assignments: {} };
-    wrap.innerHTML = `<table>
-      <tr><th>${t("teams.col.alias")}</th><th>${t("teams.col.team_id")}</th><th>${t("teams.col.models")}</th><th>${t("teams.col.plan")}</th><th>${t("teams.col.keys_count")}</th><th>${t("teams.col.requests")}</th><th>${t("teams.col.input_tokens")}</th><th>${t("teams.col.output_tokens")}</th><th>${t("teams.col.total_tokens")}</th><th>${t("teams.col.prompt_log")}</th><th>${t("teams.col.actions")}</th></tr>
-      ${teams.map((tm) => {
-        const isExcluded = (window._promptLogExcludedTeams || []).includes(tm.team_id);
-        const logBtnClass = isExcluded ? "btn-secondary" : "btn-primary";
-        const logBtnText = isExcluded ? "OFF" : "ON";
-        // Plan cell: explicit badge (with unassign X) / default muted / none muted.
-        let planCell;
-        const explicit = tps.assignments[tm.team_id];
-        if (explicit) {
-          planCell = `<span class="badge badge-plan">${esc(explicit)}</span> <button class="btn-secondary btn-sm" title="${esc(t("teams.plan_unassign"))}" onclick='window._unassignTeamPlan(${JSON.stringify(tm.team_id)})'>×</button>`;
-        } else if (tps.default_team_plan) {
-          planCell = `<span class="muted">${esc(t("teams.plan_default", { name: tps.default_team_plan }))}</span>`;
-        } else {
-          planCell = `<span class="muted">${esc(t("teams.plan_none"))}</span>`;
-        }
-        return `<tr>
-        <td>${esc(tm.team_alias || "-")}</td>
-        <td class="mono" title="${esc(tm.team_id)}">${esc((tm.team_id || "").substring(0, 12))}</td>
-        <td class="mono">${esc(formatTeamModels(tm.models))}</td>
-        <td>${planCell}</td>
-        <td>${tm.key_count}</td>
-        <td>${formatNumber(tm.request_count)}</td>
-        <td>${formatNumber(tm.total_input_tokens || 0)}</td>
-        <td>${formatNumber(tm.total_output_tokens || 0)}</td>
-        <td>${formatNumber((tm.total_input_tokens || 0) + (tm.total_output_tokens || 0))}</td>
-        <td><button class="${logBtnClass} btn-sm" onclick='window._toggleTeamPromptLog(${JSON.stringify(tm.team_id)}, ${isExcluded})'>${logBtnText}</button></td>
-        <td>
-          <button class="btn-secondary btn-sm" onclick='window._editTeam(${JSON.stringify(tm.team_id)})'>${t("action.edit")}</button>
-          <button class="btn-danger btn-sm" onclick='window._deleteTeam(${JSON.stringify(tm.team_id)}, ${tm.key_count})'>${t("action.delete")}</button>
-        </td>
-      </tr>`;
-      }).join("")}
-    </table>`;
-  }
-
+  // ── Admin: Team helpers (cards live in quota overview) ──
   function formatTeamModels(models) {
     if (!models || models.length === 0) return "all-team-models";
     if (models.includes("all-team-models")) return "all-team-models";
@@ -3147,7 +3218,7 @@
 
   window.showCreateTeamModal = function(prefill) {
     const p = prefill || {};
-    // Pre-existing explicit plan assignment (only meaningful in edit mode).
+    // Explicit plan state cached from last quota_overview load.
     const tps = window._teamPlanState || { default_team_plan: null, assignments: {} };
     const currentExplicit = p.team_id ? (tps.assignments[p.team_id] || "") : "";
     showModal(`
@@ -3169,8 +3240,6 @@
       const container = document.getElementById("m-team-models-combo");
       if (container) initModelCombo(container, p.models || [], names);
     });
-    // Populate team-plan dropdown with type=team plans, preselecting the
-    // current explicit assignment (if any).
     getTeamPlanNames().then((names) => {
       const sel = document.getElementById("m-team-plan");
       if (!sel) return;
@@ -3199,7 +3268,6 @@
               models: body.models,
             }),
           });
-          // Reconcile plan assignment: POST if changed/new, DELETE if cleared.
           if (selectedPlan && selectedPlan !== currentExplicit) {
             await api("/admin/team-assignments", {
               method: "POST",
@@ -3220,26 +3288,26 @@
           }
         }
         hideModal();
-        loadTeams();
+        loadQuotaOverview();
       } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
     });
   };
 
-  window._unassignTeamPlan = async (teamId) => {
+  // Plan dropdown onchange: POST or DELETE the team-assignment.
+  // value="" means "use default_team_plan" (delete explicit assignment).
+  window._changeTeamPlan = async (teamId, value) => {
     try {
-      await api("/admin/team-assignments/" + encodeURIComponent(teamId), { method: "DELETE" });
-      loadTeams();
-    } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
-  };
-
-  window._editTeam = async (teamId) => {
-    try {
-      const data = await api("/admin/teams");
-      const tm = (data.teams || []).find((x) => x.team_id === teamId);
-      if (!tm) return;
-      // Fetch full team record with models from DB.
-      // list_teams doesn't return models, so we pass what we have.
-      showCreateTeamModal(tm);
+      if (value) {
+        await api("/admin/team-assignments", {
+          method: "POST",
+          body: JSON.stringify({ team_id: teamId, plan_name: value }),
+        });
+      } else {
+        await api("/admin/team-assignments/" + encodeURIComponent(teamId), {
+          method: "DELETE",
+        });
+      }
+      loadQuotaOverview();
     } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
   };
 
@@ -3251,10 +3319,9 @@
     if (!confirm(t("confirm.delete_team", { name: teamId }))) return;
     try {
       await api("/admin/teams/" + encodeURIComponent(teamId), { method: "DELETE" });
-      loadTeams();
+      loadQuotaOverview();
     } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
   };
-
 
   window._toggleTeamPromptLog = async (teamId, isExcluded) => {
     try {
@@ -3262,7 +3329,7 @@
         method: 'POST',
         body: JSON.stringify({ team_id: teamId, excluded: !isExcluded }),
       });
-      loadTeams();
+      loadQuotaOverview();
     } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
   };
 

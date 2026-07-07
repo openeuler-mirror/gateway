@@ -237,6 +237,39 @@ pub async fn list_keys(
                 .get_plan_name(&r.token)
                 .or_else(|| state.plan_store.get_default_plan_name());
 
+            // Aggregate current-window tokens & cost from QuotaStore. We pick
+            // the smallest window_secs per kind — that's the "tightest" current
+            // window (typically 60s) and matches what users expect in a usage
+            // snapshot column. Cross-window aggregation would mix limits.
+            let mut tokens_min_secs: Option<(u64, u64, u64)> = None; // (secs, count, remaining)
+            let mut cost_min_secs: Option<(u64, u64, u64)> = None; // (secs, micros, remaining)
+            for w in state.quota_store.peek_key_windows(&r.token) {
+                match w.kind {
+                    boom_quota::WindowKind::Tokens => {
+                        match tokens_min_secs {
+                            None => tokens_min_secs = Some((w.window_secs, w.count, w.remaining_secs)),
+                            Some((s, _, _)) if w.window_secs < s => {
+                                tokens_min_secs = Some((w.window_secs, w.count, w.remaining_secs));
+                            }
+                            _ => {}
+                        }
+                    }
+                    boom_quota::WindowKind::CostMicros => {
+                        match cost_min_secs {
+                            None => cost_min_secs = Some((w.window_secs, w.count, w.remaining_secs)),
+                            Some((s, _, _)) if w.window_secs < s => {
+                                cost_min_secs = Some((w.window_secs, w.count, w.remaining_secs));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            let usage_tokens = tokens_min_secs.map(|(_, c, _)| c).unwrap_or(0);
+            let usage_cost_micros = cost_min_secs.map(|(_, c, _)| c).unwrap_or(0);
+            let usage_cost = rust_decimal::Decimal::from(usage_cost_micros)
+                / rust_decimal::Decimal::from(1_000_000);
+
             json!({
                 "token_prefix": token_prefix,
                 "token_hash": r.token,
@@ -256,6 +289,8 @@ pub async fn list_keys(
                 "created_at": r.created_at.map(|d| d.to_string()),
                 "usage_count": usage_count,
                 "usage_reset_secs": usage_reset_secs,
+                "usage_tokens": usage_tokens,
+                "usage_cost": usage_cost.to_string(),
                 "plan_name": plan_name,
             })
         })
@@ -1581,99 +1616,10 @@ pub async fn list_logs(
 // Teams
 // ═══════════════════════════════════════════════════════════
 
-#[derive(Debug, sqlx::FromRow)]
-struct TeamUsageRow {
-    team_id: String,
-    team_alias: Option<String>,
-    models: Option<Vec<String>>,
-    key_count: i64,
-    total_input_tokens: Option<i64>,
-    total_output_tokens: Option<i64>,
-    request_count: i64,
-}
-
-pub async fn list_teams(
-    _session: AdminSession,
-    Extension(state): Extension<std::sync::Arc<DashboardState>>,
-) -> Response {
-    let db_pool = match &state.db_pool {
-        Some(pool) => pool,
-        None => {
-            return Json(json!({"error": "Database not available"})).into_response();
-        }
-    };
-
-    let sql = r#"
-        SELECT bt.team_id,
-               bt.team_alias,
-               bt.models,
-               COALESCE(kc.cnt, 0) AS key_count,
-               COALESCE(rl.total_input, 0) AS total_input_tokens,
-               COALESCE(rl.total_output, 0) AS total_output_tokens,
-               COALESCE(rl.cnt, 0) AS request_count
-        FROM boom_team_table bt
-        LEFT JOIN (
-            SELECT team_id, COUNT(*) AS cnt FROM boom_verification_token GROUP BY team_id
-        ) kc ON bt.team_id = kc.team_id
-        LEFT JOIN (
-            SELECT team_id,
-                   SUM(input_tokens)  AS total_input,
-                   SUM(output_tokens) AS total_output,
-                   COUNT(*)           AS cnt
-            FROM boom_request_log GROUP BY team_id
-        ) rl ON bt.team_id = rl.team_id
-        ORDER BY (COALESCE(rl.total_input, 0) + COALESCE(rl.total_output, 0)) DESC
-    "#;
-
-    let rows: Vec<TeamUsageRow> = match sqlx::query_as(sql).fetch_all(db_pool).await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::error!("Dashboard list_teams query failed: {}", e);
-            return (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                format!("list_teams query failed: {e}"),
-            )
-                .into_response();
-        }
-    };
-
-    // Effective plan name per team — explicit assignment first, fall back to
-    // default_team_plan. Also expose the explicit-only map so the front-end
-    // can tell the two states apart.
-    let explicit_assignments = state.plan_store.list_team_assignments();
-    let explicit_map: std::collections::HashMap<String, String> = explicit_assignments
-        .into_iter()
-        .collect();
-    let default_team_plan = state.plan_store.get_default_team_plan_name();
-
-    let teams: Vec<Value> = rows
-        .into_iter()
-        .map(|r| {
-            let explicit_plan = explicit_map.get(&r.team_id);
-            let effective_plan = explicit_plan
-                .cloned()
-                .or_else(|| default_team_plan.clone());
-            json!({
-                "team_id": r.team_id,
-                "team_alias": r.team_alias,
-                "models": r.models,
-                "key_count": r.key_count,
-                "total_input_tokens": r.total_input_tokens,
-                "total_output_tokens": r.total_output_tokens,
-                "request_count": r.request_count,
-                "plan_name": effective_plan,
-                "plan_explicit": explicit_plan.is_some(),
-            })
-        })
-        .collect();
-
-    Json(json!({
-        "teams": teams,
-        "default_team_plan": default_team_plan,
-        "team_assignments": explicit_map,
-    }))
-        .into_response()
-}
+// Note: team listing is handled by `quota_overview` — it returns team rows
+// joined with cumulative counters, effective plan limits, and prompt-log
+// excluded status. The dedicated `list_teams` handler was removed to avoid
+// divergent data sources (boom_request_log SUM vs cumulative counters).
 
 #[derive(Debug, Deserialize)]
 pub struct CreateTeamRequest {
@@ -2484,7 +2430,10 @@ pub async fn reset_limits_all(
 // ═══════════════════════════════════════════════════════════
 // Debug Error Recording
 // ═══════════════════════════════════════════════════════════
+// Conditionally compiled — only included when the `debug-tools` feature is
+// enabled. Release builds exclude this code so debug endpoints return 404.
 
+#[cfg(feature = "debug-tools")]
 pub async fn get_debug_status(
     _session: AdminSession,
     Extension(state): Extension<Arc<DashboardState>>,
@@ -2495,11 +2444,13 @@ pub async fn get_debug_status(
     }))
 }
 
+#[cfg(feature = "debug-tools")]
 #[derive(Debug, Deserialize)]
 pub struct DebugToggleRequest {
     pub enabled: bool,
 }
 
+#[cfg(feature = "debug-tools")]
 pub async fn toggle_debug(
     _session: AdminSession,
     Extension(state): Extension<Arc<DashboardState>>,
@@ -2517,6 +2468,7 @@ pub async fn toggle_debug(
     }))
 }
 
+#[cfg(feature = "debug-tools")]
 pub async fn get_debug_error(
     _session: AdminSession,
     Extension(state): Extension<Arc<DashboardState>>,
@@ -2756,9 +2708,9 @@ pub async fn quota_overview(
         None => return Json(json!({"error": "Database not available"})).into_response(),
     };
 
-    // 1. Teams metadata.
-    let team_rows: Vec<(String, Option<String>)> = match sqlx::query_as(
-        "SELECT team_id, team_alias FROM boom_team_table",
+    // 1. Teams metadata (now includes models array).
+    let team_rows: Vec<(String, Option<String>, Option<Vec<String>>)> = match sqlx::query_as(
+        "SELECT team_id, team_alias, models FROM boom_team_table",
     )
     .fetch_all(db_pool)
     .await
@@ -2889,23 +2841,63 @@ pub async fn quota_overview(
         }
     }
 
-    // team → plan_name lookup.
+    // team → plan_name lookup (explicit assignments only).
     let team_plans: std::collections::HashMap<String, String> = state
         .plan_store
         .list_team_assignments()
         .into_iter()
         .collect();
 
+    // prompt-log excluded teams — read once, lookup in loop.
+    let excluded_teams: Vec<String> = state
+        .prompt_log_writer
+        .config()
+        .excluded_teams
+        .clone();
+
     // Build teams vector sorted by cost DESC, then tokens DESC.
     let mut teams: Vec<Value> = team_rows
         .into_iter()
-        .map(|(team_id, team_alias)| {
+        .map(|(team_id, team_alias, models)| {
             let cum = team_cum.get(&team_id).copied().unwrap_or((0, 0, 0));
+            let explicit_plan = team_plans.get(&team_id).cloned();
+            let effective_plan_name = explicit_plan
+                .clone()
+                .or_else(|| state.plan_store.get_default_team_plan_name());
+            // Resolve full plan to compute effective limits.
+            let effective_limits = state
+                .plan_store
+                .resolve_team_plan(&team_id)
+                .map(|p| {
+                    let (concurrency_limit, rpm_limit, window_limits, _) = p.effective_limits();
+                    let wl_json: Vec<serde_json::Value> = window_limits
+                        .iter()
+                        .map(|w| {
+                            let counts = w.counts.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null);
+                            let tokens = w.tokens.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null);
+                            let costs = w
+                                .costs
+                                .map(|c| serde_json::Value::String(c.to_string()))
+                                .unwrap_or(serde_json::Value::Null);
+                            serde_json::json!([counts, tokens, costs, w.window_secs])
+                        })
+                        .collect();
+                    json!({
+                        "concurrency_limit": concurrency_limit,
+                        "rpm_limit": rpm_limit,
+                        "window_limits": wl_json,
+                    })
+                });
+            let prompt_log_excluded = excluded_teams.iter().any(|t| t == &team_id);
             json!({
                 "team_id": team_id,
                 "team_alias": team_alias,
+                "models": models.unwrap_or_default(),
                 "key_count": team_key_count.get(&team_id).copied().unwrap_or(0),
-                "plan_name": team_plans.get(&team_id).cloned(),
+                "plan_name": effective_plan_name,
+                "plan_explicit": explicit_plan.is_some(),
+                "effective_limits": effective_limits,
+                "prompt_log_excluded": prompt_log_excluded,
                 "total_input_tokens": cum.0,
                 "total_output_tokens": cum.1,
                 "total_cost_micros": cum.2,
@@ -2938,7 +2930,13 @@ pub async fn quota_overview(
     // Suppress unused warning while keeping the lookup map for future use.
     let _ = token_team;
 
-    Json(json!({ "teams": teams, "no_team": no_team })).into_response()
+    let default_team_plan = state.plan_store.get_default_team_plan_name();
+    Json(json!({
+        "teams": teams,
+        "no_team": no_team,
+        "default_team_plan": default_team_plan,
+    }))
+    .into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -3383,7 +3381,7 @@ pub async fn quota_reset_key(
     };
     let limiter_cleared = state.limiter.clear_for_key(&key_hash);
     match state.quota_store.clear_key_all(db_pool, &key_hash).await {
-        Ok((tin, tout, tcost)) => {
+        Ok(snap) => {
             let _ = state
                 .admin_tx
                 .send(crate::state::AdminCommand::ConfigChanged)
@@ -3393,10 +3391,16 @@ pub async fn quota_reset_key(
                 "key_hash": key_hash,
                 "limiter_windows_cleared": limiter_cleared,
                 "previous": {
-                    "total_input_tokens": tin,
-                    "total_output_tokens": tout,
-                    "total_cost_micros": tcost,
-                    "total_cost": boom_quota::micros_to_decimal(tcost).to_string(),
+                    "total_input_tokens": snap.input_tokens,
+                    "total_output_tokens": snap.output_tokens,
+                    "total_cost_micros": snap.total_cost_micros,
+                    "total_cost": boom_quota::micros_to_decimal(snap.total_cost_micros).to_string(),
+                    "regular_input_cost_micros": snap.regular_input_cost_micros,
+                    "regular_input_cost": boom_quota::micros_to_decimal(snap.regular_input_cost_micros).to_string(),
+                    "cached_input_cost_micros": snap.cached_input_cost_micros,
+                    "cached_input_cost": boom_quota::micros_to_decimal(snap.cached_input_cost_micros).to_string(),
+                    "output_cost_micros": snap.output_cost_micros,
+                    "output_cost": boom_quota::micros_to_decimal(snap.output_cost_micros).to_string(),
                 },
             }))
             .into_response()
@@ -3508,7 +3512,7 @@ pub async fn quota_reset_key_cumulative(
         .clear_key_cumulative_db(db_pool, &key_hash, team_id.as_deref())
         .await
     {
-        Ok((tin, tout, tcost)) => {
+        Ok(snap) => {
             let _ = state
                 .admin_tx
                 .send(crate::state::AdminCommand::ConfigChanged)
@@ -3519,10 +3523,16 @@ pub async fn quota_reset_key_cumulative(
                 "team_id": team_id,
                 "scope": "cumulative",
                 "previous": {
-                    "total_input_tokens": tin,
-                    "total_output_tokens": tout,
-                    "total_cost_micros": tcost,
-                    "total_cost": boom_quota::micros_to_decimal(tcost).to_string(),
+                    "total_input_tokens": snap.input_tokens,
+                    "total_output_tokens": snap.output_tokens,
+                    "total_cost_micros": snap.total_cost_micros,
+                    "total_cost": boom_quota::micros_to_decimal(snap.total_cost_micros).to_string(),
+                    "regular_input_cost_micros": snap.regular_input_cost_micros,
+                    "regular_input_cost": boom_quota::micros_to_decimal(snap.regular_input_cost_micros).to_string(),
+                    "cached_input_cost_micros": snap.cached_input_cost_micros,
+                    "cached_input_cost": boom_quota::micros_to_decimal(snap.cached_input_cost_micros).to_string(),
+                    "output_cost_micros": snap.output_cost_micros,
+                    "output_cost": boom_quota::micros_to_decimal(snap.output_cost_micros).to_string(),
                 },
             }))
             .into_response()

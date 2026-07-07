@@ -25,13 +25,23 @@ pub enum QuotaScope {
 
 /// Which permanent counter to operate on.
 ///
-/// `TotalCost` is stored as integer micros (1e-6 USD) internally;
+/// Cost counters are stored as integer micros (1e-6 USD) internally;
 /// callers convert via `decimal_to_micros` / `micros_to_decimal`.
+///
+/// `TotalCost` = `TotalRegularInputCost` + `TotalCachedInputCost` +
+/// `TotalOutputCost`. Kept as a denormalized rollup for backward compat
+/// with existing dashboards and quota queries.
 #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
 pub enum CumulativeKind {
     TotalInputTokens,
     TotalOutputTokens,
     TotalCost,
+    /// Non-cached input token cost.
+    TotalRegularInputCost,
+    /// KV-cache hit input token cost (discounted rate when configured).
+    TotalCachedInputCost,
+    /// Output token cost.
+    TotalOutputCost,
 }
 
 impl CumulativeKind {
@@ -41,6 +51,9 @@ impl CumulativeKind {
             CumulativeKind::TotalInputTokens => "tin",
             CumulativeKind::TotalOutputTokens => "tout",
             CumulativeKind::TotalCost => "tcost",
+            CumulativeKind::TotalRegularInputCost => "cric",
+            CumulativeKind::TotalCachedInputCost => "ccic",
+            CumulativeKind::TotalOutputCost => "coc",
         }
     }
 }
@@ -90,6 +103,21 @@ pub struct TeamRecomputeResult {
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
     pub total_cost_micros: u64,
+    pub regular_input_cost_micros: u64,
+    pub cached_input_cost_micros: u64,
+    pub output_cost_micros: u64,
+}
+
+/// Snapshot of all 6 cumulative counters for one entity (key or team).
+/// Returned by reset operations so callers can log or cascade-adjust.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct CumulativeSnapshot {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_cost_micros: u64,
+    pub regular_input_cost_micros: u64,
+    pub cached_input_cost_micros: u64,
+    pub output_cost_micros: u64,
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -210,17 +238,23 @@ impl QuotaStore {
         self.mark_dirty_cumulative(&key);
     }
 
-    /// Reset all three cumulative counters for a key to zero (in-memory only).
-    /// Returns the pre-reset values: (input, output, cost_micros).
-    /// Caller is responsible for DB cleanup and team recompute.
-    pub fn reset_key_cumulative_local(&self, key_hash: &str) -> (u64, u64, u64) {
+    /// Reset all cumulative counters for a key to zero (in-memory only).
+    /// Returns the pre-reset values. Caller is responsible for DB cleanup
+    /// and team recompute.
+    pub fn reset_key_cumulative_local(&self, key_hash: &str) -> CumulativeSnapshot {
         let scope = QuotaScope::Key {
             key_hash: key_hash.to_string(),
         };
-        let tin = self.reset_one_local(&scope, CumulativeKind::TotalInputTokens);
-        let tout = self.reset_one_local(&scope, CumulativeKind::TotalOutputTokens);
-        let tcost = self.reset_one_local(&scope, CumulativeKind::TotalCost);
-        (tin, tout, tcost)
+        CumulativeSnapshot {
+            input_tokens: self.reset_one_local(&scope, CumulativeKind::TotalInputTokens),
+            output_tokens: self.reset_one_local(&scope, CumulativeKind::TotalOutputTokens),
+            total_cost_micros: self.reset_one_local(&scope, CumulativeKind::TotalCost),
+            regular_input_cost_micros: self
+                .reset_one_local(&scope, CumulativeKind::TotalRegularInputCost),
+            cached_input_cost_micros: self
+                .reset_one_local(&scope, CumulativeKind::TotalCachedInputCost),
+            output_cost_micros: self.reset_one_local(&scope, CumulativeKind::TotalOutputCost),
+        }
     }
 
     fn reset_one_local(&self, scope: &QuotaScope, kind: CumulativeKind) -> u64 {
@@ -415,6 +449,10 @@ impl QuotaStore {
     /// `model` should be the resolved model name (post-alias), so the cost
     /// rate lookup is correct.
     ///
+    /// Cost is provided as three components (regular input, cached input,
+    /// output) so the breakdown counters can be tracked independently.
+    /// `TotalCost` is stored as the sum of the three for backward compat.
+    ///
     /// `window_secs_list` is the set of window durations to roll forward —
     /// typically the configured `window_secs` of each `WindowLimit` entry from
     /// the active plan. Each duration produces one `tok` and one `cst` window.
@@ -427,22 +465,39 @@ impl QuotaStore {
         model: &str,
         input_tokens: u64,
         output_tokens: u64,
-        total_cost: Decimal,
+        regular_input_cost: Decimal,
+        cached_input_cost: Decimal,
+        output_cost: Decimal,
         window_secs_list: &[u64],
     ) {
         let total_tokens = input_tokens.saturating_add(output_tokens);
-        let cost_micros = decimal_to_micros(total_cost);
+        let total_cost = regular_input_cost + cached_input_cost + output_cost;
+        let total_cost_micros = decimal_to_micros(total_cost);
+        let regular_input_micros = decimal_to_micros(regular_input_cost);
+        let cached_input_micros = decimal_to_micros(cached_input_cost);
+        let output_micros = decimal_to_micros(output_cost);
 
         let key_scope = QuotaScope::Key {
             key_hash: key_hash.to_string(),
         };
         for &ws in window_secs_list {
             self.add_window(&key_scope, model, WindowKind::Tokens, ws, total_tokens);
-            self.add_window(&key_scope, model, WindowKind::CostMicros, ws, cost_micros);
+            self.add_window(&key_scope, model, WindowKind::CostMicros, ws, total_cost_micros);
         }
         self.add_cumulative(&key_scope, CumulativeKind::TotalInputTokens, input_tokens);
         self.add_cumulative(&key_scope, CumulativeKind::TotalOutputTokens, output_tokens);
-        self.add_cumulative(&key_scope, CumulativeKind::TotalCost, cost_micros);
+        self.add_cumulative(&key_scope, CumulativeKind::TotalCost, total_cost_micros);
+        self.add_cumulative(
+            &key_scope,
+            CumulativeKind::TotalRegularInputCost,
+            regular_input_micros,
+        );
+        self.add_cumulative(
+            &key_scope,
+            CumulativeKind::TotalCachedInputCost,
+            cached_input_micros,
+        );
+        self.add_cumulative(&key_scope, CumulativeKind::TotalOutputCost, output_micros);
 
         if let Some(tid) = team_id {
             let team_scope = QuotaScope::Team {
@@ -450,23 +505,34 @@ impl QuotaStore {
             };
             for &ws in window_secs_list {
                 self.add_window(&team_scope, model, WindowKind::Tokens, ws, total_tokens);
-                self.add_window(&team_scope, model, WindowKind::CostMicros, ws, cost_micros);
+                self.add_window(&team_scope, model, WindowKind::CostMicros, ws, total_cost_micros);
             }
             self.add_cumulative(&team_scope, CumulativeKind::TotalInputTokens, input_tokens);
             self.add_cumulative(&team_scope, CumulativeKind::TotalOutputTokens, output_tokens);
-            self.add_cumulative(&team_scope, CumulativeKind::TotalCost, cost_micros);
+            self.add_cumulative(&team_scope, CumulativeKind::TotalCost, total_cost_micros);
+            self.add_cumulative(
+                &team_scope,
+                CumulativeKind::TotalRegularInputCost,
+                regular_input_micros,
+            );
+            self.add_cumulative(
+                &team_scope,
+                CumulativeKind::TotalCachedInputCost,
+                cached_input_micros,
+            );
+            self.add_cumulative(&team_scope, CumulativeKind::TotalOutputCost, output_micros);
         }
     }
 
     // ── Reset operations (DB-backed) ──
 
     /// Clear all cumulative + window entries for a key (memory + DB).
-    /// Returns pre-reset cumulative values: (input, output, cost_micros).
+    /// Returns pre-reset cumulative snapshot.
     pub async fn clear_key_all(
         &self,
         pool: &sqlx::PgPool,
         key_hash: &str,
-    ) -> Result<(u64, u64, u64), sqlx::Error> {
+    ) -> Result<CumulativeSnapshot, sqlx::Error> {
         let prev = self.reset_key_cumulative_local(key_hash);
 
         // Windows for this key (any model/kind/secs)
@@ -525,13 +591,13 @@ impl QuotaStore {
     /// Clear ONLY a key's cumulative counters (memory + DB), leaving windows
     /// untouched. If `team_id` is provided, the same delta is subtracted from
     /// the team's cumulative so the rollup stays consistent with member sum.
-    /// Returns the pre-reset key cumulative: (input, output, cost_micros).
+    /// Returns the pre-reset key cumulative snapshot.
     pub async fn clear_key_cumulative_db(
         &self,
         pool: &sqlx::PgPool,
         key_hash: &str,
         team_id: Option<&str>,
-    ) -> Result<(u64, u64, u64), sqlx::Error> {
+    ) -> Result<CumulativeSnapshot, sqlx::Error> {
         let prev = self.reset_key_cumulative_local(key_hash);
         // DB: delete key cumulative rows.
         sqlx::query(r#"DELETE FROM boom_rate_limit_cumulative WHERE cache_key LIKE $1"#)
@@ -549,17 +615,32 @@ impl QuotaStore {
             self.add_cumulative_signed(
                 &team_scope,
                 CumulativeKind::TotalInputTokens,
-                -(prev.0 as i64),
+                -(prev.input_tokens as i64),
             );
             self.add_cumulative_signed(
                 &team_scope,
                 CumulativeKind::TotalOutputTokens,
-                -(prev.1 as i64),
+                -(prev.output_tokens as i64),
             );
             self.add_cumulative_signed(
                 &team_scope,
                 CumulativeKind::TotalCost,
-                -(prev.2 as i64),
+                -(prev.total_cost_micros as i64),
+            );
+            self.add_cumulative_signed(
+                &team_scope,
+                CumulativeKind::TotalRegularInputCost,
+                -(prev.regular_input_cost_micros as i64),
+            );
+            self.add_cumulative_signed(
+                &team_scope,
+                CumulativeKind::TotalCachedInputCost,
+                -(prev.cached_input_cost_micros as i64),
+            );
+            self.add_cumulative_signed(
+                &team_scope,
+                CumulativeKind::TotalOutputCost,
+                -(prev.output_cost_micros as i64),
             );
         }
         Ok(prev)
@@ -674,12 +755,13 @@ impl QuotaStore {
         team_id: &str,
         member_keys: &[String],
     ) -> Result<TeamRecomputeResult, sqlx::Error> {
-        // Build IN list: 3 cumulative kinds × N member keys
-        let mut cache_keys: Vec<String> = Vec::with_capacity(member_keys.len() * 3);
+        // Build IN list: 6 cumulative kinds × N member keys
+        let suffixes = ["tin", "tout", "tcost", "cric", "ccic", "coc"];
+        let mut cache_keys: Vec<String> = Vec::with_capacity(member_keys.len() * suffixes.len());
         for kh in member_keys {
-            cache_keys.push(format!("kc:{}:tin", kh));
-            cache_keys.push(format!("kc:{}:tout", kh));
-            cache_keys.push(format!("kc:{}:tcost", kh));
+            for sfx in suffixes {
+                cache_keys.push(format!("kc:{}:{}", kh, sfx));
+            }
         }
 
         let rows: Vec<(String, i64)> = if cache_keys.is_empty() {
@@ -697,6 +779,9 @@ impl QuotaStore {
         let mut tin: u64 = 0;
         let mut tout: u64 = 0;
         let mut tcost: u64 = 0;
+        let mut cric: u64 = 0;
+        let mut ccic: u64 = 0;
+        let mut coc: u64 = 0;
         for (ck, v) in &rows {
             let v = (*v).max(0) as u64;
             if ck.ends_with(":tin") {
@@ -705,6 +790,12 @@ impl QuotaStore {
                 tout = tout.saturating_add(v);
             } else if ck.ends_with(":tcost") {
                 tcost = tcost.saturating_add(v);
+            } else if ck.ends_with(":cric") {
+                cric = cric.saturating_add(v);
+            } else if ck.ends_with(":ccic") {
+                ccic = ccic.saturating_add(v);
+            } else if ck.ends_with(":coc") {
+                coc = coc.saturating_add(v);
             }
         }
 
@@ -715,11 +806,17 @@ impl QuotaStore {
         self.overwrite_cumulative(&team_scope, CumulativeKind::TotalInputTokens, tin);
         self.overwrite_cumulative(&team_scope, CumulativeKind::TotalOutputTokens, tout);
         self.overwrite_cumulative(&team_scope, CumulativeKind::TotalCost, tcost);
+        self.overwrite_cumulative(&team_scope, CumulativeKind::TotalRegularInputCost, cric);
+        self.overwrite_cumulative(&team_scope, CumulativeKind::TotalCachedInputCost, ccic);
+        self.overwrite_cumulative(&team_scope, CumulativeKind::TotalOutputCost, coc);
 
         for (kind, value) in [
             (CumulativeKind::TotalInputTokens, tin),
             (CumulativeKind::TotalOutputTokens, tout),
             (CumulativeKind::TotalCost, tcost),
+            (CumulativeKind::TotalRegularInputCost, cric),
+            (CumulativeKind::TotalCachedInputCost, ccic),
+            (CumulativeKind::TotalOutputCost, coc),
         ] {
             let key = cumulative_cache_key(&team_scope, kind);
             upsert_cumulative_db(pool, &key, value as i64).await?;
@@ -729,6 +826,9 @@ impl QuotaStore {
             total_input_tokens: tin,
             total_output_tokens: tout,
             total_cost_micros: tcost,
+            regular_input_cost_micros: cric,
+            cached_input_cost_micros: ccic,
+            output_cost_micros: coc,
         })
     }
 

@@ -3,6 +3,10 @@ name = "boom-dashboard"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+debug-tools = []
+
 [dependencies]
 boom-core = { path = "../boom-core" }
 boom-flowcontrol = { path = "../boom-flowcontrol" }

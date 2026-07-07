@@ -1304,7 +1304,9 @@ impl PlanCharge {
         }
         self.settled = true;
         if let Some(ref store) = self.quota_store {
-            let cost = self.cost_rate.compute_cost(input_tokens, cached_tokens, output_tokens);
+            let (regular_input_cost, cached_input_cost, output_cost) = self
+                .cost_rate
+                .compute_cost_breakdown(input_tokens, cached_tokens, output_tokens);
             // Roll forward every configured window_secs — tokens and cost
             // both get added to each window. Dedup so multiple dimensions on
             // the same window_secs only produce one window per kind.
@@ -1320,7 +1322,9 @@ impl PlanCharge {
                 &self.resolved_model,
                 input_tokens,
                 output_tokens,
-                cost,
+                regular_input_cost,
+                cached_input_cost,
+                output_cost,
                 &secs_set,
             );
         }

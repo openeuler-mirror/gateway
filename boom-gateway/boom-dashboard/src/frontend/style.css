@@ -530,7 +530,11 @@ input, select, textarea { font-family: var(--font); font-size: 14px; }
   border: 1px solid var(--border); background: var(--surface); color: var(--text2);
   font-weight: 500; transition: all var(--transition);
   box-shadow: 0 1px 2px rgba(0,0,0,.04);
+  width: auto;
 }
+/* When btn-small and btn-secondary are combined (e.g. prompt-log toggle in
+   quota card), override btn-secondary's width:100% to keep the button inline. */
+.btn-small.btn-secondary { width: auto; }
 .btn-small:hover { border-color: var(--primary); color: var(--primary); background: var(--primary-bg); box-shadow: 0 1px 4px rgba(0,0,0,.08); }
 
 /* Range selector for time-windowed stats (Agent / Request Rate) */
@@ -622,6 +626,32 @@ tbody tr:nth-child(even):hover td { background: var(--surface2); }
 .usage-limit-count { font-size: 1.2em; font-weight: 700; color: var(--text); font-family: var(--heading); margin-bottom: 8px; }
 .usage-limit-card .progress-bar { margin-bottom: 6px; }
 .usage-limit-reset { font-size: .8em; color: var(--text3); }
+
+/* ── Plan Card (user dashboard) ───────────────────────── */
+.plan-card {
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+}
+.plan-name-badge {
+  display: inline-block;
+  padding: 4px 12px;
+  margin-bottom: 12px;
+  border-radius: 12px;
+  font-weight: 700;
+  font-size: 14px;
+  letter-spacing: .02em;
+  background: linear-gradient(135deg, var(--primary), color-mix(in srgb, var(--primary) 70%, #fff 30%));
+  color: #fff;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, .12);
+}
+.plan-limits { display: flex; flex-direction: column; gap: 6px; }
+.plan-limit-row {
+  font-size: 13px;
+  color: var(--text2);
+  padding: 2px 0;
+}
 
 /* ── Pagination ─────────────────────────────────────────── */
 .pagination {
@@ -1521,6 +1551,7 @@ input[list] {
 }
 .dim-value {
   flex: 0 0 auto;
+  margin-left: auto;
   white-space: nowrap;
   text-align: right;
   font-size: 13px;
@@ -1590,8 +1621,33 @@ input[list] {
 }
 .quota-card-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
   margin-top: 4px;
+  align-items: center;
+}
+.team-limits-block {
+  margin: 8px 0;
+  padding: 8px 10px;
+  background: var(--surface2);
+  border-radius: var(--radius-xs);
+  border-left: 3px solid var(--primary);
+}
+.team-limits-title {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text3);
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  margin-bottom: 4px;
+}
+.team-limits-block .dim-row {
+  margin: 4px 0;
+}
+.badge-default {
+  background: var(--surface3);
+  color: var(--text2);
+  border: 1px solid var(--border);
 }
 .quota-toolbar {
   display: flex;

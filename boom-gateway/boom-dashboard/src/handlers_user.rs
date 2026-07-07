@@ -201,6 +201,15 @@ pub async fn get_usage(
     let total_cost_micros = state
         .quota_store
         .peek_cumulative(&key_scope, boom_quota::CumulativeKind::TotalCost);
+    let regular_input_cost_micros = state
+        .quota_store
+        .peek_cumulative(&key_scope, boom_quota::CumulativeKind::TotalRegularInputCost);
+    let cached_input_cost_micros = state
+        .quota_store
+        .peek_cumulative(&key_scope, boom_quota::CumulativeKind::TotalCachedInputCost);
+    let output_cost_micros = state
+        .quota_store
+        .peek_cumulative(&key_scope, boom_quota::CumulativeKind::TotalOutputCost);
 
     let concurrency = state.plan_store.get_concurrency(key_hash);
 
@@ -215,6 +224,12 @@ pub async fn get_usage(
             "total_tokens": total_in.saturating_add(total_out),
             "total_cost_micros": total_cost_micros,
             "total_cost": boom_quota::micros_to_decimal(total_cost_micros).to_string(),
+            "regular_input_cost_micros": regular_input_cost_micros,
+            "regular_input_cost": boom_quota::micros_to_decimal(regular_input_cost_micros).to_string(),
+            "cached_input_cost_micros": cached_input_cost_micros,
+            "cached_input_cost": boom_quota::micros_to_decimal(cached_input_cost_micros).to_string(),
+            "output_cost_micros": output_cost_micros,
+            "output_cost": boom_quota::micros_to_decimal(output_cost_micros).to_string(),
             "total_tpm_limit": plan.as_ref().and_then(|p| p.total_tpm_limit),
             "total_cost_limit": plan.as_ref().and_then(|p| p.total_cost_limit).map(|d| d.to_string()),
         },

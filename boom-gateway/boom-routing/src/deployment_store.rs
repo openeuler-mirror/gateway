@@ -41,16 +41,31 @@ impl ModelCostRate {
     /// When `cached_input_cost_per_token` is zero, cache hits are billed
     /// at the regular input rate (legacy behavior).
     pub fn compute_cost(&self, input_tokens: u64, cached_tokens: u64, output_tokens: u64) -> Decimal {
+        let (regular_input, cached_input, output) = self
+            .compute_cost_breakdown(input_tokens, cached_tokens, output_tokens);
+        regular_input + cached_input + output
+    }
+
+    /// Compute the three cost components separately:
+    /// (regular_input, cached_input, output). Cached hits use the discounted
+    /// `cached_input_cost_per_token` when configured; otherwise the regular
+    /// input rate applies.
+    pub fn compute_cost_breakdown(
+        &self,
+        input_tokens: u64,
+        cached_tokens: u64,
+        output_tokens: u64,
+    ) -> (Decimal, Decimal, Decimal) {
         let cached = cached_tokens.min(input_tokens);
         let non_cached = input_tokens.saturating_sub(cached);
-        let input_cost = self.input_cost_per_token * Decimal::from(non_cached);
-        let cached_cost = if self.cached_input_cost_per_token.is_zero() {
+        let regular_input_cost = self.input_cost_per_token * Decimal::from(non_cached);
+        let cached_input_cost = if self.cached_input_cost_per_token.is_zero() {
             self.input_cost_per_token * Decimal::from(cached)
         } else {
             self.cached_input_cost_per_token * Decimal::from(cached)
         };
         let output_cost = self.output_cost_per_token * Decimal::from(output_tokens);
-        input_cost + cached_cost + output_cost
+        (regular_input_cost, cached_input_cost, output_cost)
     }
 
     pub fn is_zero(&self) -> bool {
