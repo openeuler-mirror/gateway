@@ -139,55 +139,34 @@ pub async fn get_usage(
 
             let mut dims = serde_json::Map::new();
 
-            // counts (always include current; only show if plan has the dim configured OR user has counts activity)
-            if let Some(&(cur, _, _)) = counts_by_secs.get(&secs) {
+            // counts: only include when plan configured a counts limit.
+            if let Some(limit) = counts_limit {
+                let cur = counts_by_secs.get(&secs).map(|&(c, _, _)| c).unwrap_or(0);
                 dims.insert(
                     "counts".to_string(),
-                    json!({
-                        "current": cur,
-                        "limit": counts_limit,
-                    }),
-                );
-            } else if counts_limit.is_some() {
-                dims.insert(
-                    "counts".to_string(),
-                    json!({ "current": 0u64, "limit": counts_limit }),
+                    json!({ "current": cur, "limit": limit }),
                 );
             }
 
-            // tokens
-            if let Some(&(cur, _)) = tokens_by_secs.get(&secs) {
+            // tokens: only include when plan configured a tokens limit.
+            if let Some(limit) = tokens_limit {
+                let cur = tokens_by_secs.get(&secs).map(|&(c, _)| c).unwrap_or(0);
                 dims.insert(
                     "tokens".to_string(),
-                    json!({ "current": cur, "limit": tokens_limit }),
-                );
-            } else if tokens_limit.is_some() {
-                dims.insert(
-                    "tokens".to_string(),
-                    json!({ "current": 0u64, "limit": tokens_limit }),
+                    json!({ "current": cur, "limit": limit }),
                 );
             }
 
-            // costs
-            if let Some(&(cur_micros, _)) = costs_by_secs.get(&secs) {
+            // costs: only include when plan configured a costs limit.
+            if let Some(limit) = costs_limit {
+                let cur_micros = costs_by_secs.get(&secs).map(|&(c, _)| c).unwrap_or(0);
                 dims.insert(
                     "costs".to_string(),
                     json!({
                         "current_micros": cur_micros,
                         "current": boom_quota::micros_to_decimal(cur_micros).to_string(),
-                        "limit": costs_limit.map(|d| d.to_string()),
-                        "limit_micros": costs_limit.map(boom_quota::decimal_to_micros),
-                    }),
-                );
-            } else if costs_limit.is_some() {
-                let lim = costs_limit.unwrap();
-                dims.insert(
-                    "costs".to_string(),
-                    json!({
-                        "current_micros": 0u64,
-                        "current": "0",
-                        "limit": lim.to_string(),
-                        "limit_micros": boom_quota::decimal_to_micros(lim),
+                        "limit": limit.to_string(),
+                        "limit_micros": boom_quota::decimal_to_micros(limit),
                     }),
                 );
             }

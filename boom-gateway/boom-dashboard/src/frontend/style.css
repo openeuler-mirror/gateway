@@ -1496,6 +1496,8 @@ input[list] {
 /* ── Multi-dim Usage Card (wide) ──────────────────────── */
 .usage-limit-card.usage-limit-wide {
   padding: 16px 18px;
+  /* Wide cards span the full row so multi-dim progress bars have room. */
+  grid-column: 1 / -1;
 }
 .usage-limit-card.usage-limit-wide .usage-limit-title {
   font-size: .9em;

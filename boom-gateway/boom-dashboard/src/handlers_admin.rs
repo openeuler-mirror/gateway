@@ -2657,13 +2657,13 @@ pub async fn quota_overview(
     let team_sql = r#"
         SELECT bt.team_id,
                bt.team_alias,
-               COALESCE(kc.cnt, 0)                    AS key_count,
-               COALESCE(tin.value, 0)                 AS total_input_tokens,
-               COALESCE(tout.value, 0)                AS total_output_tokens,
-               COALESCE(tcost.value, 0)               AS total_cost_micros
+               COALESCE(kc.cnt, 0::BIGINT)            AS key_count,
+               COALESCE(tin.value, 0::BIGINT)         AS total_input_tokens,
+               COALESCE(tout.value, 0::BIGINT)        AS total_output_tokens,
+               COALESCE(tcost.value, 0::BIGINT)       AS total_cost_micros
         FROM boom_team_table bt
         LEFT JOIN (
-            SELECT team_id, COUNT(*) AS cnt
+            SELECT team_id, COUNT(*)::BIGINT AS cnt
             FROM boom_verification_token GROUP BY team_id
         ) kc ON bt.team_id = kc.team_id
         LEFT JOIN boom_rate_limit_cumulative tin
@@ -2679,7 +2679,10 @@ pub async fn quota_overview(
         Ok(r) => r,
         Err(e) => {
             tracing::error!("quota_overview team query failed: {}", e);
-            return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response();
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("quota_overview team query failed: {e}"),
+            ).into_response();
         }
     };
 
@@ -2708,10 +2711,10 @@ pub async fn quota_overview(
 
     // No-team aggregate: SQL count + LEFT JOIN cumulative per key.
     let no_team_sql = r#"
-        SELECT COUNT(*)                          AS key_count,
-               COALESCE(SUM(tin.value), 0)       AS total_input_tokens,
-               COALESCE(SUM(tout.value), 0)      AS total_output_tokens,
-               COALESCE(SUM(tcost.value), 0)     AS total_cost_micros
+        SELECT COUNT(*)::BIGINT                     AS key_count,
+               COALESCE(SUM(tin.value), 0::BIGINT)  AS total_input_tokens,
+               COALESCE(SUM(tout.value), 0::BIGINT) AS total_output_tokens,
+               COALESCE(SUM(tcost.value), 0::BIGINT) AS total_cost_micros
         FROM boom_verification_token vt
         LEFT JOIN boom_rate_limit_cumulative tin
                ON tin.cache_key  = 'kc:' || vt.token || ':tin'
@@ -2725,7 +2728,10 @@ pub async fn quota_overview(
         Ok(r) => r,
         Err(e) => {
             tracing::error!("quota_overview no_team query failed: {}", e);
-            return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response();
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("quota_overview no_team query failed: {e}"),
+            ).into_response();
         }
     };
     let no_team = json!({
@@ -2804,10 +2810,10 @@ async fn quota_keys_inner(
     let offset = (page - 1) * per_page;
 
     let sort_clause = match q.sort.as_deref().unwrap_or("cost") {
-        "tokens" => "(COALESCE(tin.value,0) + COALESCE(tout.value,0)) DESC",
+        "tokens" => "(COALESCE(tin.value,0::BIGINT) + COALESCE(tout.value,0::BIGINT)) DESC",
         "alias" => "COALESCE(vt.key_alias, vt.key_name, vt.token) ASC",
         // default: cost
-        _ => "COALESCE(tcost.value, 0) DESC",
+        _ => "COALESCE(tcost.value, 0::BIGINT) DESC",
     };
 
     let search_pattern = q.search.as_deref().map(|s| {
@@ -2821,9 +2827,9 @@ async fn quota_keys_inner(
                vt.user_id,
                vt.blocked,
                vt.created_at,
-               COALESCE(tin.value, 0)   AS total_input_tokens,
-               COALESCE(tout.value, 0)  AS total_output_tokens,
-               COALESCE(tcost.value, 0) AS total_cost_micros
+               COALESCE(tin.value, 0::BIGINT)   AS total_input_tokens,
+               COALESCE(tout.value, 0::BIGINT)  AS total_output_tokens,
+               COALESCE(tcost.value, 0::BIGINT) AS total_cost_micros
         FROM boom_verification_token vt
         LEFT JOIN boom_rate_limit_cumulative tin
                ON tin.cache_key  = 'kc:' || vt.token || ':tin'
@@ -2867,7 +2873,10 @@ async fn quota_keys_inner(
         Ok(r) => r,
         Err(e) => {
             tracing::error!("quota_keys_inner query failed: {}", e);
-            return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response();
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("quota_keys_inner query failed: {e}"),
+            ).into_response();
         }
     };
 
@@ -2886,7 +2895,10 @@ async fn quota_keys_inner(
         Ok(n) => n,
         Err(e) => {
             tracing::error!("quota_keys_inner count failed: {}", e);
-            return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response();
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("quota_keys_inner count failed: {e}"),
+            ).into_response();
         }
     };
 
@@ -2999,35 +3011,23 @@ pub async fn quota_key_windows(
             let costs_limit = wl.and_then(|w| w.costs);
 
             let mut dims = serde_json::Map::new();
-            if let Some(&(cur, _)) = counts_by_secs.get(&secs) {
-                dims.insert("counts".to_string(), json!({ "current": cur, "limit": counts_limit }));
-            } else if counts_limit.is_some() {
-                dims.insert("counts".to_string(), json!({ "current": 0u64, "limit": counts_limit }));
+            if let Some(limit) = counts_limit {
+                let cur = counts_by_secs.get(&secs).map(|&(c, _)| c).unwrap_or(0);
+                dims.insert("counts".to_string(), json!({ "current": cur, "limit": limit }));
             }
-            if let Some(&(cur, _)) = tokens_by_secs.get(&secs) {
-                dims.insert("tokens".to_string(), json!({ "current": cur, "limit": tokens_limit }));
-            } else if tokens_limit.is_some() {
-                dims.insert("tokens".to_string(), json!({ "current": 0u64, "limit": tokens_limit }));
+            if let Some(limit) = tokens_limit {
+                let cur = tokens_by_secs.get(&secs).map(|&(c, _)| c).unwrap_or(0);
+                dims.insert("tokens".to_string(), json!({ "current": cur, "limit": limit }));
             }
-            if let Some(&(cur_micros, _)) = costs_by_secs.get(&secs) {
+            if let Some(limit) = costs_limit {
+                let cur_micros = costs_by_secs.get(&secs).map(|&(c, _)| c).unwrap_or(0);
                 dims.insert(
                     "costs".to_string(),
                     json!({
                         "current_micros": cur_micros,
                         "current": boom_quota::micros_to_decimal(cur_micros).to_string(),
-                        "limit": costs_limit.map(|d| d.to_string()),
-                        "limit_micros": costs_limit.map(boom_quota::decimal_to_micros),
-                    }),
-                );
-            } else if costs_limit.is_some() {
-                let lim = costs_limit.unwrap();
-                dims.insert(
-                    "costs".to_string(),
-                    json!({
-                        "current_micros": 0u64,
-                        "current": "0",
-                        "limit": lim.to_string(),
-                        "limit_micros": boom_quota::decimal_to_micros(lim),
+                        "limit": limit.to_string(),
+                        "limit_micros": boom_quota::decimal_to_micros(limit),
                     }),
                 );
             }
