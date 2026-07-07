@@ -2633,17 +2633,20 @@ pub async fn get_prompt_log_entry(
 // ═══════════════════════════════════════════════════════════
 
 #[derive(Debug, sqlx::FromRow)]
-struct QuotaTeamOverviewRow {
-    team_id: String,
-    team_alias: Option<String>,
-    key_count: i64,
-    total_input_tokens: i64,
-    total_output_tokens: i64,
-    total_cost_micros: i64,
+struct QuotaKeyRow {
+    token: String,
+    key_alias: Option<String>,
+    key_name: Option<String>,
+    user_id: Option<String>,
+    blocked: Option<bool>,
+    created_at: Option<NaiveDateTime>,
 }
-
-/// GET /admin/quota/overview — list every team with key_count + cumulative
 /// totals, plus a synthetic "no_team" entry for keys without a team.
+///
+/// GaussDB distributed note: each SELECT is a single-table query. Cross-table
+/// JOINs against `boom_rate_limit_cumulative` fail with "relation does not
+/// exist on datanode" because that table is not distributed. We aggregate in
+/// application memory instead.
 pub async fn quota_overview(
     _session: AdminSession,
     Extension(state): Extension<std::sync::Arc<DashboardState>>,
@@ -2653,38 +2656,138 @@ pub async fn quota_overview(
         None => return Json(json!({"error": "Database not available"})).into_response(),
     };
 
-    // Team rows: one SELECT with LEFT JOINs on boom_rate_limit_cumulative.
-    let team_sql = r#"
-        SELECT bt.team_id,
-               bt.team_alias,
-               COALESCE(kc.cnt, 0::BIGINT)            AS key_count,
-               COALESCE(tin.value, 0::BIGINT)         AS total_input_tokens,
-               COALESCE(tout.value, 0::BIGINT)        AS total_output_tokens,
-               COALESCE(tcost.value, 0::BIGINT)       AS total_cost_micros
-        FROM boom_team_table bt
-        LEFT JOIN (
-            SELECT team_id, COUNT(*)::BIGINT AS cnt
-            FROM boom_verification_token GROUP BY team_id
-        ) kc ON bt.team_id = kc.team_id
-        LEFT JOIN boom_rate_limit_cumulative tin
-               ON tin.cache_key  = 'tc:' || bt.team_id || ':tin'
-        LEFT JOIN boom_rate_limit_cumulative tout
-               ON tout.cache_key = 'tc:' || bt.team_id || ':tout'
-        LEFT JOIN boom_rate_limit_cumulative tcost
-               ON tcost.cache_key = 'tc:' || bt.team_id || ':tcost'
-        ORDER BY total_cost_micros DESC, total_input_tokens DESC
-    "#;
-
-    let team_rows: Vec<QuotaTeamOverviewRow> = match sqlx::query_as(team_sql).fetch_all(db_pool).await {
+    // 1. Teams metadata.
+    let team_rows: Vec<(String, Option<String>)> = match sqlx::query_as(
+        "SELECT team_id, team_alias FROM boom_team_table",
+    )
+    .fetch_all(db_pool)
+    .await
+    {
         Ok(r) => r,
         Err(e) => {
-            tracing::error!("quota_overview team query failed: {}", e);
+            tracing::error!("quota_overview teams query failed: {}", e);
             return (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                format!("quota_overview team query failed: {e}"),
-            ).into_response();
+                format!("quota_overview teams query failed: {e}"),
+            )
+                .into_response();
         }
     };
+
+    // 2. Keys-per-team counts.
+    let key_count_rows: Vec<(Option<String>, i64)> = match sqlx::query_as(
+        "SELECT team_id, COUNT(*)::BIGINT FROM boom_verification_token GROUP BY team_id",
+    )
+    .fetch_all(db_pool)
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("quota_overview key_count query failed: {}", e);
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("quota_overview key_count query failed: {e}"),
+            )
+                .into_response();
+        }
+    };
+
+    // 3. token → team_id (so we can bucket key-level cumulative by team).
+    let token_team_rows: Vec<(String, Option<String>)> = match sqlx::query_as(
+        "SELECT token, team_id FROM boom_verification_token",
+    )
+    .fetch_all(db_pool)
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("quota_overview token_team query failed: {}", e);
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("quota_overview token_team query failed: {e}"),
+            )
+                .into_response();
+        }
+    };
+
+    // 4. All cumulative rows. Single-table scan — safe under GaussDB distributed.
+    let cum_rows: Vec<(String, i64)> = match sqlx::query_as(
+        "SELECT cache_key, value FROM boom_rate_limit_cumulative",
+    )
+    .fetch_all(db_pool)
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("quota_overview cumulative query failed: {}", e);
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("quota_overview cumulative query failed: {e}"),
+            )
+                .into_response();
+        }
+    };
+
+    // Aggregate cumulative by (scope, id) → (tin, tout, tcost).
+    // cache_key format: 'kc:{token}:{kind}' or 'tc:{team_id}:{kind}'.
+    let mut team_cum: std::collections::HashMap<String, (i64, i64, i64)> =
+        std::collections::HashMap::new();
+    let mut key_cum: std::collections::HashMap<String, (i64, i64, i64)> =
+        std::collections::HashMap::new();
+    for (cache_key, value) in &cum_rows {
+        if let Some(rest) = cache_key.strip_prefix("tc:") {
+            if let Some((id, kind)) = rest.rsplit_once(':') {
+                let e = team_cum.entry(id.to_string()).or_insert((0, 0, 0));
+                match kind {
+                    "tin" => e.0 = *value,
+                    "tout" => e.1 = *value,
+                    "tcost" => e.2 = *value,
+                    _ => {}
+                }
+            }
+            continue;
+        }
+        if let Some(rest) = cache_key.strip_prefix("kc:") {
+            if let Some((id, kind)) = rest.rsplit_once(':') {
+                let e = key_cum.entry(id.to_string()).or_insert((0, 0, 0));
+                match kind {
+                    "tin" => e.0 = *value,
+                    "tout" => e.1 = *value,
+                    "tcost" => e.2 = *value,
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // team_id → key_count.
+    let mut team_key_count: std::collections::HashMap<String, i64> =
+        std::collections::HashMap::new();
+    let mut no_team_key_count: i64 = 0;
+    for (tid, n) in &key_count_rows {
+        match tid {
+            Some(t) => {
+                team_key_count.entry(t.clone()).and_modify(|v| *v += n).or_insert(*n);
+            }
+            None => no_team_key_count += n,
+        }
+    }
+
+    // team_id of each token (for no-team cumulative aggregation).
+    let token_team: std::collections::HashMap<String, Option<String>> = token_team_rows
+        .iter()
+        .cloned()
+        .collect();
+
+    // No-team cumulative: sum key_cum for tokens whose team_id IS NULL.
+    let mut no_team_cum = (0i64, 0i64, 0i64);
+    for (token, _) in token_team_rows.iter().filter(|(_, t)| t.is_none()) {
+        if let Some(c) = key_cum.get(token) {
+            no_team_cum.0 += c.0;
+            no_team_cum.1 += c.1;
+            no_team_cum.2 += c.2;
+        }
+    }
 
     // team → plan_name lookup.
     let team_plans: std::collections::HashMap<String, String> = state
@@ -2693,57 +2796,47 @@ pub async fn quota_overview(
         .into_iter()
         .collect();
 
-    let teams: Vec<Value> = team_rows
+    // Build teams vector sorted by cost DESC, then tokens DESC.
+    let mut teams: Vec<Value> = team_rows
         .into_iter()
-        .map(|r| {
+        .map(|(team_id, team_alias)| {
+            let cum = team_cum.get(&team_id).copied().unwrap_or((0, 0, 0));
             json!({
-                "team_id": r.team_id,
-                "team_alias": r.team_alias,
-                "key_count": r.key_count,
-                "plan_name": team_plans.get(&r.team_id).cloned(),
-                "total_input_tokens": r.total_input_tokens.max(0),
-                "total_output_tokens": r.total_output_tokens.max(0),
-                "total_cost_micros": r.total_cost_micros.max(0),
-                "total_cost": boom_quota::micros_to_decimal(r.total_cost_micros.max(0) as u64).to_string(),
+                "team_id": team_id,
+                "team_alias": team_alias,
+                "key_count": team_key_count.get(&team_id).copied().unwrap_or(0),
+                "plan_name": team_plans.get(&team_id).cloned(),
+                "total_input_tokens": cum.0,
+                "total_output_tokens": cum.1,
+                "total_cost_micros": cum.2,
+                "total_cost": boom_quota::micros_to_decimal(cum.2.max(0) as u64).to_string(),
             })
         })
         .collect();
+    teams.sort_by(|a, b| {
+        let ca = a["total_cost_micros"].as_i64().unwrap_or(0);
+        let cb = b["total_cost_micros"].as_i64().unwrap_or(0);
+        cb.cmp(&ca)
+            .then_with(|| {
+                let ta = a["total_input_tokens"].as_i64().unwrap_or(0);
+                let tb = b["total_input_tokens"].as_i64().unwrap_or(0);
+                tb.cmp(&ta)
+            })
+    });
 
-    // No-team aggregate: SQL count + LEFT JOIN cumulative per key.
-    let no_team_sql = r#"
-        SELECT COUNT(*)::BIGINT                     AS key_count,
-               COALESCE(SUM(tin.value), 0::BIGINT)  AS total_input_tokens,
-               COALESCE(SUM(tout.value), 0::BIGINT) AS total_output_tokens,
-               COALESCE(SUM(tcost.value), 0::BIGINT) AS total_cost_micros
-        FROM boom_verification_token vt
-        LEFT JOIN boom_rate_limit_cumulative tin
-               ON tin.cache_key  = 'kc:' || vt.token || ':tin'
-        LEFT JOIN boom_rate_limit_cumulative tout
-               ON tout.cache_key = 'kc:' || vt.token || ':tout'
-        LEFT JOIN boom_rate_limit_cumulative tcost
-               ON tcost.cache_key = 'kc:' || vt.token || ':tcost'
-        WHERE vt.team_id IS NULL
-    "#;
-    let no_team_row: (i64, i64, i64, i64) = match sqlx::query_as(no_team_sql).fetch_one(db_pool).await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::error!("quota_overview no_team query failed: {}", e);
-            return (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                format!("quota_overview no_team query failed: {e}"),
-            ).into_response();
-        }
-    };
     let no_team = json!({
         "team_id": null,
         "team_alias": null,
-        "key_count": no_team_row.0,
+        "key_count": no_team_key_count,
         "plan_name": null,
-        "total_input_tokens": no_team_row.1.max(0),
-        "total_output_tokens": no_team_row.2.max(0),
-        "total_cost_micros": no_team_row.3.max(0),
-        "total_cost": boom_quota::micros_to_decimal(no_team_row.3.max(0) as u64).to_string(),
+        "total_input_tokens": no_team_cum.0,
+        "total_output_tokens": no_team_cum.1,
+        "total_cost_micros": no_team_cum.2,
+        "total_cost": boom_quota::micros_to_decimal(no_team_cum.2.max(0) as u64).to_string(),
     });
+
+    // Suppress unused warning while keeping the lookup map for future use.
+    let _ = token_team;
 
     Json(json!({ "teams": teams, "no_team": no_team })).into_response()
 }
@@ -2763,19 +2856,6 @@ pub struct QuotaKeysQuery {
 
 fn default_per_page_50() -> i64 {
     50
-}
-
-#[derive(Debug, sqlx::FromRow)]
-struct QuotaKeyRow {
-    token: String,
-    key_alias: Option<String>,
-    key_name: Option<String>,
-    user_id: Option<String>,
-    blocked: Option<bool>,
-    created_at: Option<NaiveDateTime>,
-    total_input_tokens: i64,
-    total_output_tokens: i64,
-    total_cost_micros: i64,
 }
 
 /// GET /admin/quota/team/{team_id} — paginated keys within one team.
@@ -2809,43 +2889,25 @@ async fn quota_keys_inner(
     let (page, per_page) = normalize_pagination(q.page, q.per_page);
     let offset = (page - 1) * per_page;
 
-    let sort_clause = match q.sort.as_deref().unwrap_or("cost") {
-        "tokens" => "(COALESCE(tin.value,0::BIGINT) + COALESCE(tout.value,0::BIGINT)) DESC",
-        "alias" => "COALESCE(vt.key_alias, vt.key_name, vt.token) ASC",
-        // default: cost
-        _ => "COALESCE(tcost.value, 0::BIGINT) DESC",
+    // Sort: only by alias / created_at. Cost/tokens sort requires cumulative
+    // data which lives in a separate (non-distributed) table — JOINs fail
+    // under GaussDB distributed. UI keeps cost/tokens options but they fall
+    // back to created_at DESC.
+    let sort_clause = match q.sort.as_deref().unwrap_or("created") {
+        "alias" => "COALESCE(key_alias, key_name, token) ASC",
+        _ => "created_at DESC",
     };
 
     let search_pattern = q.search.as_deref().map(|s| {
         format!("%{}%", s.replace('%', "\\%").replace('_', "\\_"))
     });
 
-    let base_sql = r#"
-        SELECT vt.token,
-               vt.key_alias,
-               vt.key_name,
-               vt.user_id,
-               vt.blocked,
-               vt.created_at,
-               COALESCE(tin.value, 0::BIGINT)   AS total_input_tokens,
-               COALESCE(tout.value, 0::BIGINT)  AS total_output_tokens,
-               COALESCE(tcost.value, 0::BIGINT) AS total_cost_micros
-        FROM boom_verification_token vt
-        LEFT JOIN boom_rate_limit_cumulative tin
-               ON tin.cache_key  = 'kc:' || vt.token || ':tin'
-        LEFT JOIN boom_rate_limit_cumulative tout
-               ON tout.cache_key = 'kc:' || vt.token || ':tout'
-        LEFT JOIN boom_rate_limit_cumulative tcost
-               ON tcost.cache_key = 'kc:' || vt.token || ':tcost'
-    "#;
-
-    // Build WHERE + parameters dynamically.
-    // Args order: $1 team_id (if Some), $2 search, $3 limit, $4 offset.
+    // Single-table query on boom_verification_token (no JOINs).
     let where_clause = match (&team_id, &search_pattern) {
-        (Some(_), Some(_)) => " WHERE vt.team_id = $1 AND (vt.key_alias ILIKE $2 OR vt.key_name ILIKE $2 OR vt.user_id ILIKE $2 OR vt.token ILIKE $2)",
-        (Some(_), None) => " WHERE vt.team_id = $1",
-        (None, Some(_)) => " WHERE vt.team_id IS NULL AND (vt.key_alias ILIKE $1 OR vt.key_name ILIKE $1 OR vt.user_id ILIKE $1 OR vt.token ILIKE $1)",
-        (None, None) => " WHERE vt.team_id IS NULL",
+        (Some(_), Some(_)) => " WHERE team_id = $1 AND (key_alias ILIKE $2 OR key_name ILIKE $2 OR user_id ILIKE $2 OR token ILIKE $2)",
+        (Some(_), None) => " WHERE team_id = $1",
+        (None, Some(_)) => " WHERE team_id IS NULL AND (key_alias ILIKE $1 OR key_name ILIKE $1 OR user_id ILIKE $1 OR token ILIKE $1)",
+        (None, None) => " WHERE team_id IS NULL",
     };
 
     let limit_idx = if team_id.is_some() && search_pattern.is_some() {
@@ -2857,7 +2919,7 @@ async fn quota_keys_inner(
     };
     let offset_idx = limit_idx + 1;
     let sql = format!(
-        "{base_sql}{where_clause} ORDER BY {sort_clause} LIMIT ${limit_idx} OFFSET ${offset_idx}"
+        "SELECT token, key_alias, key_name, user_id, blocked, created_at FROM boom_verification_token{where_clause} ORDER BY {sort_clause} LIMIT ${limit_idx} OFFSET ${offset_idx}"
     );
 
     let mut query = sqlx::query_as::<_, QuotaKeyRow>(&sql);
@@ -2876,14 +2938,13 @@ async fn quota_keys_inner(
             return (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 format!("quota_keys_inner query failed: {e}"),
-            ).into_response();
+            )
+                .into_response();
         }
     };
 
     // Total count with same WHERE.
-    let count_sql = format!(
-        "SELECT COUNT(*) FROM boom_verification_token vt{where_clause}"
-    );
+    let count_sql = format!("SELECT COUNT(*) FROM boom_verification_token{where_clause}");
     let mut count_query = sqlx::query_scalar::<_, i64>(&count_sql);
     if let Some(tid) = &team_id {
         count_query = count_query.bind(tid);
@@ -2898,9 +2959,57 @@ async fn quota_keys_inner(
             return (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 format!("quota_keys_inner count failed: {e}"),
-            ).into_response();
+            )
+                .into_response();
         }
     };
+
+    // Cumulative lookup for these tokens via IN list (50 keys × 3 kinds = 150).
+    let mut key_cum: std::collections::HashMap<String, (i64, i64, i64)> =
+        std::collections::HashMap::new();
+    if !rows.is_empty() {
+        let cache_keys: Vec<String> = rows
+            .iter()
+            .flat_map(|r| {
+                vec![
+                    format!("kc:{}:tin", r.token),
+                    format!("kc:{}:tout", r.token),
+                    format!("kc:{}:tcost", r.token),
+                ]
+            })
+            .collect();
+        let placeholders: Vec<String> =
+            (1..=cache_keys.len()).map(|i| format!("${i}")).collect();
+        let cum_sql = format!(
+            "SELECT cache_key, value FROM boom_rate_limit_cumulative WHERE cache_key IN ({})",
+            placeholders.join(", ")
+        );
+        let mut cum_query = sqlx::query_as::<_, (String, i64)>(&cum_sql);
+        for ck in &cache_keys {
+            cum_query = cum_query.bind(ck);
+        }
+        match cum_query.fetch_all(db_pool).await {
+            Ok(cum_rows) => {
+                for (cache_key, value) in cum_rows {
+                    if let Some(rest) = cache_key.strip_prefix("kc:") {
+                        if let Some((token, kind)) = rest.rsplit_once(':') {
+                            let e = key_cum.entry(token.to_string()).or_insert((0, 0, 0));
+                            match kind {
+                                "tin" => e.0 = value,
+                                "tout" => e.1 = value,
+                                "tcost" => e.2 = value,
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("quota_keys_inner cumulative fetch failed: {}", e);
+                // Non-fatal: proceed with zeroed cumulative.
+            }
+        }
+    }
 
     let keys: Vec<Value> = rows
         .into_iter()
@@ -2912,6 +3021,7 @@ async fn quota_keys_inner(
                 .or_else(|| state.plan_store.get_default_plan())
                 .map(|p| p.name);
             let concurrency = state.plan_store.get_concurrency(&key_hash);
+            let cum = key_cum.get(&r.token).copied().unwrap_or((0, 0, 0));
             json!({
                 "token": r.token,
                 "token_prefix": format!("{}...", &r.token[..8.min(r.token.len())]),
@@ -2922,10 +3032,10 @@ async fn quota_keys_inner(
                 "created_at": r.created_at.map(|d| d.to_string()),
                 "plan_name": plan_name,
                 "concurrency": concurrency,
-                "total_input_tokens": r.total_input_tokens.max(0),
-                "total_output_tokens": r.total_output_tokens.max(0),
-                "total_cost_micros": r.total_cost_micros.max(0),
-                "total_cost": boom_quota::micros_to_decimal(r.total_cost_micros.max(0) as u64).to_string(),
+                "total_input_tokens": cum.0,
+                "total_output_tokens": cum.1,
+                "total_cost_micros": cum.2,
+                "total_cost": boom_quota::micros_to_decimal(cum.2.max(0) as u64).to_string(),
             })
         })
         .collect();
