@@ -92,13 +92,20 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
     // every datanode. Without this, single-table queries still get routed
     // to a datanode where the table doesn't exist ("relation does not exist
     // on datanode"). Idempotent — REPLICATION is a no-op if already set.
-    // Errors are swallowed: vanilla Postgres / single-node openGauss don't
-    // support DISTRIBUTE BY syntax.
-    let _ = sqlx::query(
+    // Errors are warned (not fatal): vanilla Postgres / single-node
+    // openGauss don't support DISTRIBUTE BY syntax.
+    match sqlx::query(
         "ALTER TABLE boom_rate_limit_cumulative DISTRIBUTE BY REPLICATION",
     )
     .execute(&mut *conn)
-    .await;
+    .await
+    {
+        Ok(_) => tracing::info!("Migration 6c: ALTER DISTRIBUTE BY REPLICATION ok"),
+        Err(e) => tracing::warn!(
+            "Migration 6c: ALTER DISTRIBUTE BY REPLICATION failed (continuing): {}",
+            e
+        ),
+    }
     tracing::info!("Migration 6c/13: done");
 
     // 4. KV config store (dashboard-owned).
