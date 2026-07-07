@@ -2804,7 +2804,12 @@
         </div>
         <div class="quota-card-actions">
           <button class="btn-small" onclick="location.hash='#/admin/quota/team/${encodeURIComponent(t1.team_id)}'">${t("quota.view_detail")}</button>
-          <button class="btn-danger" onclick="window._quotaResetTeam('${esc(t1.team_id)}')">${t("quota.reset_team")}</button>
+          <select class="search-input" style="max-width:140px" onchange="window._quotaTeamAction('${esc(t1.team_id)}', this.value); this.value=''">
+            <option value="">${esc(t("quota.actions_label"))}</option>
+            <option value="cumulative">${esc(t("quota.reset_cumulative"))}</option>
+            <option value="windows">${esc(t("quota.reset_windows"))}</option>
+            <option value="all">${esc(t("quota.reset_all"))}</option>
+          </select>
         </div>
       </div>`;
     };
@@ -2862,7 +2867,12 @@
           <option value="tokens">${t("quota.sort.tokens")}</option>
           <option value="alias">${t("quota.sort.alias")}</option>
         </select>
-        ${teamId ? `<button class="btn-danger" id="quota-reset-team-top">${t("quota.reset_team")}</button>` : ""}
+        ${teamId ? `<select class="search-input" style="max-width:140px" id="quota-team-action-top" onchange="window._quotaTeamAction('${esc(teamId)}', this.value); this.value=''">
+          <option value="">${esc(t("quota.actions_label"))}</option>
+          <option value="cumulative">${esc(t("quota.reset_cumulative"))}</option>
+          <option value="windows">${esc(t("quota.reset_windows"))}</option>
+          <option value="all">${esc(t("quota.reset_all"))}</option>
+        </select>` : ""}
       </div>
       <div id="quota-keys-table-wrap"></div>
       <div id="quota-keys-pagination" class="pagination"></div>
@@ -2882,9 +2892,6 @@
       quotaKeysPage = 1;
       _loadQuotaKeys(teamId);
     });
-    if (teamId) {
-      document.getElementById("quota-reset-team-top").addEventListener("click", () => window._quotaResetTeam(teamId));
-    }
 
     await _loadQuotaKeys(teamId);
   }
@@ -2936,7 +2943,12 @@
           <td>$${esc(k.total_cost || "0")}</td>
           <td>
             <button class="btn-small" onclick="window._quotaToggleWindows('${esc(k.token)}', this)">${t("quota.expand_windows")}</button>
-            <button class="btn-danger" onclick="window._quotaResetKey('${esc(k.token)}')">${t("quota.reset_key")}</button>
+            <select class="search-input" style="max-width:120px" onchange="window._quotaKeyAction('${esc(k.token)}', this.value); this.value=''">
+              <option value="">${esc(t("quota.actions_label"))}</option>
+              <option value="cumulative">${esc(t("quota.reset_cumulative"))}</option>
+              <option value="windows">${esc(t("quota.reset_windows"))}</option>
+              <option value="all">${esc(t("quota.reset_all"))}</option>
+            </select>
           </td>
         </tr>
         <tr class="quota-windows-row" id="quota-windows-${esc(k.token)}" style="display:none">
@@ -3026,10 +3038,17 @@
     }).join("");
   }
 
-  window._quotaResetKey = async (token) => {
-    if (!confirm(t("quota.confirm_reset_key"))) return;
+  window._quotaKeyAction = async (token, scope) => {
+    if (!scope) return;
+    const confirmKey = scope === "cumulative"
+      ? "quota.confirm_reset_key_cumulative"
+      : scope === "windows"
+      ? "quota.confirm_reset_key_windows"
+      : "quota.confirm_reset_key_all";
+    if (!confirm(t(confirmKey))) return;
+    const suffix = scope === "all" ? "" : `/${scope}`;
     try {
-      await api(`/admin/quota/reset/key/${encodeURIComponent(token)}`, { method: "POST" });
+      await api(`/admin/quota/reset/key/${encodeURIComponent(token)}${suffix}`, { method: "POST" });
       const tid = _currentQuotaTeamId();
       _loadQuotaKeys(tid);
     } catch (err) {
@@ -3037,12 +3056,23 @@
     }
   };
 
-  window._quotaResetTeam = async (teamId) => {
-    if (!confirm(t("quota.confirm_reset_team"))) return;
+  window._quotaTeamAction = async (teamId, scope) => {
+    if (!scope) return;
+    const confirmKey = scope === "cumulative"
+      ? "quota.confirm_reset_team_cumulative"
+      : scope === "windows"
+      ? "quota.confirm_reset_team_windows"
+      : "quota.confirm_reset_team_all";
+    if (!confirm(t(confirmKey))) return;
+    const suffix = scope === "all" ? "" : `/${scope}`;
     try {
-      await api(`/admin/quota/reset/team/${encodeURIComponent(teamId)}`, { method: "POST" });
-      // Stay on detail page; just refresh.
-      _loadQuotaKeys(teamId);
+      await api(`/admin/quota/reset/team/${encodeURIComponent(teamId)}${suffix}`, { method: "POST" });
+      // Refresh either detail page (if on team detail) or overview (if on overview).
+      if (location.hash.includes("/admin/quota/team/")) {
+        _loadQuotaKeys(teamId);
+      } else {
+        loadQuotaOverview();
+      }
     } catch (err) {
       alert("Reset failed: " + err.message);
     }

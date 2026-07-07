@@ -197,6 +197,22 @@ pub fn build_router<S: Clone + Send + Sync + 'static>(state: DashboardState) -> 
             "/dashboard/api/admin/quota/reset/team/{team_id}",
             post(handlers_admin::quota_reset_team),
         )
+        .route(
+            "/dashboard/api/admin/quota/reset/key/{key_hash}/cumulative",
+            post(handlers_admin::quota_reset_key_cumulative),
+        )
+        .route(
+            "/dashboard/api/admin/quota/reset/key/{key_hash}/windows",
+            post(handlers_admin::quota_reset_key_windows),
+        )
+        .route(
+            "/dashboard/api/admin/quota/reset/team/{team_id}/cumulative",
+            post(handlers_admin::quota_reset_team_cumulative),
+        )
+        .route(
+            "/dashboard/api/admin/quota/reset/team/{team_id}/windows",
+            post(handlers_admin::quota_reset_team_windows),
+        )
         // Admin — Debug error recording.
         .route(
             "/dashboard/api/admin/debug/status",

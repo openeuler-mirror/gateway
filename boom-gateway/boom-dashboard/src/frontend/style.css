@@ -1509,6 +1509,7 @@ input[list] {
   align-items: center;
   gap: 10px;
   margin: 8px 0;
+  overflow: hidden;
 }
 .dim-label {
   flex: 0 0 90px;
@@ -1519,14 +1520,17 @@ input[list] {
   letter-spacing: .03em;
 }
 .dim-value {
-  flex: 1 1 auto;
+  flex: 0 0 auto;
+  white-space: nowrap;
+  text-align: right;
   font-size: 13px;
   font-weight: 600;
   color: var(--text);
   font-family: var(--mono);
 }
 .dim-row .progress-bar {
-  flex: 1 1 auto;
+  flex: 1 1 0;
+  min-width: 80px;
   margin-bottom: 0;
 }
 

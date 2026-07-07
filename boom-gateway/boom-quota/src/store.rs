@@ -522,6 +522,149 @@ impl QuotaStore {
         Ok(())
     }
 
+    /// Clear ONLY a key's cumulative counters (memory + DB), leaving windows
+    /// untouched. If `team_id` is provided, the same delta is subtracted from
+    /// the team's cumulative so the rollup stays consistent with member sum.
+    /// Returns the pre-reset key cumulative: (input, output, cost_micros).
+    pub async fn clear_key_cumulative_db(
+        &self,
+        pool: &sqlx::PgPool,
+        key_hash: &str,
+        team_id: Option<&str>,
+    ) -> Result<(u64, u64, u64), sqlx::Error> {
+        let prev = self.reset_key_cumulative_local(key_hash);
+        // DB: delete key cumulative rows.
+        sqlx::query(r#"DELETE FROM boom_rate_limit_cumulative WHERE cache_key LIKE $1"#)
+            .bind(format!("kc:{}:%", key_hash))
+            .execute(pool)
+            .await?;
+
+        // Cascade the subtraction to team rollup (keeps team = Σ members).
+        if let Some(tid) = team_id {
+            let team_scope = QuotaScope::Team {
+                team_id: tid.to_string(),
+            };
+            // i64 arithmetic — subtracting never underflows in practice
+            // because team cumulative ≥ any single member's contribution.
+            self.add_cumulative_signed(
+                &team_scope,
+                CumulativeKind::TotalInputTokens,
+                -(prev.0 as i64),
+            );
+            self.add_cumulative_signed(
+                &team_scope,
+                CumulativeKind::TotalOutputTokens,
+                -(prev.1 as i64),
+            );
+            self.add_cumulative_signed(
+                &team_scope,
+                CumulativeKind::TotalCost,
+                -(prev.2 as i64),
+            );
+        }
+        Ok(prev)
+    }
+
+    /// Clear ONLY a key's windows (memory + DB), cumulative untouched.
+    /// Returns count of window entries removed from memory.
+    pub async fn clear_key_windows_db(
+        &self,
+        pool: &sqlx::PgPool,
+        key_hash: &str,
+    ) -> Result<usize, sqlx::Error> {
+        let prefix = format!("kw:{}:", key_hash);
+        let before = self.windows.len();
+        self.windows.retain(|k, _| !k.starts_with(&prefix));
+        let removed = before - self.windows.len();
+
+        sqlx::query(r#"DELETE FROM boom_rate_limit_state WHERE cache_key LIKE $1"#)
+            .bind(format!("kw:{}:%", key_hash))
+            .execute(pool)
+            .await?;
+        Ok(removed)
+    }
+
+    /// Clear ONLY the team's + member keys' cumulative counters (memory + DB),
+    /// windows untouched. The team row is zeroed directly (not derived), so
+    /// member per-key audit history is also cleared.
+    pub async fn clear_team_cumulative_db(
+        &self,
+        pool: &sqlx::PgPool,
+        team_id: &str,
+        member_keys: &[String],
+    ) -> Result<TeamRecomputeResult, sqlx::Error> {
+        // DB: team cumulative rows first.
+        sqlx::query(r#"DELETE FROM boom_rate_limit_cumulative WHERE cache_key LIKE $1"#)
+            .bind(format!("tc:{}:%", team_id))
+            .execute(pool)
+            .await?;
+        // Memory: clear team cumulative.
+        let team_prefix = format!("tc:{}:", team_id);
+        self.cumulative.retain(|k, _| !k.starts_with(&team_prefix));
+
+        // Cascade: clear each member key's cumulative (no further team adjustment —
+        // team row is independent and already zeroed above).
+        for kh in member_keys {
+            self.clear_key_cumulative_db(pool, kh, None).await?;
+        }
+        Ok(TeamRecomputeResult::default())
+    }
+
+    /// Clear ONLY the team's + member keys' windows (memory + DB),
+    /// cumulative untouched.
+    pub async fn clear_team_windows_db(
+        &self,
+        pool: &sqlx::PgPool,
+        team_id: &str,
+        member_keys: &[String],
+    ) -> Result<usize, sqlx::Error> {
+        // DB: team windows first.
+        sqlx::query(r#"DELETE FROM boom_rate_limit_state WHERE cache_key LIKE $1"#)
+            .bind(format!("tw:{}:%", team_id))
+            .execute(pool)
+            .await?;
+        // Memory: clear team windows.
+        let team_window_prefix = format!("tw:{}:", team_id);
+        let mut removed = 0;
+        self.windows.retain(|k, _| {
+            if k.starts_with(&team_window_prefix) {
+                removed += 1;
+                false
+            } else {
+                true
+            }
+        });
+
+        // Cascade: clear each member key's windows.
+        for kh in member_keys {
+            let r = self.clear_key_windows_db(pool, kh).await?;
+            removed += r;
+        }
+        Ok(removed)
+    }
+
+    /// Like `add_cumulative` but accepts signed delta. Used when subtracting
+    /// a member's pre-reset value from the team rollup.
+    fn add_cumulative_signed(
+        &self,
+        scope: &QuotaScope,
+        kind: CumulativeKind,
+        delta: i64,
+    ) {
+        if delta == 0 {
+            return;
+        }
+        let key = cumulative_cache_key(scope, kind);
+        {
+            let mut entry = self
+                .cumulative
+                .entry(key.clone())
+                .or_insert_with(|| 0i64);
+            *entry += delta;
+        }
+        self.mark_dirty_cumulative(&key);
+    }
+
     /// Recompute a team's cumulative counters by SUM-ing member keys' rows.
     /// Overwrites the team row in memory and DB. Does NOT touch windows
     /// (they auto-expire). O(team_size) — does not scan boom_request_log.

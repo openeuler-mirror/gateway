@@ -2989,15 +2989,6 @@ async fn quota_keys_inner(
     let (page, per_page) = normalize_pagination(q.page, q.per_page);
     let offset = (page - 1) * per_page;
 
-    // Sort: only by alias / created_at. Cost/tokens sort requires cumulative
-    // data which lives in a separate (non-distributed) table — JOINs fail
-    // under GaussDB distributed. UI keeps cost/tokens options but they fall
-    // back to created_at DESC.
-    let sort_clause = match q.sort.as_deref().unwrap_or("created") {
-        "alias" => "COALESCE(key_alias, key_name, token) ASC",
-        _ => "created_at DESC",
-    };
-
     let search_pattern = q.search.as_deref().map(|s| {
         format!("%{}%", s.replace('%', "\\%").replace('_', "\\_"))
     });
@@ -3010,36 +3001,90 @@ async fn quota_keys_inner(
         (None, None) => " WHERE team_id IS NULL",
     };
 
-    let limit_idx = if team_id.is_some() && search_pattern.is_some() {
-        3
-    } else if team_id.is_some() || search_pattern.is_some() {
-        2
+    // ── Branch on sort mode ──
+    // For alias / created_at: SQL-side sort + pagination (cheap, scalable).
+    // For cost / tokens: fetch full result set (capped at 5000), look up
+    // cumulative via IN-list single-table query, then sort + slice in memory.
+    // GaussDB distributed mode forbids cross-table JOINs, so the cumulative
+    // lookup has to happen as a separate single-table SELECT regardless.
+    let in_memory_sort = matches!(q.sort.as_deref(), Some("cost") | Some("tokens"));
+
+    let mut sort_truncated = false;
+    let rows: Vec<QuotaKeyRow> = if in_memory_sort {
+        // ── In-memory sort path: fetch up to 5001 rows to detect truncation.
+        const IN_MEMORY_SORT_CAP: i64 = 5000;
+        let limit_idx = if team_id.is_some() && search_pattern.is_some() {
+            3
+        } else if team_id.is_some() || search_pattern.is_some() {
+            2
+        } else {
+            1
+        };
+        let sql = format!(
+            "SELECT token, key_alias, key_name, user_id, blocked, created_at \
+             FROM boom_verification_token{where_clause} \
+             ORDER BY created_at DESC LIMIT ${limit_idx}"
+        );
+        let mut query = sqlx::query_as::<_, QuotaKeyRow>(&sql);
+        if let Some(tid) = &team_id {
+            query = query.bind(tid);
+        }
+        if let Some(pat) = &search_pattern {
+            query = query.bind(pat);
+        }
+        query = query.bind(IN_MEMORY_SORT_CAP + 1);
+        let mut fetched: Vec<QuotaKeyRow> = match query.fetch_all(db_pool).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("quota_keys_inner in-memory sort query failed: {}", e);
+                return (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("quota_keys_inner query failed: {e}"),
+                )
+                    .into_response();
+            }
+        };
+        if fetched.len() as i64 > IN_MEMORY_SORT_CAP {
+            sort_truncated = true;
+            fetched.truncate(IN_MEMORY_SORT_CAP as usize);
+        }
+        fetched
     } else {
-        1
-    };
-    let offset_idx = limit_idx + 1;
-    let sql = format!(
-        "SELECT token, key_alias, key_name, user_id, blocked, created_at FROM boom_verification_token{where_clause} ORDER BY {sort_clause} LIMIT ${limit_idx} OFFSET ${offset_idx}"
-    );
+        // ── SQL-side sort path ──
+        let sort_clause = match q.sort.as_deref().unwrap_or("created") {
+            "alias" => "COALESCE(key_alias, key_name, token) ASC",
+            _ => "created_at DESC",
+        };
+        let limit_idx = if team_id.is_some() && search_pattern.is_some() {
+            3
+        } else if team_id.is_some() || search_pattern.is_some() {
+            2
+        } else {
+            1
+        };
+        let offset_idx = limit_idx + 1;
+        let sql = format!(
+            "SELECT token, key_alias, key_name, user_id, blocked, created_at FROM boom_verification_token{where_clause} ORDER BY {sort_clause} LIMIT ${limit_idx} OFFSET ${offset_idx}"
+        );
 
-    let mut query = sqlx::query_as::<_, QuotaKeyRow>(&sql);
-    if let Some(tid) = &team_id {
-        query = query.bind(tid);
-    }
-    if let Some(pat) = &search_pattern {
-        query = query.bind(pat);
-    }
-    query = query.bind(per_page).bind(offset);
-
-    let rows: Vec<QuotaKeyRow> = match query.fetch_all(db_pool).await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::error!("quota_keys_inner query failed: {}", e);
-            return (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                format!("quota_keys_inner query failed: {e}"),
-            )
-                .into_response();
+        let mut query = sqlx::query_as::<_, QuotaKeyRow>(&sql);
+        if let Some(tid) = &team_id {
+            query = query.bind(tid);
+        }
+        if let Some(pat) = &search_pattern {
+            query = query.bind(pat);
+        }
+        query = query.bind(per_page).bind(offset);
+        match query.fetch_all(db_pool).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("quota_keys_inner query failed: {}", e);
+                return (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("quota_keys_inner query failed: {e}"),
+                )
+                    .into_response();
+            }
         }
     };
 
@@ -3064,7 +3109,8 @@ async fn quota_keys_inner(
         }
     };
 
-    // Cumulative lookup for these tokens via IN list (50 keys × 3 kinds = 150).
+    // Cumulative lookup for these tokens via IN list.
+    // In in-memory-sort mode rows may be up to 5000, so up to 15000 cache_keys.
     let mut key_cum: std::collections::HashMap<String, (i64, i64, i64)> =
         std::collections::HashMap::new();
     if !rows.is_empty() {
@@ -3111,7 +3157,42 @@ async fn quota_keys_inner(
         }
     }
 
-    let keys: Vec<Value> = rows
+    // In-memory sort + page slice (only for cost/tokens mode).
+    let page_rows: Vec<QuotaKeyRow> = if in_memory_sort {
+        let mut sortable: Vec<(QuotaKeyRow, (i64, i64, i64))> = rows
+            .into_iter()
+            .map(|r| {
+                let c = key_cum.get(&r.token).copied().unwrap_or((0, 0, 0));
+                (r, c)
+            })
+            .collect();
+        match q.sort.as_deref() {
+            Some("cost") => {
+                sortable.sort_by(|a, b| {
+                    // DESC by tcost, tiebreak by tokens DESC.
+                    b.1.2.cmp(&a.1.2)
+                        .then_with(|| (b.1.0 + b.1.1).cmp(&(a.1.0 + a.1.1)))
+                });
+            }
+            Some("tokens") => {
+                sortable.sort_by(|a, b| {
+                    // DESC by tin+tout, tiebreak by tcost DESC.
+                    (b.1.0 + b.1.1).cmp(&(a.1.0 + a.1.1)).then_with(|| b.1.2.cmp(&a.1.2))
+                });
+            }
+            _ => {}
+        }
+        sortable
+            .into_iter()
+            .skip(offset as usize)
+            .take(per_page as usize)
+            .map(|(r, _)| r)
+            .collect()
+    } else {
+        rows
+    };
+
+    let keys: Vec<Value> = page_rows
         .into_iter()
         .map(|r| {
             let key_hash = r.token.clone();
@@ -3146,6 +3227,7 @@ async fn quota_keys_inner(
         "per_page": per_page,
         "total": total,
         "team_id": team_id,
+        "sort_truncated": sort_truncated,
     }))
     .into_response()
 }
@@ -3288,7 +3370,8 @@ pub async fn quota_key_windows(
 }
 
 /// POST /admin/quota/reset/key/{key_hash} — clear one key's cumulative +
-/// window counters (memory + DB). Returns previous cumulative values.
+/// window counters (memory + DB). Also clears SlidingWindowLimiter counts.
+/// Returns previous cumulative values.
 pub async fn quota_reset_key(
     _session: AdminSession,
     Extension(state): Extension<std::sync::Arc<DashboardState>>,
@@ -3298,11 +3381,17 @@ pub async fn quota_reset_key(
         Some(pool) => pool,
         None => return Json(json!({"error": "Database not available"})).into_response(),
     };
+    let limiter_cleared = state.limiter.clear_for_key(&key_hash);
     match state.quota_store.clear_key_all(db_pool, &key_hash).await {
         Ok((tin, tout, tcost)) => {
-            tracing::info!(key_hash = %key_hash, "Admin reset key quota");
+            let _ = state
+                .admin_tx
+                .send(crate::state::AdminCommand::ConfigChanged)
+                .await;
+            tracing::info!(key_hash = %key_hash, limiter_cleared, "Admin reset key quota");
             Json(json!({
                 "key_hash": key_hash,
+                "limiter_windows_cleared": limiter_cleared,
                 "previous": {
                     "total_input_tokens": tin,
                     "total_output_tokens": tout,
@@ -3345,22 +3434,270 @@ pub async fn quota_reset_team(
         Ok(v) => v,
         Err(e) => {
             tracing::error!("quota_reset_team member fetch failed: {}", e);
-            return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response();
+            return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("member fetch failed: {e}")).into_response();
         }
     };
+
+    // Clear limiter counts for team + each member (limiter cache_key has no
+    // team dimension, so we iterate member keys).
+    let mut limiter_cleared = 0usize;
+    for kh in &member_keys {
+        limiter_cleared += state.limiter.clear_for_key(kh);
+    }
 
     let member_count = member_keys.len();
     match state.quota_store.reset_team_all(db_pool, &team_id, &member_keys).await {
         Ok(()) => {
-            tracing::info!(team_id = %team_id, member_count, "Admin reset team quota");
+            let _ = state
+                .admin_tx
+                .send(crate::state::AdminCommand::ConfigChanged)
+                .await;
+            tracing::info!(team_id = %team_id, member_count, limiter_cleared, "Admin reset team quota");
             Json(json!({
                 "team_id": team_id,
                 "member_keys_reset": member_count,
+                "limiter_windows_cleared": limiter_cleared,
             }))
             .into_response()
         }
         Err(e) => {
             tracing::error!("quota_reset_team failed: {}", e);
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("Reset failed: {}", e)})),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// POST /admin/quota/reset/key/{key_hash}/cumulative — clear only cumulative
+/// counters (memory + DB). Subtracts the pre-reset value from the key's team
+/// rollup so team = Σ members stays consistent. Windows untouched.
+pub async fn quota_reset_key_cumulative(
+    _session: AdminSession,
+    Extension(state): Extension<std::sync::Arc<DashboardState>>,
+    Path(key_hash): Path<String>,
+) -> Response {
+    let db_pool = match &state.db_pool {
+        Some(pool) => pool,
+        None => return Json(json!({"error": "Database not available"})).into_response(),
+    };
+
+    // Look up the key's team (for rollup subtraction). None if no team.
+    let team_id: Option<String> = match sqlx::query_scalar::<_, String>(
+        r#"SELECT team_id FROM boom_verification_token WHERE token = $1"#,
+    )
+    .bind(&key_hash)
+    .fetch_optional(db_pool)
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!("quota_reset_key_cumulative team lookup failed: {}", e);
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("team lookup failed: {e}"),
+            )
+                .into_response();
+        }
+    };
+
+    match state
+        .quota_store
+        .clear_key_cumulative_db(db_pool, &key_hash, team_id.as_deref())
+        .await
+    {
+        Ok((tin, tout, tcost)) => {
+            let _ = state
+                .admin_tx
+                .send(crate::state::AdminCommand::ConfigChanged)
+                .await;
+            tracing::info!(key_hash = %key_hash, team_id = ?team_id, "Admin reset key cumulative");
+            Json(json!({
+                "key_hash": key_hash,
+                "team_id": team_id,
+                "scope": "cumulative",
+                "previous": {
+                    "total_input_tokens": tin,
+                    "total_output_tokens": tout,
+                    "total_cost_micros": tcost,
+                    "total_cost": boom_quota::micros_to_decimal(tcost).to_string(),
+                },
+            }))
+            .into_response()
+        }
+        Err(e) => {
+            tracing::error!("quota_reset_key_cumulative failed: {}", e);
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("Reset failed: {}", e)})),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// POST /admin/quota/reset/key/{key_hash}/windows — clear only current
+/// windows: SlidingWindowLimiter counts + QuotaStore tokens/costs windows.
+/// Cumulative counters untouched.
+pub async fn quota_reset_key_windows(
+    _session: AdminSession,
+    Extension(state): Extension<std::sync::Arc<DashboardState>>,
+    Path(key_hash): Path<String>,
+) -> Response {
+    let db_pool = match &state.db_pool {
+        Some(pool) => pool,
+        None => return Json(json!({"error": "Database not available"})).into_response(),
+    };
+    let limiter_cleared = state.limiter.clear_for_key(&key_hash);
+    match state
+        .quota_store
+        .clear_key_windows_db(db_pool, &key_hash)
+        .await
+    {
+        Ok(quota_windows_cleared) => {
+            let _ = state
+                .admin_tx
+                .send(crate::state::AdminCommand::ConfigChanged)
+                .await;
+            tracing::info!(key_hash = %key_hash, limiter_cleared, quota_windows_cleared, "Admin reset key windows");
+            Json(json!({
+                "key_hash": key_hash,
+                "scope": "windows",
+                "limiter_windows_cleared": limiter_cleared,
+                "quota_windows_cleared": quota_windows_cleared,
+            }))
+            .into_response()
+        }
+        Err(e) => {
+            tracing::error!("quota_reset_key_windows failed: {}", e);
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("Reset failed: {}", e)})),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// POST /admin/quota/reset/team/{team_id}/cumulative — clear team cumulative +
+/// cascade to member keys. Windows untouched.
+pub async fn quota_reset_team_cumulative(
+    _session: AdminSession,
+    Extension(state): Extension<std::sync::Arc<DashboardState>>,
+    Path(team_id): Path<String>,
+) -> Response {
+    let db_pool = match &state.db_pool {
+        Some(pool) => pool,
+        None => return Json(json!({"error": "Database not available"})).into_response(),
+    };
+    let member_keys: Vec<String> = match sqlx::query_scalar::<_, String>(
+        r#"SELECT token FROM boom_verification_token WHERE team_id = $1"#,
+    )
+    .bind(&team_id)
+    .fetch_all(db_pool)
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!("quota_reset_team_cumulative member fetch failed: {}", e);
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("member fetch failed: {e}"),
+            )
+                .into_response();
+        }
+    };
+    let member_count = member_keys.len();
+    match state
+        .quota_store
+        .clear_team_cumulative_db(db_pool, &team_id, &member_keys)
+        .await
+    {
+        Ok(_) => {
+            let _ = state
+                .admin_tx
+                .send(crate::state::AdminCommand::ConfigChanged)
+                .await;
+            tracing::info!(team_id = %team_id, member_count, "Admin reset team cumulative");
+            Json(json!({
+                "team_id": team_id,
+                "scope": "cumulative",
+                "member_keys_reset": member_count,
+            }))
+            .into_response()
+        }
+        Err(e) => {
+            tracing::error!("quota_reset_team_cumulative failed: {}", e);
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("Reset failed: {}", e)})),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// POST /admin/quota/reset/team/{team_id}/windows — clear team windows +
+/// member keys' windows (limiter counts + QuotaStore windows).
+/// Cumulative untouched.
+pub async fn quota_reset_team_windows(
+    _session: AdminSession,
+    Extension(state): Extension<std::sync::Arc<DashboardState>>,
+    Path(team_id): Path<String>,
+) -> Response {
+    let db_pool = match &state.db_pool {
+        Some(pool) => pool,
+        None => return Json(json!({"error": "Database not available"})).into_response(),
+    };
+    let member_keys: Vec<String> = match sqlx::query_scalar::<_, String>(
+        r#"SELECT token FROM boom_verification_token WHERE team_id = $1"#,
+    )
+    .bind(&team_id)
+    .fetch_all(db_pool)
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!("quota_reset_team_windows member fetch failed: {}", e);
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("member fetch failed: {e}"),
+            )
+                .into_response();
+        }
+    };
+
+    // Clear limiter counts for each member (limiter cache_key has no team dim).
+    let mut limiter_cleared = 0usize;
+    for kh in &member_keys {
+        limiter_cleared += state.limiter.clear_for_key(kh);
+    }
+
+    let member_count = member_keys.len();
+    match state
+        .quota_store
+        .clear_team_windows_db(db_pool, &team_id, &member_keys)
+        .await
+    {
+        Ok(quota_windows_cleared) => {
+            let _ = state
+                .admin_tx
+                .send(crate::state::AdminCommand::ConfigChanged)
+                .await;
+            tracing::info!(team_id = %team_id, member_count, limiter_cleared, quota_windows_cleared, "Admin reset team windows");
+            Json(json!({
+                "team_id": team_id,
+                "scope": "windows",
+                "member_keys_reset": member_count,
+                "limiter_windows_cleared": limiter_cleared,
+                "quota_windows_cleared": quota_windows_cleared,
+            }))
+            .into_response()
+        }
+        Err(e) => {
+            tracing::error!("quota_reset_team_windows failed: {}", e);
             (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("Reset failed: {}", e)})),
