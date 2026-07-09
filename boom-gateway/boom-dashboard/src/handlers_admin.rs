@@ -37,15 +37,13 @@ pub struct UpsertPlanRequest {
     pub rpm_limit: Option<u64>,
     #[serde(default)]
     pub tpm_limit: Option<u64>,
-    #[serde(default)]
-    pub cost_limit: Option<rust_decimal::Decimal>,
     #[serde(
         default,
         deserialize_with = "boom_core::types::deserialize_window_limit_vec"
     )]
     pub window_limits: Vec<boom_core::types::WindowLimit>,
     #[serde(default)]
-    pub total_tpm_limit: Option<u64>,
+    pub total_token_limit: Option<u64>,
     #[serde(default)]
     pub total_cost_limit: Option<rust_decimal::Decimal>,
     #[serde(default)]
@@ -64,9 +62,8 @@ pub async fn upsert_plan(
         concurrency_limit: req.concurrency_limit,
         rpm_limit: req.rpm_limit,
         tpm_limit: req.tpm_limit,
-        cost_limit: req.cost_limit,
         window_limits: req.window_limits,
-        total_tpm_limit: req.total_tpm_limit,
+        total_token_limit: req.total_token_limit,
         total_cost_limit: req.total_cost_limit,
         schedule: req.schedule.clone(),
     };
@@ -1270,93 +1267,6 @@ pub async fn delete_alias(
             Json(json!({"error": "Internal error"})).into_response()
         }
     }
-}
-
-// ═══════════════════════════════════════════════════════════
-// Config management (boom_config KV store)
-// ═══════════════════════════════════════════════════════════
-
-pub async fn get_config(
-    _session: AdminSession,
-    Extension(state): Extension<std::sync::Arc<DashboardState>>,
-) -> Response {
-    let db_pool = match &state.db_pool {
-        Some(pool) => pool,
-        None => {
-            return Json(json!({"error": "Database not available"})).into_response();
-        }
-    };
-
-    #[derive(Debug, FromRow)]
-    #[allow(dead_code)]
-    struct ConfigRow {
-        key: String,
-        value: serde_json::Value,
-        updated_at: Option<chrono::DateTime<chrono::Utc>>,
-    }
-
-    let rows: Vec<ConfigRow> = match sqlx::query_as(
-        r#"SELECT key, value, updated_at FROM boom_config ORDER BY key"#,
-    )
-    .fetch_all(db_pool)
-    .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::error!("Dashboard get_config query failed: {}", e);
-            return Json(json!({"error": "Internal error"})).into_response();
-        }
-    };
-
-    let config: std::collections::HashMap<String, Value> = rows
-        .into_iter()
-        .map(|r| (r.key, r.value))
-        .collect();
-
-    Json(json!({"config": config})).into_response()
-}
-
-#[derive(Debug, Deserialize)]
-pub struct PatchConfigRequest {
-    pub key: String,
-    pub value: serde_json::Value,
-}
-
-pub async fn patch_config(
-    _session: AdminSession,
-    Extension(state): Extension<std::sync::Arc<DashboardState>>,
-    Json(req): Json<PatchConfigRequest>,
-) -> Response {
-    let db_pool = match &state.db_pool {
-        Some(pool) => pool,
-        None => {
-            return Json(json!({"error": "Database not available"})).into_response();
-        }
-    };
-
-    let result: Result<(), sqlx::Error> = async {
-        boom_core::gaussdb_upsert!(
-            db_pool,
-            || sqlx::query(
-                r#"UPDATE boom_config SET value = $2, updated_at = NOW() WHERE key = $1"#,
-            )
-            .bind(&req.key)
-            .bind(&req.value),
-            || sqlx::query(
-                r#"INSERT INTO boom_config (key, value) VALUES ($1, $2)"#,
-            )
-            .bind(&req.key)
-            .bind(&req.value)
-        )
-    }.await;
-
-    if let Err(e) = result {
-        tracing::error!("Dashboard patch_config failed: {}", e);
-        return Json(json!({"error": "Internal error"})).into_response();
-    }
-
-    tracing::info!(key = %req.key, "Config updated");
-    Json(json!({"ok": true, "key": req.key})).into_response()
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -3360,7 +3270,7 @@ pub async fn quota_key_windows(
             "total_tokens": total_in.saturating_add(total_out),
             "total_cost_micros": total_cost_micros,
             "total_cost": boom_quota::micros_to_decimal(total_cost_micros).to_string(),
-            "total_tpm_limit": plan.as_ref().and_then(|p| p.total_tpm_limit),
+            "total_token_limit": plan.as_ref().and_then(|p| p.total_token_limit),
             "total_cost_limit": plan.as_ref().and_then(|p| p.total_cost_limit).map(|d| d.to_string()),
         },
     }))

@@ -230,7 +230,7 @@ pub async fn get_usage(
             "cached_input_cost": boom_quota::micros_to_decimal(cached_input_cost_micros).to_string(),
             "output_cost_micros": output_cost_micros,
             "output_cost": boom_quota::micros_to_decimal(output_cost_micros).to_string(),
-            "total_tpm_limit": plan.as_ref().and_then(|p| p.total_tpm_limit),
+            "total_token_limit": plan.as_ref().and_then(|p| p.total_token_limit),
             "total_cost_limit": plan.as_ref().and_then(|p| p.total_cost_limit).map(|d| d.to_string()),
         },
     }))

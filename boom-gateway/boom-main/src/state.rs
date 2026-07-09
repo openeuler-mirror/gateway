@@ -994,9 +994,8 @@ fn load_plans_from_config(plan_store: &Arc<PlanStore>, config: &Config) {
             concurrency_limit: pc.concurrency_limit,
             rpm_limit: pc.rpm_limit,
             tpm_limit: pc.tpm_limit,
-            cost_limit: pc.cost_limit,
             window_limits: pc.window_limits.clone(),
-            total_tpm_limit: pc.total_tpm_limit,
+            total_token_limit: pc.total_token_limit,
             total_cost_limit: pc.total_cost_limit,
             schedule: convert_schedule(&pc.schedule),
         };
@@ -1156,7 +1155,6 @@ fn convert_schedule(slots: &[boom_config::ScheduleSlotConfig]) -> Vec<ScheduleSl
             concurrency_limit: s.concurrency_limit,
             rpm_limit: s.rpm_limit,
             tpm_limit: s.tpm_limit,
-            cost_limit: s.cost_limit,
             window_limits: s.window_limits.clone(),
         })
         .collect()
@@ -1324,19 +1322,11 @@ async fn build_config_snapshot_value(pool: &PgPool) -> Result<serde_json::Value,
         if let Some(tpm) = r.tpm_limit {
             plan_obj.insert("tpm_limit".into(), serde_json::Value::Number(tpm.into()));
         }
-        if let Some(cost_micros) = r.cost_limit_micros {
-            let cost = rust_decimal::Decimal::from(cost_micros.max(0))
-                / rust_decimal::Decimal::from(1_000_000);
-            plan_obj.insert(
-                "cost_limit".into(),
-                serde_json::Value::String(cost.to_string()),
-            );
-        }
         if !window_limits.is_empty() {
             plan_obj.insert("window_limits".into(), serde_json::Value::Array(window_limits));
         }
-        if let Some(tpm) = r.total_tpm_limit {
-            plan_obj.insert("total_tpm_limit".into(), serde_json::Value::Number(tpm.into()));
+        if let Some(tok) = r.total_token_limit {
+            plan_obj.insert("total_token_limit".into(), serde_json::Value::Number(tok.into()));
         }
         if let Some(cost_micros) = r.total_cost_limit_micros {
             let cost = rust_decimal::Decimal::from(cost_micros.max(0))

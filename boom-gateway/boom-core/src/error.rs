@@ -14,8 +14,8 @@ pub enum GatewayError {
         message: String,
         /// Specific limit type for diagnostics: "plan_rpm_limit", "plan_window_limit",
         /// "rpm_limit", "window_limit", "key_window_tokens", "key_window_cost",
-        /// "team_window_tokens", "team_window_cost", "key_total_tpm",
-        /// "team_total_tpm", "key_total_cost", "team_total_cost", etc.
+        /// "team_window_tokens", "team_window_cost", "key_total_token",
+        /// "team_total_token", "key_total_cost", "team_total_cost", etc.
         limit_type: &'static str,
         /// Which entity hit the limit: "key" or "team". None for legacy paths.
         scope: Option<&'static str>,

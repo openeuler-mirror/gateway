@@ -1224,6 +1224,16 @@ pub struct PlanCharge {
     /// drop semantics independently of the key guard.
     team_concurrency_guard: Option<ConcurrencyGuard>,
 
+    /// Team dimension RateLimitKey (`__team__{tid}` / `__plan__`), used to
+    /// commit team RPM + counts-window counters. None when key has no team
+    /// or team has no plan. Tokens/costs dimensions are NOT committed here —
+    /// they go through `QuotaStore::settle_usage` via team scope.
+    team_key: Option<RateLimitKey>,
+    /// Team rpm_limit (from team_plan.effective_limits()).
+    team_rpm_limit: Option<u64>,
+    /// Team counts-window (limit, secs) pairs (from team_plan effective windows).
+    team_window_counts: Vec<(u64, u64)>,
+
     /// Resolved model name (post-alias) for cost rate lookup at settle time.
     resolved_model: String,
     /// team_id if the key belongs to a team (for team quota attribution).
@@ -1274,6 +1284,17 @@ impl PlanCharge {
             &counts_only,
             self.weight,
         );
+        // Team dimension: commit RPM + counts-window counters so the team
+        // aggregate rate is enforced. Without this, the peek in
+        // build_plan_charge always sees zero team counters and never rejects.
+        if let Some(tk) = &self.team_key {
+            let _ = self.limiter.commit_record(
+                tk,
+                self.team_rpm_limit,
+                &self.team_window_counts,
+                self.weight,
+            );
+        }
         self.committed = true;
         self.committed_remaining = Some(decision.remaining);
         decision
@@ -1539,10 +1560,10 @@ fn peek_cost_window(
 /// Double-layer check:
 /// 1. Team layer (if key has team_id and team has a plan assigned):
 ///    - concurrency_limit, rpm_limit, window_limits (multi-dim)
-///    - total_tpm_limit, total_cost_limit
+///    - total_token_limit, total_cost_limit
 /// 2. Key layer:
 ///    - concurrency_limit, rpm_limit, window_limits (multi-dim)
-///    - total_tpm_limit, total_cost_limit
+///    - total_token_limit, total_cost_limit
 ///
 /// A plan is a generic template — the same set of fields applies whether it
 /// is assigned to a key or a team. The `type` field (key/team) only gates
@@ -1675,6 +1696,9 @@ async fn check_plan_limits(
             weight,
             concurrency_guard: None,
             team_concurrency_guard: None,
+            team_key: None,
+            team_rpm_limit: None,
+            team_window_counts: Vec::new(),
             resolved_model: resolved_model.to_string(),
             team_id: team_id.map(|s| s.to_string()),
             quota_store: Some(state.quota_store.clone()),
@@ -1717,6 +1741,12 @@ async fn check_plan_limits(
 
     // 1b. Team RPM / counts-window / tokens-window / cost-window peek
     let team_plan_name = team_plan_ref.map(|p| p.name.clone());
+    // Captures for PlanCharge: team counts counters must be committed after
+    // accept, so the peek-only checks above actually take effect on the next
+    // request. These stay None/empty when no team plan applies.
+    let mut team_commit_key: Option<RateLimitKey> = None;
+    let mut team_commit_rpm: Option<u64> = None;
+    let mut team_commit_counts: Vec<(u64, u64)> = Vec::new();
     if let (Some(tp), Some(tid)) = (team_plan_ref, team_id) {
         let (_, team_rpm, team_windows, team_stale) = tp.effective_limits();
 
@@ -1799,8 +1829,8 @@ async fn check_plan_limits(
             }
         }
 
-        // 1c. Team cumulative total-TPM / total-cost peeks
-        if let Some(limit) = tp.total_tpm_limit {
+        // 1c. Team cumulative total-token / total-cost peeks
+        if let Some(limit) = tp.total_token_limit {
             let input = state.quota_store.peek_cumulative(&team_scope, CumulativeKind::TotalInputTokens);
             let output = state.quota_store.peek_cumulative(&team_scope, CumulativeKind::TotalOutputTokens);
             if input + output >= limit {
@@ -1808,10 +1838,10 @@ async fn check_plan_limits(
                 return Err(rate_limit_exceeded(
                     None,
                     format!(
-                        "Plan '{}' Total TPM limit exceeded. Current: {}, Limit: {}",
+                        "Plan '{}' Total Token limit exceeded. Current: {}, Limit: {}",
                         tp.name, input + output, limit
                     ),
-                    "team_total_tpm",
+                    "team_total_token",
                     "team",
                     tid.to_string(),
                     Some(tp.name.clone()),
@@ -1832,6 +1862,13 @@ async fn check_plan_limits(
                 return Err(e);
             }
         }
+
+        // All team peeks passed — capture counters for commit at PlanCharge::commit.
+        // The team_rl_key / team_counts / team_rpm values were computed above;
+        // we hold onto them so commit can increment the team counters.
+        team_commit_key = Some(team_rl_key);
+        team_commit_rpm = team_rpm;
+        team_commit_counts = team_counts;
     }
 
     // 2a. Key concurrency guard
@@ -1957,7 +1994,7 @@ async fn check_plan_limits(
                 }
             }
         }
-        if let Some(limit) = kp.total_tpm_limit {
+        if let Some(limit) = kp.total_token_limit {
             let input = state.quota_store.peek_cumulative(&key_scope, CumulativeKind::TotalInputTokens);
             let output = state.quota_store.peek_cumulative(&key_scope, CumulativeKind::TotalOutputTokens);
             if input + output >= limit {
@@ -1966,10 +2003,10 @@ async fn check_plan_limits(
                 return Err(rate_limit_exceeded(
                     None,
                     format!(
-                        "Plan '{}' Total TPM limit exceeded. Current: {}, Limit: {}",
+                        "Plan '{}' Total Token limit exceeded. Current: {}, Limit: {}",
                         kp.name, input + output, limit
                     ),
-                    "key_total_tpm",
+                    "key_total_token",
                     "key",
                     key_hash.to_string(),
                     Some(kp.name.clone()),
@@ -2005,6 +2042,9 @@ async fn check_plan_limits(
         weight,
         concurrency_guard: key_concurrency_guard,
         team_concurrency_guard,
+        team_key: team_commit_key,
+        team_rpm_limit: team_commit_rpm,
+        team_window_counts: team_commit_counts,
         resolved_model: resolved_model.to_string(),
         team_id: team_id.map(|s| s.to_string()),
         quota_store: Some(state.quota_store.clone()),

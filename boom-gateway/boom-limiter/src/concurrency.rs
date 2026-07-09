@@ -37,9 +37,9 @@ pub use boom_core::types::WindowLimit;
 /// be dangerous to leak to a single key), `type=key` plans only to keys.
 ///
 /// `window_limits` is multi-dimensional — see [`WindowLimit`]. The shorthand
-/// `rpm_limit` / `tpm_limit` / `cost_limit` fields are 1-minute-window
-/// conveniences that get merged into the effective `Vec<WindowLimit>` list
-/// by `effective_limits` so callers only need to consult one place.
+/// `rpm_limit` / `tpm_limit` fields are 1-minute-window conveniences that
+/// get merged into the effective `Vec<WindowLimit>` list by `effective_limits`
+/// so callers only need to consult one place.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RateLimitPlan {
     pub name: String,
@@ -55,15 +55,13 @@ pub struct RateLimitPlan {
     pub rpm_limit: Option<u64>,
     #[serde(default)]
     pub tpm_limit: Option<u64>,
-    #[serde(default)]
-    pub cost_limit: Option<Decimal>,
     #[serde(
         default,
         deserialize_with = "boom_core::types::deserialize_window_limit_vec"
     )]
     pub window_limits: Vec<WindowLimit>,
     #[serde(default)]
-    pub total_tpm_limit: Option<u64>,
+    pub total_token_limit: Option<u64>,
     #[serde(default)]
     pub total_cost_limit: Option<Decimal>,
 
@@ -83,7 +81,6 @@ impl RateLimitPlan {
     /// `active_windows` already includes the convenience shorthand merged in:
     ///   - `rpm_limit`    → synthetic 60s `counts` entry
     ///   - `tpm_limit`    → synthetic 60s `tokens` entry
-    ///   - `cost_limit`   → synthetic 60s `costs` entry
     ///
     /// Whether the plan applies to a key or a team, the limits are the same —
     /// the caller is responsible for picking the right plan (and the right
@@ -97,13 +94,12 @@ impl RateLimitPlan {
                 let concurrency = slot.concurrency_limit.or(self.concurrency_limit);
                 let rpm = slot.rpm_limit.or(self.rpm_limit);
                 let tpm = slot.tpm_limit.or(self.tpm_limit);
-                let cost = slot.cost_limit.or(self.cost_limit);
                 let windows = if slot.window_limits.is_empty() {
                     self.window_limits.clone()
                 } else {
                     slot.window_limits.clone()
                 };
-                let merged = Self::merge_shorthand(windows, rpm, tpm, cost);
+                let merged = Self::merge_shorthand(windows, rpm, tpm);
                 // Clear base counters whose window_secs doesn't overlap with active.
                 let active_secs: Vec<u64> = merged.iter().map(|w| w.window_secs).collect();
                 let stale: Vec<u64> = self
@@ -128,7 +124,6 @@ impl RateLimitPlan {
             self.window_limits.clone(),
             self.rpm_limit,
             self.tpm_limit,
-            self.cost_limit,
         );
         (
             self.concurrency_limit,
@@ -138,7 +133,7 @@ impl RateLimitPlan {
         )
     }
 
-    /// Merge the 1-min shorthand fields (rpm/tpm/cost) into the window list.
+    /// Merge the 1-min shorthand fields (rpm/tpm) into the window list.
     ///
     /// Each shorthand field, when set, becomes a synthetic 60s entry. If a
     /// user-configured 60s entry already covers that dimension, the
@@ -149,7 +144,6 @@ impl RateLimitPlan {
         mut windows: Vec<WindowLimit>,
         rpm: Option<u64>,
         tpm: Option<u64>,
-        cost: Option<Decimal>,
     ) -> Vec<WindowLimit> {
         // Find whether there's a 60s entry that already covers each dimension.
         let has_60s_counts = windows
@@ -158,13 +152,9 @@ impl RateLimitPlan {
         let has_60s_tokens = windows
             .iter()
             .any(|w| w.window_secs == 60 && w.tokens.is_some());
-        let has_60s_costs = windows
-            .iter()
-            .any(|w| w.window_secs == 60 && w.costs.is_some());
 
         let need_new_60s = rpm.is_some() && !has_60s_counts
-            || tpm.is_some() && !has_60s_tokens
-            || cost.is_some() && !has_60s_costs;
+            || tpm.is_some() && !has_60s_tokens;
         if !need_new_60s {
             return windows;
         }
@@ -187,9 +177,6 @@ impl RateLimitPlan {
         if !has_60s_tokens {
             windows[idx].tokens = tpm;
         }
-        if !has_60s_costs {
-            windows[idx].costs = cost;
-        }
         windows
     }
 }
@@ -205,8 +192,6 @@ pub struct ScheduleSlot {
     pub rpm_limit: Option<u64>,
     #[serde(default)]
     pub tpm_limit: Option<u64>,
-    #[serde(default)]
-    pub cost_limit: Option<Decimal>,
     #[serde(
         default,
         deserialize_with = "boom_core::types::deserialize_window_limit_vec"
@@ -587,9 +572,8 @@ pub struct PlanRow {
     pub concurrency_limit: Option<i32>,
     pub rpm_limit: Option<i64>,
     pub tpm_limit: Option<i64>,
-    pub cost_limit_micros: Option<i64>,
     pub window_limits: serde_json::Value,
-    pub total_tpm_limit: Option<i64>,
+    pub total_token_limit: Option<i64>,
     pub total_cost_limit_micros: Option<i64>,
     pub schedule: serde_json::Value,
     pub is_default: Option<bool>,
@@ -630,7 +614,6 @@ impl PlanStore {
                     "concurrency_limit": s.concurrency_limit,
                     "rpm_limit": s.rpm_limit,
                     "tpm_limit": s.tpm_limit,
-                    "cost_limit": s.cost_limit,
                     "window_limits": s.window_limits,
                 })).collect::<Vec<_>>(),
             ).unwrap_or(serde_json::json!([]));
@@ -640,13 +623,13 @@ impl PlanStore {
             sqlx::query(
                 r#"INSERT INTO boom_rate_limit_plan
                    (name, type, member_plan,
-                    concurrency_limit, rpm_limit, tpm_limit, cost_limit_micros,
-                    window_limits, total_tpm_limit, total_cost_limit_micros,
+                    concurrency_limit, rpm_limit, tpm_limit,
+                    window_limits, total_token_limit, total_cost_limit_micros,
                     schedule, is_default, source)
                    VALUES ($1, $2, $3,
-                           $4, $5, $6, $7,
-                           $8, $9, $10,
-                           $11, $12, 'yaml')"#,
+                           $4, $5, $6,
+                           $7, $8, $9,
+                           $10, $11, 'yaml')"#,
             )
             .bind(name)
             .bind(type_str)
@@ -654,9 +637,8 @@ impl PlanStore {
             .bind(pc.concurrency_limit.map(|v| v as i32))
             .bind(pc.rpm_limit.map(|v| v as i64))
             .bind(pc.tpm_limit.map(|v| v as i64))
-            .bind(pc.cost_limit.map(decimal_to_micros))
             .bind(&wl)
-            .bind(pc.total_tpm_limit.map(|v| v as i64))
+            .bind(pc.total_token_limit.map(|v| v as i64))
             .bind(pc.total_cost_limit.map(decimal_to_micros))
             .bind(&schedule_json)
             .bind(is_default)
@@ -687,8 +669,8 @@ impl PlanStore {
     pub async fn load_db_only_plans(&self, pool: &sqlx::PgPool) {
         let rows: Vec<PlanRow> = match sqlx::query_as::<_, PlanRow>(
             r#"SELECT name, type, member_plan,
-                      concurrency_limit, rpm_limit, tpm_limit, cost_limit_micros,
-                      window_limits, total_tpm_limit, total_cost_limit_micros,
+                      concurrency_limit, rpm_limit, tpm_limit,
+                      window_limits, total_token_limit, total_cost_limit_micros,
                       schedule, is_default
                FROM boom_rate_limit_plan WHERE source = 'db'"#,
         )
@@ -761,7 +743,6 @@ impl PlanStore {
                 "concurrency_limit": s.concurrency_limit,
                 "rpm_limit": s.rpm_limit,
                 "tpm_limit": s.tpm_limit,
-                "cost_limit": s.cost_limit,
                 "window_limits": s.window_limits,
             })).collect::<Vec<_>>(),
         ).unwrap_or(serde_json::json!([]));
@@ -775,10 +756,10 @@ impl PlanStore {
                 r#"UPDATE boom_rate_limit_plan
                    SET type = $2, member_plan = $3,
                        concurrency_limit = $4, rpm_limit = $5,
-                       tpm_limit = $6, cost_limit_micros = $7,
-                       window_limits = $8,
-                       total_tpm_limit = $9, total_cost_limit_micros = $10,
-                       schedule = $11, source = 'db', updated_at = NOW()
+                       tpm_limit = $6,
+                       window_limits = $7,
+                       total_token_limit = $8, total_cost_limit_micros = $9,
+                       schedule = $10, source = 'db', updated_at = NOW()
                    WHERE name = $1"#,
             )
             .bind(name)
@@ -787,21 +768,20 @@ impl PlanStore {
             .bind(plan.concurrency_limit.map(|v| v as i32))
             .bind(plan.rpm_limit.map(|v| v as i64))
             .bind(plan.tpm_limit.map(|v| v as i64))
-            .bind(plan.cost_limit.map(decimal_to_micros))
             .bind(&wl)
-            .bind(plan.total_tpm_limit.map(|v| v as i64))
+            .bind(plan.total_token_limit.map(|v| v as i64))
             .bind(plan.total_cost_limit.map(decimal_to_micros))
             .bind(&schedule_json),
             || sqlx::query(
                 r#"INSERT INTO boom_rate_limit_plan
                    (name, type, member_plan,
-                    concurrency_limit, rpm_limit, tpm_limit, cost_limit_micros,
-                    window_limits, total_tpm_limit, total_cost_limit_micros,
+                    concurrency_limit, rpm_limit, tpm_limit,
+                    window_limits, total_token_limit, total_cost_limit_micros,
                     schedule, is_default, source)
                    VALUES ($1, $2, $3,
-                           $4, $5, $6, $7,
-                           $8, $9, $10,
-                           $11, false, 'db')"#,
+                           $4, $5, $6,
+                           $7, $8, $9,
+                           $10, false, 'db')"#,
             )
             .bind(name)
             .bind(type_str)
@@ -809,9 +789,8 @@ impl PlanStore {
             .bind(plan.concurrency_limit.map(|v| v as i32))
             .bind(plan.rpm_limit.map(|v| v as i64))
             .bind(plan.tpm_limit.map(|v| v as i64))
-            .bind(plan.cost_limit.map(decimal_to_micros))
             .bind(&wl)
-            .bind(plan.total_tpm_limit.map(|v| v as i64))
+            .bind(plan.total_token_limit.map(|v| v as i64))
             .bind(plan.total_cost_limit.map(decimal_to_micros))
             .bind(&schedule_json)
         )?;
@@ -986,8 +965,8 @@ impl PlanStore {
     pub async fn snapshot_plans_db(pool: &sqlx::PgPool) -> Result<Vec<PlanRow>, sqlx::Error> {
         sqlx::query_as::<_, PlanRow>(
             r#"SELECT name, type, member_plan,
-                      concurrency_limit, rpm_limit, tpm_limit, cost_limit_micros,
-                      window_limits, total_tpm_limit, total_cost_limit_micros,
+                      concurrency_limit, rpm_limit, tpm_limit,
+                      window_limits, total_token_limit, total_cost_limit_micros,
                       schedule, is_default
                FROM boom_rate_limit_plan ORDER BY name"#,
         )
@@ -1011,9 +990,8 @@ fn row_to_plan(row: &PlanRow) -> RateLimitPlan {
         concurrency_limit: row.concurrency_limit.map(|v| v as u32),
         rpm_limit: row.rpm_limit.map(|v| v as u64),
         tpm_limit: row.tpm_limit.map(|v| v as u64),
-        cost_limit: row.cost_limit_micros.map(micros_to_decimal),
         window_limits: parse_window_limits(&row.window_limits),
-        total_tpm_limit: row.total_tpm_limit.map(|v| v as u64),
+        total_token_limit: row.total_token_limit.map(|v| v as u64),
         total_cost_limit: row.total_cost_limit_micros.map(micros_to_decimal),
         schedule: parse_schedule(&row.schedule),
     }
@@ -1099,21 +1077,12 @@ fn parse_schedule(value: &serde_json::Value) -> Vec<ScheduleSlot> {
             let rpm = obj.get("rpm_limit")
                 .and_then(|v| v.as_u64());
             let tpm = obj.get("tpm_limit").and_then(|v| v.as_u64());
-            let cost = obj.get("cost_limit")
-                .and_then(|v| v.as_str())
-                .and_then(|s| Decimal::from_str(s).ok())
-                .or_else(|| {
-                    obj.get("cost_limit")
-                        .and_then(|v| v.as_f64())
-                        .and_then(Decimal::from_f64)
-                });
             let wl = parse_window_limits(obj.get("window_limits").unwrap_or(&empty_arr));
             Some(ScheduleSlot {
                 hours: obj.get("hours")?.as_str()?.to_string(),
                 concurrency_limit: conc,
                 rpm_limit: rpm,
                 tpm_limit: tpm,
-                cost_limit: cost,
                 window_limits: wl,
             })
         }).collect()

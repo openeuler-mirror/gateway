@@ -327,7 +327,6 @@
     else if (section === "admin-assignments") loadAssignments();
     else if (section === "admin-quota") loadQuota();
     else if (section === "admin-logs") { setupLogsFilters(); loadLogs(); }
-    else if (section === "admin-config") loadConfig();
     else if (section === "admin-debug") { loadAgentStats(); loadRebalanceMoves(); }
   }
 
@@ -340,7 +339,6 @@
     if (hash.includes("/admin/quota")) return "admin-quota";
     if (hash.includes("/admin/assignments")) return "admin-assignments";
     if (hash.includes("/admin/logs")) return "admin-logs";
-    if (hash.includes("/admin/config")) return "admin-config";
     if (hash.includes("/admin/debug")) return "admin-debug";
     return "admin-models";
   }
@@ -1508,8 +1506,7 @@
     if (plan.concurrency_limit) limits.push(t("plan.limits.concurrency", { n: plan.concurrency_limit }));
     if (plan.rpm_limit) limits.push(t("plan.limits.rpm", { n: plan.rpm_limit }));
     if (plan.tpm_limit) limits.push(t("plan.limits.tpm", { n: plan.tpm_limit }));
-    if (plan.cost_limit != null) limits.push(t("plan.limits.cost", { n: plan.cost_limit }));
-    if (plan.total_tpm_limit) limits.push(t("plan.limits.total_tpm", { n: plan.total_tpm_limit }));
+    if (plan.total_token_limit) limits.push(t("plan.limits.total_token", { n: plan.total_token_limit }));
     if (plan.total_cost_limit != null) limits.push(t("plan.limits.total_cost", { n: plan.total_cost_limit }));
     (plan.window_limits || []).forEach((raw) => {
       const w = normalizeWindowLimit(raw);
@@ -1599,13 +1596,13 @@
 
     // Cumulative card (if plan has any total_*_limit or any cumulative usage > 0).
     const c = usage.cumulative || {};
-    const hasCumLimit = c.total_tpm_limit != null || c.total_cost_limit != null;
+    const hasCumLimit = c.total_token_limit != null || c.total_cost_limit != null;
     const hasCumUsage = (c.total_tokens || 0) > 0 || (c.total_cost_micros || 0) > 0;
     if (hasCumLimit || hasCumUsage) {
       let dimHtml = "";
-      if (c.total_tpm_limit != null) {
+      if (c.total_token_limit != null) {
         const cur = Number(c.total_tokens || 0);
-        const limit = Number(c.total_tpm_limit);
+        const limit = Number(c.total_token_limit);
         const pct = limit > 0 ? Math.min(100, (cur / limit) * 100) : 0;
         const cls = pct >= 90 ? "danger" : pct >= 70 ? "warn" : "";
         dimHtml += `
@@ -1809,9 +1806,8 @@
         <th>${t("plans.col.concurrent")}</th>
         <th>${t("plans.col.rpm")}</th>
         <th>${t("plans.col.tpm")}</th>
-        <th>${t("plans.col.cost_limit")}</th>
         <th>${t("plans.col.windows")}</th>
-        <th>${t("plans.col.total_tpm")}</th>
+        <th>${t("plans.col.total_token")}</th>
         <th>${t("plans.col.total_cost")}</th>
         <th>${t("plans.col.member_plan")}</th>
         <th>${t("plans.col.schedule")}</th>
@@ -1837,9 +1833,8 @@
           <td>${fmtOptInt(p.concurrency_limit)}</td>
           <td>${fmtOptInt(p.rpm_limit)}</td>
           <td>${fmtOptInt(p.tpm_limit)}</td>
-          <td>${fmtOptCost(p.cost_limit)}</td>
           <td>${wlSummary || "-"}</td>
-          <td>${fmtOptInt(p.total_tpm_limit)}</td>
+          <td>${fmtOptInt(p.total_token_limit)}</td>
           <td>${fmtOptCost(p.total_cost_limit)}</td>
           <td>${p.member_plan ? esc(p.member_plan) : "-"}</td>
           <td>${fmtSchedule(p.schedule)}</td>
@@ -2247,68 +2242,6 @@
     loadAliases();
   };
 
-  // ── Admin: Config ─────────────────────────────────────
-  async function loadConfig() {
-    try {
-      const data = await api("/admin/config");
-      renderConfigTable(data.config || {});
-    } catch (err) {
-      const wrap = document.getElementById("config-table-wrap");
-      if (wrap) wrap.innerHTML = `<p class="error-msg">${t("common.failed_to_load", { what: t("config.title"), message: esc(err.message) })}</p>`;
-    }
-  }
-
-  function renderConfigTable(config) {
-    const wrap = document.getElementById("config-table-wrap");
-    const keys = Object.keys(config);
-    if (keys.length === 0) { wrap.innerHTML = "<p>" + t("config.empty") + "</p>"; return; }
-    wrap.innerHTML = `<table>
-      <tr><th>${t("config.col.key")}</th><th>${t("config.col.value")}</th><th>${t("config.col.actions")}</th></tr>
-      ${keys.map((k) => `<tr>
-        <td><strong>${esc(k)}</strong></td>
-        <td class="mono" style="max-width:400px;word-break:break-all;white-space:pre-wrap">${esc(JSON.stringify(config[k], null, 2))}</td>
-        <td><button class="btn-small" onclick="window._editConfig('${esc(k)}')">${t("action.edit")}</button></td>
-      </tr>`).join("")}
-    </table>`;
-  }
-
-  function showNewConfigModal(prefill) {
-    const p = prefill || {};
-    showModal(`
-      <h3>${p.key ? t("form.config.title_edit") : t("form.config.title_create")}</h3>
-      <div class="form-group"><label>${t("form.config.key")} * ${tip("Configuration key name, e.g. 'general_settings' or a custom key.")}</label><input id="m-config-key" value="${esc(p.key || "")}" ${p.key ? "readonly" : ""}></div>
-      <div class="form-group"><label>${t("form.config.value")} * ${tip("Configuration value as valid JSON. E.g. {\"store_model_in_db\": true}")}</label><textarea id="m-config-value" rows="6">${esc(p.value ? JSON.stringify(p.value, null, 2) : "")}</textarea></div>
-      <div class="modal-actions">
-        <button class="btn-secondary" onclick="hideModal()" style="width:auto">${t("action.cancel")}</button>
-        <button class="btn-primary" id="m-config-submit">${t("action.save")}</button>
-      </div>
-    `);
-    document.getElementById("m-config-submit").addEventListener("click", async () => {
-      try {
-        const value = JSON.parse(document.getElementById("m-config-value").value);
-        await api("/admin/config", {
-          method: "PATCH",
-          body: JSON.stringify({
-            key: document.getElementById("m-config-key").value,
-            value: value,
-          }),
-        });
-        hideModal();
-        loadConfig();
-      } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
-    });
-  }
-
-  window._editConfig = async (key) => {
-    try {
-      const data = await api("/admin/config");
-      const config = data.config || {};
-      if (config[key] !== undefined) {
-        showNewConfigModal({ key, value: config[key] });
-      }
-    } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
-  };
-
   // ── Admin: Debug Error Recording ─────────────────────
   let debugEnabled = false;
 
@@ -2497,8 +2430,6 @@
     if (btnModel) btnModel.addEventListener("click", showNewModelModal);
     const btnAlias = document.getElementById("btn-new-alias");
     if (btnAlias) btnAlias.addEventListener("click", showNewAliasModal);
-    const btnConfig = document.getElementById("btn-new-config");
-    if (btnConfig) btnConfig.addEventListener("click", showNewConfigModal);
     const btnReload = document.getElementById("btn-reload-config");
     if (btnReload) btnReload.addEventListener("click", async () => {
       if (!confirm(t("confirm.reload"))) return;

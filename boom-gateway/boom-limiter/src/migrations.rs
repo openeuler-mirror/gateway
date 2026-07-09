@@ -86,10 +86,6 @@ BEGIN
     EXCEPTION WHEN OTHERS THEN NULL; END;
     BEGIN
         ALTER TABLE boom_rate_limit_plan
-            RENAME COLUMN key_cost_limit_micros TO cost_limit_micros;
-    EXCEPTION WHEN OTHERS THEN NULL; END;
-    BEGIN
-        ALTER TABLE boom_rate_limit_plan
             RENAME COLUMN key_total_tpm_limit TO total_tpm_limit;
     EXCEPTION WHEN OTHERS THEN NULL; END;
     BEGIN
@@ -97,14 +93,35 @@ BEGIN
             RENAME COLUMN key_total_cost_limit_micros TO total_cost_limit_micros;
     EXCEPTION WHEN OTHERS THEN NULL; END;
 
+    -- Rename total_tpm_limit → total_token_limit. The old name was misleading:
+    -- "TPM" is a per-minute concept, but this column is a cumulative cap.
+    -- No-op on a fresh DB whose base DDL uses the new name.
+    BEGIN
+        ALTER TABLE boom_rate_limit_plan
+            RENAME COLUMN total_tpm_limit TO total_token_limit;
+    EXCEPTION WHEN OTHERS THEN NULL; END;
+
     -- For fresh DBs whose base plan_ddl doesn't include these columns yet,
     -- ensure they exist (no-op on already-migrated DBs).
     BEGIN
         ALTER TABLE boom_rate_limit_plan
             ADD COLUMN IF NOT EXISTS tpm_limit           BIGINT,
-            ADD COLUMN IF NOT EXISTS cost_limit_micros   BIGINT,
-            ADD COLUMN IF NOT EXISTS total_tpm_limit     BIGINT,
+            ADD COLUMN IF NOT EXISTS total_token_limit   BIGINT,
             ADD COLUMN IF NOT EXISTS total_cost_limit_micros BIGINT;
+    EXCEPTION WHEN OTHERS THEN NULL; END;
+
+    -- DROP cost_limit_micros (per-minute cost cap was never needed in
+    -- practice — only total_cost_limit is enforced). Idempotent.
+    BEGIN
+        ALTER TABLE boom_rate_limit_plan
+            DROP COLUMN IF EXISTS cost_limit_micros;
+    EXCEPTION WHEN OTHERS THEN NULL; END;
+    -- Also drop any legacy key_cost_limit_micros that pre-migration DBs may
+    -- still carry (the RENAME above was removed, so the unprefixed form never
+    -- came back; this clears the original column directly).
+    BEGIN
+        ALTER TABLE boom_rate_limit_plan
+            DROP COLUMN IF EXISTS key_cost_limit_micros;
     EXCEPTION WHEN OTHERS THEN NULL; END;
 
     -- DROP team_* columns. They are no longer read by any code path. The

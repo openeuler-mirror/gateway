@@ -42,7 +42,6 @@
       "nav.quota": "Quota",
       "nav.logs": "Logs",
       "nav.assignments": "Assignments",
-      "nav.config": "Config",
       "nav.debug": "Debug",
 
       "common.loading": "Loading...",
@@ -194,8 +193,7 @@
       "plans.col.tkc": "TKC",
       "plans.col.actions": "Actions",
       "plans.col.windows": "Windows",
-      "plans.col.cost_limit": "Cost/min",
-      "plans.col.total_tpm": "Total TPM",
+      "plans.col.total_token": "Total Tokens",
       "plans.col.total_cost": "Total Cost",
       "plans.col.member_plan": "Member Plan",
       "plans.col.schedule": "Schedule",
@@ -220,8 +218,7 @@
       "plan.dim.output_cost": "Output cost",
       "plan.cumulative_title": "Cumulative",
       "plan.limits.tpm": "TPM: {n}",
-      "plan.limits.cost": "Cost/min: ${n}",
-      "plan.limits.total_tpm": "Total TPM: {n}",
+      "plan.limits.total_token": "Total tokens: {n}",
       "plan.limits.total_cost": "Total cost: ${n}",
       "plan.limits.window": "{dims} per {duration}",
 
@@ -301,13 +298,6 @@
       "teams.plan_use_default": "Use default_team_plan",
       "teams.plan_unassign": "Remove explicit plan assignment",
       "teams.empty": "No teams found.",
-
-      "config.title": "Configuration",
-      "config.set_value": "+ Set Value",
-      "config.col.key": "Key",
-      "config.col.value": "Value",
-      "config.col.actions": "Actions",
-      "config.empty": "No configuration entries.",
 
       "logs.title": "Request Logs",
       "logs.prompt_log.off": "Prompt Log: OFF",
@@ -470,11 +460,6 @@
       "form.plan.rpm": "RPM Limit",
       "form.plan.windows": "Window Limits",
 
-      "form.config.title_create": "Set Configuration",
-      "form.config.title_edit": "Edit Configuration",
-      "form.config.key": "Key",
-      "form.config.value": "Value (JSON)",
-
       "form.asgn.title": "Assign Key to Plan",
       "form.asgn.key": "Key",
       "form.asgn.plan": "Plan",
@@ -578,7 +563,6 @@
       "nav.quota": "配额",
       "nav.logs": "日志",
       "nav.assignments": "分配",
-      "nav.config": "配置",
       "nav.debug": "调试",
 
       "common.loading": "加载中...",
@@ -730,8 +714,7 @@
       "plans.col.tkc": "TKC",
       "plans.col.actions": "操作",
       "plans.col.windows": "窗口",
-      "plans.col.cost_limit": "每分钟费用",
-      "plans.col.total_tpm": "总 Token",
+      "plans.col.total_token": "累计 Token",
       "plans.col.total_cost": "总费用",
       "plans.col.member_plan": "成员套餐",
       "plans.col.schedule": "时段",
@@ -756,8 +739,7 @@
       "plan.dim.output_cost": "输出费用",
       "plan.cumulative_title": "累计",
       "plan.limits.tpm": "TPM: {n}",
-      "plan.limits.cost": "每分钟费用: ${n}",
-      "plan.limits.total_tpm": "总 token: {n}",
+      "plan.limits.total_token": "累计 token: {n}",
       "plan.limits.total_cost": "总费用: ${n}",
       "plan.limits.window": "{dims} / {duration}",
 
@@ -837,13 +819,6 @@
       "teams.plan_use_default": "使用 default_team_plan",
       "teams.plan_unassign": "取消显式套餐分配",
       "teams.empty": "未找到团队。",
-
-      "config.title": "配置",
-      "config.set_value": "+ 设置",
-      "config.col.key": "键",
-      "config.col.value": "值",
-      "config.col.actions": "操作",
-      "config.empty": "暂无配置项。",
 
       "logs.title": "请求日志",
       "logs.prompt_log.off": "Prompt 日志：关",
@@ -1005,11 +980,6 @@
       "form.plan.concurrency": "并发限制",
       "form.plan.rpm": "RPM 限制",
       "form.plan.windows": "窗口限制",
-
-      "form.config.title_create": "设置配置",
-      "form.config.title_edit": "编辑配置",
-      "form.config.key": "键",
-      "form.config.value": "值（JSON）",
 
       "form.asgn.title": "将密钥分配到套餐",
       "form.asgn.key": "密钥",

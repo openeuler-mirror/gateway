@@ -110,11 +110,6 @@ pub fn build_router<S: Clone + Send + Sync + 'static>(state: DashboardState) -> 
             "/dashboard/api/admin/aliases/{alias_name}",
             put(handlers_admin::update_alias).delete(handlers_admin::delete_alias),
         )
-        // Admin — Config KV store (new).
-        .route(
-            "/dashboard/api/admin/config",
-            get(handlers_admin::get_config).patch(handlers_admin::patch_config),
-        )
         // Admin — Request Logs.
         .route(
             "/dashboard/api/admin/logs",

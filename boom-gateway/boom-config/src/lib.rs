@@ -133,10 +133,10 @@ pub use boom_core::types::PlanType;
 /// one set of limits per plan.
 ///
 /// `window_limits` accepts multi-dimensional entries — see [`WindowLimit`].
-/// The legacy `rpm_limit` / `tpm_limit` / `cost_limit` fields are kept as
-/// 1-minute-window convenience shorthand; they get merged into the effective
-/// window list as a synthetic 60s entry at evaluation time, so configs can
-/// mix the shorthand and the explicit `window_limits`.
+/// The legacy `rpm_limit` / `tpm_limit` fields are kept as 1-minute-window
+/// convenience shorthand; they get merged into the effective window list as
+/// a synthetic 60s entry at evaluation time, so configs can mix the
+/// shorthand and the explicit `window_limits`.
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct PlanConfig {
     #[serde(default)]
@@ -151,15 +151,13 @@ pub struct PlanConfig {
     pub rpm_limit: Option<u64>,
     #[serde(default)]
     pub tpm_limit: Option<u64>,
-    #[serde(default)]
-    pub cost_limit: Option<rust_decimal::Decimal>,
     #[serde(
         default,
         deserialize_with = "deserialize_window_limit_vec"
     )]
     pub window_limits: Vec<WindowLimit>,
     #[serde(default)]
-    pub total_tpm_limit: Option<u64>,
+    pub total_token_limit: Option<u64>,
     #[serde(default)]
     pub total_cost_limit: Option<rust_decimal::Decimal>,
 
@@ -193,8 +191,6 @@ pub struct ScheduleSlotConfig {
     pub rpm_limit: Option<u64>,
     #[serde(default)]
     pub tpm_limit: Option<u64>,
-    #[serde(default)]
-    pub cost_limit: Option<rust_decimal::Decimal>,
     #[serde(
         default,
         deserialize_with = "deserialize_window_limit_vec"
@@ -1022,23 +1018,21 @@ plan_settings:
 
     #[test]
     fn test_window_limit_legacy_pair_still_works_via_convenience_shorthand() {
-        // The legacy convenience fields rpm_limit / tpm_limit /
-        // cost_limit are independent of window_limits — they get
-        // merged in boom-limiter::RateLimitPlan::effective_limits. Verify
-        // they still parse and store as Option<u64>/Decimal.
+        // The legacy convenience fields rpm_limit / tpm_limit are
+        // independent of window_limits — they get merged in
+        // boom-limiter::RateLimitPlan::effective_limits. Verify they still
+        // parse and store as Option<u64>.
         let yaml = r#"
 plan_settings:
   plans:
     legacy:
       rpm_limit: 60
       tpm_limit: 100000
-      cost_limit: 1.5
 "#;
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         let legacy = &config.plan_settings.plans["legacy"];
         assert_eq!(legacy.rpm_limit, Some(60));
         assert_eq!(legacy.tpm_limit, Some(100_000));
-        assert!(legacy.cost_limit.is_some());
         // No window_limits configured → empty vec.
         assert!(legacy.window_limits.is_empty());
     }
