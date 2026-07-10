@@ -794,7 +794,7 @@ pub async fn health_check(State(state): State<AppState>) -> Json<HealthResponse>
 
     Json(HealthResponse {
         status: "ok".to_string(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
+        version: boom_core::BOOM_VERSION.to_string(),
         uptime_secs: uptime as u64,
         db_connected: inner.health.db_connected,
         models_count: state.deployment_store.len(),

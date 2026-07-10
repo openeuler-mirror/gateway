@@ -411,8 +411,17 @@ input, select, textarea { font-family: var(--font); font-size: 14px; }
 .sidebar-footer {
   padding: 12px 16px; border-top: 1px solid var(--sidebar-border);
   display: flex; gap: 8px; align-items: center;
+  flex-wrap: wrap;
 }
 .sidebar-footer .btn-secondary { flex: 1; }
+.sidebar-version {
+  flex-basis: 100%;
+  font-size: 11px;
+  color: var(--text3);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: .02em;
+  margin-bottom: 2px;
+}
 
 /* ── Theme Toggle ───────────────────────────────────────── */
 .theme-toggle {
