@@ -20,7 +20,6 @@ pub struct VerificationToken {
     pub config: Option<serde_json::Value>,
     pub user_id: Option<String>,
     pub team_id: Option<String>,
-    pub permissions: Option<serde_json::Value>,
     pub max_parallel_requests: Option<i32>,
     pub metadata: Option<serde_json::Value>,
     /// Whether the key is blocked.

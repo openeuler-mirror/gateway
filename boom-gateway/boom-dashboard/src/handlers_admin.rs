@@ -120,8 +120,6 @@ struct KeyRow {
     team_id: Option<String>,
     /// litellm stores models as text[] in PostgreSQL.
     models: Vec<String>,
-    /// spend has a NOT NULL DEFAULT 0.0 constraint.
-    spend: f64,
     blocked: Option<bool>,
     rpm_limit: Option<i64>,
     tpm_limit: Option<i64>,
@@ -175,7 +173,7 @@ pub async fn list_keys(
     let rows: Vec<KeyRow> = if let Some(ref pattern) = search_pattern {
         match sqlx::query_as(
             r#"SELECT token, key_name, key_alias, user_id, team_id, models,
-                      spend, blocked, rpm_limit, tpm_limit, max_budget,
+                      blocked, rpm_limit, tpm_limit, max_budget,
                       budget_duration, expires, metadata, created_at
                FROM "boom_verification_token"
                WHERE (key_name ILIKE $1 OR key_alias ILIKE $1 OR user_id ILIKE $1 OR token ILIKE $1)"#,
@@ -197,7 +195,7 @@ pub async fn list_keys(
     } else {
         match sqlx::query_as(
             r#"SELECT token, key_name, key_alias, user_id, team_id, models,
-                      spend, blocked, rpm_limit, tpm_limit, max_budget,
+                      blocked, rpm_limit, tpm_limit, max_budget,
                       budget_duration, expires, metadata, created_at
                FROM "boom_verification_token""#,
         )
@@ -267,6 +265,20 @@ pub async fn list_keys(
             let usage_cost = rust_decimal::Decimal::from(usage_cost_micros)
                 / rust_decimal::Decimal::from(1_000_000);
 
+            // Cumulative total cost across the key's lifetime — comes from
+            // QuotaStore.cumulative (boom_rate_limit_cumulative backed), NOT
+            // boom_verification_token.spend (litellm legacy column we never write).
+            let total_cost_micros = state
+                .quota_store
+                .peek_cumulative(
+                    &boom_quota::QuotaScope::Key {
+                        key_hash: r.token.clone(),
+                    },
+                    boom_quota::CumulativeKind::TotalCost,
+                );
+            let total_cost = rust_decimal::Decimal::from(total_cost_micros)
+                / rust_decimal::Decimal::from(1_000_000);
+
             json!({
                 "token_prefix": token_prefix,
                 "token_hash": r.token,
@@ -275,7 +287,8 @@ pub async fn list_keys(
                 "user_id": r.user_id,
                 "team_id": r.team_id,
                 "models": r.models,
-                "spend": r.spend,
+                "spend": total_cost.to_string(),
+                "total_cost": total_cost.to_string(),
                 "blocked": r.blocked.unwrap_or(false),
                 "rpm_limit": r.rpm_limit,
                 "tpm_limit": r.tpm_limit,
@@ -2795,7 +2808,10 @@ pub async fn quota_overview(
                     json!({
                         "concurrency_limit": concurrency_limit,
                         "rpm_limit": rpm_limit,
+                        "tpm_limit": p.tpm_limit,
                         "window_limits": wl_json,
+                        "total_token_limit": p.total_token_limit,
+                        "total_cost_limit": p.total_cost_limit.map(|c| c.to_string()),
                     })
                 });
             let prompt_log_excluded = excluded_teams.iter().any(|t| t == &team_id);
