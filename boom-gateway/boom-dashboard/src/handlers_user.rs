@@ -273,14 +273,29 @@ pub async fn get_key_info(
     .unwrap_or(None);
 
     match row {
-        Some((key_name, key_alias, spend, expires, blocked, rpm_limit, tpm_limit, max_budget, budget_duration, metadata, created_at)) => {
+        Some((key_name, key_alias, _spend, expires, blocked, rpm_limit, tpm_limit, max_budget, budget_duration, metadata, created_at)) => {
             // Query token usage from LiteLLM_SpendLogs (may not exist in all deployments).
             let (input_tokens, output_tokens) = query_token_usage(db_pool, key_hash).await;
+
+            // Total cost across the key's lifetime — from QuotaStore.cumulative
+            // (boom_rate_limit_cumulative backed), NOT boom_verification_token.spend
+            // (litellm legacy column we never write, always 0).
+            let total_cost_micros = state
+                .quota_store
+                .peek_cumulative(
+                    &boom_quota::QuotaScope::Key {
+                        key_hash: key_hash.to_string(),
+                    },
+                    boom_quota::CumulativeKind::TotalCost,
+                );
+            let total_cost = rust_decimal::Decimal::from(total_cost_micros)
+                / rust_decimal::Decimal::from(1_000_000);
 
             Json(json!({
                 "key_name": key_name,
                 "key_alias": key_alias,
-                "spend": spend,
+                "spend": total_cost.to_string(),
+                "total_cost": total_cost.to_string(),
                 "expires": expires.map(|d| d.to_string()),
                 "blocked": blocked.unwrap_or(false),
                 "rpm_limit": rpm_limit,

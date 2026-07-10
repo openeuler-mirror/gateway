@@ -80,7 +80,7 @@ impl DbAuthenticator {
         tracing::debug!("Token cache miss, querying DB: {}", &hashed[..8]);
         let result = sqlx::query_as::<_, VerificationToken>(
             r#"SELECT token, key_name, key_alias, spend, expires, models,
-                      aliases, config, user_id, team_id, permissions,
+                      aliases, config, user_id, team_id,
                       max_parallel_requests, metadata, blocked,
                       tpm_limit, rpm_limit, max_budget, budget_duration,
                       budget_reset_at, allowed_cache_controls, allowed_routes,

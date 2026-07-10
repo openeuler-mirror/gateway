@@ -1644,6 +1644,31 @@ input[list] {
 .team-limits-block .dim-row {
   margin: 4px 0;
 }
+.plan-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.plan-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  background: var(--surface3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xs);
+  font-size: 12px;
+  line-height: 1.4;
+}
+.plan-tag-label {
+  color: var(--text3);
+  font-weight: 600;
+}
+.plan-tag-value {
+  color: var(--text1);
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
 .badge-default {
   background: var(--surface3);
   color: var(--text2);

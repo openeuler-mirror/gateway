@@ -1920,7 +1920,7 @@
         <td>${esc(k.user_id || "-")}</td>
         <td>${esc(k.plan_name || "-")}</td>
         <td><span class="mono">${k.usage_count || 0}/${fmtTokens(k.usage_tokens)}/${fmtCost(k.usage_cost)}</span><br><span class="muted" style="font-size:11px">${formatCountdown(k.usage_reset_secs || 0)}</span></td>
-        <td>$${(k.spend || 0).toFixed(4)}</td>
+        <td>${fmtCost(k.spend)}</td>
         <td>${k.max_budget != null ? "$" + k.max_budget : "-"}</td>
         <td>${k.blocked
               ? '<span style="color:var(--danger)">' + t("status.blocked") + '</span>'
@@ -2546,18 +2546,28 @@
       const container = document.getElementById("m-key-models-combo");
       if (container) initModelCombo(container, [], names);
     });
-    // Populate team dropdown
-    api("/admin/teams").then((data) => {
+    // Populate team dropdown — /admin/teams is POST-only, so teams list comes
+    // from the quota overview cache (set by loadQuotaOverview). Fall back to
+    // fetching overview on demand if cache is cold.
+    const populateTeams = async () => {
       const sel = document.getElementById("m-key-team");
-      if (sel && data.teams) {
-        data.teams.forEach((t) => {
-          const o = document.createElement("option");
-          o.value = t.team_id;
-          o.textContent = t.team_alias || t.team_id;
-          sel.appendChild(o);
-        });
+      if (!sel) return;
+      let teams = window._teams;
+      if (!teams) {
+        try {
+          const data = await api("/admin/quota/overview");
+          teams = data.teams || [];
+          window._teams = teams;
+        } catch { teams = []; }
       }
-    }).catch(() => {});
+      teams.forEach((t) => {
+        const o = document.createElement("option");
+        o.value = t.team_id;
+        o.textContent = t.team_alias || t.team_id;
+        sel.appendChild(o);
+      });
+    };
+    populateTeams();
     getPlanNames().then((names) => {
       const sel = document.getElementById("m-key-plan");
       if (sel) names.forEach((n) => { const o = document.createElement("option"); o.value = n; o.textContent = n; sel.appendChild(o); });
@@ -2771,6 +2781,8 @@
         if (tm.plan_explicit && tm.plan_name) assignments[tm.team_id] = tm.plan_name;
       });
       window._teamPlanState = { default_team_plan: defaultTeamPlan, assignments };
+      // Cache teams list for the key-creation modal dropdown.
+      window._teams = data.teams || [];
       // Cache the team-plan names list once for the plan dropdowns.
       if (!window._teamPlanNames) {
         try {
@@ -2783,16 +2795,19 @@
     }
   }
 
-  // Render effective_limits as a compact spec block (no progress bar — team
-  // dimension has no current data, only limit spec).
+  // Render team plan spec as a single line of compact tags.
+  // Every plan-configurable dimension is shown; unset ones display "∞"
+  // so the operator can distinguish "unlimited" from "not applicable".
   function renderTeamEffectiveLimits(el) {
     if (!el) return "";
-    const rows = [];
-    if (el.concurrency_limit != null) {
-      rows.push(`<div class="dim-row"><span class="dim-label">${esc(t("plan.dim.concurrency"))}</span><span class="dim-value">${formatNumber(el.concurrency_limit)}</span></div>`);
-    }
-    // Window limits: array of [counts, tokens, costs, window_secs]. Each non-null
-    // dimension on a window_secs produces a row. Aggregate same secs together.
+    const INF = "∞";
+    const fmtOrInf = (v, fmt) => (v == null ? INF : fmt(v));
+    const fmtNum = (v) => formatNumber(Number(v));
+    const fmtCost = (v) => "$" + (Number(v) || 0).toLocaleString(undefined, { maximumFractionDigits: 2 });
+
+    // Aggregate window_limits by secs → {counts, tokens, costs}.
+    // rpm_limit / tpm_limit are 60s-window shorthands; merge them into the 60s
+    // bucket if not already set there (so we render one combined 60s tag).
     const bySecs = new Map();
     (el.window_limits || []).forEach((w) => {
       const [counts, tokens, costs, secs] = w;
@@ -2802,24 +2817,36 @@
       if (tokens != null) e.tokens = tokens;
       if (costs != null) e.costs = costs;
     });
-    // RPM (60s counts) is rendered separately from window_limits when present.
-    if (el.rpm_limit != null && !bySecs.has(60)) {
-      bySecs.set(60, { counts: el.rpm_limit });
-    }
+    // Ensure a 60s bucket always exists — RPM/TPM live there. If plan didn't
+    // configure either and no 60s window_limits entry exists, we still show
+    // the 60s slot as "∞" so the operator sees that short-window dimension
+    // is unrestricted (rather than silently absent).
+    if (!bySecs.has(60)) bySecs.set(60, {});
+    const min60 = bySecs.get(60);
+    if (min60.counts == null && el.rpm_limit != null) min60.counts = el.rpm_limit;
+    if (min60.tokens == null && el.tpm_limit != null) min60.tokens = el.tpm_limit;
+
+    const tags = [];
+    // Concurrency
+    tags.push(`<span class="plan-tag"><span class="plan-tag-label">${esc(t("plan.dim.concurrency"))}</span><span class="plan-tag-value">${fmtOrInf(el.concurrency_limit, fmtNum)}</span></span>`);
+    // Windows sorted by secs ascending (always includes 60s due to above).
     const sortedSecs = [...bySecs.keys()].sort((a, b) => a - b);
     sortedSecs.forEach((secs) => {
       const e = bySecs.get(secs);
-      const label = secs === 60 ? "RPM" : t("plan.window_limit_label", { duration: formatDuration(secs) });
+      const label = secs === 60 ? "60s" : formatDuration(secs);
       const parts = [];
-      if (e.counts != null) parts.push(`${formatNumber(e.counts)} ${t("quota.col.counts_short") || "req"}`);
-      if (e.tokens != null) parts.push(`${formatNumber(e.tokens)} tok`);
-      if (e.costs != null) parts.push(`$${e.costs}`);
-      rows.push(`<div class="dim-row"><span class="dim-label">${esc(label)}</span><span class="dim-value">${esc(parts.join(" / "))}</span></div>`);
+      if (e.counts != null) parts.push(`${fmtNum(e.counts)} ${t("quota.col.counts_short") || "req"}`);
+      if (e.tokens != null) parts.push(`${fmtNum(e.tokens)} tok`);
+      if (e.costs != null) parts.push(fmtCost(e.costs));
+      tags.push(`<span class="plan-tag"><span class="plan-tag-label">${esc(label)}</span><span class="plan-tag-value">${esc(parts.join(" / ") || INF)}</span></span>`);
     });
-    if (rows.length === 0) return "";
+    // Cumulative totals
+    tags.push(`<span class="plan-tag"><span class="plan-tag-label">${esc(t("plan.dim.total_tokens"))}</span><span class="plan-tag-value">${fmtOrInf(el.total_token_limit, fmtNum)}</span></span>`);
+    tags.push(`<span class="plan-tag"><span class="plan-tag-label">${esc(t("plan.dim.total_cost") || "Total Cost")}</span><span class="plan-tag-value">${fmtOrInf(el.total_cost_limit, fmtCost)}</span></span>`);
+
     return `<div class="team-limits-block">
       <div class="team-limits-title">${esc(t("quota.team_limits_title"))}</div>
-      ${rows.join("")}
+      <div class="plan-tags">${tags.join("")}</div>
     </div>`;
   }
 
