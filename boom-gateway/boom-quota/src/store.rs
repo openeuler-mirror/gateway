@@ -906,15 +906,19 @@ impl QuotaStore {
         let dirty_win = self.take_dirty_windows();
         let now = now_epoch_secs();
         for ck in &dirty_win {
-            if let Some(entry) = self.windows.get(ck) {
-                if now.saturating_sub(entry.window_start) >= entry.window_secs {
-                    continue;
+            // Copy fields out of the DashMap Ref before awaiting — otherwise
+            // the shard read lock is held across the DB upsert, blocking the
+            // hot path (add_window on the same shard) for up to sync timeout.
+            let (count, ws, wsec) = match self.windows.get(ck) {
+                Some(entry) => {
+                    if now.saturating_sub(entry.window_start) >= entry.window_secs {
+                        continue;
+                    }
+                    (entry.count as i64, entry.window_start as i64, entry.window_secs as i64)
                 }
-                let count = entry.count as i64;
-                let ws = entry.window_start as i64;
-                let wsec = entry.window_secs as i64;
-                upsert_window_db(pool, ck, count, ws, wsec).await?;
-            }
+                None => continue,
+            };
+            upsert_window_db(pool, ck, count, ws, wsec).await?;
         }
         Ok(())
     }

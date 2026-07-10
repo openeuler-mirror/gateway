@@ -19,10 +19,20 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
     // with the timeout active — PgPool multiplexes queries across connections,
     // so SET on one connection does NOT affect others.
     let mut conn = pool.acquire().await?;
-    // Best-effort: some PostgreSQL-compatible databases don't support lock_timeout.
-    let _ = sqlx::query("SET lock_timeout = '10s'")
+    // Set lock_timeout on this connection so ALTER TABLE / CREATE INDEX can't
+    // hang indefinitely on a GaussDB distributed table with stale locks from
+    // a crashed previous process. Some PG-compatible databases (notably
+    // openGauss) don't support lock_timeout — log + continue, since most
+    // ALTERs in our migrations are idempotent no-ops in steady state.
+    if let Err(e) = sqlx::query("SET lock_timeout = '10s'")
         .execute(&mut *conn)
-        .await;
+        .await
+    {
+        tracing::warn!(
+            "SET lock_timeout failed on migration connection (continuing without timeout protection): {}",
+            e
+        );
+    }
 
     // 1. Request logs (boom-audit owns all boom_request_log DDL).
     tracing::info!("Migration 1/7: request_log...");
