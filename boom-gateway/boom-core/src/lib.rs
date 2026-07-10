@@ -10,4 +10,4 @@ pub mod types;
 pub use debug_store::{DebugErrorEntry, DebugErrorStore};
 pub use error::GatewayError;
 pub use kv_event::KvIndexBackend;
-pub use provider::{Authenticator, DeploymentQueueInfo, KeyAliasLookup, Provider, RateLimiter};
+pub use provider::{Authenticator, DeploymentQueueInfo, KeyAliasLookup, Provider};

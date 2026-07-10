@@ -6,7 +6,6 @@ members = [
     "boom-gateway/boom-auth",
     "boom-gateway/boom-provider",
     "boom-gateway/boom-limiter",
-    "boom-gateway/boom-quota",
     "boom-gateway/boom-routing",
     "boom-gateway/boom-audit",
     "boom-gateway/boom-ctxaware",

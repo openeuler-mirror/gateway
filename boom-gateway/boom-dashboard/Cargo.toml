@@ -15,7 +15,6 @@ boom-routing = { path = "../boom-routing" }
 boom-ctxaware = { path = "../boom-ctxaware" }
 boom-audit = { path = "../boom-audit" }
 boom-promptlog = { path = "../boom-promptlog" }
-boom-quota = { path = "../boom-quota" }
 axum = { workspace = true }
 sqlx = { workspace = true }
 serde = { workspace = true }

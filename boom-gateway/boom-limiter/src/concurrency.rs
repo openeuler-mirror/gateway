@@ -73,21 +73,26 @@ pub struct RateLimitPlan {
 impl RateLimitPlan {
     /// Return the effective limits for the current time.
     ///
-    /// Returns (concurrency, rpm, active_windows, stale_window_secs).
-    /// `stale_window_secs` contains the `window_secs` values from the OTHER
-    /// schedule period that should be cleared so the user starts fresh on
-    /// every schedule switch.
+    /// Returns `(concurrency, active_windows, stale_window_secs)`.
     ///
     /// `active_windows` already includes the convenience shorthand merged in:
     ///   - `rpm_limit`    → synthetic 60s `counts` entry
     ///   - `tpm_limit`    → synthetic 60s `tokens` entry
     ///
+    /// RPM/TPM are NOT returned separately — they live only inside the merged
+    /// `active_windows` as 60s entries. This is the normalization fix: before,
+    /// callers received `rpm` AND a 60s counts window (from merge_shorthand)
+    /// and passed both to the limiter, which double-counted the same cache_key.
+    /// Now there's a single source of truth.
+    ///
+    /// `stale_window_secs` contains the `window_secs` values from the OTHER
+    /// schedule period that should be cleared so the user starts fresh on
+    /// every schedule switch.
+    ///
     /// Whether the plan applies to a key or a team, the limits are the same —
     /// the caller is responsible for picking the right plan (and the right
     /// concurrency counter namespace) based on `self.r#type`.
-    pub fn effective_limits(
-        &self,
-    ) -> (Option<u32>, Option<u64>, Vec<WindowLimit>, Vec<u64>) {
+    pub fn effective_limits(&self) -> (Option<u32>, Vec<WindowLimit>, Vec<u64>) {
         for slot in &self.schedule {
             if slot.is_active_now() {
                 // Merge: slot fields override plan base, unset fields fall back to base.
@@ -108,7 +113,7 @@ impl RateLimitPlan {
                     .map(|w| w.window_secs)
                     .filter(|s| !active_secs.contains(s))
                     .collect();
-                return (concurrency, rpm, merged, stale);
+                return (concurrency, merged, stale);
             }
         }
         // No schedule active: clear all schedule slot counters that don't overlap with base.
@@ -125,12 +130,7 @@ impl RateLimitPlan {
             self.rpm_limit,
             self.tpm_limit,
         );
-        (
-            self.concurrency_limit,
-            self.rpm_limit,
-            merged,
-            stale,
-        )
+        (self.concurrency_limit, merged, stale)
     }
 
     /// Merge the 1-min shorthand fields (rpm/tpm) into the window list.
@@ -1140,5 +1140,203 @@ impl<S: Stream + Unpin> Stream for GuardedStream<S> {
             this.guard.take();
         }
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use boom_core::types::{PlanType, WindowLimit};
+
+    /// Two YAML forms — `rpm_limit: 2` vs `window_limits: [[2, null, null, 60]]`
+    /// — must produce equivalent effective_limits. This is the regression guard
+    /// for the boss-reported bug where commit counts were doubled when both
+    /// forms were set (and effective_limits transparently passed rpm through
+    /// alongside windows, leading the limiter to write twice to the same cache
+    /// key). After normalization, the rpm form folds into the 60s window, so
+    /// both forms map to the same single 60s counts entry.
+    #[test]
+    fn test_rpm_field_form_equals_window_limits_form() {
+        let mut form_a = RateLimitPlan::default_for_test();
+        form_a.name = "form_a".to_string();
+        form_a.r#type = PlanType::Key;
+        form_a.rpm_limit = Some(2);
+
+        let mut form_b = RateLimitPlan::default_for_test();
+        form_b.name = "form_b".to_string();
+        form_b.r#type = PlanType::Key;
+        form_b.window_limits = vec![WindowLimit {
+            counts: Some(2),
+            tokens: None,
+            costs: None,
+            window_secs: 60,
+        }];
+
+        let (_, windows_a, _) = form_a.effective_limits();
+        let (_, windows_b, _) = form_b.effective_limits();
+
+        // Both forms produce exactly one 60s window with counts=2.
+        assert_eq!(windows_a.len(), 1, "form_a should produce one 60s entry");
+        assert_eq!(windows_b.len(), 1, "form_b should produce one 60s entry");
+        assert_eq!(windows_a[0].window_secs, 60);
+        assert_eq!(windows_b[0].window_secs, 60);
+        assert_eq!(windows_a[0].counts, Some(2));
+        assert_eq!(windows_b[0].counts, Some(2));
+
+        // No duplication: a single 60s counts entry, not two. This is the
+        // core invariant — if the limiter wrote counts twice (once for rpm
+        // field, once for 60s window), the effective allowance would be 1
+        // instead of 2 (each commit subtracts 2 instead of 1).
+        let counts_60s = windows_a
+            .iter()
+            .filter(|w| w.window_secs == 60 && w.counts.is_some())
+            .count();
+        assert_eq!(
+            counts_60s, 1,
+            "rpm_limit must fold into a single 60s counts entry, not duplicate"
+        );
+    }
+
+    /// Explicit 60s window_limits wins over rpm_limit shorthand. This is the
+    /// documented behavior in merge_shorthand: user config wins over shorthand.
+    #[test]
+    fn test_explicit_window_overrides_rpm_shorthand() {
+        let mut plan = RateLimitPlan::default_for_test();
+        plan.name = "mixed".to_string();
+        plan.r#type = PlanType::Key;
+        plan.rpm_limit = Some(2); // would default to counts=2 if no explicit 60s
+        plan.window_limits = vec![WindowLimit {
+            counts: Some(10),
+            tokens: None,
+            costs: None,
+            window_secs: 60,
+        }];
+
+        let (_, windows, _) = plan.effective_limits();
+        assert_eq!(windows.len(), 1);
+        // The explicit counts=10 wins, not the rpm_limit shorthand of 2.
+        assert_eq!(windows[0].counts, Some(10));
+    }
+
+    /// End-to-end regression test for the boss-reported bug:
+    /// "key plan 配 `rpm_limit: 2`，但实际只允许 1 个请求".
+    ///
+    /// Pre-normalization root cause: effective_limits() returned BOTH a
+    /// separate `rpm` field AND a `windows` vec containing the folded 60s
+    /// counts entry. Callers passed both to commit_record, which wrote the
+    /// same cache_key twice — doubling the per-commit weight.
+    ///
+    /// This test drives the FULL post-normalization pipeline:
+    ///   plan config → effective_limits → peek_only → commit_counts → peek_only
+    /// and asserts that rpm_limit=2 actually admits 2 requests.
+    #[tokio::test]
+    async fn test_rpm_limit_2_actually_allows_2_requests_e2e() {
+        use crate::sliding_window::{QuotaScope, SlidingWindowLimiter};
+        use boom_core::types::RateLimitKey;
+
+        let mut plan = RateLimitPlan::default_for_test();
+        plan.name = "rpm_only".to_string();
+        plan.r#type = PlanType::Key;
+        plan.rpm_limit = Some(2);
+
+        let limiter = SlidingWindowLimiter::new();
+        let key = RateLimitKey {
+            key_hash: "rpm_e2e".to_string(),
+            model: "gpt-4".to_string(),
+        };
+        let scope = QuotaScope::Key {
+            key_hash: "rpm_e2e".to_string(),
+        };
+
+        // The post-normalization contract: caller ONLY passes windows (no
+        // separate rpm field), exactly like check_plan_limits does.
+        let (_, windows, _) = plan.effective_limits();
+        assert_eq!(windows.len(), 1, "rpm_limit folds to one 60s entry");
+
+        // Two requests pass.
+        for i in 0..2 {
+            let d = limiter.peek_only(&key, &windows, 1).await;
+            assert!(d.allowed, "request {} must pass under rpm_limit=2", i + 1);
+            // PlanCharge::commit drives this single call per layer:
+            limiter.commit_counts(&key, &windows, 1);
+            // PlanCharge::settle drives this single call per layer (zero
+            // tokens for a pure-rpm plan, but exercises the path):
+            limiter.settle_usage(&key, &scope, &windows, 0, 0, 0, 0, 0);
+        }
+
+        // Third request must be rejected. If commit_counts were double-writing
+        // (the old bug), the counter would already be at 2 after the FIRST
+        // request, and the second would have been rejected — never reaching
+        // this third-request check.
+        let d3 = limiter.peek_only(&key, &windows, 1).await;
+        assert!(
+            !d3.allowed,
+            "third request must be rejected — if this fails, commit is double-writing"
+        );
+    }
+
+    /// End-to-end test for the symmetric tpm_limit case. Same shape: tpm_limit
+    /// folds into a 60s tokens entry, settle_usage must not double-count.
+    /// Tokens dimension uses historical-cumulative semantics: peek rejects
+    /// when `current >= limit` — the request that pushes the counter TO the
+    /// limit was already allowed (at peek time, current was below), but the
+    /// NEXT request after that is rejected.
+    #[tokio::test]
+    async fn test_tpm_limit_tokens_window_no_double_settle() {
+        use crate::sliding_window::{QuotaScope, SlidingWindowLimiter};
+        use boom_core::types::RateLimitKey;
+
+        let mut plan = RateLimitPlan::default_for_test();
+        plan.name = "tpm_only".to_string();
+        plan.r#type = PlanType::Key;
+        plan.tpm_limit = Some(100);
+
+        let (_, windows, _) = plan.effective_limits();
+        assert_eq!(windows.len(), 1, "tpm_limit folds to one 60s entry");
+        assert_eq!(windows[0].tokens, Some(100), "folded into 60s tokens dim");
+
+        let limiter = SlidingWindowLimiter::new();
+        let key = RateLimitKey {
+            key_hash: "tpm_e2e".to_string(),
+            model: "gpt-4".to_string(),
+        };
+        let scope = QuotaScope::Key {
+            key_hash: "tpm_e2e".to_string(),
+        };
+
+        // Settle 50 tokens. Counter=50, peek sees 50<100 → allowed.
+        limiter.settle_usage(&key, &scope, &windows, 50, 0, 0, 0, 0);
+        let d1 = limiter.peek_only(&key, &windows, 1).await;
+        assert!(d1.allowed, "50 tokens against 100 limit must pass");
+        // If settle were double-writing (the old bug), counter would already
+        // be 100 here and d1 would have been rejected.
+
+        // Settle another 49 (total=99). Peek sees 99<100 → allowed.
+        // This is the "request that pushes the counter near the limit".
+        limiter.settle_usage(&key, &scope, &windows, 49, 0, 0, 0, 0);
+        let d2 = limiter.peek_only(&key, &windows, 1).await;
+        assert!(d2.allowed, "99 tokens against 100 limit still allowed");
+
+        // Settle 1 more (total=100). Peek sees 100>=100 → rejected.
+        limiter.settle_usage(&key, &scope, &windows, 1, 0, 0, 0, 0);
+        let d3 = limiter.peek_only(&key, &windows, 1).await;
+        assert!(!d3.allowed, "100 tokens at the limit must reject (>=)");
+    }
+
+    impl RateLimitPlan {
+        fn default_for_test() -> Self {
+            RateLimitPlan {
+                name: String::new(),
+                r#type: PlanType::Key,
+                member_plan: None,
+                concurrency_limit: None,
+                rpm_limit: None,
+                tpm_limit: None,
+                window_limits: Vec::new(),
+                total_token_limit: None,
+                total_cost_limit: None,
+                schedule: Vec::new(),
+            }
+        }
     }
 }

@@ -389,7 +389,6 @@ dependencies = [
  "boom-flowcontrol",
  "boom-limiter",
  "boom-promptlog",
- "boom-quota",
  "boom-routing",
  "chrono",
  "dashmap",
@@ -475,7 +474,6 @@ dependencies = [
  "boom-limiter",
  "boom-promptlog",
  "boom-provider",
- "boom-quota",
  "boom-routing",
  "chrono",
  "clap",
@@ -530,23 +528,6 @@ dependencies = [
  "tracing",
  "uuid",
  "wiremock",
-]
-
-[[package]]
-name = "boom-quota"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "boom-core",
- "chrono",
- "dashmap",
- "rust_decimal",
- "serde",
- "serde_json",
- "sqlx",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
 ]
 
 [[package]]

@@ -7,7 +7,6 @@ use boom_kvindex::{spawn_kv_subscriber, KvSubscriberConfig, TokenPrefixIndex, To
 use boom_core::kv_event::KvIndexBackend;
 use boom_limiter::{PlanStore, RateLimitPlan, ScheduleSlot, SlidingWindowLimiter};
 use boom_flowcontrol::{FlowControlConfig, FlowController};
-use boom_quota::QuotaStore;
 use boom_routing::{AliasStore, DeploymentStore, HybridRouter, InFlightTracker, KeyAffinityPolicy, RebalanceMoveTracker, RequestRateTracker, Router, RoundRobinPolicy, SchedulePolicy, StrategyRegistry, TierClassifier};
 use boom_ctxaware::AgentStatsTracker;
 use boom_promptlog::PromptLogWriter;
@@ -44,9 +43,6 @@ pub struct AppState {
     pub limiter: Arc<SlidingWindowLimiter>,
     /// Plan store survives reloads (preserves plan definitions and key assignments).
     pub plan_store: Arc<PlanStore>,
-    /// Quota store survives reloads (preserves cumulative token/cost counters
-    /// and 1-minute TPM windows). Owned by boom-quota.
-    pub quota_store: Arc<QuotaStore>,
     /// Deployment store survives reloads (preserves model deployments).
     pub deployment_store: Arc<DeploymentStore>,
     /// Alias store survives reloads (preserves model aliases).
@@ -165,9 +161,6 @@ impl AppState {
         // 3. Plan store survives across reloads.
         let plan_store = Arc::new(PlanStore::new());
 
-        // 3b. Quota store survives across reloads (cumulative token/cost + 1-min TPM).
-        let quota_store = Arc::new(QuotaStore::new());
-
         // 4. Deployment store & alias store survive across reloads.
         let deployment_store = Arc::new(DeploymentStore::new());
         let alias_store = Arc::new(AliasStore::new());
@@ -232,7 +225,6 @@ impl AppState {
             plan_store.restore_assignments_from_db(pool).await;
             plan_store.restore_team_assignments_from_db(pool).await;
             limiter.restore_counters_from_db(pool).await;
-            quota_store.restore_from_db(pool).await;
         }
 
         // 6. Build inner state (config + auth + health).
@@ -250,7 +242,6 @@ impl AppState {
             dashboard_db_pool,
             limiter,
             plan_store,
-            quota_store,
             deployment_store,
             alias_store,
             router,

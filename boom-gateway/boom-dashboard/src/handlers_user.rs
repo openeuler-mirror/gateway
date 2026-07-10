@@ -25,7 +25,13 @@ pub async fn get_plan(
 
     match plan {
         Some(p) => {
-            let (concurrency_limit, rpm_limit, window_limits, _) = p.effective_limits();
+            let (concurrency_limit, window_limits, _) = p.effective_limits();
+            // rpm_limit is the 60s counts dimension — surfaced separately for
+            // front-end compat (effective_limits folds it into window_limits).
+            let rpm_limit = window_limits
+                .iter()
+                .find(|w| w.window_secs == 60)
+                .and_then(|w| w.counts);
             // Serialize WindowLimit entries as compact arrays for front-end compat.
             let wl_json: Vec<serde_json::Value> = window_limits
                 .iter()
@@ -70,10 +76,15 @@ pub async fn get_usage(
         .plan_store
         .resolve_plan(key_hash)
         .or_else(|| state.plan_store.get_default_plan());
-    let (plan_concurrency, plan_rpm, plan_window_limits, _) = plan
+    let (plan_concurrency, plan_window_limits, _) = plan
         .as_ref()
         .map(|p| p.effective_limits())
-        .unwrap_or((None, None, vec![], vec![]));
+        .unwrap_or((None, vec![], vec![]));
+    // rpm_limit is the 60s counts dimension (folded into window_limits).
+    let plan_rpm = plan_window_limits
+        .iter()
+        .find(|w| w.window_secs == 60)
+        .and_then(|w| w.counts);
 
     // Counts dimension: from SlidingWindowLimiter (per-window aggregated).
     // We dedupe by window_secs — multiple models under the same key collapse
@@ -84,22 +95,22 @@ pub async fn get_usage(
         let remaining = w.window_secs.saturating_sub(w.elapsed_secs);
         counts_by_secs
             .entry(w.window_secs)
-            .and_modify(|e| e.0 = e.0.saturating_add(w.count))
-            .or_insert((w.count, w.elapsed_secs, remaining));
+            .and_modify(|e| e.0 = e.0.saturating_add(w.counts))
+            .or_insert((w.counts, w.elapsed_secs, remaining));
     }
 
-    // Tokens / costs dimension: from QuotaStore. Aggregate count by (secs, kind)
+    // Tokens / costs dimension: from the limiter's multi-dim windows. Aggregate count by (secs, kind)
     // — we don't surface per-model breakdown on the user usage card.
     let mut tokens_by_secs: std::collections::HashMap<u64, (u64, u64)> =
         std::collections::HashMap::new(); // secs → (count, remaining)
     let mut costs_by_secs: std::collections::HashMap<u64, (u64, u64)> =
         std::collections::HashMap::new(); // secs → (micros, remaining)
-    for w in state.quota_store.peek_key_windows(key_hash) {
+    for w in state.limiter.peek_key_windows(key_hash) {
         let entry = match w.kind {
-            boom_quota::WindowKind::Tokens => tokens_by_secs
+            boom_limiter::WindowKind::Tokens => tokens_by_secs
                 .entry(w.window_secs)
                 .or_insert((0, w.remaining_secs)),
-            boom_quota::WindowKind::CostMicros => costs_by_secs
+            boom_limiter::WindowKind::CostMicros => costs_by_secs
                 .entry(w.window_secs)
                 .or_insert((0, w.remaining_secs)),
         };
@@ -164,9 +175,9 @@ pub async fn get_usage(
                     "costs".to_string(),
                     json!({
                         "current_micros": cur_micros,
-                        "current": boom_quota::micros_to_decimal(cur_micros).to_string(),
+                        "current": boom_limiter::micros_to_decimal(cur_micros).to_string(),
                         "limit": limit.to_string(),
-                        "limit_micros": boom_quota::decimal_to_micros(limit),
+                        "limit_micros": boom_limiter::decimal_to_micros(limit),
                     }),
                 );
             }
@@ -189,27 +200,27 @@ pub async fn get_usage(
         .collect();
 
     // Cumulative counters + plan cumulative limits.
-    let key_scope = boom_quota::QuotaScope::Key {
+    let key_scope = boom_limiter::QuotaScope::Key {
         key_hash: key_hash.to_string(),
     };
     let total_in = state
-        .quota_store
-        .peek_cumulative(&key_scope, boom_quota::CumulativeKind::TotalInputTokens);
+        .limiter
+        .peek_cumulative(&key_scope, boom_limiter::CumulativeKind::TotalInputTokens);
     let total_out = state
-        .quota_store
-        .peek_cumulative(&key_scope, boom_quota::CumulativeKind::TotalOutputTokens);
+        .limiter
+        .peek_cumulative(&key_scope, boom_limiter::CumulativeKind::TotalOutputTokens);
     let total_cost_micros = state
-        .quota_store
-        .peek_cumulative(&key_scope, boom_quota::CumulativeKind::TotalCost);
+        .limiter
+        .peek_cumulative(&key_scope, boom_limiter::CumulativeKind::TotalCost);
     let regular_input_cost_micros = state
-        .quota_store
-        .peek_cumulative(&key_scope, boom_quota::CumulativeKind::TotalRegularInputCost);
+        .limiter
+        .peek_cumulative(&key_scope, boom_limiter::CumulativeKind::TotalRegularInputCost);
     let cached_input_cost_micros = state
-        .quota_store
-        .peek_cumulative(&key_scope, boom_quota::CumulativeKind::TotalCachedInputCost);
+        .limiter
+        .peek_cumulative(&key_scope, boom_limiter::CumulativeKind::TotalCachedInputCost);
     let output_cost_micros = state
-        .quota_store
-        .peek_cumulative(&key_scope, boom_quota::CumulativeKind::TotalOutputCost);
+        .limiter
+        .peek_cumulative(&key_scope, boom_limiter::CumulativeKind::TotalOutputCost);
 
     let concurrency = state.plan_store.get_concurrency(key_hash);
 
@@ -223,13 +234,13 @@ pub async fn get_usage(
             "total_output_tokens": total_out,
             "total_tokens": total_in.saturating_add(total_out),
             "total_cost_micros": total_cost_micros,
-            "total_cost": boom_quota::micros_to_decimal(total_cost_micros).to_string(),
+            "total_cost": boom_limiter::micros_to_decimal(total_cost_micros).to_string(),
             "regular_input_cost_micros": regular_input_cost_micros,
-            "regular_input_cost": boom_quota::micros_to_decimal(regular_input_cost_micros).to_string(),
+            "regular_input_cost": boom_limiter::micros_to_decimal(regular_input_cost_micros).to_string(),
             "cached_input_cost_micros": cached_input_cost_micros,
-            "cached_input_cost": boom_quota::micros_to_decimal(cached_input_cost_micros).to_string(),
+            "cached_input_cost": boom_limiter::micros_to_decimal(cached_input_cost_micros).to_string(),
             "output_cost_micros": output_cost_micros,
-            "output_cost": boom_quota::micros_to_decimal(output_cost_micros).to_string(),
+            "output_cost": boom_limiter::micros_to_decimal(output_cost_micros).to_string(),
             "total_token_limit": plan.as_ref().and_then(|p| p.total_token_limit),
             "total_cost_limit": plan.as_ref().and_then(|p| p.total_cost_limit).map(|d| d.to_string()),
         },
@@ -277,16 +288,16 @@ pub async fn get_key_info(
             // Query token usage from LiteLLM_SpendLogs (may not exist in all deployments).
             let (input_tokens, output_tokens) = query_token_usage(db_pool, key_hash).await;
 
-            // Total cost across the key's lifetime — from QuotaStore.cumulative
+            // Total cost across the key's lifetime — from limiter.cumulative
             // (boom_rate_limit_cumulative backed), NOT boom_verification_token.spend
             // (litellm legacy column we never write, always 0).
             let total_cost_micros = state
-                .quota_store
+                .limiter
                 .peek_cumulative(
-                    &boom_quota::QuotaScope::Key {
+                    &boom_limiter::QuotaScope::Key {
                         key_hash: key_hash.to_string(),
                     },
-                    boom_quota::CumulativeKind::TotalCost,
+                    boom_limiter::CumulativeKind::TotalCost,
                 );
             let total_cost = rust_decimal::Decimal::from(total_cost_micros)
                 / rust_decimal::Decimal::from(1_000_000);
