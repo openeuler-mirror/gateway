@@ -675,6 +675,23 @@ pub struct AnthropicUsage {
 // Rate Limit Types
 // ============================================================
 
+/// Plan type — determines which set of limits applies.
+///
+/// - `Key` (default): plan is assigned to a key. Only `key_*` fields apply.
+/// - `Team`: plan is assigned to a team. Only `team_*` fields apply.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, Hash, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum PlanType {
+    Key,
+    Team,
+}
+
+impl Default for PlanType {
+    fn default() -> Self {
+        PlanType::Key
+    }
+}
+
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct RateLimitKey {
     pub key_hash: String,
@@ -691,4 +708,100 @@ pub struct RateLimitDecision {
     /// When `allowed` is false, the window duration that triggered the rejection.
     /// 60 = RPM window, other = custom window limit.
     pub rejected_window_secs: Option<u64>,
+}
+
+/// A multi-dimensional sliding-window limit entry.
+///
+/// One entry can cap up to three dimensions simultaneously within a sliding
+/// window of `window_secs`:
+///   - `counts`: number of requests
+///   - `tokens`: total tokens (input + output, including cached)
+///   - `costs`:  total cost in USD (Decimal)
+///
+/// Any subset of dimensions may be set; `None` means "no cap on this dimension".
+/// The gateway checks each configured dimension and rejects the request when
+/// the **current cumulative** value already meets or exceeds the limit (peek
+/// semantics — the request that pushes the counter past the limit is allowed
+/// through, the next one is rejected).
+///
+/// Defined here in boom-core (the leaf crate) so both boom-config (YAML parse)
+/// and boom-limiter (plan model) reference the same type without boom-limiter
+/// depending on boom-config — keeps the module dependency graph clean.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WindowLimit {
+    pub counts: Option<u64>,
+    pub tokens: Option<u64>,
+    pub costs: Option<rust_decimal::Decimal>,
+    pub window_secs: u64,
+}
+
+impl Default for WindowLimit {
+    fn default() -> Self {
+        Self {
+            counts: None,
+            tokens: None,
+            costs: None,
+            window_secs: 60,
+        }
+    }
+}
+
+impl WindowLimit {
+    /// True if no dimension is configured (no-op entry).
+    pub fn is_empty(&self) -> bool {
+        self.counts.is_none() && self.tokens.is_none() && self.costs.is_none()
+    }
+}
+
+/// Serde helper: accept both compact array form `[counts, tokens, costs, window_secs]`
+/// (with `null` for unused dimensions) and verbose object form. The array form
+/// requires exactly 4 elements to keep field positions unambiguous.
+///
+/// Lives in boom-core so every boom-* module that owns a struct with
+/// `Vec<WindowLimit>` fields can attach it via `#[serde(deserialize_with = ...)]`
+/// without depending on boom-config.
+pub fn deserialize_window_limit_vec<'de, D>(
+    deserializer: D,
+) -> Result<Vec<WindowLimit>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Helper {
+        Array(Option<u64>, Option<u64>, Option<rust_decimal::Decimal>, u64),
+        Object {
+            #[serde(default)]
+            counts: Option<u64>,
+            #[serde(default)]
+            tokens: Option<u64>,
+            #[serde(default)]
+            costs: Option<rust_decimal::Decimal>,
+            window_secs: u64,
+        },
+    }
+
+    let helpers = Vec::<Helper>::deserialize(deserializer)?;
+    Ok(helpers
+        .into_iter()
+        .map(|h| match h {
+            Helper::Array(counts, tokens, costs, window_secs) => WindowLimit {
+                counts,
+                tokens,
+                costs,
+                window_secs,
+            },
+            Helper::Object {
+                counts,
+                tokens,
+                costs,
+                window_secs,
+            } => WindowLimit {
+                counts,
+                tokens,
+                costs,
+                window_secs,
+            },
+        })
+        .collect())
 }

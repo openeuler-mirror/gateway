@@ -6,6 +6,7 @@ members = [
     "boom-gateway/boom-auth",
     "boom-gateway/boom-provider",
     "boom-gateway/boom-limiter",
+    "boom-gateway/boom-quota",
     "boom-gateway/boom-routing",
     "boom-gateway/boom-audit",
     "boom-gateway/boom-ctxaware",
@@ -87,3 +88,7 @@ lru = "0.12"
 # ZMQ + msgpack (KV event transport)
 tmq = "0.5"
 rmpv = "1"
+
+# Decimal arithmetic (cost / billing)
+rust_decimal = { version = "1", features = ["serde", "db-postgres"] }
+rust_decimal_macros = { version = "1" }

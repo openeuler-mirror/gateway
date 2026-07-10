@@ -7,6 +7,7 @@ use boom_kvindex::{spawn_kv_subscriber, KvSubscriberConfig, TokenPrefixIndex, To
 use boom_core::kv_event::KvIndexBackend;
 use boom_limiter::{PlanStore, RateLimitPlan, ScheduleSlot, SlidingWindowLimiter};
 use boom_flowcontrol::{FlowControlConfig, FlowController};
+use boom_quota::QuotaStore;
 use boom_routing::{AliasStore, DeploymentStore, HybridRouter, InFlightTracker, KeyAffinityPolicy, RebalanceMoveTracker, RequestRateTracker, Router, RoundRobinPolicy, SchedulePolicy, StrategyRegistry, TierClassifier};
 use boom_ctxaware::AgentStatsTracker;
 use boom_promptlog::PromptLogWriter;
@@ -43,6 +44,9 @@ pub struct AppState {
     pub limiter: Arc<SlidingWindowLimiter>,
     /// Plan store survives reloads (preserves plan definitions and key assignments).
     pub plan_store: Arc<PlanStore>,
+    /// Quota store survives reloads (preserves cumulative token/cost counters
+    /// and 1-minute TPM windows). Owned by boom-quota.
+    pub quota_store: Arc<QuotaStore>,
     /// Deployment store survives reloads (preserves model deployments).
     pub deployment_store: Arc<DeploymentStore>,
     /// Alias store survives reloads (preserves model aliases).
@@ -161,6 +165,9 @@ impl AppState {
         // 3. Plan store survives across reloads.
         let plan_store = Arc::new(PlanStore::new());
 
+        // 3b. Quota store survives across reloads (cumulative token/cost + 1-min TPM).
+        let quota_store = Arc::new(QuotaStore::new());
+
         // 4. Deployment store & alias store survive across reloads.
         let deployment_store = Arc::new(DeploymentStore::new());
         let alias_store = Arc::new(AliasStore::new());
@@ -223,7 +230,9 @@ impl AppState {
 
             // Restore runtime state.
             plan_store.restore_assignments_from_db(pool).await;
+            plan_store.restore_team_assignments_from_db(pool).await;
             limiter.restore_counters_from_db(pool).await;
+            quota_store.restore_from_db(pool).await;
         }
 
         // 6. Build inner state (config + auth + health).
@@ -241,6 +250,7 @@ impl AppState {
             dashboard_db_pool,
             limiter,
             plan_store,
+            quota_store,
             deployment_store,
             alias_store,
             router,
@@ -817,6 +827,75 @@ fn build_deployments_from_config(config: &Config, deployment_store: &Arc<Deploym
                     );
                 }
                 deployment_store.set_quota_ratio(&entry.model_name, ratio);
+
+                // Per-model cost rates for billing/quota accounting.
+                // Resolution order: cost_template reference overrides inline
+                // cost fields. Inline fields fill in any rate the template
+                // left unset (None). Falls back to inline only when no template.
+                //
+                // YAML rates are USD per million tokens (e.g. `0.27` = $0.27/1M
+                // tokens). Convert to per-token Decimal internally for accurate
+                // accounting on small requests.
+                if let Some(info) = entry.model_info.as_ref() {
+                    use rust_decimal::prelude::FromPrimitive;
+                    let per_million_to_per_token = |v: Option<f64>| -> Option<rust_decimal::Decimal> {
+                        v.and_then(rust_decimal::Decimal::from_f64)
+                            .map(|d| d / rust_decimal::Decimal::from(1_000_000))
+                    };
+
+                    let (in_input, in_cached, in_output) = (
+                        info.input_cost_per_million_tokens,
+                        info.cached_input_cost_per_million_tokens,
+                        info.output_cost_per_million_tokens,
+                    );
+
+                    // Template lookup (overrides inline when present).
+                    let template_rates = info.cost_template.as_ref().and_then(|tn| {
+                        config.cost_templates.iter().find(|t| t.name == *tn).map(|t| {
+                            (
+                                t.input_cost_per_million_tokens,
+                                t.cached_input_cost_per_million_tokens,
+                                t.output_cost_per_million_tokens,
+                            )
+                        })
+                    });
+
+                    // If template name was set but not found, warn and fall
+                    // back to inline fields (don't silently bill at zero).
+                    if let (Some(ref tn), None) = (&info.cost_template, &template_rates) {
+                        tracing::warn!(
+                            model = %entry.model_name,
+                            template = %tn,
+                            "cost_template not found in cost_templates — falling back to inline fields"
+                        );
+                    }
+
+                    let (src_input, src_cached, src_output) = match template_rates {
+                        Some(t) => t,
+                        None => (in_input, in_cached, in_output),
+                    };
+
+                    let input_rate = per_million_to_per_token(src_input);
+                    let cached_rate = per_million_to_per_token(src_cached);
+                    let output_rate = per_million_to_per_token(src_output);
+
+                    if input_rate.is_some() || output_rate.is_some() || cached_rate.is_some() {
+                        let rate = boom_routing::ModelCostRate::with_cached(
+                            input_rate.unwrap_or_default(),
+                            cached_rate.unwrap_or_default(),
+                            output_rate.unwrap_or_default(),
+                        );
+                        deployment_store.set_cost_rate(&entry.model_name, rate);
+                        tracing::info!(
+                            model = %entry.model_name,
+                            template = ?info.cost_template,
+                            input_per_1m = src_input.unwrap_or(0.0),
+                            cached_per_1m = src_cached.unwrap_or(0.0),
+                            output_per_1m = src_output.unwrap_or(0.0),
+                            "Registered cost rate (USD per million tokens)"
+                        );
+                    }
+                }
             }
             Err(e) => {
                 tracing::error!(
@@ -905,23 +984,19 @@ fn seed_flow_controller_from_config(config: &Config, flow_controller: &Arc<FlowC
 /// Load plans from YAML config into PlanStore.
 fn load_plans_from_config(plan_store: &Arc<PlanStore>, config: &Config) {
     for (name, pc) in &config.plan_settings.plans {
-        let window_limits: Vec<(u64, u64)> = pc
-            .window_limits
-            .iter()
-            .filter_map(|w| {
-                if w.len() >= 2 {
-                    Some((w[0], w[1]))
-                } else {
-                    None
-                }
-            })
-            .collect();
-
+        // `window_limits` is already a multi-dim `Vec<WindowLimit>` in the
+        // config struct — pass through as-is. A plan is a generic template;
+        // `type` only gates which entity it may be assigned to.
         let plan = RateLimitPlan {
             name: name.clone(),
+            r#type: pc.r#type,
+            member_plan: pc.member_plan.clone(),
             concurrency_limit: pc.concurrency_limit,
             rpm_limit: pc.rpm_limit,
-            window_limits,
+            tpm_limit: pc.tpm_limit,
+            window_limits: pc.window_limits.clone(),
+            total_token_limit: pc.total_token_limit,
+            total_cost_limit: pc.total_cost_limit,
             schedule: convert_schedule(&pc.schedule),
         };
         plan_store.upsert_plan(plan);
@@ -944,6 +1019,35 @@ fn load_plans_from_config(plan_store: &Arc<PlanStore>, config: &Config) {
         None => {
             plan_store.set_default_plan(None);
             tracing::warn!("没有默认套餐配置，所有用户将无套餐限制。");
+        }
+    }
+
+    match &config.plan_settings.default_team_plan {
+        Some(dtp) => {
+            if let Some(plan) = plan_store.get_plan(dtp) {
+                if plan.r#type == boom_core::types::PlanType::Team {
+                    plan_store.set_default_team_plan(Some(dtp.clone()));
+                    tracing::info!(default_team_plan = %dtp, "Default team plan set");
+                } else {
+                    tracing::warn!(
+                        default_team_plan = %dtp,
+                        "default_team_plan '{}' is not type=team, ignoring",
+                        dtp
+                    );
+                    plan_store.set_default_team_plan(None);
+                }
+            } else {
+                tracing::warn!(
+                    default_team_plan = %dtp,
+                    "default_team_plan '{}' not found in configured plans, ignoring",
+                    dtp
+                );
+                plan_store.set_default_team_plan(None);
+            }
+        }
+        None => {
+            plan_store.set_default_team_plan(None);
+            tracing::info!("没有默认 team 套餐配置，未显式分配 plan 的 team 将不受 team 维度限制。");
         }
     }
 }
@@ -1050,17 +1154,8 @@ fn convert_schedule(slots: &[boom_config::ScheduleSlotConfig]) -> Vec<ScheduleSl
             hours: s.hours.clone(),
             concurrency_limit: s.concurrency_limit,
             rpm_limit: s.rpm_limit,
-            window_limits: s
-                .window_limits
-                .iter()
-                .filter_map(|w| {
-                    if w.len() >= 2 {
-                        Some((w[0], w[1]))
-                    } else {
-                        None
-                    }
-                })
-                .collect(),
+            tpm_limit: s.tpm_limit,
+            window_limits: s.window_limits.clone(),
         })
         .collect()
 }
@@ -1173,9 +1268,11 @@ async fn build_config_snapshot_value(pool: &PgPool) -> Result<serde_json::Value,
             .map(|arr| {
                 arr.iter()
                     .filter_map(|item| {
-                        let a = item.as_array()?;
-                        if a.len() >= 2 {
-                            Some(serde_json::json!([a[0], a[1]]))
+                        // Pass through the entry as-is. The schema is
+                        // multi-dimensional (compact array or verbose object
+                        // form — see boom_core::types::WindowLimit).
+                        if item.is_array() || item.is_object() {
+                            Some(item.clone())
                         } else {
                             None
                         }
@@ -1211,14 +1308,33 @@ async fn build_config_snapshot_value(pool: &PgPool) -> Result<serde_json::Value,
             .unwrap_or_default();
 
         let mut plan_obj = serde_json::Map::new();
+        let type_str = r.r#type.as_deref().unwrap_or("key");
+        plan_obj.insert("type".into(), serde_json::Value::String(type_str.to_string()));
+        if let Some(mp) = &r.member_plan {
+            plan_obj.insert("member_plan".into(), serde_json::Value::String(mp.clone()));
+        }
         if let Some(cl) = r.concurrency_limit {
             plan_obj.insert("concurrency_limit".into(), serde_json::Value::Number(cl.into()));
         }
         if let Some(rpm) = r.rpm_limit {
             plan_obj.insert("rpm_limit".into(), serde_json::Value::Number(rpm.into()));
         }
+        if let Some(tpm) = r.tpm_limit {
+            plan_obj.insert("tpm_limit".into(), serde_json::Value::Number(tpm.into()));
+        }
         if !window_limits.is_empty() {
             plan_obj.insert("window_limits".into(), serde_json::Value::Array(window_limits));
+        }
+        if let Some(tok) = r.total_token_limit {
+            plan_obj.insert("total_token_limit".into(), serde_json::Value::Number(tok.into()));
+        }
+        if let Some(cost_micros) = r.total_cost_limit_micros {
+            let cost = rust_decimal::Decimal::from(cost_micros.max(0))
+                / rust_decimal::Decimal::from(1_000_000);
+            plan_obj.insert(
+                "total_cost_limit".into(),
+                serde_json::Value::String(cost.to_string()),
+            );
         }
         if !schedule.is_empty() {
             plan_obj.insert("schedule".into(), serde_json::Value::Array(schedule));

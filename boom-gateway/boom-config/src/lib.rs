@@ -3,6 +3,17 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
 
+/// Re-export of `boom_core::types::WindowLimit` — single source of truth.
+///
+/// Defined in boom-core (the leaf crate) so both boom-config (YAML parse) and
+/// boom-limiter (plan model) reference the same type without boom-limiter
+/// depending on boom-config. The serde helper also lives in boom-core for the
+/// same reason — every module that owns a `Vec<WindowLimit>` field needs it.
+pub use boom_core::types::WindowLimit;
+
+/// Re-export of the serde helper — see `boom_core::types::deserialize_window_limit_vec`.
+pub use boom_core::types::deserialize_window_limit_vec;
+
 /// Top-level gateway configuration, loaded from YAML.
 /// Compatible with litellm's `proxy_server_config.yaml` format.
 #[derive(Debug, Deserialize, Clone)]
@@ -19,11 +30,45 @@ pub struct Config {
     pub rate_limit: RateLimitSettings,
     #[serde(default)]
     pub plan_settings: PlanSettings,
+    /// Reusable billing templates — referenced by `model_info.cost_template`.
+    /// Lets ops define one rate set (e.g. deepseek-v3 pricing) and bind it to
+    /// multiple deployments without repeating the cost fields per model.
+    #[serde(default)]
+    pub cost_templates: Vec<CostTemplate>,
     #[serde(default)]
     pub deployment_health_check: DeploymentHealthCheckSettings,
     /// Prompt log configuration (transparent pass-through to boom-promptlog).
     #[serde(default)]
     pub prompt_log: Option<serde_json::Value>,
+}
+
+/// A reusable billing rate template.
+///
+/// All rates are **USD per million tokens** — write `0.27` for $0.27/1M tokens,
+/// not `0.00000027`. The gateway converts to per-token internally.
+///
+/// ```yaml
+/// cost_templates:
+///   - name: deepseek-v3
+///     input_cost_per_million_tokens: 0.27
+///     cached_input_cost_per_million_tokens: 0.014   # 1/20 of input
+///     output_cost_per_million_tokens: 1.10
+/// ```
+///
+/// Bind a model to a template via `model_info.cost_template: deepseek-v3`.
+/// Template fields override any inline cost fields on the model (avoids
+/// ambiguity when both are set).
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct CostTemplate {
+    pub name: String,
+    #[serde(default)]
+    pub input_cost_per_million_tokens: Option<f64>,
+    /// USD per million cached input tokens (KV-cache hit). Usually 1/N of
+    /// input price. When None / 0 → cache hits billed at the regular input rate.
+    #[serde(default)]
+    pub cached_input_cost_per_million_tokens: Option<f64>,
+    #[serde(default)]
+    pub output_cost_per_million_tokens: Option<f64>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -71,21 +116,61 @@ fn default_offline_check_interval_secs() -> u64 { 30 }
 fn default_recovery_check_interval_secs() -> u64 { 60 }
 fn default_request_failure_threshold() -> u32 { 3 }
 
+/// Re-export of `boom_core::types::PlanType` so config consumers don't need
+/// to depend on boom-limiter. Defined in boom-core as the single source of truth.
+pub use boom_core::types::PlanType;
+
 /// A single plan definition in YAML config (plan name comes from the HashMap key).
-#[derive(Debug, Deserialize, Clone)]
+///
+/// A plan is a **generic template** — all limit fields apply uniformly to
+/// whichever entity (key or team) the plan is assigned to. The `type` field
+/// only acts as a guard against misassignment: `type=team` plans can only be
+/// assigned to teams, `type=key` plans only to keys (typically team plans
+/// carry larger quotas so mis-assigning them to a single key would be
+/// dangerous).
+///
+/// Field names therefore carry **no** `key_` / `team_` prefix — there is only
+/// one set of limits per plan.
+///
+/// `window_limits` accepts multi-dimensional entries — see [`WindowLimit`].
+/// The legacy `rpm_limit` / `tpm_limit` fields are kept as 1-minute-window
+/// convenience shorthand; they get merged into the effective window list as
+/// a synthetic 60s entry at evaluation time, so configs can mix the
+/// shorthand and the explicit `window_limits`.
+#[derive(Debug, Deserialize, Clone, Default)]
 pub struct PlanConfig {
+    #[serde(default)]
+    pub r#type: PlanType,
+    /// Only used when type=Team. Plan name applied to each member key.
+    #[serde(default)]
+    pub member_plan: Option<String>,
+
     #[serde(default)]
     pub concurrency_limit: Option<u32>,
     #[serde(default)]
     pub rpm_limit: Option<u64>,
     #[serde(default)]
-    pub window_limits: Vec<Vec<u64>>,
+    pub tpm_limit: Option<u64>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_window_limit_vec"
+    )]
+    pub window_limits: Vec<WindowLimit>,
+    #[serde(default)]
+    pub total_token_limit: Option<u64>,
+    #[serde(default)]
+    pub total_cost_limit: Option<rust_decimal::Decimal>,
+
     /// Optional time-based schedule overrides.
     #[serde(default)]
     pub schedule: Vec<ScheduleSlotConfig>,
 }
 
 /// A time-based schedule slot within a plan.
+///
+/// Slots override the base plan fields during their active time window.
+/// Like the plan itself, slot fields are **generic** (no key_/team_ prefix)
+/// — they apply to whichever entity the parent plan is assigned to.
 ///
 /// ```yaml
 /// schedule:
@@ -105,7 +190,12 @@ pub struct ScheduleSlotConfig {
     #[serde(default)]
     pub rpm_limit: Option<u64>,
     #[serde(default)]
-    pub window_limits: Vec<Vec<u64>>,
+    pub tpm_limit: Option<u64>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_window_limit_vec"
+    )]
+    pub window_limits: Vec<WindowLimit>,
 }
 
 /// Top-level plan settings section.
@@ -113,6 +203,7 @@ pub struct ScheduleSlotConfig {
 /// ```yaml
 /// plan_settings:
 ///   default_plan: "basic"
+///   default_team_plan: "team_basic"
 ///   plans:
 ///     basic:
 ///       concurrency_limit: 4
@@ -123,6 +214,8 @@ pub struct ScheduleSlotConfig {
 pub struct PlanSettings {
     /// Name of the plan to use for keys without an explicit assignment.
     pub default_plan: Option<String>,
+    /// Name of the plan to use for teams without an explicit assignment.
+    pub default_team_plan: Option<String>,
     /// Plan name → plan definition.
     #[serde(default)]
     pub plans: HashMap<String, PlanConfig>,
@@ -130,21 +223,43 @@ pub struct PlanSettings {
 
 /// Model metadata — compatible with litellm's `model_info` field.
 ///
-/// ```yaml
-/// model_info:
-///   id: node-a
-///   input_cost_per_token: 0.000005
-///   output_cost_per_token: 0.000015
-/// ```
+/// Cost fields can be set in two ways:
+/// 1. Inline directly here:
+///    ```yaml
+///    model_info:
+///      input_cost_per_million_tokens: 5.0       # $5 / 1M input tokens
+///      cached_input_cost_per_million_tokens: 1.0  # $1 / 1M cached input tokens
+///      output_cost_per_million_tokens: 15.0
+///    ```
+/// 2. By reference to a `cost_templates` entry:
+///    ```yaml
+///    model_info:
+///      cost_template: deepseek-v3
+///    ```
+///    The template's rates override inline fields when both are present —
+///    this lets ops swap pricing for many models in one place.
+///
+/// All `*_per_million_tokens` fields are USD per 1 million tokens. The
+/// gateway converts to per-token internally for accounting.
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct ModelInfo {
     pub id: Option<String>,
-    pub input_cost_per_token: Option<f64>,
-    pub output_cost_per_token: Option<f64>,
+    #[serde(default)]
+    pub input_cost_per_million_tokens: Option<f64>,
+    /// USD per million cached input tokens (KV-cache hit). Optional — when
+    /// None/0, cache hits are billed at the regular `input_cost_per_million_tokens` rate.
+    #[serde(default)]
+    pub cached_input_cost_per_million_tokens: Option<f64>,
+    #[serde(default)]
+    pub output_cost_per_million_tokens: Option<f64>,
     /// Quota count multiplier for this model.
     /// Each request consumes `quota_count_ratio` units instead of 1.
     /// Defaults to 1 when not set.
     pub quota_count_ratio: Option<u64>,
+    /// Reference to a `cost_templates` entry by name. Template rates take
+    /// precedence over any inline cost fields above.
+    #[serde(default)]
+    pub cost_template: Option<String>,
 }
 
 /// Per-deployment flow control configuration.
@@ -848,5 +963,77 @@ mod tests {
         // NaN → reject (all comparisons are false).
         config.router_settings.kvc_aware.full_report_hit_threshold = f64::NAN;
         assert!(config.validate().is_err(), "NaN should be rejected");
+    }
+
+    #[test]
+    fn test_window_limit_compact_array_syntax() {
+        // Compact array form: [counts, tokens, costs, window_secs]
+        let yaml = r#"
+plan_settings:
+  default_plan: basic
+  plans:
+    basic:
+      window_limits:
+        - [1000, null, null, 3600]
+        - [null, 5000000, 5.0, 3600]
+        - [null, null, 1.0, 60]
+    team_plan:
+      window_limits:
+        - counts: 5000
+          tokens: 50000000
+          costs: 50.0
+          window_secs: 86400
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let basic = &config.plan_settings.plans["basic"];
+        assert_eq!(basic.window_limits.len(), 3);
+
+        let w0 = &basic.window_limits[0];
+        assert_eq!(w0.counts, Some(1000));
+        assert_eq!(w0.tokens, None);
+        assert_eq!(w0.costs, None);
+        assert_eq!(w0.window_secs, 3600);
+
+        let w1 = &basic.window_limits[1];
+        assert_eq!(w1.counts, None);
+        assert_eq!(w1.tokens, Some(5_000_000));
+        assert!(w1.costs.is_some());
+        assert_eq!(w1.window_secs, 3600);
+
+        let w2 = &basic.window_limits[2];
+        assert_eq!(w2.counts, None);
+        assert_eq!(w2.tokens, None);
+        assert!(w2.costs.is_some());
+        assert_eq!(w2.window_secs, 60);
+
+        // Verbose object form for team plan
+        let team_plan = &config.plan_settings.plans["team_plan"];
+        assert_eq!(team_plan.window_limits.len(), 1);
+        let tw = &team_plan.window_limits[0];
+        assert_eq!(tw.counts, Some(5000));
+        assert_eq!(tw.tokens, Some(50_000_000));
+        assert!(tw.costs.is_some());
+        assert_eq!(tw.window_secs, 86400);
+    }
+
+    #[test]
+    fn test_window_limit_legacy_pair_still_works_via_convenience_shorthand() {
+        // The legacy convenience fields rpm_limit / tpm_limit are
+        // independent of window_limits — they get merged in
+        // boom-limiter::RateLimitPlan::effective_limits. Verify they still
+        // parse and store as Option<u64>.
+        let yaml = r#"
+plan_settings:
+  plans:
+    legacy:
+      rpm_limit: 60
+      tpm_limit: 100000
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let legacy = &config.plan_settings.plans["legacy"];
+        assert_eq!(legacy.rpm_limit, Some(60));
+        assert_eq!(legacy.tpm_limit, Some(100_000));
+        // No window_limits configured → empty vec.
+        assert!(legacy.window_limits.is_empty());
     }
 }

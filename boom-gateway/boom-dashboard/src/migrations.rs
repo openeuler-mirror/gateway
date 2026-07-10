@@ -19,10 +19,20 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
     // with the timeout active — PgPool multiplexes queries across connections,
     // so SET on one connection does NOT affect others.
     let mut conn = pool.acquire().await?;
-    // Best-effort: some PostgreSQL-compatible databases don't support lock_timeout.
-    let _ = sqlx::query("SET lock_timeout = '10s'")
+    // Set lock_timeout on this connection so ALTER TABLE / CREATE INDEX can't
+    // hang indefinitely on a GaussDB distributed table with stale locks from
+    // a crashed previous process. Some PG-compatible databases (notably
+    // openGauss) don't support lock_timeout — log + continue, since most
+    // ALTERs in our migrations are idempotent no-ops in steady state.
+    if let Err(e) = sqlx::query("SET lock_timeout = '10s'")
         .execute(&mut *conn)
-        .await;
+        .await
+    {
+        tracing::warn!(
+            "SET lock_timeout failed on migration connection (continuing without timeout protection): {}",
+            e
+        );
+    }
 
     // 1. Request logs (boom-audit owns all boom_request_log DDL).
     tracing::info!("Migration 1/7: request_log...");
@@ -73,15 +83,40 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
     tracing::info!("Migration 3/7: done");
 
     // 3. Rate limit state + assignments + plans (boom-limiter).
-    tracing::info!("Migration 4/7: rate_limit_state...");
+    tracing::info!("Migration 4/13: rate_limit_state...");
     run_ddl_on_conn(&mut conn, boom_limiter::migrations::rate_limit_state_ddl()).await?;
-    tracing::info!("Migration 4/7: done");
-    tracing::info!("Migration 5/7: assignment...");
+    tracing::info!("Migration 4/13: done");
+    tracing::info!("Migration 5/13: assignment...");
     run_ddl_on_conn(&mut conn, boom_limiter::migrations::assignment_ddl()).await?;
-    tracing::info!("Migration 5/7: done");
-    tracing::info!("Migration 6/7: plan...");
+    tracing::info!("Migration 5/13: done");
+    tracing::info!("Migration 6/13: plan...");
     run_ddl_on_conn(&mut conn, boom_limiter::migrations::plan_ddl()).await?;
-    tracing::info!("Migration 6/7: done");
+    run_ddl_on_conn(&mut conn, boom_limiter::migrations::plan_alter_ddl()).await?;
+    tracing::info!("Migration 6/13: done");
+    tracing::info!("Migration 6b/13: team_assignment...");
+    run_ddl_on_conn(&mut conn, boom_limiter::migrations::team_assignment_ddl()).await?;
+    tracing::info!("Migration 6b/13: done");
+    tracing::info!("Migration 6c/13: quota cumulative...");
+    run_ddl_on_conn(&mut conn, boom_quota::migrations::cumulative_ddl()).await?;
+    // GaussDB distributed: mark as REPLICATION so the table is copied to
+    // every datanode. Without this, single-table queries still get routed
+    // to a datanode where the table doesn't exist ("relation does not exist
+    // on datanode"). Idempotent — REPLICATION is a no-op if already set.
+    // Errors are warned (not fatal): vanilla Postgres / single-node
+    // openGauss don't support DISTRIBUTE BY syntax.
+    match sqlx::query(
+        "ALTER TABLE boom_rate_limit_cumulative DISTRIBUTE BY REPLICATION",
+    )
+    .execute(&mut *conn)
+    .await
+    {
+        Ok(_) => tracing::info!("Migration 6c: ALTER DISTRIBUTE BY REPLICATION ok"),
+        Err(e) => tracing::warn!(
+            "Migration 6c: ALTER DISTRIBUTE BY REPLICATION failed (continuing): {}",
+            e
+        ),
+    }
+    tracing::info!("Migration 6c/13: done");
 
     // 4. KV config store (dashboard-owned).
     tracing::info!("Migration 7/8: boom_config...");
@@ -124,16 +159,16 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
 }
 
 /// Execute a multi-statement DDL string on a single connection.
+///
+/// Uses sqlx's raw simple-query protocol so PL/pgSQL `DO $$ ... $$` blocks
+/// (which contain semicolons) are sent to the server as one unit instead of
+/// being split client-side. The previous `split(';')` approach broke dollar
+/// quoting — `DO $$ BEGIN ... ; ... END $$` got cut into unterminated pieces.
 async fn run_ddl_on_conn(
     conn: &mut sqlx::PgConnection,
     ddl: &str,
 ) -> Result<(), sqlx::Error> {
-    for stmt in ddl.split(';') {
-        let trimmed = stmt.trim();
-        if !trimmed.is_empty() {
-            sqlx::query(trimmed).execute(&mut *conn).await?;
-        }
-    }
+    sqlx::raw_sql(ddl).execute(&mut *conn).await?;
     Ok(())
 }
 

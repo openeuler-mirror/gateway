@@ -26,11 +26,24 @@ pub async fn get_plan(
     match plan {
         Some(p) => {
             let (concurrency_limit, rpm_limit, window_limits, _) = p.effective_limits();
+            // Serialize WindowLimit entries as compact arrays for front-end compat.
+            let wl_json: Vec<serde_json::Value> = window_limits
+                .iter()
+                .map(|w| {
+                    let counts = w.counts.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null);
+                    let tokens = w.tokens.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null);
+                    let costs = w
+                        .costs
+                        .map(|c| serde_json::Value::String(c.to_string()))
+                        .unwrap_or(serde_json::Value::Null);
+                    serde_json::json!([counts, tokens, costs, w.window_secs])
+                })
+                .collect();
             Json(json!({
                 "plan_name": p.name,
                 "concurrency_limit": concurrency_limit,
                 "rpm_limit": rpm_limit,
-                "window_limits": window_limits,
+                "window_limits": wl_json,
                 "schedule": p.schedule,
             }))
         }
@@ -62,30 +75,141 @@ pub async fn get_usage(
         .map(|p| p.effective_limits())
         .unwrap_or((None, None, vec![], vec![]));
 
-    let windows: Vec<Value> = state
-        .limiter
-        .get_usage_for_key(key_hash)
-        .into_iter()
-        .map(|w| {
-            // cache_key format: {key_hash}:{model}:{window_secs}
-            // Find the limit for this window from plan.
-            let limit = if w.window_secs == 60 {
-                plan_rpm
-            } else {
-                plan_window_limits
-                    .iter()
-                    .find(|(_, ws)| *ws == w.window_secs)
-                    .map(|(limit, _)| *limit)
-            };
+    // Counts dimension: from SlidingWindowLimiter (per-window aggregated).
+    // We dedupe by window_secs — multiple models under the same key collapse
+    // into one counts window because the plan limit is keyed by secs only.
+    let mut counts_by_secs: std::collections::HashMap<u64, (u64, u64, u64)> =
+        std::collections::HashMap::new(); // secs → (count, elapsed, remaining)
+    for w in state.limiter.get_usage_for_key(key_hash) {
+        let remaining = w.window_secs.saturating_sub(w.elapsed_secs);
+        counts_by_secs
+            .entry(w.window_secs)
+            .and_modify(|e| e.0 = e.0.saturating_add(w.count))
+            .or_insert((w.count, w.elapsed_secs, remaining));
+    }
+
+    // Tokens / costs dimension: from QuotaStore. Aggregate count by (secs, kind)
+    // — we don't surface per-model breakdown on the user usage card.
+    let mut tokens_by_secs: std::collections::HashMap<u64, (u64, u64)> =
+        std::collections::HashMap::new(); // secs → (count, remaining)
+    let mut costs_by_secs: std::collections::HashMap<u64, (u64, u64)> =
+        std::collections::HashMap::new(); // secs → (micros, remaining)
+    for w in state.quota_store.peek_key_windows(key_hash) {
+        let entry = match w.kind {
+            boom_quota::WindowKind::Tokens => tokens_by_secs
+                .entry(w.window_secs)
+                .or_insert((0, w.remaining_secs)),
+            boom_quota::WindowKind::CostMicros => costs_by_secs
+                .entry(w.window_secs)
+                .or_insert((0, w.remaining_secs)),
+        };
+        entry.0 = entry.0.saturating_add(w.count);
+        // Keep the smallest remaining (i.e. the soonest-resetting window in
+        // that secs bucket — defensive in case of clock skew between models).
+        if w.remaining_secs < entry.1 {
+            entry.1 = w.remaining_secs;
+        }
+    }
+
+    // Assemble per-window_secs card. The plan's window_limits drives which
+    // window_secs values exist; if a counter exists at a secs not in the plan
+    // (legacy / stale), include it with no limit so the user still sees it.
+    let mut seen_secs: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+    for wl in &plan_window_limits {
+        seen_secs.insert(wl.window_secs);
+    }
+    for &s in counts_by_secs.keys() {
+        seen_secs.insert(s);
+    }
+    for &s in tokens_by_secs.keys() {
+        seen_secs.insert(s);
+    }
+    for &s in costs_by_secs.keys() {
+        seen_secs.insert(s);
+    }
+
+    let windows: Vec<Value> = seen_secs
+        .iter()
+        .map(|&secs| {
+            // Find plan config for this window_secs (if any).
+            let wl = plan_window_limits.iter().find(|w| w.window_secs == secs);
+            let counts_limit = wl.and_then(|w| w.counts).or(if secs == 60 { plan_rpm } else { None });
+            let tokens_limit = wl.and_then(|w| w.tokens);
+            let costs_limit = wl.and_then(|w| w.costs);
+
+            let mut dims = serde_json::Map::new();
+
+            // counts: only include when plan configured a counts limit.
+            if let Some(limit) = counts_limit {
+                let cur = counts_by_secs.get(&secs).map(|&(c, _, _)| c).unwrap_or(0);
+                dims.insert(
+                    "counts".to_string(),
+                    json!({ "current": cur, "limit": limit }),
+                );
+            }
+
+            // tokens: only include when plan configured a tokens limit.
+            if let Some(limit) = tokens_limit {
+                let cur = tokens_by_secs.get(&secs).map(|&(c, _)| c).unwrap_or(0);
+                dims.insert(
+                    "tokens".to_string(),
+                    json!({ "current": cur, "limit": limit }),
+                );
+            }
+
+            // costs: only include when plan configured a costs limit.
+            if let Some(limit) = costs_limit {
+                let cur_micros = costs_by_secs.get(&secs).map(|&(c, _)| c).unwrap_or(0);
+                dims.insert(
+                    "costs".to_string(),
+                    json!({
+                        "current_micros": cur_micros,
+                        "current": boom_quota::micros_to_decimal(cur_micros).to_string(),
+                        "limit": limit.to_string(),
+                        "limit_micros": boom_quota::decimal_to_micros(limit),
+                    }),
+                );
+            }
+
+            // remaining_secs: pick the smallest non-zero across dims, fall
+            // back to the secs itself when unknown.
+            let remaining = counts_by_secs
+                .get(&secs)
+                .map(|(_, _, r)| *r)
+                .or_else(|| tokens_by_secs.get(&secs).map(|(_, r)| *r))
+                .or_else(|| costs_by_secs.get(&secs).map(|(_, r)| *r))
+                .unwrap_or(secs);
+
             json!({
-                "cache_key": w.cache_key,
-                "count": w.count,
-                "limit": limit,
-                "window_secs": w.window_secs,
-                "elapsed_secs": w.elapsed_secs,
+                "window_secs": secs,
+                "remaining_secs": remaining,
+                "dims": dims,
             })
         })
         .collect();
+
+    // Cumulative counters + plan cumulative limits.
+    let key_scope = boom_quota::QuotaScope::Key {
+        key_hash: key_hash.to_string(),
+    };
+    let total_in = state
+        .quota_store
+        .peek_cumulative(&key_scope, boom_quota::CumulativeKind::TotalInputTokens);
+    let total_out = state
+        .quota_store
+        .peek_cumulative(&key_scope, boom_quota::CumulativeKind::TotalOutputTokens);
+    let total_cost_micros = state
+        .quota_store
+        .peek_cumulative(&key_scope, boom_quota::CumulativeKind::TotalCost);
+    let regular_input_cost_micros = state
+        .quota_store
+        .peek_cumulative(&key_scope, boom_quota::CumulativeKind::TotalRegularInputCost);
+    let cached_input_cost_micros = state
+        .quota_store
+        .peek_cumulative(&key_scope, boom_quota::CumulativeKind::TotalCachedInputCost);
+    let output_cost_micros = state
+        .quota_store
+        .peek_cumulative(&key_scope, boom_quota::CumulativeKind::TotalOutputCost);
 
     let concurrency = state.plan_store.get_concurrency(key_hash);
 
@@ -94,6 +218,21 @@ pub async fn get_usage(
         "concurrency": concurrency,
         "concurrency_limit": plan_concurrency,
         "windows": windows,
+        "cumulative": {
+            "total_input_tokens": total_in,
+            "total_output_tokens": total_out,
+            "total_tokens": total_in.saturating_add(total_out),
+            "total_cost_micros": total_cost_micros,
+            "total_cost": boom_quota::micros_to_decimal(total_cost_micros).to_string(),
+            "regular_input_cost_micros": regular_input_cost_micros,
+            "regular_input_cost": boom_quota::micros_to_decimal(regular_input_cost_micros).to_string(),
+            "cached_input_cost_micros": cached_input_cost_micros,
+            "cached_input_cost": boom_quota::micros_to_decimal(cached_input_cost_micros).to_string(),
+            "output_cost_micros": output_cost_micros,
+            "output_cost": boom_quota::micros_to_decimal(output_cost_micros).to_string(),
+            "total_token_limit": plan.as_ref().and_then(|p| p.total_token_limit),
+            "total_cost_limit": plan.as_ref().and_then(|p| p.total_cost_limit).map(|d| d.to_string()),
+        },
     }))
 }
 

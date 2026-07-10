@@ -1,9 +1,79 @@
 use boom_core::provider::Provider;
 use dashmap::DashMap;
+use rust_decimal::Decimal;
 use serde::Serialize;
 use sqlx::Row;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+
+/// Per-model cost rates for billing/quota accounting.
+///
+/// Stored separately from `DeploymentRow` because cost is metadata that
+/// survives reloads and may be set even when no live deployment exists yet.
+#[derive(Debug, Clone, Default)]
+pub struct ModelCostRate {
+    pub input_cost_per_token: Decimal,
+    /// Cost per cached input token (KV-cache hit). Zero when no separate
+    /// cache pricing is configured — cache hits then billed at input rate.
+    pub cached_input_cost_per_token: Decimal,
+    pub output_cost_per_token: Decimal,
+}
+
+impl ModelCostRate {
+    pub fn new(input: Decimal, output: Decimal) -> Self {
+        Self {
+            input_cost_per_token: input,
+            cached_input_cost_per_token: Decimal::ZERO,
+            output_cost_per_token: output,
+        }
+    }
+
+    /// Full constructor with cached input pricing.
+    pub fn with_cached(input: Decimal, cached: Decimal, output: Decimal) -> Self {
+        Self {
+            input_cost_per_token: input,
+            cached_input_cost_per_token: cached,
+            output_cost_per_token: output,
+        }
+    }
+
+    /// Compute total cost for a request given token counts.
+    /// When `cached_input_cost_per_token` is zero, cache hits are billed
+    /// at the regular input rate (legacy behavior).
+    pub fn compute_cost(&self, input_tokens: u64, cached_tokens: u64, output_tokens: u64) -> Decimal {
+        let (regular_input, cached_input, output) = self
+            .compute_cost_breakdown(input_tokens, cached_tokens, output_tokens);
+        regular_input + cached_input + output
+    }
+
+    /// Compute the three cost components separately:
+    /// (regular_input, cached_input, output). Cached hits use the discounted
+    /// `cached_input_cost_per_token` when configured; otherwise the regular
+    /// input rate applies.
+    pub fn compute_cost_breakdown(
+        &self,
+        input_tokens: u64,
+        cached_tokens: u64,
+        output_tokens: u64,
+    ) -> (Decimal, Decimal, Decimal) {
+        let cached = cached_tokens.min(input_tokens);
+        let non_cached = input_tokens.saturating_sub(cached);
+        let regular_input_cost = self.input_cost_per_token * Decimal::from(non_cached);
+        let cached_input_cost = if self.cached_input_cost_per_token.is_zero() {
+            self.input_cost_per_token * Decimal::from(cached)
+        } else {
+            self.cached_input_cost_per_token * Decimal::from(cached)
+        };
+        let output_cost = self.output_cost_per_token * Decimal::from(output_tokens);
+        (regular_input_cost, cached_input_cost, output_cost)
+    }
+
+    pub fn is_zero(&self) -> bool {
+        self.input_cost_per_token.is_zero()
+            && self.cached_input_cost_per_token.is_zero()
+            && self.output_cost_per_token.is_zero()
+    }
+}
 
 /// In-memory store for model deployments.
 /// Survives config reloads — updated incrementally via DB or YAML seed.
@@ -14,6 +84,8 @@ pub struct DeploymentStore {
     rr_counters: DashMap<String, AtomicUsize>,
     /// model_name → quota count ratio (default 1).
     quota_ratios: DashMap<String, u64>,
+    /// model_name → cost rates for billing.
+    cost_rates: DashMap<String, ModelCostRate>,
 }
 
 /// Full deployment row from boom_model_deployment table.
@@ -131,6 +203,7 @@ impl DeploymentStore {
             deployments: DashMap::new(),
             rr_counters: DashMap::new(),
             quota_ratios: DashMap::new(),
+            cost_rates: DashMap::new(),
         }
     }
 
@@ -162,6 +235,7 @@ impl DeploymentStore {
         self.rr_counters.clear();
         self.deployments.clear();
         self.quota_ratios.clear();
+        self.cost_rates.clear();
     }
 
     /// Set the quota count ratio for a model.
@@ -172,6 +246,23 @@ impl DeploymentStore {
     /// Get the quota count ratio for a model. Returns 1 if not set.
     pub fn get_quota_ratio(&self, model_name: &str) -> u64 {
         self.quota_ratios.get(model_name).map(|r| *r).unwrap_or(1)
+    }
+
+    /// Set the per-model cost rate (input + output cost per token in USD).
+    pub fn set_cost_rate(&self, model_name: &str, rate: ModelCostRate) {
+        if rate.is_zero() {
+            self.cost_rates.remove(model_name);
+        } else {
+            self.cost_rates.insert(model_name.to_string(), rate);
+        }
+    }
+
+    /// Get the per-model cost rate. Returns a zero rate if not set.
+    pub fn get_cost_rate(&self, model_name: &str) -> ModelCostRate {
+        self.cost_rates
+            .get(model_name)
+            .map(|r| r.value().clone())
+            .unwrap_or_default()
     }
 
     /// Select a provider via round-robin for the given model.

@@ -20,7 +20,7 @@ pub use state::DashboardState;
 pub fn build_router<S: Clone + Send + Sync + 'static>(state: DashboardState) -> Router<S> {
     let state_arc = Arc::new(state);
 
-    Router::new()
+    let main_router: Router<S> = Router::new()
         // Root redirect → /dashboard
         .route("/", get(handlers_static::redirect_root))
         // Static files (SPA).
@@ -110,11 +110,6 @@ pub fn build_router<S: Clone + Send + Sync + 'static>(state: DashboardState) -> 
             "/dashboard/api/admin/aliases/{alias_name}",
             put(handlers_admin::update_alias).delete(handlers_admin::delete_alias),
         )
-        // Admin — Config KV store (new).
-        .route(
-            "/dashboard/api/admin/config",
-            get(handlers_admin::get_config).patch(handlers_admin::patch_config),
-        )
         // Admin — Request Logs.
         .route(
             "/dashboard/api/admin/logs",
@@ -154,28 +149,68 @@ pub fn build_router<S: Clone + Send + Sync + 'static>(state: DashboardState) -> 
             "/dashboard/api/admin/limits/reset",
             post(handlers_admin::reset_limits_all),
         )
-        // Admin — Teams.
+        // Admin — Teams (POST only; listing is via quota_overview).
         .route(
             "/dashboard/api/admin/teams",
-            get(handlers_admin::list_teams).post(handlers_admin::create_team),
+            post(handlers_admin::create_team),
         )
         .route(
             "/dashboard/api/admin/teams/{team_id}",
             put(handlers_admin::update_team).delete(handlers_admin::delete_team),
         )
-        // Admin — Debug error recording.
+        // Admin — Team plan assignments (explicit per-team plan).
         .route(
-            "/dashboard/api/admin/debug/status",
-            get(handlers_admin::get_debug_status),
+            "/dashboard/api/admin/team-assignments",
+            post(handlers_admin::assign_team_plan),
         )
         .route(
-            "/dashboard/api/admin/debug/toggle",
-            post(handlers_admin::toggle_debug),
+            "/dashboard/api/admin/team-assignments/{team_id}",
+            delete(handlers_admin::unassign_team_plan),
+        )
+        // Admin — Quota management (team-organized).
+        .route(
+            "/dashboard/api/admin/quota/overview",
+            get(handlers_admin::quota_overview),
         )
         .route(
-            "/dashboard/api/admin/debug/errors/{request_id}",
-            get(handlers_admin::get_debug_error),
+            "/dashboard/api/admin/quota/team/{team_id}",
+            get(handlers_admin::quota_team_keys),
         )
+        .route(
+            "/dashboard/api/admin/quota/unassigned",
+            get(handlers_admin::quota_unassigned_keys),
+        )
+        .route(
+            "/dashboard/api/admin/quota/key/{key_hash}/windows",
+            get(handlers_admin::quota_key_windows),
+        )
+        .route(
+            "/dashboard/api/admin/quota/reset/key/{key_hash}",
+            post(handlers_admin::quota_reset_key),
+        )
+        .route(
+            "/dashboard/api/admin/quota/reset/team/{team_id}",
+            post(handlers_admin::quota_reset_team),
+        )
+        .route(
+            "/dashboard/api/admin/quota/reset/key/{key_hash}/cumulative",
+            post(handlers_admin::quota_reset_key_cumulative),
+        )
+        .route(
+            "/dashboard/api/admin/quota/reset/key/{key_hash}/windows",
+            post(handlers_admin::quota_reset_key_windows),
+        )
+        .route(
+            "/dashboard/api/admin/quota/reset/team/{team_id}/cumulative",
+            post(handlers_admin::quota_reset_team_cumulative),
+        )
+        .route(
+            "/dashboard/api/admin/quota/reset/team/{team_id}/windows",
+            post(handlers_admin::quota_reset_team_windows),
+        )
+        // Admin — Debug error recording (conditional on `debug-tools` feature).
+        // Routes are merged via `debug_router()` below — only compiled in when
+        // the feature is on.
         // Admin — Prompt log controls.
         .route(
             "/dashboard/api/admin/prompt-log/status",
@@ -205,5 +240,37 @@ pub fn build_router<S: Clone + Send + Sync + 'static>(state: DashboardState) -> 
         // SPA fallback — must be last.
         .route("/dashboard/{*path}", get(handlers_static::spa_fallback))
         // Inject state via Extension layer.
-        .layer(axum::Extension(state_arc))
+        .layer(axum::Extension(state_arc.clone()))
+        // Merge debug-only routes (compiled out unless `debug-tools` feature is on).
+        .merge(debug_router(state_arc));
+
+    main_router
+}
+
+/// Debug-only routes — empty router unless `debug-tools` feature is enabled.
+/// State is injected via the same Extension layer used by the main router.
+#[cfg(feature = "debug-tools")]
+fn debug_router<S: Clone + Send + Sync + 'static>(
+    _state: Arc<DashboardState>,
+) -> Router<S> {
+    Router::new()
+        .route(
+            "/dashboard/api/admin/debug/status",
+            get(handlers_admin::get_debug_status),
+        )
+        .route(
+            "/dashboard/api/admin/debug/toggle",
+            post(handlers_admin::toggle_debug),
+        )
+        .route(
+            "/dashboard/api/admin/debug/errors/{request_id}",
+            get(handlers_admin::get_debug_error),
+        )
+}
+
+#[cfg(not(feature = "debug-tools"))]
+fn debug_router<S: Clone + Send + Sync + 'static>(
+    _state: Arc<DashboardState>,
+) -> Router<S> {
+    Router::new()
 }

@@ -27,18 +27,34 @@ model_list:
       api_key: ${OPENAI_API_KEY_BACKUP}
       api_base: https://api.openai.com/v1
 
-  # Anthropic — 带配额倍率
-  - model_name: claude-sonnet
+  # OpenAI 模型 — 计费通过 cost_template 引用（推荐方式，便于复用）
+  - model_name: gpt-4o-billed
     model_info:
-      id: node-a                   # 可选：部署标识
-      input_cost_per_token: 0.000003   # 可选：输入成本
-      output_cost_per_token: 0.000015  # 可选：输出成本
-      quota_count_ratio: 3         # 配额消耗倍率：1 次请求消耗 3 个配额
+      id: node-a                    # 可选：部署标识
+      cost_template: gpt-4o         # 引用下方 cost_templates 中的定价
+      quota_count_ratio: 3          # 可选：配额消耗倍率，1 次请求消耗 3 个配额
     litellm_params:
-      model: anthropic/claude-sonnet-4-20250514
-      api_key: os.environ/ANTHROPIC_API_KEY
+      model: openai/gpt-4o
+      api_key: os.environ/OPENAI_API_KEY
       temperature: 0.7             # 可选：温度覆盖
       max_tokens: 4096             # 可选：最大输出 token
+
+  # OpenAI 模型 — 直接内联定价（适合一次性配置）
+  - model_name: gpt-4o-inline
+    model_info:
+      input_cost_per_million_tokens: 2.5
+      cached_input_cost_per_million_tokens: 1.25   # 可选：KV-cache 命中单价
+      output_cost_per_million_tokens: 10.0
+    litellm_params:
+      model: openai/gpt-4o
+      api_key: ${OPENAI_API_KEY}
+
+  # 兜底部署：匹配不到任何 model_name 时路由到这里（"*" 是真实 model_name）
+  - model_name: "*"
+    serve_not_match: true          # 同一部署同时注册为 "*" 兜底
+    litellm_params:
+      model: openai/gpt-4o
+      api_key: ${OPENAI_API_KEY}
 
   # 带流控的部署 — 限制在途请求数和上下文总量
   # - model_name: gpt-4o
@@ -51,36 +67,21 @@ model_list:
   #     model: openai/gpt-4o
   #     api_key: ${OPENAI_API_KEY}
 
-  # Azure OpenAI
-  - model_name: azure-gpt4
-    litellm_params:
-      model: azure/my-gpt4-deployment
-      api_base: https://YOUR_RESOURCE.openai.azure.com
-      api_key: os.environ/AZURE_API_KEY
-      api_version: "2024-02-01"
+# ──────────────────────────────────────────────
+# 计费模板（可复用的定价表）
+# ──────────────────────────────────────────────
+# 所有价格均为「USD per 1M tokens」。网关内部会换算成 per-token。
+# model_info.cost_template 引用这里的 name；同名时模板覆盖内联字段。
+cost_templates:
+  - name: gpt-4o
+    input_cost_per_million_tokens: 2.5           # $2.5 / 1M 输入 token
+    cached_input_cost_per_million_tokens: 1.25   # KV-cache 命中价（通常 1/2）
+    output_cost_per_million_tokens: 10.0         # $10 / 1M 输出 token
 
-  # Gemini
-  - model_name: gemini-pro
-    litellm_params:
-      model: gemini/gemini-2.0-flash
-      api_key: os.environ/GEMINI_API_KEY
-
-  # AWS Bedrock
-  - model_name: bedrock-claude
-    litellm_params:
-      model: bedrock/anthropic.claude-3-sonnet
-      aws_region_name: us-east-1
-      aws_access_key_id: ${AWS_ACCESS_KEY_ID}
-      aws_secret_access_key: ${AWS_SECRET_ACCESS_KEY}
-
-  # 自定义请求头
-  - model_name: custom-provider
-    litellm_params:
-      model: openai/custom-model
-      api_key: ${CUSTOM_API_KEY}
-      api_base: https://custom.api.com/v1
-      headers:
-        X-Custom-Header: custom-value
+  - name: gpt-4-turbo
+    input_cost_per_million_tokens: 10.0
+    cached_input_cost_per_million_tokens: 5.0
+    output_cost_per_million_tokens: 30.0
 
 # ──────────────────────────────────────────────
 # 通用设置
@@ -124,8 +125,6 @@ router_settings:
       model: "gpt-4o"
       hidden: true
 
-    "claude": "claude-sonnet"
-
   # key_affinity 策略参数（仅 routing_strategy: key_affinity 时生效）
   # key_affinity_context_threshold: 0     # 上下文字符数阈值，低于此值优先最低负载
   # key_affinity_rebalance_threshold: 10  # 再均衡阈值（请求数差异超过此值时重新分配）
@@ -141,7 +140,7 @@ router_settings:
   #     medium:
   #       target_model: "gpt-4o"          # 中等请求 → 标准模型
   #     large:
-  #       target_model: "claude-sonnet"   # 复杂请求 → 强力模型
+  #       target_model: "gpt-4o"          # 复杂请求 → 强力模型
 
   # 剥离 Claude Code 注入的 x-anthropic-billing-header 块（仅 /v1/messages）。
   # Claude Code 会在 system prompt 开头注入一个独立 text block：
@@ -162,7 +161,7 @@ server:
   workers: 4
 
 # ──────────────────────────────────────────────
-# 全局限流设置
+# 全局限流设置（无套餐的 key 兜底）
 # ──────────────────────────────────────────────
 rate_limit:
   enabled: true
@@ -174,43 +173,82 @@ rate_limit:
 # ──────────────────────────────────────────────
 # 套餐设置
 # ──────────────────────────────────────────────
+# 套餐是「通用模板」——同一组限流字段对 key 和 team 都适用。
+# type=key 的套餐分配给单个 key（按 key 维度独立计数）；
+# type=team 的套餐分配给整个 team（team 下所有 key 请求聚合计数）。
+# team 套餐可设 member_plan，让 team 下每个 key 再单独套用一个 key 套餐
+# 做「team 总额 + key 单独限流」的双层防护。
+#
+# WindowLimit 项格式：[counts, tokens, costs, window_secs]，null 表示不限该维度
+#   - [100, 18000, null, 60]      60s 内：100 请求 / 18K token
+#   - [null, 1000000, null, 3600] 1h 内：1M token
+#   - [null, null, 50.0, 86400]   24h 内：$50
 plan_settings:
-  default_plan: "basic"             # 未分配套餐的 key 使用的默认套餐
+  default_plan: "basic"             # 未显式分配套餐的 key 使用的默认套餐
+  default_team_plan: "team_basic"   # 未显式分配套餐的 team 使用的默认套餐
 
   plans:
+    # ── key 套餐示例：单 key 4 并发、60 RPM、100K TPM ──
     basic:
-      concurrency_limit: 4          # 最大并发请求数
-      rpm_limit: 60                 # 每分钟请求数
-      window_limits:
-        - [100, 18000]              # 100 次 / 5 小时
+      type: key                     # 套餐适用对象：key 或 team
+      concurrency_limit: 4          # 最大并发请求数（RAII guard，Drop 释放）
+      rpm_limit: 60                 # 每分钟请求数上限（60s counts 维度简写）
+      tpm_limit: 100000             # 每分钟 token 数上限（60s tokens 维度简写）
+      window_limits:                # 多维滑动窗口列表，每项可同时卡 counts/tokens/costs
+        - [100, 18000, null, 60]    # 60s 内：100 请求 / 18K token
+        - [null, 1000000, null, 3600] # 1h 内：1M token
+        - [null, null, 50.0, 86400] # 24h 内：$50
+      total_token_limit: 10000000   # 累计 token 总量上限（无时间窗，跨整个生命周期，达到需手动 reset）
+      total_cost_limit: 500.0       # 累计费用上限（USD，无时间窗，达到需手动 reset）
 
+    # ── key 套餐示例：白天高配，夜间降级 ──
     pro:
-      concurrency_limit: 10
-      rpm_limit: 120
-      window_limits:
-        - [500, 18000]
+      type: key                     # 套餐适用对象
+      concurrency_limit: 8          # 最大并发请求数
+      rpm_limit: 120                # 每分钟请求数上限
+      tpm_limit: 200000             # 每分钟 token 数上限
+      window_limits:                # 多维滑动窗口列表
+        - [200, 50000, 100.0, 60]   # 60s 内：200 请求 / 50K token / $100
+      total_token_limit: 50000000   # 累计 token 总量上限
+      total_cost_limit: 2000.0      # 累计费用上限
+      schedule:                     # 时段覆盖，命中时段时 slot 字段覆盖套餐基线
+        - hours: "9:00-21:00"       # 北京时间（UTC+8），支持跨午夜
+          concurrency_limit: 8      # 时段内并发上限（未设则回退到套餐基线）
+          rpm_limit: 120            # 时段内 RPM 上限
+        - hours: "21:00-9:00"       # 跨午夜时段
+          concurrency_limit: 2      # 夜间降级：并发 2
+          rpm_limit: 30             # 夜间降级：RPM 30
 
+    # ── team 套餐示例：team 维度聚合限流 ──
+    # team 下每个 key 再套用 basic 套餐做 key 维度限流（双层防护）
+    team_basic:
+      type: team                    # team 套餐，team 下所有 key 请求聚合计数
+      member_plan: basic            # team 下每个 key 单独套用的 key 套餐名
+      concurrency_limit: 40         # team 总并发上限
+      rpm_limit: 600                # team 总 RPM 上限
+      window_limits:                # team 维度多维滑动窗口
+        - [1000, 10000000, 150.0, 3600] # 1h 内：1000 请求 / 10M token / $150
+      total_token_limit: 1000000000 # team 累计 token 总量上限
+      total_cost_limit: 10000.0     # team 累计费用上限
+
+    # ── 企业版 team 套餐：高额累计上限 ──
     enterprise:
-      concurrency_limit: 50
-      rpm_limit: 600
-      window_limits:
-        - [2000, 18000]
-        - [500, 3600]               # 500 次 / 1 小时
+      type: team                    # team 套餐
+      member_plan: pro              # team 下每个 key 套用 pro 套餐
+      concurrency_limit: 100        # team 总并发上限
+      rpm_limit: 3000               # team 总 RPM 上限
+      total_token_limit: 100000000000 # team 累计 token 总量上限（100B）
+      total_cost_limit: 50000.0     # team 累计费用上限（$50K）
 
-    # 支持时段调度的套餐
-    scheduled-plan:
-      concurrency_limit: 4
-      rpm_limit: 40
-      window_limits:
-        - [80, 18000]
-      schedule:
-        - hours: "9:00-21:00"       # 高峰期
-          concurrency_limit: 4
-          rpm_limit: 40
-          window_limits:
-            - [80, 18000]
-        - hours: "21:00-9:00"       # 低峰期（支持跨午夜）
-          concurrency_limit: 8
-          rpm_limit: 80
-          window_limits:
-            - [160, 18000]
+# ──────────────────────────────────────────────
+# Prompt 日志（完整请求/响应落盘，调试用）
+# ──────────────────────────────────────────────
+# 默认关闭。开启后每个请求的输入/输出会按天分目录写入 dir。
+# 可在 Dashboard 按套餐/team/key 维度动态开关，也可在这里做全局默认。
+prompt_log:
+  enabled: false                    # 全局开关，默认关闭
+  dir: "/data/prompt_logs"          # 日志根目录，按天分子目录
+  max_file_size_mb: 50              # 单文件大小上限（MB），超过自动滚动
+  capture_raw_upstream: false       # 同时记录上游原始响应（仅格式转换路径如 /v1/messages）
+  excluded_keys: []                 # 跳过这些 key（key_hash），不记录
+  excluded_teams: []                # 跳过这些 team（team_id），不记录

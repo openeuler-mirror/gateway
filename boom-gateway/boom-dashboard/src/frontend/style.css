@@ -530,7 +530,11 @@ input, select, textarea { font-family: var(--font); font-size: 14px; }
   border: 1px solid var(--border); background: var(--surface); color: var(--text2);
   font-weight: 500; transition: all var(--transition);
   box-shadow: 0 1px 2px rgba(0,0,0,.04);
+  width: auto;
 }
+/* When btn-small and btn-secondary are combined (e.g. prompt-log toggle in
+   quota card), override btn-secondary's width:100% to keep the button inline. */
+.btn-small.btn-secondary { width: auto; }
 .btn-small:hover { border-color: var(--primary); color: var(--primary); background: var(--primary-bg); box-shadow: 0 1px 4px rgba(0,0,0,.08); }
 
 /* Range selector for time-windowed stats (Agent / Request Rate) */
@@ -622,6 +626,32 @@ tbody tr:nth-child(even):hover td { background: var(--surface2); }
 .usage-limit-count { font-size: 1.2em; font-weight: 700; color: var(--text); font-family: var(--heading); margin-bottom: 8px; }
 .usage-limit-card .progress-bar { margin-bottom: 6px; }
 .usage-limit-reset { font-size: .8em; color: var(--text3); }
+
+/* ── Plan Card (user dashboard) ───────────────────────── */
+.plan-card {
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+}
+.plan-name-badge {
+  display: inline-block;
+  padding: 4px 12px;
+  margin-bottom: 12px;
+  border-radius: 12px;
+  font-weight: 700;
+  font-size: 14px;
+  letter-spacing: .02em;
+  background: linear-gradient(135deg, var(--primary), color-mix(in srgb, var(--primary) 70%, #fff 30%));
+  color: #fff;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, .12);
+}
+.plan-limits { display: flex; flex-direction: column; gap: 6px; }
+.plan-limit-row {
+  font-size: 13px;
+  color: var(--text2);
+  padding: 2px 0;
+}
 
 /* ── Pagination ─────────────────────────────────────────── */
 .pagination {
@@ -1491,5 +1521,152 @@ input[list] {
   width: auto;
   min-width: 84px;
   padding: 8px 16px;
+}
+
+/* ── Multi-dim Usage Card (wide) ──────────────────────── */
+.usage-limit-card.usage-limit-wide {
+  padding: 16px 18px;
+  /* Wide cards span two grid cells so multi-dim progress bars have room
+     without forcing the card across the entire viewport. */
+  grid-column: span 2;
+}
+.usage-limit-card.usage-limit-wide .usage-limit-title {
+  font-size: .9em;
+  margin-bottom: 10px;
+}
+.dim-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 8px 0;
+  overflow: hidden;
+}
+.dim-label {
+  flex: 0 0 90px;
+  font-size: 12px;
+  color: var(--text3);
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: .03em;
+}
+.dim-value {
+  flex: 0 0 auto;
+  margin-left: auto;
+  white-space: nowrap;
+  text-align: right;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  font-family: var(--mono);
+}
+.dim-row .progress-bar {
+  flex: 1 1 0;
+  min-width: 80px;
+  margin-bottom: 0;
+}
+
+/* ── Admin Quota Management ───────────────────────────── */
+.quota-section-title {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text);
+  margin: 18px 0 12px;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+}
+.quota-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 14px;
+  margin-bottom: 24px;
+}
+.quota-card {
+  padding: 16px 18px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  transition: border-color var(--transition), box-shadow var(--transition);
+}
+.quota-card:hover {
+  border-color: var(--border2);
+  box-shadow: var(--shadow);
+}
+.quota-card-header {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.quota-card-header strong {
+  font-size: 15px;
+  color: var(--text);
+  font-family: var(--heading);
+}
+.quota-card-stats {
+  display: flex;
+  gap: 18px;
+  flex-wrap: wrap;
+  font-size: 13px;
+}
+.quota-card-stats > div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.quota-card-stats strong {
+  font-family: var(--mono);
+  font-size: 14px;
+}
+.quota-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 4px;
+  align-items: center;
+}
+.team-limits-block {
+  margin: 8px 0;
+  padding: 8px 10px;
+  background: var(--surface2);
+  border-radius: var(--radius-xs);
+  border-left: 3px solid var(--primary);
+}
+.team-limits-title {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text3);
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  margin-bottom: 4px;
+}
+.team-limits-block .dim-row {
+  margin: 4px 0;
+}
+.badge-default {
+  background: var(--surface3);
+  color: var(--text2);
+  border: 1px solid var(--border);
+}
+.quota-toolbar {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  margin-bottom: 14px;
+  flex-wrap: wrap;
+}
+.quota-key-row td {
+  vertical-align: middle;
+}
+.quota-windows-row td {
+  padding: 0;
+  background: var(--surface2) !important;
+}
+.quota-windows-content {
+  padding: 12px 16px;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 10px;
 }
 

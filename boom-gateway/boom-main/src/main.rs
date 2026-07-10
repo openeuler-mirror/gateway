@@ -65,6 +65,9 @@ async fn main() -> anyhow::Result<()> {
     // Spawn background sync task (persist rate limit state + cleanup memory).
     spawn_sync_task(state.clone(), shutdown_tx.subscribe());
 
+    // Spawn quota sync task (every 30s — crash loss ≤ 30s for token/cost counters).
+    spawn_quota_sync_task(state.clone(), shutdown_tx.subscribe());
+
     // Spawn request summary logger (every 60s).
     spawn_request_summary(state.request_count.clone(), shutdown_tx.subscribe());
 
@@ -188,6 +191,7 @@ fn build_router(state: AppState) -> Router {
         state.dashboard_db_pool.clone(),
         state.plan_store.clone(),
         state.limiter.clone(),
+        state.quota_store.clone(),
         state.deployment_store.clone(),
         state.alias_store.clone(),
         state.inflight.clone(),
@@ -401,6 +405,58 @@ fn spawn_sync_task(state: AppState, mut shutdown: tokio::sync::broadcast::Receiv
 fn spawn_kv_event_subscriber(state: &AppState) {
     let config = state.inner.load().config.clone();
     state.spawn_kv_subscriber(&config);
+}
+
+/// Background task: every 30s, persist dirty quota counters (cumulative
+/// token/cost + 1-min TPM windows) to DB. Bounded crash loss ≤ 30s.
+/// Also purges expired 1-min windows from memory.
+fn spawn_quota_sync_task(state: AppState, mut shutdown: tokio::sync::broadcast::Receiver<()>) {
+    let db_pool = state.db_pool.clone();
+    let quota_store = state.quota_store.clone();
+
+    tokio::spawn(async move {
+        let pool = match db_pool {
+            Some(p) => p,
+            None => return, // No DB — nothing to persist.
+        };
+
+        // Initial short delay to let startup traffic settle.
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(15)) => {}
+            _ = shutdown.recv() => {
+                tracing::debug!("Quota sync task shutting down during initial delay");
+                return;
+            }
+        }
+
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
+                _ = shutdown.recv() => {
+                    tracing::debug!("Quota sync task shutting down");
+                    return;
+                }
+            }
+
+            // Purge expired 1-min TPM windows from memory.
+            let expired = quota_store.cleanup_expired();
+            if expired > 0 {
+                tracing::debug!("Quota cleanup: removed {} expired TPM window(s)", expired);
+            }
+
+            // Sync dirty entries to DB (with timeout to avoid stalls).
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                quota_store.sync_to_db(&pool),
+            ).await;
+            match result {
+                Ok(Ok(())) => tracing::debug!("Quota sync completed"),
+                Ok(Err(e)) => tracing::warn!("Quota sync error: {}", e),
+                Err(_) => tracing::warn!("Quota sync timed out after 10s"),
+            }
+        }
+    });
+    tracing::info!("Quota sync task spawned (every 30s, crash loss ≤ 30s)");
 }
 
 /// Initialize tracing with a non-blocking writer.

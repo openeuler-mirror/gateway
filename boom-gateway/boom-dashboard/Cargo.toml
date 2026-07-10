@@ -3,6 +3,10 @@ name = "boom-dashboard"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+debug-tools = []
+
 [dependencies]
 boom-core = { path = "../boom-core" }
 boom-flowcontrol = { path = "../boom-flowcontrol" }
@@ -11,6 +15,7 @@ boom-routing = { path = "../boom-routing" }
 boom-ctxaware = { path = "../boom-ctxaware" }
 boom-audit = { path = "../boom-audit" }
 boom-promptlog = { path = "../boom-promptlog" }
+boom-quota = { path = "../boom-quota" }
 axum = { workspace = true }
 sqlx = { workspace = true }
 serde = { workspace = true }
@@ -23,3 +28,4 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 dashmap = { workspace = true }
+rust_decimal = { workspace = true }

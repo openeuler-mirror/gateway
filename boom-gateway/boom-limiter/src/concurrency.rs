@@ -1,25 +1,70 @@
 use chrono::Timelike;
 use dashmap::DashMap;
 use futures::Stream;
+use rust_decimal::Decimal;
+use rust_decimal::prelude::FromPrimitive;
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+/// Convert Decimal USD → integer micros (1e-6 USD) for DB storage.
+/// Local copy to avoid a cross-crate dependency on boom-quota.
+fn decimal_to_micros(d: Decimal) -> i64 {
+    use rust_decimal::prelude::ToPrimitive;
+    (d * Decimal::from(1_000_000)).to_i64().unwrap_or(0)
+}
+
+/// Convert integer micros (1e-6 USD) back to Decimal USD.
+fn micros_to_decimal(micros: i64) -> Decimal {
+    Decimal::from(micros.max(0)) / Decimal::from(1_000_000)
+}
+
+/// Re-export of `boom_core::types::PlanType` — single source of truth.
+pub use boom_core::types::PlanType;
+
+/// Re-export of `boom_core::types::WindowLimit` — single source of truth.
+pub use boom_core::types::WindowLimit;
+
 /// A rate limit plan definition.
 ///
-/// Plans define concurrency and sliding-window limits that can be
-/// assigned to API keys via the admin API.
+/// A plan is a **generic template** of limits — fields carry no `key_` /
+/// `team_` prefix because the same plan can be assigned to either entity.
+/// The `type` field only gates assignment: `type=team` plans can only be
+/// assigned to teams (typically because they carry larger quotas that would
+/// be dangerous to leak to a single key), `type=key` plans only to keys.
+///
+/// `window_limits` is multi-dimensional — see [`WindowLimit`]. The shorthand
+/// `rpm_limit` / `tpm_limit` fields are 1-minute-window conveniences that
+/// get merged into the effective `Vec<WindowLimit>` list by `effective_limits`
+/// so callers only need to consult one place.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RateLimitPlan {
     pub name: String,
+    #[serde(default)]
+    pub r#type: PlanType,
+    /// Only used when type=Team. Plan name applied to each member key.
+    #[serde(default)]
+    pub member_plan: Option<String>,
+
     #[serde(default)]
     pub concurrency_limit: Option<u32>,
     #[serde(default)]
     pub rpm_limit: Option<u64>,
     #[serde(default)]
-    pub window_limits: Vec<(u64, u64)>,
+    pub tpm_limit: Option<u64>,
+    #[serde(
+        default,
+        deserialize_with = "boom_core::types::deserialize_window_limit_vec"
+    )]
+    pub window_limits: Vec<WindowLimit>,
+    #[serde(default)]
+    pub total_token_limit: Option<u64>,
+    #[serde(default)]
+    pub total_cost_limit: Option<Decimal>,
+
     /// Optional time-based schedule overrides.
     #[serde(default)]
     pub schedule: Vec<ScheduleSlot>,
@@ -28,42 +73,111 @@ pub struct RateLimitPlan {
 impl RateLimitPlan {
     /// Return the effective limits for the current time.
     ///
-    /// Returns (concurrency, rpm, active_windows, stale_windows).
-    /// `stale_windows` contains counters from the OTHER schedule period that
-    /// should be cleared so the user starts fresh on every schedule switch.
-    pub fn effective_limits(&self) -> (Option<u32>, Option<u64>, Vec<(u64, u64)>, Vec<(u64, u64)>) {
+    /// Returns (concurrency, rpm, active_windows, stale_window_secs).
+    /// `stale_window_secs` contains the `window_secs` values from the OTHER
+    /// schedule period that should be cleared so the user starts fresh on
+    /// every schedule switch.
+    ///
+    /// `active_windows` already includes the convenience shorthand merged in:
+    ///   - `rpm_limit`    → synthetic 60s `counts` entry
+    ///   - `tpm_limit`    → synthetic 60s `tokens` entry
+    ///
+    /// Whether the plan applies to a key or a team, the limits are the same —
+    /// the caller is responsible for picking the right plan (and the right
+    /// concurrency counter namespace) based on `self.r#type`.
+    pub fn effective_limits(
+        &self,
+    ) -> (Option<u32>, Option<u64>, Vec<WindowLimit>, Vec<u64>) {
         for slot in &self.schedule {
             if slot.is_active_now() {
                 // Merge: slot fields override plan base, unset fields fall back to base.
                 let concurrency = slot.concurrency_limit.or(self.concurrency_limit);
                 let rpm = slot.rpm_limit.or(self.rpm_limit);
+                let tpm = slot.tpm_limit.or(self.tpm_limit);
                 let windows = if slot.window_limits.is_empty() {
                     self.window_limits.clone()
                 } else {
                     slot.window_limits.clone()
                 };
+                let merged = Self::merge_shorthand(windows, rpm, tpm);
                 // Clear base counters whose window_secs doesn't overlap with active.
-                let active_secs: Vec<u64> = windows.iter().map(|&(_, s)| s).collect();
-                let stale: Vec<(u64, u64)> = self.window_limits.iter()
-                    .filter(|(_, s)| !active_secs.contains(s))
-                    .copied()
+                let active_secs: Vec<u64> = merged.iter().map(|w| w.window_secs).collect();
+                let stale: Vec<u64> = self
+                    .window_limits
+                    .iter()
+                    .map(|w| w.window_secs)
+                    .filter(|s| !active_secs.contains(s))
                     .collect();
-                return (concurrency, rpm, windows, stale);
+                return (concurrency, rpm, merged, stale);
             }
         }
         // No schedule active: clear all schedule slot counters that don't overlap with base.
-        let base_secs: Vec<u64> = self.window_limits.iter().map(|&(_, s)| s).collect();
-        let stale: Vec<(u64, u64)> = self.schedule.iter()
+        let base_secs: Vec<u64> = self.window_limits.iter().map(|w| w.window_secs).collect();
+        let stale: Vec<u64> = self
+            .schedule
+            .iter()
             .flat_map(|s| s.window_limits.iter())
-            .filter(|(_, s)| !base_secs.contains(s))
-            .copied()
+            .map(|w| w.window_secs)
+            .filter(|s| !base_secs.contains(s))
             .collect();
+        let merged = Self::merge_shorthand(
+            self.window_limits.clone(),
+            self.rpm_limit,
+            self.tpm_limit,
+        );
         (
             self.concurrency_limit,
             self.rpm_limit,
-            self.window_limits.clone(),
+            merged,
             stale,
         )
+    }
+
+    /// Merge the 1-min shorthand fields (rpm/tpm) into the window list.
+    ///
+    /// Each shorthand field, when set, becomes a synthetic 60s entry. If a
+    /// user-configured 60s entry already covers that dimension, the
+    /// user-configured entry wins (we don't overwrite it) — the shorthand is
+    /// only a fallback for the 60s window when no explicit 60s entry exists
+    /// for that dimension.
+    fn merge_shorthand(
+        mut windows: Vec<WindowLimit>,
+        rpm: Option<u64>,
+        tpm: Option<u64>,
+    ) -> Vec<WindowLimit> {
+        // Find whether there's a 60s entry that already covers each dimension.
+        let has_60s_counts = windows
+            .iter()
+            .any(|w| w.window_secs == 60 && w.counts.is_some());
+        let has_60s_tokens = windows
+            .iter()
+            .any(|w| w.window_secs == 60 && w.tokens.is_some());
+
+        let need_new_60s = rpm.is_some() && !has_60s_counts
+            || tpm.is_some() && !has_60s_tokens;
+        if !need_new_60s {
+            return windows;
+        }
+
+        // Find or create a 60s entry to host the missing shorthand dimensions.
+        let mut entry_idx = windows.iter().position(|w| w.window_secs == 60);
+        if entry_idx.is_none() {
+            windows.push(WindowLimit {
+                counts: None,
+                tokens: None,
+                costs: None,
+                window_secs: 60,
+            });
+            entry_idx = Some(windows.len() - 1);
+        }
+        let idx = entry_idx.unwrap();
+        if !has_60s_counts {
+            windows[idx].counts = rpm;
+        }
+        if !has_60s_tokens {
+            windows[idx].tokens = tpm;
+        }
+        windows
     }
 }
 
@@ -77,7 +191,12 @@ pub struct ScheduleSlot {
     #[serde(default)]
     pub rpm_limit: Option<u64>,
     #[serde(default)]
-    pub window_limits: Vec<(u64, u64)>,
+    pub tpm_limit: Option<u64>,
+    #[serde(
+        default,
+        deserialize_with = "boom_core::types::deserialize_window_limit_vec"
+    )]
+    pub window_limits: Vec<WindowLimit>,
 }
 
 impl ScheduleSlot {
@@ -113,14 +232,17 @@ fn parse_hm(s: &str) -> Option<u32> {
     Some(h.parse::<u32>().ok()? * 60 + m.parse::<u32>().ok()?)
 }
 
-/// In-memory store for rate limit plans and key assignments.
+/// In-memory store for rate limit plans and key/team assignments.
 /// Survives config reloads.
 #[derive(Debug)]
 pub struct PlanStore {
     plans: DashMap<String, RateLimitPlan>,
     key_assignments: DashMap<String, String>,
-    concurrency_counters: DashMap<String, Arc<AtomicU32>>,
+    team_assignments: DashMap<String, String>,
+    key_concurrency_counters: DashMap<String, Arc<AtomicU32>>,
+    team_concurrency_counters: DashMap<String, Arc<AtomicU32>>,
     default_plan_name: std::sync::Mutex<Option<String>>,
+    default_team_plan_name: std::sync::Mutex<Option<String>>,
 }
 
 impl PlanStore {
@@ -128,8 +250,11 @@ impl PlanStore {
         Self {
             plans: DashMap::new(),
             key_assignments: DashMap::new(),
-            concurrency_counters: DashMap::new(),
+            team_assignments: DashMap::new(),
+            key_concurrency_counters: DashMap::new(),
+            team_concurrency_counters: DashMap::new(),
             default_plan_name: std::sync::Mutex::new(None),
+            default_team_plan_name: std::sync::Mutex::new(None),
         }
     }
 
@@ -155,6 +280,26 @@ impl PlanStore {
         self.plans.get(&name).map(|r| r.value().clone())
     }
 
+    /// Set the default team plan name (called during config load / reload).
+    pub fn set_default_team_plan(&self, name: Option<String>) {
+        let mut guard = self.default_team_plan_name.lock().unwrap();
+        *guard = name;
+    }
+
+    /// Get the default team plan name (raw string).
+    pub fn get_default_team_plan_name(&self) -> Option<String> {
+        self.default_team_plan_name.lock().unwrap().clone()
+    }
+
+    /// Get the default team plan (if configured and the plan actually exists).
+    pub fn get_default_team_plan(&self) -> Option<RateLimitPlan> {
+        let name = {
+            let guard = self.default_team_plan_name.lock().unwrap();
+            guard.clone()
+        }?;
+        self.plans.get(&name).map(|r| r.value().clone())
+    }
+
     /// Resolve the plan assigned to a key.
     pub fn resolve_plan(&self, key_hash: &str) -> Option<RateLimitPlan> {
         let plan_name = self.key_assignments.get(key_hash)?;
@@ -162,24 +307,56 @@ impl PlanStore {
         Some(plan.value().clone())
     }
 
+    /// Resolve the plan assigned to a team.
+    /// Falls back to default_team_plan when the team has no explicit assignment.
+    pub fn resolve_team_plan(&self, team_id: &str) -> Option<RateLimitPlan> {
+        if let Some(plan_name) = self.team_assignments.get(team_id) {
+            if let Some(plan) = self.plans.get(plan_name.value()) {
+                return Some(plan.value().clone());
+            }
+        }
+        self.get_default_team_plan()
+    }
+
     /// Get the plan name assigned to a key (for display purposes).
     pub fn get_plan_name(&self, key_hash: &str) -> Option<String> {
         self.key_assignments.get(key_hash).map(|n| n.value().clone())
     }
 
+    /// Get the plan name assigned to a team (for display purposes).
+    pub fn get_team_plan_name(&self, team_id: &str) -> Option<String> {
+        self.team_assignments.get(team_id).map(|n| n.value().clone())
+    }
+
+    /// Get the effective plan name for a team — explicit assignment if any,
+    /// otherwise the default_team_plan. Returns None when neither is set.
+    pub fn get_team_plan_name_effective(&self, team_id: &str) -> Option<String> {
+        self.get_team_plan_name(team_id)
+            .or_else(|| self.get_default_team_plan_name())
+    }
+
     /// Try to acquire a concurrency slot for a key.
     /// Returns a guard that decrements on drop, or None if limit exceeded.
     pub fn try_acquire(&self, key_hash: &str, limit: u32) -> Option<ConcurrencyGuard> {
-        let counter_ref = self
-            .concurrency_counters
-            .entry(key_hash.to_string())
-            .or_insert_with(|| Arc::new(AtomicU32::new(0)));
+        Self::try_acquire_inner(&self.key_concurrency_counters, key_hash, limit)
+    }
 
+    /// Try to acquire a concurrency slot for a team.
+    pub fn try_acquire_team(&self, team_id: &str, limit: u32) -> Option<ConcurrencyGuard> {
+        Self::try_acquire_inner(&self.team_concurrency_counters, team_id, limit)
+    }
+
+    fn try_acquire_inner(
+        counters: &DashMap<String, Arc<AtomicU32>>,
+        id: &str,
+        limit: u32,
+    ) -> Option<ConcurrencyGuard> {
+        let counter_ref = counters
+            .entry(id.to_string())
+            .or_insert_with(|| Arc::new(AtomicU32::new(0)));
         let counter = counter_ref.value().clone();
         let prev = counter.fetch_add(1, Ordering::Relaxed);
-
         if prev >= limit {
-            // Over limit — roll back.
             counter.fetch_sub(1, Ordering::Relaxed);
             None
         } else {
@@ -202,20 +379,34 @@ impl PlanStore {
         self.plans.iter().map(|r| r.value().clone()).collect()
     }
 
-    /// Delete a plan and remove all key assignments referencing it.
+    /// Delete a plan and remove all key/team assignments referencing it.
     /// In-flight concurrency counters are untouched — they drain naturally
     /// as guards are dropped.
     pub fn delete_plan(&self, name: &str) -> bool {
         self.key_assignments
+            .retain(|_, plan_name| plan_name != name);
+        self.team_assignments
             .retain(|_, plan_name| plan_name != name);
         self.plans.remove(name).is_some()
     }
 
     // ── Key assignment CRUD ────────────────────────────────────
 
+    /// Assign a key to a plan. Rejects if the plan's type=Team — team plans
+    /// cannot be assigned to individual keys. The caller (dashboard) should
+    /// catch this and fall back to default_plan with a warning.
     pub fn assign_key(&self, key_hash: &str, plan_name: &str) -> Result<(), String> {
-        if !self.plans.contains_key(plan_name) {
-            return Err(format!("Plan '{}' not found", plan_name));
+        let plan = self
+            .plans
+            .get(plan_name)
+            .map(|r| r.value().clone())
+            .ok_or_else(|| format!("Plan '{}' not found", plan_name))?;
+        if plan.r#type == PlanType::Team {
+            return Err(format!(
+                "Plan '{}' is type=team, cannot be assigned to key '{}'. \
+                 Use a type=key plan or default_plan.",
+                plan_name, key_hash
+            ));
         }
         self.key_assignments
             .insert(key_hash.to_string(), plan_name.to_string());
@@ -235,10 +426,50 @@ impl PlanStore {
 
     /// Read the current concurrency count for a key.
     pub fn get_concurrency(&self, key_hash: &str) -> u32 {
-        self.concurrency_counters
+        self.key_concurrency_counters
             .get(key_hash)
             .map(|c| c.value().load(Ordering::Relaxed))
             .unwrap_or(0)
+    }
+
+    /// Read the current concurrency count for a team.
+    pub fn get_team_concurrency(&self, team_id: &str) -> u32 {
+        self.team_concurrency_counters
+            .get(team_id)
+            .map(|c| c.value().load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
+    // ── Team assignment CRUD ───────────────────────────────────
+
+    /// Assign a team to a plan. Rejects if the plan's type=Key.
+    pub fn assign_team(&self, team_id: &str, plan_name: &str) -> Result<(), String> {
+        let plan = self
+            .plans
+            .get(plan_name)
+            .map(|r| r.value().clone())
+            .ok_or_else(|| format!("Plan '{}' not found", plan_name))?;
+        if plan.r#type == PlanType::Key {
+            return Err(format!(
+                "Plan '{}' is type=key, cannot be assigned to team '{}'. \
+                 Use a type=team plan.",
+                plan_name, team_id
+            ));
+        }
+        self.team_assignments
+            .insert(team_id.to_string(), plan_name.to_string());
+        Ok(())
+    }
+
+    pub fn unassign_team(&self, team_id: &str) -> bool {
+        self.team_assignments.remove(team_id).is_some()
+    }
+
+    pub fn list_team_assignments(&self) -> Vec<(String, String)> {
+        self.team_assignments
+            .iter()
+            .map(|r| (r.key().clone(), r.value().clone()))
+            .collect()
     }
 
     // ── Persistence helpers ───────────────────────────────────
@@ -251,11 +482,25 @@ impl PlanStore {
             .collect()
     }
 
+    /// Snapshot all team→plan assignments for DB persistence.
+    pub fn snapshot_team_assignments(&self) -> Vec<(String, String)> {
+        self.team_assignments
+            .iter()
+            .map(|r| (r.key().clone(), r.value().clone()))
+            .collect()
+    }
+
     /// Restore a single key→plan assignment from DB into memory.
     /// Called at startup. Does NOT validate plan existence (plan may be loaded later).
     pub fn restore_assignment(&self, key_hash: &str, plan_name: &str) {
         self.key_assignments
             .insert(key_hash.to_string(), plan_name.to_string());
+    }
+
+    /// Restore a single team→plan assignment from DB into memory.
+    pub fn restore_team_assignment(&self, team_id: &str, plan_name: &str) {
+        self.team_assignments
+            .insert(team_id.to_string(), plan_name.to_string());
     }
 
     /// Remove an assignment from memory only (DB deletion handled separately).
@@ -264,12 +509,19 @@ impl PlanStore {
         self.key_assignments.remove(key_hash).is_some()
     }
 
-    /// Clear all plan definitions and default_plan, but keep key assignments
-    /// and concurrency counters intact. Used during hot-reload.
+    /// Remove a team assignment from memory only (DB deletion handled separately).
+    pub fn remove_team_assignment_persisted(&self, team_id: &str) -> bool {
+        self.team_assignments.remove(team_id).is_some()
+    }
+
+    /// Clear all plan definitions and default_plan/default_team_plan, but keep
+    /// key/team assignments and concurrency counters intact. Used during hot-reload.
     pub fn clear_plans(&self) {
         self.plans.clear();
         let mut guard = self.default_plan_name.lock().unwrap();
         *guard = None;
+        let mut team_guard = self.default_team_plan_name.lock().unwrap();
+        *team_guard = None;
     }
 
     /// Remove assignments pointing to plans that no longer exist.
@@ -277,16 +529,22 @@ impl PlanStore {
     pub fn cleanup_assignments(&self) {
         self.key_assignments
             .retain(|_, plan_name| self.plans.contains_key(plan_name));
+        self.team_assignments
+            .retain(|_, plan_name| self.plans.contains_key(plan_name));
     }
 
     /// Remove concurrency entries with count==0 to free memory.
     /// Returns the count of removed entries.
     pub fn cleanup_concurrency(&self) -> usize {
-        let before = self.concurrency_counters.len();
-        self.concurrency_counters.retain(|_, counter| {
+        let before = self.key_concurrency_counters.len() + self.team_concurrency_counters.len();
+        self.key_concurrency_counters.retain(|_, counter| {
             counter.load(Ordering::Relaxed) > 0
         });
-        before - self.concurrency_counters.len()
+        self.team_concurrency_counters.retain(|_, counter| {
+            counter.load(Ordering::Relaxed) > 0
+        });
+        let after = self.key_concurrency_counters.len() + self.team_concurrency_counters.len();
+        before - after
     }
 }
 
@@ -301,12 +559,22 @@ impl Default for PlanStore {
 // ═══════════════════════════════════════════════════════════
 
 /// Row for plan snapshot queries.
+///
+/// Schema assumption: `boom_rate_limit_plan` has a single unprefixed set of
+/// limit columns (a plan is a generic template — `type` only gates which
+/// entity it can be assigned to). The old `key_*` / `team_*` columns were
+/// dropped/renamed by `plan_alter_ddl`.
 #[derive(Debug, sqlx::FromRow)]
 pub struct PlanRow {
     pub name: String,
+    pub r#type: Option<String>,
+    pub member_plan: Option<String>,
     pub concurrency_limit: Option<i32>,
     pub rpm_limit: Option<i64>,
+    pub tpm_limit: Option<i64>,
     pub window_limits: serde_json::Value,
+    pub total_token_limit: Option<i64>,
+    pub total_cost_limit_micros: Option<i64>,
     pub schedule: serde_json::Value,
     pub is_default: Option<bool>,
 }
@@ -339,26 +607,39 @@ impl PlanStore {
 
         // 3. Insert YAML plans.
         for (name, pc) in yaml_plans {
-            let window_limits_json = serde_json::to_value(&pc.window_limits).unwrap_or(serde_json::json!([]));
+            let wl = serde_json::to_value(&pc.window_limits).unwrap_or(serde_json::json!([]));
             let schedule_json = serde_json::to_value(
                 pc.schedule.iter().map(|s| serde_json::json!({
                     "hours": s.hours,
                     "concurrency_limit": s.concurrency_limit,
                     "rpm_limit": s.rpm_limit,
+                    "tpm_limit": s.tpm_limit,
                     "window_limits": s.window_limits,
                 })).collect::<Vec<_>>(),
             ).unwrap_or(serde_json::json!([]));
             let is_default = default_plan_name == Some(name.as_str());
+            let type_str = match pc.r#type { PlanType::Key => "key", PlanType::Team => "team" };
 
             sqlx::query(
                 r#"INSERT INTO boom_rate_limit_plan
-                   (name, concurrency_limit, rpm_limit, window_limits, schedule, is_default, source)
-                   VALUES ($1, $2, $3, $4, $5, $6, 'yaml')"#,
+                   (name, type, member_plan,
+                    concurrency_limit, rpm_limit, tpm_limit,
+                    window_limits, total_token_limit, total_cost_limit_micros,
+                    schedule, is_default, source)
+                   VALUES ($1, $2, $3,
+                           $4, $5, $6,
+                           $7, $8, $9,
+                           $10, $11, 'yaml')"#,
             )
             .bind(name)
+            .bind(type_str)
+            .bind(&pc.member_plan)
             .bind(pc.concurrency_limit.map(|v| v as i32))
             .bind(pc.rpm_limit.map(|v| v as i64))
-            .bind(&window_limits_json)
+            .bind(pc.tpm_limit.map(|v| v as i64))
+            .bind(&wl)
+            .bind(pc.total_token_limit.map(|v| v as i64))
+            .bind(pc.total_cost_limit.map(decimal_to_micros))
             .bind(&schedule_json)
             .bind(is_default)
             .execute(pool)
@@ -367,9 +648,15 @@ impl PlanStore {
 
         tracing::info!("Synced {} plan(s) from YAML to DB", yaml_plans.len());
 
-        // 4. Clean up orphaned assignments.
+        // 4. Clean up orphaned assignments (key + team).
         sqlx::query(
             r#"DELETE FROM boom_key_plan_assignment
+               WHERE plan_name NOT IN (SELECT name FROM boom_rate_limit_plan)"#,
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            r#"DELETE FROM boom_team_plan_assignment
                WHERE plan_name NOT IN (SELECT name FROM boom_rate_limit_plan)"#,
         )
         .execute(pool)
@@ -381,7 +668,10 @@ impl PlanStore {
     /// Load source='db' plans from DB into memory.
     pub async fn load_db_only_plans(&self, pool: &sqlx::PgPool) {
         let rows: Vec<PlanRow> = match sqlx::query_as::<_, PlanRow>(
-            r#"SELECT name, concurrency_limit, rpm_limit, window_limits, schedule, is_default
+            r#"SELECT name, type, member_plan,
+                      concurrency_limit, rpm_limit, tpm_limit,
+                      window_limits, total_token_limit, total_cost_limit_micros,
+                      schedule, is_default
                FROM boom_rate_limit_plan WHERE source = 'db'"#,
         )
         .fetch_all(pool)
@@ -423,42 +713,85 @@ impl PlanStore {
         }
     }
 
+    /// Restore team→plan assignments from DB.
+    pub async fn restore_team_assignments_from_db(&self, pool: &sqlx::PgPool) {
+        match sqlx::query_as::<_, (String, String)>(
+            r#"SELECT team_id, plan_name FROM boom_team_plan_assignment"#,
+        )
+        .fetch_all(pool)
+        .await
+        {
+            Ok(rows) => {
+                let count = rows.len();
+                for (team_id, plan_name) in rows {
+                    self.restore_team_assignment(&team_id, &plan_name);
+                }
+                tracing::info!("Restored {} team→plan assignment(s) from DB", count);
+            }
+            Err(e) => {
+                tracing::error!("Failed to restore team assignments: {}", e);
+            }
+        }
+    }
+
     /// Upsert a plan in DB (source='db') and update memory.
     pub async fn upsert_plan_db(&self, pool: &sqlx::PgPool, plan: &RateLimitPlan) -> Result<(), sqlx::Error> {
-        let window_limits_json = serde_json::to_value(&plan.window_limits).unwrap_or(serde_json::json!([]));
+        let wl = serde_json::to_value(&plan.window_limits).unwrap_or(serde_json::json!([]));
         let schedule_json = serde_json::to_value(
             plan.schedule.iter().map(|s| serde_json::json!({
                 "hours": s.hours,
                 "concurrency_limit": s.concurrency_limit,
                 "rpm_limit": s.rpm_limit,
+                "tpm_limit": s.tpm_limit,
                 "window_limits": s.window_limits,
             })).collect::<Vec<_>>(),
         ).unwrap_or(serde_json::json!([]));
 
         let name = &plan.name;
-        let cl = plan.concurrency_limit.map(|v| v as i32);
-        let rpm = plan.rpm_limit.map(|v| v as i64);
+        let type_str = match plan.r#type { PlanType::Key => "key", PlanType::Team => "team" };
+
         boom_core::gaussdb_upsert!(
             pool,
             || sqlx::query(
                 r#"UPDATE boom_rate_limit_plan
-                   SET concurrency_limit = $2, rpm_limit = $3,
-                       window_limits = $4, schedule = $5, source = 'db', updated_at = NOW()
+                   SET type = $2, member_plan = $3,
+                       concurrency_limit = $4, rpm_limit = $5,
+                       tpm_limit = $6,
+                       window_limits = $7,
+                       total_token_limit = $8, total_cost_limit_micros = $9,
+                       schedule = $10, source = 'db', updated_at = NOW()
                    WHERE name = $1"#,
             )
             .bind(name)
-            .bind(cl)
-            .bind(rpm)
-            .bind(&window_limits_json)
+            .bind(type_str)
+            .bind(&plan.member_plan)
+            .bind(plan.concurrency_limit.map(|v| v as i32))
+            .bind(plan.rpm_limit.map(|v| v as i64))
+            .bind(plan.tpm_limit.map(|v| v as i64))
+            .bind(&wl)
+            .bind(plan.total_token_limit.map(|v| v as i64))
+            .bind(plan.total_cost_limit.map(decimal_to_micros))
             .bind(&schedule_json),
             || sqlx::query(
-                r#"INSERT INTO boom_rate_limit_plan (name, concurrency_limit, rpm_limit, window_limits, schedule, is_default, source)
-                   VALUES ($1, $2, $3, $4, $5, false, 'db')"#,
+                r#"INSERT INTO boom_rate_limit_plan
+                   (name, type, member_plan,
+                    concurrency_limit, rpm_limit, tpm_limit,
+                    window_limits, total_token_limit, total_cost_limit_micros,
+                    schedule, is_default, source)
+                   VALUES ($1, $2, $3,
+                           $4, $5, $6,
+                           $7, $8, $9,
+                           $10, false, 'db')"#,
             )
             .bind(name)
-            .bind(cl)
-            .bind(rpm)
-            .bind(&window_limits_json)
+            .bind(type_str)
+            .bind(&plan.member_plan)
+            .bind(plan.concurrency_limit.map(|v| v as i32))
+            .bind(plan.rpm_limit.map(|v| v as i64))
+            .bind(plan.tpm_limit.map(|v| v as i64))
+            .bind(&wl)
+            .bind(plan.total_token_limit.map(|v| v as i64))
+            .bind(plan.total_cost_limit.map(decimal_to_micros))
             .bind(&schedule_json)
         )?;
 
@@ -535,7 +868,56 @@ impl PlanStore {
         }
     }
 
-    /// Sync in-memory assignments to DB (periodic background task).
+    /// Assign a team to a plan in DB and memory.
+    pub async fn assign_team_db(&self, pool: &sqlx::PgPool, team_id: &str, plan_name: &str) -> Result<(), String> {
+        let updated = sqlx::query(
+            r#"UPDATE boom_team_plan_assignment SET plan_name = $2 WHERE team_id = $1"#,
+        )
+        .bind(team_id)
+        .bind(plan_name)
+        .execute(pool)
+        .await
+        .map_err(|e| format!("DB error: {}", e))?;
+        if updated.rows_affected() == 0 {
+            if let Err(_) = sqlx::query(
+                r#"INSERT INTO boom_team_plan_assignment (team_id, plan_name, assigned_at)
+                   VALUES ($1, $2, NOW())"#,
+            )
+            .bind(team_id)
+            .bind(plan_name)
+            .execute(pool)
+            .await
+            {
+                sqlx::query(
+                    r#"UPDATE boom_team_plan_assignment SET plan_name = $2 WHERE team_id = $1"#,
+                )
+                .bind(team_id)
+                .bind(plan_name)
+                .execute(pool)
+                .await
+                .map_err(|e| format!("DB error: {}", e))?;
+            }
+        }
+        self.assign_team(team_id, plan_name)?;
+        Ok(())
+    }
+
+    /// Unassign a team from its plan in DB and memory.
+    pub async fn unassign_team_db(&self, pool: &sqlx::PgPool, team_id: &str) -> Result<bool, String> {
+        let result = sqlx::query(r#"DELETE FROM boom_team_plan_assignment WHERE team_id = $1"#)
+            .bind(team_id)
+            .execute(pool)
+            .await
+            .map_err(|e| format!("DB error: {}", e))?;
+        if result.rows_affected() > 0 {
+            self.unassign_team(team_id);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Sync in-memory key assignments to DB (periodic background task).
     pub async fn sync_assignments_to_db(&self, pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
         let assignments = self.snapshot_assignments();
         for (key_hash, plan_name) in &assignments {
@@ -557,10 +939,35 @@ impl PlanStore {
         Ok(())
     }
 
+    /// Sync in-memory team assignments to DB (periodic background task).
+    pub async fn sync_team_assignments_to_db(&self, pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
+        let assignments = self.snapshot_team_assignments();
+        for (team_id, plan_name) in &assignments {
+            boom_core::gaussdb_upsert!(
+                pool,
+                || sqlx::query(
+                    r#"UPDATE boom_team_plan_assignment SET plan_name = $2 WHERE team_id = $1"#,
+                )
+                .bind(team_id)
+                .bind(plan_name),
+                || sqlx::query(
+                    r#"INSERT INTO boom_team_plan_assignment (team_id, plan_name, assigned_at)
+                       VALUES ($1, $2, NOW())"#,
+                )
+                .bind(team_id)
+                .bind(plan_name)
+            )?;
+        }
+        Ok(())
+    }
+
     /// Snapshot all plans from DB (for config export).
     pub async fn snapshot_plans_db(pool: &sqlx::PgPool) -> Result<Vec<PlanRow>, sqlx::Error> {
         sqlx::query_as::<_, PlanRow>(
-            r#"SELECT name, concurrency_limit, rpm_limit, window_limits, schedule, is_default
+            r#"SELECT name, type, member_plan,
+                      concurrency_limit, rpm_limit, tpm_limit,
+                      window_limits, total_token_limit, total_cost_limit_micros,
+                      schedule, is_default
                FROM boom_rate_limit_plan ORDER BY name"#,
         )
         .fetch_all(pool)
@@ -569,34 +976,114 @@ impl PlanStore {
 }
 
 /// Convert a DB plan row to a RateLimitPlan.
+///
+/// Backward compat: if `type` column is NULL (pre-migration DB), defaults to `Key`.
 fn row_to_plan(row: &PlanRow) -> RateLimitPlan {
+    let plan_type = match row.r#type.as_deref() {
+        Some("team") => PlanType::Team,
+        _ => PlanType::Key,
+    };
     RateLimitPlan {
         name: row.name.clone(),
+        r#type: plan_type,
+        member_plan: row.member_plan.clone(),
         concurrency_limit: row.concurrency_limit.map(|v| v as u32),
         rpm_limit: row.rpm_limit.map(|v| v as u64),
+        tpm_limit: row.tpm_limit.map(|v| v as u64),
         window_limits: parse_window_limits(&row.window_limits),
+        total_token_limit: row.total_token_limit.map(|v| v as u64),
+        total_cost_limit: row.total_cost_limit_micros.map(micros_to_decimal),
         schedule: parse_schedule(&row.schedule),
     }
 }
 
-fn parse_window_limits(value: &serde_json::Value) -> Vec<(u64, u64)> {
-    value.as_array().map(|arr| {
-        arr.iter().filter_map(|item| {
-            let a = item.as_array()?;
-            if a.len() >= 2 { Some((a[0].as_u64()?, a[1].as_u64()?)) } else { None }
-        }).collect()
-    }).unwrap_or_default()
+fn parse_window_limits(value: &serde_json::Value) -> Vec<WindowLimit> {
+    // The DB column stores the serde-serialized form of `Vec<WindowLimit>`.
+    // We round-trip via the same custom deserializer the YAML path uses, so
+    // both compact-array and verbose-object forms survive a write-then-read.
+    // Old rows written as `[[count, window_secs]]` (legacy 2-element form)
+    // won't fit the 4-element array helper; fall back to interpreting them
+    // as `(counts=count, window_secs)` entries with the other dims None.
+    let arr = match value.as_array() {
+        Some(a) => a,
+        None => return Vec::new(),
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for item in arr {
+        if let Some(a) = item.as_array() {
+            // Compact array form.
+            match a.len() {
+                4 => {
+                    // [counts, tokens, costs, window_secs] — null for unused dims.
+                    let counts = a[0].as_u64();
+                    let tokens = a[1].as_u64();
+                    let costs = a[2]
+                        .as_str()
+                        .and_then(|s| Decimal::from_str(s).ok())
+                        .or_else(|| a[2].as_f64().and_then(Decimal::from_f64));
+                    let window_secs = a[3].as_u64().unwrap_or(60);
+                    out.push(WindowLimit {
+                        counts,
+                        tokens,
+                        costs,
+                        window_secs,
+                    });
+                }
+                2 => {
+                    // Legacy 2-element form: [count, window_secs].
+                    if let (Some(c), Some(s)) = (a[0].as_u64(), a[1].as_u64()) {
+                        out.push(WindowLimit {
+                            counts: Some(c),
+                            tokens: None,
+                            costs: None,
+                            window_secs: s,
+                        });
+                    }
+                }
+                _ => continue,
+            }
+        } else if let Some(obj) = item.as_object() {
+            // Verbose object form.
+            let counts = obj.get("counts").and_then(|v| v.as_u64());
+            let tokens = obj.get("tokens").and_then(|v| v.as_u64());
+            let costs = obj
+                .get("costs")
+                .and_then(|v| v.as_str())
+                .and_then(|s| Decimal::from_str(s).ok())
+                .or_else(|| {
+                    obj.get("costs")
+                        .and_then(|v| v.as_f64())
+                        .and_then(Decimal::from_f64)
+                });
+            let window_secs = obj.get("window_secs").and_then(|v| v.as_u64()).unwrap_or(60);
+            out.push(WindowLimit {
+                counts,
+                tokens,
+                costs,
+                window_secs,
+            });
+        }
+    }
+    out
 }
 
 fn parse_schedule(value: &serde_json::Value) -> Vec<ScheduleSlot> {
     value.as_array().map(|arr| {
         arr.iter().filter_map(|item| {
             let obj = item.as_object()?;
+            let empty_arr = serde_json::Value::Array(vec![]);
+            let conc = obj.get("concurrency_limit")
+                .and_then(|v| v.as_u64()).map(|v| v as u32);
+            let rpm = obj.get("rpm_limit")
+                .and_then(|v| v.as_u64());
+            let tpm = obj.get("tpm_limit").and_then(|v| v.as_u64());
+            let wl = parse_window_limits(obj.get("window_limits").unwrap_or(&empty_arr));
             Some(ScheduleSlot {
                 hours: obj.get("hours")?.as_str()?.to_string(),
-                concurrency_limit: obj.get("concurrency_limit").and_then(|v| v.as_u64()).map(|v| v as u32),
-                rpm_limit: obj.get("rpm_limit").and_then(|v| v.as_u64()),
-                window_limits: parse_window_limits(obj.get("window_limits")?),
+                concurrency_limit: conc,
+                rpm_limit: rpm,
+                tpm_limit: tpm,
+                window_limits: wl,
             })
         }).collect()
     }).unwrap_or_default()

@@ -13,8 +13,16 @@ pub enum GatewayError {
         retry_after_secs: Option<u64>,
         message: String,
         /// Specific limit type for diagnostics: "plan_rpm_limit", "plan_window_limit",
-        /// "rpm_limit", "window_limit".
+        /// "rpm_limit", "window_limit", "key_window_tokens", "key_window_cost",
+        /// "team_window_tokens", "team_window_cost", "key_total_token",
+        /// "team_total_token", "key_total_cost", "team_total_cost", etc.
         limit_type: &'static str,
+        /// Which entity hit the limit: "key" or "team". None for legacy paths.
+        scope: Option<&'static str>,
+        /// Identifier of the scope (key_alias / team_alias / key_hash / team_id).
+        scope_id: Option<String>,
+        /// Plan name that defined the limit.
+        plan_name: Option<String>,
     },
 
     #[error("Concurrency limit exceeded: {message}")]

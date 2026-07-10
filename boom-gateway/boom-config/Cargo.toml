@@ -10,3 +10,4 @@ serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+rust_decimal = { workspace = true }

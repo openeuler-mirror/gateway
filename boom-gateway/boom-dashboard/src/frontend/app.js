@@ -72,6 +72,16 @@
     return cachedPlanNames;
   }
 
+  // Return plan names filtered to type=team (for team modal dropdown).
+  async function getTeamPlanNames() {
+    try {
+      const data = await api("/admin/plans");
+      return (data.plans || [])
+        .filter((p) => !p.type || p.type === "team")
+        .map((p) => p.name);
+    } catch { return []; }
+  }
+
   // Invalidate caches after mutations
   function invalidateCaches() { cachedModelNames = null; cachedPlanNames = null; }
 
@@ -315,9 +325,8 @@
     else if (section === "admin-plans") loadPlans();
     else if (section === "admin-keys") { setupKeysSearch(); loadKeys(); }
     else if (section === "admin-assignments") loadAssignments();
-    else if (section === "admin-teams") loadTeams();
+    else if (section === "admin-quota") loadQuota();
     else if (section === "admin-logs") { setupLogsFilters(); loadLogs(); }
-    else if (section === "admin-config") loadConfig();
     else if (section === "admin-debug") { loadAgentStats(); loadRebalanceMoves(); }
   }
 
@@ -327,10 +336,9 @@
     if (hash.includes("/admin/aliases")) return "admin-aliases";
     if (hash.includes("/admin/plans")) return "admin-plans";
     if (hash.includes("/admin/keys")) return "admin-keys";
-    if (hash.includes("/admin/teams")) return "admin-teams";
+    if (hash.includes("/admin/quota")) return "admin-quota";
     if (hash.includes("/admin/assignments")) return "admin-assignments";
     if (hash.includes("/admin/logs")) return "admin-logs";
-    if (hash.includes("/admin/config")) return "admin-config";
     if (hash.includes("/admin/debug")) return "admin-debug";
     return "admin-models";
   }
@@ -1497,12 +1505,23 @@
     const limits = [];
     if (plan.concurrency_limit) limits.push(t("plan.limits.concurrency", { n: plan.concurrency_limit }));
     if (plan.rpm_limit) limits.push(t("plan.limits.rpm", { n: plan.rpm_limit }));
-    if (plan.window_limits && plan.window_limits.length > 0) {
-      plan.window_limits.forEach(([l, w]) => limits.push(t("plan.limits.window", { n: l, duration: formatDuration(w) })));
-    }
+    if (plan.tpm_limit) limits.push(t("plan.limits.tpm", { n: plan.tpm_limit }));
+    if (plan.total_token_limit) limits.push(t("plan.limits.total_token", { n: plan.total_token_limit }));
+    if (plan.total_cost_limit != null) limits.push(t("plan.limits.total_cost", { n: plan.total_cost_limit }));
+    (plan.window_limits || []).forEach((raw) => {
+      const w = normalizeWindowLimit(raw);
+      if (!w) return;
+      const parts = [];
+      if (w.counts != null) parts.push(t("plan.dim.counts", { n: w.counts }));
+      if (w.tokens != null) parts.push(t("plan.dim.tokens", { n: w.tokens }));
+      if (w.costs != null) parts.push(t("plan.dim.costs", { n: w.costs }));
+      if (parts.length) limits.push(t("plan.limits.window", { dims: parts.join(" / "), duration: formatDuration(w.window_secs) }));
+    });
     el.innerHTML = `
-      <p><strong>${esc(plan.plan_name)}</strong></p>
-      <ul>${limits.map((l) => `<li>${esc(l)}</li>`).join("")}</ul>
+      <div class="plan-card">
+        <div class="plan-name-badge">${esc(plan.plan_name)}</div>
+        <div class="plan-limits">${limits.map((l) => `<div class="plan-limit-row">${esc(l)}</div>`).join("") || `<div class="muted">${esc(t("common.unlimited"))}</div>`}</div>
+      </div>
     `;
   }
 
@@ -1512,11 +1531,13 @@
 
     // Concurrency card
     const concLimit = usage.concurrency_limit;
-    const concCount = usage.concurrency;
+    const concCount = usage.concurrency || 0;
     if (concLimit != null) {
+      const pct = concLimit > 0 ? Math.min(100, (concCount / concLimit) * 100) : 0;
       html += `<div class="usage-limit-card">
         <div class="usage-limit-title">${t("req.concurrency")}</div>
         <div class="usage-limit-count">${concCount} / ${concLimit}</div>
+        <div class="progress-bar"><div class="progress-fill ${pct >= 90 ? "danger" : pct >= 70 ? "warn" : ""}" style="width:${pct}%"></div></div>
         <div class="usage-limit-reset">${t("req.simultaneous")}</div>
       </div>`;
     } else {
@@ -1527,30 +1548,123 @@
       </div>`;
     }
 
-    // Rate limit window cards
-    if (usage.windows.length === 0) {
-      html += '<div class="usage-limit-card"><div class="usage-limit-title">' + t("req.rate_limits") + '</div><div class="usage-limit-reset">' + t("req.no_active_windows") + '</div></div>';
+    // Window cards: one per window_secs. Each card holds multi-dim progress
+    // bars (counts / tokens / costs — whichever the plan configured).
+    if (!usage.windows || usage.windows.length === 0) {
+      html += '<div class="usage-limit-card usage-limit-wide"><div class="usage-limit-title">' +
+        t("req.rate_limits") + '</div><div class="usage-limit-reset">' +
+        t("req.no_active_windows") + '</div></div>';
     } else {
       usage.windows.forEach((w) => {
-        const limit = w.limit;
         const isRpm = w.window_secs === 60;
-        const label = isRpm ? "RPM" : t("plan.window_limit_label", { duration: formatDuration(w.window_secs) });
-        const remaining = Math.max(0, w.window_secs - w.elapsed_secs);
+        const label = isRpm ? "RPM (60s)" : t("plan.window_limit_label", { duration: formatDuration(w.window_secs) });
+        const remaining = w.remaining_secs || 0;
+        const dims = w.dims || {};
+        const dimKeys = ["counts", "tokens", "costs"].filter((k) => dims[k]);
+        if (dimKeys.length === 0) return; // nothing configured, skip
 
-        if (limit != null) {
-          html += `<div class="usage-limit-card">
-            <div class="usage-limit-title">${esc(label)}</div>
-            <div class="usage-limit-count">${w.count} / ${limit}</div>
-            <div class="usage-limit-reset">${t("req.resets_in", { time: formatCountdown(remaining) })}</div>
-          </div>`;
-        } else {
-          html += `<div class="usage-limit-card">
-            <div class="usage-limit-title">${esc(label)}</div>
-            <div class="usage-limit-count">${w.count}</div>
-            <div class="usage-limit-reset">${t("req.unlimited_resets", { time: formatCountdown(remaining) })}</div>
-          </div>`;
-        }
+        let dimHtml = "";
+        dimKeys.forEach((k) => {
+          const d = dims[k];
+          let cur, limit, display;
+          if (k === "costs") {
+            cur = Number(d.current_micros || 0);
+            limit = Number(d.limit_micros || 0);
+            display = "$" + (d.current || "0") + " / " + (limit > 0 ? "$" + (d.limit || "0") : t("common.unlimited"));
+          } else {
+            cur = Number(d.current || 0);
+            limit = Number(d.limit || 0);
+            display = formatNumber(cur) + " / " + (limit > 0 ? formatNumber(limit) : t("common.unlimited"));
+          }
+          const pct = limit > 0 ? Math.min(100, (cur / limit) * 100) : 0;
+          const cls = pct >= 90 ? "danger" : pct >= 70 ? "warn" : "";
+          dimHtml += `
+            <div class="dim-row">
+              <span class="dim-label">${esc(t("plan.dim." + k))}</span>
+              <div class="progress-bar"><div class="progress-fill ${cls}" style="width:${pct}%"></div></div>
+              <span class="dim-value">${esc(display)}</span>
+            </div>`;
+        });
+
+        html += `<div class="usage-limit-card usage-limit-wide">
+          <div class="usage-limit-title">${esc(label)}</div>
+          ${dimHtml}
+          <div class="usage-limit-reset">${t("req.resets_in", { time: formatCountdown(remaining) })}</div>
+        </div>`;
       });
+    }
+
+    // Cumulative card (if plan has any total_*_limit or any cumulative usage > 0).
+    const c = usage.cumulative || {};
+    const hasCumLimit = c.total_token_limit != null || c.total_cost_limit != null;
+    const hasCumUsage = (c.total_tokens || 0) > 0 || (c.total_cost_micros || 0) > 0;
+    if (hasCumLimit || hasCumUsage) {
+      let dimHtml = "";
+      if (c.total_token_limit != null) {
+        const cur = Number(c.total_tokens || 0);
+        const limit = Number(c.total_token_limit);
+        const pct = limit > 0 ? Math.min(100, (cur / limit) * 100) : 0;
+        const cls = pct >= 90 ? "danger" : pct >= 70 ? "warn" : "";
+        dimHtml += `
+          <div class="dim-row">
+            <span class="dim-label">${esc(t("plan.dim.total_tokens"))}</span>
+            <div class="progress-bar"><div class="progress-fill ${cls}" style="width:${pct}%"></div></div>
+            <span class="dim-value">${formatNumber(cur)} / ${formatNumber(limit)}</span>
+          </div>`;
+      } else if ((c.total_tokens || 0) > 0) {
+        dimHtml += `
+          <div class="dim-row">
+            <span class="dim-label">${esc(t("plan.dim.total_tokens"))}</span>
+            <div class="dim-value">${formatNumber(c.total_tokens)}</div>
+          </div>`;
+      }
+      if (c.total_cost_limit != null) {
+        const cur = Number(c.total_cost_micros || 0);
+        const limitMicros = Math.round(Number(c.total_cost_limit) * 1_000_000);
+        const pct = limitMicros > 0 ? Math.min(100, (cur / limitMicros) * 100) : 0;
+        const cls = pct >= 90 ? "danger" : pct >= 70 ? "warn" : "";
+        dimHtml += `
+          <div class="dim-row">
+            <span class="dim-label">${esc(t("plan.dim.total_cost"))}</span>
+            <div class="progress-bar"><div class="progress-fill ${cls}" style="width:${pct}%"></div></div>
+            <span class="dim-value">$${esc(c.total_cost || "0")} / $${esc(c.total_cost_limit)}</span>
+          </div>`;
+      } else if ((c.total_cost_micros || 0) > 0) {
+        dimHtml += `
+          <div class="dim-row">
+            <span class="dim-label">${esc(t("plan.dim.total_cost"))}</span>
+            <div class="dim-value">$${esc(c.total_cost || "0")}</div>
+          </div>`;
+      }
+      // Cost breakdown (cached / non-cached / output). Only show when the
+      // relevant component is non-zero — keeps the card minimal for fresh keys.
+      if ((c.regular_input_cost_micros || 0) > 0) {
+        dimHtml += `
+          <div class="dim-row">
+            <span class="dim-label">${esc(t("plan.dim.regular_input_cost"))}</span>
+            <div class="dim-value">$${esc(c.regular_input_cost || "0")}</div>
+          </div>`;
+      }
+      if ((c.cached_input_cost_micros || 0) > 0) {
+        dimHtml += `
+          <div class="dim-row">
+            <span class="dim-label">${esc(t("plan.dim.cached_input_cost"))}</span>
+            <div class="dim-value">$${esc(c.cached_input_cost || "0")}</div>
+          </div>`;
+      }
+      if ((c.output_cost_micros || 0) > 0) {
+        dimHtml += `
+          <div class="dim-row">
+            <span class="dim-label">${esc(t("plan.dim.output_cost"))}</span>
+            <div class="dim-value">$${esc(c.output_cost || "0")}</div>
+          </div>`;
+      }
+      if (dimHtml) {
+        html += `<div class="usage-limit-card usage-limit-wide">
+          <div class="usage-limit-title">${esc(t("plan.cumulative_title"))}</div>
+          ${dimHtml}
+        </div>`;
+      }
     }
 
     html += '</div>';
@@ -1599,7 +1713,6 @@
       [t("keyinfo.spend"), "$" + (info.spend || 0).toFixed(4)],
       [t("keyinfo.max_budget"), info.max_budget != null ? "$" + info.max_budget : t("common.unlimited")],
       [t("keyinfo.blocked"), info.blocked ? t("common.yes") : t("common.no")],
-      [t("keyinfo.rpm_limit"), info.rpm_limit || t("common.default")],
       [t("keyinfo.expires"), info.expires || t("common.never")],
       [t("keyinfo.created"), info.created_at || "-"],
     ];
@@ -1680,18 +1793,57 @@
   function renderPlansTable(plans) {
     const wrap = document.getElementById("plans-table-wrap");
     if (plans.length === 0) { wrap.innerHTML = "<p>" + t("plans.empty") + "</p>"; return; }
+    const fmtOptInt = (v) => (v == null ? "-" : Number(v).toLocaleString());
+    const fmtOptCost = (v) => (v == null ? "-" : "$" + String(v));
+    const fmtSchedule = (slots) => {
+      if (!Array.isArray(slots) || slots.length === 0) return "-";
+      return slots.map((s) => esc(s.hours || "")).join(", ");
+    };
     wrap.innerHTML = `<table>
-      <tr><th>${t("plans.col.name")}</th><th>${t("plans.col.concurrent")}</th><th>${t("plans.col.rpm")}</th><th>${t("plans.col.windows")}</th><th>${t("plans.col.actions")}</th></tr>
-      ${plans.map((p) => `<tr>
-        <td><strong>${esc(p.name)}</strong></td>
-        <td>${p.concurrency_limit || "-"}</td>
-        <td>${p.rpm_limit || "-"}</td>
-        <td>${(p.window_limits || []).map(([l, w]) => `${l}/${formatDuration(w)}`).join(", ") || "-"}</td>
-        <td>
-          <button class="btn-small" onclick="window._editPlan('${esc(p.name)}')">${t("action.edit")}</button>
-          <button class="btn-danger" onclick="window._deletePlan('${esc(p.name)}')">${t("action.delete")}</button>
-        </td>
-      </tr>`).join("")}
+      <tr>
+        <th>${t("plans.col.name")}</th>
+        <th>${t("plans.col.type")}</th>
+        <th>${t("plans.col.concurrent")}</th>
+        <th>${t("plans.col.rpm")}</th>
+        <th>${t("plans.col.tpm")}</th>
+        <th>${t("plans.col.windows")}</th>
+        <th>${t("plans.col.total_token")}</th>
+        <th>${t("plans.col.total_cost")}</th>
+        <th>${t("plans.col.member_plan")}</th>
+        <th>${t("plans.col.schedule")}</th>
+        <th>${t("plans.col.actions")}</th>
+      </tr>
+      ${plans.map((p) => {
+        const wlSummary = (p.window_limits || [])
+          .map((raw) => {
+            const w = normalizeWindowLimit(raw);
+            if (!w) return null;
+            const dims = [];
+            if (w.counts != null) dims.push(t("plan.dim.counts", { n: w.counts }));
+            if (w.tokens != null) dims.push(t("plan.dim.tokens", { n: w.tokens }));
+            if (w.costs != null) dims.push(t("plan.dim.costs", { n: w.costs }));
+            return dims.length ? dims.join("/") + " / " + formatDuration(w.window_secs) : null;
+          })
+          .filter(Boolean)
+          .join(", ");
+        const typeLabel = p.type === "team" ? t("plans.type.team") : t("plans.type.key");
+        return `<tr>
+          <td><strong>${esc(p.name)}</strong></td>
+          <td>${esc(typeLabel)}</td>
+          <td>${fmtOptInt(p.concurrency_limit)}</td>
+          <td>${fmtOptInt(p.rpm_limit)}</td>
+          <td>${fmtOptInt(p.tpm_limit)}</td>
+          <td>${wlSummary || "-"}</td>
+          <td>${fmtOptInt(p.total_token_limit)}</td>
+          <td>${fmtOptCost(p.total_cost_limit)}</td>
+          <td>${p.member_plan ? esc(p.member_plan) : "-"}</td>
+          <td>${fmtSchedule(p.schedule)}</td>
+          <td>
+            <button class="btn-small" onclick="window._editPlan('${esc(p.name)}')">${t("action.edit")}</button>
+            <button class="btn-danger" onclick="window._deletePlan('${esc(p.name)}')">${t("action.delete")}</button>
+          </td>
+        </tr>`;
+      }).join("")}
     </table>`;
   }
 
@@ -1747,15 +1899,27 @@
   function renderKeysTable(keys) {
     const wrap = document.getElementById("keys-table-wrap");
     if (keys.length === 0) { wrap.innerHTML = "<p>" + t("keys.empty") + "</p>"; return; }
+    const fmtTokens = (n) => {
+      const v = Number(n) || 0;
+      if (v >= 1e9) return (v / 1e9).toFixed(2) + "B";
+      if (v >= 1e6) return (v / 1e6).toFixed(2) + "M";
+      if (v >= 1e3) return (v / 1e3).toFixed(2) + "K";
+      return String(v);
+    };
+    const fmtCost = (s) => {
+      const v = Number(s) || 0;
+      if (v >= 1) return "$" + v.toFixed(2);
+      if (v > 0) return "$" + v.toFixed(4);
+      return "$0";
+    };
     wrap.innerHTML = `<table>
-      <tr><th>${t("keys.col.token")}</th><th>${t("keys.col.alias")}</th><th>${t("keys.col.user")}</th><th>${t("keys.col.plan")}</th><th>${t("keys.col.usage")}</th><th>${t("keys.col.reset")}</th><th>${t("keys.col.spend")}</th><th>${t("keys.col.budget")}</th><th>${t("keys.col.status")}</th><th>${t("keys.col.actions")}</th></tr>
+      <tr><th>${t("keys.col.token")}</th><th>${t("keys.col.alias")}</th><th>${t("keys.col.user")}</th><th>${t("keys.col.plan")}</th><th>${t("keys.col.usage")}</th><th>${t("keys.col.spend")}</th><th>${t("keys.col.budget")}</th><th>${t("keys.col.status")}</th><th>${t("keys.col.actions")}</th></tr>
       ${keys.map((k) => `<tr>
         <td class="mono">${esc(k.token_prefix)}</td>
         <td>${esc(k.key_alias || "-")}</td>
         <td>${esc(k.user_id || "-")}</td>
         <td>${esc(k.plan_name || "-")}</td>
-        <td>${k.usage_count || 0}</td>
-        <td>${formatCountdown(k.usage_reset_secs || 0)}</td>
+        <td><span class="mono">${k.usage_count || 0}/${fmtTokens(k.usage_tokens)}/${fmtCost(k.usage_cost)}</span><br><span class="muted" style="font-size:11px">${formatCountdown(k.usage_reset_secs || 0)}</span></td>
         <td>$${(k.spend || 0).toFixed(4)}</td>
         <td>${k.max_budget != null ? "$" + k.max_budget : "-"}</td>
         <td>${k.blocked
@@ -2078,68 +2242,6 @@
     loadAliases();
   };
 
-  // ── Admin: Config ─────────────────────────────────────
-  async function loadConfig() {
-    try {
-      const data = await api("/admin/config");
-      renderConfigTable(data.config || {});
-    } catch (err) {
-      const wrap = document.getElementById("config-table-wrap");
-      if (wrap) wrap.innerHTML = `<p class="error-msg">${t("common.failed_to_load", { what: t("config.title"), message: esc(err.message) })}</p>`;
-    }
-  }
-
-  function renderConfigTable(config) {
-    const wrap = document.getElementById("config-table-wrap");
-    const keys = Object.keys(config);
-    if (keys.length === 0) { wrap.innerHTML = "<p>" + t("config.empty") + "</p>"; return; }
-    wrap.innerHTML = `<table>
-      <tr><th>${t("config.col.key")}</th><th>${t("config.col.value")}</th><th>${t("config.col.actions")}</th></tr>
-      ${keys.map((k) => `<tr>
-        <td><strong>${esc(k)}</strong></td>
-        <td class="mono" style="max-width:400px;word-break:break-all;white-space:pre-wrap">${esc(JSON.stringify(config[k], null, 2))}</td>
-        <td><button class="btn-small" onclick="window._editConfig('${esc(k)}')">${t("action.edit")}</button></td>
-      </tr>`).join("")}
-    </table>`;
-  }
-
-  function showNewConfigModal(prefill) {
-    const p = prefill || {};
-    showModal(`
-      <h3>${p.key ? t("form.config.title_edit") : t("form.config.title_create")}</h3>
-      <div class="form-group"><label>${t("form.config.key")} * ${tip("Configuration key name, e.g. 'general_settings' or a custom key.")}</label><input id="m-config-key" value="${esc(p.key || "")}" ${p.key ? "readonly" : ""}></div>
-      <div class="form-group"><label>${t("form.config.value")} * ${tip("Configuration value as valid JSON. E.g. {\"store_model_in_db\": true}")}</label><textarea id="m-config-value" rows="6">${esc(p.value ? JSON.stringify(p.value, null, 2) : "")}</textarea></div>
-      <div class="modal-actions">
-        <button class="btn-secondary" onclick="hideModal()" style="width:auto">${t("action.cancel")}</button>
-        <button class="btn-primary" id="m-config-submit">${t("action.save")}</button>
-      </div>
-    `);
-    document.getElementById("m-config-submit").addEventListener("click", async () => {
-      try {
-        const value = JSON.parse(document.getElementById("m-config-value").value);
-        await api("/admin/config", {
-          method: "PATCH",
-          body: JSON.stringify({
-            key: document.getElementById("m-config-key").value,
-            value: value,
-          }),
-        });
-        hideModal();
-        loadConfig();
-      } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
-    });
-  }
-
-  window._editConfig = async (key) => {
-    try {
-      const data = await api("/admin/config");
-      const config = data.config || {};
-      if (config[key] !== undefined) {
-        showNewConfigModal({ key, value: config[key] });
-      }
-    } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
-  };
-
   // ── Admin: Debug Error Recording ─────────────────────
   let debugEnabled = false;
 
@@ -2150,7 +2252,13 @@
       const data = await api("/admin/debug/status");
       debugEnabled = data.enabled;
       updateDebugButton(btn);
-    } catch {}
+    } catch {
+      // Release builds compile out debug endpoints — hide the toggle button
+      // and the Debug nav-link (404 → catch branch).
+      btn.style.display = "none";
+      document.querySelectorAll('.nav-link[data-section="admin-debug"]')
+        .forEach((el) => el.style.display = "none");
+    }
   }
 
   function updateDebugButton(btn) {
@@ -2238,16 +2346,6 @@
     } catch {}
   }
 
-  async function toggleTeamPromptLog(teamId, excluded) {
-    try {
-      await api("/admin/prompt-log/team", {
-        method: "POST",
-        body: JSON.stringify({ team_id: teamId, excluded: !excluded }),
-      });
-      loadTeams();
-    } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
-  }
-
   async function showDebugError(requestId) {
     try {
       const data = await api("/admin/debug/errors/" + encodeURIComponent(requestId));
@@ -2332,8 +2430,6 @@
     if (btnModel) btnModel.addEventListener("click", showNewModelModal);
     const btnAlias = document.getElementById("btn-new-alias");
     if (btnAlias) btnAlias.addEventListener("click", showNewAliasModal);
-    const btnConfig = document.getElementById("btn-new-config");
-    if (btnConfig) btnConfig.addEventListener("click", showNewConfigModal);
     const btnReload = document.getElementById("btn-reload-config");
     if (btnReload) btnReload.addEventListener("click", async () => {
       if (!confirm(t("confirm.reload"))) return;
@@ -2632,50 +2728,419 @@
     });
   }
 
-  // ── Admin: Teams ──────────────────────────────────────
-  async function loadTeams() {
+  // ── Admin: Quota Management ───────────────────────────
+  // Two views share the same #admin-quota section:
+  //   #/admin/quota                       → overview (team cards)
+  //   #/admin/quota/team/{team_id}        → team detail (paginated keys)
+  //   #/admin/quota/unassigned            → unassigned keys (paginated)
+
+  let quotaKeysPage = 1;
+  let quotaKeysSearch = "";
+  let quotaKeysSort = "cost";
+  let quotaKeysSearchTimer = null;
+
+  async function loadQuota() {
+    const hash = location.hash || "";
+    if (hash.includes("/admin/quota/team/")) {
+      const m = hash.match(/\/admin\/quota\/team\/([^/?#]+)/);
+      const tid = m ? decodeURIComponent(m[1]) : null;
+      if (tid) { renderQuotaTeamDetail(tid); return; }
+    } else if (hash.includes("/admin/quota/unassigned")) {
+      renderQuotaUnassigned();
+      return;
+    }
+    loadQuotaOverview();
+  }
+
+  async function loadQuotaOverview() {
+    const wrap = document.getElementById("quota-overview-wrap");
+    if (!wrap) return;
+    wrap.innerHTML = '<p class="loading">' + t("common.loading") + '</p>';
     try {
-      // Load prompt log status alongside teams to know excluded teams.
+      // Load prompt-log status alongside — to know which teams are excluded.
       try {
         const plData = await api("/admin/prompt-log/status");
         window._promptLogExcludedTeams = plData.excluded_teams || [];
       } catch { window._promptLogExcludedTeams = []; }
-      const data = await api("/admin/teams");
-      renderTeamsTable(data.teams || []);
+      // Cache default_team_plan + explicit assignments for the create/edit modal.
+      // We don't have list_teams anymore — derive from quota overview teams.
+      const data = await api("/admin/quota/overview");
+      const assignments = {};
+      const defaultTeamPlan = (data.default_team_plan) || null;
+      (data.teams || []).forEach((tm) => {
+        if (tm.plan_explicit && tm.plan_name) assignments[tm.team_id] = tm.plan_name;
+      });
+      window._teamPlanState = { default_team_plan: defaultTeamPlan, assignments };
+      // Cache the team-plan names list once for the plan dropdowns.
+      if (!window._teamPlanNames) {
+        try {
+          window._teamPlanNames = await getTeamPlanNames();
+        } catch { window._teamPlanNames = []; }
+      }
+      renderQuotaOverview(data);
     } catch (err) {
-      const wrap = document.getElementById("teams-table-wrap");
-      if (wrap) wrap.innerHTML = `<p class="error-msg">${t("common.failed_to_load", { what: t("teams.title"), message: esc(err.message) })}</p>`;
+      wrap.innerHTML = `<p class="error-msg">${t("common.failed_to_load", { what: t("quota.title"), message: esc(err.message) })}</p>`;
     }
   }
 
-  function renderTeamsTable(teams) {
-    const wrap = document.getElementById("teams-table-wrap");
-    if (teams.length === 0) { wrap.innerHTML = "<p>" + t("teams.empty") + "</p>"; return; }
+  // Render effective_limits as a compact spec block (no progress bar — team
+  // dimension has no current data, only limit spec).
+  function renderTeamEffectiveLimits(el) {
+    if (!el) return "";
+    const rows = [];
+    if (el.concurrency_limit != null) {
+      rows.push(`<div class="dim-row"><span class="dim-label">${esc(t("plan.dim.concurrency"))}</span><span class="dim-value">${formatNumber(el.concurrency_limit)}</span></div>`);
+    }
+    // Window limits: array of [counts, tokens, costs, window_secs]. Each non-null
+    // dimension on a window_secs produces a row. Aggregate same secs together.
+    const bySecs = new Map();
+    (el.window_limits || []).forEach((w) => {
+      const [counts, tokens, costs, secs] = w;
+      if (!bySecs.has(secs)) bySecs.set(secs, {});
+      const e = bySecs.get(secs);
+      if (counts != null) e.counts = counts;
+      if (tokens != null) e.tokens = tokens;
+      if (costs != null) e.costs = costs;
+    });
+    // RPM (60s counts) is rendered separately from window_limits when present.
+    if (el.rpm_limit != null && !bySecs.has(60)) {
+      bySecs.set(60, { counts: el.rpm_limit });
+    }
+    const sortedSecs = [...bySecs.keys()].sort((a, b) => a - b);
+    sortedSecs.forEach((secs) => {
+      const e = bySecs.get(secs);
+      const label = secs === 60 ? "RPM" : t("plan.window_limit_label", { duration: formatDuration(secs) });
+      const parts = [];
+      if (e.counts != null) parts.push(`${formatNumber(e.counts)} ${t("quota.col.counts_short") || "req"}`);
+      if (e.tokens != null) parts.push(`${formatNumber(e.tokens)} tok`);
+      if (e.costs != null) parts.push(`$${e.costs}`);
+      rows.push(`<div class="dim-row"><span class="dim-label">${esc(label)}</span><span class="dim-value">${esc(parts.join(" / "))}</span></div>`);
+    });
+    if (rows.length === 0) return "";
+    return `<div class="team-limits-block">
+      <div class="team-limits-title">${esc(t("quota.team_limits_title"))}</div>
+      ${rows.join("")}
+    </div>`;
+  }
+
+  // Render a <select> for plan choice. value="" = use default_team_plan.
+  function renderTeamPlanSelect(teamId, currentPlan, isExplicit) {
+    const names = window._teamPlanNames || [];
+    const opts = [`<option value="">${esc(t("quota.team_plan_default"))}</option>`];
+    names.forEach((n) => {
+      const sel = (isExplicit && n === currentPlan) ? "selected" : "";
+      opts.push(`<option value="${esc(n)}" ${sel}>${esc(n)}</option>`);
+    });
+    return `<select class="search-input" style="max-width:160px" onchange="window._changeTeamPlan('${esc(teamId)}', this.value)">
+      ${opts.join("")}
+    </select>`;
+  }
+
+  function renderQuotaOverview(data) {
+    const wrap = document.getElementById("quota-overview-wrap");
+    const teams = data.teams || [];
+    const noTeam = data.no_team || {};
+
+    const teamCard = (t1) => {
+      const tokens = Number(t1.total_input_tokens || 0) + Number(t1.total_output_tokens || 0);
+      const planBadge = t1.plan_name
+        ? `<span class="badge ${t1.plan_explicit ? "badge-plan" : "badge-default"}">${esc(t1.plan_name)}</span>`
+        : `<span class="muted">${esc(t("quota.team_plan_none"))}</span>`;
+      const isExcluded = (window._promptLogExcludedTeams || []).includes(t1.team_id);
+      const promptLogBtn = `<button class="btn-small ${isExcluded ? "btn-secondary" : "btn-primary"}" onclick="window._toggleTeamPromptLog('${esc(t1.team_id)}', ${isExcluded})">${isExcluded ? t("quota.prompt_log_off") : t("quota.prompt_log_on")}</button>`;
+      const planSelect = renderTeamPlanSelect(t1.team_id, t1.plan_name, t1.plan_explicit);
+      const limitsHtml = renderTeamEffectiveLimits(t1.effective_limits);
+      return `<div class="quota-card">
+        <div class="quota-card-header">
+          <strong>${esc(t1.team_alias || t1.team_id)}</strong>
+          ${planBadge}
+        </div>
+        <div class="quota-card-stats">
+          <div><span class="muted">${esc(t("teams.col.keys_count") || "Keys")}</span> <strong>${t1.key_count || 0}</strong></div>
+          <div><span class="muted">${esc(t("quota.col.tokens"))}</span> <strong>${formatNumber(tokens)}</strong></div>
+          <div><span class="muted">${esc(t("quota.col.cost"))}</span> <strong>$${esc(t1.total_cost || "0")}</strong></div>
+        </div>
+        ${limitsHtml}
+        <div class="quota-card-actions">
+          <button class="btn-small" onclick="location.hash='#/admin/quota/team/${encodeURIComponent(t1.team_id)}'">${t("quota.view_detail")}</button>
+          ${planSelect}
+          ${promptLogBtn}
+          <button class="btn-danger btn-small" onclick="window._deleteTeam('${esc(t1.team_id)}', ${t1.key_count || 0})">${t("action.delete")}</button>
+          <select class="search-input" style="max-width:140px" onchange="window._quotaTeamAction('${esc(t1.team_id)}', this.value); this.value=''">
+            <option value="">${esc(t("quota.actions_label"))}</option>
+            <option value="cumulative">${esc(t("quota.reset_cumulative"))}</option>
+            <option value="windows">${esc(t("quota.reset_windows"))}</option>
+            <option value="all">${esc(t("quota.reset_all"))}</option>
+          </select>
+        </div>
+      </div>`;
+    };
+
+    let html = "";
+    if (teams.length > 0) {
+      html += `<h3 class="quota-section-title">${t("quota.teams_header")}</h3>`;
+      html += `<div class="quota-grid">${teams.map(teamCard).join("")}</div>`;
+    }
+
+    // No-team card.
+    const ntTokens = Number(noTeam.total_input_tokens || 0) + Number(noTeam.total_output_tokens || 0);
+    html += `<h3 class="quota-section-title">${t("quota.no_team_header")}</h3>`;
+    html += `<div class="quota-grid"><div class="quota-card">
+      <div class="quota-card-header">
+        <strong>${t("quota.no_team_header")}</strong>
+      </div>
+      <div class="quota-card-stats">
+        <div><span class="muted">${esc(t("teams.col.keys_count") || "Keys")}</span> <strong>${noTeam.key_count || 0}</strong></div>
+        <div><span class="muted">${esc(t("quota.col.tokens"))}</span> <strong>${formatNumber(ntTokens)}</strong></div>
+        <div><span class="muted">${esc(t("quota.col.cost"))}</span> <strong>$${esc(noTeam.total_cost || "0")}</strong></div>
+      </div>
+      <div class="quota-card-actions">
+        <button class="btn-small" onclick="location.hash='#/admin/quota/unassigned'">${t("quota.view_detail")}</button>
+      </div>
+    </div></div>`;
+
+    wrap.innerHTML = html;
+  }
+
+  async function renderQuotaTeamDetail(teamId) {
+    await _renderQuotaKeysView({ teamId, titleSuffix: t("quota.teams_header") });
+  }
+
+  async function renderQuotaUnassigned() {
+    await _renderQuotaKeysView({ teamId: null, titleSuffix: t("quota.no_team_header") });
+  }
+
+  async function _renderQuotaKeysView({ teamId, titleSuffix }) {
+    const wrap = document.getElementById("quota-overview-wrap");
+    if (!wrap) return;
+    quotaKeysPage = 1;
+    quotaKeysSearch = "";
+
+    const backHref = "#/admin/quota";
+    wrap.innerHTML = `
+      <div class="section-header">
+        <h3>${esc(titleSuffix)} ${teamId ? "· " + esc(teamId) : ""}</h3>
+        <a href="${backHref}" class="btn-small" style="text-decoration:none;display:inline-block">${t("quota.back_to_overview")}</a>
+      </div>
+      <div class="keys-toolbar" style="margin-bottom:12px">
+        <input type="text" id="quota-keys-search" placeholder="${esc(t("keys.search_placeholder"))}" class="search-input">
+        <select id="quota-keys-sort" class="search-input" style="max-width:160px">
+          <option value="cost">${t("quota.sort.cost")}</option>
+          <option value="tokens">${t("quota.sort.tokens")}</option>
+          <option value="alias">${t("quota.sort.alias")}</option>
+        </select>
+        ${teamId ? `<select class="search-input" style="max-width:140px" id="quota-team-action-top" onchange="window._quotaTeamAction('${esc(teamId)}', this.value); this.value=''">
+          <option value="">${esc(t("quota.actions_label"))}</option>
+          <option value="cumulative">${esc(t("quota.reset_cumulative"))}</option>
+          <option value="windows">${esc(t("quota.reset_windows"))}</option>
+          <option value="all">${esc(t("quota.reset_all"))}</option>
+        </select>` : ""}
+      </div>
+      <div id="quota-keys-table-wrap"></div>
+      <div id="quota-keys-pagination" class="pagination"></div>
+    `;
+
+    document.getElementById("quota-keys-search").addEventListener("input", (e) => {
+      clearTimeout(quotaKeysSearchTimer);
+      quotaKeysSearchTimer = setTimeout(() => {
+        quotaKeysSearch = e.target.value.trim();
+        quotaKeysPage = 1;
+        _loadQuotaKeys(teamId);
+      }, 300);
+    });
+    document.getElementById("quota-keys-sort").value = quotaKeysSort;
+    document.getElementById("quota-keys-sort").addEventListener("change", (e) => {
+      quotaKeysSort = e.target.value;
+      quotaKeysPage = 1;
+      _loadQuotaKeys(teamId);
+    });
+
+    await _loadQuotaKeys(teamId);
+  }
+
+  async function _loadQuotaKeys(teamId) {
+    const wrap = document.getElementById("quota-keys-table-wrap");
+    if (!wrap) return;
+    wrap.innerHTML = '<p class="loading">' + t("common.loading") + '</p>';
+    let url = teamId
+      ? `/admin/quota/team/${encodeURIComponent(teamId)}?page=${quotaKeysPage}&per_page=50&sort=${encodeURIComponent(quotaKeysSort)}`
+      : `/admin/quota/unassigned?page=${quotaKeysPage}&per_page=50&sort=${encodeURIComponent(quotaKeysSort)}`;
+    if (quotaKeysSearch) url += `&search=${encodeURIComponent(quotaKeysSearch)}`;
+    try {
+      const data = await api(url);
+      _renderQuotaKeysTable(data, teamId);
+      _renderQuotaKeysPagination(data);
+    } catch (err) {
+      wrap.innerHTML = `<p class="error-msg">${t("common.failed_to_load", { what: t("quota.title"), message: esc(err.message) })}</p>`;
+    }
+  }
+
+  function _renderQuotaKeysTable(data, teamId) {
+    const wrap = document.getElementById("quota-keys-table-wrap");
+    const keys = data.keys || [];
+    if (keys.length === 0) {
+      wrap.innerHTML = "<p>" + (teamId ? t("quota.empty") : t("quota.empty_no_team")) + "</p>";
+      return;
+    }
     wrap.innerHTML = `<table>
-      <tr><th>${t("teams.col.alias")}</th><th>${t("teams.col.team_id")}</th><th>${t("teams.col.models")}</th><th>${t("teams.col.keys_count")}</th><th>${t("teams.col.requests")}</th><th>${t("teams.col.input_tokens")}</th><th>${t("teams.col.output_tokens")}</th><th>${t("teams.col.total_tokens")}</th><th>${t("teams.col.prompt_log")}</th><th>${t("teams.col.actions")}</th></tr>
-      ${teams.map((tm) => {
-        const isExcluded = (window._promptLogExcludedTeams || []).includes(tm.team_id);
-        const logBtnClass = isExcluded ? "btn-secondary" : "btn-primary";
-        const logBtnText = isExcluded ? "OFF" : "ON";
-        return `<tr>
-        <td>${esc(tm.team_alias || "-")}</td>
-        <td class="mono" title="${esc(tm.team_id)}">${esc((tm.team_id || "").substring(0, 12))}</td>
-        <td class="mono">${esc(formatTeamModels(tm.models))}</td>
-        <td>${tm.key_count}</td>
-        <td>${formatNumber(tm.request_count)}</td>
-        <td>${formatNumber(tm.total_input_tokens || 0)}</td>
-        <td>${formatNumber(tm.total_output_tokens || 0)}</td>
-        <td>${formatNumber((tm.total_input_tokens || 0) + (tm.total_output_tokens || 0))}</td>
-        <td><button class="${logBtnClass} btn-sm" onclick='window._toggleTeamPromptLog(${JSON.stringify(tm.team_id)}, ${isExcluded})'>${logBtnText}</button></td>
-        <td>
-          <button class="btn-secondary btn-sm" onclick='window._editTeam(${JSON.stringify(tm.team_id)})'>${t("action.edit")}</button>
-          <button class="btn-danger btn-sm" onclick='window._deleteTeam(${JSON.stringify(tm.team_id)}, ${tm.key_count})'>${t("action.delete")}</button>
-        </td>
-      </tr>`;
+      <tr>
+        <th>${t("quota.col.alias")}</th>
+        <th>${t("quota.col.plan")}</th>
+        <th>${t("quota.col.concurrency")}</th>
+        <th>${t("quota.col.tokens")}</th>
+        <th>${t("quota.col.cost")}</th>
+        <th>${t("quota.col.actions")}</th>
+      </tr>
+      ${keys.map((k) => {
+        const tokens = Number(k.total_input_tokens || 0) + Number(k.total_output_tokens || 0);
+        return `<tr class="quota-key-row" data-token="${esc(k.token)}">
+          <td>
+            <strong>${esc(k.key_alias || k.key_name || k.token_prefix)}</strong>
+            ${k.user_id ? `<br><span class="muted">${esc(k.user_id)}</span>` : ""}
+            ${k.blocked ? `<br><span class="badge-danger">blocked</span>` : ""}
+          </td>
+          <td>${esc(k.plan_name || "-")}</td>
+          <td>${k.concurrency || 0}</td>
+          <td>${formatNumber(tokens)}</td>
+          <td>$${esc(k.total_cost || "0")}</td>
+          <td>
+            <button class="btn-small" onclick="window._quotaToggleWindows('${esc(k.token)}', this)">${t("quota.expand_windows")}</button>
+            <select class="search-input" style="max-width:120px" onchange="window._quotaKeyAction('${esc(k.token)}', this.value); this.value=''">
+              <option value="">${esc(t("quota.actions_label"))}</option>
+              <option value="cumulative">${esc(t("quota.reset_cumulative"))}</option>
+              <option value="windows">${esc(t("quota.reset_windows"))}</option>
+              <option value="all">${esc(t("quota.reset_all"))}</option>
+            </select>
+          </td>
+        </tr>
+        <tr class="quota-windows-row" id="quota-windows-${esc(k.token)}" style="display:none">
+          <td colspan="6"><div class="quota-windows-content"><span class="loading">${esc(t("common.loading"))}</span></div></td>
+        </tr>`;
       }).join("")}
     </table>`;
   }
 
+  function _renderQuotaKeysPagination(data) {
+    const el = document.getElementById("quota-keys-pagination");
+    if (!el) return;
+    const pages = Math.ceil((data.total || 0) / (data.per_page || 50));
+    if (pages <= 1) { el.innerHTML = ""; return; }
+    el.innerHTML = `
+      <button ${data.page <= 1 ? "disabled" : ""} onclick="window._quotaKeysPrev()">&lt;</button>
+      <span>${t("common.page_of", { page: data.page, total: pages, count: data.total, unit: t("keys.title") })}</span>
+      <button ${data.page >= pages ? "disabled" : ""} onclick="window._quotaKeysNext()">&gt;</button>
+    `;
+  }
+
+  window._quotaKeysPrev = () => { quotaKeysPage = Math.max(1, quotaKeysPage - 1); _loadQuotaKeys(_currentQuotaTeamId()); };
+  window._quotaKeysNext = () => { quotaKeysPage += 1; _loadQuotaKeys(_currentQuotaTeamId()); };
+  function _currentQuotaTeamId() {
+    const hash = location.hash || "";
+    const m = hash.match(/\/admin\/quota\/team\/([^/?#]+)/);
+    return m ? decodeURIComponent(m[1]) : null;
+  }
+
+  window._quotaToggleWindows = async (token, btn) => {
+    const row = document.getElementById("quota-windows-" + token);
+    if (!row) return;
+    const showing = row.style.display !== "none";
+    if (showing) {
+      row.style.display = "none";
+      btn.textContent = t("quota.expand_windows");
+      return;
+    }
+    row.style.display = "";
+    btn.textContent = t("quota.collapse_windows");
+    const content = row.querySelector(".quota-windows-content");
+    content.innerHTML = '<span class="loading">' + t("common.loading") + '</span>';
+    try {
+      const data = await api(`/admin/quota/key/${encodeURIComponent(token)}/windows`);
+      content.innerHTML = _renderWindowsBlock(data);
+    } catch (err) {
+      content.innerHTML = `<span class="error-msg">${esc(err.message)}</span>`;
+    }
+  };
+
+  // Reuse the user-side multi-dim window card layout.
+  function _renderWindowsBlock(data) {
+    const windows = data.windows || [];
+    if (windows.length === 0) return '<p class="muted">' + t("req.no_active_windows") + '</p>';
+    return windows.map((w) => {
+      const isRpm = w.window_secs === 60;
+      const label = isRpm ? "RPM (60s)" : t("plan.window_limit_label", { duration: formatDuration(w.window_secs) });
+      const remaining = w.remaining_secs || 0;
+      const dims = w.dims || {};
+      const dimKeys = ["counts", "tokens", "costs"].filter((k) => dims[k]);
+      const dimHtml = dimKeys.map((k) => {
+        const d = dims[k];
+        let cur, limit, display;
+        if (k === "costs") {
+          cur = Number(d.current_micros || 0);
+          limit = Number(d.limit_micros || 0);
+          display = "$" + (d.current || "0") + " / " + (limit > 0 ? "$" + (d.limit || "0") : t("common.unlimited"));
+        } else {
+          cur = Number(d.current || 0);
+          limit = Number(d.limit || 0);
+          display = formatNumber(cur) + " / " + (limit > 0 ? formatNumber(limit) : t("common.unlimited"));
+        }
+        const pct = limit > 0 ? Math.min(100, (cur / limit) * 100) : 0;
+        const cls = pct >= 90 ? "danger" : pct >= 70 ? "warn" : "";
+        return `
+          <div class="dim-row">
+            <span class="dim-label">${esc(t("plan.dim." + k))}</span>
+            <div class="progress-bar"><div class="progress-fill ${cls}" style="width:${pct}%"></div></div>
+            <span class="dim-value">${esc(display)}</span>
+          </div>`;
+      }).join("");
+      return `<div class="usage-limit-card usage-limit-wide">
+        <div class="usage-limit-title">${esc(label)}</div>
+        ${dimHtml}
+        <div class="usage-limit-reset">${t("req.resets_in", { time: formatCountdown(remaining) })}</div>
+      </div>`;
+    }).join("");
+  }
+
+  window._quotaKeyAction = async (token, scope) => {
+    if (!scope) return;
+    const confirmKey = scope === "cumulative"
+      ? "quota.confirm_reset_key_cumulative"
+      : scope === "windows"
+      ? "quota.confirm_reset_key_windows"
+      : "quota.confirm_reset_key_all";
+    if (!confirm(t(confirmKey))) return;
+    const suffix = scope === "all" ? "" : `/${scope}`;
+    try {
+      await api(`/admin/quota/reset/key/${encodeURIComponent(token)}${suffix}`, { method: "POST" });
+      const tid = _currentQuotaTeamId();
+      _loadQuotaKeys(tid);
+    } catch (err) {
+      alert("Reset failed: " + err.message);
+    }
+  };
+
+  window._quotaTeamAction = async (teamId, scope) => {
+    if (!scope) return;
+    const confirmKey = scope === "cumulative"
+      ? "quota.confirm_reset_team_cumulative"
+      : scope === "windows"
+      ? "quota.confirm_reset_team_windows"
+      : "quota.confirm_reset_team_all";
+    if (!confirm(t(confirmKey))) return;
+    const suffix = scope === "all" ? "" : `/${scope}`;
+    try {
+      await api(`/admin/quota/reset/team/${encodeURIComponent(teamId)}${suffix}`, { method: "POST" });
+      // Refresh either detail page (if on team detail) or overview (if on overview).
+      if (location.hash.includes("/admin/quota/team/")) {
+        _loadQuotaKeys(teamId);
+      } else {
+        loadQuotaOverview();
+      }
+    } catch (err) {
+      alert("Reset failed: " + err.message);
+    }
+  };
+
+  // ── Admin: Team helpers (cards live in quota overview) ──
   function formatTeamModels(models) {
     if (!models || models.length === 0) return "all-team-models";
     if (models.includes("all-team-models")) return "all-team-models";
@@ -2684,11 +3149,19 @@
 
   window.showCreateTeamModal = function(prefill) {
     const p = prefill || {};
+    // Explicit plan state cached from last quota_overview load.
+    const tps = window._teamPlanState || { default_team_plan: null, assignments: {} };
+    const currentExplicit = p.team_id ? (tps.assignments[p.team_id] || "") : "";
     showModal(`
       <h3>${p.team_id ? t("form.team.title_edit") : t("form.team.title_create")}</h3>
       <div class="form-group"><label>${t("form.team.id")} ${tip("Unique identifier for this team. Cannot be changed after creation.")}</label><input id="m-team-id" value="${esc(p.team_id || "")}" ${p.team_id ? "readonly" : ""} required></div>
       <div class="form-group"><label>${t("form.team.alias")} ${tip("Display name for this team. Can be non-unique.")}</label><input id="m-team-alias" value="${esc(p.team_alias || "")}"></div>
       <div class="form-group"><label>${t("form.team.models")} ${tip("Select model access for this team. Check 'all-team-models' for full access to all current and future models, or pick specific models.")}</label><div class="model-check-combo" id="m-team-models-combo"></div></div>
+      <div class="form-group"><label>${t("teams.col.plan")} ${tip("Pick a type=team plan, or leave on default to fall back to default_team_plan (YAML-configured).")}</label>
+        <select id="m-team-plan">
+          <option value="">${esc(t("teams.plan_use_default"))}${tps.default_team_plan ? " (" + tps.default_team_plan + ")" : ""}</option>
+        </select>
+      </div>
       <div class="modal-actions">
         <button class="btn-secondary" onclick="hideModal()" style="width:auto">${t("action.cancel")}</button>
         <button class="btn-primary" id="m-team-submit">${p.team_id ? t("action.update") : t("action.create")}</button>
@@ -2698,6 +3171,17 @@
       const container = document.getElementById("m-team-models-combo");
       if (container) initModelCombo(container, p.models || [], names);
     });
+    getTeamPlanNames().then((names) => {
+      const sel = document.getElementById("m-team-plan");
+      if (!sel) return;
+      names.forEach((n) => {
+        const o = document.createElement("option");
+        o.value = n;
+        o.textContent = n;
+        if (n === currentExplicit) o.selected = true;
+        sel.appendChild(o);
+      });
+    });
     document.getElementById("m-team-submit").addEventListener("click", async () => {
       try {
         const modelsVal = getComboModels("m-team-models-combo");
@@ -2706,6 +3190,7 @@
           team_alias: document.getElementById("m-team-alias").value.trim() || null,
           models: modelsVal || ["all-team-models"],
         };
+        const selectedPlan = document.getElementById("m-team-plan").value;
         if (p.team_id) {
           await api("/admin/teams/" + encodeURIComponent(p.team_id), {
             method: "PUT",
@@ -2714,23 +3199,46 @@
               models: body.models,
             }),
           });
+          if (selectedPlan && selectedPlan !== currentExplicit) {
+            await api("/admin/team-assignments", {
+              method: "POST",
+              body: JSON.stringify({ team_id: p.team_id, plan_name: selectedPlan }),
+            });
+          } else if (!selectedPlan && currentExplicit) {
+            await api("/admin/team-assignments/" + encodeURIComponent(p.team_id), {
+              method: "DELETE",
+            });
+          }
         } else {
           await api("/admin/teams", { method: "POST", body: JSON.stringify(body) });
+          if (selectedPlan) {
+            await api("/admin/team-assignments", {
+              method: "POST",
+              body: JSON.stringify({ team_id: body.team_id, plan_name: selectedPlan }),
+            });
+          }
         }
         hideModal();
-        loadTeams();
+        loadQuotaOverview();
       } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
     });
   };
 
-  window._editTeam = async (teamId) => {
+  // Plan dropdown onchange: POST or DELETE the team-assignment.
+  // value="" means "use default_team_plan" (delete explicit assignment).
+  window._changeTeamPlan = async (teamId, value) => {
     try {
-      const data = await api("/admin/teams");
-      const tm = (data.teams || []).find((x) => x.team_id === teamId);
-      if (!tm) return;
-      // Fetch full team record with models from DB.
-      // list_teams doesn't return models, so we pass what we have.
-      showCreateTeamModal(tm);
+      if (value) {
+        await api("/admin/team-assignments", {
+          method: "POST",
+          body: JSON.stringify({ team_id: teamId, plan_name: value }),
+        });
+      } else {
+        await api("/admin/team-assignments/" + encodeURIComponent(teamId), {
+          method: "DELETE",
+        });
+      }
+      loadQuotaOverview();
     } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
   };
 
@@ -2742,10 +3250,9 @@
     if (!confirm(t("confirm.delete_team", { name: teamId }))) return;
     try {
       await api("/admin/teams/" + encodeURIComponent(teamId), { method: "DELETE" });
-      loadTeams();
+      loadQuotaOverview();
     } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
   };
-
 
   window._toggleTeamPromptLog = async (teamId, isExcluded) => {
     try {
@@ -2753,7 +3260,7 @@
         method: 'POST',
         body: JSON.stringify({ team_id: teamId, excluded: !isExcluded }),
       });
-      loadTeams();
+      loadQuotaOverview();
     } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
   };
 
@@ -3132,6 +3639,33 @@
     if (secs < 3600) return (secs / 60) + "min";
     if (secs < 86400) return (secs / 3600) + "h";
     return (secs / 86400) + "d";
+  }
+
+  // Normalize a window_limits entry into {counts, tokens, costs, window_secs}.
+  // Accepts the verbose object form ({counts, tokens, costs, window_secs}),
+  // the 4-element compact array ([counts, tokens, costs, window_secs]), and
+  // the legacy 2-element array ([count, window_secs]) for backward compat.
+  // Returns null if the entry is not a usable shape.
+  function normalizeWindowLimit(w) {
+    if (w == null) return null;
+    if (Array.isArray(w)) {
+      if (w.length === 4) {
+        return { counts: w[0], tokens: w[1], costs: w[2], window_secs: w[3] };
+      }
+      if (w.length === 2) {
+        return { counts: w[0], tokens: null, costs: null, window_secs: w[1] };
+      }
+      return null;
+    }
+    if (typeof w === "object") {
+      return {
+        counts: w.counts ?? null,
+        tokens: w.tokens ?? null,
+        costs: w.costs == null ? null : w.costs,
+        window_secs: w.window_secs,
+      };
+    }
+    return null;
   }
 
   function formatCountdown(secs) {

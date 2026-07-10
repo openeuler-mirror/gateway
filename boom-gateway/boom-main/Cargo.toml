@@ -7,6 +7,10 @@ edition.workspace = true
 name = "boom-gateway"
 path = "src/main.rs"
 
+[features]
+default = ["debug-tools"]
+debug-tools = ["boom-dashboard/debug-tools"]
+
 [dependencies]
 boom-core = { path = "../boom-core" }
 boom-config = { path = "../boom-config" }
@@ -14,8 +18,9 @@ boom-auth = { path = "../boom-auth" }
 boom-provider = { path = "../boom-provider" }
 boom-limiter = { path = "../boom-limiter" }
 boom-routing = { path = "../boom-routing" }
+boom-quota = { path = "../boom-quota" }
 boom-audit = { path = "../boom-audit" }
-boom-dashboard = { path = "../boom-dashboard" }
+boom-dashboard = { path = "../boom-dashboard", default-features = false }
 boom-ctxaware = { path = "../boom-ctxaware" }
 boom-flowcontrol = { path = "../boom-flowcontrol" }
 boom-promptlog = { path = "../boom-promptlog" }
@@ -42,3 +47,4 @@ arc-swap = { workspace = true }
 reqwest = { workspace = true }
 moka = { workspace = true, features = ["sync"] }
 dashmap = { workspace = true }
+rust_decimal = { workspace = true }
