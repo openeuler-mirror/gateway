@@ -97,7 +97,11 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
     run_ddl_on_conn(&mut conn, boom_limiter::migrations::team_assignment_ddl()).await?;
     tracing::info!("Migration 6b/13: done");
     tracing::info!("Migration 6c/13: quota cumulative...");
-    run_ddl_on_conn(&mut conn, boom_quota::migrations::cumulative_ddl()).await?;
+    run_ddl_on_conn(&mut conn, boom_limiter::migrations::cumulative_ddl()).await?;
+    // Idempotent ALTER: add tokens + costs_micros columns to existing tables
+    // (no-op if already present). New tables created by cumulative_ddl() above
+    // already include them.
+    run_ddl_on_conn(&mut conn, boom_limiter::migrations::state_alter_ddl()).await?;
     // GaussDB distributed: mark as REPLICATION so the table is copied to
     // every datanode. Without this, single-table queries still get routed
     // to a datanode where the table doesn't exist ("relation does not exist

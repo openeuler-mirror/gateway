@@ -3,7 +3,6 @@ use boom_core::DebugErrorStore;
 use boom_flowcontrol::FlowController;
 use boom_limiter::{PlanStore, SlidingWindowLimiter};
 use boom_promptlog::PromptLogWriter;
-use boom_quota::QuotaStore;
 use boom_routing::{AliasStore, DeploymentStore, InFlightTracker, RebalanceMoveTracker, RequestRateTracker};
 use boom_ctxaware::AgentStatsTracker;
 use dashmap::DashMap;
@@ -66,8 +65,6 @@ pub struct DashboardState {
     pub db_pool: Option<PgPool>,
     pub plan_store: Arc<PlanStore>,
     pub limiter: Arc<SlidingWindowLimiter>,
-    /// Quota store — multi-dim (tokens/costs) window + cumulative counters.
-    pub quota_store: Arc<QuotaStore>,
     /// Deployment store for model reads.
     pub deployment_store: Arc<DeploymentStore>,
     /// Alias store for alias reads.
@@ -103,7 +100,6 @@ impl DashboardState {
         db_pool: Option<PgPool>,
         plan_store: Arc<PlanStore>,
         limiter: Arc<SlidingWindowLimiter>,
-        quota_store: Arc<QuotaStore>,
         deployment_store: Arc<DeploymentStore>,
         alias_store: Arc<AliasStore>,
         inflight: Arc<InFlightTracker>,
@@ -126,7 +122,6 @@ impl DashboardState {
             db_pool,
             plan_store,
             limiter,
-            quota_store,
             deployment_store,
             alias_store,
             inflight,

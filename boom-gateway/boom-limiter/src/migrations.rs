@@ -1,12 +1,54 @@
 /// DDL for boom_rate_limit_state table.
+///
+/// `tokens` and `costs_micros` are NEW columns added by the limiter
+/// normalization refactor (boom-quota deletion). They are nullable + default 0
+/// so pre-migration rows (counts-only) round-trip cleanly. `state_alter_ddl`
+/// adds them idempotently on existing databases; fresh databases get them
+/// from this base DDL.
 pub fn rate_limit_state_ddl() -> &'static str {
     r#"
 CREATE TABLE IF NOT EXISTS boom_rate_limit_state (
-    cache_key    TEXT PRIMARY KEY,
-    count        BIGINT NOT NULL DEFAULT 0,
-    window_start BIGINT NOT NULL,
-    window_secs  BIGINT NOT NULL,
-    updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    cache_key     TEXT PRIMARY KEY,
+    count         BIGINT NOT NULL DEFAULT 0,
+    tokens        BIGINT,
+    costs_micros  BIGINT,
+    window_start  BIGINT NOT NULL,
+    window_secs   BIGINT NOT NULL,
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+"#
+}
+
+/// Idempotent ALTER: ensure pre-refactor databases have the new tokens and
+/// costs_micros columns on boom_rate_limit_state. No-op on fresh DBs whose
+/// base DDL already includes them.
+pub fn state_alter_ddl() -> &'static str {
+    r#"
+DO $$
+BEGIN
+    BEGIN
+        ALTER TABLE boom_rate_limit_state
+            ADD COLUMN IF NOT EXISTS tokens       BIGINT,
+            ADD COLUMN IF NOT EXISTS costs_micros BIGINT;
+    EXCEPTION WHEN OTHERS THEN NULL; END;
+END $$;
+"#
+}
+
+/// DDL for the cumulative counters table.
+///
+/// `boom_rate_limit_cumulative` stores permanent counters (input/output token
+/// totals, cost totals) keyed by `kc:{key_hash}:{kind}` / `tc:{team_id}:{kind}`.
+/// These rows never expire; they are only cleared by explicit reset operations.
+///
+/// Ownership transferred from boom-quota (deleted) to boom-limiter during the
+/// limiter normalization refactor. Table name and schema are unchanged.
+pub fn cumulative_ddl() -> &'static str {
+    r#"
+CREATE TABLE IF NOT EXISTS boom_rate_limit_cumulative (
+    cache_key   TEXT PRIMARY KEY,
+    value       BIGINT NOT NULL DEFAULT 0,
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 "#
 }

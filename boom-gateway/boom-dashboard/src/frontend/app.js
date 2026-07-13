@@ -96,6 +96,7 @@
     updateThemeIcons();
     setupViewportTooltip();
     bindRangeControls();
+    initSidebarVersion();
     window.addEventListener("hashchange", () => { onRoute(); onUserRoute(); });
     document.addEventListener("languagechange", () => {
       // Re-render visible dynamic content so t() picks up the new language.
@@ -107,6 +108,22 @@
     });
     checkSession();
   });
+
+  // Fetch /health once on load and inject the version into both sidebars.
+  // /health is unauthenticated (liveness endpoint), so this works pre-login.
+  async function initSidebarVersion() {
+    try {
+      const res = await fetch("/health");
+      if (!res.ok) return;
+      const data = await res.json().catch(() => null);
+      if (!data || !data.version) return;
+      const v = "v" + String(data.version);
+      document.getElementById("sidebar-version-user").textContent = v;
+      document.getElementById("sidebar-version-admin").textContent = v;
+    } catch {
+      // Network/probe failure — leave the placeholder; not worth surfacing.
+    }
+  }
 
   // ── Language toggle ───────────────────────────────────
   function setupLangToggle() {

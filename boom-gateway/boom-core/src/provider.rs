@@ -1,7 +1,4 @@
-use crate::types::{
-    AuthIdentity, ChatCompletionRequest, ChatCompletionResponse, ChatStream, RateLimitKey,
-    RateLimitDecision,
-};
+use crate::types::{AuthIdentity, ChatCompletionRequest, ChatCompletionResponse, ChatStream};
 use crate::GatewayError;
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -53,20 +50,12 @@ pub trait Provider: Send + Sync + 'static {
     }
 }
 
-/// Rate limiter trait — supports per-key and per-model sliding window limits.
-#[async_trait]
-pub trait RateLimiter: Send + Sync + 'static {
-    /// Check if the request is within rate limits and record a counter.
-    /// Returns a decision with remaining quota info.
-    /// `weight` is the quota consumption multiplier (default 1).
-    async fn check_and_record(
-        &self,
-        key: &RateLimitKey,
-        rpm_limit: Option<u64>,
-        window_limits: &[(u64, u64)], // (limit, window_secs) pairs
-        weight: u64,
-    ) -> Result<RateLimitDecision, GatewayError>;
-}
+/// Rate limiter trait was removed during the limiter normalization refactor
+/// (boom-quota deletion). The three-phase contract (peek_only → commit_counts
+/// → settle_usage) lives directly on `boom_limiter::SlidingWindowLimiter` —
+/// it cannot be expressed as a single `check_and_record` method because the
+/// caller must drive commit/settle at distinct moments (post-accept and
+/// post-stream-done).
 
 /// Narrow trait for looking up key aliases by token hashes.
 /// Separated from Authenticator so that consumers (e.g. Dashboard) don't

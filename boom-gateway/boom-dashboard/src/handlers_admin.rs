@@ -232,15 +232,15 @@ pub async fn list_keys(
                 .get_plan_name(&r.token)
                 .or_else(|| state.plan_store.get_default_plan_name());
 
-            // Aggregate current-window tokens & cost from QuotaStore. We pick
+            // Aggregate current-window tokens & cost from limiter. We pick
             // the smallest window_secs per kind — that's the "tightest" current
             // window (typically 60s) and matches what users expect in a usage
             // snapshot column. Cross-window aggregation would mix limits.
             let mut tokens_min_secs: Option<(u64, u64, u64)> = None; // (secs, count, remaining)
             let mut cost_min_secs: Option<(u64, u64, u64)> = None; // (secs, micros, remaining)
-            for w in state.quota_store.peek_key_windows(&r.token) {
+            for w in state.limiter.peek_key_windows(&r.token) {
                 match w.kind {
-                    boom_quota::WindowKind::Tokens => {
+                    boom_limiter::WindowKind::Tokens => {
                         match tokens_min_secs {
                             None => tokens_min_secs = Some((w.window_secs, w.count, w.remaining_secs)),
                             Some((s, _, _)) if w.window_secs < s => {
@@ -249,7 +249,7 @@ pub async fn list_keys(
                             _ => {}
                         }
                     }
-                    boom_quota::WindowKind::CostMicros => {
+                    boom_limiter::WindowKind::CostMicros => {
                         match cost_min_secs {
                             None => cost_min_secs = Some((w.window_secs, w.count, w.remaining_secs)),
                             Some((s, _, _)) if w.window_secs < s => {
@@ -266,15 +266,15 @@ pub async fn list_keys(
                 / rust_decimal::Decimal::from(1_000_000);
 
             // Cumulative total cost across the key's lifetime — comes from
-            // QuotaStore.cumulative (boom_rate_limit_cumulative backed), NOT
+            // limiter.cumulative (boom_rate_limit_cumulative backed), NOT
             // boom_verification_token.spend (litellm legacy column we never write).
             let total_cost_micros = state
-                .quota_store
+                .limiter
                 .peek_cumulative(
-                    &boom_quota::QuotaScope::Key {
+                    &boom_limiter::QuotaScope::Key {
                         key_hash: r.token.clone(),
                     },
-                    boom_quota::CumulativeKind::TotalCost,
+                    boom_limiter::CumulativeKind::TotalCost,
                 );
             let total_cost = rust_decimal::Decimal::from(total_cost_micros)
                 / rust_decimal::Decimal::from(1_000_000);
@@ -843,7 +843,7 @@ pub async fn get_key_usage(
         .map(|w| {
             json!({
                 "cache_key": w.cache_key,
-                "count": w.count,
+                "count": w.counts,
                 "window_secs": w.window_secs,
                 "elapsed_secs": w.elapsed_secs,
             })
@@ -2604,7 +2604,7 @@ pub async fn get_prompt_log_entry(
 // ═══════════════════════════════════════════════════════════
 // Quota management — team-organized view of cumulative / window
 // counters across all keys & teams. Reads boom_rate_limit_cumulative
-// via SQL JOIN (avoids scanning the whole QuotaStore DashMap).
+// via SQL JOIN (avoids scanning the whole limiter DashMap).
 // ═══════════════════════════════════════════════════════════
 
 #[derive(Debug, sqlx::FromRow)]
@@ -2792,7 +2792,12 @@ pub async fn quota_overview(
                 .plan_store
                 .resolve_team_plan(&team_id)
                 .map(|p| {
-                    let (concurrency_limit, rpm_limit, window_limits, _) = p.effective_limits();
+                    let (concurrency_limit, window_limits, _) = p.effective_limits();
+                    // rpm_limit is the 60s counts dimension (folded into window_limits).
+                    let rpm_limit = window_limits
+                        .iter()
+                        .find(|w| w.window_secs == 60)
+                        .and_then(|w| w.counts);
                     let wl_json: Vec<serde_json::Value> = window_limits
                         .iter()
                         .map(|w| {
@@ -2827,7 +2832,7 @@ pub async fn quota_overview(
                 "total_input_tokens": cum.0,
                 "total_output_tokens": cum.1,
                 "total_cost_micros": cum.2,
-                "total_cost": boom_quota::micros_to_decimal(cum.2.max(0) as u64).to_string(),
+                "total_cost": boom_limiter::micros_to_decimal(cum.2.max(0) as u64).to_string(),
             })
         })
         .collect();
@@ -2850,7 +2855,7 @@ pub async fn quota_overview(
         "total_input_tokens": no_team_cum.0,
         "total_output_tokens": no_team_cum.1,
         "total_cost_micros": no_team_cum.2,
-        "total_cost": boom_quota::micros_to_decimal(no_team_cum.2.max(0) as u64).to_string(),
+        "total_cost": boom_limiter::micros_to_decimal(no_team_cum.2.max(0) as u64).to_string(),
     });
 
     // Suppress unused warning while keeping the lookup map for future use.
@@ -3140,7 +3145,7 @@ async fn quota_keys_inner(
                 "total_input_tokens": cum.0,
                 "total_output_tokens": cum.1,
                 "total_cost_micros": cum.2,
-                "total_cost": boom_quota::micros_to_decimal(cum.2.max(0) as u64).to_string(),
+                "total_cost": boom_limiter::micros_to_decimal(cum.2.max(0) as u64).to_string(),
             })
         })
         .collect();
@@ -3168,10 +3173,15 @@ pub async fn quota_key_windows(
         .plan_store
         .resolve_plan(&key_hash)
         .or_else(|| state.plan_store.get_default_plan());
-    let (_, plan_rpm, plan_window_limits, _) = plan
+    let (_, plan_window_limits, _) = plan
         .as_ref()
         .map(|p| p.effective_limits())
-        .unwrap_or((None, None, vec![], vec![]));
+        .unwrap_or((None, vec![], vec![]));
+    // rpm_limit is the 60s counts dimension (folded into window_limits).
+    let plan_rpm = plan_window_limits
+        .iter()
+        .find(|w| w.window_secs == 60)
+        .and_then(|w| w.counts);
 
     // counts dimension
     let mut counts_by_secs: std::collections::HashMap<u64, (u64, u64)> =
@@ -3180,21 +3190,21 @@ pub async fn quota_key_windows(
         let remaining = w.window_secs.saturating_sub(w.elapsed_secs);
         counts_by_secs
             .entry(w.window_secs)
-            .and_modify(|e| e.0 = e.0.saturating_add(w.count))
-            .or_insert((w.count, remaining));
+            .and_modify(|e| e.0 = e.0.saturating_add(w.counts))
+            .or_insert((w.counts, remaining));
     }
 
-    // tokens / costs from QuotaStore
+    // tokens / costs from limiter multi-dim windows
     let mut tokens_by_secs: std::collections::HashMap<u64, (u64, u64)> =
         std::collections::HashMap::new();
     let mut costs_by_secs: std::collections::HashMap<u64, (u64, u64)> =
         std::collections::HashMap::new();
-    for w in state.quota_store.peek_key_windows(&key_hash) {
+    for w in state.limiter.peek_key_windows(&key_hash) {
         let entry = match w.kind {
-            boom_quota::WindowKind::Tokens => tokens_by_secs
+            boom_limiter::WindowKind::Tokens => tokens_by_secs
                 .entry(w.window_secs)
                 .or_insert((0, w.remaining_secs)),
-            boom_quota::WindowKind::CostMicros => costs_by_secs
+            boom_limiter::WindowKind::CostMicros => costs_by_secs
                 .entry(w.window_secs)
                 .or_insert((0, w.remaining_secs)),
         };
@@ -3241,9 +3251,9 @@ pub async fn quota_key_windows(
                     "costs".to_string(),
                     json!({
                         "current_micros": cur_micros,
-                        "current": boom_quota::micros_to_decimal(cur_micros).to_string(),
+                        "current": boom_limiter::micros_to_decimal(cur_micros).to_string(),
                         "limit": limit.to_string(),
-                        "limit_micros": boom_quota::decimal_to_micros(limit),
+                        "limit_micros": boom_limiter::decimal_to_micros(limit),
                     }),
                 );
             }
@@ -3264,18 +3274,18 @@ pub async fn quota_key_windows(
         .collect();
 
     // Cumulative counters for this key.
-    let key_scope = boom_quota::QuotaScope::Key {
+    let key_scope = boom_limiter::QuotaScope::Key {
         key_hash: key_hash.clone(),
     };
     let total_in = state
-        .quota_store
-        .peek_cumulative(&key_scope, boom_quota::CumulativeKind::TotalInputTokens);
+        .limiter
+        .peek_cumulative(&key_scope, boom_limiter::CumulativeKind::TotalInputTokens);
     let total_out = state
-        .quota_store
-        .peek_cumulative(&key_scope, boom_quota::CumulativeKind::TotalOutputTokens);
+        .limiter
+        .peek_cumulative(&key_scope, boom_limiter::CumulativeKind::TotalOutputTokens);
     let total_cost_micros = state
-        .quota_store
-        .peek_cumulative(&key_scope, boom_quota::CumulativeKind::TotalCost);
+        .limiter
+        .peek_cumulative(&key_scope, boom_limiter::CumulativeKind::TotalCost);
 
     Json(json!({
         "key_hash": key_hash,
@@ -3285,7 +3295,7 @@ pub async fn quota_key_windows(
             "total_output_tokens": total_out,
             "total_tokens": total_in.saturating_add(total_out),
             "total_cost_micros": total_cost_micros,
-            "total_cost": boom_quota::micros_to_decimal(total_cost_micros).to_string(),
+            "total_cost": boom_limiter::micros_to_decimal(total_cost_micros).to_string(),
             "total_token_limit": plan.as_ref().and_then(|p| p.total_token_limit),
             "total_cost_limit": plan.as_ref().and_then(|p| p.total_cost_limit).map(|d| d.to_string()),
         },
@@ -3306,7 +3316,7 @@ pub async fn quota_reset_key(
         None => return Json(json!({"error": "Database not available"})).into_response(),
     };
     let limiter_cleared = state.limiter.clear_for_key(&key_hash);
-    match state.quota_store.clear_key_all(db_pool, &key_hash).await {
+    match state.limiter.clear_key_all(db_pool, &key_hash).await {
         Ok(snap) => {
             let _ = state
                 .admin_tx
@@ -3320,13 +3330,13 @@ pub async fn quota_reset_key(
                     "total_input_tokens": snap.input_tokens,
                     "total_output_tokens": snap.output_tokens,
                     "total_cost_micros": snap.total_cost_micros,
-                    "total_cost": boom_quota::micros_to_decimal(snap.total_cost_micros).to_string(),
+                    "total_cost": boom_limiter::micros_to_decimal(snap.total_cost_micros).to_string(),
                     "regular_input_cost_micros": snap.regular_input_cost_micros,
-                    "regular_input_cost": boom_quota::micros_to_decimal(snap.regular_input_cost_micros).to_string(),
+                    "regular_input_cost": boom_limiter::micros_to_decimal(snap.regular_input_cost_micros).to_string(),
                     "cached_input_cost_micros": snap.cached_input_cost_micros,
-                    "cached_input_cost": boom_quota::micros_to_decimal(snap.cached_input_cost_micros).to_string(),
+                    "cached_input_cost": boom_limiter::micros_to_decimal(snap.cached_input_cost_micros).to_string(),
                     "output_cost_micros": snap.output_cost_micros,
-                    "output_cost": boom_quota::micros_to_decimal(snap.output_cost_micros).to_string(),
+                    "output_cost": boom_limiter::micros_to_decimal(snap.output_cost_micros).to_string(),
                 },
             }))
             .into_response()
@@ -3376,7 +3386,7 @@ pub async fn quota_reset_team(
     }
 
     let member_count = member_keys.len();
-    match state.quota_store.reset_team_all(db_pool, &team_id, &member_keys).await {
+    match state.limiter.reset_team_all(db_pool, &team_id, &member_keys).await {
         Ok(()) => {
             let _ = state
                 .admin_tx
@@ -3434,7 +3444,7 @@ pub async fn quota_reset_key_cumulative(
     };
 
     match state
-        .quota_store
+        .limiter
         .clear_key_cumulative_db(db_pool, &key_hash, team_id.as_deref())
         .await
     {
@@ -3452,13 +3462,13 @@ pub async fn quota_reset_key_cumulative(
                     "total_input_tokens": snap.input_tokens,
                     "total_output_tokens": snap.output_tokens,
                     "total_cost_micros": snap.total_cost_micros,
-                    "total_cost": boom_quota::micros_to_decimal(snap.total_cost_micros).to_string(),
+                    "total_cost": boom_limiter::micros_to_decimal(snap.total_cost_micros).to_string(),
                     "regular_input_cost_micros": snap.regular_input_cost_micros,
-                    "regular_input_cost": boom_quota::micros_to_decimal(snap.regular_input_cost_micros).to_string(),
+                    "regular_input_cost": boom_limiter::micros_to_decimal(snap.regular_input_cost_micros).to_string(),
                     "cached_input_cost_micros": snap.cached_input_cost_micros,
-                    "cached_input_cost": boom_quota::micros_to_decimal(snap.cached_input_cost_micros).to_string(),
+                    "cached_input_cost": boom_limiter::micros_to_decimal(snap.cached_input_cost_micros).to_string(),
                     "output_cost_micros": snap.output_cost_micros,
-                    "output_cost": boom_quota::micros_to_decimal(snap.output_cost_micros).to_string(),
+                    "output_cost": boom_limiter::micros_to_decimal(snap.output_cost_micros).to_string(),
                 },
             }))
             .into_response()
@@ -3475,7 +3485,7 @@ pub async fn quota_reset_key_cumulative(
 }
 
 /// POST /admin/quota/reset/key/{key_hash}/windows — clear only current
-/// windows: SlidingWindowLimiter counts + QuotaStore tokens/costs windows.
+/// windows: limiter multi-dim counters (counts + tokens + costs).
 /// Cumulative counters untouched.
 pub async fn quota_reset_key_windows(
     _session: AdminSession,
@@ -3488,7 +3498,7 @@ pub async fn quota_reset_key_windows(
     };
     let limiter_cleared = state.limiter.clear_for_key(&key_hash);
     match state
-        .quota_store
+        .limiter
         .clear_key_windows_db(db_pool, &key_hash)
         .await
     {
@@ -3547,7 +3557,7 @@ pub async fn quota_reset_team_cumulative(
     };
     let member_count = member_keys.len();
     match state
-        .quota_store
+        .limiter
         .clear_team_cumulative_db(db_pool, &team_id, &member_keys)
         .await
     {
@@ -3576,7 +3586,7 @@ pub async fn quota_reset_team_cumulative(
 }
 
 /// POST /admin/quota/reset/team/{team_id}/windows — clear team windows +
-/// member keys' windows (limiter counts + QuotaStore windows).
+/// member keys' windows (limiter multi-dim counters).
 /// Cumulative untouched.
 pub async fn quota_reset_team_windows(
     _session: AdminSession,
@@ -3613,7 +3623,7 @@ pub async fn quota_reset_team_windows(
 
     let member_count = member_keys.len();
     match state
-        .quota_store
+        .limiter
         .clear_team_windows_db(db_pool, &team_id, &member_keys)
         .await
     {
