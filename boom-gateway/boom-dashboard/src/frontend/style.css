@@ -1153,21 +1153,48 @@ input[list] {
 .rb-chart-card {
   position: relative;
   margin-bottom: 0.8rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 14px 16px 10px;
 }
 .rb-chart-card__label {
   font-size: 12px;
   font-weight: 600;
-  margin-bottom: 2px;
+  margin-bottom: 6px;
   color: var(--text2);
   padding-right: 200px;   /* keep title clear of the floating legend */
   min-height: 16px;
 }
 .rb-chart-card--single { margin-bottom: 1rem; }
+.rb-chart-card:last-child { margin-bottom: 0; }
+
+/* Outer panel: wraps "Request Rate" title + range controls + all chart cards. */
+.request-rate-panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 20px 24px;
+  box-shadow: var(--shadow-sm);
+}
+.request-rate-panel__head {
+  display: flex; justify-content: space-between; align-items: center;
+  margin-bottom: 16px;
+}
+.request-rate-panel__head h2 {
+  font-size: 20px; color: var(--text); font-weight: 700; letter-spacing: -.2px;
+}
+.request-rate-panel #request-rate-wrap > p.loading,
+.request-rate-panel #request-rate-wrap > p {
+  margin: 4px 0 0;
+  color: var(--text3);
+  font-size: 13px;
+}
 
 /* Legend floats at the chart card's top-right corner. */
 .rb-legend {
   position: absolute;
-  top: 0; right: 0;
+  top: 14px; right: 16px;
   display: flex; flex-wrap: wrap; gap: 6px 12px;
   justify-content: flex-end;
   max-width: 60%;
