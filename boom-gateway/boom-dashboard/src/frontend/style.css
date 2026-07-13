@@ -573,6 +573,19 @@ input, select, textarea { font-family: var(--font); font-size: 14px; }
    width:100% so they hug their content instead of stretching full-width. */
 .btn-secondary.btn-inline { width: auto; }
 .btn-small:hover { border-color: var(--primary); color: var(--primary); background: var(--primary-bg); box-shadow: 0 1px 4px rgba(0,0,0,.08); }
+/* Danger-tinted btn-small for destructive section actions (e.g. "Reset All
+   Limits") — keeps the small/neutral baseline look but signals risk via red
+   text + red-tinted hover. */
+.btn-small.is-danger {
+  color: var(--danger);
+  border-color: rgba(239,68,68,.3);
+}
+.btn-small.is-danger:hover {
+  background: var(--danger-bg);
+  border-color: var(--danger);
+  color: var(--danger);
+  box-shadow: 0 1px 4px rgba(239,68,68,.1);
+}
 
 /* Range selector for time-windowed stats (Agent / Request Rate) */
 .range-controls {
@@ -779,6 +792,23 @@ div[id$="-table-wrap"]:not(.bare) > table > thead:first-child > tr:first-child >
 }
 .modal-wide { width: 90vw; }
 .modal h3 { margin-bottom: 20px; font-size: 17px; color: var(--text); font-weight: 700; }
+.modal table {
+  width: 100%; border-collapse: collapse; margin-bottom: 16px;
+  font-size: 12px;
+}
+.modal table th {
+  text-align: left; padding: 8px 10px;
+  background: var(--surface2);
+  color: var(--text2); font-weight: 600;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+.modal table td {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: middle;
+}
+.modal table td:nth-child(2), .modal table td:nth-child(3) { white-space: nowrap; }
 .modal .form-group { margin-bottom: 14px; }
 .modal .form-group input,
 .modal .form-group select,
@@ -1027,26 +1057,39 @@ input[list] {
 }
 
 /* ── Per-1M-token cost cell (models table) ───────────────── */
+/* Inline "label:$value" per line — three rows stack tightly so the
+   column stays narrow even when EN headers ("Cost / 1M tokens") squeeze it. */
 .cost-cell {
   display: flex; flex-direction: column; gap: 2px;
   padding: 4px 0;
 }
 .cost-line {
-  display: flex; align-items: center; gap: 8px;
-  font-size: 11px; line-height: 1.3;
+  display: flex; align-items: center; gap: 4px;
+  font-size: 11px; line-height: 1.4;
+  white-space: nowrap;
 }
 .cost-label {
   color: var(--text3);
-  flex: 0 0 90px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  flex: 0 0 auto;
+  font-weight: 500;
 }
 .cost-value {
   font-family: var(--mono);
   color: var(--text);
   font-weight: 600;
-  margin-left: auto;
+  white-space: nowrap;
+}
+
+/* ── Alias chip (models table 别名列 single alias) ─────────── */
+.alias-chip {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: var(--radius-xs);
+  background: var(--primary-bg);
+  color: var(--primary);
+  font-size: 11px;
+  font-family: var(--mono);
+  font-weight: 500;
   white-space: nowrap;
 }
 

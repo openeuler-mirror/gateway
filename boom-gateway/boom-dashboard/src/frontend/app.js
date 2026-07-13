@@ -338,7 +338,6 @@
       stopInflightPoll();
     }
     if (section === "admin-models") loadModels();
-    else if (section === "admin-aliases") loadAliases();
     else if (section === "admin-plans") loadPlans();
     else if (section === "admin-keys") { setupKeysSearch(); loadKeys(); }
     else if (section === "admin-assignments") loadAssignments();
@@ -350,7 +349,6 @@
   function sectionFromHash(hash) {
     if (hash.includes("/admin/stats")) return "admin-stats";
     if (hash.includes("/admin/models")) return "admin-models";
-    if (hash.includes("/admin/aliases")) return "admin-aliases";
     if (hash.includes("/admin/plans")) return "admin-plans";
     if (hash.includes("/admin/keys")) return "admin-keys";
     if (hash.includes("/admin/quota")) return "admin-quota";
@@ -2077,19 +2075,30 @@
   // ── Admin: Models ─────────────────────────────────────
   async function loadModels() {
     try {
-      const data = await api("/admin/models");
-      renderModelsTable(data.models || []);
+      const [modelsResp, aliasesResp] = await Promise.all([
+        api("/admin/models"),
+        api("/admin/aliases"),
+      ]);
+      // Build { target_model → [alias_name, ...] } map so the models table
+      // can show each model's aliases inline without a separate aliases page.
+      const aliasesMap = {};
+      (aliasesResp.aliases || []).forEach((a) => {
+        if (!a.target_model) return;
+        (aliasesMap[a.target_model] = aliasesMap[a.target_model] || []).push(a.alias_name);
+      });
+      renderModelsTable(modelsResp.models || [], aliasesMap);
     } catch (err) {
       const wrap = document.getElementById("models-table-wrap");
       if (wrap) wrap.innerHTML = `<p class="error-msg">${t("common.failed_to_load", { what: t("models.title"), message: esc(err.message) })}</p>`;
     }
   }
 
-  function renderModelsTable(models) {
+  function renderModelsTable(models, aliasesMap) {
     const wrap = document.getElementById("models-table-wrap");
     if (models.length === 0) { wrap.innerHTML = "<p>" + t("models.empty") + "</p>"; return; }
+    aliasesMap = aliasesMap || {};
     wrap.innerHTML = `<table>
-      <tr><th>${t("models.col.model")}</th><th>${t("models.col.litellm_model")}</th><th>${t("models.col.cost")}</th><th>${t("models.col.base_url")}</th><th>${t("models.col.ratio")}</th><th>${t("models.col.rpm")}</th><th>${t("models.col.timeout")}</th><th>${t("models.col.enabled")}</th><th>${t("models.col.source")}</th><th>${t("models.col.actions")}</th></tr>
+      <tr><th>${t("models.col.model")}</th><th>${t("models.col.aliases")}</th><th>${t("models.col.litellm_model")}</th><th>${t("models.col.cost")}</th><th>${t("models.col.base_url")}</th><th>${t("models.col.ratio")}</th><th>${t("models.col.rpm")}</th><th>${t("models.col.timeout")}</th><th>${t("models.col.enabled")}</th><th>${t("models.col.source")}</th><th>${t("models.col.actions")}</th></tr>
       ${models.map((m) => {
         const isAutoDisabled = !m.enabled && m.auto_disabled;
         const enabledBadge = m.enabled
@@ -2098,20 +2107,31 @@
             ? '<span class="badge badge-blocked">' + t("common.no") + '</span><br><span style="color:var(--danger);font-size:0.8em">' + t("status.auto_disabled") + '</span>'
             : '<span class="badge badge-blocked">' + t("common.no") + '</span>';
         const warningRow = isAutoDisabled
-          ? `<tr style="background:rgba(255,80,80,0.08)"><td colspan="10" style="padding:4px 8px;font-size:0.85em;color:var(--danger)">${t("models.fault_disabled")}</td></tr>`
+          ? `<tr style="background:rgba(255,80,80,0.08)"><td colspan="11" style="padding:4px 8px;font-size:0.85em;color:var(--danger)">${t("models.fault_disabled")}</td></tr>`
           : '';
-        // Cost cell: three sub-lines (input / cached-input / output), each
-        // showing USD per 1M tokens. Backend returns string-ready decimals;
-        // we just prepend "$" and append "/M" for readability.
+        // Cost cell: inline "label:$value" per line, three rows. Compact so
+        // the column stays narrow even when EN headers squeeze the table.
         const c = m.cost_per_million || {};
         const fmtCost = (v) => (v == null || v === "0" || v === "") ? "-" : "$" + v;
         const costCell = '<div class="cost-cell">'
-          + '<div class="cost-line"><span class="cost-label">' + t("plan.dim.regular_input_cost") + '</span><span class="cost-value">' + fmtCost(c.input) + '</span></div>'
-          + '<div class="cost-line"><span class="cost-label">' + t("plan.dim.cached_input_cost") + '</span><span class="cost-value">' + fmtCost(c.cached_input) + '</span></div>'
-          + '<div class="cost-line"><span class="cost-label">' + t("plan.dim.output_cost") + '</span><span class="cost-value">' + fmtCost(c.output) + '</span></div>'
+          + '<div class="cost-line"><span class="cost-label">' + esc(t("plan.dim.regular_input_cost")) + ':</span><span class="cost-value">' + fmtCost(c.input) + '</span></div>'
+          + '<div class="cost-line"><span class="cost-label">' + esc(t("plan.dim.cached_input_cost")) + ':</span><span class="cost-value">' + fmtCost(c.cached_input) + '</span></div>'
+          + '<div class="cost-line"><span class="cost-label">' + esc(t("plan.dim.output_cost")) + ':</span><span class="cost-value">' + fmtCost(c.output) + '</span></div>'
           + '</div>';
+        // Alias cell: 0 → "-"; 1 → chip with name; ≥2 → "View N aliases" button.
+        const aliases = aliasesMap[m.model_name] || [];
+        let aliasCell;
+        if (aliases.length === 0) {
+          aliasCell = '<span class="muted">-</span>';
+        } else if (aliases.length === 1) {
+          aliasCell = '<span class="alias-chip">' + esc(aliases[0]) + '</span>';
+        } else {
+          aliasCell = '<button class="btn-small" onclick="window._showModelAliases(\'' + esc(m.model_name) + '\')">'
+            + esc(t("models.aliases.view_detail", { n: aliases.length })) + '</button>';
+        }
         return `<tr${isAutoDisabled ? ' style="background:rgba(255,80,80,0.04)"' : ''}>
         <td>${renderDeployCell(m.model_name, m.deployment_id)}</td>
+        <td>${aliasCell}</td>
         <td class="mono">${esc(m.litellm_model)}</td>
         <td>${costCell}</td>
         <td class="mono">${esc(m.api_base || "-")}</td>
@@ -2207,34 +2227,6 @@
   };
 
   // ── Admin: Aliases ────────────────────────────────────
-  async function loadAliases() {
-    try {
-      const data = await api("/admin/aliases");
-      renderAliasesTable(data.aliases || []);
-    } catch (err) {
-      const wrap = document.getElementById("aliases-table-wrap");
-      if (wrap) wrap.innerHTML = `<p class="error-msg">${t("common.failed_to_load", { what: t("aliases.title"), message: esc(err.message) })}</p>`;
-    }
-  }
-
-  function renderAliasesTable(aliases) {
-    const wrap = document.getElementById("aliases-table-wrap");
-    if (aliases.length === 0) { wrap.innerHTML = "<p>" + t("aliases.empty") + "</p>"; return; }
-    wrap.innerHTML = `<table>
-      <tr><th>${t("aliases.col.alias")}</th><th>${t("aliases.col.target")}</th><th>${t("form.alias.hidden")}</th><th>${t("models.col.source")}</th><th>${t("aliases.col.actions")}</th></tr>
-      ${aliases.map((a) => `<tr>
-        <td><strong>${esc(a.alias_name)}</strong></td>
-        <td class="mono">${esc(a.target_model)}</td>
-        <td>${a.hidden ? t("common.yes") : t("common.no")}</td>
-        <td><span class="badge badge-plan">${esc(a.source || "-")}</span></td>
-        <td>
-          <button class="btn-small" onclick="window._editAlias('${esc(a.alias_name)}')">${t("action.edit")}</button>
-          <button class="btn-danger" onclick="window._deleteAlias('${esc(a.alias_name)}')">${t("action.delete")}</button>
-        </td>
-      </tr>`).join("")}
-    </table>`;
-  }
-
   function showNewAliasModal(prefill) {
     const p = prefill || {};
     showModal(`
@@ -2264,7 +2256,7 @@
         await api(url, { method, body: JSON.stringify(body) });
         hideModal();
         invalidateCaches();
-        loadAliases();
+        loadModels();
       } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
     });
   }
@@ -2281,7 +2273,34 @@
   window._deleteAlias = async (name) => {
     if (!confirm(t("confirm.delete_alias", { name }))) return;
     await api(`/admin/aliases/${encodeURIComponent(name)}`, { method: "DELETE" });
-    loadAliases();
+    loadModels();
+  };
+
+  window._showModelAliases = async (modelName) => {
+    try {
+      const data = await api("/admin/aliases");
+      const list = (data.aliases || []).filter((a) => a.target_model === modelName);
+      showModal(`
+        <h3>${t("models.aliases.modal_title", { model: esc(modelName) })}</h3>
+        ${list.length === 0
+          ? `<p class="muted">${t("common.no_data")}</p>`
+          : `<table class="modal-table">
+              <tr><th>${t("aliases.col.alias")}</th><th>${t("form.alias.hidden")}</th><th>${t("models.col.source")}</th><th>${t("aliases.col.actions")}</th></tr>
+              ${list.map((a) => `<tr>
+                <td><strong>${esc(a.alias_name)}</strong></td>
+                <td>${a.hidden ? t("common.yes") : t("common.no")}</td>
+                <td><span class="badge badge-plan">${esc(a.source || "-")}</span></td>
+                <td>
+                  <button class="btn-small" onclick="window._editAlias('${esc(a.alias_name)}')">${t("action.edit")}</button>
+                  <button class="btn-small is-danger" onclick="window._deleteAlias('${esc(a.alias_name)}')">${t("action.delete")}</button>
+                </td>
+              </tr>`).join("")}
+            </table>`}
+        <div class="modal-actions">
+          <button class="btn-small btn-inline" onclick="hideModal()">${t("action.close")}</button>
+        </div>
+      `);
+    } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
   };
 
   // ── Admin: Debug Error Recording ─────────────────────

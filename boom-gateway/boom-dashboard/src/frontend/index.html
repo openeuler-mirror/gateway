@@ -149,10 +149,6 @@
               <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 3h12v9a2 2 0 01-2 2H4a2 2 0 01-2-2V3zM5 3V1.5M11 3V1.5M2 7h12"/></svg>
               <span data-i18n="nav.models">Models</span>
             </a>
-            <a href="#/admin/aliases" class="nav-link" data-section="admin-aliases">
-              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M6.5 3L12 8l-5.5 5"/><path d="M2 3l5.5 5L2 13"/></svg>
-              <span data-i18n="nav.aliases">Aliases</span>
-            </a>
             <a href="#/admin/plans" class="nav-link" data-section="admin-plans">
               <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="1.5" y="1.5" width="13" height="13" rx="2"/><path d="M5 5h6M5 8h4M5 11h2"/></svg>
               <span data-i18n="nav.plans">Plans</span>
@@ -253,27 +249,21 @@
           <section id="admin-models" class="section">
             <div class="section-header">
               <h2 data-i18n="models.title">Model Deployments</h2>
-              <button class="btn-primary" id="btn-new-model" data-i18n="models.add">+ Add Model</button>
+              <div style="display:flex;gap:8px">
+                <button class="btn-small" id="btn-new-alias" data-i18n="aliases.add">+ Add Alias</button>
+                <button class="btn-small" id="btn-new-model" data-i18n="models.add">+ Add Model</button>
+              </div>
             </div>
             <div id="models-table-wrap"><p class="loading" data-i18n="common.loading">Loading...</p></div>
-          </section>
-
-          <!-- Aliases Section -->
-          <section id="admin-aliases" class="section">
-            <div class="section-header">
-              <h2 data-i18n="aliases.title">Model Aliases</h2>
-              <button class="btn-primary" id="btn-new-alias" data-i18n="aliases.add">+ Add Alias</button>
-            </div>
-            <div id="aliases-table-wrap"><p class="loading" data-i18n="common.loading">Loading...</p></div>
           </section>
 
           <!-- Plans Section -->
           <section id="admin-plans" class="section">
             <div class="section-header">
               <h2 data-i18n="plans.title">Plans</h2>
-              <div>
-                <button class="btn-danger" id="btn-reset-all-limits" data-i18n="plans.reset_all">Reset All Limits</button>
-                <button class="btn-primary" id="btn-new-plan" data-i18n="plans.add">+ New Plan</button>
+              <div style="display:flex;gap:8px">
+                <button class="btn-small is-danger" id="btn-reset-all-limits" data-i18n="plans.reset_all">Reset All Limits</button>
+                <button class="btn-small" id="btn-new-plan" data-i18n="plans.add">+ New Plan</button>
               </div>
             </div>
             <div id="plans-table-wrap"><p class="loading" data-i18n="common.loading">Loading...</p></div>
@@ -286,7 +276,7 @@
               <div class="keys-toolbar">
                 <input type="text" id="keys-search" data-i18n-ph="keys.search_placeholder" placeholder="Search alias, name, user, token..." class="search-input">
                 <button class="btn-small" id="btn-vip-filter" data-i18n="keys.vip_only">VIP Only</button>
-                <button class="btn-primary" id="btn-new-key" data-i18n="keys.add">+ Create Key</button>
+                <button class="btn-small" id="btn-new-key" data-i18n="keys.add">+ Create Key</button>
               </div>
             </div>
             <div id="keys-table-wrap"><p class="loading" data-i18n="common.loading">Loading...</p></div>
@@ -297,7 +287,7 @@
           <section id="admin-assignments" class="section">
             <div class="section-header">
               <h2 data-i18n="assignments.title">Key-Plan Assignments</h2>
-              <button class="btn-primary" id="btn-new-assignment" data-i18n="assignments.add">+ Assign</button>
+              <button class="btn-small" id="btn-new-assignment" data-i18n="assignments.add">+ Assign</button>
             </div>
             <div id="assignments-table-wrap"><p class="loading" data-i18n="common.loading">Loading...</p></div>
             <div id="assignments-pagination" class="pagination"></div>
@@ -307,7 +297,7 @@
           <section id="admin-quota" class="section">
             <div class="section-header">
               <h2 data-i18n="quota.title">Quota Management</h2>
-              <button class="btn-primary" id="btn-create-team" onclick="showCreateTeamModal()" data-i18n="quota.create_team">Create Team</button>
+              <button class="btn-small" id="btn-create-team" onclick="showCreateTeamModal()" data-i18n="quota.create_team">Create Team</button>
             </div>
             <div id="quota-overview-wrap"><p class="loading" data-i18n="common.loading">Loading...</p></div>
           </section>
