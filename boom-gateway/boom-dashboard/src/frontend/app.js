@@ -3729,6 +3729,9 @@
     if (/^glm|^chatglm|^thinking|^cogvlm|^cogview/.test(s)) return "glm";
     if (/^minimax|^abab|^emotion|^speech-0/.test(s))        return "minimax";
     if (/^qwen|^qwq/.test(s))                                return "qwen";
+    if (/^deepseek/.test(s))                                return "deepseek";
+    if (/^kimi|^moonshot/.test(s))                          return "kimi";
+    if (/^mimo/.test(s))                                    return "mimo";
     return "default";
   }
 
