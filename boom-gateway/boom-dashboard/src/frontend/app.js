@@ -3723,15 +3723,26 @@
   }
 
   // Map model name → vendor slug for the logo endpoint
-  // (/dashboard/assets/vendor/:name). Add patterns here when new vendors ship.
+  // (/dashboard/assets/vendor/:name). Match is substring + case-insensitive,
+  // so "GLM-5.1" / "glm-xx" / "xxGlmxx" all hit GLM. Vendors with model
+  // families that don't contain the brand name as substring keep explicit
+  // aliases (e.g. cogvlm/cogview/thinking → GLM, abab/emotion → MiniMax,
+  // qwq → Qwen, moonshot → Kimi).
+  const VENDOR_PATTERNS = [
+    { slug: "glm",      needles: ["glm", "chatglm", "cogvlm", "cogview", "thinking"] },
+    { slug: "minimax",  needles: ["minimax", "abab", "emotion", "speech-0"] },
+    { slug: "qwen",     needles: ["qwen", "qwq"] },
+    { slug: "deepseek", needles: ["deepseek"] },
+    { slug: "kimi",     needles: ["kimi", "moonshot"] },
+    { slug: "mimo",     needles: ["mimo"] },
+  ];
   function vendorOf(model) {
     const s = (model || "").toLowerCase();
-    if (/^glm|^chatglm|^thinking|^cogvlm|^cogview/.test(s)) return "glm";
-    if (/^minimax|^abab|^emotion|^speech-0/.test(s))        return "minimax";
-    if (/^qwen|^qwq/.test(s))                                return "qwen";
-    if (/^deepseek/.test(s))                                return "deepseek";
-    if (/^kimi|^moonshot/.test(s))                          return "kimi";
-    if (/^mimo/.test(s))                                    return "mimo";
+    for (const v of VENDOR_PATTERNS) {
+      for (const n of v.needles) {
+        if (s.indexOf(n) !== -1) return v.slug;
+      }
+    }
     return "default";
   }
 

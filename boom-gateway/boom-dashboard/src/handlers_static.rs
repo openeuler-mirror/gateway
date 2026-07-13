@@ -12,15 +12,16 @@ const I18N_JS: &str = include_str!("frontend/i18n.js");
 // always renders gracefully. Replace the files under frontend/assets/ to
 // swap in real logos (same path, same format → no code change required).
 // Format auto-detected from magic bytes — SVG (text "<svg") or PNG (89 50 4E 47).
-// To use a PNG: drop your file at frontend/assets/vendor-<name>.svg (filename
-// stays .svg, but content is PNG bytes) — content-type is auto-detected.
-const VENDOR_GLM: &[u8] = include_bytes!("frontend/assets/vendor-glm.svg");
-const VENDOR_MINIMAX: &[u8] = include_bytes!("frontend/assets/vendor-minimax.svg");
-const VENDOR_QWEN: &[u8] = include_bytes!("frontend/assets/vendor-qwen.svg");
-const VENDOR_DEEPSEEK: &[u8] = include_bytes!("frontend/assets/vendor-deepseek.svg");
-const VENDOR_KIMI: &[u8] = include_bytes!("frontend/assets/vendor-kimi.svg");
-const VENDOR_MIMO: &[u8] = include_bytes!("frontend/assets/vendor-mimo.svg");
-const VENDOR_DEFAULT: &[u8] = include_bytes!("frontend/assets/vendor-default.svg");
+// To use a PNG: drop your file at frontend/assets/<Vendor>.png — filename
+// convention is <Vendor>.<ext> (e.g. GLM.png, MiniMax.png, Qwen.png,
+// DeepSeek.svg, Kimi.svg, MiMo.svg, default.svg).
+const VENDOR_GLM: &[u8] = include_bytes!("frontend/assets/GLM.png");
+const VENDOR_MINIMAX: &[u8] = include_bytes!("frontend/assets/MiniMax.png");
+const VENDOR_QWEN: &[u8] = include_bytes!("frontend/assets/Qwen.png");
+const VENDOR_DEEPSEEK: &[u8] = include_bytes!("frontend/assets/DeepSeek.svg");
+const VENDOR_KIMI: &[u8] = include_bytes!("frontend/assets/Kimi.svg");
+const VENDOR_MIMO: &[u8] = include_bytes!("frontend/assets/MiMo.svg");
+const VENDOR_DEFAULT: &[u8] = include_bytes!("frontend/assets/default.svg");
 
 /// Auto-detect image content-type from magic bytes.
 /// PNG: starts with `89 50 4E 47 0D 0A 1A 0A`
