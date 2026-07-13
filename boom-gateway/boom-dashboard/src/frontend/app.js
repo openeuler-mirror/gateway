@@ -452,14 +452,7 @@
             reqsHtml = '<span class="cell-tip" data-tip="' + reqItems.join("&#10;").replace(/"/g, "&quot;") + '">' + reqsDisplay + '</span>';
           }
 
-          var deployCell;
-          if (d.deployment_id) {
-            deployCell = '<span class="deploy-model">' + esc(d.model) + '</span>' +
-              '<span class="deploy-sep">:</span>' +
-              '<span class="deploy-id">' + esc(d.deployment_id) + '</span>';
-          } else {
-            deployCell = '<span class="deploy-model">' + esc(d.model) + '</span>';
-          }
+          var deployCell = renderDeployCell(d.model, d.deployment_id);
 
           // 24h aggregates — read from cache populated on page load / Refresh button.
           var s = d.deployment_id ? deployment24hSummary[d.deployment_id] : null;
@@ -625,12 +618,10 @@
   function renderRequestRateCharts(charts, window) {
     const wrap = document.getElementById("request-rate-wrap");
     if (!wrap) return;
+    setRangeWindowNote("rate", window && window.from, window && window.to);
     if (!charts.length) { wrap.innerHTML = "<p>" + t("common.no_records") + "</p>"; return; }
 
-    const windowNote = window
-      ? `<div class="range-window-note">${esc(window.from)} → ${esc(window.to)} · bucket ${(window.bucket_secs / 60).toFixed(0)}min</div>`
-      : "";
-    var html = windowNote;
+    var html = "";
     charts.forEach(function (chart) {
       var events = chart.events || [];
       if (!events.length) return;
@@ -654,8 +645,8 @@
             '<div class="rb-bar-label' + (showLabel ? "" : " rb-label-hidden") + '">' + esc(lbl) + '</div>' +
             '</div>';
         }).join("");
-        html += '<div style="margin-bottom:0.8rem">' +
-          '<div style="font-size:0.85em;font-weight:600;margin-bottom:2px;color:var(--text2)">' + label + '</div>' +
+        html += '<div class="rb-chart-card rb-chart-card--single">' +
+          '<div class="rb-chart-card__label">' + label + '</div>' +
           '<div class="rebalance-chart">' +
           '<div class="rb-y-axis"><span>' + maxCount + '</span><span>0</span></div>' +
           '<div class="rb-bars">' + bars + '</div>' +
@@ -708,8 +699,8 @@
             '</div>';
         }).join("");
 
-        html += '<div style="margin-bottom:0.8rem">' +
-          '<div style="font-size:0.85em;font-weight:600;margin-bottom:2px;color:var(--text2)">' + label + '</div>' +
+        html += '<div class="rb-chart-card rb-chart-card--stacked">' +
+          '<div class="rb-chart-card__label">' + label + '</div>' +
           '<div class="rebalance-chart">' +
           '<div class="rb-y-axis"><span>' + maxTotal + '</span><span>0</span></div>' +
           '<div class="rb-bars">' + bars + '</div>' +
@@ -726,7 +717,7 @@
       }
     });
 
-    wrap.innerHTML = html || (windowNote + "<p>" + t("common.no_records") + "</p>");
+    wrap.innerHTML = html || ("<p>" + t("common.no_records") + "</p>");
   }
 
   // ── Rebalance Moves (per deployment, lifetime cumulative) ──
@@ -794,14 +785,12 @@
       output_tokens_total: 0, output_tokens_anthropic: 0, output_token_ratio: 0,
     };
     const window = data.window || null;
+    setRangeWindowNote("agent", window && window.from, window && window.to);
     const rangeLabel = rangeState.agent.range === "custom" ? "custom" : rangeState.agent.range;
 
     const ratioPct = (summary.ratio * 100).toFixed(1);
     const inputRatioPct = (summary.input_token_ratio * 100).toFixed(1);
     const outputRatioPct = (summary.output_token_ratio * 100).toFixed(1);
-    const windowNote = window
-      ? `<div class="range-window-note">${esc(window.from)} → ${esc(window.to)} · bucket ${(window.bucket_secs / 60).toFixed(0)}min</div>`
-      : "";
 
     // Five summary cards — Requests (Total / Anthropic / Ratio) + Tokens (Input / Output anthropic share).
     const summaryHtml =
@@ -831,7 +820,7 @@
       '</div>';
 
     if (!events.length || summary.total === 0) {
-      wrap.innerHTML = summaryHtml + windowNote + '<p class="loading" style="margin-top:1rem">' + t("common.no_records") + '</p>';
+      wrap.innerHTML = summaryHtml + '<p class="loading" style="margin-top:1rem">' + t("common.no_records") + '</p>';
       return;
     }
 
@@ -846,7 +835,7 @@
         '<span class="agent-legend-item"><span class="agent-legend-swatch agent-legend-other"></span>Other (/v1/chat/completions, etc.)</span>' +
       '</div>';
 
-    wrap.innerHTML = summaryHtml + windowNote +
+    wrap.innerHTML = summaryHtml +
       '<div style="margin-top:1rem"><div style="font-weight:600;margin-bottom:0.25rem">' + t("stats.agent.chart.requests") + '</div>' + requestChart + '</div>' +
       '<div style="margin-top:1.5rem"><div style="font-weight:600;margin-bottom:0.25rem">' + t("stats.agent.chart.input_tokens") + '</div>' + inputChart + '</div>' +
       '<div style="margin-top:1.5rem"><div style="font-weight:600;margin-bottom:0.25rem">' + t("stats.agent.chart.output_tokens") + '</div>' + outputChart + '</div>' +
@@ -1032,7 +1021,7 @@
       // RPM is the 60s window if present.
       const rpmWindow = windows.find((w) => w.window_secs === 60);
 
-      const fmtLimit = (l) => (l == null ? "∞" : String(l));
+      const fmtLimit = (l) => (l == null || l === 0 ? "∞" : String(l));
       const pct = (u, l) => (l == null || l === 0 ? 0 : Math.min(100, Math.round((u / l) * 100)));
 
       // Concurrency meter.
@@ -1041,19 +1030,42 @@
         `${concUsed} / ${fmtLimit(concLimit)}`,
         pct(concUsed, concLimit)
       );
-      // RPM meter (60s).
-      const rpmUsed = rpmWindow ? rpmWindow.count : 0;
-      const rpmLimit = plan.rpm_limit;
+      // RPM meter (60s counts dim — backend folds plan.rpm_limit into the
+      // 60s window's counts limit. Old code read rpmWindow.count / plan.rpm_limit
+      // which no longer exist; both come from dims.counts now.
+      const rpmCounts = rpmWindow && rpmWindow.dims && rpmWindow.dims.counts;
+      const rpmUsed = rpmCounts ? Number(rpmCounts.current || 0) : 0;
+      const rpmLimit = rpmCounts ? Number(rpmCounts.limit || 0) : null;
       const rpmHtml = meterHtml(
         "RPM",
         `${rpmUsed} / ${fmtLimit(rpmLimit)}`,
         pct(rpmUsed, rpmLimit)
       );
-      // Other windows (skip 60s — already shown as RPM).
+      // Other windows (skip 60s — already shown as RPM). Each window may have
+      // multiple dims (counts/tokens/costs); show the configured one. If
+      // multiple, render them stacked — but for the chat meter strip we pick
+      // the most informative one per window (tokens > costs > counts).
       const otherWindows = windows.filter((w) => w.window_secs !== 60);
       const otherHtml = otherWindows.map((w) => {
         const label = formatDuration(w.window_secs);
-        return meterHtml(label, `${w.count} / ${fmtLimit(w.limit)}`, pct(w.count, w.limit));
+        const dims = w.dims || {};
+        // Prefer tokens for TPM-style windows, then costs, then counts.
+        const dimKey = dims.tokens ? "tokens"
+                     : dims.costs  ? "costs"
+                     : dims.counts ? "counts"
+                     : null;
+        if (!dimKey) return "";
+        const d = dims[dimKey];
+        let used, limit;
+        if (dimKey === "costs") {
+          used = Number(d.current_micros || 0);
+          limit = Number(d.limit_micros || 0);
+          const valTxt = "$" + (d.current || "0") + " / " + (limit > 0 ? "$" + (d.limit || "0") : "∞");
+          return meterHtml(label, valTxt, pct(used, limit));
+        }
+        used = Number(d.current || 0);
+        limit = Number(d.limit || 0);
+        return meterHtml(label, `${used} / ${fmtLimit(limit)}`, pct(used, limit));
       }).join("");
 
       el.innerHTML = `
@@ -1521,10 +1533,12 @@
     }
     const limits = [];
     if (plan.concurrency_limit) limits.push(t("plan.limits.concurrency", { n: plan.concurrency_limit }));
-    if (plan.rpm_limit) limits.push(t("plan.limits.rpm", { n: plan.rpm_limit }));
-    if (plan.tpm_limit) limits.push(t("plan.limits.tpm", { n: plan.tpm_limit }));
     if (plan.total_token_limit) limits.push(t("plan.limits.total_token", { n: plan.total_token_limit }));
     if (plan.total_cost_limit != null) limits.push(t("plan.limits.total_cost", { n: plan.total_cost_limit }));
+    // RPM/TPM are no longer separate fields — the backend folds them into
+    // window_limits' 60s counts / 60s tokens entries via effective_limits().
+    // Rendering them here would either show "undefined 请求/1min" (field gone)
+    // or duplicate the 60s line that the forEach below already emits.
     (plan.window_limits || []).forEach((raw) => {
       const w = normalizeWindowLimit(raw);
       if (!w) return;
@@ -2087,7 +2101,7 @@
           ? `<tr style="background:rgba(255,80,80,0.08)"><td colspan="9" style="padding:4px 8px;font-size:0.85em;color:var(--danger)">${t("models.fault_disabled")}</td></tr>`
           : '';
         return `<tr${isAutoDisabled ? ' style="background:rgba(255,80,80,0.04)"' : ''}>
-        <td><strong>${esc(m.model_name)}</strong></td>
+        <td>${renderDeployCell(m.model_name, m.litellm_model)}</td>
         <td class="mono">${esc(m.litellm_model)}</td>
         <td class="mono">${esc(m.api_base || "-")}</td>
         <td>${m.quota_count_ratio && m.quota_count_ratio !== 1 ? '<span class="badge badge-plan">x' + m.quota_count_ratio + '</span>' : 'x1'}</td>
@@ -2124,7 +2138,7 @@
       <div class="form-group"><label>${t("form.model.maxctx")} ${tip("Max total input characters across all in-flight requests. 0 or empty = unlimited.")}</label><input id="m-model-maxctx" type="number" min="0" value="${p.max_context_len || ""}"></div>
       <div class="form-group"><label>${t("form.model.enabled")} ${tip("Disabled deployments are ignored in routing.")}</label><select id="m-model-enabled"><option value="true" ${p.enabled !== false ? "selected" : ""}>${t("common.yes")}</option><option value="false" ${p.enabled === false ? "selected" : ""}>${t("common.no")}</option></select></div>
       <div class="modal-actions">
-        <button class="btn-secondary" onclick="hideModal()" style="width:auto">${t("action.cancel")}</button>
+        <button class="btn-secondary btn-inline" onclick="hideModal()">${t("action.cancel")}</button>
         <button class="btn-primary" id="m-model-submit">${p.id ? t("action.update") : t("action.create")}</button>
       </div>
     `);
@@ -2218,7 +2232,7 @@
       <div class="form-group"><label>${t("form.alias.target")} * ${tip("The actual model name to route to. Must match an existing model deployment name.")}</label><input id="m-alias-target" value="${esc(p.target_model || "")}" required list="alias-target-list"><datalist id="alias-target-list"></datalist></div>
       <div class="form-group"><label>${t("form.alias.hidden")} ${tip("Hidden aliases work for routing but are not listed to users in model discovery endpoints.")}</label><select id="m-alias-hidden"><option value="false" ${!p.hidden ? "selected" : ""}>${t("common.no")}</option><option value="true" ${p.hidden ? "selected" : ""}>${t("common.yes")}</option></select></div>
       <div class="modal-actions">
-        <button class="btn-secondary" onclick="hideModal()" style="width:auto">${t("action.cancel")}</button>
+        <button class="btn-secondary btn-inline" onclick="hideModal()">${t("action.cancel")}</button>
         <button class="btn-primary" id="m-alias-submit">${p.alias_name ? t("action.update") : t("action.create")}</button>
       </div>
     `);
@@ -2405,7 +2419,7 @@
         ${upstreamHtml}
         ${requestHtml}
         <div class="modal-actions">
-          <button class="btn-secondary" onclick="hideModal()" style="width:auto">${t("action.close")}</button>
+          <button class="btn-secondary btn-inline" onclick="hideModal()">${t("action.close")}</button>
         </div>
       `);
     } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
@@ -2511,7 +2525,7 @@
       <div class="form-group"><label>${t("form.plan.rpm")} ${tip("Maximum requests per minute per key. Leave empty for unlimited.")}</label><input id="m-plan-rpm" type="number" value="${p.rpm_limit || ""}"></div>
       <div class="form-group"><label>${t("form.plan.windows")} ${tip("Custom time windows as JSON array: [[count, seconds], ...]. E.g. [[100,18000]] = 100 requests per 5 hours. Each request's quota consumption is multiplied by the model's Quota Ratio.")}</label><textarea id="m-plan-windows" rows="2">${JSON.stringify(p.window_limits || [])}</textarea></div>
       <div class="modal-actions">
-        <button class="btn-secondary" onclick="hideModal()" style="width:auto">${t("action.cancel")}</button>
+        <button class="btn-secondary btn-inline" onclick="hideModal()">${t("action.cancel")}</button>
         <button class="btn-primary" id="m-plan-submit">${p.name ? t("action.update") : t("action.create")}</button>
       </div>
     `);
@@ -2554,7 +2568,7 @@
       <div class="form-group"><label>${t("form.key.rpm")} ${tip("Per-key RPM override. Leave empty to use plan or default limits.")}</label><input id="m-key-rpm" type="number"></div>
       <div class="form-group"><label>${t("form.key.plan")} ${tip("Assign this key to a rate limit plan. Leave empty for default plan.")}</label><select id="m-key-plan"><option value="">${t("common.default_option")}</option></select></div>
       <div class="modal-actions">
-        <button class="btn-secondary" onclick="hideModal()" style="width:auto">${t("action.cancel")}</button>
+        <button class="btn-secondary btn-inline" onclick="hideModal()">${t("action.cancel")}</button>
         <button class="btn-primary" id="m-key-submit">${t("action.create")}</button>
       </div>
     `);
@@ -2611,7 +2625,7 @@
           <p class="key-warning">${t("form.key.copy_warning")}</p>
           <div class="key-display">${esc(rawKey)}</div>
           <div class="modal-actions" style="justify-content:space-between">
-            <button class="btn-secondary" style="width:auto" onclick="window._copyText(this,'${esc(rawKey)}')">${t("action.copy")}</button>
+            <button class="btn-secondary btn-inline" onclick="window._copyText(this,'${esc(rawKey)}')">${t("action.copy")}</button>
             <button class="btn-primary" onclick="hideModal(); window._loadKeysPage();">${t("action.done")}</button>
           </div>
         `);
@@ -2634,7 +2648,7 @@
       <div class="form-group"><label>${t("form.key.vip")} ${tip("VIP keys get priority in flow control queues when deployments are at capacity.")}</label><div style="display:flex;align-items:center;gap:8px;padding-top:4px"><input type="checkbox" id="m-edit-vip" ${isVip ? "checked" : ""}><span style="font-weight:600;color:#b45309;white-space:nowrap">${t("form.key.vip_label")}</span></div></div>
       <div class="form-group"><label>${t("form.key.prompt_log")} ${tip("Disable prompt logging for this key. When the global prompt log switch is ON, this key will be excluded from capture.")}</label><div style="display:flex;align-items:center;gap:8px;padding-top:4px"><input type="checkbox" id="m-edit-no-prompt-log" ${isPromptLogExcluded ? "checked" : ""}><span style="font-weight:600;color:#dc2626;white-space:nowrap">${t("form.key.prompt_log_label")}</span></div></div>
       <div class="modal-actions">
-        <button class="btn-secondary" onclick="hideModal()" style="width:auto">${t("action.cancel")}</button>
+        <button class="btn-secondary btn-inline" onclick="hideModal()">${t("action.cancel")}</button>
         <button class="btn-primary" id="m-edit-submit">${t("action.save")}</button>
       </div>
     `);
@@ -2687,7 +2701,7 @@
       </div>
       <div class="form-group"><label>${t("form.asgn.plan")} ${tip("Select an existing plan to assign this key to.")}</label><select id="m-asgn-plan" required><option value="">${t("common.select_plan")}</option></select></div>
       <div class="modal-actions">
-        <button class="btn-secondary" onclick="hideModal()" style="width:auto">${t("action.cancel")}</button>
+        <button class="btn-secondary btn-inline" onclick="hideModal()">${t("action.cancel")}</button>
         <button class="btn-primary" id="m-asgn-submit">${t("action.assign")}</button>
       </div>
     `);
@@ -3207,7 +3221,7 @@
         </select>
       </div>
       <div class="modal-actions">
-        <button class="btn-secondary" onclick="hideModal()" style="width:auto">${t("action.cancel")}</button>
+        <button class="btn-secondary btn-inline" onclick="hideModal()">${t("action.cancel")}</button>
         <button class="btn-primary" id="m-team-submit">${p.team_id ? t("action.update") : t("action.create")}</button>
       </div>
     `);
@@ -3676,6 +3690,61 @@
     const d = document.createElement("div");
     d.textContent = s;
     return d.innerHTML;
+  }
+
+  // Map model name → vendor slug for the logo endpoint
+  // (/dashboard/assets/vendor/:name). Add patterns here when new vendors ship.
+  function vendorOf(model) {
+    const s = (model || "").toLowerCase();
+    if (/^glm|^chatglm|^thinking|^cogvlm|^cogview/.test(s)) return "glm";
+    if (/^minimax|^abab|^emotion|^speech-0/.test(s))        return "minimax";
+    if (/^qwen|^qwq/.test(s))                                return "qwen";
+    return "default";
+  }
+
+  // Two-line deployment cell: [logo] + bold model name + faded deployment_id.
+  // Replaces the old "model:deployment_id" flat concatenation.
+  function renderDeployCell(model, deploymentId) {
+    const v = vendorOf(model);
+    return '' +
+      '<div class="deploy-cell">' +
+        '<img class="vendor-logo" src="/dashboard/assets/vendor/' + v + '" alt="' + v + '">' +
+        '<div class="deploy-text">' +
+          '<div class="deploy-model">' + esc(model) + '</div>' +
+          (deploymentId ? '<div class="deploy-id">' + esc(deploymentId) + '</div>' : '') +
+        '</div>' +
+      '</div>';
+  }
+
+  // ISO 8601 (e.g. "2026-07-13T17:50:00Z") → "2026-07-13 17:50:00".
+  // Falls back to the raw string when Date can't parse it.
+  function formatRangeISO(iso) {
+    if (!iso) return "";
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return String(iso);
+    const p = (n, w) => String(n).padStart(w || 2, "0");
+    return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate())
+         + " " + p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+  }
+
+  // Place the formatted time range next to the section title (`<h2>`).
+  // target = "rate" | "agent" — matches `data-target` on `.range-controls`.
+  // Removes the span when from/to are falsy so stale ranges don't linger.
+  function setRangeWindowNote(target, from, to) {
+    const controls = document.querySelector(`.range-controls[data-target="${target}"]`);
+    const header = controls && controls.parentElement;
+    if (!header) return;
+    let span = header.querySelector(".range-window-note");
+    if (!from || !to) {
+      if (span) span.remove();
+      return;
+    }
+    if (!span) {
+      span = document.createElement("span");
+      span.className = "range-window-note";
+      header.appendChild(span);
+    }
+    span.textContent = formatRangeISO(from) + " → " + formatRangeISO(to);
   }
 
   function formatDuration(secs) {

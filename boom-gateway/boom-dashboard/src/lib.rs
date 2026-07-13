@@ -29,6 +29,12 @@ pub fn build_router<S: Clone + Send + Sync + 'static>(state: DashboardState) -> 
         .route("/dashboard/style.css", get(handlers_static::style_css))
         .route("/dashboard/app.js", get(handlers_static::app_js))
         .route("/dashboard/i18n.js", get(handlers_static::i18n_js))
+        // Vendor logos (GLM/MiniMax/Qwen) — replace the placeholder SVGs
+        // at frontend/assets/vendor-*.svg to swap in real logos.
+        .route(
+            "/dashboard/assets/vendor/{name}",
+            get(handlers_static::vendor_logo),
+        )
         // Auth endpoints.
         .route("/dashboard/api/auth/login", post(auth::login))
         .route("/dashboard/api/auth/logout", post(auth::logout))

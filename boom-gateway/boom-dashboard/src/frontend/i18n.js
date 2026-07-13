@@ -421,7 +421,7 @@
       "plan.limits.window": "{dims} / {duration}",
       "plan.window_limit_label": "{duration} limit",
 
-      "models.col.litellm_model": "LiteLLM Model",
+      "models.col.litellm_model": "Model Name",
       "models.col.base_url": "Base URL",
       "models.col.ratio": "Quota Ratio",
       "models.col.timeout": "Timeout",
@@ -734,8 +734,8 @@
       "plan.dim.concurrency": "并发",
       "plan.dim.total_tokens": "累计 token",
       "plan.dim.total_cost": "累计费用",
-      "plan.dim.regular_input_cost": "输入费用（非命中）",
-      "plan.dim.cached_input_cost": "输入费用（缓存命中）",
+      "plan.dim.regular_input_cost": "非缓存输入费用",
+      "plan.dim.cached_input_cost": "缓存命中输入费用",
       "plan.dim.output_cost": "输出费用",
       "plan.cumulative_title": "累计",
       "plan.limits.tpm": "TPM: {n}",
@@ -942,7 +942,7 @@
       "plan.limits.window": "{n} 请求 / {duration}",
       "plan.window_limit_label": "{duration} 限制",
 
-      "models.col.litellm_model": "LiteLLM 模型",
+      "models.col.litellm_model": "模型名称",
       "models.col.base_url": "Base URL",
       "models.col.ratio": "配额倍率",
       "models.col.timeout": "超时",
