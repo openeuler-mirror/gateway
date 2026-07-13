@@ -1026,6 +1026,30 @@ input[list] {
   margin-top: 2px;
 }
 
+/* ── Per-1M-token cost cell (models table) ───────────────── */
+.cost-cell {
+  display: flex; flex-direction: column; gap: 2px;
+  padding: 4px 0;
+}
+.cost-line {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 11px; line-height: 1.3;
+}
+.cost-label {
+  color: var(--text3);
+  flex: 0 0 90px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.cost-value {
+  font-family: var(--mono);
+  color: var(--text);
+  font-weight: 600;
+  margin-left: auto;
+  white-space: nowrap;
+}
+
 /* ── Stats bar chart (Request Rate / high-throughput feel) ─ */
 /*
  * Visual feel: thin rounded bars, not chunky ones. Each column is wide,

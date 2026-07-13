@@ -2089,7 +2089,7 @@
     const wrap = document.getElementById("models-table-wrap");
     if (models.length === 0) { wrap.innerHTML = "<p>" + t("models.empty") + "</p>"; return; }
     wrap.innerHTML = `<table>
-      <tr><th>${t("form.model.name")}</th><th>${t("models.col.litellm_model")}</th><th>${t("models.col.base_url")}</th><th>${t("models.col.ratio")}</th><th>${t("models.col.rpm")}</th><th>${t("models.col.timeout")}</th><th>${t("models.col.enabled")}</th><th>${t("models.col.source")}</th><th>${t("models.col.actions")}</th></tr>
+      <tr><th>${t("models.col.model")}</th><th>${t("models.col.litellm_model")}</th><th>${t("models.col.cost")}</th><th>${t("models.col.base_url")}</th><th>${t("models.col.ratio")}</th><th>${t("models.col.rpm")}</th><th>${t("models.col.timeout")}</th><th>${t("models.col.enabled")}</th><th>${t("models.col.source")}</th><th>${t("models.col.actions")}</th></tr>
       ${models.map((m) => {
         const isAutoDisabled = !m.enabled && m.auto_disabled;
         const enabledBadge = m.enabled
@@ -2098,11 +2098,22 @@
             ? '<span class="badge badge-blocked">' + t("common.no") + '</span><br><span style="color:var(--danger);font-size:0.8em">' + t("status.auto_disabled") + '</span>'
             : '<span class="badge badge-blocked">' + t("common.no") + '</span>';
         const warningRow = isAutoDisabled
-          ? `<tr style="background:rgba(255,80,80,0.08)"><td colspan="9" style="padding:4px 8px;font-size:0.85em;color:var(--danger)">${t("models.fault_disabled")}</td></tr>`
+          ? `<tr style="background:rgba(255,80,80,0.08)"><td colspan="10" style="padding:4px 8px;font-size:0.85em;color:var(--danger)">${t("models.fault_disabled")}</td></tr>`
           : '';
+        // Cost cell: three sub-lines (input / cached-input / output), each
+        // showing USD per 1M tokens. Backend returns string-ready decimals;
+        // we just prepend "$" and append "/M" for readability.
+        const c = m.cost_per_million || {};
+        const fmtCost = (v) => (v == null || v === "0" || v === "") ? "-" : "$" + v;
+        const costCell = '<div class="cost-cell">'
+          + '<div class="cost-line"><span class="cost-label">' + t("plan.dim.regular_input_cost") + '</span><span class="cost-value">' + fmtCost(c.input) + '</span></div>'
+          + '<div class="cost-line"><span class="cost-label">' + t("plan.dim.cached_input_cost") + '</span><span class="cost-value">' + fmtCost(c.cached_input) + '</span></div>'
+          + '<div class="cost-line"><span class="cost-label">' + t("plan.dim.output_cost") + '</span><span class="cost-value">' + fmtCost(c.output) + '</span></div>'
+          + '</div>';
         return `<tr${isAutoDisabled ? ' style="background:rgba(255,80,80,0.04)"' : ''}>
-        <td>${renderDeployCell(m.model_name, m.litellm_model)}</td>
+        <td>${renderDeployCell(m.model_name, m.deployment_id)}</td>
         <td class="mono">${esc(m.litellm_model)}</td>
+        <td>${costCell}</td>
         <td class="mono">${esc(m.api_base || "-")}</td>
         <td>${m.quota_count_ratio && m.quota_count_ratio !== 1 ? '<span class="badge badge-plan">x' + m.quota_count_ratio + '</span>' : 'x1'}</td>
         <td>${m.rpm || "-"}</td>

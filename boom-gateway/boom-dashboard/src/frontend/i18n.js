@@ -423,6 +423,7 @@
 
       "models.col.litellm_model": "Model Name",
       "models.col.base_url": "Base URL",
+      "models.col.cost": "Cost / 1M tokens",
       "models.col.ratio": "Quota Ratio",
       "models.col.timeout": "Timeout",
       "models.col.enabled": "Enabled",
@@ -944,6 +945,7 @@
 
       "models.col.litellm_model": "模型名称",
       "models.col.base_url": "Base URL",
+      "models.col.cost": "价格 (每百万 token)",
       "models.col.ratio": "配额倍率",
       "models.col.timeout": "超时",
       "models.col.enabled": "启用",
