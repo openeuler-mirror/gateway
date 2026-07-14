@@ -381,35 +381,40 @@ input, select, textarea { font-family: var(--font); font-size: 14px; }
 
 /* ── Sidebar ────────────────────────────────────────────── */
 .sidebar {
-  width: 240px; background: var(--sidebar-bg);
+  width: 240px;
+  background: linear-gradient(to bottom, #5053e8 0%, #a1a4f7 100%);
   display: flex; flex-direction: column;
-  border-right: 1px solid var(--sidebar-border);
+  border-right: 1px solid rgba(255,255,255,.18);
+  color: #ffffff;
 }
 .sidebar h2 {
   padding: 22px 20px 18px; font-size: 13px; letter-spacing: 1.2px;
-  color: var(--sidebar-text); border-bottom: 1px solid var(--sidebar-border);
+  color: #ffffff; border-bottom: 1px solid rgba(255,255,255,.18);
   font-weight: 600; text-transform: uppercase;
 }
 .sidebar nav { flex: 1; padding: 10px 0; }
 .nav-link {
   display: flex; align-items: center; gap: 10px;
-  padding: 10px 20px; color: var(--sidebar-text);
+  padding: 10px 20px; color: rgba(255,255,255,.85);
   font-size: 13px; font-weight: 500;
   transition: all var(--transition);
   border-left: 3px solid transparent;
   margin: 1px 0;
 }
-.nav-link:hover { color: #d0d5e0; background: var(--sidebar-hover); }
+.nav-link:hover {
+  color: #ffffff;
+  background: rgba(255,255,255,.12);
+}
 .nav-link.active {
-  color: var(--sidebar-text-active);
-  background: var(--sidebar-active);
-  border-left-color: var(--primary);
+  color: #ffffff;
+  background: rgba(255,255,255,.18);
+  border-left-color: #ffffff;
   font-weight: 600;
 }
-.nav-link svg { width: 16px; height: 16px; flex-shrink: 0; opacity: .7; }
+.nav-link svg { width: 16px; height: 16px; flex-shrink: 0; opacity: .8; }
 .nav-link.active svg { opacity: 1; }
 .sidebar-footer {
-  padding: 12px 16px; border-top: 1px solid var(--sidebar-border);
+  padding: 12px 16px; border-top: 1px solid rgba(255,255,255,.18);
   display: flex; gap: 8px; align-items: center;
   flex-wrap: wrap;
 }
@@ -417,7 +422,7 @@ input, select, textarea { font-family: var(--font); font-size: 14px; }
 .sidebar-version {
   flex-basis: 100%;
   font-size: 11px;
-  color: var(--text3);
+  color: rgba(255,255,255,.7);
   font-variant-numeric: tabular-nums;
   letter-spacing: .02em;
   margin-bottom: 2px;
@@ -426,13 +431,14 @@ input, select, textarea { font-family: var(--font); font-size: 14px; }
 /* ── Theme Toggle ───────────────────────────────────────── */
 .theme-toggle {
   width: 36px; height: 36px; border-radius: var(--radius-sm);
-  background: var(--sidebar-hover); border: 1px solid var(--sidebar-border);
-  color: var(--sidebar-text); display: flex; align-items: center; justify-content: center;
+  background: rgba(255,255,255,.12); border: 1px solid rgba(255,255,255,.18);
+  color: #ffffff; display: flex; align-items: center; justify-content: center;
   transition: all var(--transition); flex-shrink: 0;
 }
 .theme-toggle:hover {
-  background: var(--sidebar-active); color: var(--sidebar-text-active);
-  border-color: rgba(232,116,12,.3);
+  background: rgba(255,255,255,.22);
+  color: #ffffff;
+  border-color: rgba(255,255,255,.35);
 }
 .theme-toggle svg { width: 18px; height: 18px; }
 
@@ -440,11 +446,11 @@ input, select, textarea { font-family: var(--font); font-size: 14px; }
 .sidebar-top {
   display: flex; align-items: center; justify-content: space-between;
   gap: 8px; padding: 16px 20px 14px;
-  border-bottom: 1px solid var(--sidebar-border);
+  border-bottom: 1px solid rgba(255,255,255,.18);
 }
 .sidebar-top h2 {
   padding: 0; margin: 0; font-size: 13px; letter-spacing: 1.2px;
-  color: var(--sidebar-text); font-weight: 600; text-transform: uppercase;
+  color: #ffffff; font-weight: 600; text-transform: uppercase;
 }
 
 /* ── Language Toggle ─────────────────────────────────────── */
@@ -545,6 +551,19 @@ input, select, textarea { font-family: var(--font); font-size: 14px; }
   cursor: pointer; font-size: 13px;
 }
 .btn-secondary:hover { border-color: var(--border2); color: var(--text); background: var(--surface3); }
+/* Sidebar buttons (Logout, etc.) on purple gradient — override default surface colors. */
+.sidebar-footer .btn-secondary,
+.sidebar .btn-secondary {
+  background: rgba(255,255,255,.14);
+  border: 1px solid rgba(255,255,255,.25);
+  color: #ffffff;
+}
+.sidebar-footer .btn-secondary:hover,
+.sidebar .btn-secondary:hover {
+  background: rgba(255,255,255,.24);
+  border-color: rgba(255,255,255,.4);
+  color: #ffffff;
+}
 
 .btn-danger {
   background: var(--danger-bg); color: var(--danger); border: 1px solid rgba(220,53,69,.2);
