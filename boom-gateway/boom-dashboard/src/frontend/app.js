@@ -2859,12 +2859,32 @@
   // Render team plan spec as a single line of compact tags.
   // Every plan-configurable dimension is shown; unset ones display "∞"
   // so the operator can distinguish "unlimited" from "not applicable".
-  function renderTeamEffectiveLimits(el) {
-    if (!el) return "";
+  // `planName` is merged into the block title so the operator sees the plan
+  // name and its limits as one unit instead of a detached badge in the header.
+  function renderTeamEffectiveLimits(el, planName, planExplicit) {
     const INF = "∞";
     const fmtOrInf = (v, fmt) => (v == null ? INF : fmt(v));
     const fmtNum = (v) => formatNumber(Number(v));
     const fmtCost = (v) => "$" + (Number(v) || 0).toLocaleString(undefined, { maximumFractionDigits: 2 });
+
+    // Title line: "套餐规格 · <planName>" or "套餐规格 · 默认/无套餐".
+    // planExplicit=false means the team is falling back to the default team plan
+    // (or has no plan at all) — we render that state in the title so the operator
+    // doesn't have to infer it from the absence of a badge.
+    let title = t("quota.team_limits_title");
+    if (planName) {
+      const tag = planExplicit ? "" : ` <span class="team-limits-suffix">${esc(t("quota.team_plan_default"))}</span>`;
+      title += ` · <strong class="${planExplicit ? "team-limits-name-explicit" : "team-limits-name-implicit"}">${esc(planName)}</strong>${tag}`;
+    } else {
+      title += ` · <span class="team-limits-suffix">${esc(t("quota.team_plan_none"))}</span>`;
+    }
+
+    if (!el) {
+      return `<div class="team-limits-block">
+        <div class="team-limits-title">${title}</div>
+        <div class="plan-tags"><span class="muted">${esc(t("quota.team_limits_empty") || "—")}</span></div>
+      </div>`;
+    }
 
     // Aggregate window_limits by secs → {counts, tokens, costs}.
     // rpm_limit / tpm_limit are 60s-window shorthands; merge them into the 60s
@@ -2906,8 +2926,27 @@
     tags.push(`<span class="plan-tag"><span class="plan-tag-label">${esc(t("plan.dim.total_cost") || "Total Cost")}</span><span class="plan-tag-value">${fmtOrInf(el.total_cost_limit, fmtCost)}</span></span>`);
 
     return `<div class="team-limits-block">
-      <div class="team-limits-title">${esc(t("quota.team_limits_title"))}</div>
+      <div class="team-limits-title">${title}</div>
       <div class="plan-tags">${tags.join("")}</div>
+    </div>`;
+  }
+
+  // Render the team's allowed-models list as chips. `models` comes straight
+  // from boom_team_table.models — either ["all-team-models"] (full access),
+  // an explicit list of model_names, or [] (no models configured).
+  function renderTeamModels(models) {
+    const list = Array.isArray(models) ? models : [];
+    let body;
+    if (list.length === 0) {
+      body = `<span class="muted">${esc(t("quota.team_models_empty"))}</span>`;
+    } else if (list.includes("all-team-models")) {
+      body = `<span class="model-chip model-chip-all">${esc(t("quota.team_models_all"))}</span>`;
+    } else {
+      body = list.map((m) => `<span class="model-chip">${esc(m)}</span>`).join("");
+    }
+    return `<div class="team-models-block">
+      <div class="team-models-title">${esc(t("quota.team_models_title"))}</div>
+      <div class="team-models-list">${body}</div>
     </div>`;
   }
 
@@ -2931,23 +2970,21 @@
 
     const teamCard = (t1) => {
       const tokens = Number(t1.total_input_tokens || 0) + Number(t1.total_output_tokens || 0);
-      const planBadge = t1.plan_name
-        ? `<span class="badge ${t1.plan_explicit ? "badge-plan" : "badge-default"}">${esc(t1.plan_name)}</span>`
-        : `<span class="muted">${esc(t("quota.team_plan_none"))}</span>`;
       const isExcluded = (window._promptLogExcludedTeams || []).includes(t1.team_id);
       const promptLogBtn = `<button class="btn-small ${isExcluded ? "btn-secondary" : "btn-primary"}" onclick="window._toggleTeamPromptLog('${esc(t1.team_id)}', ${isExcluded})">${isExcluded ? t("quota.prompt_log_off") : t("quota.prompt_log_on")}</button>`;
       const planSelect = renderTeamPlanSelect(t1.team_id, t1.plan_name, t1.plan_explicit);
-      const limitsHtml = renderTeamEffectiveLimits(t1.effective_limits);
+      const limitsHtml = renderTeamEffectiveLimits(t1.effective_limits, t1.plan_name, t1.plan_explicit);
+      const modelsHtml = renderTeamModels(t1.models);
       return `<div class="quota-card">
         <div class="quota-card-header">
           <strong>${esc(t1.team_alias || t1.team_id)}</strong>
-          ${planBadge}
         </div>
         <div class="quota-card-stats">
           <div><span class="muted">${esc(t("teams.col.keys_count") || "Keys")}</span> <strong>${t1.key_count || 0}</strong></div>
           <div><span class="muted">${esc(t("quota.col.tokens"))}</span> <strong>${formatNumber(tokens)}</strong></div>
           <div><span class="muted">${esc(t("quota.col.cost"))}</span> <strong>$${esc(t1.total_cost || "0")}</strong></div>
         </div>
+        ${modelsHtml}
         ${limitsHtml}
         <div class="quota-card-actions">
           <button class="btn-small" onclick="location.hash='#/admin/quota/team/${encodeURIComponent(t1.team_id)}'">${t("quota.view_detail")}</button>

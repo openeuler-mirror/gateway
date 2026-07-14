@@ -58,6 +58,11 @@
   --sidebar-text-active:#f0a04b;
   --sidebar-border:rgba(255,255,255,.08);
 
+  /* Sidebar gradient — bright brand purple. Overridden in dark mode. */
+  --sidebar-gradient-1: #5053e8;
+  --sidebar-gradient-2: #7879f0;
+  --sidebar-gradient-3: #a1a4f7;
+
   /* Scrollbar */
   --scrollbar-track: transparent;
   --scrollbar-thumb: var(--border);
@@ -69,12 +74,14 @@
 
 /* ── Dark Theme ────────────────────────────────────────── */
 [data-theme="dark"] {
-  --bg:        #0d0f14;
-  --surface:   #161922;
-  --surface2:  #1e2230;
-  --surface3:  #272c3d;
-  --border:    #2a2f42;
-  --border2:   #3a4158;
+  /* Surfaces — tinted slightly purple so they harmonize with the deep-purple
+     sidebar (#1f1b4d→#3a3170) rather than reading as neutral gray-blue. */
+  --bg:        #0c0e1a;
+  --surface:   #15182a;
+  --surface2:  #1d2138;
+  --surface3:  #262b48;
+  --border:    #2a2f4e;
+  --border2:   #3a4170;
 
   --text:      #e4e7ee;
   --text2:     #a0a8c0;
@@ -106,6 +113,14 @@
   --sidebar-text:   #6b7394;
   --sidebar-text-active:#f5a623;
   --sidebar-border: rgba(255,255,255,.06);
+
+  /* Sidebar gradient override — deep purple, same hue family as the light-mode
+     #5053e8→#a1a4f7 sidebar but tuned for dark surfaces. Light mode keeps the
+     bright gradient as a brand anchor; dark mode dims it so the sidebar
+     doesn't visually shout against #161922 surfaces. */
+  --sidebar-gradient-1: #1f1b4d;
+  --sidebar-gradient-2: #2a245e;
+  --sidebar-gradient-3: #3a3170;
 
   --scrollbar-thumb: var(--border);
   --scrollbar-hover: var(--border2);
@@ -382,7 +397,10 @@ input, select, textarea { font-family: var(--font); font-size: 14px; }
 /* ── Sidebar ────────────────────────────────────────────── */
 .sidebar {
   width: 240px;
-  background: linear-gradient(to bottom, #5053e8 0%, #a1a4f7 100%);
+  background: linear-gradient(to bottom,
+    var(--sidebar-gradient-1) 0%,
+    var(--sidebar-gradient-2) 50%,
+    var(--sidebar-gradient-3) 100%);
   display: flex; flex-direction: column;
   border-right: 1px solid rgba(255,255,255,.18);
   color: #ffffff;
@@ -1891,8 +1909,68 @@ input[list] {
   letter-spacing: .04em;
   margin-bottom: 4px;
 }
+.team-limits-title .team-limits-name-explicit {
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 12px;
+  color: var(--primary);
+  font-weight: 700;
+}
+.team-limits-title .team-limits-name-implicit {
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 12px;
+  color: var(--text2);
+  font-weight: 600;
+}
+.team-limits-title .team-limits-suffix {
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 11px;
+  color: var(--text3);
+  font-weight: 500;
+  margin-left: 4px;
+}
 .team-limits-block .dim-row {
   margin: 4px 0;
+}
+.team-models-block {
+  margin: 4px 0;
+  padding: 6px 10px;
+  background: var(--surface2);
+  border-radius: var(--radius-xs);
+  border-left: 3px solid var(--text3);
+}
+.team-models-title {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text3);
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  margin-bottom: 4px;
+}
+.team-models-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.model-chip {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: var(--radius-xs);
+  background: var(--surface3);
+  border: 1px solid var(--border);
+  color: var(--text1);
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.4;
+}
+.model-chip-all {
+  background: var(--primary-bg);
+  border-color: var(--primary);
+  color: var(--primary);
+  font-weight: 600;
 }
 .plan-tags {
   display: flex;
