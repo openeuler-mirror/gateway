@@ -63,18 +63,21 @@
   --sidebar-gradient-2: #7879f0;
   --sidebar-gradient-3: #a1a4f7;
 
-  /* Login — neutral background + purple accent (Linear/Vercel/Stripe style).
-   * Background is near-white so the card reads as the focal point; ambient
-   * pools add a faint brand wash without competing. Card is solid (not
-   * glass) with a defined shadow + subtle purple glow. */
+  /* Login — Aurora stage: neutral base + multi-layer ambient purple pools
+   * over a faint grid + noise. Card is solid white with multi-layer shadow
+   * and a soft inner top-edge glow so it reads as floating above the stage.
+   * Accent is the brand purple, same hue family as the sidebar gradient. */
   --login-bg:            #f5f6fa;
-  --login-ambient-1:     rgba(80,83,232,.10);
-  --login-ambient-2:     rgba(161,164,247,.12);
-  --login-card-bg:      #ffffff;
-  --login-card-border:  #e4e7ee;
-  --login-input-bg:     #f7f8fb;
-  --login-input-border: #d8dce5;
-  --login-input-bg-focus: #ffffff;
+  --login-aurora-1:      rgba(80,83,232,.14);
+  --login-aurora-2:      rgba(120,121,240,.10);
+  --login-aurora-3:      rgba(161,164,247,.16);
+  --login-grid-color:    rgba(80,83,232,.045);
+  --login-card-bg:       #ffffff;
+  --login-card-border:   rgba(228,231,238,.9);
+  --login-card-glow:     rgba(255,255,255,.7);
+  --login-input-bg:      #f7f8fb;
+  --login-input-border:  #d8dce5;
+  --login-input-bg-focus:#ffffff;
 
   /* Login accent — purple gradient endpoints for button + focus ring +
    * hover link. Same hue family as sidebar. */
@@ -86,8 +89,9 @@
   --scrollbar-thumb: var(--border);
   --scrollbar-hover: var(--border2);
 
-  /* Selection */
-  --selection-bg: rgba(232,116,12,.18);
+  /* Selection — purple to match brand (was orange #e8740c, caused a
+   * yellow flash when text/button got briefly selected during click). */
+  --selection-bg: rgba(80,83,232,.20);
 }
 
 /* ── Dark Theme ────────────────────────────────────────── */
@@ -140,14 +144,18 @@
   --sidebar-gradient-2: #2a245e;
   --sidebar-gradient-3: #3a3170;
 
-  /* Login — dark neutral background + dimmer ambient pools + slightly
-     lighter accent so the button/focus ring stays visible against the
-     near-black base. Card is solid dark, not glass. */
+  /* Login — dark Aurora stage: near-black base with brighter ambient pools
+     (the noise + grid layers below dim them further) and a slightly lighter
+     accent so the button stays visible against the dark base. Card is solid
+     dark, not glass — keeps form clarity against the busy background. */
   --login-bg:            #0a0c14;
-  --login-ambient-1:     rgba(80,83,232,.16);
-  --login-ambient-2:     rgba(161,164,247,.10);
+  --login-aurora-1:      rgba(80,83,232,.22);
+  --login-aurora-2:      rgba(120,121,240,.14);
+  --login-aurora-3:      rgba(161,164,247,.16);
+  --login-grid-color:    rgba(161,164,247,.05);
   --login-card-bg:       #15182a;
-  --login-card-border:   #2a2f4e;
+  --login-card-border:   rgba(58,65,112,.55);
+  --login-card-glow:     rgba(120,121,240,.06);
   --login-input-bg:      #0e1018;
   --login-input-border:  #2a2f4e;
   --login-input-bg-focus:#1a1e30;
@@ -160,7 +168,7 @@
   --scrollbar-thumb: var(--border);
   --scrollbar-hover: var(--border2);
 
-  --selection-bg: rgba(240,146,14,.22);
+  --selection-bg: rgba(120,121,240,.24);
 }
 
 /* ── Base ──────────────────────────────────────────────── */
@@ -189,124 +197,324 @@ input, select, textarea { font-family: var(--font); font-size: 14px; }
 .page { display: none; height: 100vh; }
 .page.active { display: flex; }
 
-/* ── Login ────────────────────────────────────────────────
- * Neutral background + purple accent. Pattern follows Linear/Vercel/
- * Stripe: low-saturation backdrop so the card becomes the focal point,
- * purple appears only on button, focus ring, and hover link.
+/* ── Login — Aurora stage ─────────────────────────────────
+ * Layered backdrop (Linear/Vercel/Stripe school): a near-neutral base
+ * carries three slow-drifting purple pools (Aurora) above a faint engineering
+ * grid and a fine noise veil. The card sits centered with multi-layer
+ * shadow + inner top-edge glow so it reads as floating above the stage.
+ * Logo and accent are the brand purple — already approved, not changed.
  * ───────────────────────────────────────────────────────── */
 #page-login {
   align-items: center; justify-content: center;
   position: relative; overflow: hidden;
   background: var(--login-bg);
 }
-[data-theme="dark"] #page-login {
-  background: var(--login-bg);
-}
 
-/* Ambient purple wash — barely visible, gives the neutral background a
- * hint of brand color without competing with the card. Two soft radial
- * pools anchored to opposite corners, no animation. */
-.login-ambient {
+/* Layer order, back→front: aurora (z=0) → grid (z=0) → noise (z=1) → card (z=2).
+ * Each layer is absolutely positioned, full-bleed, pointer-events:none. */
+
+/* Aurora — three soft radial pools, slowly drifting so the backdrop never
+ * feels static. Animation is reduced for users who prefer reduced motion. */
+.login-aurora {
   position: absolute; inset: 0;
   pointer-events: none; z-index: 0;
   background:
-    radial-gradient(ellipse 60% 50% at 15% 10%, var(--login-ambient-1) 0%, transparent 60%),
-    radial-gradient(ellipse 50% 60% at 85% 90%, var(--login-ambient-2) 0%, transparent 60%);
+    radial-gradient(ellipse 50% 42% at 18% 18%, var(--login-aurora-1) 0%, transparent 60%),
+    radial-gradient(ellipse 42% 50% at 82% 28%, var(--login-aurora-2) 0%, transparent 60%),
+    radial-gradient(ellipse 60% 40% at 50% 95%, var(--login-aurora-3) 0%, transparent 65%);
+  animation: auroraDrift 28s ease-in-out infinite alternate;
+  will-change: transform;
+}
+@keyframes auroraDrift {
+  0%   { transform: translate3d(0,0,0)     scale(1); }
+  50%  { transform: translate3d(-3%,2%,0)  scale(1.05); }
+  100% { transform: translate3d(2%,-2%,0)  scale(1.02); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .login-aurora { animation: none; }
 }
 
+/* ── Swimming light blobs ────────────────────────────────
+ * Three soft purple blobs that drift independently across the backdrop —
+ * the "海底生物" feel the page had in v1 (6bc7a3b) and lost in v2. Colors
+ * are rebased onto the Aurora purple palette so they layer naturally with
+ * the ambient pools and grid instead of reading as foreign decoration.
+ * Blobs sit ABOVE the static aurora+grid, BELOW the noise veil and card. */
+.login-creature {
+  position: absolute;
+  border-radius: 50%;
+  pointer-events: none;
+  z-index: 0;
+  will-change: transform;
+  filter: blur(48px);
+  mix-blend-mode: screen;
+}
+[data-theme="dark"] .login-creature { mix-blend-mode: screen; }
+/* Blob 1 — large, slow, bright lavender — patrols the upper band. */
+.login-creature.sc-1 {
+  width: 480px; height: 220px;
+  top: -10%; left: -8%;
+  background: radial-gradient(ellipse, rgba(161,164,247,.32) 0%, rgba(120,121,240,.10) 50%, transparent 70%);
+  animation: swim1 26s ease-in-out infinite;
+}
+[data-theme="dark"] .login-creature.sc-1 {
+  background: radial-gradient(ellipse, rgba(161,164,247,.28) 0%, rgba(120,121,240,.10) 50%, transparent 70%);
+}
+@keyframes swim1 {
+  0%   { transform: translate(0, 0) scaleX(1); }
+  15%  { transform: translate(28vw, 12vh) scaleX(1.08); }
+  35%  { transform: translate(62vw, 4vh)  scaleX(.96); }
+  55%  { transform: translate(38vw, 22vh) scaleX(1.04); }
+  75%  { transform: translate(10vw, 14vh) scaleX(.99); }
+  100% { transform: translate(0, 0) scaleX(1); }
+}
+/* Blob 2 — medium, deep purple — patrols the lower-right. */
+.login-creature.sc-2 {
+  width: 380px; height: 180px;
+  bottom: -8%; right: -8%;
+  background: radial-gradient(ellipse, rgba(80,83,232,.30) 0%, rgba(120,121,240,.10) 50%, transparent 70%);
+  animation: swim2 20s ease-in-out infinite;
+  animation-delay: -7s;
+}
+[data-theme="dark"] .login-creature.sc-2 {
+  background: radial-gradient(ellipse, rgba(80,83,232,.36) 0%, rgba(120,121,240,.14) 50%, transparent 70%);
+}
+@keyframes swim2 {
+  0%   { transform: translate(0, 0) scaleX(1); }
+  20%  { transform: translate(-30vw, -16vh) scaleX(1.06); }
+  45%  { transform: translate(-62vw, -4vh)  scaleX(.97); }
+  70%  { transform: translate(-26vw, 10vh)  scaleX(1.04); }
+  100% { transform: translate(0, 0) scaleX(1); }
+}
+/* Blob 3 — small, bright lavender — crosses the mid-band. */
+.login-creature.sc-3 {
+  width: 280px; height: 130px;
+  top: 45%; left: 30%;
+  background: radial-gradient(ellipse, rgba(161,164,247,.28) 0%, rgba(161,164,247,.06) 50%, transparent 70%);
+  animation: swim3 15s ease-in-out infinite;
+  animation-delay: -4s;
+}
+[data-theme="dark"] .login-creature.sc-3 {
+  background: radial-gradient(ellipse, rgba(161,164,247,.22) 0%, rgba(161,164,247,.05) 50%, transparent 70%);
+}
+@keyframes swim3 {
+  0%   { transform: translate(0, 0) scaleX(1); }
+  25%  { transform: translate(18vw, -20vh) scaleX(1.10); }
+  50%  { transform: translate(46vw, 6vh)   scaleX(.92); }
+  75%  { transform: translate(14vw, 16vh) scaleX(1.05); }
+  100% { transform: translate(0, 0) scaleX(1); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .login-creature { animation: none; }
+}
+
+/* Engineering grid — barely visible 32px lines, fading toward edges so the
+ * center reads as the focal area. Sits below aurora but above noise. */
+.login-grid {
+  position: absolute; inset: 0;
+  pointer-events: none; z-index: 0;
+  background-image:
+    linear-gradient(var(--login-grid-color) 1px, transparent 1px),
+    linear-gradient(90deg, var(--login-grid-color) 1px, transparent 1px);
+  background-size: 32px 32px, 32px 32px;
+  background-position: center center;
+  -webkit-mask-image: radial-gradient(ellipse 70% 60% at 50% 45%, #000 0%, transparent 75%);
+          mask-image: radial-gradient(ellipse 70% 60% at 50% 45%, #000 0%, transparent 75%);
+}
+
+/* Noise veil — inline SVG turbulence, opacity tuned so it adds texture
+ * without making the backdrop dirty. Sits above aurora+grid, below card. */
+.login-noise {
+  position: absolute; inset: 0;
+  pointer-events: none; z-index: 1;
+  opacity: .035;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='200' height='200'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 1  0 0 0 0 1  0 0 0 0 1  0 0 0 0.6 0'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");
+  mix-blend-mode: overlay;
+}
+[data-theme="dark"] .login-noise { opacity: .06; }
+
+/* Card — solid (not glass), multi-layer shadow, faint inner top-edge glow
+ * so it reads as a polished surface catching the aurora light. Glow layer
+ * below is a soft purple halo behind the card. */
 .login-card {
-  position: relative; z-index: 1;
+  position: relative; z-index: 2;
   background: var(--login-card-bg);
   border: 1px solid var(--login-card-border);
-  border-radius: 20px; padding: 44px 40px; width: 400px;
+  border-radius: 20px; padding: 48px 44px; width: 420px;
   box-shadow:
+    0 1px 2px rgba(0,0,0,.04),
     0 24px 60px rgba(0,0,0,.08),
-    0 8px 24px rgba(80,83,232,.08),
-    inset 0 1px 0 rgba(255,255,255,.6);
-  animation: cardIn .4s cubic-bezier(.16,1,.3,1);
+    0 8px 24px rgba(80,83,232,.10),
+    inset 0 1px 0 var(--login-card-glow);
+  animation: cardIn .5s cubic-bezier(.16,1,.3,1);
+  isolation: isolate;
 }
 [data-theme="dark"] .login-card {
-  background: var(--login-card-bg);
-  border-color: var(--login-card-border);
   box-shadow:
-    0 24px 60px rgba(0,0,0,.5),
-    0 8px 24px rgba(80,83,232,.18),
-    inset 0 1px 0 rgba(255,255,255,.06);
+    0 1px 2px rgba(0,0,0,.3),
+    0 24px 60px rgba(0,0,0,.55),
+    0 8px 24px rgba(80,83,232,.22),
+    inset 0 1px 0 var(--login-card-glow);
 }
 @keyframes cardIn {
-  from { opacity: 0; transform: translateY(12px); }
-  to   { opacity: 1; transform: translateY(0); }
+  from { opacity: 0; transform: translateY(14px) scale(.985); }
+  to   { opacity: 1; transform: translateY(0)    scale(1); }
 }
 
-.login-card .form-group label { color: var(--text2); }
+.login-card .form-group label {
+  color: var(--text2);
+  font-size: 12px; font-weight: 600; letter-spacing: .3px;
+  margin-bottom: 8px; display: block;
+}
 .login-card .form-group input {
+  width: 100%;
+  height: 44px;
+  padding: 0 16px;
   background: var(--login-input-bg);
   border: 1px solid var(--login-input-border);
+  border-radius: 10px;
   color: var(--text);
+  font-size: 14px;
+  outline: none;
   transition: border var(--transition), box-shadow var(--transition), background var(--transition);
 }
 .login-card .form-group input::placeholder { color: var(--text3); }
 .login-card .form-group input:focus {
   border-color: var(--login-accent);
-  box-shadow: 0 0 0 3px rgba(80,83,232,.14);
+  box-shadow:
+    0 0 0 4px rgba(80,83,232,.12),
+    inset 0 1px 2px rgba(80,83,232,.05);
   background: var(--login-input-bg-focus);
 }
 .login-card .error-msg {
   background: var(--danger-bg); border: 1px solid rgba(239,68,68,.18);
   color: var(--danger);
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: 13px;
+  margin: 0 0 12px;
 }
 [data-theme="dark"] .login-card .error-msg {
   background: rgba(239,68,68,.16); border-color: rgba(239,68,68,.28);
   color: #fca5a5;
 }
+/* Button — purple gradient with an animated underglow that blooms on hover.
+ * The underglow is a separate ::before layer so the button face stays crisp
+ * while the halo blooms behind it. Active state flattens the lift. */
 .login-card #login-btn {
-  background: linear-gradient(135deg, var(--login-accent), var(--login-accent-2));
-  border: none; font-weight: 600; letter-spacing: .3px;
+  position: relative;
+  width: 100%; height: 44px; padding: 0 16px;
+  background: linear-gradient(135deg, var(--login-accent) 0%, var(--login-accent-2) 100%);
+  border: none; border-radius: 10px;
+  font-weight: 600; font-size: 14px; letter-spacing: .3px;
   color: #ffffff;
-  transition: all var(--transition);
+  transition: transform .15s ease, box-shadow .25s ease, filter .15s ease;
+  isolation: isolate;
+}
+.login-card #login-btn::before {
+  content: ""; position: absolute; inset: 0;
+  border-radius: 10px;
+  background: linear-gradient(135deg, var(--login-accent-2), var(--login-accent));
+  opacity: 0;
+  box-shadow: 0 8px 28px rgba(80,83,232,.45);
+  transition: opacity .25s ease;
+  z-index: -1;
 }
 .login-card #login-btn:hover {
-  background: linear-gradient(135deg, var(--login-accent-2), var(--login-accent));
-  box-shadow: 0 6px 20px rgba(80,83,232,.35);
   transform: translateY(-1px);
+  filter: saturate(1.05);
 }
+.login-card #login-btn:hover::before { opacity: 1; }
 .login-card #login-btn:active {
   transform: translateY(0);
-  box-shadow: 0 2px 8px rgba(80,83,232,.25);
+  filter: saturate(.98);
+}
+.login-card #login-btn:disabled {
+  opacity: .6; cursor: not-allowed; filter: grayscale(.3);
 }
 
-.login-brand { text-align: center; margin-bottom: 32px; position: relative; }
-/* Diamond mark — small, in purple accent. Replaces the 5-dot cluster; less
- * visual noise, brand color carried by a single element. */
-.login-brand::before {
-  content: ""; display: block; width: 12px; height: 12px; margin: 0 auto 14px;
-  background: linear-gradient(135deg, var(--login-accent), var(--login-accent-2));
-  transform: rotate(45deg);
-  border-radius: 2px;
-  box-shadow: 0 4px 12px rgba(80,83,232,.3);
+/* Brand block — logo + name + tagline stacked, centered. Logo carries the
+ * brand color so it's the most visible element on the card; name and
+ * tagline use neutral text colors so they don't compete.
+ *
+ * Brand mark is the same diamond+4-dots icon used in /misc/logo.svg, just
+ * scaled larger for the login surface. Keeping the icon identical across
+ * README, login, etc. is what makes the brand recognizable. */
+.login-brand {
+  text-align: center;
+  margin-bottom: 36px;
+  display: flex; flex-direction: column; align-items: center;
+  gap: 14px;
+}
+/* Brand mark — same diamond+4-dots icon as /misc/logo.svg. Wraps in a
+ * relative box so the halo pseudo-element can sit behind the SVG. Static
+ * drop-shadow gives weight; a slow halo pulse breathes around it so the
+ * card never feels inert. Reduced-motion users get a static halo only. */
+.brand-mark-wrap {
+  position: relative;
+  width: 56px; height: 56px;
+  display: flex; align-items: center; justify-content: center;
+}
+.brand-mark {
+  width: 56px; height: 56px;
+  display: block;
+  filter: drop-shadow(0 6px 16px rgba(80,83,232,.35));
+  position: relative; z-index: 1;
+}
+.brand-mark-halo {
+  position: absolute; inset: -14px;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(80,83,232,.22) 0%, transparent 70%);
+  z-index: 0; pointer-events: none;
+  animation: brandPulse 6s ease-in-out infinite;
+}
+@keyframes brandPulse {
+  0%, 100% { opacity: .55; transform: scale(.9); }
+  50%      { opacity: 1;   transform: scale(1.1); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .brand-mark-halo { animation: none; opacity: .7; }
 }
 .login-brand .brand-name {
-  font-family: var(--mono); font-size: 32px; font-weight: 700; letter-spacing: 4px;
+  font-family: var(--mono); font-size: 28px; font-weight: 700; letter-spacing: 4px;
   color: var(--text);
+  line-height: 1;
 }
 .login-brand .brand-tagline {
-  color: var(--text3); font-size: 11px; letter-spacing: 3px;
-  text-transform: uppercase; margin-top: 8px; font-weight: 500;
+  color: var(--text3); font-size: 11px; letter-spacing: 2.5px;
+  text-transform: uppercase; margin-top: 2px; font-weight: 500;
+  line-height: 1;
 }
 .form-group { margin-bottom: 18px; }
 .form-group.hidden { display: none; }
 .login-hint {
   text-align: center; color: var(--text3);
-  font-size: 13px; margin: 0 0 24px; line-height: 1.5;
+  font-size: 13px; margin: 0 0 28px; line-height: 1.5;
   letter-spacing: .2px;
 }
-.admin-toggle {
-  display: block; text-align: center; margin-top: 18px;
-  font-size: 12px; color: var(--text3); text-decoration: none;
-  letter-spacing: .3px; cursor: pointer;
-  transition: color var(--transition);
+.admin-toggle-wrap {
+  margin-top: 20px;
+  padding-top: 18px;
+  border-top: 1px solid var(--login-card-border);
+  text-align: center;
+  position: relative;
 }
-.admin-toggle:hover { color: var(--login-accent); }
+.admin-toggle-wrap::before {
+  /* Subtle gradient fade on the divider so it doesn't read as a hard line. */
+  content: ""; position: absolute; left: 0; right: 0; top: 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--login-card-border) 25%, var(--login-card-border) 75%, transparent);
+}
+.admin-toggle {
+  display: inline-block;
+  font-size: 13px; color: var(--text3); text-decoration: none;
+  letter-spacing: .3px; cursor: pointer;
+  transition: color var(--transition), transform .2s ease;
+}
+.admin-toggle:hover {
+  color: var(--login-accent);
+  transform: translateY(-1px);
+}
 .form-group label {
   display: block; font-weight: 600; margin-bottom: 6px;
   font-size: 12px; color: var(--text3); letter-spacing: .4px;
@@ -323,15 +531,12 @@ input, select, textarea { font-family: var(--font); font-size: 14px; }
   box-shadow: 0 0 0 3px var(--primary-bg);
   background: var(--surface);
 }
-#login-btn {
-  width: 100%; padding: 11px; background: var(--primary); color: #fff;
-  border: none; border-radius: var(--radius-sm); font-weight: 600;
-  margin-top: 6px; letter-spacing: .3px;
-  transition: background var(--transition), transform .1s ease;
-}
-#login-btn:hover { background: var(--primary-h); }
-#login-btn:active { transform: scale(.985); }
-#login-btn:disabled { opacity: .5; cursor: not-allowed; }
+/* Legacy fallback `#login-btn` rules removed — the button is fully
+ * styled by the `.login-card #login-btn` block above, and these legacy
+ * `background: var(--primary)` (orange #e8740c) rules were the source of
+ * the yellow flash on hover when the more specific selectors momentarily
+ * ceded specificity (e.g. during transition). The login button should
+ * only ever render in the brand purple. */
 .error-msg {
   color: var(--danger); font-size: 13px; margin-top: 12px; text-align: center;
   padding: 10px; background: var(--danger-bg); border-radius: var(--radius-sm);

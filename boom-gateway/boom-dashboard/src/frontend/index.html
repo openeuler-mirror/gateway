@@ -16,11 +16,36 @@
 </head>
 <body>
   <div id="app">
-    <!-- Login Page -->
+    <!-- Login Page — Aurora stage: ambient purple pools over a faint grid +
+         noise texture. Card sits centered with multi-layer shadow + inner
+         glow. References Linear / Vercel / Stripe login aesthetics. -->
     <div id="page-login" class="page active">
-      <div class="login-ambient" aria-hidden="true"></div>
+      <div class="login-aurora" aria-hidden="true"></div>
+      <!-- Three slow-swimming light blobs — revived from v1 (6bc7a3b) per
+           feedback: the page felt static. Trajectories preserved (swim1/2/3);
+           colors rebased onto the purple Aurora palette so they read as
+           drifting brand-colored light, not foreign decoration. -->
+      <div class="login-creature sc-1" aria-hidden="true"></div>
+      <div class="login-creature sc-2" aria-hidden="true"></div>
+      <div class="login-creature sc-3" aria-hidden="true"></div>
+      <div class="login-grid" aria-hidden="true"></div>
+      <div class="login-noise" aria-hidden="true"></div>
       <div class="login-card">
+        <div class="login-card-glow" aria-hidden="true"></div>
         <div class="login-brand">
+          <div class="brand-mark-wrap">
+            <span class="brand-mark-halo" aria-hidden="true"></span>
+            <svg class="brand-mark" viewBox="0 0 48 48" width="48" height="48" aria-hidden="true">
+              <!-- Diamond + 4 dots — matches the mark in /misc/logo.svg (purple palette). -->
+              <g transform="translate(24,24)">
+                <rect x="-7" y="-7" width="14" height="14" fill="#5053e8" transform="rotate(45)" rx="1.5"/>
+                <circle cx="-18" cy="0" r="3" fill="rgba(80,83,232,0.35)"/>
+                <circle cx="18" cy="0" r="3" fill="rgba(80,83,232,0.35)"/>
+                <circle cx="0" cy="-18" r="3" fill="rgba(80,83,232,0.35)"/>
+                <circle cx="0" cy="18" r="3" fill="rgba(80,83,232,0.35)"/>
+              </g>
+            </svg>
+          </div>
           <div class="brand-name" data-i18n="brand.name">BooM</div>
           <div class="brand-tagline" data-i18n="brand.tagline">Gateway Dashboard</div>
         </div>
@@ -35,7 +60,9 @@
           </div>
           <button type="submit" id="login-btn" data-i18n="login.submit">Login</button>
           <p id="login-error" class="error-msg hidden"></p>
-          <a href="#" class="admin-toggle" id="admin-toggle" data-i18n="login.admin_link">Admin sign in →</a>
+          <div class="admin-toggle-wrap">
+            <a href="#" class="admin-toggle" id="admin-toggle" data-i18n="login.admin_link">Admin sign in →</a>
+          </div>
         </form>
       </div>
     </div>
