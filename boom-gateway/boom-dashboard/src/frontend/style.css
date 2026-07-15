@@ -63,17 +63,21 @@
   --sidebar-gradient-2: #7879f0;
   --sidebar-gradient-3: #a1a4f7;
 
-  /* Login page gradient — same hue family as sidebar. Shares #5053e8 → #a1a4f7
-     so login reads as part of the same product, not a separate surface. */
-  --login-gradient-1: #5053e8;
-  --login-gradient-2: #7879f0;
-  --login-gradient-3: #a1a4f7;
+  /* Login — neutral background + purple accent (Linear/Vercel/Stripe style).
+   * Background is near-white so the card reads as the focal point; ambient
+   * pools add a faint brand wash without competing. Card is solid (not
+   * glass) with a defined shadow + subtle purple glow. */
+  --login-bg:            #f5f6fa;
+  --login-ambient-1:     rgba(80,83,232,.10);
+  --login-ambient-2:     rgba(161,164,247,.12);
+  --login-card-bg:      #ffffff;
+  --login-card-border:  #e4e7ee;
+  --login-input-bg:     #f7f8fb;
+  --login-input-border: #d8dce5;
+  --login-input-bg-focus: #ffffff;
 
-  /* Login accent — used for focus rings, button gradient, hover links.
-     Lighter than --primary (#e8740c, orange) because the orange fights the
-     purple backdrop. Keep orange as the dashboard's action color inside the
-     app where it has white surfaces to sit on; login sits on the purple
-     gradient itself, so a purple accent harmonizes. */
+  /* Login accent — purple gradient endpoints for button + focus ring +
+   * hover link. Same hue family as sidebar. */
   --login-accent:   #5053e8;
   --login-accent-2: #7879f0;
 
@@ -136,16 +140,20 @@
   --sidebar-gradient-2: #2a245e;
   --sidebar-gradient-3: #3a3170;
 
-  /* Login gradient — same deep-purple family as sidebar. The login page
-     takes up the whole viewport so a darker base reads less harsh on the
-     eyes than the bright light-mode gradient. Card still pops via the
-     purple-tinted glass surface defined on .login-card. */
-  --login-gradient-1: #1f1b4d;
-  --login-gradient-2: #2a245e;
-  --login-gradient-3: #3a3170;
+  /* Login — dark neutral background + dimmer ambient pools + slightly
+     lighter accent so the button/focus ring stays visible against the
+     near-black base. Card is solid dark, not glass. */
+  --login-bg:            #0a0c14;
+  --login-ambient-1:     rgba(80,83,232,.16);
+  --login-ambient-2:     rgba(161,164,247,.10);
+  --login-card-bg:       #15182a;
+  --login-card-border:   #2a2f4e;
+  --login-input-bg:      #0e1018;
+  --login-input-border:  #2a2f4e;
+  --login-input-bg-focus:#1a1e30;
 
   /* Login accent — brighter than sidebar gradient so focus rings / buttons
-     stay visible on the deep purple background. */
+     stay visible on the deep dark background. */
   --login-accent:   #7879f0;
   --login-accent-2: #a1a4f7;
 
@@ -182,236 +190,123 @@ input, select, textarea { font-family: var(--font); font-size: 14px; }
 .page.active { display: flex; }
 
 /* ── Login ────────────────────────────────────────────────
- * Brand-aligned blue-purple gradient. Matches the admin sidebar's
- * --sidebar-gradient-1/2/3 palette so the login page reads as part of
- * the same product, not a separate surface.
+ * Neutral background + purple accent. Pattern follows Linear/Vercel/
+ * Stripe: low-saturation backdrop so the card becomes the focal point,
+ * purple appears only on button, focus ring, and hover link.
  * ───────────────────────────────────────────────────────── */
 #page-login {
   align-items: center; justify-content: center;
   position: relative; overflow: hidden;
-  background:
-    radial-gradient(ellipse at 20% 0%, rgba(255,255,255,.15) 0%, transparent 50%),
-    radial-gradient(ellipse at 80% 100%, rgba(255,255,255,.08) 0%, transparent 50%),
-    linear-gradient(135deg, var(--login-gradient-1) 0%, var(--login-gradient-2) 50%, var(--login-gradient-3) 100%);
+  background: var(--login-bg);
 }
 [data-theme="dark"] #page-login {
+  background: var(--login-bg);
+}
+
+/* Ambient purple wash — barely visible, gives the neutral background a
+ * hint of brand color without competing with the card. Two soft radial
+ * pools anchored to opposite corners, no animation. */
+.login-ambient {
+  position: absolute; inset: 0;
+  pointer-events: none; z-index: 0;
   background:
-    radial-gradient(ellipse at 20% 0%, rgba(255,255,255,.06) 0%, transparent 50%),
-    radial-gradient(ellipse at 80% 100%, rgba(255,255,255,.04) 0%, transparent 50%),
-    linear-gradient(135deg, var(--login-gradient-1) 0%, var(--login-gradient-2) 50%, var(--login-gradient-3) 100%);
-}
-
-/* ── Ambient light blobs ─────────────────────────────────
- * Same "swim" animation concept, but colors rebased onto the purple
- * palette so they layer naturally on the gradient instead of feeling
- * like a separate teal accent. All three are white-tinted translucencies
- * over the purple base, so they read as light reflections rather than
- * colored creatures.
- * ───────────────────────────────────────────────────────── */
-.sea-creature {
-  position: absolute;
-  border-radius: 50%;
-  pointer-events: none;
-  z-index: 0;
-  will-change: transform;
-}
-/* Blob 1 — large, slow, top-left, brightest */
-.sc-1 {
-  width: 550px; height: 240px;
-  bottom: 10%; left: -120px;
-  background: radial-gradient(ellipse, rgba(255,255,255,.22) 0%, rgba(255,255,255,.06) 50%, transparent 70%);
-  filter: blur(55px);
-  animation: swim1 26s ease-in-out infinite;
-}
-[data-theme="dark"] .sc-1 {
-  background: radial-gradient(ellipse, rgba(255,255,255,.12) 0%, rgba(255,255,255,.03) 50%, transparent 70%);
-}
-@keyframes swim1 {
-  0%   { transform: translate(0, 0) scaleX(1); }
-  15%  { transform: translate(30vw, -18vh) scaleX(1.1); }
-  35%  { transform: translate(65vw, -8vh) scaleX(.95); }
-  55%  { transform: translate(40vw, 12vh) scaleX(1.06); }
-  75%  { transform: translate(10vw, -5vh) scaleX(.98); }
-  100% { transform: translate(0, 0) scaleX(1); }
-}
-
-/* Blob 2 — medium, deep purple, mid-upper-right */
-.sc-2 {
-  width: 420px; height: 190px;
-  top: 15%; right: -100px;
-  background: radial-gradient(ellipse, rgba(80,83,232,.35) 0%, rgba(120,121,240,.12) 50%, transparent 70%);
-  filter: blur(48px);
-  animation: swim2 20s ease-in-out infinite;
-  animation-delay: -7s;
-}
-[data-theme="dark"] .sc-2 {
-  background: radial-gradient(ellipse, rgba(80,83,232,.45) 0%, rgba(120,121,240,.18) 50%, transparent 70%);
-}
-@keyframes swim2 {
-  0%   { transform: translate(0, 0) scaleX(1); }
-  20%  { transform: translate(-35vw, 20vh) scaleX(1.05); }
-  45%  { transform: translate(-70vw, 5vh) scaleX(.96); }
-  70%  { transform: translate(-30vw, -15vh) scaleX(1.08); }
-  100% { transform: translate(0, 0) scaleX(1); }
-}
-
-/* Blob 3 — small, light lavender, center */
-.sc-3 {
-  width: 320px; height: 140px;
-  top: 40%; left: 20%;
-  background: radial-gradient(ellipse, rgba(161,164,247,.3) 0%, rgba(161,164,247,.08) 50%, transparent 70%);
-  filter: blur(42px);
-  animation: swim3 15s ease-in-out infinite;
-  animation-delay: -4s;
-}
-[data-theme="dark"] .sc-3 {
-  background: radial-gradient(ellipse, rgba(161,164,247,.25) 0%, rgba(161,164,247,.06) 50%, transparent 70%);
-}
-@keyframes swim3 {
-  0%   { transform: translate(0, 0) scaleX(1); }
-  25%  { transform: translate(20vw, -25vh) scaleX(1.12); }
-  50%  { transform: translate(50vw, 10vh) scaleX(.9); }
-  75%  { transform: translate(15vw, 20vh) scaleX(1.06); }
-  100% { transform: translate(0, 0) scaleX(1); }
+    radial-gradient(ellipse 60% 50% at 15% 10%, var(--login-ambient-1) 0%, transparent 60%),
+    radial-gradient(ellipse 50% 60% at 85% 90%, var(--login-ambient-2) 0%, transparent 60%);
 }
 
 .login-card {
   position: relative; z-index: 1;
-  background: rgba(255,255,255,.45);
-  border: 1px solid rgba(255,255,255,.6);
-  border-radius: 24px; padding: 48px 44px; width: 420px;
-  backdrop-filter: blur(40px) saturate(1.8) brightness(1.05);
-  -webkit-backdrop-filter: blur(40px) saturate(1.8) brightness(1.05);
+  background: var(--login-card-bg);
+  border: 1px solid var(--login-card-border);
+  border-radius: 20px; padding: 44px 40px; width: 400px;
   box-shadow:
-    0 24px 80px rgba(80,83,232,.12),
-    0 8px 24px rgba(0,0,0,.06),
-    inset 0 1px 1px rgba(255,255,255,.85),
-    inset 0 -1px 1px rgba(255,255,255,.35);
-  animation: cardIn .5s cubic-bezier(.16,1,.3,1);
-  overflow: hidden;
-}
-/* Liquid glass specular highlight — slow drifting light reflection */
-.login-card::before {
-  content: "";
-  position: absolute; top: -50%; left: -50%;
-  width: 200%; height: 200%;
-  background: radial-gradient(ellipse at 30% 20%, rgba(255,255,255,.4) 0%, transparent 50%);
-  animation: glassReflect 8s ease-in-out infinite alternate;
-  pointer-events: none;
-}
-@keyframes glassReflect {
-  0%   { transform: translate(0, 0) rotate(0deg); }
-  100% { transform: translate(15%, 10%) rotate(3deg); }
+    0 24px 60px rgba(0,0,0,.08),
+    0 8px 24px rgba(80,83,232,.08),
+    inset 0 1px 0 rgba(255,255,255,.6);
+  animation: cardIn .4s cubic-bezier(.16,1,.3,1);
 }
 [data-theme="dark"] .login-card {
-  background: rgba(31,27,77,.55);
-  border-color: rgba(255,255,255,.18);
+  background: var(--login-card-bg);
+  border-color: var(--login-card-border);
   box-shadow:
-    0 24px 80px rgba(0,0,0,.5),
-    0 8px 24px rgba(80,83,232,.2),
-    inset 0 1px 1px rgba(255,255,255,.12),
-    inset 0 -1px 1px rgba(255,255,255,.04);
+    0 24px 60px rgba(0,0,0,.5),
+    0 8px 24px rgba(80,83,232,.18),
+    inset 0 1px 0 rgba(255,255,255,.06);
 }
-[data-theme="dark"] .login-card::before {
-  background: radial-gradient(ellipse at 30% 20%, rgba(255,255,255,.1) 0%, transparent 50%);
+@keyframes cardIn {
+  from { opacity: 0; transform: translateY(12px); }
+  to   { opacity: 1; transform: translateY(0); }
 }
-.login-card .form-group label { color: var(--text3); }
+
+.login-card .form-group label { color: var(--text2); }
 .login-card .form-group input {
-  background: rgba(255,255,255,.5);
-  border-color: rgba(255,255,255,.65);
+  background: var(--login-input-bg);
+  border: 1px solid var(--login-input-border);
   color: var(--text);
+  transition: border var(--transition), box-shadow var(--transition), background var(--transition);
 }
 .login-card .form-group input::placeholder { color: var(--text3); }
 .login-card .form-group input:focus {
   border-color: var(--login-accent);
-  box-shadow: 0 0 0 3px rgba(80,83,232,.18);
-  background: rgba(255,255,255,.7);
-}
-[data-theme="dark"] .login-card .form-group label { color: rgba(255,255,255,.6); }
-[data-theme="dark"] .login-card .form-group input {
-  background: rgba(255,255,255,.08);
-  border-color: rgba(255,255,255,.16);
-  color: #fff;
-}
-[data-theme="dark"] .login-card .form-group input::placeholder { color: rgba(255,255,255,.35); }
-[data-theme="dark"] .login-card .form-group input:focus {
-  border-color: var(--login-accent);
-  box-shadow: 0 0 0 3px rgba(120,121,240,.25);
-  background: rgba(255,255,255,.12);
+  box-shadow: 0 0 0 3px rgba(80,83,232,.14);
+  background: var(--login-input-bg-focus);
 }
 .login-card .error-msg {
   background: var(--danger-bg); border: 1px solid rgba(239,68,68,.18);
   color: var(--danger);
 }
 [data-theme="dark"] .login-card .error-msg {
-  background: rgba(239,68,68,.18); border-color: rgba(239,68,68,.28);
+  background: rgba(239,68,68,.16); border-color: rgba(239,68,68,.28);
   color: #fca5a5;
 }
 .login-card #login-btn {
   background: linear-gradient(135deg, var(--login-accent), var(--login-accent-2));
-  border: none; font-weight: 700; letter-spacing: .5px;
+  border: none; font-weight: 600; letter-spacing: .3px;
   color: #ffffff;
   transition: all var(--transition);
 }
 .login-card #login-btn:hover {
   background: linear-gradient(135deg, var(--login-accent-2), var(--login-accent));
-  box-shadow: 0 6px 24px rgba(80,83,232,.4);
+  box-shadow: 0 6px 20px rgba(80,83,232,.35);
   transform: translateY(-1px);
 }
 .login-card #login-btn:active {
   transform: translateY(0);
+  box-shadow: 0 2px 8px rgba(80,83,232,.25);
 }
-@keyframes cardIn {
-  from { opacity: 0; transform: translateY(12px); }
-  to   { opacity: 1; transform: translateY(0); }
-}
-.login-brand { text-align: center; margin-bottom: 36px; position: relative; }
+
+.login-brand { text-align: center; margin-bottom: 32px; position: relative; }
+/* Diamond mark — small, in purple accent. Replaces the 5-dot cluster; less
+ * visual noise, brand color carried by a single element. */
 .login-brand::before {
-  content: ""; display: block; width: 10px; height: 10px; margin: 0 auto 16px;
-  background: #ffffff; transform: rotate(45deg);
-  box-shadow:
-    -12px 0 0 0 rgba(255,255,255,.5),
-    12px 0 0 0 rgba(255,255,255,.5),
-    0 -12px 0 0 rgba(255,255,255,.5),
-    0 12px 0 0 rgba(255,255,255,.5);
+  content: ""; display: block; width: 12px; height: 12px; margin: 0 auto 14px;
+  background: linear-gradient(135deg, var(--login-accent), var(--login-accent-2));
+  transform: rotate(45deg);
+  border-radius: 2px;
+  box-shadow: 0 4px 12px rgba(80,83,232,.3);
 }
 .login-brand .brand-name {
-  font-family: var(--mono); font-size: 38px; font-weight: 700; letter-spacing: 6px;
-  color: #ffffff;
-  background: linear-gradient(135deg, #ffffff 0%, rgba(255,255,255,.75) 50%, #ffffff 100%);
-  background-size: 200% 200%;
-  -webkit-background-clip: text; -webkit-text-fill-color: transparent;
-  background-clip: text;
-  animation: brand-shimmer 4s ease-in-out infinite;
-}
-@keyframes brand-shimmer {
-  0%, 100% { background-position: 0% 50%; }
-  50% { background-position: 100% 50%; }
+  font-family: var(--mono); font-size: 32px; font-weight: 700; letter-spacing: 4px;
+  color: var(--text);
 }
 .login-brand .brand-tagline {
-  color: rgba(255,255,255,.7); font-size: 11px; letter-spacing: 3.5px;
-  text-transform: uppercase; margin-top: 10px; font-weight: 500;
-}
-[data-theme="dark"] .login-brand .brand-tagline {
-  color: rgba(255,255,255,.55);
+  color: var(--text3); font-size: 11px; letter-spacing: 3px;
+  text-transform: uppercase; margin-top: 8px; font-weight: 500;
 }
 .form-group { margin-bottom: 18px; }
 .form-group.hidden { display: none; }
 .login-hint {
   text-align: center; color: var(--text3);
-  font-size: 13px; margin: 0 0 22px; line-height: 1.5;
+  font-size: 13px; margin: 0 0 24px; line-height: 1.5;
   letter-spacing: .2px;
 }
-[data-theme="dark"] .login-hint { color: rgba(255,255,255,.5); }
 .admin-toggle {
   display: block; text-align: center; margin-top: 18px;
   font-size: 12px; color: var(--text3); text-decoration: none;
-  letter-spacing: .4px; cursor: pointer;
+  letter-spacing: .3px; cursor: pointer;
   transition: color var(--transition);
 }
 .admin-toggle:hover { color: var(--login-accent); }
-[data-theme="dark"] .admin-toggle { color: rgba(255,255,255,.45); }
-[data-theme="dark"] .admin-toggle:hover { color: var(--login-accent-2); }
 .form-group label {
   display: block; font-weight: 600; margin-bottom: 6px;
   font-size: 12px; color: var(--text3); letter-spacing: .4px;
