@@ -532,6 +532,7 @@
 
       "alert.cannot_delete_team": "Cannot delete team: {count} key(s) still assigned.",
       "alert.config_reloaded": "Config reloaded successfully",
+      "alert.reload_failed": "Reload aborted: {message}\n\nThe gateway is still running with the previous config — fix the issue and try again.",
       "alert.done": "Done",
     },
     zh: {
@@ -1057,6 +1058,7 @@
 
       "alert.cannot_delete_team": "无法删除团队：仍有 {count} 个密钥分配。",
       "alert.config_reloaded": "配置已成功重载",
+      "alert.reload_failed": "本次热加载未生效：{message}\n\n网关仍按上一次配置运行，请修复问题后重试。",
       "alert.done": "完成",
     },
   };

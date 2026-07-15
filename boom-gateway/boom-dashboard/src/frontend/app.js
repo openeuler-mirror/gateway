@@ -2501,7 +2501,7 @@
         const data = await api("/admin/config/reload", { method: "POST" });
         alert(data.message || t("alert.config_reloaded"));
         onRoute();
-      } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
+      } catch (err) { alert(t("alert.reload_failed", { message: err.message })); }
       finally {
         btnReload.disabled = false;
         btnReload.textContent = t("action.reload_config");
