@@ -63,6 +63,20 @@
   --sidebar-gradient-2: #7879f0;
   --sidebar-gradient-3: #a1a4f7;
 
+  /* Login page gradient — same hue family as sidebar. Shares #5053e8 → #a1a4f7
+     so login reads as part of the same product, not a separate surface. */
+  --login-gradient-1: #5053e8;
+  --login-gradient-2: #7879f0;
+  --login-gradient-3: #a1a4f7;
+
+  /* Login accent — used for focus rings, button gradient, hover links.
+     Lighter than --primary (#e8740c, orange) because the orange fights the
+     purple backdrop. Keep orange as the dashboard's action color inside the
+     app where it has white surfaces to sit on; login sits on the purple
+     gradient itself, so a purple accent harmonizes. */
+  --login-accent:   #5053e8;
+  --login-accent-2: #7879f0;
+
   /* Scrollbar */
   --scrollbar-track: transparent;
   --scrollbar-thumb: var(--border);
@@ -122,6 +136,19 @@
   --sidebar-gradient-2: #2a245e;
   --sidebar-gradient-3: #3a3170;
 
+  /* Login gradient — same deep-purple family as sidebar. The login page
+     takes up the whole viewport so a darker base reads less harsh on the
+     eyes than the bright light-mode gradient. Card still pops via the
+     purple-tinted glass surface defined on .login-card. */
+  --login-gradient-1: #1f1b4d;
+  --login-gradient-2: #2a245e;
+  --login-gradient-3: #3a3170;
+
+  /* Login accent — brighter than sidebar gradient so focus rings / buttons
+     stay visible on the deep purple background. */
+  --login-accent:   #7879f0;
+  --login-accent-2: #a1a4f7;
+
   --scrollbar-thumb: var(--border);
   --scrollbar-hover: var(--border2);
 
@@ -154,17 +181,33 @@ input, select, textarea { font-family: var(--font); font-size: 14px; }
 .page { display: none; height: 100vh; }
 .page.active { display: flex; }
 
-/* ── Login ──────────────────────────────────────────────── */
+/* ── Login ────────────────────────────────────────────────
+ * Brand-aligned blue-purple gradient. Matches the admin sidebar's
+ * --sidebar-gradient-1/2/3 palette so the login page reads as part of
+ * the same product, not a separate surface.
+ * ───────────────────────────────────────────────────────── */
 #page-login {
   align-items: center; justify-content: center;
   position: relative; overflow: hidden;
-  background: linear-gradient(180deg, #eef2f7 0%, #e8eff8 40%, #dce8f4 100%);
+  background:
+    radial-gradient(ellipse at 20% 0%, rgba(255,255,255,.15) 0%, transparent 50%),
+    radial-gradient(ellipse at 80% 100%, rgba(255,255,255,.08) 0%, transparent 50%),
+    linear-gradient(135deg, var(--login-gradient-1) 0%, var(--login-gradient-2) 50%, var(--login-gradient-3) 100%);
 }
 [data-theme="dark"] #page-login {
-  background: linear-gradient(180deg, #0a0e18 0%, #0b1120 40%, #0d1528 100%);
+  background:
+    radial-gradient(ellipse at 20% 0%, rgba(255,255,255,.06) 0%, transparent 50%),
+    radial-gradient(ellipse at 80% 100%, rgba(255,255,255,.04) 0%, transparent 50%),
+    linear-gradient(135deg, var(--login-gradient-1) 0%, var(--login-gradient-2) 50%, var(--login-gradient-3) 100%);
 }
 
-/* ── Sea creatures ──────────────────────────────────────── */
+/* ── Ambient light blobs ─────────────────────────────────
+ * Same "swim" animation concept, but colors rebased onto the purple
+ * palette so they layer naturally on the gradient instead of feeling
+ * like a separate teal accent. All three are white-tinted translucencies
+ * over the purple base, so they read as light reflections rather than
+ * colored creatures.
+ * ───────────────────────────────────────────────────────── */
 .sea-creature {
   position: absolute;
   border-radius: 50%;
@@ -172,16 +215,16 @@ input, select, textarea { font-family: var(--font); font-size: 14px; }
   z-index: 0;
   will-change: transform;
 }
-/* Creature 1 — large, slow, deep teal — patrols lower-mid area */
+/* Blob 1 — large, slow, top-left, brightest */
 .sc-1 {
   width: 550px; height: 240px;
   bottom: 10%; left: -120px;
-  background: radial-gradient(ellipse, rgba(56,189,176,.18) 0%, rgba(45,130,140,.08) 50%, transparent 70%);
+  background: radial-gradient(ellipse, rgba(255,255,255,.22) 0%, rgba(255,255,255,.06) 50%, transparent 70%);
   filter: blur(55px);
   animation: swim1 26s ease-in-out infinite;
 }
 [data-theme="dark"] .sc-1 {
-  background: radial-gradient(ellipse, rgba(56,189,176,.22) 0%, rgba(34,211,238,.08) 50%, transparent 70%);
+  background: radial-gradient(ellipse, rgba(255,255,255,.12) 0%, rgba(255,255,255,.03) 50%, transparent 70%);
 }
 @keyframes swim1 {
   0%   { transform: translate(0, 0) scaleX(1); }
@@ -192,17 +235,17 @@ input, select, textarea { font-family: var(--font); font-size: 14px; }
   100% { transform: translate(0, 0) scaleX(1); }
 }
 
-/* Creature 2 — medium, indigo — wanders mid-upper area */
+/* Blob 2 — medium, deep purple, mid-upper-right */
 .sc-2 {
   width: 420px; height: 190px;
   top: 15%; right: -100px;
-  background: radial-gradient(ellipse, rgba(99,102,241,.12) 0%, rgba(139,92,246,.06) 50%, transparent 70%);
+  background: radial-gradient(ellipse, rgba(80,83,232,.35) 0%, rgba(120,121,240,.12) 50%, transparent 70%);
   filter: blur(48px);
   animation: swim2 20s ease-in-out infinite;
   animation-delay: -7s;
 }
 [data-theme="dark"] .sc-2 {
-  background: radial-gradient(ellipse, rgba(129,140,248,.18) 0%, rgba(139,92,246,.08) 50%, transparent 70%);
+  background: radial-gradient(ellipse, rgba(80,83,232,.45) 0%, rgba(120,121,240,.18) 50%, transparent 70%);
 }
 @keyframes swim2 {
   0%   { transform: translate(0, 0) scaleX(1); }
@@ -212,17 +255,17 @@ input, select, textarea { font-family: var(--font); font-size: 14px; }
   100% { transform: translate(0, 0) scaleX(1); }
 }
 
-/* Creature 3 — small, cyan — darts around center */
+/* Blob 3 — small, light lavender, center */
 .sc-3 {
   width: 320px; height: 140px;
   top: 40%; left: 20%;
-  background: radial-gradient(ellipse, rgba(34,211,238,.1) 0%, rgba(6,182,212,.04) 50%, transparent 70%);
+  background: radial-gradient(ellipse, rgba(161,164,247,.3) 0%, rgba(161,164,247,.08) 50%, transparent 70%);
   filter: blur(42px);
   animation: swim3 15s ease-in-out infinite;
   animation-delay: -4s;
 }
 [data-theme="dark"] .sc-3 {
-  background: radial-gradient(ellipse, rgba(34,211,238,.2) 0%, rgba(6,182,212,.08) 50%, transparent 70%);
+  background: radial-gradient(ellipse, rgba(161,164,247,.25) 0%, rgba(161,164,247,.06) 50%, transparent 70%);
 }
 @keyframes swim3 {
   0%   { transform: translate(0, 0) scaleX(1); }
@@ -231,17 +274,19 @@ input, select, textarea { font-family: var(--font); font-size: 14px; }
   75%  { transform: translate(15vw, 20vh) scaleX(1.06); }
   100% { transform: translate(0, 0) scaleX(1); }
 }
+
 .login-card {
   position: relative; z-index: 1;
   background: rgba(255,255,255,.45);
-  border: 1px solid rgba(255,255,255,.5);
+  border: 1px solid rgba(255,255,255,.6);
   border-radius: 24px; padding: 48px 44px; width: 420px;
   backdrop-filter: blur(40px) saturate(1.8) brightness(1.05);
   -webkit-backdrop-filter: blur(40px) saturate(1.8) brightness(1.05);
   box-shadow:
-    0 24px 80px rgba(0,0,0,.06),
-    inset 0 1px 1px rgba(255,255,255,.8),
-    inset 0 -1px 1px rgba(255,255,255,.3);
+    0 24px 80px rgba(80,83,232,.12),
+    0 8px 24px rgba(0,0,0,.06),
+    inset 0 1px 1px rgba(255,255,255,.85),
+    inset 0 -1px 1px rgba(255,255,255,.35);
   animation: cardIn .5s cubic-bezier(.16,1,.3,1);
   overflow: hidden;
 }
@@ -250,7 +295,7 @@ input, select, textarea { font-family: var(--font); font-size: 14px; }
   content: "";
   position: absolute; top: -50%; left: -50%;
   width: 200%; height: 200%;
-  background: radial-gradient(ellipse at 30% 20%, rgba(255,255,255,.35) 0%, transparent 50%);
+  background: radial-gradient(ellipse at 30% 20%, rgba(255,255,255,.4) 0%, transparent 50%);
   animation: glassReflect 8s ease-in-out infinite alternate;
   pointer-events: none;
 }
@@ -259,55 +304,62 @@ input, select, textarea { font-family: var(--font); font-size: 14px; }
   100% { transform: translate(15%, 10%) rotate(3deg); }
 }
 [data-theme="dark"] .login-card {
-  background: rgba(30,34,48,.45);
-  border-color: rgba(255,255,255,.1);
+  background: rgba(31,27,77,.55);
+  border-color: rgba(255,255,255,.18);
   box-shadow:
-    0 24px 80px rgba(0,0,0,.4),
-    inset 0 1px 1px rgba(255,255,255,.08),
-    inset 0 -1px 1px rgba(255,255,255,.03);
+    0 24px 80px rgba(0,0,0,.5),
+    0 8px 24px rgba(80,83,232,.2),
+    inset 0 1px 1px rgba(255,255,255,.12),
+    inset 0 -1px 1px rgba(255,255,255,.04);
 }
 [data-theme="dark"] .login-card::before {
-  background: radial-gradient(ellipse at 30% 20%, rgba(255,255,255,.08) 0%, transparent 50%);
+  background: radial-gradient(ellipse at 30% 20%, rgba(255,255,255,.1) 0%, transparent 50%);
 }
 .login-card .form-group label { color: var(--text3); }
 .login-card .form-group input {
-  background: rgba(0,0,0,.03);
-  border-color: var(--border);
+  background: rgba(255,255,255,.5);
+  border-color: rgba(255,255,255,.65);
   color: var(--text);
 }
 .login-card .form-group input::placeholder { color: var(--text3); }
 .login-card .form-group input:focus {
-  border-color: var(--primary);
-  box-shadow: 0 0 0 3px var(--primary-bg);
-  background: var(--surface);
+  border-color: var(--login-accent);
+  box-shadow: 0 0 0 3px rgba(80,83,232,.18);
+  background: rgba(255,255,255,.7);
 }
-[data-theme="dark"] .login-card .form-group label { color: rgba(255,255,255,.55); }
+[data-theme="dark"] .login-card .form-group label { color: rgba(255,255,255,.6); }
 [data-theme="dark"] .login-card .form-group input {
-  background: rgba(255,255,255,.06);
-  border-color: rgba(255,255,255,.1);
+  background: rgba(255,255,255,.08);
+  border-color: rgba(255,255,255,.16);
   color: #fff;
 }
-[data-theme="dark"] .login-card .form-group input::placeholder { color: rgba(255,255,255,.3); }
+[data-theme="dark"] .login-card .form-group input::placeholder { color: rgba(255,255,255,.35); }
 [data-theme="dark"] .login-card .form-group input:focus {
-  border-color: var(--primary);
-  box-shadow: 0 0 0 3px rgba(232,116,12,.2);
-  background: rgba(255,255,255,.1);
+  border-color: var(--login-accent);
+  box-shadow: 0 0 0 3px rgba(120,121,240,.25);
+  background: rgba(255,255,255,.12);
 }
 .login-card .error-msg {
-  background: var(--danger-bg); border: 1px solid rgba(239,68,68,.12);
+  background: var(--danger-bg); border: 1px solid rgba(239,68,68,.18);
   color: var(--danger);
 }
 [data-theme="dark"] .login-card .error-msg {
-  background: rgba(239,68,68,.15); border-color: rgba(239,68,68,.2);
+  background: rgba(239,68,68,.18); border-color: rgba(239,68,68,.28);
   color: #fca5a5;
 }
 .login-card #login-btn {
-  background: linear-gradient(135deg, var(--primary), #f5a623);
+  background: linear-gradient(135deg, var(--login-accent), var(--login-accent-2));
   border: none; font-weight: 700; letter-spacing: .5px;
+  color: #ffffff;
+  transition: all var(--transition);
 }
 .login-card #login-btn:hover {
-  background: linear-gradient(135deg, var(--primary-h), #e8950c);
-  box-shadow: 0 4px 20px rgba(232,116,12,.25);
+  background: linear-gradient(135deg, var(--login-accent-2), var(--login-accent));
+  box-shadow: 0 6px 24px rgba(80,83,232,.4);
+  transform: translateY(-1px);
+}
+.login-card #login-btn:active {
+  transform: translateY(0);
 }
 @keyframes cardIn {
   from { opacity: 0; transform: translateY(12px); }
@@ -316,16 +368,17 @@ input, select, textarea { font-family: var(--font); font-size: 14px; }
 .login-brand { text-align: center; margin-bottom: 36px; position: relative; }
 .login-brand::before {
   content: ""; display: block; width: 10px; height: 10px; margin: 0 auto 16px;
-  background: var(--primary); transform: rotate(45deg);
+  background: #ffffff; transform: rotate(45deg);
   box-shadow:
-    -12px 0 0 0 var(--primary-glow),
-    12px 0 0 0 var(--primary-glow),
-    0 -12px 0 0 var(--primary-glow),
-    0 12px 0 0 var(--primary-glow);
+    -12px 0 0 0 rgba(255,255,255,.5),
+    12px 0 0 0 rgba(255,255,255,.5),
+    0 -12px 0 0 rgba(255,255,255,.5),
+    0 12px 0 0 rgba(255,255,255,.5);
 }
 .login-brand .brand-name {
   font-family: var(--mono); font-size: 38px; font-weight: 700; letter-spacing: 6px;
-  background: linear-gradient(135deg, var(--primary), #f5a623, var(--primary));
+  color: #ffffff;
+  background: linear-gradient(135deg, #ffffff 0%, rgba(255,255,255,.75) 50%, #ffffff 100%);
   background-size: 200% 200%;
   -webkit-background-clip: text; -webkit-text-fill-color: transparent;
   background-clip: text;
@@ -336,11 +389,11 @@ input, select, textarea { font-family: var(--font); font-size: 14px; }
   50% { background-position: 100% 50%; }
 }
 .login-brand .brand-tagline {
-  color: var(--text3); font-size: 11px; letter-spacing: 3.5px;
+  color: rgba(255,255,255,.7); font-size: 11px; letter-spacing: 3.5px;
   text-transform: uppercase; margin-top: 10px; font-weight: 500;
 }
 [data-theme="dark"] .login-brand .brand-tagline {
-  color: rgba(255,255,255,.4);
+  color: rgba(255,255,255,.55);
 }
 .form-group { margin-bottom: 18px; }
 .form-group.hidden { display: none; }
@@ -356,9 +409,9 @@ input, select, textarea { font-family: var(--font); font-size: 14px; }
   letter-spacing: .4px; cursor: pointer;
   transition: color var(--transition);
 }
-.admin-toggle:hover { color: var(--primary); }
-[data-theme="dark"] .admin-toggle { color: rgba(255,255,255,.4); }
-[data-theme="dark"] .admin-toggle:hover { color: var(--primary); }
+.admin-toggle:hover { color: var(--login-accent); }
+[data-theme="dark"] .admin-toggle { color: rgba(255,255,255,.45); }
+[data-theme="dark"] .admin-toggle:hover { color: var(--login-accent-2); }
 .form-group label {
   display: block; font-weight: 600; margin-bottom: 6px;
   font-size: 12px; color: var(--text3); letter-spacing: .4px;
