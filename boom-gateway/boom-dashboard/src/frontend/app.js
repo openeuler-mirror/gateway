@@ -2101,13 +2101,14 @@
       <tr><th>${t("models.col.model")}</th><th>${t("models.col.aliases")}</th><th>${t("models.col.litellm_model")}</th><th>${t("models.col.cost")}</th><th>${t("models.col.base_url")}</th><th>${t("models.col.ratio")}</th><th>${t("models.col.rpm")}</th><th>${t("models.col.timeout")}</th><th>${t("models.col.enabled")}</th><th>${t("models.col.source")}</th><th>${t("models.col.actions")}</th></tr>
       ${models.map((m) => {
         const isAutoDisabled = !m.enabled && m.auto_disabled;
+        const rowClass = !m.enabled ? "model-row-disabled" : "";
         const enabledBadge = m.enabled
           ? '<span class="badge badge-active">' + t("common.yes") + '</span>'
           : isAutoDisabled
             ? '<span class="badge badge-blocked">' + t("common.no") + '</span><br><span style="color:var(--danger);font-size:0.8em">' + t("status.auto_disabled") + '</span>'
             : '<span class="badge badge-blocked">' + t("common.no") + '</span>';
         const warningRow = isAutoDisabled
-          ? `<tr style="background:rgba(255,80,80,0.08)"><td colspan="11" style="padding:4px 8px;font-size:0.85em;color:var(--danger)">${t("models.fault_disabled")}</td></tr>`
+          ? `<tr class="model-row-warning"><td colspan="11">${t("models.fault_disabled")}</td></tr>`
           : '';
         // Cost cell: inline "label:$value" per line, three rows. Compact so
         // the column stays narrow even when EN headers squeeze the table.
@@ -2129,7 +2130,7 @@
           aliasCell = '<button class="btn-small" onclick="window._showModelAliases(\'' + esc(m.model_name) + '\')">'
             + esc(t("models.aliases.view_detail", { n: aliases.length })) + '</button>';
         }
-        return `<tr${isAutoDisabled ? ' style="background:rgba(255,80,80,0.04)"' : ''}>
+        return `<tr class="${rowClass}">
         <td>${renderDeployCell(m.model_name, m.deployment_id)}</td>
         <td>${aliasCell}</td>
         <td class="mono">${esc(m.litellm_model)}</td>
@@ -2932,14 +2933,14 @@
   }
 
   // Render the team's allowed-models list as chips. `models` comes straight
-  // from boom_team_table.models — either ["all-team-models"] (full access),
-  // an explicit list of model_names, or [] (no models configured).
+  // from boom_team_table.models. Per project convention (CLAUDE.md): an empty
+  // array OR ["all-team-models"] means full access to all models — both must
+  // render as the "all models" chip. Only an explicit list of model_names
+  // limits the team to those entries.
   function renderTeamModels(models) {
     const list = Array.isArray(models) ? models : [];
     let body;
-    if (list.length === 0) {
-      body = `<span class="muted">${esc(t("quota.team_models_empty"))}</span>`;
-    } else if (list.includes("all-team-models")) {
+    if (list.length === 0 || list.includes("all-team-models")) {
       body = `<span class="model-chip model-chip-all">${esc(t("quota.team_models_all"))}</span>`;
     } else {
       body = list.map((m) => `<span class="model-chip">${esc(m)}</span>`).join("");
@@ -2987,6 +2988,7 @@
         ${modelsHtml}
         ${limitsHtml}
         <div class="quota-card-actions">
+          <button class="btn-small" onclick="window._editTeam('${esc(t1.team_id)}')">${t("action.edit")}</button>
           <button class="btn-small" onclick="location.hash='#/admin/quota/team/${encodeURIComponent(t1.team_id)}'">${t("quota.view_detail")}</button>
           ${planSelect}
           ${promptLogBtn}
@@ -3365,6 +3367,22 @@
       }
       loadQuotaOverview();
     } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
+  };
+
+  // Edit entry for the team card: prefills showCreateTeamModal with the
+  // team's current fields. Modal handles id (readonly), alias, models, and
+  // explicit plan assignment (the only four editable fields on a team).
+  window._editTeam = (teamId) => {
+    const team = (window._teams || []).find((x) => x.team_id === teamId);
+    if (!team) {
+      alert(t("common.error_prefix", { message: "team not found in cache" }));
+      return;
+    }
+    showCreateTeamModal({
+      team_id: team.team_id,
+      team_alias: team.team_alias,
+      models: Array.isArray(team.models) ? team.models : [],
+    });
   };
 
   window._deleteTeam = async (teamId, keyCount) => {

@@ -702,6 +702,27 @@ tbody tr:nth-child(even) td { background: var(--surface2); }
 tbody tr:nth-child(odd) td { background: var(--surface); }
 tbody tr:hover td { background: var(--surface3); }
 tbody tr:nth-child(even):hover td { background: var(--surface3); }
+/* Disabled model rows: dim the entire row (text + badges + buttons) so the
+   operator can see at a glance that this deployment is out of rotation. The
+   enabled badge and action buttons stay readable — opacity .55 is enough to
+   signal "inactive" without making the Edit/Delete controls unusable. */
+tbody tr.model-row-disabled td {
+  background: var(--surface2) !important;
+  color: var(--text3);
+  opacity: .55;
+}
+tbody tr.model-row-disabled:hover td {
+  background: var(--surface3) !important;
+  opacity: .75;
+}
+tbody tr.model-row-disabled .badge { opacity: 1; }
+tbody tr.model-row-warning td {
+  background: rgba(255,80,80,.08) !important;
+  padding: 4px 14px;
+  font-size: .85em;
+  color: var(--danger);
+  height: auto;
+}
 .mono { font-family: var(--mono); font-size: 13px; }
 .muted { color: var(--text3); font-size: 12px; }
 

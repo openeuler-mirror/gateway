@@ -219,7 +219,7 @@
       "plan.limits.total_cost": "Total cost: ${n}",
       "plan.limits.window": "{dims} per {duration}",
 
-      "quota.title": "Quota Management",
+      "quota.title": "Team",
       "quota.teams_header": "Teams",
       "quota.no_team_header": "No Team",
       "quota.create_team": "Create Team",
@@ -228,7 +228,6 @@
       "quota.team_limits_title": "Plan Limits",
       "quota.team_limits_empty": "—",
       "quota.team_models_title": "Allowed Models",
-      "quota.team_models_empty": "No models configured",
       "quota.team_models_all": "All models",
       "quota.prompt_log_on": "Prompt Log: ON",
       "quota.prompt_log_off": "Prompt Log: OFF",
@@ -745,7 +744,7 @@
       "plan.limits.total_cost": "总费用: ${n}",
       "plan.limits.window": "{dims} / {duration}",
 
-      "quota.title": "配额管理",
+      "quota.title": "团队管理",
       "quota.teams_header": "Teams",
       "quota.no_team_header": "无 Team",
       "quota.create_team": "创建团队",
@@ -754,7 +753,6 @@
       "quota.team_limits_title": "套餐规格",
       "quota.team_limits_empty": "—",
       "quota.team_models_title": "可用模型",
-      "quota.team_models_empty": "未配置可用模型",
       "quota.team_models_all": "全部模型",
       "quota.prompt_log_on": "Prompt Log: ON",
       "quota.prompt_log_off": "Prompt Log: OFF",
