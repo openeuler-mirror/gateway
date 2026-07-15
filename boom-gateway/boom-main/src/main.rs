@@ -228,9 +228,17 @@ fn build_router(state: AppState) -> Router {
 }
 
 /// Listen for SIGHUP and trigger hot-reload.
+///
+/// A single-slot `Mutex` serializes concurrent SIGHUPs: rapid `kill -HUP`
+/// bursts (e.g. from a wrapper script) won't stack reloads on top of each
+/// other. `try_lock` (not `lock().await`) so the listener itself never
+/// blocks waiting for the previous reload to finish — additional SIGHUPs
+/// during an in-progress reload just get a "skipping" log line.
 fn spawn_sighup_listener(state: AppState, mut shutdown: tokio::sync::broadcast::Receiver<()>) {
     #[cfg(unix)]
     {
+        let reload_lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+        let state_clone = state.clone();
         tokio::spawn(async move {
             let mut stream = match tokio::signal::unix::signal(
                 tokio::signal::unix::SignalKind::hangup(),
@@ -245,11 +253,22 @@ fn spawn_sighup_listener(state: AppState, mut shutdown: tokio::sync::broadcast::
             loop {
                 tokio::select! {
                     _ = stream.recv() => {
+                        // try_lock: if a previous reload is still running
+                        // (bounded to 60s by AppState::reload's outer timeout),
+                        // skip this SIGHUP instead of queueing another.
+                        let guard = reload_lock.try_lock();
+                        if guard.is_err() {
+                            tracing::warn!(
+                                "SIGHUP received but a reload is already in progress — skipping"
+                            );
+                            continue;
+                        }
                         tracing::info!("Received SIGHUP — triggering hot-reload...");
-                        match state.reload().await {
+                        match state_clone.reload().await {
                             Ok(summary) => tracing::info!("SIGHUP reload: {}", summary),
                             Err(e) => tracing::error!("SIGHUP reload failed: {}", e),
                         }
+                        drop(guard);
                     }
                     _ = shutdown.recv() => {
                         tracing::debug!("SIGHUP listener shutting down");

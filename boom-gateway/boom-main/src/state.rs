@@ -262,14 +262,82 @@ impl AppState {
         })
     }
 
-    /// Hot-reload: re-read config file and update state.
+    /// Hot-reload safety wrapper: bounds total wall time at 60s and converts
+    /// panics into `Err`. The original reload logic lives in [`reload_inner`];
+    /// this function exists so callers (SIGHUP listener, HTTP handler) always
+    /// get a returned `Result` within bounded time, regardless of which step
+    /// inside fails, hangs, or panics.
+    ///
+    /// On `Err`: the previous `inner` config still routes traffic — only the
+    /// in-memory stores may be partially rebuilt. The atomic swap at the end
+    /// of `reload_inner` is what would have committed the new state; an early
+    /// `Err` skips that swap, so the OLD config object stays live. See
+    /// `reload_inner` doc for the partial-mutation caveat.
+    pub async fn reload(&self) -> anyhow::Result<String> {
+        use futures::future::FutureExt;
+        use std::panic::AssertUnwindSafe;
+
+        let started = std::time::Instant::now();
+        let inner = AssertUnwindSafe(self.reload_inner()).catch_unwind();
+        match tokio::time::timeout(std::time::Duration::from_secs(60), inner).await {
+            // Outer Ok = timeout didn't fire.
+            // Middle Ok = no panic (catch_unwind recovered).
+            // Inner Ok = reload_inner returned success.
+            Ok(Ok(Ok(summary))) => Ok(summary),
+            Ok(Ok(Err(e))) => {
+                // reload_inner returned Err — pass through with elapsed log.
+                tracing::error!(
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    error = %e,
+                    "reload aborted: step returned Err"
+                );
+                Err(e)
+            }
+            Ok(Err(panic_payload)) => {
+                let msg = panic_payload
+                    .downcast_ref::<String>()
+                    .map(|s| s.clone())
+                    .or_else(|| panic_payload.downcast_ref::<&'static str>().map(|s| s.to_string()))
+                    .unwrap_or_else(|| "(non-string panic payload)".to_string());
+                tracing::error!(
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    panic = %msg,
+                    "reload aborted: panic captured"
+                );
+                Err(anyhow::anyhow!(
+                    "reload aborted: panic captured ({}). \
+                     Previous config still active; stores may be partially rebuilt.",
+                    msg
+                ))
+            }
+            Err(_elapsed) => {
+                tracing::error!(
+                    elapsed_secs = started.elapsed().as_secs(),
+                    "reload aborted: total timeout 60s exceeded"
+                );
+                Err(anyhow::anyhow!(
+                    "reload aborted: timed out after 60s. \
+                     Previous config still active; stores may be partially rebuilt."
+                ))
+            }
+        }
+    }
+
+    /// Hot-reload implementation. See [`reload`] for the safety wrapper.
     ///
     /// Unified YAML-priority flow (same as startup, minus DB reconnection):
     ///   1. Rebuild deployments/aliases/plans from YAML → memory stores
     ///   2. sync_yaml_to_db() → persist YAML to DB, handle conflicts
     ///   3. load_db_only_*() → load source='db' records on top
     ///   4. Clean up orphaned assignments
-    pub async fn reload(&self) -> anyhow::Result<String> {
+    ///
+    /// Failure window: once step 4's `deployment_store.clear()` runs, the
+    /// stores are mutable targets. Any later failure leaves them in a
+    /// partially-built state while the old `inner` config still routes.
+    /// Wrapping with timeout + catch_unwind (in `reload`) bounds *how long*
+    /// this can take but does NOT roll back partial mutations — that requires
+    /// shadow-build + atomic swap (tracked as TODO).
+    async fn reload_inner(&self) -> anyhow::Result<String> {
         tracing::info!("Hot-reloading config from {}...", self.config_path);
 
         // 1. Re-read config.
@@ -377,14 +445,32 @@ impl AppState {
 
         if let Some(ref pool) = db_pool {
             // Sync YAML config to DB (upsert source='yaml', handle conflicts).
-            if let Err(e) = sync_yaml_to_db(pool, &new_config, &self.plan_store).await {
+            // Errors are non-fatal — log and continue. The follow-up
+            // load_db_only_* steps still need to run against whatever DB
+            // state we have. Timeout bounds DB hangs from blocking reload.
+            if let Err(e) = with_db_timeout(
+                "sync_yaml_to_db",
+                sync_yaml_to_db(pool, &new_config, &self.plan_store),
+            ).await {
                 tracing::error!("Failed to sync YAML to DB: {}", e);
             }
 
-            // Load source='db' records on top of YAML-built stores.
-            load_db_only_deployments(pool, &self.deployment_store, &self.flow_controller).await;
-            load_db_only_aliases(pool, &self.alias_store).await;
-            self.plan_store.load_db_only_plans(pool).await;
+            // Load source='db' records on top of YAML-built stores. Each step
+            // is independently timeout-bounded; failure aborts the reload
+            // (surfaces via reload's overall Err return), but the previous
+            // inner config still routes.
+            with_db_timeout_void(
+                "load_db_only_deployments",
+                load_db_only_deployments(pool, &self.deployment_store, &self.flow_controller),
+            ).await?;
+            with_db_timeout_void(
+                "load_db_only_aliases",
+                load_db_only_aliases(pool, &self.alias_store),
+            ).await?;
+            with_db_timeout_void(
+                "load_db_only_plans",
+                self.plan_store.load_db_only_plans(pool),
+            ).await?;
         }
 
         // Clean up assignments pointing to plans that no longer exist.
@@ -590,6 +676,35 @@ impl AppState {
 ///
 /// Delegates SQL to owning modules (boom-routing, boom-limiter).
 /// Only plan sync remains here (will move to boom-limiter in Phase 1b).
+/// Wrap a Result-returning DB operation with a 15s timeout. Bounds each
+/// `sync_yaml_to_db` call so a slow DB can't hang the entire reload future.
+/// 15s leaves headroom for slow networks without letting a stuck query block
+/// reload indefinitely.
+async fn with_db_timeout<F, T>(op_name: &str, f: F) -> Result<T, anyhow::Error>
+where
+    F: std::future::Future<Output = Result<T, sqlx::Error>>,
+{
+    match tokio::time::timeout(std::time::Duration::from_secs(15), f).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(anyhow::anyhow!("{}: {}", op_name, e)),
+        Err(_) => Err(anyhow::anyhow!("{} timed out after 15s", op_name)),
+    }
+}
+
+/// Wrap a `()`-returning DB operation with a 15s timeout. Used for the
+/// `load_db_only_*` helpers that swallow errors internally — we can't surface
+/// their internal failures, but we can at least bound their wall time.
+/// Returns `Err` only on timeout.
+async fn with_db_timeout_void<F>(op_name: &str, f: F) -> Result<(), anyhow::Error>
+where
+    F: std::future::Future<Output = ()>,
+{
+    match tokio::time::timeout(std::time::Duration::from_secs(15), f).await {
+        Ok(()) => Ok(()),
+        Err(_) => Err(anyhow::anyhow!("{} timed out after 15s", op_name)),
+    }
+}
+
 async fn sync_yaml_to_db(pool: &PgPool, config: &Config, plan_store: &Arc<PlanStore>) -> Result<(), sqlx::Error> {
     // ── Deployments (delegated to DeploymentStore) ──
     let yaml_model_names: Vec<String> = config.model_list.iter()

@@ -1040,6 +1040,19 @@ pub async fn list_models(
     let models: Vec<Value> = rows
         .into_iter()
         .map(|r| {
+            // Cost rate lives in the DeploymentStore's in-memory cost_rates
+            // map (seeded from config, not the DB table). Convert per-token
+            // Decimal → per-million Decimal for display; the front-end shows
+            // "input / cached / output" per 1M tokens.
+            let rate = state.deployment_store.get_cost_rate(&r.model_name);
+            let one_million = rust_decimal::Decimal::from(1_000_000);
+            let per_million = |v: rust_decimal::Decimal| -> String {
+                if v.is_zero() {
+                    "0".to_string()
+                } else {
+                    (v * one_million).to_string()
+                }
+            };
             json!({
                 "id": r.id,
                 "model_name": r.model_name,
@@ -1061,6 +1074,11 @@ pub async fn list_models(
                 "quota_count_ratio": r.quota_count_ratio.unwrap_or(1),
                 "max_inflight_queue_len": r.max_inflight_queue_len,
                 "max_context_len": r.max_context_len,
+                "cost_per_million": {
+                    "input": per_million(rate.input_cost_per_token),
+                    "cached_input": per_million(rate.cached_input_cost_per_token),
+                    "output": per_million(rate.output_cost_per_token),
+                },
                 "created_at": r.created_at.map(|d| d.to_string()),
                 "updated_at": r.updated_at.map(|d| d.to_string()),
             })

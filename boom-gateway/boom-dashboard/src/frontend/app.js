@@ -338,7 +338,6 @@
       stopInflightPoll();
     }
     if (section === "admin-models") loadModels();
-    else if (section === "admin-aliases") loadAliases();
     else if (section === "admin-plans") loadPlans();
     else if (section === "admin-keys") { setupKeysSearch(); loadKeys(); }
     else if (section === "admin-assignments") loadAssignments();
@@ -350,7 +349,6 @@
   function sectionFromHash(hash) {
     if (hash.includes("/admin/stats")) return "admin-stats";
     if (hash.includes("/admin/models")) return "admin-models";
-    if (hash.includes("/admin/aliases")) return "admin-aliases";
     if (hash.includes("/admin/plans")) return "admin-plans";
     if (hash.includes("/admin/keys")) return "admin-keys";
     if (hash.includes("/admin/quota")) return "admin-quota";
@@ -452,14 +450,7 @@
             reqsHtml = '<span class="cell-tip" data-tip="' + reqItems.join("&#10;").replace(/"/g, "&quot;") + '">' + reqsDisplay + '</span>';
           }
 
-          var deployCell;
-          if (d.deployment_id) {
-            deployCell = '<span class="deploy-model">' + esc(d.model) + '</span>' +
-              '<span class="deploy-sep">:</span>' +
-              '<span class="deploy-id">' + esc(d.deployment_id) + '</span>';
-          } else {
-            deployCell = '<span class="deploy-model">' + esc(d.model) + '</span>';
-          }
+          var deployCell = renderDeployCell(d.model, d.deployment_id);
 
           // 24h aggregates — read from cache populated on page load / Refresh button.
           var s = d.deployment_id ? deployment24hSummary[d.deployment_id] : null;
@@ -625,12 +616,10 @@
   function renderRequestRateCharts(charts, window) {
     const wrap = document.getElementById("request-rate-wrap");
     if (!wrap) return;
+    setRangeWindowNote("rate", window && window.from, window && window.to);
     if (!charts.length) { wrap.innerHTML = "<p>" + t("common.no_records") + "</p>"; return; }
 
-    const windowNote = window
-      ? `<div class="range-window-note">${esc(window.from)} → ${esc(window.to)} · bucket ${(window.bucket_secs / 60).toFixed(0)}min</div>`
-      : "";
-    var html = windowNote;
+    var html = "";
     charts.forEach(function (chart) {
       var events = chart.events || [];
       if (!events.length) return;
@@ -654,8 +643,8 @@
             '<div class="rb-bar-label' + (showLabel ? "" : " rb-label-hidden") + '">' + esc(lbl) + '</div>' +
             '</div>';
         }).join("");
-        html += '<div style="margin-bottom:0.8rem">' +
-          '<div style="font-size:0.85em;font-weight:600;margin-bottom:2px;color:var(--text2)">' + label + '</div>' +
+        html += '<div class="rb-chart-card rb-chart-card--single">' +
+          '<div class="rb-chart-card__label">' + label + '</div>' +
           '<div class="rebalance-chart">' +
           '<div class="rb-y-axis"><span>' + maxCount + '</span><span>0</span></div>' +
           '<div class="rb-bars">' + bars + '</div>' +
@@ -708,8 +697,8 @@
             '</div>';
         }).join("");
 
-        html += '<div style="margin-bottom:0.8rem">' +
-          '<div style="font-size:0.85em;font-weight:600;margin-bottom:2px;color:var(--text2)">' + label + '</div>' +
+        html += '<div class="rb-chart-card rb-chart-card--stacked">' +
+          '<div class="rb-chart-card__label">' + label + '</div>' +
           '<div class="rebalance-chart">' +
           '<div class="rb-y-axis"><span>' + maxTotal + '</span><span>0</span></div>' +
           '<div class="rb-bars">' + bars + '</div>' +
@@ -726,7 +715,7 @@
       }
     });
 
-    wrap.innerHTML = html || (windowNote + "<p>" + t("common.no_records") + "</p>");
+    wrap.innerHTML = html || ("<p>" + t("common.no_records") + "</p>");
   }
 
   // ── Rebalance Moves (per deployment, lifetime cumulative) ──
@@ -794,14 +783,12 @@
       output_tokens_total: 0, output_tokens_anthropic: 0, output_token_ratio: 0,
     };
     const window = data.window || null;
+    setRangeWindowNote("agent", window && window.from, window && window.to);
     const rangeLabel = rangeState.agent.range === "custom" ? "custom" : rangeState.agent.range;
 
     const ratioPct = (summary.ratio * 100).toFixed(1);
     const inputRatioPct = (summary.input_token_ratio * 100).toFixed(1);
     const outputRatioPct = (summary.output_token_ratio * 100).toFixed(1);
-    const windowNote = window
-      ? `<div class="range-window-note">${esc(window.from)} → ${esc(window.to)} · bucket ${(window.bucket_secs / 60).toFixed(0)}min</div>`
-      : "";
 
     // Five summary cards — Requests (Total / Anthropic / Ratio) + Tokens (Input / Output anthropic share).
     const summaryHtml =
@@ -831,7 +818,7 @@
       '</div>';
 
     if (!events.length || summary.total === 0) {
-      wrap.innerHTML = summaryHtml + windowNote + '<p class="loading" style="margin-top:1rem">' + t("common.no_records") + '</p>';
+      wrap.innerHTML = summaryHtml + '<p class="loading" style="margin-top:1rem">' + t("common.no_records") + '</p>';
       return;
     }
 
@@ -846,7 +833,7 @@
         '<span class="agent-legend-item"><span class="agent-legend-swatch agent-legend-other"></span>Other (/v1/chat/completions, etc.)</span>' +
       '</div>';
 
-    wrap.innerHTML = summaryHtml + windowNote +
+    wrap.innerHTML = summaryHtml +
       '<div style="margin-top:1rem"><div style="font-weight:600;margin-bottom:0.25rem">' + t("stats.agent.chart.requests") + '</div>' + requestChart + '</div>' +
       '<div style="margin-top:1.5rem"><div style="font-weight:600;margin-bottom:0.25rem">' + t("stats.agent.chart.input_tokens") + '</div>' + inputChart + '</div>' +
       '<div style="margin-top:1.5rem"><div style="font-weight:600;margin-bottom:0.25rem">' + t("stats.agent.chart.output_tokens") + '</div>' + outputChart + '</div>' +
@@ -1032,7 +1019,7 @@
       // RPM is the 60s window if present.
       const rpmWindow = windows.find((w) => w.window_secs === 60);
 
-      const fmtLimit = (l) => (l == null ? "∞" : String(l));
+      const fmtLimit = (l) => (l == null || l === 0 ? "∞" : String(l));
       const pct = (u, l) => (l == null || l === 0 ? 0 : Math.min(100, Math.round((u / l) * 100)));
 
       // Concurrency meter.
@@ -1041,19 +1028,42 @@
         `${concUsed} / ${fmtLimit(concLimit)}`,
         pct(concUsed, concLimit)
       );
-      // RPM meter (60s).
-      const rpmUsed = rpmWindow ? rpmWindow.count : 0;
-      const rpmLimit = plan.rpm_limit;
+      // RPM meter (60s counts dim — backend folds plan.rpm_limit into the
+      // 60s window's counts limit. Old code read rpmWindow.count / plan.rpm_limit
+      // which no longer exist; both come from dims.counts now.
+      const rpmCounts = rpmWindow && rpmWindow.dims && rpmWindow.dims.counts;
+      const rpmUsed = rpmCounts ? Number(rpmCounts.current || 0) : 0;
+      const rpmLimit = rpmCounts ? Number(rpmCounts.limit || 0) : null;
       const rpmHtml = meterHtml(
         "RPM",
         `${rpmUsed} / ${fmtLimit(rpmLimit)}`,
         pct(rpmUsed, rpmLimit)
       );
-      // Other windows (skip 60s — already shown as RPM).
+      // Other windows (skip 60s — already shown as RPM). Each window may have
+      // multiple dims (counts/tokens/costs); show the configured one. If
+      // multiple, render them stacked — but for the chat meter strip we pick
+      // the most informative one per window (tokens > costs > counts).
       const otherWindows = windows.filter((w) => w.window_secs !== 60);
       const otherHtml = otherWindows.map((w) => {
         const label = formatDuration(w.window_secs);
-        return meterHtml(label, `${w.count} / ${fmtLimit(w.limit)}`, pct(w.count, w.limit));
+        const dims = w.dims || {};
+        // Prefer tokens for TPM-style windows, then costs, then counts.
+        const dimKey = dims.tokens ? "tokens"
+                     : dims.costs  ? "costs"
+                     : dims.counts ? "counts"
+                     : null;
+        if (!dimKey) return "";
+        const d = dims[dimKey];
+        let used, limit;
+        if (dimKey === "costs") {
+          used = Number(d.current_micros || 0);
+          limit = Number(d.limit_micros || 0);
+          const valTxt = "$" + (d.current || "0") + " / " + (limit > 0 ? "$" + (d.limit || "0") : "∞");
+          return meterHtml(label, valTxt, pct(used, limit));
+        }
+        used = Number(d.current || 0);
+        limit = Number(d.limit || 0);
+        return meterHtml(label, `${used} / ${fmtLimit(limit)}`, pct(used, limit));
       }).join("");
 
       el.innerHTML = `
@@ -1521,10 +1531,12 @@
     }
     const limits = [];
     if (plan.concurrency_limit) limits.push(t("plan.limits.concurrency", { n: plan.concurrency_limit }));
-    if (plan.rpm_limit) limits.push(t("plan.limits.rpm", { n: plan.rpm_limit }));
-    if (plan.tpm_limit) limits.push(t("plan.limits.tpm", { n: plan.tpm_limit }));
     if (plan.total_token_limit) limits.push(t("plan.limits.total_token", { n: plan.total_token_limit }));
     if (plan.total_cost_limit != null) limits.push(t("plan.limits.total_cost", { n: plan.total_cost_limit }));
+    // RPM/TPM are no longer separate fields — the backend folds them into
+    // window_limits' 60s counts / 60s tokens entries via effective_limits().
+    // Rendering them here would either show "undefined 请求/1min" (field gone)
+    // or duplicate the 60s line that the forEach below already emits.
     (plan.window_limits || []).forEach((raw) => {
       const w = normalizeWindowLimit(raw);
       if (!w) return;
@@ -2063,32 +2075,66 @@
   // ── Admin: Models ─────────────────────────────────────
   async function loadModels() {
     try {
-      const data = await api("/admin/models");
-      renderModelsTable(data.models || []);
+      const [modelsResp, aliasesResp] = await Promise.all([
+        api("/admin/models"),
+        api("/admin/aliases"),
+      ]);
+      // Build { target_model → [alias_name, ...] } map so the models table
+      // can show each model's aliases inline without a separate aliases page.
+      const aliasesMap = {};
+      (aliasesResp.aliases || []).forEach((a) => {
+        if (!a.target_model) return;
+        (aliasesMap[a.target_model] = aliasesMap[a.target_model] || []).push(a.alias_name);
+      });
+      renderModelsTable(modelsResp.models || [], aliasesMap);
     } catch (err) {
       const wrap = document.getElementById("models-table-wrap");
       if (wrap) wrap.innerHTML = `<p class="error-msg">${t("common.failed_to_load", { what: t("models.title"), message: esc(err.message) })}</p>`;
     }
   }
 
-  function renderModelsTable(models) {
+  function renderModelsTable(models, aliasesMap) {
     const wrap = document.getElementById("models-table-wrap");
     if (models.length === 0) { wrap.innerHTML = "<p>" + t("models.empty") + "</p>"; return; }
+    aliasesMap = aliasesMap || {};
     wrap.innerHTML = `<table>
-      <tr><th>${t("form.model.name")}</th><th>${t("models.col.litellm_model")}</th><th>${t("models.col.base_url")}</th><th>${t("models.col.ratio")}</th><th>${t("models.col.rpm")}</th><th>${t("models.col.timeout")}</th><th>${t("models.col.enabled")}</th><th>${t("models.col.source")}</th><th>${t("models.col.actions")}</th></tr>
+      <tr><th>${t("models.col.model")}</th><th>${t("models.col.aliases")}</th><th>${t("models.col.litellm_model")}</th><th>${t("models.col.cost")}</th><th>${t("models.col.base_url")}</th><th>${t("models.col.ratio")}</th><th>${t("models.col.rpm")}</th><th>${t("models.col.timeout")}</th><th>${t("models.col.enabled")}</th><th>${t("models.col.source")}</th><th>${t("models.col.actions")}</th></tr>
       ${models.map((m) => {
         const isAutoDisabled = !m.enabled && m.auto_disabled;
+        const rowClass = !m.enabled ? "model-row-disabled" : "";
         const enabledBadge = m.enabled
           ? '<span class="badge badge-active">' + t("common.yes") + '</span>'
           : isAutoDisabled
             ? '<span class="badge badge-blocked">' + t("common.no") + '</span><br><span style="color:var(--danger);font-size:0.8em">' + t("status.auto_disabled") + '</span>'
             : '<span class="badge badge-blocked">' + t("common.no") + '</span>';
         const warningRow = isAutoDisabled
-          ? `<tr style="background:rgba(255,80,80,0.08)"><td colspan="9" style="padding:4px 8px;font-size:0.85em;color:var(--danger)">${t("models.fault_disabled")}</td></tr>`
+          ? `<tr class="model-row-warning"><td colspan="11">${t("models.fault_disabled")}</td></tr>`
           : '';
-        return `<tr${isAutoDisabled ? ' style="background:rgba(255,80,80,0.04)"' : ''}>
-        <td><strong>${esc(m.model_name)}</strong></td>
+        // Cost cell: inline "label:$value" per line, three rows. Compact so
+        // the column stays narrow even when EN headers squeeze the table.
+        const c = m.cost_per_million || {};
+        const fmtCost = (v) => (v == null || v === "0" || v === "") ? "-" : "$" + v;
+        const costCell = '<div class="cost-cell">'
+          + '<div class="cost-line"><span class="cost-label">' + esc(t("plan.dim.regular_input_cost")) + ':</span><span class="cost-value">' + fmtCost(c.input) + '</span></div>'
+          + '<div class="cost-line"><span class="cost-label">' + esc(t("plan.dim.cached_input_cost")) + ':</span><span class="cost-value">' + fmtCost(c.cached_input) + '</span></div>'
+          + '<div class="cost-line"><span class="cost-label">' + esc(t("plan.dim.output_cost")) + ':</span><span class="cost-value">' + fmtCost(c.output) + '</span></div>'
+          + '</div>';
+        // Alias cell: 0 → "-"; 1 → chip with name; ≥2 → "View N aliases" button.
+        const aliases = aliasesMap[m.model_name] || [];
+        let aliasCell;
+        if (aliases.length === 0) {
+          aliasCell = '<span class="muted">-</span>';
+        } else if (aliases.length === 1) {
+          aliasCell = '<span class="alias-chip">' + esc(aliases[0]) + '</span>';
+        } else {
+          aliasCell = '<button class="btn-small" onclick="window._showModelAliases(\'' + esc(m.model_name) + '\')">'
+            + esc(t("models.aliases.view_detail", { n: aliases.length })) + '</button>';
+        }
+        return `<tr class="${rowClass}">
+        <td>${renderDeployCell(m.model_name, m.deployment_id)}</td>
+        <td>${aliasCell}</td>
         <td class="mono">${esc(m.litellm_model)}</td>
+        <td>${costCell}</td>
         <td class="mono">${esc(m.api_base || "-")}</td>
         <td>${m.quota_count_ratio && m.quota_count_ratio !== 1 ? '<span class="badge badge-plan">x' + m.quota_count_ratio + '</span>' : 'x1'}</td>
         <td>${m.rpm || "-"}</td>
@@ -2124,7 +2170,7 @@
       <div class="form-group"><label>${t("form.model.maxctx")} ${tip("Max total input characters across all in-flight requests. 0 or empty = unlimited.")}</label><input id="m-model-maxctx" type="number" min="0" value="${p.max_context_len || ""}"></div>
       <div class="form-group"><label>${t("form.model.enabled")} ${tip("Disabled deployments are ignored in routing.")}</label><select id="m-model-enabled"><option value="true" ${p.enabled !== false ? "selected" : ""}>${t("common.yes")}</option><option value="false" ${p.enabled === false ? "selected" : ""}>${t("common.no")}</option></select></div>
       <div class="modal-actions">
-        <button class="btn-secondary" onclick="hideModal()" style="width:auto">${t("action.cancel")}</button>
+        <button class="btn-secondary btn-inline" onclick="hideModal()">${t("action.cancel")}</button>
         <button class="btn-primary" id="m-model-submit">${p.id ? t("action.update") : t("action.create")}</button>
       </div>
     `);
@@ -2182,34 +2228,6 @@
   };
 
   // ── Admin: Aliases ────────────────────────────────────
-  async function loadAliases() {
-    try {
-      const data = await api("/admin/aliases");
-      renderAliasesTable(data.aliases || []);
-    } catch (err) {
-      const wrap = document.getElementById("aliases-table-wrap");
-      if (wrap) wrap.innerHTML = `<p class="error-msg">${t("common.failed_to_load", { what: t("aliases.title"), message: esc(err.message) })}</p>`;
-    }
-  }
-
-  function renderAliasesTable(aliases) {
-    const wrap = document.getElementById("aliases-table-wrap");
-    if (aliases.length === 0) { wrap.innerHTML = "<p>" + t("aliases.empty") + "</p>"; return; }
-    wrap.innerHTML = `<table>
-      <tr><th>${t("aliases.col.alias")}</th><th>${t("aliases.col.target")}</th><th>${t("form.alias.hidden")}</th><th>${t("models.col.source")}</th><th>${t("aliases.col.actions")}</th></tr>
-      ${aliases.map((a) => `<tr>
-        <td><strong>${esc(a.alias_name)}</strong></td>
-        <td class="mono">${esc(a.target_model)}</td>
-        <td>${a.hidden ? t("common.yes") : t("common.no")}</td>
-        <td><span class="badge badge-plan">${esc(a.source || "-")}</span></td>
-        <td>
-          <button class="btn-small" onclick="window._editAlias('${esc(a.alias_name)}')">${t("action.edit")}</button>
-          <button class="btn-danger" onclick="window._deleteAlias('${esc(a.alias_name)}')">${t("action.delete")}</button>
-        </td>
-      </tr>`).join("")}
-    </table>`;
-  }
-
   function showNewAliasModal(prefill) {
     const p = prefill || {};
     showModal(`
@@ -2218,7 +2236,7 @@
       <div class="form-group"><label>${t("form.alias.target")} * ${tip("The actual model name to route to. Must match an existing model deployment name.")}</label><input id="m-alias-target" value="${esc(p.target_model || "")}" required list="alias-target-list"><datalist id="alias-target-list"></datalist></div>
       <div class="form-group"><label>${t("form.alias.hidden")} ${tip("Hidden aliases work for routing but are not listed to users in model discovery endpoints.")}</label><select id="m-alias-hidden"><option value="false" ${!p.hidden ? "selected" : ""}>${t("common.no")}</option><option value="true" ${p.hidden ? "selected" : ""}>${t("common.yes")}</option></select></div>
       <div class="modal-actions">
-        <button class="btn-secondary" onclick="hideModal()" style="width:auto">${t("action.cancel")}</button>
+        <button class="btn-secondary btn-inline" onclick="hideModal()">${t("action.cancel")}</button>
         <button class="btn-primary" id="m-alias-submit">${p.alias_name ? t("action.update") : t("action.create")}</button>
       </div>
     `);
@@ -2239,7 +2257,7 @@
         await api(url, { method, body: JSON.stringify(body) });
         hideModal();
         invalidateCaches();
-        loadAliases();
+        loadModels();
       } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
     });
   }
@@ -2256,7 +2274,34 @@
   window._deleteAlias = async (name) => {
     if (!confirm(t("confirm.delete_alias", { name }))) return;
     await api(`/admin/aliases/${encodeURIComponent(name)}`, { method: "DELETE" });
-    loadAliases();
+    loadModels();
+  };
+
+  window._showModelAliases = async (modelName) => {
+    try {
+      const data = await api("/admin/aliases");
+      const list = (data.aliases || []).filter((a) => a.target_model === modelName);
+      showModal(`
+        <h3>${t("models.aliases.modal_title", { model: esc(modelName) })}</h3>
+        ${list.length === 0
+          ? `<p class="muted">${t("common.no_data")}</p>`
+          : `<table class="modal-table">
+              <tr><th>${t("aliases.col.alias")}</th><th>${t("form.alias.hidden")}</th><th>${t("models.col.source")}</th><th>${t("aliases.col.actions")}</th></tr>
+              ${list.map((a) => `<tr>
+                <td><strong>${esc(a.alias_name)}</strong></td>
+                <td>${a.hidden ? t("common.yes") : t("common.no")}</td>
+                <td><span class="badge badge-plan">${esc(a.source || "-")}</span></td>
+                <td>
+                  <button class="btn-small" onclick="window._editAlias('${esc(a.alias_name)}')">${t("action.edit")}</button>
+                  <button class="btn-small is-danger" onclick="window._deleteAlias('${esc(a.alias_name)}')">${t("action.delete")}</button>
+                </td>
+              </tr>`).join("")}
+            </table>`}
+        <div class="modal-actions">
+          <button class="btn-small btn-inline" onclick="hideModal()">${t("action.close")}</button>
+        </div>
+      `);
+    } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
   };
 
   // ── Admin: Debug Error Recording ─────────────────────
@@ -2405,7 +2450,7 @@
         ${upstreamHtml}
         ${requestHtml}
         <div class="modal-actions">
-          <button class="btn-secondary" onclick="hideModal()" style="width:auto">${t("action.close")}</button>
+          <button class="btn-secondary btn-inline" onclick="hideModal()">${t("action.close")}</button>
         </div>
       `);
     } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
@@ -2456,7 +2501,7 @@
         const data = await api("/admin/config/reload", { method: "POST" });
         alert(data.message || t("alert.config_reloaded"));
         onRoute();
-      } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
+      } catch (err) { alert(t("alert.reload_failed", { message: err.message })); }
       finally {
         btnReload.disabled = false;
         btnReload.textContent = t("action.reload_config");
@@ -2511,7 +2556,7 @@
       <div class="form-group"><label>${t("form.plan.rpm")} ${tip("Maximum requests per minute per key. Leave empty for unlimited.")}</label><input id="m-plan-rpm" type="number" value="${p.rpm_limit || ""}"></div>
       <div class="form-group"><label>${t("form.plan.windows")} ${tip("Custom time windows as JSON array: [[count, seconds], ...]. E.g. [[100,18000]] = 100 requests per 5 hours. Each request's quota consumption is multiplied by the model's Quota Ratio.")}</label><textarea id="m-plan-windows" rows="2">${JSON.stringify(p.window_limits || [])}</textarea></div>
       <div class="modal-actions">
-        <button class="btn-secondary" onclick="hideModal()" style="width:auto">${t("action.cancel")}</button>
+        <button class="btn-secondary btn-inline" onclick="hideModal()">${t("action.cancel")}</button>
         <button class="btn-primary" id="m-plan-submit">${p.name ? t("action.update") : t("action.create")}</button>
       </div>
     `);
@@ -2554,7 +2599,7 @@
       <div class="form-group"><label>${t("form.key.rpm")} ${tip("Per-key RPM override. Leave empty to use plan or default limits.")}</label><input id="m-key-rpm" type="number"></div>
       <div class="form-group"><label>${t("form.key.plan")} ${tip("Assign this key to a rate limit plan. Leave empty for default plan.")}</label><select id="m-key-plan"><option value="">${t("common.default_option")}</option></select></div>
       <div class="modal-actions">
-        <button class="btn-secondary" onclick="hideModal()" style="width:auto">${t("action.cancel")}</button>
+        <button class="btn-secondary btn-inline" onclick="hideModal()">${t("action.cancel")}</button>
         <button class="btn-primary" id="m-key-submit">${t("action.create")}</button>
       </div>
     `);
@@ -2611,7 +2656,7 @@
           <p class="key-warning">${t("form.key.copy_warning")}</p>
           <div class="key-display">${esc(rawKey)}</div>
           <div class="modal-actions" style="justify-content:space-between">
-            <button class="btn-secondary" style="width:auto" onclick="window._copyText(this,'${esc(rawKey)}')">${t("action.copy")}</button>
+            <button class="btn-secondary btn-inline" onclick="window._copyText(this,'${esc(rawKey)}')">${t("action.copy")}</button>
             <button class="btn-primary" onclick="hideModal(); window._loadKeysPage();">${t("action.done")}</button>
           </div>
         `);
@@ -2634,7 +2679,7 @@
       <div class="form-group"><label>${t("form.key.vip")} ${tip("VIP keys get priority in flow control queues when deployments are at capacity.")}</label><div style="display:flex;align-items:center;gap:8px;padding-top:4px"><input type="checkbox" id="m-edit-vip" ${isVip ? "checked" : ""}><span style="font-weight:600;color:#b45309;white-space:nowrap">${t("form.key.vip_label")}</span></div></div>
       <div class="form-group"><label>${t("form.key.prompt_log")} ${tip("Disable prompt logging for this key. When the global prompt log switch is ON, this key will be excluded from capture.")}</label><div style="display:flex;align-items:center;gap:8px;padding-top:4px"><input type="checkbox" id="m-edit-no-prompt-log" ${isPromptLogExcluded ? "checked" : ""}><span style="font-weight:600;color:#dc2626;white-space:nowrap">${t("form.key.prompt_log_label")}</span></div></div>
       <div class="modal-actions">
-        <button class="btn-secondary" onclick="hideModal()" style="width:auto">${t("action.cancel")}</button>
+        <button class="btn-secondary btn-inline" onclick="hideModal()">${t("action.cancel")}</button>
         <button class="btn-primary" id="m-edit-submit">${t("action.save")}</button>
       </div>
     `);
@@ -2687,7 +2732,7 @@
       </div>
       <div class="form-group"><label>${t("form.asgn.plan")} ${tip("Select an existing plan to assign this key to.")}</label><select id="m-asgn-plan" required><option value="">${t("common.select_plan")}</option></select></div>
       <div class="modal-actions">
-        <button class="btn-secondary" onclick="hideModal()" style="width:auto">${t("action.cancel")}</button>
+        <button class="btn-secondary btn-inline" onclick="hideModal()">${t("action.cancel")}</button>
         <button class="btn-primary" id="m-asgn-submit">${t("action.assign")}</button>
       </div>
     `);
@@ -2815,12 +2860,32 @@
   // Render team plan spec as a single line of compact tags.
   // Every plan-configurable dimension is shown; unset ones display "∞"
   // so the operator can distinguish "unlimited" from "not applicable".
-  function renderTeamEffectiveLimits(el) {
-    if (!el) return "";
+  // `planName` is merged into the block title so the operator sees the plan
+  // name and its limits as one unit instead of a detached badge in the header.
+  function renderTeamEffectiveLimits(el, planName, planExplicit) {
     const INF = "∞";
     const fmtOrInf = (v, fmt) => (v == null ? INF : fmt(v));
     const fmtNum = (v) => formatNumber(Number(v));
     const fmtCost = (v) => "$" + (Number(v) || 0).toLocaleString(undefined, { maximumFractionDigits: 2 });
+
+    // Title line: "套餐规格 · <planName>" or "套餐规格 · 默认/无套餐".
+    // planExplicit=false means the team is falling back to the default team plan
+    // (or has no plan at all) — we render that state in the title so the operator
+    // doesn't have to infer it from the absence of a badge.
+    let title = t("quota.team_limits_title");
+    if (planName) {
+      const tag = planExplicit ? "" : ` <span class="team-limits-suffix">${esc(t("quota.team_plan_default"))}</span>`;
+      title += ` · <strong class="${planExplicit ? "team-limits-name-explicit" : "team-limits-name-implicit"}">${esc(planName)}</strong>${tag}`;
+    } else {
+      title += ` · <span class="team-limits-suffix">${esc(t("quota.team_plan_none"))}</span>`;
+    }
+
+    if (!el) {
+      return `<div class="team-limits-block">
+        <div class="team-limits-title">${title}</div>
+        <div class="plan-tags"><span class="muted">${esc(t("quota.team_limits_empty") || "—")}</span></div>
+      </div>`;
+    }
 
     // Aggregate window_limits by secs → {counts, tokens, costs}.
     // rpm_limit / tpm_limit are 60s-window shorthands; merge them into the 60s
@@ -2862,8 +2927,27 @@
     tags.push(`<span class="plan-tag"><span class="plan-tag-label">${esc(t("plan.dim.total_cost") || "Total Cost")}</span><span class="plan-tag-value">${fmtOrInf(el.total_cost_limit, fmtCost)}</span></span>`);
 
     return `<div class="team-limits-block">
-      <div class="team-limits-title">${esc(t("quota.team_limits_title"))}</div>
+      <div class="team-limits-title">${title}</div>
       <div class="plan-tags">${tags.join("")}</div>
+    </div>`;
+  }
+
+  // Render the team's allowed-models list as chips. `models` comes straight
+  // from boom_team_table.models. Per project convention (CLAUDE.md): an empty
+  // array OR ["all-team-models"] means full access to all models — both must
+  // render as the "all models" chip. Only an explicit list of model_names
+  // limits the team to those entries.
+  function renderTeamModels(models) {
+    const list = Array.isArray(models) ? models : [];
+    let body;
+    if (list.length === 0 || list.includes("all-team-models")) {
+      body = `<span class="model-chip model-chip-all">${esc(t("quota.team_models_all"))}</span>`;
+    } else {
+      body = list.map((m) => `<span class="model-chip">${esc(m)}</span>`).join("");
+    }
+    return `<div class="team-models-block">
+      <div class="team-models-title">${esc(t("quota.team_models_title"))}</div>
+      <div class="team-models-list">${body}</div>
     </div>`;
   }
 
@@ -2887,25 +2971,24 @@
 
     const teamCard = (t1) => {
       const tokens = Number(t1.total_input_tokens || 0) + Number(t1.total_output_tokens || 0);
-      const planBadge = t1.plan_name
-        ? `<span class="badge ${t1.plan_explicit ? "badge-plan" : "badge-default"}">${esc(t1.plan_name)}</span>`
-        : `<span class="muted">${esc(t("quota.team_plan_none"))}</span>`;
       const isExcluded = (window._promptLogExcludedTeams || []).includes(t1.team_id);
       const promptLogBtn = `<button class="btn-small ${isExcluded ? "btn-secondary" : "btn-primary"}" onclick="window._toggleTeamPromptLog('${esc(t1.team_id)}', ${isExcluded})">${isExcluded ? t("quota.prompt_log_off") : t("quota.prompt_log_on")}</button>`;
       const planSelect = renderTeamPlanSelect(t1.team_id, t1.plan_name, t1.plan_explicit);
-      const limitsHtml = renderTeamEffectiveLimits(t1.effective_limits);
+      const limitsHtml = renderTeamEffectiveLimits(t1.effective_limits, t1.plan_name, t1.plan_explicit);
+      const modelsHtml = renderTeamModels(t1.models);
       return `<div class="quota-card">
         <div class="quota-card-header">
           <strong>${esc(t1.team_alias || t1.team_id)}</strong>
-          ${planBadge}
         </div>
         <div class="quota-card-stats">
           <div><span class="muted">${esc(t("teams.col.keys_count") || "Keys")}</span> <strong>${t1.key_count || 0}</strong></div>
           <div><span class="muted">${esc(t("quota.col.tokens"))}</span> <strong>${formatNumber(tokens)}</strong></div>
           <div><span class="muted">${esc(t("quota.col.cost"))}</span> <strong>$${esc(t1.total_cost || "0")}</strong></div>
         </div>
+        ${modelsHtml}
         ${limitsHtml}
         <div class="quota-card-actions">
+          <button class="btn-small" onclick="window._editTeam('${esc(t1.team_id)}')">${t("action.edit")}</button>
           <button class="btn-small" onclick="location.hash='#/admin/quota/team/${encodeURIComponent(t1.team_id)}'">${t("quota.view_detail")}</button>
           ${planSelect}
           ${promptLogBtn}
@@ -3207,7 +3290,7 @@
         </select>
       </div>
       <div class="modal-actions">
-        <button class="btn-secondary" onclick="hideModal()" style="width:auto">${t("action.cancel")}</button>
+        <button class="btn-secondary btn-inline" onclick="hideModal()">${t("action.cancel")}</button>
         <button class="btn-primary" id="m-team-submit">${p.team_id ? t("action.update") : t("action.create")}</button>
       </div>
     `);
@@ -3284,6 +3367,22 @@
       }
       loadQuotaOverview();
     } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
+  };
+
+  // Edit entry for the team card: prefills showCreateTeamModal with the
+  // team's current fields. Modal handles id (readonly), alias, models, and
+  // explicit plan assignment (the only four editable fields on a team).
+  window._editTeam = (teamId) => {
+    const team = (window._teams || []).find((x) => x.team_id === teamId);
+    if (!team) {
+      alert(t("common.error_prefix", { message: "team not found in cache" }));
+      return;
+    }
+    showCreateTeamModal({
+      team_id: team.team_id,
+      team_alias: team.team_alias,
+      models: Array.isArray(team.models) ? team.models : [],
+    });
   };
 
   window._deleteTeam = async (teamId, keyCount) => {
@@ -3676,6 +3775,75 @@
     const d = document.createElement("div");
     d.textContent = s;
     return d.innerHTML;
+  }
+
+  // Map model name → vendor slug for the logo endpoint
+  // (/dashboard/assets/vendor/:name). Match is substring + case-insensitive,
+  // so "GLM-5.1" / "glm-xx" / "xxGlmxx" all hit GLM. Vendors with model
+  // families that don't contain the brand name as substring keep explicit
+  // aliases (e.g. cogvlm/cogview/thinking → GLM, abab/emotion → MiniMax,
+  // qwq → Qwen, moonshot → Kimi).
+  const VENDOR_PATTERNS = [
+    { slug: "glm",      needles: ["glm", "chatglm", "cogvlm", "cogview", "thinking"] },
+    { slug: "minimax",  needles: ["minimax", "abab", "emotion", "speech-0"] },
+    { slug: "qwen",     needles: ["qwen", "qwq"] },
+    { slug: "deepseek", needles: ["deepseek"] },
+    { slug: "kimi",     needles: ["kimi", "moonshot"] },
+    { slug: "mimo",     needles: ["mimo"] },
+  ];
+  function vendorOf(model) {
+    const s = (model || "").toLowerCase();
+    for (const v of VENDOR_PATTERNS) {
+      for (const n of v.needles) {
+        if (s.indexOf(n) !== -1) return v.slug;
+      }
+    }
+    return "default";
+  }
+
+  // Two-line deployment cell: [logo] + bold model name + faded deployment_id.
+  // Replaces the old "model:deployment_id" flat concatenation.
+  function renderDeployCell(model, deploymentId) {
+    const v = vendorOf(model);
+    return '' +
+      '<div class="deploy-cell">' +
+        '<img class="vendor-logo" src="/dashboard/assets/vendor/' + v + '" alt="' + v + '">' +
+        '<div class="deploy-text">' +
+          '<div class="deploy-model">' + esc(model) + '</div>' +
+          (deploymentId ? '<div class="deploy-id">' + esc(deploymentId) + '</div>' : '') +
+        '</div>' +
+      '</div>';
+  }
+
+  // ISO 8601 (e.g. "2026-07-13T17:50:00Z") → "2026-07-13 17:50:00".
+  // Falls back to the raw string when Date can't parse it.
+  function formatRangeISO(iso) {
+    if (!iso) return "";
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return String(iso);
+    const p = (n, w) => String(n).padStart(w || 2, "0");
+    return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate())
+         + " " + p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+  }
+
+  // Place the formatted time range next to the section title (`<h2>`).
+  // target = "rate" | "agent" — matches `data-target` on `.range-controls`.
+  // Removes the span when from/to are falsy so stale ranges don't linger.
+  function setRangeWindowNote(target, from, to) {
+    const controls = document.querySelector(`.range-controls[data-target="${target}"]`);
+    const header = controls && controls.parentElement;
+    if (!header) return;
+    let span = header.querySelector(".range-window-note");
+    if (!from || !to) {
+      if (span) span.remove();
+      return;
+    }
+    if (!span) {
+      span = document.createElement("span");
+      span.className = "range-window-note";
+      header.appendChild(span);
+    }
+    span.textContent = formatRangeISO(from) + " → " + formatRangeISO(to);
   }
 
   function formatDuration(secs) {

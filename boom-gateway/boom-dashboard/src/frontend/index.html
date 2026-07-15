@@ -16,13 +16,36 @@
 </head>
 <body>
   <div id="app">
-    <!-- Login Page -->
+    <!-- Login Page — Aurora stage: ambient purple pools over a faint grid +
+         noise texture. Card sits centered with multi-layer shadow + inner
+         glow. References Linear / Vercel / Stripe login aesthetics. -->
     <div id="page-login" class="page active">
-      <div class="sea-creature sc-1"></div>
-      <div class="sea-creature sc-2"></div>
-      <div class="sea-creature sc-3"></div>
+      <div class="login-aurora" aria-hidden="true"></div>
+      <!-- Three slow-swimming light blobs — revived from v1 (6bc7a3b) per
+           feedback: the page felt static. Trajectories preserved (swim1/2/3);
+           colors rebased onto the purple Aurora palette so they read as
+           drifting brand-colored light, not foreign decoration. -->
+      <div class="login-creature sc-1" aria-hidden="true"></div>
+      <div class="login-creature sc-2" aria-hidden="true"></div>
+      <div class="login-creature sc-3" aria-hidden="true"></div>
+      <div class="login-grid" aria-hidden="true"></div>
+      <div class="login-noise" aria-hidden="true"></div>
       <div class="login-card">
+        <div class="login-card-glow" aria-hidden="true"></div>
         <div class="login-brand">
+          <div class="brand-mark-wrap">
+            <span class="brand-mark-halo" aria-hidden="true"></span>
+            <svg class="brand-mark" viewBox="0 0 48 48" width="48" height="48" aria-hidden="true">
+              <!-- Diamond + 4 dots — matches the mark in /misc/logo.svg (purple palette). -->
+              <g transform="translate(24,24)">
+                <rect x="-7" y="-7" width="14" height="14" fill="#5053e8" transform="rotate(45)" rx="1.5"/>
+                <circle cx="-18" cy="0" r="3" fill="rgba(80,83,232,0.35)"/>
+                <circle cx="18" cy="0" r="3" fill="rgba(80,83,232,0.35)"/>
+                <circle cx="0" cy="-18" r="3" fill="rgba(80,83,232,0.35)"/>
+                <circle cx="0" cy="18" r="3" fill="rgba(80,83,232,0.35)"/>
+              </g>
+            </svg>
+          </div>
           <div class="brand-name" data-i18n="brand.name">BooM</div>
           <div class="brand-tagline" data-i18n="brand.tagline">Gateway Dashboard</div>
         </div>
@@ -37,7 +60,9 @@
           </div>
           <button type="submit" id="login-btn" data-i18n="login.submit">Login</button>
           <p id="login-error" class="error-msg hidden"></p>
-          <a href="#" class="admin-toggle" id="admin-toggle" data-i18n="login.admin_link">Admin sign in →</a>
+          <div class="admin-toggle-wrap">
+            <a href="#" class="admin-toggle" id="admin-toggle" data-i18n="login.admin_link">Admin sign in →</a>
+          </div>
         </form>
       </div>
     </div>
@@ -149,10 +174,6 @@
               <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 3h12v9a2 2 0 01-2 2H4a2 2 0 01-2-2V3zM5 3V1.5M11 3V1.5M2 7h12"/></svg>
               <span data-i18n="nav.models">Models</span>
             </a>
-            <a href="#/admin/aliases" class="nav-link" data-section="admin-aliases">
-              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M6.5 3L12 8l-5.5 5"/><path d="M2 3l5.5 5L2 13"/></svg>
-              <span data-i18n="nav.aliases">Aliases</span>
-            </a>
             <a href="#/admin/plans" class="nav-link" data-section="admin-plans">
               <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="1.5" y="1.5" width="13" height="13" rx="2"/><path d="M5 5h6M5 8h4M5 11h2"/></svg>
               <span data-i18n="nav.plans">Plans</span>
@@ -162,8 +183,8 @@
               <span data-i18n="nav.keys">Keys</span>
             </a>
             <a href="#/admin/quota" class="nav-link" data-section="admin-quota">
-              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 13h12"/><path d="M4 13V6M7 13V3M10 13V8M13 13V5"/></svg>
-              <span data-i18n="nav.quota">Quota</span>
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="5.5" r="2.2"/><circle cx="2.6" cy="6.6" r="1.6"/><circle cx="13.4" cy="6.6" r="1.6"/><path d="M1 13.5c0-1.8 1-3 2.6-3.2M15 13.5c0-1.8-1-3-2.6-3.2M4 13.5c0-2.5 1.7-4.3 4-4.3s4 1.8 4 4.3"/></svg>
+              <span data-i18n="nav.quota">Teams</span>
             </a>
             <a href="#/admin/logs" class="nav-link" data-section="admin-logs">
               <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 4h12M2 8h12M2 12h8"/><circle cx="14" cy="12" r="1.5"/></svg>
@@ -199,23 +220,25 @@
             </div>
             <div id="inflight-table-wrap"><p class="loading" data-i18n="common.loading">Loading...</p></div>
 
-            <div class="section-header" style="margin-top:2rem">
-              <h2 data-i18n="stats.rate.title">Request Rate (per model)</h2>
-              <div class="range-controls" data-target="rate">
-                <button class="btn-range active" data-range="1h">1h</button>
-                <button class="btn-range" data-range="4h">4h</button>
-                <button class="btn-range" data-range="8h">8h</button>
-                <button class="btn-range" data-range="24h">24h</button>
-                <button class="btn-range" data-range="custom" data-i18n="range.custom">Custom</button>
-                <span class="range-custom hidden">
-                  <input type="datetime-local" class="range-from">
-                  <input type="datetime-local" class="range-to">
-                  <button class="btn-tiny range-apply" data-i18n="action.apply">Apply</button>
-                </span>
-                <span class="range-note hidden"></span>
+            <div class="request-rate-panel" style="margin-top:2rem">
+              <div class="request-rate-panel__head">
+                <h2 data-i18n="stats.rate.title">Request Rate (per model)</h2>
+                <div class="range-controls" data-target="rate">
+                  <button class="btn-range active" data-range="1h">1h</button>
+                  <button class="btn-range" data-range="4h">4h</button>
+                  <button class="btn-range" data-range="8h">8h</button>
+                  <button class="btn-range" data-range="24h">24h</button>
+                  <button class="btn-range" data-range="custom" data-i18n="range.custom">Custom</button>
+                  <span class="range-custom hidden">
+                    <input type="datetime-local" class="range-from">
+                    <input type="datetime-local" class="range-to">
+                    <button class="btn-tiny range-apply" data-i18n="action.apply">Apply</button>
+                  </span>
+                  <span class="range-note hidden"></span>
+                </div>
               </div>
+              <div id="request-rate-wrap"><p class="loading" data-i18n="common.loading">Loading...</p></div>
             </div>
-            <div id="request-rate-wrap"><p class="loading" data-i18n="common.loading">Loading...</p></div>
           </section>
 
           <!-- Debug Section -->
@@ -253,27 +276,21 @@
           <section id="admin-models" class="section">
             <div class="section-header">
               <h2 data-i18n="models.title">Model Deployments</h2>
-              <button class="btn-primary" id="btn-new-model" data-i18n="models.add">+ Add Model</button>
+              <div style="display:flex;gap:8px">
+                <button class="btn-small" id="btn-new-alias" data-i18n="aliases.add">+ Add Alias</button>
+                <button class="btn-small" id="btn-new-model" data-i18n="models.add">+ Add Model</button>
+              </div>
             </div>
             <div id="models-table-wrap"><p class="loading" data-i18n="common.loading">Loading...</p></div>
-          </section>
-
-          <!-- Aliases Section -->
-          <section id="admin-aliases" class="section">
-            <div class="section-header">
-              <h2 data-i18n="aliases.title">Model Aliases</h2>
-              <button class="btn-primary" id="btn-new-alias" data-i18n="aliases.add">+ Add Alias</button>
-            </div>
-            <div id="aliases-table-wrap"><p class="loading" data-i18n="common.loading">Loading...</p></div>
           </section>
 
           <!-- Plans Section -->
           <section id="admin-plans" class="section">
             <div class="section-header">
               <h2 data-i18n="plans.title">Plans</h2>
-              <div>
-                <button class="btn-danger" id="btn-reset-all-limits" data-i18n="plans.reset_all">Reset All Limits</button>
-                <button class="btn-primary" id="btn-new-plan" data-i18n="plans.add">+ New Plan</button>
+              <div style="display:flex;gap:8px">
+                <button class="btn-small is-danger" id="btn-reset-all-limits" data-i18n="plans.reset_all">Reset All Limits</button>
+                <button class="btn-small" id="btn-new-plan" data-i18n="plans.add">+ New Plan</button>
               </div>
             </div>
             <div id="plans-table-wrap"><p class="loading" data-i18n="common.loading">Loading...</p></div>
@@ -286,7 +303,7 @@
               <div class="keys-toolbar">
                 <input type="text" id="keys-search" data-i18n-ph="keys.search_placeholder" placeholder="Search alias, name, user, token..." class="search-input">
                 <button class="btn-small" id="btn-vip-filter" data-i18n="keys.vip_only">VIP Only</button>
-                <button class="btn-primary" id="btn-new-key" data-i18n="keys.add">+ Create Key</button>
+                <button class="btn-small" id="btn-new-key" data-i18n="keys.add">+ Create Key</button>
               </div>
             </div>
             <div id="keys-table-wrap"><p class="loading" data-i18n="common.loading">Loading...</p></div>
@@ -297,7 +314,7 @@
           <section id="admin-assignments" class="section">
             <div class="section-header">
               <h2 data-i18n="assignments.title">Key-Plan Assignments</h2>
-              <button class="btn-primary" id="btn-new-assignment" data-i18n="assignments.add">+ Assign</button>
+              <button class="btn-small" id="btn-new-assignment" data-i18n="assignments.add">+ Assign</button>
             </div>
             <div id="assignments-table-wrap"><p class="loading" data-i18n="common.loading">Loading...</p></div>
             <div id="assignments-pagination" class="pagination"></div>
@@ -307,7 +324,7 @@
           <section id="admin-quota" class="section">
             <div class="section-header">
               <h2 data-i18n="quota.title">Quota Management</h2>
-              <button class="btn-primary" id="btn-create-team" onclick="showCreateTeamModal()" data-i18n="quota.create_team">Create Team</button>
+              <button class="btn-small" id="btn-create-team" onclick="showCreateTeamModal()" data-i18n="quota.create_team">Create Team</button>
             </div>
             <div id="quota-overview-wrap"><p class="loading" data-i18n="common.loading">Loading...</p></div>
           </section>

@@ -58,23 +58,52 @@
   --sidebar-text-active:#f0a04b;
   --sidebar-border:rgba(255,255,255,.08);
 
+  /* Sidebar gradient — bright brand purple. Overridden in dark mode. */
+  --sidebar-gradient-1: #5053e8;
+  --sidebar-gradient-2: #7879f0;
+  --sidebar-gradient-3: #a1a4f7;
+
+  /* Login — Aurora stage: neutral base + multi-layer ambient purple pools
+   * over a faint grid + noise. Card is solid white with multi-layer shadow
+   * and a soft inner top-edge glow so it reads as floating above the stage.
+   * Accent is the brand purple, same hue family as the sidebar gradient. */
+  --login-bg:            #f5f6fa;
+  --login-aurora-1:      rgba(80,83,232,.14);
+  --login-aurora-2:      rgba(120,121,240,.10);
+  --login-aurora-3:      rgba(161,164,247,.16);
+  --login-grid-color:    rgba(80,83,232,.045);
+  --login-card-bg:       #ffffff;
+  --login-card-border:   rgba(228,231,238,.9);
+  --login-card-glow:     rgba(255,255,255,.7);
+  --login-input-bg:      #f7f8fb;
+  --login-input-border:  #d8dce5;
+  --login-input-bg-focus:#ffffff;
+
+  /* Login accent — purple gradient endpoints for button + focus ring +
+   * hover link. Same hue family as sidebar. */
+  --login-accent:   #5053e8;
+  --login-accent-2: #7879f0;
+
   /* Scrollbar */
   --scrollbar-track: transparent;
   --scrollbar-thumb: var(--border);
   --scrollbar-hover: var(--border2);
 
-  /* Selection */
-  --selection-bg: rgba(232,116,12,.18);
+  /* Selection — purple to match brand (was orange #e8740c, caused a
+   * yellow flash when text/button got briefly selected during click). */
+  --selection-bg: rgba(80,83,232,.20);
 }
 
 /* ── Dark Theme ────────────────────────────────────────── */
 [data-theme="dark"] {
-  --bg:        #0d0f14;
-  --surface:   #161922;
-  --surface2:  #1e2230;
-  --surface3:  #272c3d;
-  --border:    #2a2f42;
-  --border2:   #3a4158;
+  /* Surfaces — tinted slightly purple so they harmonize with the deep-purple
+     sidebar (#1f1b4d→#3a3170) rather than reading as neutral gray-blue. */
+  --bg:        #0c0e1a;
+  --surface:   #15182a;
+  --surface2:  #1d2138;
+  --surface3:  #262b48;
+  --border:    #2a2f4e;
+  --border2:   #3a4170;
 
   --text:      #e4e7ee;
   --text2:     #a0a8c0;
@@ -107,10 +136,39 @@
   --sidebar-text-active:#f5a623;
   --sidebar-border: rgba(255,255,255,.06);
 
+  /* Sidebar gradient override — deep purple, same hue family as the light-mode
+     #5053e8→#a1a4f7 sidebar but tuned for dark surfaces. Light mode keeps the
+     bright gradient as a brand anchor; dark mode dims it so the sidebar
+     doesn't visually shout against #161922 surfaces. */
+  --sidebar-gradient-1: #1f1b4d;
+  --sidebar-gradient-2: #2a245e;
+  --sidebar-gradient-3: #3a3170;
+
+  /* Login — dark Aurora stage: near-black base with brighter ambient pools
+     (the noise + grid layers below dim them further) and a slightly lighter
+     accent so the button stays visible against the dark base. Card is solid
+     dark, not glass — keeps form clarity against the busy background. */
+  --login-bg:            #0a0c14;
+  --login-aurora-1:      rgba(80,83,232,.22);
+  --login-aurora-2:      rgba(120,121,240,.14);
+  --login-aurora-3:      rgba(161,164,247,.16);
+  --login-grid-color:    rgba(161,164,247,.05);
+  --login-card-bg:       #15182a;
+  --login-card-border:   rgba(58,65,112,.55);
+  --login-card-glow:     rgba(120,121,240,.06);
+  --login-input-bg:      #0e1018;
+  --login-input-border:  #2a2f4e;
+  --login-input-bg-focus:#1a1e30;
+
+  /* Login accent — brighter than sidebar gradient so focus rings / buttons
+     stay visible on the deep dark background. */
+  --login-accent:   #7879f0;
+  --login-accent-2: #a1a4f7;
+
   --scrollbar-thumb: var(--border);
   --scrollbar-hover: var(--border2);
 
-  --selection-bg: rgba(240,146,14,.22);
+  --selection-bg: rgba(120,121,240,.24);
 }
 
 /* ── Base ──────────────────────────────────────────────── */
@@ -139,211 +197,324 @@ input, select, textarea { font-family: var(--font); font-size: 14px; }
 .page { display: none; height: 100vh; }
 .page.active { display: flex; }
 
-/* ── Login ──────────────────────────────────────────────── */
+/* ── Login — Aurora stage ─────────────────────────────────
+ * Layered backdrop (Linear/Vercel/Stripe school): a near-neutral base
+ * carries three slow-drifting purple pools (Aurora) above a faint engineering
+ * grid and a fine noise veil. The card sits centered with multi-layer
+ * shadow + inner top-edge glow so it reads as floating above the stage.
+ * Logo and accent are the brand purple — already approved, not changed.
+ * ───────────────────────────────────────────────────────── */
 #page-login {
   align-items: center; justify-content: center;
   position: relative; overflow: hidden;
-  background: linear-gradient(180deg, #eef2f7 0%, #e8eff8 40%, #dce8f4 100%);
-}
-[data-theme="dark"] #page-login {
-  background: linear-gradient(180deg, #0a0e18 0%, #0b1120 40%, #0d1528 100%);
+  background: var(--login-bg);
 }
 
-/* ── Sea creatures ──────────────────────────────────────── */
-.sea-creature {
+/* Layer order, back→front: aurora (z=0) → grid (z=0) → noise (z=1) → card (z=2).
+ * Each layer is absolutely positioned, full-bleed, pointer-events:none. */
+
+/* Aurora — three soft radial pools, slowly drifting so the backdrop never
+ * feels static. Animation is reduced for users who prefer reduced motion. */
+.login-aurora {
+  position: absolute; inset: 0;
+  pointer-events: none; z-index: 0;
+  background:
+    radial-gradient(ellipse 50% 42% at 18% 18%, var(--login-aurora-1) 0%, transparent 60%),
+    radial-gradient(ellipse 42% 50% at 82% 28%, var(--login-aurora-2) 0%, transparent 60%),
+    radial-gradient(ellipse 60% 40% at 50% 95%, var(--login-aurora-3) 0%, transparent 65%);
+  animation: auroraDrift 28s ease-in-out infinite alternate;
+  will-change: transform;
+}
+@keyframes auroraDrift {
+  0%   { transform: translate3d(0,0,0)     scale(1); }
+  50%  { transform: translate3d(-3%,2%,0)  scale(1.05); }
+  100% { transform: translate3d(2%,-2%,0)  scale(1.02); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .login-aurora { animation: none; }
+}
+
+/* ── Swimming light blobs ────────────────────────────────
+ * Three soft purple blobs that drift independently across the backdrop —
+ * the "海底生物" feel the page had in v1 (6bc7a3b) and lost in v2. Colors
+ * are rebased onto the Aurora purple palette so they layer naturally with
+ * the ambient pools and grid instead of reading as foreign decoration.
+ * Blobs sit ABOVE the static aurora+grid, BELOW the noise veil and card. */
+.login-creature {
   position: absolute;
   border-radius: 50%;
   pointer-events: none;
   z-index: 0;
   will-change: transform;
+  filter: blur(48px);
+  mix-blend-mode: screen;
 }
-/* Creature 1 — large, slow, deep teal — patrols lower-mid area */
-.sc-1 {
-  width: 550px; height: 240px;
-  bottom: 10%; left: -120px;
-  background: radial-gradient(ellipse, rgba(56,189,176,.18) 0%, rgba(45,130,140,.08) 50%, transparent 70%);
-  filter: blur(55px);
+[data-theme="dark"] .login-creature { mix-blend-mode: screen; }
+/* Blob 1 — large, slow, bright lavender — patrols the upper band. */
+.login-creature.sc-1 {
+  width: 480px; height: 220px;
+  top: -10%; left: -8%;
+  background: radial-gradient(ellipse, rgba(161,164,247,.32) 0%, rgba(120,121,240,.10) 50%, transparent 70%);
   animation: swim1 26s ease-in-out infinite;
 }
-[data-theme="dark"] .sc-1 {
-  background: radial-gradient(ellipse, rgba(56,189,176,.22) 0%, rgba(34,211,238,.08) 50%, transparent 70%);
+[data-theme="dark"] .login-creature.sc-1 {
+  background: radial-gradient(ellipse, rgba(161,164,247,.28) 0%, rgba(120,121,240,.10) 50%, transparent 70%);
 }
 @keyframes swim1 {
   0%   { transform: translate(0, 0) scaleX(1); }
-  15%  { transform: translate(30vw, -18vh) scaleX(1.1); }
-  35%  { transform: translate(65vw, -8vh) scaleX(.95); }
-  55%  { transform: translate(40vw, 12vh) scaleX(1.06); }
-  75%  { transform: translate(10vw, -5vh) scaleX(.98); }
+  15%  { transform: translate(28vw, 12vh) scaleX(1.08); }
+  35%  { transform: translate(62vw, 4vh)  scaleX(.96); }
+  55%  { transform: translate(38vw, 22vh) scaleX(1.04); }
+  75%  { transform: translate(10vw, 14vh) scaleX(.99); }
   100% { transform: translate(0, 0) scaleX(1); }
 }
-
-/* Creature 2 — medium, indigo — wanders mid-upper area */
-.sc-2 {
-  width: 420px; height: 190px;
-  top: 15%; right: -100px;
-  background: radial-gradient(ellipse, rgba(99,102,241,.12) 0%, rgba(139,92,246,.06) 50%, transparent 70%);
-  filter: blur(48px);
+/* Blob 2 — medium, deep purple — patrols the lower-right. */
+.login-creature.sc-2 {
+  width: 380px; height: 180px;
+  bottom: -8%; right: -8%;
+  background: radial-gradient(ellipse, rgba(80,83,232,.30) 0%, rgba(120,121,240,.10) 50%, transparent 70%);
   animation: swim2 20s ease-in-out infinite;
   animation-delay: -7s;
 }
-[data-theme="dark"] .sc-2 {
-  background: radial-gradient(ellipse, rgba(129,140,248,.18) 0%, rgba(139,92,246,.08) 50%, transparent 70%);
+[data-theme="dark"] .login-creature.sc-2 {
+  background: radial-gradient(ellipse, rgba(80,83,232,.36) 0%, rgba(120,121,240,.14) 50%, transparent 70%);
 }
 @keyframes swim2 {
   0%   { transform: translate(0, 0) scaleX(1); }
-  20%  { transform: translate(-35vw, 20vh) scaleX(1.05); }
-  45%  { transform: translate(-70vw, 5vh) scaleX(.96); }
-  70%  { transform: translate(-30vw, -15vh) scaleX(1.08); }
+  20%  { transform: translate(-30vw, -16vh) scaleX(1.06); }
+  45%  { transform: translate(-62vw, -4vh)  scaleX(.97); }
+  70%  { transform: translate(-26vw, 10vh)  scaleX(1.04); }
   100% { transform: translate(0, 0) scaleX(1); }
 }
-
-/* Creature 3 — small, cyan — darts around center */
-.sc-3 {
-  width: 320px; height: 140px;
-  top: 40%; left: 20%;
-  background: radial-gradient(ellipse, rgba(34,211,238,.1) 0%, rgba(6,182,212,.04) 50%, transparent 70%);
-  filter: blur(42px);
+/* Blob 3 — small, bright lavender — crosses the mid-band. */
+.login-creature.sc-3 {
+  width: 280px; height: 130px;
+  top: 45%; left: 30%;
+  background: radial-gradient(ellipse, rgba(161,164,247,.28) 0%, rgba(161,164,247,.06) 50%, transparent 70%);
   animation: swim3 15s ease-in-out infinite;
   animation-delay: -4s;
 }
-[data-theme="dark"] .sc-3 {
-  background: radial-gradient(ellipse, rgba(34,211,238,.2) 0%, rgba(6,182,212,.08) 50%, transparent 70%);
+[data-theme="dark"] .login-creature.sc-3 {
+  background: radial-gradient(ellipse, rgba(161,164,247,.22) 0%, rgba(161,164,247,.05) 50%, transparent 70%);
 }
 @keyframes swim3 {
   0%   { transform: translate(0, 0) scaleX(1); }
-  25%  { transform: translate(20vw, -25vh) scaleX(1.12); }
-  50%  { transform: translate(50vw, 10vh) scaleX(.9); }
-  75%  { transform: translate(15vw, 20vh) scaleX(1.06); }
+  25%  { transform: translate(18vw, -20vh) scaleX(1.10); }
+  50%  { transform: translate(46vw, 6vh)   scaleX(.92); }
+  75%  { transform: translate(14vw, 16vh) scaleX(1.05); }
   100% { transform: translate(0, 0) scaleX(1); }
 }
+@media (prefers-reduced-motion: reduce) {
+  .login-creature { animation: none; }
+}
+
+/* Engineering grid — barely visible 32px lines, fading toward edges so the
+ * center reads as the focal area. Sits below aurora but above noise. */
+.login-grid {
+  position: absolute; inset: 0;
+  pointer-events: none; z-index: 0;
+  background-image:
+    linear-gradient(var(--login-grid-color) 1px, transparent 1px),
+    linear-gradient(90deg, var(--login-grid-color) 1px, transparent 1px);
+  background-size: 32px 32px, 32px 32px;
+  background-position: center center;
+  -webkit-mask-image: radial-gradient(ellipse 70% 60% at 50% 45%, #000 0%, transparent 75%);
+          mask-image: radial-gradient(ellipse 70% 60% at 50% 45%, #000 0%, transparent 75%);
+}
+
+/* Noise veil — inline SVG turbulence, opacity tuned so it adds texture
+ * without making the backdrop dirty. Sits above aurora+grid, below card. */
+.login-noise {
+  position: absolute; inset: 0;
+  pointer-events: none; z-index: 1;
+  opacity: .035;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='200' height='200'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 1  0 0 0 0 1  0 0 0 0 1  0 0 0 0.6 0'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");
+  mix-blend-mode: overlay;
+}
+[data-theme="dark"] .login-noise { opacity: .06; }
+
+/* Card — solid (not glass), multi-layer shadow, faint inner top-edge glow
+ * so it reads as a polished surface catching the aurora light. Glow layer
+ * below is a soft purple halo behind the card. */
 .login-card {
-  position: relative; z-index: 1;
-  background: rgba(255,255,255,.45);
-  border: 1px solid rgba(255,255,255,.5);
-  border-radius: 24px; padding: 48px 44px; width: 420px;
-  backdrop-filter: blur(40px) saturate(1.8) brightness(1.05);
-  -webkit-backdrop-filter: blur(40px) saturate(1.8) brightness(1.05);
+  position: relative; z-index: 2;
+  background: var(--login-card-bg);
+  border: 1px solid var(--login-card-border);
+  border-radius: 20px; padding: 48px 44px; width: 420px;
   box-shadow:
-    0 24px 80px rgba(0,0,0,.06),
-    inset 0 1px 1px rgba(255,255,255,.8),
-    inset 0 -1px 1px rgba(255,255,255,.3);
+    0 1px 2px rgba(0,0,0,.04),
+    0 24px 60px rgba(0,0,0,.08),
+    0 8px 24px rgba(80,83,232,.10),
+    inset 0 1px 0 var(--login-card-glow);
   animation: cardIn .5s cubic-bezier(.16,1,.3,1);
-  overflow: hidden;
-}
-/* Liquid glass specular highlight — slow drifting light reflection */
-.login-card::before {
-  content: "";
-  position: absolute; top: -50%; left: -50%;
-  width: 200%; height: 200%;
-  background: radial-gradient(ellipse at 30% 20%, rgba(255,255,255,.35) 0%, transparent 50%);
-  animation: glassReflect 8s ease-in-out infinite alternate;
-  pointer-events: none;
-}
-@keyframes glassReflect {
-  0%   { transform: translate(0, 0) rotate(0deg); }
-  100% { transform: translate(15%, 10%) rotate(3deg); }
+  isolation: isolate;
 }
 [data-theme="dark"] .login-card {
-  background: rgba(30,34,48,.45);
-  border-color: rgba(255,255,255,.1);
   box-shadow:
-    0 24px 80px rgba(0,0,0,.4),
-    inset 0 1px 1px rgba(255,255,255,.08),
-    inset 0 -1px 1px rgba(255,255,255,.03);
+    0 1px 2px rgba(0,0,0,.3),
+    0 24px 60px rgba(0,0,0,.55),
+    0 8px 24px rgba(80,83,232,.22),
+    inset 0 1px 0 var(--login-card-glow);
 }
-[data-theme="dark"] .login-card::before {
-  background: radial-gradient(ellipse at 30% 20%, rgba(255,255,255,.08) 0%, transparent 50%);
+@keyframes cardIn {
+  from { opacity: 0; transform: translateY(14px) scale(.985); }
+  to   { opacity: 1; transform: translateY(0)    scale(1); }
 }
-.login-card .form-group label { color: var(--text3); }
+
+.login-card .form-group label {
+  color: var(--text2);
+  font-size: 12px; font-weight: 600; letter-spacing: .3px;
+  margin-bottom: 8px; display: block;
+}
 .login-card .form-group input {
-  background: rgba(0,0,0,.03);
-  border-color: var(--border);
+  width: 100%;
+  height: 44px;
+  padding: 0 16px;
+  background: var(--login-input-bg);
+  border: 1px solid var(--login-input-border);
+  border-radius: 10px;
   color: var(--text);
+  font-size: 14px;
+  outline: none;
+  transition: border var(--transition), box-shadow var(--transition), background var(--transition);
 }
 .login-card .form-group input::placeholder { color: var(--text3); }
 .login-card .form-group input:focus {
-  border-color: var(--primary);
-  box-shadow: 0 0 0 3px var(--primary-bg);
-  background: var(--surface);
-}
-[data-theme="dark"] .login-card .form-group label { color: rgba(255,255,255,.55); }
-[data-theme="dark"] .login-card .form-group input {
-  background: rgba(255,255,255,.06);
-  border-color: rgba(255,255,255,.1);
-  color: #fff;
-}
-[data-theme="dark"] .login-card .form-group input::placeholder { color: rgba(255,255,255,.3); }
-[data-theme="dark"] .login-card .form-group input:focus {
-  border-color: var(--primary);
-  box-shadow: 0 0 0 3px rgba(232,116,12,.2);
-  background: rgba(255,255,255,.1);
+  border-color: var(--login-accent);
+  box-shadow:
+    0 0 0 4px rgba(80,83,232,.12),
+    inset 0 1px 2px rgba(80,83,232,.05);
+  background: var(--login-input-bg-focus);
 }
 .login-card .error-msg {
-  background: var(--danger-bg); border: 1px solid rgba(239,68,68,.12);
+  background: var(--danger-bg); border: 1px solid rgba(239,68,68,.18);
   color: var(--danger);
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: 13px;
+  margin: 0 0 12px;
 }
 [data-theme="dark"] .login-card .error-msg {
-  background: rgba(239,68,68,.15); border-color: rgba(239,68,68,.2);
+  background: rgba(239,68,68,.16); border-color: rgba(239,68,68,.28);
   color: #fca5a5;
 }
+/* Button — purple gradient with an animated underglow that blooms on hover.
+ * The underglow is a separate ::before layer so the button face stays crisp
+ * while the halo blooms behind it. Active state flattens the lift. */
 .login-card #login-btn {
-  background: linear-gradient(135deg, var(--primary), #f5a623);
-  border: none; font-weight: 700; letter-spacing: .5px;
+  position: relative;
+  width: 100%; height: 44px; padding: 0 16px;
+  background: linear-gradient(135deg, var(--login-accent) 0%, var(--login-accent-2) 100%);
+  border: none; border-radius: 10px;
+  font-weight: 600; font-size: 14px; letter-spacing: .3px;
+  color: #ffffff;
+  transition: transform .15s ease, box-shadow .25s ease, filter .15s ease;
+  isolation: isolate;
+}
+.login-card #login-btn::before {
+  content: ""; position: absolute; inset: 0;
+  border-radius: 10px;
+  background: linear-gradient(135deg, var(--login-accent-2), var(--login-accent));
+  opacity: 0;
+  box-shadow: 0 8px 28px rgba(80,83,232,.45);
+  transition: opacity .25s ease;
+  z-index: -1;
 }
 .login-card #login-btn:hover {
-  background: linear-gradient(135deg, var(--primary-h), #e8950c);
-  box-shadow: 0 4px 20px rgba(232,116,12,.25);
+  transform: translateY(-1px);
+  filter: saturate(1.05);
 }
-@keyframes cardIn {
-  from { opacity: 0; transform: translateY(12px); }
-  to   { opacity: 1; transform: translateY(0); }
+.login-card #login-btn:hover::before { opacity: 1; }
+.login-card #login-btn:active {
+  transform: translateY(0);
+  filter: saturate(.98);
 }
-.login-brand { text-align: center; margin-bottom: 36px; position: relative; }
-.login-brand::before {
-  content: ""; display: block; width: 10px; height: 10px; margin: 0 auto 16px;
-  background: var(--primary); transform: rotate(45deg);
-  box-shadow:
-    -12px 0 0 0 var(--primary-glow),
-    12px 0 0 0 var(--primary-glow),
-    0 -12px 0 0 var(--primary-glow),
-    0 12px 0 0 var(--primary-glow);
+.login-card #login-btn:disabled {
+  opacity: .6; cursor: not-allowed; filter: grayscale(.3);
+}
+
+/* Brand block — logo + name + tagline stacked, centered. Logo carries the
+ * brand color so it's the most visible element on the card; name and
+ * tagline use neutral text colors so they don't compete.
+ *
+ * Brand mark is the same diamond+4-dots icon used in /misc/logo.svg, just
+ * scaled larger for the login surface. Keeping the icon identical across
+ * README, login, etc. is what makes the brand recognizable. */
+.login-brand {
+  text-align: center;
+  margin-bottom: 36px;
+  display: flex; flex-direction: column; align-items: center;
+  gap: 14px;
+}
+/* Brand mark — same diamond+4-dots icon as /misc/logo.svg. Wraps in a
+ * relative box so the halo pseudo-element can sit behind the SVG. Static
+ * drop-shadow gives weight; a slow halo pulse breathes around it so the
+ * card never feels inert. Reduced-motion users get a static halo only. */
+.brand-mark-wrap {
+  position: relative;
+  width: 56px; height: 56px;
+  display: flex; align-items: center; justify-content: center;
+}
+.brand-mark {
+  width: 56px; height: 56px;
+  display: block;
+  filter: drop-shadow(0 6px 16px rgba(80,83,232,.35));
+  position: relative; z-index: 1;
+}
+.brand-mark-halo {
+  position: absolute; inset: -14px;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(80,83,232,.22) 0%, transparent 70%);
+  z-index: 0; pointer-events: none;
+  animation: brandPulse 6s ease-in-out infinite;
+}
+@keyframes brandPulse {
+  0%, 100% { opacity: .55; transform: scale(.9); }
+  50%      { opacity: 1;   transform: scale(1.1); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .brand-mark-halo { animation: none; opacity: .7; }
 }
 .login-brand .brand-name {
-  font-family: var(--mono); font-size: 38px; font-weight: 700; letter-spacing: 6px;
-  background: linear-gradient(135deg, var(--primary), #f5a623, var(--primary));
-  background-size: 200% 200%;
-  -webkit-background-clip: text; -webkit-text-fill-color: transparent;
-  background-clip: text;
-  animation: brand-shimmer 4s ease-in-out infinite;
-}
-@keyframes brand-shimmer {
-  0%, 100% { background-position: 0% 50%; }
-  50% { background-position: 100% 50%; }
+  font-family: var(--mono); font-size: 28px; font-weight: 700; letter-spacing: 4px;
+  color: var(--text);
+  line-height: 1;
 }
 .login-brand .brand-tagline {
-  color: var(--text3); font-size: 11px; letter-spacing: 3.5px;
-  text-transform: uppercase; margin-top: 10px; font-weight: 500;
-}
-[data-theme="dark"] .login-brand .brand-tagline {
-  color: rgba(255,255,255,.4);
+  color: var(--text3); font-size: 11px; letter-spacing: 2.5px;
+  text-transform: uppercase; margin-top: 2px; font-weight: 500;
+  line-height: 1;
 }
 .form-group { margin-bottom: 18px; }
 .form-group.hidden { display: none; }
 .login-hint {
   text-align: center; color: var(--text3);
-  font-size: 13px; margin: 0 0 22px; line-height: 1.5;
+  font-size: 13px; margin: 0 0 28px; line-height: 1.5;
   letter-spacing: .2px;
 }
-[data-theme="dark"] .login-hint { color: rgba(255,255,255,.5); }
-.admin-toggle {
-  display: block; text-align: center; margin-top: 18px;
-  font-size: 12px; color: var(--text3); text-decoration: none;
-  letter-spacing: .4px; cursor: pointer;
-  transition: color var(--transition);
+.admin-toggle-wrap {
+  margin-top: 20px;
+  padding-top: 18px;
+  border-top: 1px solid var(--login-card-border);
+  text-align: center;
+  position: relative;
 }
-.admin-toggle:hover { color: var(--primary); }
-[data-theme="dark"] .admin-toggle { color: rgba(255,255,255,.4); }
-[data-theme="dark"] .admin-toggle:hover { color: var(--primary); }
+.admin-toggle-wrap::before {
+  /* Subtle gradient fade on the divider so it doesn't read as a hard line. */
+  content: ""; position: absolute; left: 0; right: 0; top: 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--login-card-border) 25%, var(--login-card-border) 75%, transparent);
+}
+.admin-toggle {
+  display: inline-block;
+  font-size: 13px; color: var(--text3); text-decoration: none;
+  letter-spacing: .3px; cursor: pointer;
+  transition: color var(--transition), transform .2s ease;
+}
+.admin-toggle:hover {
+  color: var(--login-accent);
+  transform: translateY(-1px);
+}
 .form-group label {
   display: block; font-weight: 600; margin-bottom: 6px;
   font-size: 12px; color: var(--text3); letter-spacing: .4px;
@@ -360,15 +531,12 @@ input, select, textarea { font-family: var(--font); font-size: 14px; }
   box-shadow: 0 0 0 3px var(--primary-bg);
   background: var(--surface);
 }
-#login-btn {
-  width: 100%; padding: 11px; background: var(--primary); color: #fff;
-  border: none; border-radius: var(--radius-sm); font-weight: 600;
-  margin-top: 6px; letter-spacing: .3px;
-  transition: background var(--transition), transform .1s ease;
-}
-#login-btn:hover { background: var(--primary-h); }
-#login-btn:active { transform: scale(.985); }
-#login-btn:disabled { opacity: .5; cursor: not-allowed; }
+/* Legacy fallback `#login-btn` rules removed — the button is fully
+ * styled by the `.login-card #login-btn` block above, and these legacy
+ * `background: var(--primary)` (orange #e8740c) rules were the source of
+ * the yellow flash on hover when the more specific selectors momentarily
+ * ceded specificity (e.g. during transition). The login button should
+ * only ever render in the brand purple. */
 .error-msg {
   color: var(--danger); font-size: 13px; margin-top: 12px; text-align: center;
   padding: 10px; background: var(--danger-bg); border-radius: var(--radius-sm);
@@ -381,35 +549,43 @@ input, select, textarea { font-family: var(--font); font-size: 14px; }
 
 /* ── Sidebar ────────────────────────────────────────────── */
 .sidebar {
-  width: 240px; background: var(--sidebar-bg);
+  width: 240px;
+  background: linear-gradient(to bottom,
+    var(--sidebar-gradient-1) 0%,
+    var(--sidebar-gradient-2) 50%,
+    var(--sidebar-gradient-3) 100%);
   display: flex; flex-direction: column;
-  border-right: 1px solid var(--sidebar-border);
+  border-right: 1px solid rgba(255,255,255,.18);
+  color: #ffffff;
 }
 .sidebar h2 {
   padding: 22px 20px 18px; font-size: 13px; letter-spacing: 1.2px;
-  color: var(--sidebar-text); border-bottom: 1px solid var(--sidebar-border);
+  color: #ffffff; border-bottom: 1px solid rgba(255,255,255,.18);
   font-weight: 600; text-transform: uppercase;
 }
 .sidebar nav { flex: 1; padding: 10px 0; }
 .nav-link {
   display: flex; align-items: center; gap: 10px;
-  padding: 10px 20px; color: var(--sidebar-text);
+  padding: 10px 20px; color: rgba(255,255,255,.85);
   font-size: 13px; font-weight: 500;
   transition: all var(--transition);
   border-left: 3px solid transparent;
   margin: 1px 0;
 }
-.nav-link:hover { color: #d0d5e0; background: var(--sidebar-hover); }
+.nav-link:hover {
+  color: #ffffff;
+  background: rgba(255,255,255,.12);
+}
 .nav-link.active {
-  color: var(--sidebar-text-active);
-  background: var(--sidebar-active);
-  border-left-color: var(--primary);
+  color: #ffffff;
+  background: rgba(255,255,255,.18);
+  border-left-color: #ffffff;
   font-weight: 600;
 }
-.nav-link svg { width: 16px; height: 16px; flex-shrink: 0; opacity: .7; }
+.nav-link svg { width: 16px; height: 16px; flex-shrink: 0; opacity: .8; }
 .nav-link.active svg { opacity: 1; }
 .sidebar-footer {
-  padding: 12px 16px; border-top: 1px solid var(--sidebar-border);
+  padding: 12px 16px; border-top: 1px solid rgba(255,255,255,.18);
   display: flex; gap: 8px; align-items: center;
   flex-wrap: wrap;
 }
@@ -417,7 +593,7 @@ input, select, textarea { font-family: var(--font); font-size: 14px; }
 .sidebar-version {
   flex-basis: 100%;
   font-size: 11px;
-  color: var(--text3);
+  color: rgba(255,255,255,.7);
   font-variant-numeric: tabular-nums;
   letter-spacing: .02em;
   margin-bottom: 2px;
@@ -426,13 +602,14 @@ input, select, textarea { font-family: var(--font); font-size: 14px; }
 /* ── Theme Toggle ───────────────────────────────────────── */
 .theme-toggle {
   width: 36px; height: 36px; border-radius: var(--radius-sm);
-  background: var(--sidebar-hover); border: 1px solid var(--sidebar-border);
-  color: var(--sidebar-text); display: flex; align-items: center; justify-content: center;
+  background: rgba(255,255,255,.12); border: 1px solid rgba(255,255,255,.18);
+  color: #ffffff; display: flex; align-items: center; justify-content: center;
   transition: all var(--transition); flex-shrink: 0;
 }
 .theme-toggle:hover {
-  background: var(--sidebar-active); color: var(--sidebar-text-active);
-  border-color: rgba(232,116,12,.3);
+  background: rgba(255,255,255,.22);
+  color: #ffffff;
+  border-color: rgba(255,255,255,.35);
 }
 .theme-toggle svg { width: 18px; height: 18px; }
 
@@ -440,11 +617,11 @@ input, select, textarea { font-family: var(--font); font-size: 14px; }
 .sidebar-top {
   display: flex; align-items: center; justify-content: space-between;
   gap: 8px; padding: 16px 20px 14px;
-  border-bottom: 1px solid var(--sidebar-border);
+  border-bottom: 1px solid rgba(255,255,255,.18);
 }
 .sidebar-top h2 {
   padding: 0; margin: 0; font-size: 13px; letter-spacing: 1.2px;
-  color: var(--sidebar-text); font-weight: 600; text-transform: uppercase;
+  color: #ffffff; font-weight: 600; text-transform: uppercase;
 }
 
 /* ── Language Toggle ─────────────────────────────────────── */
@@ -509,42 +686,96 @@ input, select, textarea { font-family: var(--font); font-size: 14px; }
 }
 
 /* ── Buttons ────────────────────────────────────────────── */
+/*
+ * Unified sizing — every action button across the dashboard shares the
+ * same height (28px) so rows and section headers stop looking jagged:
+ *   .btn-primary   → primary action (modals / "+ Add X" hero buttons)
+ *   .btn-secondary → full-width neutral (sidebar Logout, modal Cancel)
+ *   .btn-small     → secondary action (Refresh / table Edit / table Reset)
+ *   .btn-danger    → destructive (Delete / Block / Remove)
+ *   .btn-tiny      → micro controls (range Apply, collapse toggles)
+ *   .btn-range     → segmented time-window selector
+ *
+ * .btn-small and .btn-danger share height/padding so the Edit/Delete pair
+ * in a table row stay equal-sized. .btn-primary is one step taller — it's
+ * reserved for hero buttons, not table-row actions.
+ */
 .btn-primary {
   background: var(--primary); color: #fff; border: none;
-  padding: 8px 18px; border-radius: var(--radius-sm);
+  padding: 0 18px; height: 32px; line-height: 1;
+  border-radius: var(--radius-sm);
   font-size: 13px; font-weight: 600; letter-spacing: .2px;
   transition: all var(--transition);
   box-shadow: 0 1px 2px rgba(0,0,0,.08);
+  display: inline-flex; align-items: center; justify-content: center;
+  cursor: pointer;
 }
 .btn-primary:hover { background: var(--primary-h); box-shadow: 0 2px 8px rgba(0,0,0,.12); transform: translateY(-1px); }
 .btn-primary:active { transform: translateY(0) scale(.98); box-shadow: 0 1px 2px rgba(0,0,0,.08); }
 
 .btn-secondary {
   background: var(--surface2); border: 1px solid var(--border);
-  color: var(--text2); padding: 8px 16px; border-radius: var(--radius-sm);
+  color: var(--text2); padding: 0 16px; height: 32px; line-height: 1;
+  border-radius: var(--radius-sm);
   width: 100%; transition: all var(--transition); font-weight: 500;
+  display: inline-flex; align-items: center; justify-content: center;
+  cursor: pointer; font-size: 13px;
 }
 .btn-secondary:hover { border-color: var(--border2); color: var(--text); background: var(--surface3); }
+/* Sidebar buttons (Logout, etc.) on purple gradient — override default surface colors. */
+.sidebar-footer .btn-secondary,
+.sidebar .btn-secondary {
+  background: rgba(255,255,255,.14);
+  border: 1px solid rgba(255,255,255,.25);
+  color: #ffffff;
+}
+.sidebar-footer .btn-secondary:hover,
+.sidebar .btn-secondary:hover {
+  background: rgba(255,255,255,.24);
+  border-color: rgba(255,255,255,.4);
+  color: #ffffff;
+}
 
 .btn-danger {
   background: var(--danger-bg); color: var(--danger); border: 1px solid rgba(220,53,69,.2);
-  padding: 8px 16px; border-radius: var(--radius-sm); font-size: 13px;
-  font-weight: 600; transition: all var(--transition);
-  box-shadow: 0 1px 2px rgba(0,0,0,.06);
+  padding: 0 14px; height: 28px; line-height: 1; border-radius: var(--radius-xs);
+  font-size: 12px; font-weight: 600; transition: all var(--transition);
+  box-shadow: 0 1px 2px rgba(0,0,0,.04);
+  display: inline-flex; align-items: center; justify-content: center;
+  cursor: pointer;
 }
 .btn-danger:hover { background: var(--danger); color: #fff; border-color: var(--danger); box-shadow: 0 2px 8px rgba(220,53,69,.2); }
 
 .btn-small {
-  padding: 6px 14px; font-size: 12px; border-radius: var(--radius-xs);
+  padding: 0 14px; height: 28px; line-height: 1;
+  font-size: 12px; border-radius: var(--radius-xs);
   border: 1px solid var(--border); background: var(--surface); color: var(--text2);
   font-weight: 500; transition: all var(--transition);
   box-shadow: 0 1px 2px rgba(0,0,0,.04);
   width: auto;
+  display: inline-flex; align-items: center; justify-content: center;
+  cursor: pointer;
 }
 /* When btn-small and btn-secondary are combined (e.g. prompt-log toggle in
    quota card), override btn-secondary's width:100% to keep the button inline. */
 .btn-small.btn-secondary { width: auto; }
+/* Inline cancel/close/copy buttons in modals — override btn-secondary's
+   width:100% so they hug their content instead of stretching full-width. */
+.btn-secondary.btn-inline { width: auto; }
 .btn-small:hover { border-color: var(--primary); color: var(--primary); background: var(--primary-bg); box-shadow: 0 1px 4px rgba(0,0,0,.08); }
+/* Danger-tinted btn-small for destructive section actions (e.g. "Reset All
+   Limits") — keeps the small/neutral baseline look but signals risk via red
+   text + red-tinted hover. */
+.btn-small.is-danger {
+  color: var(--danger);
+  border-color: rgba(239,68,68,.3);
+}
+.btn-small.is-danger:hover {
+  background: var(--danger-bg);
+  border-color: var(--danger);
+  color: var(--danger);
+  box-shadow: 0 1px 4px rgba(239,68,68,.1);
+}
 
 /* Range selector for time-windowed stats (Agent / Request Rate) */
 .range-controls {
@@ -552,9 +783,11 @@ input, select, textarea { font-family: var(--font); font-size: 14px; }
   font-size: 12px;
 }
 .btn-range {
-  padding: 4px 10px; font-size: 11px; border-radius: var(--radius-xs);
+  padding: 0 10px; height: 26px; line-height: 1; font-size: 11px;
+  border-radius: var(--radius-xs);
   border: 1px solid var(--border); background: var(--surface); color: var(--text2);
   font-weight: 500; cursor: pointer; transition: all var(--transition);
+  display: inline-flex; align-items: center; justify-content: center;
 }
 .btn-range:hover { border-color: var(--primary); color: var(--primary); }
 .btn-range.active {
@@ -565,40 +798,114 @@ input, select, textarea { font-family: var(--font); font-size: 14px; }
   display: inline-flex; align-items: center; gap: 4px;
 }
 .range-custom input[type="datetime-local"] {
-  padding: 3px 6px; font-size: 11px; border-radius: var(--radius-xs);
+  padding: 0 6px; height: 26px; font-size: 11px; border-radius: var(--radius-xs);
   border: 1px solid var(--border); background: var(--surface); color: var(--text2);
 }
 .btn-tiny {
-  padding: 3px 9px; font-size: 11px; border-radius: var(--radius-xs);
+  padding: 0 10px; height: 24px; line-height: 1; font-size: 11px;
+  border-radius: var(--radius-xs);
   border: 1px solid var(--primary); background: var(--primary); color: #fff;
   font-weight: 500; cursor: pointer;
+  display: inline-flex; align-items: center; justify-content: center;
 }
 .btn-tiny:hover { opacity: .9; }
 .range-note {
   color: var(--danger); font-size: 11px; padding-left: 4px;
 }
 .range-window-note {
-  font-size: 11px; color: var(--text3); margin: 2px 0 6px 0;
-  font-family: ui-monospace, SFMono-Regular, monospace;
+  font-size: 12px;
+  color: var(--text3);
+  margin-left: 10px;
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-weight: 500;
+  white-space: nowrap;
 }
 
 /* ── Tables ─────────────────────────────────────────────── */
+/*
+ * Layout invariants:
+ *   - Header rows are fixed at 40px, data rows at 44px. content wraps but
+ *     the row baseline stays put when scrolling — no more row-jump jitter.
+ *   - Tables always live inside a `.table-card` (or a `*-table-wrap` div,
+ *     which gets the same look via the attribute selector). The card owns
+ *     the border + radius + shadow; the table inside goes borderless.
+ *   - Sub-tables inside a `.card` (e.g. quota detail panels) get the
+ *     `.sub-table-card` look: lighter background, smaller radius.
+ */
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
 th {
-  padding: 10px 14px; text-align: left; font-weight: 600; color: var(--text3);
+  height: 40px; padding: 0 14px; text-align: left;
+  font-weight: 600; color: var(--text3);
   font-size: 11px; text-transform: uppercase; letter-spacing: .8px;
+  line-height: 1;
   background: var(--surface2); border-bottom: 1px solid var(--border);
 }
 td {
-  padding: 10px 14px; text-align: left;
+  height: 44px; padding: 0 14px; text-align: left;
+  line-height: 1.3; vertical-align: middle;
   border-bottom: 1px solid var(--border);
 }
+tbody tr:last-child td { border-bottom: none; }
 tbody tr { transition: background var(--transition); }
-tbody tr:hover td { background: var(--surface2); }
-tbody tr:nth-child(even) td { background: var(--surface); }
-tbody tr:nth-child(even):hover td { background: var(--surface2); }
+/* Zebra striping: odd rows keep the card surface; even rows get a slightly
+   darker tint so adjacent rows stay distinguishable when scanning. Hover
+   always wins over the zebra tint. */
+tbody tr:nth-child(even) td { background: var(--surface2); }
+tbody tr:nth-child(odd) td { background: var(--surface); }
+tbody tr:hover td { background: var(--surface3); }
+tbody tr:nth-child(even):hover td { background: var(--surface3); }
+/* Disabled model rows: dim the entire row (text + badges + buttons) so the
+   operator can see at a glance that this deployment is out of rotation. The
+   enabled badge and action buttons stay readable — opacity .55 is enough to
+   signal "inactive" without making the Edit/Delete controls unusable. */
+tbody tr.model-row-disabled td {
+  background: var(--surface2) !important;
+  color: var(--text3);
+  opacity: .55;
+}
+tbody tr.model-row-disabled:hover td {
+  background: var(--surface3) !important;
+  opacity: .75;
+}
+tbody tr.model-row-disabled .badge { opacity: 1; }
+tbody tr.model-row-warning td {
+  background: rgba(255,80,80,.08) !important;
+  padding: 4px 14px;
+  font-size: .85em;
+  color: var(--danger);
+  height: auto;
+}
 .mono { font-family: var(--mono); font-size: 13px; }
 .muted { color: var(--text3); font-size: 12px; }
+
+/* Outer rounded panel that frames every table — applies uniformly to every
+   `*-table-wrap` div without HTML changes. */
+.table-card,
+div[id$="-table-wrap"]:not(.bare) {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  box-shadow: var(--shadow-sm);
+}
+.table-card > table,
+div[id$="-table-wrap"]:not(.bare) > table {
+  border: none;
+}
+.table-card > table > thead:first-child > tr:first-child > th,
+div[id$="-table-wrap"]:not(.bare) > table > thead:first-child > tr:first-child > th {
+  /* header bg blends with the card so the top corners stay rounded cleanly */
+}
+
+/* Sub-table (nested inside a card, e.g. quota detail panels) */
+.sub-table-card {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+.sub-table-card > table { border: none; }
 
 /* ── Key Select List ────────────────────────────────────── */
 .key-select-list {
@@ -696,6 +1003,23 @@ tbody tr:nth-child(even):hover td { background: var(--surface2); }
 }
 .modal-wide { width: 90vw; }
 .modal h3 { margin-bottom: 20px; font-size: 17px; color: var(--text); font-weight: 700; }
+.modal table {
+  width: 100%; border-collapse: collapse; margin-bottom: 16px;
+  font-size: 12px;
+}
+.modal table th {
+  text-align: left; padding: 8px 10px;
+  background: var(--surface2);
+  color: var(--text2); font-weight: 600;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+.modal table td {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: middle;
+}
+.modal table td:nth-child(2), .modal table td:nth-child(3) { white-space: nowrap; }
 .modal .form-group { margin-bottom: 14px; }
 .modal .form-group input,
 .modal .form-group select,
@@ -918,19 +1242,74 @@ input[list] {
 }
 
 /* ── Inflight deployment cell ───────────────────────────── */
-.deploy-model {
-  font-family: var(--mono); font-size: 13px;
-  color: var(--info); font-weight: 600;
-  background: var(--info-bg); padding: 1px 7px;
-  border-radius: var(--radius-xs);
+/* Two-line layout: [vendor logo] + bold model name / faint deployment_id.
+   Replaces the old "model:deployment_id" inline span run. */
+.deploy-cell {
+  display: flex; align-items: center; gap: 10px;
 }
-.deploy-sep { color: var(--text3); margin: 0 2px; }
+.vendor-logo {
+  width: 22px; height: 22px;
+  border-radius: 5px;
+  flex-shrink: 0;
+  object-fit: contain;
+  background: var(--surface3);   /* shows through if the SVG fails to load */
+}
+.deploy-text { line-height: 1.2; min-width: 0; }
+.deploy-model {
+  font-weight: 600;
+  color: var(--text);
+  font-size: 13px;
+}
 .deploy-id {
-  font-family: var(--mono); font-size: 12px;
+  font-family: var(--mono);
+  font-size: 11px;
   color: var(--text3);
+  margin-top: 2px;
+}
+
+/* ── Per-1M-token cost cell (models table) ───────────────── */
+/* Inline "label:$value" per line — three rows stack tightly so the
+   column stays narrow even when EN headers ("Cost / 1M tokens") squeeze it. */
+.cost-cell {
+  display: flex; flex-direction: column; gap: 2px;
+  padding: 4px 0;
+}
+.cost-line {
+  display: flex; align-items: center; gap: 4px;
+  font-size: 11px; line-height: 1.4;
+  white-space: nowrap;
+}
+.cost-label {
+  color: var(--text3);
+  flex: 0 0 auto;
+  font-weight: 500;
+}
+.cost-value {
+  font-family: var(--mono);
+  color: var(--text);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+/* ── Alias chip (models table 别名列 single alias) ─────────── */
+.alias-chip {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: var(--radius-xs);
+  background: var(--primary-bg);
+  color: var(--primary);
+  font-size: 11px;
+  font-family: var(--mono);
+  font-weight: 500;
+  white-space: nowrap;
 }
 
 /* ── Stats bar chart (Request Rate / high-throughput feel) ─ */
+/*
+ * Visual feel: thin rounded bars, not chunky ones. Each column is wide,
+ * but the bar itself only takes ~14px centered inside it — looks more
+ * refined and lets dense time axes breathe.
+ */
 .rebalance-chart { display: flex; align-items: stretch; height: 160px; gap: 0; }
 .rb-y-axis {
   display: flex; flex-direction: column; justify-content: space-between;
@@ -941,16 +1320,31 @@ input[list] {
   display: flex; align-items: flex-end; flex: 1; gap: 2px;
   padding-bottom: 18px; border-bottom: 1px solid var(--border);
   border-radius: 0 0 2px 2px;
+  min-width: 0;
 }
 .rb-bar-col {
-  flex: 1; display: flex; flex-direction: column;
+  /* `flex: 1 1 0` + `min-width: 0` = columns share container width equally
+     AND can shrink below content size. Combined with % bar width below,
+     bars naturally thin out as the window narrows — no scrollbar, no
+     overflow. Labels truncate via ellipsis instead of forcing the column
+     wider. */
+  flex: 1 1 0;
+  min-width: 0;
+  display: flex; flex-direction: column;
   align-items: center; height: 100%; justify-content: flex-end;
 }
 .rb-bar-value { font-size: 10px; color: var(--text3); margin-bottom: 3px; line-height: 1; font-weight: 500; }
 .rb-bar-value-zero { visibility: hidden; }
 .rb-bar {
-  width: 100%; min-height: 1px;
-  border-radius: 3px 3px 0 0; transition: height .3s ease;
+  /* Width as % of column → bar thickens/thins with column. 70% leaves ~30%
+     gutter between adjacent bars. min/max caps keep visually sensible at
+     extremes (2px hairline on very narrow windows, 22px on very wide). */
+  width: 70%;
+  min-width: 2px;
+  max-width: 22px;
+  min-height: 1px;
+  border-radius: 4px 4px 0 0;
+  transition: height .3s ease;
   position: relative;
 }
 .rb-bar::after {
@@ -958,7 +1352,17 @@ input[list] {
   border-radius: inherit;
   background: linear-gradient(180deg, rgba(255,255,255,.15) 0%, transparent 60%);
 }
-.rb-bar-label { font-size: 10px; color: var(--text3); margin-top: 3px; white-space: nowrap; }
+.rb-bar-label {
+  font-size: 10px; color: var(--text3); margin-top: 3px;
+  /* Constrain to column width so long labels (MM-DD HH:MM) truncate with
+     ellipsis instead of forcing the column wider. Full label is always
+     available via the column's title tooltip. */
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: ltr;
+}
 .rb-label-hidden { visibility: hidden; }
 
 /* Stacked variant — per-model request-rate chart. */
@@ -972,16 +1376,63 @@ input[list] {
   transition: height .3s ease;
 }
 .rb-bar-seg:first-child { border-radius: 0 0 0 0; }
-.rb-bar-seg:last-child { border-radius: 3px 3px 0 0; }
+.rb-bar-seg:last-child { border-radius: 4px 4px 0 0; }
 .rb-bar-stacked .rb-bar-seg + .rb-bar-seg {
   /* tiny separator so adjacent segments stay readable even at full pastel */
   border-top: 1px solid rgba(255,255,255,.35);
 }
 
-/* Legend under each per-model chart. */
+/* Per-chart wrapper so the legend can absolutely position to top-right. */
+.rb-chart-card {
+  position: relative;
+  margin-bottom: 0.8rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 14px 16px 10px;
+}
+.rb-chart-card__label {
+  font-size: 12px;
+  font-weight: 600;
+  margin-bottom: 6px;
+  color: var(--text2);
+  padding-right: 200px;   /* keep title clear of the floating legend */
+  min-height: 16px;
+}
+.rb-chart-card--single { margin-bottom: 1rem; }
+.rb-chart-card:last-child { margin-bottom: 0; }
+
+/* Outer panel: wraps "Request Rate" title + range controls + all chart cards. */
+.request-rate-panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 20px 24px;
+  box-shadow: var(--shadow-sm);
+}
+.request-rate-panel__head {
+  display: flex; justify-content: space-between; align-items: center;
+  margin-bottom: 16px;
+}
+.request-rate-panel__head h2 {
+  font-size: 20px; color: var(--text); font-weight: 700; letter-spacing: -.2px;
+}
+.request-rate-panel #request-rate-wrap > p.loading,
+.request-rate-panel #request-rate-wrap > p {
+  margin: 4px 0 0;
+  color: var(--text3);
+  font-size: 13px;
+}
+
+/* Legend floats at the chart card's top-right corner. */
 .rb-legend {
-  display: flex; flex-wrap: wrap; gap: 8px 14px;
-  margin-top: 6px; font-size: 11px; color: var(--text3);
+  position: absolute;
+  top: 14px; right: 16px;
+  display: flex; flex-wrap: wrap; gap: 6px 12px;
+  justify-content: flex-end;
+  max-width: 60%;
+  font-size: 11px; color: var(--text3);
+  line-height: 1.4;
 }
 .rb-legend-item { display: inline-flex; align-items: center; gap: 4px; }
 .rb-legend-swatch {
@@ -1042,9 +1493,10 @@ input[list] {
   font-size: 24px; font-weight: 700; color: var(--text); line-height: 1.1;
 }
 .agent-bar {
-  width: 100%; min-height: 1px;
+  width: 14px; min-width: 6px; max-width: 22px;
+  min-height: 1px;
   display: flex; flex-direction: column;
-  border-radius: 3px 3px 0 0; overflow: hidden;
+  border-radius: 4px 4px 0 0; overflow: hidden;
   transition: height .3s ease;
 }
 .agent-bar-anthropic {
@@ -1551,12 +2003,15 @@ input[list] {
   overflow: hidden;
 }
 .dim-label {
-  flex: 0 0 90px;
+  flex: 0 0 130px;
   font-size: 12px;
   color: var(--text3);
   font-weight: 500;
   text-transform: uppercase;
   letter-spacing: .03em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .dim-value {
   flex: 0 0 auto;
@@ -1650,8 +2105,68 @@ input[list] {
   letter-spacing: .04em;
   margin-bottom: 4px;
 }
+.team-limits-title .team-limits-name-explicit {
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 12px;
+  color: var(--primary);
+  font-weight: 700;
+}
+.team-limits-title .team-limits-name-implicit {
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 12px;
+  color: var(--text2);
+  font-weight: 600;
+}
+.team-limits-title .team-limits-suffix {
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 11px;
+  color: var(--text3);
+  font-weight: 500;
+  margin-left: 4px;
+}
 .team-limits-block .dim-row {
   margin: 4px 0;
+}
+.team-models-block {
+  margin: 4px 0;
+  padding: 6px 10px;
+  background: var(--surface2);
+  border-radius: var(--radius-xs);
+  border-left: 3px solid var(--text3);
+}
+.team-models-title {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text3);
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  margin-bottom: 4px;
+}
+.team-models-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.model-chip {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: var(--radius-xs);
+  background: var(--surface3);
+  border: 1px solid var(--border);
+  color: var(--text1);
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.4;
+}
+.model-chip-all {
+  background: var(--primary-bg);
+  border-color: var(--primary);
+  color: var(--primary);
+  font-weight: 600;
 }
 .plan-tags {
   display: flex;
