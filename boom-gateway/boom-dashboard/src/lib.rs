@@ -262,8 +262,12 @@ pub fn build_router<S: Clone + Send + Sync + 'static>(state: DashboardState) -> 
 /// State is injected via the same Extension layer used by the main router.
 #[cfg(feature = "debug-tools")]
 fn debug_router<S: Clone + Send + Sync + 'static>(
-    _state: Arc<DashboardState>,
+    state: Arc<DashboardState>,
 ) -> Router<S> {
+    // debug_router is merged AFTER the main router's Extension layer (see
+    // build_router), so that layer does not cover these routes. Attach the
+    // state Extension here, otherwise handlers extracting
+    // Extension<Arc<DashboardState>> fail with "DashboardState not found".
     Router::new()
         .route(
             "/dashboard/api/admin/debug/status",
@@ -277,6 +281,7 @@ fn debug_router<S: Clone + Send + Sync + 'static>(
             "/dashboard/api/admin/debug/errors/{request_id}",
             get(handlers_admin::get_debug_error),
         )
+        .layer(axum::Extension(state))
 }
 
 #[cfg(not(feature = "debug-tools"))]

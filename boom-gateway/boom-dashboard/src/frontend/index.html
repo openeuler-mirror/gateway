@@ -199,7 +199,7 @@
               <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M6 3h8M6 8h8M6 13h8M2 3h2M2 8h2M2 13h2"/></svg>
               <span data-i18n="nav.assignments">Assignments</span>
             </a>
-            <a href="#/admin/debug" class="nav-link" data-section="admin-debug">
+            <a href="#/admin/debug" class="nav-link" data-section="admin-debug" id="nav-admin-debug" style="display:none">
               <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M4 4l8 8M12 4l-8 8M8 1v2M8 13v2M1 8h2M13 8h2"/></svg>
               <span data-i18n="nav.debug">Debug</span>
             </a>
@@ -275,6 +275,12 @@
               </div>
             </div>
             <div id="agent-stats-wrap"><p class="loading" data-i18n="common.loading">Loading...</p></div>
+
+            <div class="section-header" style="margin-top:2rem">
+              <h2>KVC DFX (per-request, latest 50)</h2>
+              <button class="btn-small" id="btn-reset-kvc-filters" data-i18n="logs.reset_filters">Reset Filters</button>
+            </div>
+            <div id="kvc-dfx-wrap"><p class="muted">Compile with --features boom-dashboard/debug-tools to enable.</p></div>
           </section>
 
           <!-- Models Section -->
