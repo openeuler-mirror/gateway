@@ -38,6 +38,13 @@ pub struct RequestLog {
     /// vLLM-reported real KV-cache hit (HBM + external store), from the final
     /// usage chunk's prompt_tokens_details.cached_tokens.
     pub cached_tokens: Option<i64>,
+    // DFX scheduling observability — columns on boom_request_log.
+    pub schedule_policy: Option<String>,
+    pub kv_hit_blocks: Option<i64>,
+    pub kv_input_blocks: Option<i64>,
+    pub trie_blocks: Option<i64>,
+    pub trie_max_blocks: Option<i64>,
+    pub request_tokens: Option<i64>,
 }
 
 /// Fire-and-forget: spawn a tokio task to INSERT the log record.
@@ -53,8 +60,10 @@ pub fn log_request(pool: Option<PgPool>, log: RequestLog) {
                        (request_id, key_hash, key_name, key_alias, team_id, model, model_name, api_path,
                         is_stream, status_code, error_type, error_message,
                         input_tokens, output_tokens, duration_ms, deployment_id, client_ip, ttft_ms,
-                        cached_tokens)
-                       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)"#,
+                        cached_tokens, schedule_policy, kv_hit_blocks, kv_input_blocks,
+                        trie_blocks, trie_max_blocks, request_tokens)
+                       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
+                               $19, $20, $21, $22, $23, $24, $25)"#,
                 )
                 .bind(&log.request_id)
                 .bind(&log.key_hash)
@@ -75,6 +84,12 @@ pub fn log_request(pool: Option<PgPool>, log: RequestLog) {
                 .bind(&log.client_ip)
                 .bind(log.ttft_ms)
                 .bind(log.cached_tokens)
+                .bind(&log.schedule_policy)
+                .bind(log.kv_hit_blocks)
+                .bind(log.kv_input_blocks)
+                .bind(log.trie_blocks)
+                .bind(log.trie_max_blocks)
+                .bind(log.request_tokens)
                 .execute(&pool),
             )
             .await;
@@ -143,6 +158,12 @@ pub fn log_error(
             deployment_id,
             client_ip: client_ip.clone(),
             cached_tokens: None,
+            schedule_policy: None,
+            kv_hit_blocks: None,
+            kv_input_blocks: None,
+            trie_blocks: None,
+            trie_max_blocks: None,
+            request_tokens: None,
         },
     );
 

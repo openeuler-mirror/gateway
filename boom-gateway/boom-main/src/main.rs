@@ -1,6 +1,7 @@
 mod admin_command;
 mod extractor;
 mod health_monitor;
+mod kvc;
 mod request_log;
 mod rewrite;
 mod routes;
@@ -71,8 +72,8 @@ async fn main() -> anyhow::Result<()> {
     // Spawn periodic FC dispatch (every 1s — prevents idle capacity).
     spawn_periodic_fc_dispatch(state.flow_controller.clone(), shutdown_tx.subscribe());
 
-    // Spawn ZMQ KV event subscriber (if kvc_aware enabled with endpoints).
-    spawn_kv_event_subscriber(&state);
+    // Spawn the KV TTL prune task (if kvc_aware enabled).
+    spawn_kv_prune(&state);
 
     // Spawn deployment health monitor (auto offline/recovery, DB deployments only).
     health_monitor::spawn_deployment_health_monitor(state.clone(), shutdown_tx.subscribe());
@@ -102,12 +103,6 @@ async fn main() -> anyhow::Result<()> {
 
             // 1. Signal all background tasks to stop.
             let _ = shutdown_tx.send(());
-
-            // 1a. Let the ZMQ KV subscriber drain its current batch and close
-            //     its SUB sockets cleanly (rather than being torn down mid-recv
-            //     by the runtime drop). It exits via its shutdown.recv() branch
-            //     during the pool.close() window below.
-            let _ = state.kv_shutdown_tx.send(());
 
             // 2. Close DB pool — releases all connections and table locks.
             //    Server future was just dropped by select!, so admin_tx is dropped,
@@ -413,14 +408,12 @@ fn spawn_sync_task(state: AppState, mut shutdown: tokio::sync::broadcast::Receiv
     tracing::info!("Background sync task spawned (every 10 min)");
 }
 
-/// Spawn the ZMQ KV event subscriber if kvc_aware is enabled with endpoints.
-///
-/// Delegates to `AppState::spawn_kv_subscriber`, which records the task handle
-/// on the state so a later SIGHUP reload can abort it before spawning a fresh
-/// subscriber against the rebuilt index.
-fn spawn_kv_event_subscriber(state: &AppState) {
+/// Spawn the TTL prune task if kvc_aware is enabled. Delegates to
+/// `AppState::spawn_kv_prune_task`, which records the handle so a later SIGHUP
+/// reload can abort it before spawning a fresh one against the rebuilt index.
+fn spawn_kv_prune(state: &AppState) {
     let config = state.inner.load().config.clone();
-    state.spawn_kv_subscriber(&config);
+    state.spawn_kv_prune_task(&config);
 }
 
 /// Initialize tracing with a non-blocking writer.

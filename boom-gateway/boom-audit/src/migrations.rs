@@ -88,6 +88,14 @@ pub async fn run_request_log_migration(conn: &mut sqlx::PgConnection) -> Result<
         r#"ALTER TABLE boom_request_log ADD COLUMN IF NOT EXISTS cached_tokens BIGINT"#,
     )
     .await;
+    // DFX scheduling observability — columns on boom_request_log (one INSERT,
+    // no JOIN needed for dashboard). Raw counts; ratios derived on read.
+    execute_alter(conn, r#"ALTER TABLE boom_request_log ADD COLUMN IF NOT EXISTS schedule_policy TEXT"#).await;
+    execute_alter(conn, r#"ALTER TABLE boom_request_log ADD COLUMN IF NOT EXISTS kv_hit_blocks BIGINT"#).await;
+    execute_alter(conn, r#"ALTER TABLE boom_request_log ADD COLUMN IF NOT EXISTS kv_input_blocks BIGINT"#).await;
+    execute_alter(conn, r#"ALTER TABLE boom_request_log ADD COLUMN IF NOT EXISTS trie_blocks BIGINT"#).await;
+    execute_alter(conn, r#"ALTER TABLE boom_request_log ADD COLUMN IF NOT EXISTS trie_max_blocks BIGINT"#).await;
+    execute_alter(conn, r#"ALTER TABLE boom_request_log ADD COLUMN IF NOT EXISTS request_tokens BIGINT"#).await;
     Ok(())
 }
 

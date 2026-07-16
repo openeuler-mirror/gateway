@@ -10,13 +10,7 @@ serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
-tokenizers.workspace = true
-minijinja = "2"
 parking_lot = "0.12"
-tmq = { workspace = true }
-rmpv = { workspace = true }
-tokio = { workspace = true }
-futures = { workspace = true }
 regex = "1"
 twox-hash = { workspace = true }
 lru = { workspace = true }

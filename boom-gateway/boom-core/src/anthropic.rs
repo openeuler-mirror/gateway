@@ -102,7 +102,6 @@ pub fn anthropic_request_to_openai(req: &AnthropicMessagesRequest) -> ChatComple
         logit_bias: None,
         extra,
         gateway_headers: HashMap::new(),
-        kv_cache_report_full: false,
     }
 }
 
@@ -550,7 +549,7 @@ impl AnthropicStreamTranscoder {
 // Internal Helpers
 // ============================================================
 
-fn extract_system_text(system: &AnthropicSystemContent) -> String {
+pub fn extract_system_text(system: &AnthropicSystemContent) -> String {
     match system {
         AnthropicSystemContent::Text(t) => t.clone(),
         AnthropicSystemContent::Blocks(blocks) => blocks

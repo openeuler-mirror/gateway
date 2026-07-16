@@ -487,12 +487,17 @@ pub struct RouterSettings {
     #[serde(default)]
     pub key_affinity_context_threshold: u64,
     /// Key-affinity: rebalance threshold (percentage, 1..=100).
-    /// If the preferred provider's utilization exceeds the least-loaded
-    /// by more than this percentage, reassign to the least-loaded provider.
-    /// Utilization = (in-flight + queued) * 100 / max_inflight per deployment.
-    /// Default: 20 (20% utilization difference triggers rebalance).
-    #[serde(default = "default_rebalance_threshold")]
-    pub key_affinity_rebalance_threshold: u8,
+    /// Shared rebalance threshold for key_affinity AND kvc_aware: if the
+    /// preferred/winning provider's utilization exceeds the least-loaded
+    /// candidate's by more than this percentage, hand off to the least-loaded
+    /// (so it can build cache / spread load by capacity). Utilization =
+    /// (in-flight + queued) * 100 / max_inflight per deployment.
+    /// key_affinity applies it per-key (migration); kvc_aware applies it
+    /// per-request at the scoring stage. Default: 20.
+    /// (serde alias keeps the old `key_affinity_rebalance_threshold` name
+    /// working for existing configs.)
+    #[serde(default = "default_rebalance_threshold", alias = "key_affinity_rebalance_threshold")]
+    pub rebalance_threshold: u8,
     /// Content-based hybrid router (optional dynamic model alias).
     #[serde(default)]
     pub hybrid_router: Option<HybridRouterConfig>,
@@ -530,39 +535,35 @@ pub struct RouterSettings {
 /// Settings for KV-cache aware routing.
 #[derive(Debug, Deserialize, Clone)]
 pub struct KvcAwareSettings {
-    /// Block size for token chunking (tokens per block). Default: 16.
+    /// Block size in BYTES for the gateway-side prefix serialization chunking.
+    /// The request's serialized prefix (system+tools+messages) is sliced into
+    /// blocks of this many bytes; each block is xxhash3-64'd into a trie edge.
+    /// Default: 512 (≈ original 128-token granularity; 256-block record cap
+    /// covers 128KB, enough for a typical system+tools prefix).
     #[serde(default = "default_block_size")]
     pub block_size: usize,
-    /// Weight for cache hit score in combined scoring. Default: 0.5.
+    /// Weight for cache hit score in combined scoring. Default: 0.7.
     #[serde(default = "default_cache_weight")]
     pub cache_weight: f64,
-    /// Weight for load score in combined scoring. Default: 0.2.
+    /// Weight for load score in combined scoring. Default: 0.3.
     #[serde(default = "default_load_weight")]
     pub load_weight: f64,
-    /// Weight for storage tier score in combined scoring. Default: 0.3.
-    #[serde(default = "default_tier_weight")]
-    pub tier_weight: f64,
-    /// Directory containing tokenizer.json files ({tokenizer_dir}/{model}/tokenizer.json).
-    #[serde(default)]
-    pub tokenizer_dir: Option<String>,
-    /// ZMQ endpoints for KV event subscription (e.g., `["tcp://worker-0:5557"]`).
-    #[serde(default)]
-    pub zmq_endpoints: Vec<String>,
-    /// ZMQ topic prefix for subscription filtering. Default: `"kv@"`.
-    #[serde(default = "default_zmq_topic_prefix")]
-    pub zmq_topic_prefix: String,
     /// Maximum number of indexed blocks across all models/workers.
     /// When exceeded, the least recently stored blocks are evicted. Default: 500,000.
     #[serde(default = "default_max_blocks")]
     pub max_blocks: usize,
-    /// KV-cache prefix hit ratio at/above which incremental reporting is used
-    /// instead of full. When a request's prefix hit ratio is below this
-    /// threshold the gateway asks vLLM for a full report to backfill the trie
-    /// (the trie is missing part of the reused prefix); otherwise incremental
-    /// suffices because the trie already covers the prefix vLLM will reuse.
-    /// Default: 0.8.
-    #[serde(default = "default_full_report_hit_threshold")]
-    pub full_report_hit_threshold: f64,
+    /// Overload gate for kvc_aware routing: a candidate whose gateway-side
+    /// inflight load ≥ this percentage of its capacity is HARD-EXCLUDED from
+    /// selection (load_pct from inflight/capacity). 100 disables the gate.
+    /// Default: 90.
+    #[serde(default = "default_overload_threshold_pct")]
+    pub overload_threshold_pct: u64,
+    /// TTL in seconds for approximate-mode blocks. The trie is self-learned
+    /// (gateway records routed prefixes); without a real evict signal from
+    /// vLLM, blocks expire by wall-clock to bound over-approximation. A
+    /// background sweep prunes blocks older than this TTL. Default: 1200.0.
+    #[serde(default = "default_router_ttl_secs")]
+    pub router_ttl_secs: f64,
 }
 
 impl Default for KvcAwareSettings {
@@ -571,12 +572,9 @@ impl Default for KvcAwareSettings {
             block_size: default_block_size(),
             cache_weight: default_cache_weight(),
             load_weight: default_load_weight(),
-            tier_weight: default_tier_weight(),
-            tokenizer_dir: None,
-            zmq_endpoints: Vec::new(),
-            zmq_topic_prefix: default_zmq_topic_prefix(),
             max_blocks: default_max_blocks(),
-            full_report_hit_threshold: default_full_report_hit_threshold(),
+            overload_threshold_pct: default_overload_threshold_pct(),
+            router_ttl_secs: default_router_ttl_secs(),
         }
     }
 }
@@ -584,16 +582,60 @@ impl Default for KvcAwareSettings {
 impl KvcAwareSettings {
     /// Validate semantic constraints serde cannot enforce.
     pub fn validate(&self) -> Result<(), GatewayError> {
-        // full_report_hit_threshold must be a valid ratio in (0.0, 1.0]:
-        //   - <= 0 would never trigger a full report, so the trie never
-        //     backfills and KVC matches degrade to zero (silent failure).
-        //   - > 1 would always trigger a full report (equivalent to disabling
-        //     the optimization); NaN is rejected too since all comparisons
-        //     against NaN are false.
-        let threshold = self.full_report_hit_threshold;
-        if !(threshold > 0.0 && threshold <= 1.0) {
+        // overload_threshold_pct: 1..=100. 100 disables the overload gate;
+        // values >100 are silently a no-op (load_pct is capped at 100, so
+        // load_pct >= 150 is never true) — reject to avoid a misleading
+        // "configured but ineffective" state. 0 would hard-exclude every
+        // candidate (load_pct >= 0 always true), also rejected.
+        let otp = self.overload_threshold_pct;
+        if !(1..=100).contains(&otp) {
             return Err(GatewayError::ConfigError(format!(
-                "router_settings.kvc_aware.full_report_hit_threshold must be in (0.0, 1.0], got {threshold}"
+                "router_settings.kvc_aware.overload_threshold_pct must be in 1..=100 (100 disables), got {otp}"
+            )));
+        }
+        // router_ttl_secs: 0 disables the TTL prune task (LRU-only); >0 is the TTL in seconds.
+        // Must be finite and non-negative: NaN and ±∞ are rejected — ∞ would panic
+        // Duration::from_secs_f64 in spawn_kv_prune_task.
+        if !self.router_ttl_secs.is_finite() || self.router_ttl_secs < 0.0 {
+            return Err(GatewayError::ConfigError(format!(
+                "router_settings.kvc_aware.router_ttl_secs must be finite and >= 0 (0 disables TTL prune), got {}",
+                self.router_ttl_secs
+            )));
+        }
+        // block_size: 0 makes the trie silently inert (n_full=0, no blocks hashed).
+        if self.block_size == 0 {
+            return Err(GatewayError::ConfigError(
+                "router_settings.kvc_aware.block_size must be > 0".to_string(),
+            ));
+        }
+        // max_blocks: 0 triggers a silent fallback to 500_000 in LruCache::new; reject so
+        // the configured value is honored (or the user learns it is invalid).
+        if self.max_blocks == 0 {
+            return Err(GatewayError::ConfigError(
+                "router_settings.kvc_aware.max_blocks must be > 0".to_string(),
+            ));
+        }
+        // Weights are mixing coefficients in [0,1]. range.contains() returns false for NaN,
+        // so NaN is rejected here too.
+        if !(0.0..=1.0).contains(&self.cache_weight) {
+            return Err(GatewayError::ConfigError(format!(
+                "router_settings.kvc_aware.cache_weight must be in 0.0..=1.0, got {}",
+                self.cache_weight
+            )));
+        }
+        if !(0.0..=1.0).contains(&self.load_weight) {
+            return Err(GatewayError::ConfigError(format!(
+                "router_settings.kvc_aware.load_weight must be in 0.0..=1.0, got {}",
+                self.load_weight
+            )));
+        }
+        // score = cache_weight·hit + load_weight·load_avail is selected by max, so the sum
+        // isn't a mathematical requirement — but capping it at 1.0 keeps score normalized to
+        // [0,1] and matches the original weighted design (cw+lw+tw=1.0 before tier removal).
+        if self.cache_weight + self.load_weight > 1.0 {
+            return Err(GatewayError::ConfigError(format!(
+                "router_settings.kvc_aware.cache_weight + load_weight must be <= 1.0, got {}",
+                self.cache_weight + self.load_weight
             )));
         }
         Ok(())
@@ -601,27 +643,23 @@ impl KvcAwareSettings {
 }
 
 fn default_block_size() -> usize {
-    16
+    512
+}
+
+fn default_router_ttl_secs() -> f64 {
+    1200.0
 }
 
 fn default_cache_weight() -> f64 {
-    0.5
+    0.7
 }
 
-fn default_full_report_hit_threshold() -> f64 {
-    0.8
+fn default_overload_threshold_pct() -> u64 {
+    90
 }
 
 fn default_load_weight() -> f64 {
-    0.2
-}
-
-fn default_tier_weight() -> f64 {
     0.3
-}
-
-fn default_zmq_topic_prefix() -> String {
-    "kv@".to_string()
 }
 
 fn default_max_blocks() -> usize {
@@ -791,12 +829,13 @@ pub fn load_config(path: &str) -> Result<Config, GatewayError> {
         }
     }
 
-    // Validate key-affinity rebalance threshold when policy is key_affinity.
-    if config.router_settings.schedule_policy == "key_affinity" {
-        let t = config.router_settings.key_affinity_rebalance_threshold;
+    // Validate the shared rebalance threshold when a policy that uses it is
+    // active (key_affinity applies it per-key; kvc_aware at scoring stage).
+    if matches!(config.router_settings.schedule_policy.as_str(), "key_affinity" | "kvc_aware") {
+        let t = config.router_settings.rebalance_threshold;
         if t == 0 || t > 100 {
             return Err(GatewayError::ConfigError(format!(
-                "key_affinity_rebalance_threshold must be 1..=100 (percentage), got {}",
+                "rebalance_threshold must be 1..=100 (percentage), got {}",
                 t
             )));
         }
@@ -935,34 +974,53 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_full_report_hit_threshold() {
-        // All defaults (threshold = 0.8) should pass.
+    fn test_validate_kvc_aware_params() {
+        // Defaults (block_size=512, max_blocks=500_000, cw=0.5, lw=0.2) pass.
         let mut config: Config = serde_yaml::from_str("{}").unwrap();
-        assert!(config.validate().is_ok(), "default threshold should be valid");
+        assert!(config.validate().is_ok(), "defaults should be valid");
 
-        // Boundary: 1.0 is the maximum valid value.
-        config.router_settings.kvc_aware.full_report_hit_threshold = 1.0;
-        assert!(config.validate().is_ok(), "1.0 should be valid");
+        // router_ttl_secs: 0 = valid (disables TTL prune); negative / NaN / ±∞ → reject.
+        config.router_settings.kvc_aware.router_ttl_secs = 0.0;
+        assert!(config.validate().is_ok(), "router_ttl_secs=0 should be valid (disables TTL)");
+        config.router_settings.kvc_aware.router_ttl_secs = -1.0;
+        assert!(config.validate().is_err(), "negative ttl should be rejected");
+        config.router_settings.kvc_aware.router_ttl_secs = f64::NAN;
+        assert!(config.validate().is_err(), "NaN ttl should be rejected");
+        config.router_settings.kvc_aware.router_ttl_secs = f64::INFINITY;
+        assert!(config.validate().is_err(), "infinite ttl should be rejected");
+        config.router_settings.kvc_aware.router_ttl_secs = 120.0;
 
-        // Small positive value is fine.
-        config.router_settings.kvc_aware.full_report_hit_threshold = 0.01;
-        assert!(config.validate().is_ok(), "0.01 should be valid");
+        // block_size = 0 → reject (trie would be silently inert).
+        config.router_settings.kvc_aware.block_size = 0;
+        assert!(config.validate().is_err(), "block_size=0 should be rejected");
+        config.router_settings.kvc_aware.block_size = 512;
 
-        // Zero → reject (would never trigger a full report).
-        config.router_settings.kvc_aware.full_report_hit_threshold = 0.0;
-        assert!(config.validate().is_err(), "0.0 should be rejected");
+        // max_blocks = 0 → reject (silent 500_000 fallback otherwise).
+        config.router_settings.kvc_aware.max_blocks = 0;
+        assert!(config.validate().is_err(), "max_blocks=0 should be rejected");
+        config.router_settings.kvc_aware.max_blocks = 500_000;
 
-        // Above 1.0 → reject.
-        config.router_settings.kvc_aware.full_report_hit_threshold = 1.1;
-        assert!(config.validate().is_err(), "1.1 should be rejected");
+        // cache_weight out of [0,1] → reject (NaN rejected too: contains() is false for NaN).
+        config.router_settings.kvc_aware.cache_weight = 1.5;
+        assert!(config.validate().is_err(), "cache_weight=1.5 should be rejected");
+        config.router_settings.kvc_aware.cache_weight = -0.1;
+        assert!(config.validate().is_err(), "negative cache_weight should be rejected");
+        config.router_settings.kvc_aware.cache_weight = f64::NAN;
+        assert!(config.validate().is_err(), "NaN cache_weight should be rejected");
 
-        // Negative → reject.
-        config.router_settings.kvc_aware.full_report_hit_threshold = -0.5;
-        assert!(config.validate().is_err(), "negative should be rejected");
+        // Boundary: cache_weight=1.0, load_weight=0.0 (sum=1.0) is valid.
+        config.router_settings.kvc_aware.cache_weight = 1.0;
+        config.router_settings.kvc_aware.load_weight = 0.0;
+        assert!(config.validate().is_ok(), "cw=1.0/lw=0.0 should be valid");
 
-        // NaN → reject (all comparisons are false).
-        config.router_settings.kvc_aware.full_report_hit_threshold = f64::NAN;
-        assert!(config.validate().is_err(), "NaN should be rejected");
+        // sum > 1.0 → reject (normalization).
+        config.router_settings.kvc_aware.cache_weight = 0.5;
+        config.router_settings.kvc_aware.load_weight = 0.6;
+        assert!(config.validate().is_err(), "cw+lw>1.0 should be rejected");
+
+        // sum == 1.0 → valid.
+        config.router_settings.kvc_aware.load_weight = 0.5;
+        assert!(config.validate().is_ok(), "cw+lw==1.0 should be valid");
     }
 
     #[test]

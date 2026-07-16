@@ -114,7 +114,7 @@ Dashboard 需要执行写操作（创建模型、修改配置等）时：
 - `store_model_in_db=true` 模式：只重新 seed `source='yaml'` 的 DB 行，`source='db'` 的行不动。
 - `store_model_in_db=false` 模式：从 YAML 重建所有 store。
 - **热加载不得清除运行时计数器**（limiter、concurrency guard、assignment 等不受影响）。
-- **kv_index 是第三种生命周期**：它放在 AppState 顶层（`Arc<ArcSwap<Option<…>>>`），但与 deployment_store / plan_store 等"跨 reload 内容存活"不同——任何 kvc_aware 配置变化都会**重建空 trie**（旧 trie 随 ArcSwap 替换被 drop，新 subscriber 从空开始重新填充）。这是有意为之的"重建即清缓存"语义，瞬态查询会降级到 lowest-load。
+- **kv_index 是第三种生命周期**：它放在 AppState 顶层（`Arc<ArcSwap<Option<…>>>`），但与 deployment_store / plan_store 等"跨 reload 内容存活"不同——`schedule_policy` / `block_size` / `max_blocks` / `router_ttl_secs` 变化会**重建空 trie**（旧 trie 随 ArcSwap 替换被 drop，新 trie 从空开始）。**trie 是自学习的**：不订阅 vLLM ZMQ 事件，由 `KvcOrchestrator` 在每次路由后把请求前缀（system+tools+messages 字节序列化 → 按 `block_size` 切块 → xxhash）记录到选中 worker 下；下一个相同前缀的请求即命中。驱逐只有 gateway 侧 LRU（`max_blocks`）+ TTL（`router_ttl_secs`，后台扫描）。这是 over-approximation（vLLM 实际 evict 后 trie 仍乐观保留，靠 LRU/TTL 老化）。`cache_weight`/`load_weight`/`tier_weight` 纯权重变化不 wipe trie（policy 热重建即可）。瞬态查询命中空 trie → 0 hit → 按负载评分路由（无 key_affinity 回退）。
 
 ### 8. 新增模块检查清单
 

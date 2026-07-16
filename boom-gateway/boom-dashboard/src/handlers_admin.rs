@@ -1346,6 +1346,13 @@ struct LogRow {
     deployment_id: Option<String>,
     client_ip: Option<String>,
     cached_tokens: Option<i64>,
+    // DFX scheduling observability — columns on boom_request_log.
+    schedule_policy: Option<String>,
+    kv_hit_blocks: Option<i64>,
+    kv_input_blocks: Option<i64>,
+    trie_blocks: Option<i64>,
+    trie_max_blocks: Option<i64>,
+    request_tokens: Option<i64>,
 }
 
 pub async fn list_logs(
@@ -1440,7 +1447,9 @@ pub async fn list_logs(
                   rl.model, rl.api_path,
                   rl.is_stream, rl.status_code, rl.error_type, rl.error_message,
                   rl.input_tokens, rl.output_tokens, rl.duration_ms, rl.ttft_ms, rl.created_at,
-                  rl.deployment_id, rl.client_ip, rl.cached_tokens
+                  rl.deployment_id, rl.client_ip, rl.cached_tokens,
+                  rl.schedule_policy, rl.kv_hit_blocks, rl.kv_input_blocks,
+                  rl.trie_blocks, rl.trie_max_blocks, rl.request_tokens
            FROM boom_request_log rl
            LEFT JOIN boom_team_table bt ON rl.team_id = bt.team_id
            {where_sql}
@@ -1533,13 +1542,28 @@ pub async fn list_logs(
                 "input_tokens": r.input_tokens,
                 "output_tokens": r.output_tokens,
                 // vLLM-reported real KV-cache hit (prompt_tokens_details.cached_tokens).
-                // Frontend "Prefix Hit Rate" = cached_tokens / total_tokens
-                // (total = input + output), computed client-side.
+                // Frontend "Prefix Hit Rate" = cached_tokens / input_tokens
+                // (prefix only), computed client-side.
                 "cached_tokens": r.cached_tokens,
                 "duration_ms": r.duration_ms,
                 "ttft_ms": r.ttft_ms,
                 "created_at": r.created_at.map(|d| d.to_rfc3339()),
                 "client_ip": r.client_ip,
+                // DFX: scheduling observability. policy shown as short code:
+                // kvc=kvc_aware, key=key_affinity, rr=round_robin.
+                "policy": match r.schedule_policy.as_deref() {
+                    Some("kvc_aware") => "kvc",
+                    Some("kvc_aware→key_affinity") => "kvc→key",
+                    Some("key_affinity") => "key",
+                    Some("round_robin") => "rr",
+                    Some(other) => other,
+                    None => "",
+                },
+                "kv_hit_blocks": r.kv_hit_blocks,
+                "kv_input_blocks": r.kv_input_blocks,
+                "trie_blocks": r.trie_blocks,
+                "trie_max_blocks": r.trie_max_blocks,
+                "request_tokens": r.request_tokens,
             })
         })
         .collect();

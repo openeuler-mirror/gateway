@@ -3,7 +3,7 @@ use boom_auth::DbAuthenticator;
 use boom_config::Config;
 use boom_core::provider::{Authenticator, KeyAliasLookup};
 use boom_core::DebugErrorStore;
-use boom_kvindex::{spawn_kv_subscriber, KvSubscriberConfig, TokenPrefixIndex, TokenizerPool};
+use boom_kvindex::{TokenPrefixIndex};
 use boom_core::kv_event::KvIndexBackend;
 use boom_limiter::{PlanStore, RateLimitPlan, ScheduleSlot, SlidingWindowLimiter};
 use boom_flowcontrol::{FlowControlConfig, FlowController};
@@ -74,22 +74,20 @@ pub struct AppState {
     /// THIRD lifecycle (distinct from AppState's other fields): unlike
     /// deployment_store / plan_store / limiter — which survive reloads with
     /// their contents intact — this is rebuilt EMPTY on every reload. Any
-    /// kvc_aware config change (policy, weights, block_size, zmq_endpoints,
-    /// tokenizer_dir) swaps in a fresh index; the old trie is dropped and the
-    /// new one starts empty, repopulated by a freshly spawned subscriber. The
-    /// transient moment (queries hit an empty trie → 0 hit → degrade to
-    /// lowest-load) is intentional ("rebuild = clear cache"). `None` when
-    /// kvc_aware is disabled. See `reload()`.
+    /// kvc_aware config change (policy, weights, block_size) swaps in a fresh
+    /// index; the old trie is dropped and the new one starts empty, repopulated
+    /// by the orchestrator recording routed requests (self-contained learning —
+    /// no ZMQ subscriber). The transient moment (queries hit an empty trie →
+    /// 0 hit → route by load) is intentional ("rebuild = clear cache"). `None`
+    /// when kvc_aware is disabled. See `reload()`.
     pub kv_index: Arc<ArcSwap<Option<Arc<dyn KvIndexBackend>>>>,
-    /// Tokenizer pool for computing prefix block hashes, hot-swappable.
-    pub tokenizer_pool: Arc<ArcSwap<Option<Arc<TokenizerPool>>>>,
-    /// Handle to the running ZMQ subscriber task (if any). Held so reload can
-    /// abort it before spawning a fresh one. None when kvc_aware disabled.
-    pub kv_subscriber_handle: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
-    /// Shutdown signal for the KV subscriber task. Dedicated (separate from the
-    /// process-level shutdown) so reload can spawn fresh subscribers that still
-    /// exit cleanly on process exit. Reload stops the old subscriber via abort.
-    pub kv_shutdown_tx: tokio::sync::broadcast::Sender<()>,
+    /// Handle to the running TTL prune task (sweeps expired approximate blocks).
+    /// None when kvc_aware disabled. Held so reload can abort before respawning.
+    pub kv_prune_handle: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// kvc-aware routing orchestrator (prefix-serialize + route + DFX + record).
+    /// Handler calls kvc_orchestrator.route() — all kvc business logic is here,
+    /// not in routes.rs. Returns None when kvc is disabled.
+    pub kvc_orchestrator: crate::kvc::KvcOrchestrator,
 }
 
 /// The state that gets swapped on config reload.
@@ -183,7 +181,7 @@ impl AppState {
         // Driven by schedule_policy == "kvc_aware", not a separate enabled flag.
         // Built fresh on startup and on every reload (see reload()): any change
         // to kvc_aware settings rebuilds an empty trie, so the old trie is dropped.
-        let (kv_index_val, tokenizer_pool_val) = Self::build_kvc_subsystems(&config);
+        let kv_index_val = Self::build_kvc_subsystems(&config);
 
         // Create scheduling policy from config (may reference inflight, rebalance_move_tracker, kv_index).
         let policy = create_policy(&config, &inflight, &flow_controller, &rebalance_move_tracker, &kv_index_val);
@@ -206,7 +204,9 @@ impl AppState {
         seed_flow_controller_from_config(&config, &flow_controller);
 
         if let Some(ref pool) = db_pool {
-            // Run migrations (all tables).
+            // Run migrations. boom_dashboard::run_migrations calls
+            // boom_audit::run_request_log_migration internally (with
+            // lock_timeout set on its connection).
             if let Err(e) = boom_dashboard::migrations::run_migrations(pool).await {
                 tracing::error!("Failed to run migrations: {}", e);
             }
@@ -235,6 +235,16 @@ impl AppState {
 
         let inner = Self::build_inner(config, &db_pool, chrono::Utc::now(), 0)?;
 
+        // Single shared Arc<ArcSwap> for kv_index — AppState and
+        // KvcOrchestrator MUST observe the same swap. reload() stores a fresh
+        // empty trie into this ArcSwap; both holders get an Arc clone of the
+        // SAME ArcSwap so the orchestrator sees the swap.
+        let kv_index = Arc::new(ArcSwap::from_pointee(kv_index_val));
+        let kvc_orchestrator = crate::kvc::KvcOrchestrator::new(
+            kv_index.clone(),
+            router.clone(),
+        );
+
         Ok(Self {
             config_path,
             inner: Arc::new(ArcSwap::from_pointee(inner)),
@@ -249,16 +259,15 @@ impl AppState {
             request_count: Arc::new(AtomicU64::new(0)),
             deployment_health: Arc::new(DeploymentHealthStore::new()),
             request_failure_counter: Arc::new(DashMap::new()),
-            flow_controller,
+            flow_controller: flow_controller.clone(),
             debug_store,
             prompt_log_writer,
             rebalance_move_tracker,
             request_rate,
             agent_stats,
-            kv_index: Arc::new(ArcSwap::from_pointee(kv_index_val)),
-            tokenizer_pool: Arc::new(ArcSwap::from_pointee(tokenizer_pool_val)),
-            kv_subscriber_handle: Arc::new(std::sync::Mutex::new(None)),
-            kv_shutdown_tx: tokio::sync::broadcast::channel::<()>(1).0,
+            kv_index,
+            kv_prune_handle: Arc::new(std::sync::Mutex::new(None)),
+            kvc_orchestrator,
         })
     }
 
@@ -389,29 +398,32 @@ impl AppState {
         // the trie refills. A reload that only touched models/limits/plans must
         // not pay that cost. (CLAUDE.md documents kv_index as a separate
         // lifecycle — this gate narrows "any reload" to "kvc config change".)
-        //
-        // `full_report_hit_threshold` is intentionally excluded: it is read
-        // live at routing time (policy is recreated just below), so changing it
-        // must not invalidate the trie.
         let old_router = self.inner.load().config.router_settings.clone();
+        // Signature of kvc-relevant config that requires a trie rebuild.
+        //   schedule_policy  → enables/disables kvc_aware entirely.
+        //   block_size       → changes the hash algorithm (all entries invalid).
+        //   max_blocks       → LRU capacity; LruCache can't resize in-place.
+        //   router_ttl_secs  → prune task TTL/interval, fixed at spawn time.
+        // Excluded (hot-updatable via policy recreate, no trie wipe):
+        //   cache_weight / load_weight / overload_threshold_pct / rebalance_threshold.
+        // Only schedule_policy and block_size require a trie wipe (hash algo
+        // changes invalidate all entries). max_blocks / router_ttl_secs don't
+        // affect existing hashes — the prune task is restarted below to pick
+        // up the new TTL, and the LRU capacity adapts on the next batch.
         let kvc_sig = |r: &boom_config::RouterSettings| {
             let k = &r.kvc_aware;
             (
                 r.schedule_policy.clone(),
                 k.block_size,
-                k.cache_weight,
-                k.load_weight,
-                k.tier_weight,
-                k.tokenizer_dir.clone(),
-                k.zmq_endpoints.clone(),
-                k.zmq_topic_prefix.clone(),
-                k.max_blocks,
             )
         };
         if kvc_sig(&old_router) == kvc_sig(&new_config.router_settings) {
-            tracing::info!(
-                "KV-aware subsystem unchanged — preserving trie and subscriber (no rebuild)"
-            );
+            tracing::info!("KV-aware subsystem unchanged — preserving learned trie (no rebuild)");
+            // Restart prune task to pick up new router_ttl_secs (cheap: abort + spawn)
+            self.stop_kv_prune_task();
+            if new_config.router_settings.schedule_policy == "kvc_aware" {
+                self.spawn_kv_prune_task(&new_config);
+            }
         } else {
             let new_kvc_enabled = new_config.router_settings.schedule_policy == "kvc_aware";
             let old_kvc_enabled = self.kv_index.load().is_some();
@@ -420,12 +432,11 @@ impl AppState {
                 after = new_kvc_enabled,
                 "KV-aware config changed: rebuilding index (trie will be empty)"
             );
-            self.stop_kv_subscriber();
-            let (new_kv_index, new_tokenizer_pool) = Self::build_kvc_subsystems(&new_config);
+            self.stop_kv_prune_task();
+            let new_kv_index = Self::build_kvc_subsystems(&new_config);
             self.kv_index.store(Arc::new(new_kv_index));
-            self.tokenizer_pool.store(Arc::new(new_tokenizer_pool));
             if new_kvc_enabled {
-                self.spawn_kv_subscriber(&new_config);
+                self.spawn_kv_prune_task(&new_config);
             }
         }
 
@@ -501,101 +512,74 @@ impl AppState {
         Ok(summary)
     }
 
-    /// Build the KV-cache index + tokenizer pool for the given config.
+    /// Build the KV-cache index for the given config (self-contained — no
+    /// tokenizer pool, no ZMQ subscriber).
     ///
-    /// Returns `(None, None)` when `schedule_policy != "kvc_aware"`. Shared by
-    /// startup (`from_config`) and every `reload()` so both paths build the
-    /// subsystems identically. Any change to kvc_aware settings produces a
-    /// fresh empty trie — the caller drops the old one.
-    fn build_kvc_subsystems(
-        config: &Config,
-    ) -> (Option<Arc<dyn KvIndexBackend>>, Option<Arc<TokenizerPool>>) {
-        let is_kvc_aware = config.router_settings.schedule_policy == "kvc_aware";
-        if !is_kvc_aware {
-            return (None, None);
+    /// Returns `None` when `schedule_policy != "kvc_aware"`. Shared by startup
+    /// (`from_config`) and every `reload()` so both paths build the subsystem
+    /// identically. Any change to kvc_aware settings produces a fresh empty
+    /// trie — the caller drops the old one.
+    fn build_kvc_subsystems(config: &Config) -> Option<Arc<dyn KvIndexBackend>> {
+        if config.router_settings.schedule_policy != "kvc_aware" {
+            return None;
         }
-
         let kv_settings = &config.router_settings.kvc_aware;
         let index: Arc<dyn KvIndexBackend> = Arc::new(TokenPrefixIndex::new(
             kv_settings.block_size,
             kv_settings.cache_weight,
-            kv_settings.tier_weight,
             kv_settings.load_weight,
             kv_settings.max_blocks,
         ));
-        let pool = match &kv_settings.tokenizer_dir {
-            Some(dir) => {
-                let p = TokenizerPool::new(dir.into());
-                tracing::info!(
-                    tokenizer_dir = %dir,
-                    block_size = kv_settings.block_size,
-                    "KV-aware routing: tokenizer pool initialized"
-                );
-                Some(Arc::new(p))
-            }
-            None => {
-                tracing::warn!("KV-aware routing enabled but no tokenizer_dir configured — tokenization disabled");
-                None
-            }
-        };
         tracing::info!(
+            block_size = kv_settings.block_size,
             cache_weight = kv_settings.cache_weight,
             load_weight = kv_settings.load_weight,
-            tier_weight = kv_settings.tier_weight,
             max_blocks = kv_settings.max_blocks,
-            full_report_hit_threshold = kv_settings.full_report_hit_threshold,
-            "KV-aware routing enabled (token-prefix matching)"
+            router_ttl_secs = kv_settings.router_ttl_secs,
+            "KV-aware routing enabled (self-contained byte-prefix affinity)"
         );
-        (Some(index), pool)
+        Some(index)
     }
 
-    /// Spawn the ZMQ KV event subscriber against the current `kv_index`, using
-    /// the given config's zmq settings. Records the task handle so the next
-    /// reload can stop it. No-op if kvc_aware is disabled or no endpoints set.
-    ///
-    /// `config` is passed in explicitly (rather than read from `self.inner`)
-    /// because reload calls this *before* swapping in the new inner — reading
-    /// `self.inner` here would see the stale pre-reload config and miss the
-    /// freshly-configured zmq endpoints.
-    pub fn spawn_kv_subscriber(&self, config: &Config) {
-        let kv_index = match &**self.kv_index.load() {
-            Some(idx) => idx.clone(),
-            None => {
-                tracing::debug!("spawn_kv_subscriber: kv_index is None, skipping");
-                return;
-            }
-        };
-        let kv_settings = &config.router_settings.kvc_aware;
-        if kv_settings.zmq_endpoints.is_empty() {
-            tracing::warn!("kvc_aware enabled but no zmq_endpoints configured — no KV events will be received");
+    /// Spawn the TTL prune task: periodically sweeps approximate-mode blocks
+    /// older than `router_ttl_secs` (the trie is self-learned, so blocks have
+    /// no real evict signal — expire by wall-clock). Records the handle so
+    /// reload can abort it. The task loads the CURRENT kv_index each tick (via
+    /// the shared ArcSwap) so it keeps pruning the live trie across reloads
+    /// until aborted.
+    pub fn spawn_kv_prune_task(&self, config: &Config) {
+        if self.kv_index.load().is_none() {
             return;
         }
-        let sub_config = KvSubscriberConfig {
-            endpoints: kv_settings.zmq_endpoints.clone(),
-            topic_prefix: kv_settings.zmq_topic_prefix.clone(),
-        };
-        let handle = spawn_kv_subscriber(sub_config, kv_index, self.kv_shutdown_tx.subscribe());
-        *self.kv_subscriber_handle.lock().unwrap() = Some(handle);
-        tracing::info!(
-            endpoints = ?kv_settings.zmq_endpoints,
-            topic_prefix = %kv_settings.zmq_topic_prefix,
-            "ZMQ KV event subscriber spawned"
-        );
+        let ttl_secs = config.router_settings.kvc_aware.router_ttl_secs;
+        // 0 = TTL prune disabled: rely on LRU (max_blocks) alone. Skip spawning the sweeper
+        // (also avoids Duration::from_secs_f64 on a non-positive value).
+        if !(ttl_secs > 0.0) {
+            tracing::info!("KV TTL prune disabled (router_ttl_secs=0), using LRU only");
+            return;
+        }
+        let ttl = std::time::Duration::from_secs_f64(ttl_secs);
+        // Sweep at half the TTL so a block lives at most ~ttl.
+        let interval = std::time::Duration::from_secs_f64((ttl_secs / 2.0).max(5.0));
+        let kv_index = self.kv_index.clone();
+        let handle = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.tick().await; // first tick is immediate
+            loop {
+                ticker.tick().await;
+                let g = kv_index.load();
+                if let Some(idx) = (**g).as_ref() {
+                    idx.prune_expired(ttl);
+                }
+            }
+        });
+        *self.kv_prune_handle.lock().unwrap() = Some(handle);
+        tracing::info!(ttl_secs, sweep_secs = interval.as_secs_f64(), "KV TTL prune task spawned");
     }
 
-    /// Stop the running KV subscriber task (if any).
-    ///
-    /// Sends on `kv_shutdown_tx` first so the subscriber can drain its current
-    /// batch and drop its ZMQ sockets cleanly (sends a proper SUB teardown).
-    /// `abort()` is kept as a safety net in case the task is stuck and never
-    /// observes the broadcast (e.g. blocked mid-`handle_message`).
-    fn stop_kv_subscriber(&self) {
-        let handle = self.kv_subscriber_handle.lock().unwrap().take();
-        if let Some(h) = handle {
-            if !h.is_finished() {
-                let _ = self.kv_shutdown_tx.send(());
-                tracing::info!("Signaling previous KV subscriber to shut down before rebuild");
-            }
+    /// Abort the running TTL prune task (if any). Called before respawning on reload.
+    fn stop_kv_prune_task(&self) {
+        if let Some(h) = self.kv_prune_handle.lock().unwrap().take() {
             h.abort();
         }
     }
@@ -1214,7 +1198,7 @@ fn create_policy(
         "round_robin" | "" => Arc::new(RoundRobinPolicy::new()),
         "key_affinity" => {
             let ctx_threshold = config.router_settings.key_affinity_context_threshold;
-            let rebalance_threshold = config.router_settings.key_affinity_rebalance_threshold;
+            let rebalance_threshold = config.router_settings.rebalance_threshold;
             tracing::info!(
                 "Using key_affinity policy: context_threshold={}, rebalance_threshold={}",
                 ctx_threshold,
@@ -1237,9 +1221,23 @@ fn create_policy(
                     return Arc::new(RoundRobinPolicy::new());
                 }
             };
-            tracing::info!("Using kvc_aware policy");
-            let mut policy = boom_routing::KvcAwarePolicy::new(kv, inflight.clone());
+            tracing::info!("Using kvc_aware policy (self-contained)");
+            let mut policy = boom_routing::KvcAwarePolicy::new(
+                kv,
+                inflight.clone(),
+                Some(rebalance_move_tracker.clone()),
+            );
             policy.set_queue_info(flow_controller.clone());
+            // Unified-score weights + hard overload gate. No key_affinity
+            // fallback (the trie self-learns from routed requests); no
+            // KV-sharing groups (PD topology removed).
+            let kvc = &config.router_settings.kvc_aware;
+            policy.set_scoring(
+                kvc.cache_weight,
+                kvc.load_weight,
+                kvc.overload_threshold_pct,
+                config.router_settings.rebalance_threshold as u64,
+            );
             Arc::new(policy)
         }
         other => {
