@@ -3412,6 +3412,16 @@
   let logsFilters = {};
   let logsFiltersTimer = null;
   let logsFiltersSetup = false;
+  // Monotonic token used by loadLogs to drop stale responses. Each call
+  // bumps the token; when the awaited fetch returns, if its captured token
+  // no longer equals the live one, the response is discarded — so a slow
+  // earlier request can't overwrite a newer one's render. Without this,
+  // typing fast in a column filter (e.g. "张" then "张三") could see the
+  // broader "张" result land *after* the narrower "张三" one and clobber
+  // the table back to a wider set — or vice versa, with the narrower result
+  // landing first then the wider one arriving late. Same for hashchange
+  // re-entering admin-logs mid-typing.
+  let logsLoadToken = 0;
 
   function setupLogsFilters() {
     if (logsFiltersSetup) return;
@@ -3444,17 +3454,25 @@
 
   async function loadLogs(page) {
     if (page !== undefined) logsPage = page;
+    // Capture this request's token. When the fetch returns, if it doesn't
+    // match the live token, a newer request has superseded this one — drop
+    // the result on the floor so it can't clobber a fresher render.
+    const myToken = ++logsLoadToken;
     try {
       let url = `/admin/logs?page=${logsPage}&per_page=50`;
       for (const [k, v] of Object.entries(logsFilters)) {
         url += `&${encodeURIComponent(k)}=${encodeURIComponent(v)}`;
       }
       const data = await api(url);
+      if (myToken !== logsLoadToken) return;
       renderLogsTable(data.logs || []);
       renderLogsPagination(data);
     } catch (err) {
+      if (myToken !== logsLoadToken) return;
       const tbody = document.getElementById("logs-tbody");
       if (tbody) tbody.innerHTML = `<tr><td colspan="14" class="no-results">${t("logs.failed", { message: esc(err.message) })}</td></tr>`;
+      const pg = document.getElementById("logs-pagination");
+      if (pg) pg.innerHTML = "";
     }
   }
 
