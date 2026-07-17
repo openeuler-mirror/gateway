@@ -76,15 +76,25 @@ impl KvcOrchestrator {
     /// stable across turns — include it for maximum prefix depth.
     fn compute_prefix_bytes(req: &ChatCompletionRequest) -> Vec<u8> {
         let mut bytes = Vec::new();
-        if let Ok(s) = serde_json::to_string(&req.messages) {
-            bytes.extend_from_slice(s.as_bytes());
-        }
+        // Fixed prefix (tools) MUST come before the per-turn suffix (messages):
+        // across turns, only `messages` grows. Continuous trie matching breaks at
+        // the first differing block (the messages-growth point), so anything
+        // placed AFTER that point — including a fixed tools block — can never be
+        // reached and is permanently counted as a miss, even though it was
+        // recorded. Putting tools first keeps the fixed segment ahead of the
+        // divergence point, so it matches every turn. This also matches the
+        // chat-template render order of every served model (GLM/Qwen3/MiniMax:
+        // tools live in the system segment, before messages), so the gateway's
+        // prefix ordering is at least consistent with vLLM's prompt layout.
         if let Some(tools) = &req.tools {
             if !tools.is_empty() {
                 if let Ok(s) = serde_json::to_string(tools) {
                     bytes.extend_from_slice(s.as_bytes());
                 }
             }
+        }
+        if let Ok(s) = serde_json::to_string(&req.messages) {
+            bytes.extend_from_slice(s.as_bytes());
         }
         bytes
     }
