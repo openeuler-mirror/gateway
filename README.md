@@ -9,7 +9,7 @@
 一个使用 Rust 构建的生产级 LLM API 网关。统一接入 OpenAI、Anthropic、Gemini、Bedrock、vLLM、Ollama 等 20+ 上游服务商。兼容 litellm 密钥体系，自建速率限制、套餐管理、流量控制、计费、Web 管理面板、请求审计与完整 prompt 落盘。
 
 [![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange)](https://www.rust-lang.org/)
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![License: MulanPSL v2](https://img.shields.io/badge/License-MulanPSL%20v2-green.svg)](LICENSE)
 
 ---
 
@@ -591,4 +591,4 @@ prompt_log:
 
 ## 许可证
 
-Apache License 2.0
+木兰宽松许可证 v2（Mulan Permissive Software License v2，MulanPSL-2.0）。详见 [LICENSE](LICENSE) 与 <http://license.coscl.org.cn/MulanPSL2>。

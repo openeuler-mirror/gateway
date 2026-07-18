@@ -9,7 +9,7 @@
 A production-grade LLM API gateway built in Rust. Unified request entry point for OpenAI, Anthropic, Gemini, Bedrock, vLLM, Ollama and 20+ providers. Compatible with the litellm key schema, with self-built rate limiting, plan management, flow control, cost/billing, web dashboard, request auditing, and full prompt logging.
 
 [![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange)](https://www.rust-lang.org/)
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![License: MulanPSL v2](https://img.shields.io/badge/License-MulanPSL%20v2-green.svg)](LICENSE)
 
 ---
 
@@ -591,4 +591,4 @@ Routes by `host` (wildcard `*.example.com`), `path` prefix, `client_ip` CIDR.
 
 ## License
 
-Apache License 2.0
+Mulan Permissive Software License v2 (MulanPSL-2.0). See [LICENSE](LICENSE) and <http://license.coscl.org.cn/MulanPSL2>.
