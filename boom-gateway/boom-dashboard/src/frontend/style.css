@@ -1327,7 +1327,12 @@ input[list] {
      AND can shrink below content size. Combined with % bar width below,
      bars naturally thin out as the window narrows — no scrollbar, no
      overflow. Labels truncate via ellipsis instead of forcing the column
-     wider. */
+     wider.
+
+     Layout (column, justify:flex-end): value on top → bar → label bottom.
+     Bar's bottom y = col_bottom − label_height, identical across all
+     columns. value/label hidden via visibility:hidden (preserves box) so
+     hiding never perturbs the bar's bottom alignment. */
   flex: 1 1 0;
   min-width: 0;
   display: flex; flex-direction: column;
@@ -1336,14 +1341,20 @@ input[list] {
 .rb-bar-value { font-size: 10px; color: var(--text3); margin-bottom: 3px; line-height: 1; font-weight: 500; }
 .rb-bar-value-zero { visibility: hidden; }
 .rb-bar {
-  /* Width as % of column → bar thickens/thins with column. 70% leaves ~30%
-     gutter between adjacent bars. min/max caps keep visually sensible at
-     extremes (2px hairline on very narrow windows, 22px on very wide). */
-  width: 70%;
+  /* Width as % of column → bar thickens/thins with column. 45% leaves a wide
+     gutter so bars stay slender and refined even at wide windows. min/max
+     caps: 2px hairline on very narrow windows, 14px ceiling on very wide
+     (was 22px — felt chunky and lost the high-throughput feel).
+
+     min-height raised to 3px so tiny-value bars still render as a clean
+     flat-bottom sliver (border-radius < height would otherwise round the
+     bottom corners and make the bar look like it's floating above the
+     baseline — which is the "bars don't bottom-align" visual issue). */
+  width: 45%;
   min-width: 2px;
-  max-width: 22px;
-  min-height: 1px;
-  border-radius: 4px 4px 0 0;
+  max-width: 14px;
+  min-height: 3px;
+  border-radius: 3px 3px 0 0;
   transition: height .3s ease;
   position: relative;
 }
@@ -1376,7 +1387,7 @@ input[list] {
   transition: height .3s ease;
 }
 .rb-bar-seg:first-child { border-radius: 0 0 0 0; }
-.rb-bar-seg:last-child { border-radius: 4px 4px 0 0; }
+.rb-bar-seg:last-child { border-radius: 3px 3px 0 0; }
 .rb-bar-stacked .rb-bar-seg + .rb-bar-seg {
   /* tiny separator so adjacent segments stay readable even at full pastel */
   border-top: 1px solid rgba(255,255,255,.35);
