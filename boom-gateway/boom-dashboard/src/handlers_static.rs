@@ -23,6 +23,11 @@ const VENDOR_KIMI: &[u8] = include_bytes!("frontend/assets/Kimi.svg");
 const VENDOR_MIMO: &[u8] = include_bytes!("frontend/assets/MiMo.svg");
 const VENDOR_DEFAULT: &[u8] = include_bytes!("frontend/assets/default.svg");
 
+// Login hero illustration — shown in the left column of the split login page.
+// Drop a new file at frontend/assets/login.{webp,png} to swap (update the
+// include_bytes! path + content_type below if the extension changes).
+const LOGIN_IMAGE: &[u8] = include_bytes!("frontend/assets/login.webp");
+
 /// Auto-detect image content-type from magic bytes.
 /// PNG: starts with `89 50 4E 47 0D 0A 1A 0A`
 /// SVG: starts with `<?xml` or `<svg` (leading whitespace tolerated)
@@ -104,6 +109,20 @@ pub async fn vendor_logo(Path(name): Path<String>) -> Response {
             (header::CACHE_CONTROL, "public, max-age=3600"),
         ],
         bytes,
+    )
+        .into_response()
+}
+
+/// `/dashboard/assets/login.png` — hero illustration for the split login page.
+/// Served as WebP (better compression for the neon/gradient artwork); route
+/// path stays `.png` for URL stability.
+pub async fn login_image() -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "image/webp"),
+            (header::CACHE_CONTROL, "public, max-age=3600"),
+        ],
+        LOGIN_IMAGE,
     )
         .into_response()
 }

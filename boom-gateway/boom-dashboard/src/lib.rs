@@ -35,6 +35,11 @@ pub fn build_router<S: Clone + Send + Sync + 'static>(state: DashboardState) -> 
             "/dashboard/assets/vendor/{name}",
             get(handlers_static::vendor_logo),
         )
+        // Login hero illustration (split-layout left column).
+        .route(
+            "/dashboard/assets/login.png",
+            get(handlers_static::login_image),
+        )
         // Auth endpoints.
         .route("/dashboard/api/auth/login", post(auth::login))
         .route("/dashboard/api/auth/logout", post(auth::logout))

@@ -210,6 +210,48 @@ input, select, textarea { font-family: var(--font); font-size: 14px; }
   background: var(--login-bg);
 }
 
+/* ── Login split layout ──────────────────────────────────
+ * Two-column shell: left = hero illustration, right = form card.
+ * Shell shrinks to content (`width: max-content`) so #page-login's flex
+ * centering positions the whole pair at the viewport center — hero on the
+ * left of the vertical midline, card on the right. Below 960px the hero
+ * hides and the card centers as the single column. */
+.login-shell {
+  position: relative; z-index: 2;
+  display: grid;
+  grid-template-columns: auto auto;
+  width: max-content;
+  max-width: calc(100% - 48px);
+  align-items: center; justify-items: center;
+  gap: 80px;
+}
+.login-hero {
+  display: flex; align-items: center; justify-content: center;
+  min-height: 0;
+}
+.login-hero img {
+  width: 560px;
+  max-width: calc(60vw - 80px);
+  height: auto;
+  object-fit: contain;
+  border-radius: 24px;
+  filter: drop-shadow(0 30px 80px rgba(80,83,232,.22));
+  animation: cardIn .55s cubic-bezier(.16,1,.3,1);
+  user-select: none;
+}
+@media (max-width: 960px) {
+  .login-shell {
+    grid-template-columns: 1fr;
+    width: 100%;
+    padding: 0 24px;
+    gap: 0;
+  }
+  .login-hero { display: none; }
+}
+
+/* Card keeps its original fixed 420px width (defined in the .login-card
+ * rule below). No shell-level override needed. */
+
 /* Layer order, back→front: aurora (z=0) → grid (z=0) → noise (z=1) → card (z=2).
  * Each layer is absolutely positioned, full-bleed, pointer-events:none. */
 
@@ -341,6 +383,7 @@ input, select, textarea { font-family: var(--font); font-size: 14px; }
   background: var(--login-card-bg);
   border: 1px solid var(--login-card-border);
   border-radius: 20px; padding: 48px 44px; width: 420px;
+  margin: auto;
   box-shadow:
     0 1px 2px rgba(0,0,0,.04),
     0 24px 60px rgba(0,0,0,.08),
