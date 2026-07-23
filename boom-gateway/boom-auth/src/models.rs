@@ -10,6 +10,14 @@ pub struct VerificationToken {
     pub token: String,
     pub key_name: Option<String>,
     pub key_alias: Option<String>,
+    /// Optional prefix shown to user (e.g. "prod" in sk-prod-<secret>).
+    /// NULL for legacy/unprefixed keys.
+    #[sqlx(default)]
+    pub key_prefix: Option<String>,
+    /// Optional user-supplied classification tag. Free text, ≤64 chars.
+    /// Not part of the raw key. Forward-compatible: NULL on old rows.
+    #[sqlx(default)]
+    pub tag: Option<String>,
     /// Total spend on this key.
     pub spend: f64,
     /// Expiration time (null = never expires).

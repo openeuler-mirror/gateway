@@ -1,7 +1,8 @@
-use axum::extract::{Path, Query};
+use axum::extract::{Multipart, Path, Query};
 use axum::response::{IntoResponse, Response};
 use axum::Extension;
 use axum::Json;
+use boom_core::key_format::is_valid_prefix;
 use chrono::NaiveDateTime;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -11,6 +12,68 @@ use uuid::Uuid;
 
 use crate::auth::{hash_token, AdminSession};
 use crate::state::DashboardState;
+
+/// Maximum allowed length of the user-supplied `tag` string. Tags are free
+/// text (Unicode OK) but capped to keep cell rendering sane.
+const MAX_TAG_LEN: usize = 64;
+
+/// Generate a (raw_key, hashed_token, optional_prefix) triple for a new key.
+///
+/// When `requested_prefix` is `Some` and passes [`is_valid_prefix`], emits a
+/// prefixed key whose secret portion is hashed (prefix is metadata only).
+/// Otherwise emits a legacy `sk-{32 hex}` key whose entire raw string is
+/// hashed — byte-for-byte identical to the pre-prefix code path, so DB rows
+/// created by older binaries remain matchable.
+///
+/// Callers must validate the prefix themselves and reject invalid values
+/// with a 400 — this helper silently drops an invalid prefix to keep the
+/// invariant "DB never stores an invalid prefix" at the validation layer.
+fn generate_key_material(requested_prefix: Option<&str>) -> (String, String, Option<String>) {
+    let secret = hex::encode(Uuid::new_v4().as_bytes());
+    match requested_prefix.filter(|p| is_valid_prefix(p)) {
+        Some(p) => {
+            let raw = format!("sk-{}-{}", p, secret);
+            let hashed = hash_token(&secret);
+            (raw, hashed, Some(p.to_string()))
+        }
+        None => {
+            let raw = format!("sk-{}", secret);
+            let hashed = hash_token(&raw);
+            (raw, hashed, None)
+        }
+    }
+}
+
+/// Validate the `key_prefix` and `tag` fields of a creation request.
+///
+/// Returns `Some(Response)` (a 400) when validation fails, otherwise `None`.
+/// Centralized here so the single-key, batch, and import paths all enforce
+/// the same rule — invalid prefixes get rejected rather than silently
+/// falling back to the legacy `sk-{secret}` form.
+fn validate_prefix_and_tag(req: &CreateKeyRequest) -> Option<Response> {
+    if let Some(ref p) = req.key_prefix {
+        if !p.is_empty() && !is_valid_prefix(p) {
+            return Some((
+                axum::http::StatusCode::BAD_REQUEST,
+                format!(
+                    "Invalid key_prefix '{}': must be 1-8 ASCII alphanumeric chars [a-zA-Z0-9]",
+                    p
+                ),
+            )
+                .into_response());
+        }
+    }
+    if let Some(ref tag) = req.tag {
+        if tag.chars().count() > MAX_TAG_LEN {
+            return Some((
+                axum::http::StatusCode::BAD_REQUEST,
+                format!("Invalid tag: length must be <= {} chars", MAX_TAG_LEN),
+            )
+                .into_response());
+        }
+    }
+    None
+}
 
 // ═══════════════════════════════════════════════════════════
 // Plan management (delegated to PlanStore)
@@ -116,6 +179,10 @@ struct KeyRow {
     token: String,
     key_name: Option<String>,
     key_alias: Option<String>,
+    #[sqlx(default)]
+    key_prefix: Option<String>,
+    #[sqlx(default)]
+    tag: Option<String>,
     user_id: Option<String>,
     team_id: Option<String>,
     /// litellm stores models as text[] in PostgreSQL.
@@ -172,7 +239,7 @@ pub async fn list_keys(
     // Fetch ALL keys from DB (no LIMIT/OFFSET) for global usage sorting.
     let rows: Vec<KeyRow> = if let Some(ref pattern) = search_pattern {
         match sqlx::query_as(
-            r#"SELECT token, key_name, key_alias, user_id, team_id, models,
+            r#"SELECT token, key_name, key_alias, key_prefix, tag, user_id, team_id, models,
                       blocked, rpm_limit, tpm_limit, max_budget,
                       budget_duration, expires, metadata, created_at
                FROM "boom_verification_token"
@@ -194,7 +261,7 @@ pub async fn list_keys(
         }
     } else {
         match sqlx::query_as(
-            r#"SELECT token, key_name, key_alias, user_id, team_id, models,
+            r#"SELECT token, key_name, key_alias, key_prefix, tag, user_id, team_id, models,
                       blocked, rpm_limit, tpm_limit, max_budget,
                       budget_duration, expires, metadata, created_at
                FROM "boom_verification_token""#,
@@ -284,6 +351,8 @@ pub async fn list_keys(
                 "token_hash": r.token,
                 "key_name": r.key_name,
                 "key_alias": r.key_alias,
+                "key_prefix": r.key_prefix,
+                "tag": r.tag,
                 "user_id": r.user_id,
                 "team_id": r.team_id,
                 "models": r.models,
@@ -347,6 +416,12 @@ pub struct CreateKeyRequest {
     pub key_alias: Option<String>,
     /// Legacy display name. Defaults to key_alias if not provided.
     pub key_name: Option<String>,
+    /// Optional key prefix shown in the raw key (e.g. `sk-prod-<secret>`).
+    /// Must match `[a-zA-Z0-9]{1,8}`; invalid values are rejected with 400.
+    pub key_prefix: Option<String>,
+    /// Optional user-supplied classification tag. Free text, ≤64 chars.
+    /// Not part of the raw key — purely a dashboard/display field.
+    pub tag: Option<String>,
     pub user_id: Option<String>,
     pub team_id: Option<String>,
     pub models: Option<Vec<String>>,
@@ -371,9 +446,17 @@ pub async fn create_key(
         }
     };
 
-    // 1. Generate raw key: sk- + 32 bytes random hex.
-    let raw_key = format!("sk-{}", hex::encode(Uuid::new_v4().as_bytes()));
-    let token_hash = hash_token(&raw_key);
+    // 0. Validate user-supplied prefix and tag. Reject instead of silently
+    //    falling back, so users learn the rule rather than getting mystery
+    //    legacy keys.
+    if let Some(resp) = validate_prefix_and_tag(&req) {
+        return resp;
+    }
+
+    // 1. Generate raw key + token hash + optional prefix metadata.
+    //    Prefixed keys hash only the secret portion; legacy keys hash the
+    //    whole raw_key so old DB rows remain matchable.
+    let (raw_key, token_hash, key_prefix) = generate_key_material(req.key_prefix.as_deref());
 
     // 1b. Check key_alias dedup (if provided).
     if let Some(ref alias) = req.key_alias {
@@ -408,14 +491,16 @@ pub async fn create_key(
     let key_name = req.key_name.or(req.key_alias.clone());
     let result = sqlx::query(
         r#"INSERT INTO "boom_verification_token"
-           (token, key_name, key_alias, user_id, team_id, models, spend, blocked,
+           (token, key_name, key_alias, key_prefix, tag, user_id, team_id, models, spend, blocked,
             rpm_limit, tpm_limit, max_budget, budget_duration, expires,
             metadata, created_at, updated_at)
-           VALUES ($1, $2, $3, $4, $5, $6, 0.0, false, $7, $8, $9, $10, $11, $12, NOW(), NOW())"#,
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0.0, false, $9, $10, $11, $12, $13, $14, NOW(), NOW())"#,
     )
     .bind(&token_hash)
     .bind(&key_name)
     .bind(&req.key_alias)
+    .bind(&key_prefix)
+    .bind(&req.tag)
     .bind(&req.user_id)
     .bind(&req.team_id)
     .bind(&models_list)
@@ -879,83 +964,18 @@ pub async fn batch_create_keys(
     let mut skipped = Vec::new();
 
     for req in reqs {
-        // Dedup check on key_alias.
-        if let Some(ref alias) = req.key_alias {
-            let exists: bool = sqlx::query_scalar(
-                r#"SELECT EXISTS(SELECT 1 FROM "boom_verification_token" WHERE key_alias = $1)"#,
-            )
-            .bind(alias)
-            .fetch_one(db_pool)
-            .await
-            .unwrap_or(false);
-
-            if exists {
-                skipped.push(json!({
-                    "key_alias": alias,
-                    "reason": "duplicate",
-                }));
-                continue;
-            }
-        }
-
-        let raw_key = format!("sk-{}", hex::encode(Uuid::new_v4().as_bytes()));
-        let token_hash = hash_token(&raw_key);
-
-        let expires: Option<NaiveDateTime> = req
-            .expires
-            .as_deref()
-            .and_then(|s| NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").ok());
-
-        let models_list: Vec<String> = req.models.clone().unwrap_or_default();
-        let key_name = req.key_name.clone().or(req.key_alias.clone());
-
-        let result = sqlx::query(
-            r#"INSERT INTO "boom_verification_token"
-               (token, key_name, key_alias, user_id, team_id, models, spend, blocked,
-                rpm_limit, tpm_limit, max_budget, budget_duration, expires,
-                metadata, created_at, updated_at)
-               VALUES ($1, $2, $3, $4, $5, $6, 0.0, false, $7, $8, $9, $10, $11, $12, NOW(), NOW())"#,
-        )
-        .bind(&token_hash)
-        .bind(&key_name)
-        .bind(&req.key_alias)
-        .bind(&req.user_id)
-        .bind(&req.team_id)
-        .bind(&models_list)
-        .bind(req.rpm_limit)
-        .bind(req.tpm_limit)
-        .bind(req.max_budget)
-        .bind(&req.budget_duration)
-        .bind(expires)
-        .bind(req.metadata.as_ref().unwrap_or(&serde_json::json!({})))
-        .execute(db_pool)
-        .await;
-
-        match result {
-            Ok(_) => {
-                // Optionally assign to plan (skip DB write if same as default).
-                if let Some(ref plan_name) = req.plan_name {
-                    let is_default = state.plan_store.get_default_plan_name().as_deref() == Some(plan_name.as_str());
-                    let result = if is_default {
-                        state.plan_store.assign_key(&token_hash, plan_name)
-                    } else {
-                        state.plan_store.assign_key_db(db_pool, &token_hash, plan_name).await
-                    };
-                    if let Err(e) = result {
-                        tracing::warn!("Batch: key created but plan assignment failed: {}", e);
-                    }
-                }
+        match insert_single_key(&state, db_pool, req).await {
+            CreateOutcome::Created { key, token_hash, key_alias } => {
                 created.push(json!({
-                    "key": raw_key,
+                    "key": key,
                     "token_hash": token_hash,
-                    "key_alias": req.key_alias,
+                    "key_alias": key_alias,
                 }));
             }
-            Err(e) => {
-                tracing::error!("Dashboard batch_create_keys insert failed: {}", e);
+            CreateOutcome::Skipped { key_alias, reason } => {
                 skipped.push(json!({
-                    "key_alias": req.key_alias,
-                    "reason": "db_error",
+                    "key_alias": key_alias,
+                    "reason": reason,
                 }));
             }
         }
@@ -968,6 +988,363 @@ pub async fn batch_create_keys(
         "skipped_count": skipped.len(),
     }))
     .into_response()
+}
+
+/// Outcome of inserting one key. Shared by [`batch_create_keys`] and
+/// [`import_keys`] so they report identical shapes.
+enum CreateOutcome {
+    Created {
+        key: String,
+        token_hash: String,
+        key_alias: Option<String>,
+    },
+    Skipped {
+        key_alias: Option<String>,
+        reason: &'static str,
+    },
+}
+
+/// Insert a single key from a [`CreateKeyRequest`]. Encapsulates alias dedup,
+/// generation, INSERT, and optional plan assignment so both the JSON-array
+/// batch endpoint and the file-import endpoint stay in lockstep.
+async fn insert_single_key(
+    state: &DashboardState,
+    db_pool: &sqlx::PgPool,
+    req: CreateKeyRequest,
+) -> CreateOutcome {
+    // Validate prefix and tag up front so batch/import paths reject bad
+    // rows with a precise reason rather than silently degrading.
+    if let Some(p) = req.key_prefix.as_ref() {
+        if !p.is_empty() && !is_valid_prefix(p) {
+            return CreateOutcome::Skipped {
+                key_alias: req.key_alias,
+                reason: "invalid_prefix",
+            };
+        }
+    }
+    if let Some(t) = req.tag.as_ref() {
+        if t.chars().count() > MAX_TAG_LEN {
+            return CreateOutcome::Skipped {
+                key_alias: req.key_alias,
+                reason: "invalid_tag",
+            };
+        }
+    }
+
+    // Dedup check on key_alias.
+    if let Some(ref alias) = req.key_alias {
+        let exists: bool = sqlx::query_scalar(
+            r#"SELECT EXISTS(SELECT 1 FROM "boom_verification_token" WHERE key_alias = $1)"#,
+        )
+        .bind(alias)
+        .fetch_one(db_pool)
+        .await
+        .unwrap_or(false);
+
+        if exists {
+            return CreateOutcome::Skipped {
+                key_alias: req.key_alias,
+                reason: "duplicate",
+            };
+        }
+    }
+
+    let (raw_key, token_hash, key_prefix) = generate_key_material(req.key_prefix.as_deref());
+
+    let expires: Option<NaiveDateTime> = req
+        .expires
+        .as_deref()
+        .and_then(|s| NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").ok());
+
+    let mut models_list: Vec<String> = req.models.clone().unwrap_or_default();
+    if models_list.iter().any(|m| m == "all-team-models") {
+        models_list = vec!["all-team-models".to_string()];
+    }
+    let key_name = req.key_name.clone().or(req.key_alias.clone());
+
+    let result = sqlx::query(
+        r#"INSERT INTO "boom_verification_token"
+           (token, key_name, key_alias, key_prefix, tag, user_id, team_id, models, spend, blocked,
+            rpm_limit, tpm_limit, max_budget, budget_duration, expires,
+            metadata, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0.0, false, $9, $10, $11, $12, $13, $14, NOW(), NOW())"#,
+    )
+    .bind(&token_hash)
+    .bind(&key_name)
+    .bind(&req.key_alias)
+    .bind(&key_prefix)
+    .bind(&req.tag)
+    .bind(&req.user_id)
+    .bind(&req.team_id)
+    .bind(&models_list)
+    .bind(req.rpm_limit)
+    .bind(req.tpm_limit)
+    .bind(req.max_budget)
+    .bind(&req.budget_duration)
+    .bind(expires)
+    .bind(req.metadata.as_ref().unwrap_or(&serde_json::json!({})))
+    .execute(db_pool)
+    .await;
+
+    match result {
+        Ok(_) => {
+            if let Some(ref plan_name) = req.plan_name {
+                let is_default =
+                    state.plan_store.get_default_plan_name().as_deref() == Some(plan_name.as_str());
+                let result = if is_default {
+                    state.plan_store.assign_key(&token_hash, plan_name)
+                } else {
+                    state.plan_store.assign_key_db(db_pool, &token_hash, plan_name).await
+                };
+                if let Err(e) = result {
+                    tracing::warn!("Key created but plan assignment failed: {}", e);
+                }
+            }
+            CreateOutcome::Created {
+                key: raw_key,
+                token_hash,
+                key_alias: req.key_alias,
+            }
+        }
+        Err(e) => {
+            tracing::error!("Dashboard insert_single_key failed: {}", e);
+            CreateOutcome::Skipped {
+                key_alias: req.key_alias,
+                reason: "db_error",
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+// File-based batch import (JSONL or CSV)
+// ═══════════════════════════════════════════════════════════
+
+/// `multipart/form-data` field name expected from the dashboard uploader.
+const IMPORT_FIELD_NAME: &str = "file";
+
+pub async fn import_keys(
+    _session: AdminSession,
+    Extension(state): Extension<std::sync::Arc<DashboardState>>,
+    mut multipart: Multipart,
+) -> Response {
+    let db_pool = match &state.db_pool {
+        Some(pool) => pool,
+        None => {
+            return Json(json!({"error": "Database not available"})).into_response();
+        }
+    };
+
+    // 1. Pull the first file field from multipart.
+    let mut file_bytes: Option<Vec<u8>> = None;
+    let mut file_name: Option<String> = None;
+    while let Ok(Some(field)) = multipart.next_field().await {
+        if field.name() == Some(IMPORT_FIELD_NAME) {
+            file_name = field.file_name().map(|s| s.to_string());
+            file_bytes = match field.bytes().await {
+                Ok(b) => Some(b.to_vec()),
+                Err(e) => {
+                    return Json(json!({
+                        "error": format!("Failed to read upload: {}", e),
+                    }))
+                    .into_response();
+                }
+            };
+            break;
+        }
+        // Drain any other fields so the connection can be reused.
+        let _ = field.bytes().await;
+    }
+    let (bytes, name) = match (file_bytes, file_name) {
+        (Some(b), Some(n)) => (b, n),
+        _ => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                "Missing 'file' field in multipart upload",
+            )
+                .into_response();
+        }
+    };
+
+    // 2. Route by extension.
+    let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
+    let (parsed_reqs, parse_errors) = match ext.as_deref() {
+        Some("jsonl") => parse_jsonl(&bytes),
+        Some("csv") => parse_csv(&bytes),
+        _ => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                "Unsupported file extension; use .jsonl or .csv",
+            )
+                .into_response();
+        }
+    };
+
+    let parsed_total = parsed_reqs.len();
+
+    // 3. Insert each parsed request via the shared helper.
+    let mut created = Vec::new();
+    let mut skipped = Vec::new();
+    for req in parsed_reqs {
+        match insert_single_key(&state, db_pool, req).await {
+            CreateOutcome::Created { key, token_hash, key_alias } => {
+                created.push(json!({
+                    "key": key,
+                    "token_hash": token_hash,
+                    "key_alias": key_alias,
+                }));
+            }
+            CreateOutcome::Skipped { key_alias, reason } => {
+                skipped.push(json!({
+                    "key_alias": key_alias,
+                    "reason": reason,
+                }));
+            }
+        }
+    }
+
+    Json(json!({
+        "file_name": name,
+        "format": ext,
+        "parsed": parsed_total,
+        "parse_errors": parse_errors,
+        "created": created,
+        "skipped": skipped,
+        "created_count": created.len(),
+        "skipped_count": skipped.len(),
+    }))
+    .into_response()
+}
+
+/// Parse a JSONL file into requests plus per-line errors.
+///
+/// Each non-empty line is one JSON object matching `CreateKeyRequest`.
+/// Blank lines are skipped silently. Lines that fail JSON parsing or fail
+/// required-field checks (`key_alias` is the only soft-required field,
+/// since blank alias rows would otherwise be unidentifiable in the UI)
+/// are reported with 1-based line numbers.
+fn parse_jsonl(bytes: &[u8]) -> (Vec<CreateKeyRequest>, Vec<Value>) {
+    let text = match std::str::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(_) => {
+            return (
+                vec![],
+                vec![json!({
+                    "line": 0,
+                    "reason": "file is not valid UTF-8",
+                })],
+            );
+        }
+    };
+
+    let mut reqs = Vec::new();
+    let mut errors = Vec::new();
+    for (idx, raw_line) in text.lines().enumerate() {
+        let line_no = idx + 1;
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<CreateKeyRequest>(trimmed) {
+            Ok(req) => reqs.push(req),
+            Err(e) => {
+                errors.push(json!({
+                    "line": line_no,
+                    "reason": format!("invalid JSON: {}", e),
+                }));
+            }
+        }
+    }
+    (reqs, errors)
+}
+
+/// CSV row schema. Fields map 1:1 onto [`CreateKeyRequest`].
+///
+/// `models` uses `|` (pipe) as in-cell separator so Excel users don't have
+/// to fight quoted commas. `metadata` is a single JSON object string.
+/// Empty cells become `None`.
+#[derive(Debug, Deserialize)]
+struct CsvKeyRow {
+    key_alias: Option<String>,
+    key_name: Option<String>,
+    key_prefix: Option<String>,
+    tag: Option<String>,
+    user_id: Option<String>,
+    team_id: Option<String>,
+    models: Option<String>,
+    rpm_limit: Option<i64>,
+    tpm_limit: Option<i64>,
+    max_budget: Option<f64>,
+    budget_duration: Option<String>,
+    expires: Option<String>,
+    metadata: Option<String>,
+    plan_name: Option<String>,
+}
+
+fn parse_csv(bytes: &[u8]) -> (Vec<CreateKeyRequest>, Vec<Value>) {
+    let mut rdr = csv::Reader::from_reader(bytes);
+
+    let mut reqs = Vec::new();
+    let mut errors = Vec::new();
+    for (idx, record) in rdr.deserialize::<CsvKeyRow>().enumerate() {
+        let line_no = idx + 2; // 1-based header + 1-based data offset
+        let row = match record {
+            Ok(r) => r,
+            Err(e) => {
+                errors.push(json!({
+                    "line": line_no,
+                    "reason": format!("CSV parse error: {}", e),
+                }));
+                continue;
+            }
+        };
+
+        // Split `models` on `|`, dropping empty fragments.
+        let models = row
+            .models
+            .map(|s| {
+                s.split('|')
+                    .map(|x| x.trim().to_string())
+                    .filter(|x| !x.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|v| !v.is_empty());
+
+        // Parse `metadata` JSON string → Value. Bad JSON leaves the field as
+        // an error rather than silently dropping it.
+        let metadata = match row.metadata.as_deref() {
+            None => None,
+            Some("") => None,
+            Some(s) => match serde_json::from_str::<serde_json::Value>(s) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    errors.push(json!({
+                        "line": line_no,
+                        "reason": format!("metadata is not valid JSON: {}", e),
+                    }));
+                    continue;
+                }
+            },
+        };
+
+        reqs.push(CreateKeyRequest {
+            key_alias: row.key_alias.filter(|s| !s.is_empty()),
+            key_name: row.key_name.filter(|s| !s.is_empty()),
+            key_prefix: row.key_prefix.filter(|s| !s.is_empty()),
+            tag: row.tag.filter(|s| !s.is_empty()),
+            user_id: row.user_id.filter(|s| !s.is_empty()),
+            team_id: row.team_id.filter(|s| !s.is_empty()),
+            models,
+            max_budget: row.max_budget,
+            budget_duration: row.budget_duration.filter(|s| !s.is_empty()),
+            rpm_limit: row.rpm_limit,
+            tpm_limit: row.tpm_limit,
+            expires: row.expires.filter(|s| !s.is_empty()),
+            metadata,
+            plan_name: row.plan_name.filter(|s| !s.is_empty()),
+        });
+    }
+    (reqs, errors)
 }
 
 // ═══════════════════════════════════════════════════════════

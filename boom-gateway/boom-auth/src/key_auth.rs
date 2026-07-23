@@ -1,4 +1,5 @@
 use crate::models::{TeamRow, VerificationToken};
+use boom_core::key_format::{parse_raw_key, ParsedKey};
 use boom_core::provider::{Authenticator, KeyAliasLookup};
 use boom_core::types::AuthIdentity;
 use boom_core::GatewayError;
@@ -79,7 +80,7 @@ impl DbAuthenticator {
         // 3. Query database
         tracing::debug!("Token cache miss, querying DB: {}", &hashed[..8]);
         let result = sqlx::query_as::<_, VerificationToken>(
-            r#"SELECT token, key_name, key_alias, spend, expires, models,
+            r#"SELECT token, key_name, key_alias, key_prefix, tag, spend, expires, models,
                       aliases, config, user_id, team_id,
                       max_parallel_requests, metadata, blocked,
                       tpm_limit, rpm_limit, max_budget, budget_duration,
@@ -176,14 +177,53 @@ impl Authenticator for DbAuthenticator {
             });
         }
 
-        // 2. Hash the key — all keys are stored as SHA-256 hash in DB.
-        let hashed = Self::hash_token(raw_key);
+        // 2. Hash the key. For `sk-{prefix}-{secret}` keys only `secret`
+        //    participates; legacy `sk-{hex}` keys keep hashing the entire
+        //    raw_key so historical DB rows match byte-for-byte.
+        let parsed = parse_raw_key(raw_key);
+        let hashed = match parsed {
+            ParsedKey::Prefixed { secret, .. } => Self::hash_token(secret),
+            ParsedKey::Legacy => Self::hash_token(raw_key),
+        };
 
         // 3. Look up in cache / DB
         let token = self
             .lookup_token(&hashed)
             .await?
             .ok_or_else(|| GatewayError::AuthError("Invalid API key".to_string()))?;
+
+        // 3b. Prefix tampering check: if the DB row was created with a prefix,
+        //     the raw key must carry that same prefix. Rejects the case where
+        //     an attacker pairs a stolen secret with a different prefix to
+        //     muddy audit trails. A legacy (unprefixed) row also must not
+        //     suddenly arrive wrapped in a prefix.
+        match (&parsed, &token.key_prefix) {
+            (ParsedKey::Prefixed { prefix, .. }, Some(db_prefix)) if prefix == db_prefix => {}
+            (ParsedKey::Prefixed { .. }, Some(_)) => {
+                tracing::warn!(
+                    "Prefix mismatch on key {:?}: rejected",
+                    token.key_name
+                );
+                return Err(GatewayError::AuthError("Invalid API key".to_string()));
+            }
+            (ParsedKey::Prefixed { .. }, None) => {
+                // Raw key has prefix but DB row has none — reject.
+                tracing::warn!(
+                    "Prefixed raw key on unprefixed row {:?}: rejected",
+                    token.key_name
+                );
+                return Err(GatewayError::AuthError("Invalid API key".to_string()));
+            }
+            (ParsedKey::Legacy, Some(_)) => {
+                // Raw key has no prefix but DB row expects one — reject.
+                tracing::warn!(
+                    "Unprefixed raw key on prefixed row {:?}: rejected",
+                    token.key_name
+                );
+                return Err(GatewayError::AuthError("Invalid API key".to_string()));
+            }
+            (ParsedKey::Legacy, None) => {}
+        }
 
         // 4. Validate the token
         let mut identity = self.token_to_identity(token);
@@ -297,5 +337,45 @@ impl KeyAliasLookup for DbAuthenticator {
                 HashMap::new()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Critical compatibility guarantee: a legacy 32-hex key hashed via the
+    /// legacy path must produce the same digest as the pre-prefix code did.
+    /// If this ever breaks, every existing DB row stops matching.
+    #[test]
+    fn legacy_hash_matches_pre_prefix_behavior() {
+        let raw = "sk-deadbeefdeadbeefdeadbeefdeadbeef";
+        // Old code: hash_token(raw_key).
+        // New code: parse_raw_key says Legacy → hash_token(raw_key).
+        let digest = match parse_raw_key(raw) {
+            ParsedKey::Legacy => DbAuthenticator::hash_token(raw),
+            _ => panic!("expected Legacy"),
+        };
+        // Hard-coded expectation: SHA-256 of the literal string.
+        let mut h = Sha256::new();
+        h.update(raw.as_bytes());
+        let expected = hex::encode(h.finalize());
+        assert_eq!(digest, expected);
+    }
+
+    /// Prefixed keys hash only the secret portion. This is what makes the
+    /// prefix purely informational — strip it and you still get the same hash.
+    #[test]
+    fn prefixed_hash_ignores_prefix_bytes() {
+        let secret = "deadbeefdeadbeefdeadbeefdeadbeef";
+        let raw = format!("sk-teama-{}", secret);
+        let digest = match parse_raw_key(&raw) {
+            ParsedKey::Prefixed { secret: s, .. } => DbAuthenticator::hash_token(s),
+            _ => panic!("expected Prefixed"),
+        };
+        let mut h = Sha256::new();
+        h.update(secret.as_bytes());
+        let expected = hex::encode(h.finalize());
+        assert_eq!(digest, expected);
     }
 }

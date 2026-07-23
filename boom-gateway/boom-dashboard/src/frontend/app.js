@@ -1945,7 +1945,7 @@
       <tr><th>${t("keys.col.token")}</th><th>${t("keys.col.alias")}</th><th>${t("keys.col.user")}</th><th>${t("keys.col.plan")}</th><th>${t("keys.col.usage")}</th><th>${t("keys.col.spend")}</th><th>${t("keys.col.budget")}</th><th>${t("keys.col.status")}</th><th>${t("keys.col.actions")}</th></tr>
       ${keys.map((k) => `<tr>
         <td class="mono">${esc(k.token_prefix)}</td>
-        <td>${esc(k.key_alias || "-")}</td>
+        <td>${esc(k.key_alias || "-")}${k.key_prefix ? ' <span class="badge badge-prefix">' + esc(k.key_prefix) + "</span>" : ""}${k.tag ? ' <span class="badge badge-tag">' + esc(k.tag) + "</span>" : ""}</td>
         <td>${esc(k.user_id || "-")}</td>
         <td>${esc(k.plan_name || "-")}</td>
         <td><span class="mono">${k.usage_count || 0}/${fmtTokens(k.usage_tokens)}/${fmtCost(k.usage_cost)}</span><br><span class="muted" style="font-size:11px">${formatCountdown(k.usage_reset_secs || 0)}</span></td>
@@ -2472,6 +2472,8 @@
       alert(r.message || t("alert.done"));
     });
     document.getElementById("btn-new-key").addEventListener("click", showNewKeyModal);
+    document.getElementById("btn-import-keys").addEventListener("click", showImportKeysModal);
+    document.getElementById("btn-import-help").addEventListener("click", showImportHelpModal);
     const btnVipFilter = document.getElementById("btn-vip-filter");
     if (btnVipFilter) btnVipFilter.addEventListener("click", () => {
       keysVipOnly = !keysVipOnly;
@@ -2592,6 +2594,8 @@
     showModal(`
       <h3>${t("form.key.title_create")}</h3>
       <div class="form-group"><label>${t("form.key.alias")} ${tip("Short unique identifier for this key, e.g. 'alice' or 'team-api'. Used for display in dashboard and debug logging.")}</label><input id="m-key-alias"></div>
+      <div class="form-group"><label>Key Prefix ${tip("Optional 1-8 char alphanumeric label embedded in the raw key, e.g. 'prod' → sk-prod-<secret>. Empty = legacy sk-<secret> form. Not part of authentication.")}</label><input id="m-key-prefix" placeholder="e.g. prod, TeamA, v2" pattern="[a-zA-Z0-9]{1,8}" maxlength="8"></div>
+      <div class="form-group"><label>Tag ${tip("Optional free-text label (≤64 chars, any characters) for your own classification. Not embedded in the raw key. Use cases: environment, customer, purpose.")}</label><input id="m-key-tag" placeholder="e.g. production, customer-acme, exp-2026Q1" maxlength="64"></div>
       <div class="form-group"><label>${t("form.key.user_id")} ${tip("Optional user identifier for tracking.")}</label><input id="m-key-user"></div>
       <div class="form-group"><label>${t("form.key.team")} ${tip("Optional team assignment.")}</label><select id="m-key-team"><option value="">${t("common.none_option")}</option></select></div>
       <div class="form-group"><label>${t("form.key.models")} ${tip("Select model access. Check 'all-team-models' for full access, or pick specific models.")}</label><div class="model-check-combo" id="m-key-models-combo"></div></div>
@@ -2641,6 +2645,8 @@
           method: "POST",
           body: JSON.stringify({
             key_alias: document.getElementById("m-key-alias").value.trim() || null,
+            key_prefix: document.getElementById("m-key-prefix").value.trim() || null,
+            tag: document.getElementById("m-key-tag").value.trim() || null,
             user_id: document.getElementById("m-key-user").value || null,
             team_id: document.getElementById("m-key-team").value || null,
             models: modelsVal || ["all-team-models"],
@@ -2662,6 +2668,144 @@
         `);
       } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
     });
+  }
+
+  function showImportHelpModal() {
+    const jsonlTemplate =
+`{"key_alias":"alice","key_name":"Alice Wang","key_prefix":"prod","tag":"production","user_id":"alice","team_id":"team-eng","models":["gpt-4","claude-3"],"rpm_limit":60,"tpm_limit":100000,"max_budget":100.0,"budget_duration":"30d","expires":"2026-12-31 23:59:59","metadata":{"env":"prod","tier":"paid"},"plan_name":"default"}
+{"key_alias":"bob","key_prefix":"stg","tag":"staging","models":["all-team-models"],"team_id":"team-eng"}
+{"key_alias":"ci-runner","key_prefix":"ci","tag":"automation","models":["gpt-4"],"rpm_limit":30}`;
+    const csvTemplate =
+`key_alias,key_name,key_prefix,tag,user_id,team_id,models,rpm_limit,tpm_limit,max_budget,budget_duration,expires,metadata,plan_name
+alice,Alice Wang,prod,production,alice,team-eng,"gpt-4|claude-3",60,100000,100.0,30d,"2026-12-31 23:59:59","{""env"":""prod"",""tier"":""paid""}",default
+bob,,stg,staging,,team-eng,all-team-models,,,,,,,
+ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
+    const fieldsTable = `
+      <table style="width:100%;font-size:12px">
+        <tr><th>Field</th><th>Type</th><th>Required</th><th>Notes</th></tr>
+        <tr><td><code>key_alias</code></td><td>string</td><td>recommended</td><td>Unique display identifier. Empty = unidentifiable in dashboard.</td></tr>
+        <tr><td><code>key_name</code></td><td>string</td><td>optional</td><td>Defaults to key_alias if omitted.</td></tr>
+        <tr><td><code>key_prefix</code></td><td>string</td><td>optional</td><td>1-8 chars <code>[a-zA-Z0-9]</code>. Embedded in raw key: <code>sk-{prefix}-{secret}</code>. Invalid → row skipped.</td></tr>
+        <tr><td><code>tag</code></td><td>string</td><td>optional</td><td>Free text ≤64 chars. Your own classification label (env, customer, purpose). Not embedded in key.</td></tr>
+        <tr><td><code>user_id</code></td><td>string</td><td>optional</td><td>User identifier for tracking.</td></tr>
+        <tr><td><code>team_id</code></td><td>string</td><td>optional</td><td>Team assignment. Resolves <code>all-team-models</code> via team's model list.</td></tr>
+        <tr><td><code>models</code></td><td>array (JSONL) <br>pipe-separated (CSV)</td><td>optional</td><td>Model whitelist. <code>["all-team-models"]</code> = full access. CSV uses <code>|</code> separator.</td></tr>
+        <tr><td><code>rpm_limit</code></td><td>integer</td><td>optional</td><td>Per-key requests-per-minute cap. Empty = use plan default.</td></tr>
+        <tr><td><code>tpm_limit</code></td><td>integer</td><td>optional</td><td>Per-key tokens-per-minute cap.</td></tr>
+        <tr><td><code>max_budget</code></td><td>number</td><td>optional</td><td>USD spend cap. Empty = unlimited.</td></tr>
+        <tr><td><code>budget_duration</code></td><td>string</td><td>optional</td><td>Reset period. Examples: <code>"1d"</code>, <code>"7d"</code>, <code>"30d"</code>.</td></tr>
+        <tr><td><code>expires</code></td><td>string</td><td>optional</td><td>Format: <code>"YYYY-MM-DD HH:MM:SS"</code>. Empty = never expires.</td></tr>
+        <tr><td><code>metadata</code></td><td>object (JSONL)<br>JSON string (CSV)</td><td>optional</td><td>Arbitrary JSON. CSV must double-quote inner <code>"</code>. Special key <code>vip: true</code> = priority queue.</td></tr>
+        <tr><td><code>plan_name</code></td><td>string</td><td>optional</td><td>Rate-limit plan assignment. Empty = default plan.</td></tr>
+      </table>`;
+    showModal(`
+      <h3>Batch Import — Format Reference</h3>
+      <p class="muted">Supported formats: <code>.jsonl</code> (one JSON object per line) and <code>.csv</code> (header row required). Parse errors are reported with line numbers; valid rows still import.</p>
+
+      <h4>Field reference</h4>
+      ${fieldsTable}
+
+      <h4>JSONL example <span class="muted" style="font-size:11px">(click Copy to grab the template)</span></h4>
+      <pre id="help-jsonl" style="background:var(--surface3);padding:8px;border-radius:4px;font-size:11px;overflow-x:auto;max-height:200px">${esc(jsonlTemplate)}</pre>
+      <button class="btn-small" onclick="window._copyText(this, document.getElementById('help-jsonl').textContent)">Copy JSONL</button>
+
+      <h4>CSV example</h4>
+      <pre id="help-csv" style="background:var(--surface3);padding:8px;border-radius:4px;font-size:11px;overflow-x:auto;max-height:200px">${esc(csvTemplate)}</pre>
+      <button class="btn-small" onclick="window._copyText(this, document.getElementById('help-csv').textContent)">Copy CSV</button>
+
+      <div class="modal-actions">
+        <button class="btn-primary" onclick="hideModal()">${t("action.close")}</button>
+      </div>
+    `);
+  }
+
+  function showImportKeysModal() {
+    showModal(`
+      <h3>Batch Import Keys</h3>
+      <p class="muted">Upload a <code>.jsonl</code> or <code>.csv</code> file. Each line/row becomes one key. Parsing failures are reported per-line and do not block other rows.</p>
+      <div class="form-group">
+        <label>File (.jsonl or .csv)</label>
+        <input type="file" id="m-import-file" accept=".jsonl,.csv">
+      </div>
+      <details style="margin:8px 0">
+        <summary class="muted" style="cursor:pointer">Format reference</summary>
+        <pre style="background:var(--surface3);padding:8px;border-radius:4px;font-size:11px;overflow-x:auto">// keys.jsonl
+{"key_alias":"alice","key_prefix":"prod","models":["gpt-4"],"rpm_limit":60}
+{"key_alias":"bob","models":["all-team-models"],"team_id":"team-1"}
+
+// keys.csv (models pipe-separated, metadata JSON string)
+key_alias,key_prefix,user_id,models,rpm_limit,metadata
+alice,prod,alice,"gpt-4|claude-3",60,"{&quot;env&quot;:&quot;prod&quot;}"
+bob,,,all-team-models,,</pre>
+      </details>
+      <div class="modal-actions">
+        <button class="btn-secondary btn-inline" onclick="hideModal()">Cancel</button>
+        <button class="btn-primary" id="m-import-submit">Upload &amp; Import</button>
+      </div>
+    `);
+    document.getElementById("m-import-submit").addEventListener("click", async () => {
+      const fileInput = document.getElementById("m-import-file");
+      const file = fileInput && fileInput.files && fileInput.files[0];
+      if (!file) { alert("Please choose a file first."); return; }
+      const fd = new FormData();
+      fd.append("file", file);
+      try {
+        const resp = await fetch("/dashboard/api/admin/keys/import", {
+          method: "POST",
+          body: fd,
+          credentials: "include",
+        });
+        const data = await resp.json();
+        if (!resp.ok) {
+          alert("Import failed: " + (data.error || resp.status));
+          return;
+        }
+        renderImportResult(data);
+      } catch (err) { alert("Import error: " + err.message); }
+    });
+  }
+
+  function renderImportResult(data) {
+    const createdRows = (data.created || []).map((c) => `<tr>
+      <td class="mono">${esc(c.key_alias || "-")}</td>
+      <td class="mono" style="font-size:11px">${esc(c.key)}</td>
+      <td><button class="btn-small" onclick="window._copyText(this,'${esc(c.key)}')">Copy</button></td>
+    </tr>`).join("");
+    const skippedRows = (data.skipped || []).map((s) => `<tr>
+      <td>${esc(s.key_alias || "-")}</td>
+      <td class="muted">${esc(s.reason)}</td>
+    </tr>`).join("");
+    const parseErrorRows = (data.parse_errors || []).map((e) => `<tr>
+      <td class="mono">line ${e.line}</td>
+      <td class="muted">${esc(e.reason)}</td>
+    </tr>`).join("");
+    showModal(`
+      <h3>Import Result</h3>
+      <p>File: <code>${esc(data.file_name)}</code> &middot; Parsed: <b>${data.parsed}</b> &middot;
+         Created: <b style="color:var(--success)">${data.created_count}</b> &middot;
+         Skipped: <b style="color:var(--danger)">${data.skipped_count}</b></p>
+      ${data.created && data.created.length ? `
+        <h4>Created Keys <span class="muted" style="font-size:11px">(shown once — copy now)</span></h4>
+        <table style="width:100%">
+          <tr><th>Alias</th><th>Raw Key</th><th></th></tr>
+          ${createdRows}
+        </table>` : ""}
+      ${data.skipped && data.skipped.length ? `
+        <h4>Skipped</h4>
+        <table style="width:100%">
+          <tr><th>Alias</th><th>Reason</th></tr>
+          ${skippedRows}
+        </table>` : ""}
+      ${data.parse_errors && data.parse_errors.length ? `
+        <h4>Parse Errors</h4>
+        <table style="width:100%">
+          <tr><th>Location</th><th>Reason</th></tr>
+          ${parseErrorRows}
+        </table>` : ""}
+      <div class="modal-actions">
+        <button class="btn-primary" onclick="hideModal(); window._loadKeysPage();">Done</button>
+      </div>
+    `);
   }
 
   function showEditKeyModal(key) {

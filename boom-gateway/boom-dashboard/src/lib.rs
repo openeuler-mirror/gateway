@@ -78,6 +78,10 @@ pub fn build_router<S: Clone + Send + Sync + 'static>(state: DashboardState) -> 
             post(handlers_admin::batch_create_keys),
         )
         .route(
+            "/dashboard/api/admin/keys/import",
+            post(handlers_admin::import_keys),
+        )
+        .route(
             "/dashboard/api/admin/keys/{token_hash}",
             put(handlers_admin::update_key),
         )
