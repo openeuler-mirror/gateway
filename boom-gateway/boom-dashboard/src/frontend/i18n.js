@@ -1092,10 +1092,27 @@
       if (el.children.length === 0) {
         el.textContent = translated;
       } else {
-        // For elements with children (e.g. icon + text span), only replace the last text node.
-        const lastText = Array.from(el.childNodes).reverse().find((n) => n.nodeType === Node.TEXT_NODE);
-        if (lastText) lastText.nodeValue = translated;
-        else el.appendChild(document.createTextNode(translated));
+        // Elements with children (e.g. icon + text span): strip every direct
+        // non-Element child (plain text nodes AND any Chrome-translation
+        // wrapper elements like <font>) and append a fresh translated text
+        // node at the end.
+        //
+        // Why strip wrapper elements too: Chrome's auto-translate rewrites
+        // the DOM by wrapping text nodes in <font> elements. The old
+        // implementation only replaced the last text node, which:
+        //   1. failed to find a text node (it was inside <font>, not a
+        //      direct child), then
+        //   2. fell into the appendChild branch, adding a NEW text node —
+        //   3. every subsequent language toggle doubled the text
+        //   ("管理后台管理后台管理后台...").
+        //
+        // Idempotent replacement: first run leaves one text node; later
+        // runs strip it (it's a non-Element child) and re-add a single
+        // replacement. Repeated calls never accumulate.
+        Array.from(el.childNodes)
+          .filter((n) => n.nodeType !== Node.ELEMENT_NODE)
+          .forEach((n) => el.removeChild(n));
+        el.appendChild(document.createTextNode(translated));
       }
     });
     root.querySelectorAll("[data-i18n-html]").forEach((el) => {
