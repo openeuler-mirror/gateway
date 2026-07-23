@@ -1,0 +1,32 @@
+[package]
+name = "bench-client"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "bench-client"
+path = "src/main.rs"
+
+# Empty [workspace] table keeps this package OUT of the parent gateway workspace
+# so `cargo build --workspace` from /Users/icecream/code/atomgit/gateway doesn't
+# compile these test tools. Build explicitly: `cd boom-gateway/test/bench-client
+# && cargo build --release`.
+[workspace]
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rand = "0.8"
+clap = { version = "4", features = ["derive"] }
+hdrhistogram = "7"
+futures-util = "0.3"
+tokio-stream = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+bytes = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
