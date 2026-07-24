@@ -344,6 +344,7 @@
     else if (section === "admin-quota") loadQuota();
     else if (section === "admin-logs") { setupLogsFilters(); loadLogs(); }
     else if (section === "admin-debug") { loadAgentStats(); loadRebalanceMoves(); }
+    else if (section === "admin-config") loadConfigPage();
   }
 
   function sectionFromHash(hash) {
@@ -355,6 +356,7 @@
     if (hash.includes("/admin/assignments")) return "admin-assignments";
     if (hash.includes("/admin/logs")) return "admin-logs";
     if (hash.includes("/admin/debug")) return "admin-debug";
+    if (hash.includes("/admin/config")) return "admin-config";
     return "admin-models";
   }
 
@@ -2152,28 +2154,83 @@
 
   function showNewModelModal(prefill) {
     const p = prefill || {};
-    showModal(`
+    const headers = p.headers || {};
+    const modelInfo = p.model_info || {};
+    const __html = `
       <h3>${p.id ? t("form.model.title_edit") : t("form.model.title_create")}</h3>
-      <div class="form-group"><label>${t("form.model.name")} * ${tip("Client-visible model name. Multiple deployments can share the same name for load balancing.")}</label><input id="m-model-name" value="${esc(p.model_name || "")}" required></div>
-      <div class="form-group"><label>${t("form.model.provider")} * ${tip("Upstream provider type. Determines API format and authentication.")}</label><select id="m-model-provider"><option value="">${t("common.select_placeholder")}</option><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option><option value="azure">Azure OpenAI</option><option value="gemini">Google Gemini</option><option value="bedrock">AWS Bedrock</option></select></div>
-      <div class="form-group"><label>${t("form.model.id")} * ${tip("Actual model ID at the provider, e.g. gpt-4o, claude-sonnet-4-20250514. Auto-combined with Provider as provider/model-id.")}</label><input id="m-model-id" value="${esc((p.litellm_model || "").includes("/") ? p.litellm_model.split("/").slice(1).join("/") : p.litellm_model || "")}" required></div>
-      <div class="form-group"><label>${t("form.model.api_key")} ${tip("Provider API key. Use os.environ/VAR_NAME for env reference.")}</label><input id="m-model-key" type="password" value="${esc(p.api_key || "")}" placeholder="sk-... or os.environ/VAR"></div>
-      <div class="form-group"><label>${t("form.model.api_key_env")} ${tip("Enable if the API Key field contains an environment variable reference like os.environ/VAR_NAME.")}</label><select id="m-model-key-env"><option value="false">${t("common.no")}</option><option value="true" ${(p.api_key_env) ? "selected" : ""}>${t("common.yes")}</option></select></div>
-      <div class="form-group"><label>${t("form.model.base")} ${tip("Override the default provider endpoint, e.g. https://api.openai.com/v1")}</label><input id="m-model-base" value="${esc(p.api_base || "")}" placeholder="https://api.openai.com/v1"></div>
-      <div class="form-group"><label>${t("form.model.version")} ${tip("Required for Azure OpenAI deployments, e.g. 2024-02-01")}</label><input id="m-model-version" value="${esc(p.api_version || "")}"></div>
-      <div class="form-group"><label>${t("form.model.ratio")} ${tip("Quota consumption multiplier. Each request counts as this many units against rate limits. E.g. 3 means one request consumes 3 quota. Default: 1.")}</label><input id="m-model-ratio" type="number" min="1" step="1" value="${p.quota_count_ratio || 1}"></div>
-      <div class="form-group"><label>${t("form.model.rpm")} ${tip("Per-deployment RPM limit. Leave empty for unlimited.")}</label><input id="m-model-rpm" type="number" value="${p.rpm || ""}"></div>
-      <div class="form-group"><label>${t("form.model.timeout")} ${tip("Request timeout. Default: 120s.")}</label><input id="m-model-timeout" type="number" value="${p.timeout || 120}"></div>
-      <div class="form-group"><label>${t("form.model.temp")} ${tip("Sampling temperature override (0.0-2.0). Leave empty to use provider default.")}</label><input id="m-model-temp" type="number" step="0.1" value="${p.temperature || ""}"></div>
-      <div class="form-group"><label>${t("form.model.maxtok")} ${tip("Maximum output tokens. Leave empty for provider default.")}</label><input id="m-model-maxtok" type="number" value="${p.max_tokens || ""}"></div>
-      <div class="form-group"><label>${t("form.model.maxinflight")} ${tip("Max concurrent in-flight requests for this deployment. 0 or empty = unlimited.")}</label><input id="m-model-maxinflight" type="number" min="0" value="${p.max_inflight_queue_len || ""}"></div>
-      <div class="form-group"><label>${t("form.model.maxctx")} ${tip("Max total input characters across all in-flight requests. 0 or empty = unlimited.")}</label><input id="m-model-maxctx" type="number" min="0" value="${p.max_context_len || ""}"></div>
-      <div class="form-group"><label>${t("form.model.enabled")} ${tip("Disabled deployments are ignored in routing.")}</label><select id="m-model-enabled"><option value="true" ${p.enabled !== false ? "selected" : ""}>${t("common.yes")}</option><option value="false" ${p.enabled === false ? "selected" : ""}>${t("common.no")}</option></select></div>
+      <div class="form-grid">
+        <div class="form-card">
+          <div class="form-card-title">${t("model_card.basic")}</div>
+          <div class="form-card-grid">
+            <div class="form-group field-full"><label>${t("form.model.name")} * ${tip("Client-visible model name. Multiple deployments can share the same name for load balancing.")}</label><input id="m-model-name" value="${esc(p.model_name || "")}" required></div>
+            <div class="form-group"><label>${t("form.model.provider")} * ${tip("Upstream provider type. Determines API format and authentication.")}</label><select id="m-model-provider"><option value="">${t("common.select_placeholder")}</option><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option><option value="azure">Azure OpenAI</option><option value="gemini">Google Gemini</option><option value="bedrock">AWS Bedrock</option></select></div>
+            <div class="form-group"><label>${t("form.model.id")} * ${tip("Actual model ID at the provider, e.g. gpt-4o, claude-sonnet-4-20250514.")}</label><input id="m-model-id" value="${esc((p.litellm_model || "").includes("/") ? p.litellm_model.split("/").slice(1).join("/") : p.litellm_model || "")}" required></div>
+            <div class="form-group field-checkbox"><input id="m-model-enabled" type="checkbox" ${p.enabled !== false ? "checked" : ""}><label for="m-model-enabled">${t("form.model.enabled")} ${tip("Disabled deployments are ignored in routing.")}</label></div>
+          </div>
+        </div>
+        <div class="form-card">
+          <div class="form-card-title">${t("model_card.auth")}</div>
+          <div class="form-card-grid">
+            <div class="form-group"><label>${t("form.model.api_key")} ${tip("Provider API key. Use os.environ/VAR_NAME for env reference.")}</label><input id="m-model-key" type="password" value="${esc(p.api_key || "")}" placeholder="sk-... or os.environ/VAR"></div>
+            <div class="form-group field-checkbox"><input id="m-model-key-env" type="checkbox" ${(p.api_key_env) ? "checked" : ""}><label for="m-model-key-env">${t("form.model.api_key_env")} ${tip("Enable if the API Key field contains an environment variable reference.")}</label></div>
+            <div class="form-group field-full"><label>${t("form.model.headers")} ${tip("Custom headers (JSON object). Values support env-var expansion.")}</label><textarea id="m-model-headers" rows="2" style="font-family:var(--mono);font-size:12px">${esc(Object.keys(headers).length ? JSON.stringify(headers, null, 2) : "")}</textarea></div>
+          </div>
+        </div>
+        <div class="form-card">
+          <div class="form-card-title">${t("model_card.aws")}</div>
+          <div class="form-card-grid">
+            <div class="form-group"><label>${t("form.model.aws_region")} ${tip("AWS region for Bedrock deployments.")}</label><input id="m-model-aws-region" value="${esc(p.aws_region_name || "")}"></div>
+            <div class="form-group"><label>${t("form.model.aws_key_id")} ${tip("AWS access key ID. Use os.environ/VAR_NAME for env reference.")}</label><input id="m-model-aws-key" value="${esc(p.aws_access_key_id || "")}"></div>
+            <div class="form-group field-full"><label>${t("form.model.aws_secret")} ${tip("AWS secret access key. Use os.environ/VAR_NAME for env reference.")}</label><input id="m-model-aws-secret" type="password" value="${esc(p.aws_secret_access_key || "")}"></div>
+          </div>
+        </div>
+        <div class="form-card">
+          <div class="form-card-title">${t("model_card.rate_limit")}</div>
+          <div class="form-card-grid">
+            <div class="form-group"><label>${t("form.model.rpm")} ${tip("Per-deployment RPM limit. Leave empty for unlimited.")}</label><input id="m-model-rpm" type="number" value="${p.rpm || ""}"></div>
+            <div class="form-group"><label>${t("form.model.tpm")} ${tip("Per-deployment TPM limit. Leave empty for unlimited.")}</label><input id="m-model-tpm" type="number" value="${p.tpm || ""}"></div>
+            <div class="form-group"><label>${t("form.model.ratio")} ${tip("Quota consumption multiplier. Default: 1.")}</label><input id="m-model-ratio" type="number" min="1" step="1" value="${p.quota_count_ratio || 1}"></div>
+          </div>
+        </div>
+        <div class="form-card">
+          <div class="form-card-title">${t("model_card.flow_control")}</div>
+          <div class="form-card-grid">
+            <div class="form-group"><label>${t("form.model.maxinflight")} ${tip("Max concurrent in-flight requests. 0 or empty = unlimited.")}</label><input id="m-model-maxinflight" type="number" min="0" value="${p.max_inflight_queue_len || ""}"></div>
+            <div class="form-group"><label>${t("form.model.maxctx")} ${tip("Max total input characters across all in-flight requests. 0 or empty = unlimited.")}</label><input id="m-model-maxctx" type="number" min="0" value="${p.max_context_len || ""}"></div>
+          </div>
+        </div>
+        <div class="form-card">
+          <div class="form-card-title">${t("model_card.tuning")}</div>
+          <div class="form-card-grid">
+            <div class="form-group"><label>${t("form.model.base")} ${tip("Override the default provider endpoint, e.g. https://api.openai.com/v1")}</label><input id="m-model-base" value="${esc(p.api_base || "")}" placeholder="https://api.openai.com/v1"></div>
+            <div class="form-group"><label>${t("form.model.version")} ${tip("Required for Azure OpenAI deployments, e.g. 2024-02-01")}</label><input id="m-model-version" value="${esc(p.api_version || "")}"></div>
+            <div class="form-group"><label>${t("form.model.timeout")} ${tip("Request timeout (seconds). Default: 1200.")}</label><input id="m-model-timeout" type="number" value="${p.timeout || 1200}"></div>
+            <div class="form-group"><label>${t("form.model.temp")} ${tip("Sampling temperature override (0.0-2.0).")}</label><input id="m-model-temp" type="number" step="0.1" value="${p.temperature || ""}"></div>
+            <div class="form-group"><label>${t("form.model.maxtok")} ${tip("Maximum output tokens.")}</label><input id="m-model-maxtok" type="number" value="${p.max_tokens || ""}"></div>
+          </div>
+        </div>
+        <div class="form-card">
+          <div class="form-card-title">${t("model_card.behavior")}</div>
+          <div class="form-card-grid">
+            <div class="form-group field-checkbox"><input id="m-model-serve-not-match" type="checkbox" ${p.serve_not_match ? "checked" : ""}><label for="m-model-serve-not-match">${t("form.model.serve_not_match")} ${tip("When true, this deployment also serves as catch-all for unmatched model names.")}</label></div>
+            <div class="form-group field-checkbox"><input id="m-model-client-type" type="checkbox" ${p.client_type_header ? "checked" : ""}><label for="m-model-client-type">${t("form.model.client_type_header")} ${tip("Attach X-BooM-Client-Type header to outgoing requests.")}</label></div>
+          </div>
+        </div>
+        <div class="form-card">
+          <div class="form-card-title">${t("model_card.cost")}</div>
+          <div class="form-card-grid">
+            <div class="form-group"><label>${t("form.model.input_cost")} ${tip("USD per million input tokens. Overrides cost_template.")}</label><input id="m-model-input-cost" type="number" step="0.01" value="${modelInfo.input_cost_per_million_tokens || ""}"></div>
+            <div class="form-group"><label>${t("form.model.cached_cost")} ${tip("USD per million cached input tokens (KV-cache hit).")}</label><input id="m-model-cached-cost" type="number" step="0.01" value="${modelInfo.cached_input_cost_per_million_tokens || ""}"></div>
+            <div class="form-group"><label>${t("form.model.output_cost")} ${tip("USD per million output tokens.")}</label><input id="m-model-output-cost" type="number" step="0.01" value="${modelInfo.output_cost_per_million_tokens || ""}"></div>
+          </div>
+        </div>
+      </div>
       <div class="modal-actions">
         <button class="btn-secondary btn-inline" onclick="hideModal()">${t("action.cancel")}</button>
         <button class="btn-primary" id="m-model-submit">${p.id ? t("action.update") : t("action.create")}</button>
       </div>
-    `);
+    `;
+    showModal(__html, { xwide: true });
     // Pre-select provider dropdown from litellm_model
     if (p.litellm_model && p.litellm_model.includes("/")) {
       const prov = p.litellm_model.split("/")[0];
@@ -2185,23 +2242,44 @@
         const providerVal = document.getElementById("m-model-provider").value;
         const modelIdVal = document.getElementById("m-model-id").value.trim();
         const litellmModel = providerVal ? providerVal + "/" + modelIdVal : modelIdVal;
+        const headersText = document.getElementById("m-model-headers").value.trim();
+        let headers = {};
+        if (headersText) {
+          try { headers = JSON.parse(headersText); }
+          catch (e) { throw new Error(t("config.error.invalid_json", { msg: e.message })); }
+        }
+        // Build model_info only if cost fields are set.
+        const inputCost = document.getElementById("m-model-input-cost").value;
+        const cachedCost = document.getElementById("m-model-cached-cost").value;
+        const outputCost = document.getElementById("m-model-output-cost").value;
+        const modelInfo = {};
+        if (inputCost) modelInfo.input_cost_per_million_tokens = Number(inputCost);
+        if (cachedCost) modelInfo.cached_input_cost_per_million_tokens = Number(cachedCost);
+        if (outputCost) modelInfo.output_cost_per_million_tokens = Number(outputCost);
         const body = {
           model_name: document.getElementById("m-model-name").value,
           litellm_model: litellmModel,
           api_key: document.getElementById("m-model-key").value || null,
-          api_key_env: document.getElementById("m-model-key-env").value === "true",
+          api_key_env: document.getElementById("m-model-key-env").checked,
           api_base: document.getElementById("m-model-base").value || null,
           api_version: document.getElementById("m-model-version").value || null,
-          quota_count_ratio: Number(document.getElementById("m-model-ratio").value) || 1,
+          aws_region_name: document.getElementById("m-model-aws-region").value || null,
+          aws_access_key_id: document.getElementById("m-model-aws-key").value || null,
+          aws_secret_access_key: document.getElementById("m-model-aws-secret").value || null,
           rpm: document.getElementById("m-model-rpm").value ? Number(document.getElementById("m-model-rpm").value) : null,
-          timeout: Number(document.getElementById("m-model-timeout").value) || 120,
+          tpm: document.getElementById("m-model-tpm").value ? Number(document.getElementById("m-model-tpm").value) : null,
+          quota_count_ratio: Number(document.getElementById("m-model-ratio").value) || 1,
+          timeout: Number(document.getElementById("m-model-timeout").value) || 1200,
           temperature: document.getElementById("m-model-temp").value ? Number(document.getElementById("m-model-temp").value) : null,
           max_tokens: document.getElementById("m-model-maxtok").value ? Number(document.getElementById("m-model-maxtok").value) : null,
           max_inflight_queue_len: document.getElementById("m-model-maxinflight").value ? Number(document.getElementById("m-model-maxinflight").value) : null,
           max_context_len: document.getElementById("m-model-maxctx").value ? Number(document.getElementById("m-model-maxctx").value) : null,
-          enabled: document.getElementById("m-model-enabled").value === "true",
-          headers: {},
+          enabled: document.getElementById("m-model-enabled").checked,
+          serve_not_match: document.getElementById("m-model-serve-not-match").checked,
+          client_type_header: document.getElementById("m-model-client-type").checked,
+          headers,
         };
+        if (Object.keys(modelInfo).length > 0) body.model_info = modelInfo;
         const url = p.id ? `/admin/models/${p.id}` : "/admin/models";
         const method = p.id ? "PUT" : "POST";
         await api(url, { method, body: JSON.stringify(body) });
@@ -2230,16 +2308,24 @@
   // ── Admin: Aliases ────────────────────────────────────
   function showNewAliasModal(prefill) {
     const p = prefill || {};
-    showModal(`
+    const __html = `
       <h3>${p.alias_name ? t("form.alias.title_edit") : t("form.alias.title_create")}</h3>
-      <div class="form-group"><label>${t("form.alias.name")} * ${tip("The name clients will use in their request. E.g. 'gpt-4' → routes to 'gpt-4o'.")}</label><input id="m-alias-name" value="${esc(p.alias_name || "")}" ${p.alias_name ? "readonly" : ""}></div>
-      <div class="form-group"><label>${t("form.alias.target")} * ${tip("The actual model name to route to. Must match an existing model deployment name.")}</label><input id="m-alias-target" value="${esc(p.target_model || "")}" required list="alias-target-list"><datalist id="alias-target-list"></datalist></div>
-      <div class="form-group"><label>${t("form.alias.hidden")} ${tip("Hidden aliases work for routing but are not listed to users in model discovery endpoints.")}</label><select id="m-alias-hidden"><option value="false" ${!p.hidden ? "selected" : ""}>${t("common.no")}</option><option value="true" ${p.hidden ? "selected" : ""}>${t("common.yes")}</option></select></div>
+      <div class="form-grid">
+        <div class="form-card">
+          <div class="form-card-title">${t("alias_card.basic")}</div>
+          <div class="form-card-grid">
+            <div class="form-group field-full"><label>${t("form.alias.name")} * ${tip("The name clients will use in their request. E.g. 'gpt-4' → routes to 'gpt-4o'.")}</label><input id="m-alias-name" value="${esc(p.alias_name || "")}" ${p.alias_name ? "readonly" : ""}></div>
+            <div class="form-group field-full"><label>${t("form.alias.target")} * ${tip("The actual model name to route to. Must match an existing model deployment name.")}</label><input id="m-alias-target" value="${esc(p.target_model || "")}" required list="alias-target-list"><datalist id="alias-target-list"></datalist></div>
+            <div class="form-group field-full"><label>${t("form.alias.hidden")} ${tip("Hidden aliases work for routing but are not listed to users in model discovery endpoints.")}</label><select id="m-alias-hidden"><option value="false" ${!p.hidden ? "selected" : ""}>${t("common.no")}</option><option value="true" ${p.hidden ? "selected" : ""}>${t("common.yes")}</option></select></div>
+          </div>
+        </div>
+      </div>
       <div class="modal-actions">
         <button class="btn-secondary btn-inline" onclick="hideModal()">${t("action.cancel")}</button>
         <button class="btn-primary" id="m-alias-submit">${p.alias_name ? t("action.update") : t("action.create")}</button>
       </div>
-    `);
+    `;
+    showModal(__html, { xwide: true });
     // Populate datalist with existing model names
     getModelNames().then((names) => {
       const dl = document.getElementById("alias-target-list");
@@ -2304,7 +2390,384 @@
     } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
   };
 
-  // ── Admin: Debug Error Recording ─────────────────────
+  // ── Admin: Config Page ────────────────────────────────
+
+  let _configCache = null;
+
+  async function loadConfigPage() {
+    const wrap = document.getElementById("config-page-wrap");
+    if (!wrap) return;
+    wrap.innerHTML = '<p class="loading">' + t("common.loading") + "</p>";
+    try {
+      const cfg = await api("/admin/config");
+      _configCache = cfg;
+      wrap.innerHTML = renderConfigPage(cfg);
+      wireConfigPage(cfg);
+    } catch (err) {
+      wrap.innerHTML = '<p style="color:var(--danger)">' + esc(err.message) + "</p>";
+    }
+  }
+
+  function renderConfigPage(cfg) {
+    return `
+      <div class="config-grid">
+        ${renderCardServer(cfg.server || {})}
+        ${renderCardGeneral(cfg.general_settings || {})}
+        ${renderCardRateLimit(cfg.rate_limit || {})}
+        ${renderCardPlanSettings(cfg.plan_settings || {}, cfg)}
+        ${renderCardHealthCheck(cfg.deployment_health_check || {})}
+        ${renderCardPromptLog(cfg.prompt_log || {})}
+        ${renderCardRouter(cfg.router_settings || {})}
+        ${renderCardCostTemplates(cfg.cost_templates || [])}
+        ${renderCardModelList(cfg.model_list || [])}
+      </div>
+    `;
+  }
+
+  function fieldText(id, label, value, opts = {}) {
+    const v = value === null || value === undefined ? "" : String(value);
+    const placeholder = opts.placeholder ? ` placeholder="${esc(opts.placeholder)}"` : "";
+    const type = opts.type || "text";
+    return `<div class="form-group${opts.full ? " field-full" : ""}"><label for="${id}">${esc(label)}</label><input id="${id}" type="${type}" value="${esc(v)}"${placeholder}></div>`;
+  }
+  function fieldNum(id, label, value, opts = {}) {
+    const v = value === null || value === undefined ? "" : String(value);
+    return `<div class="form-group${opts.full ? " field-full" : ""}"><label for="${id}">${esc(label)}</label><input id="${id}" type="number" value="${esc(v)}" ${opts.min !== undefined ? `min="${opts.min}"` : ""} ${opts.step ? `step="${opts.step}"` : ""}></div>`;
+  }
+  function fieldCheckbox(id, label, checked) {
+    return `<div class="form-group field-checkbox"><input id="${id}" type="checkbox" ${checked ? "checked" : ""}><label for="${id}">${esc(label)}</label></div>`;
+  }
+  function fieldSelect(id, label, options, selected) {
+    const opts = options.map((o) => {
+      const val = typeof o === "string" ? o : o.value;
+      const txt = typeof o === "string" ? o : o.label;
+      return `<option value="${esc(val)}" ${val === selected ? "selected" : ""}>${esc(txt)}</option>`;
+    }).join("");
+    return `<div class="form-group"><label for="${id}">${esc(label)}</label><select id="${id}">${opts}</select></div>`;
+  }
+  function fieldTextarea(id, label, value, opts = {}) {
+    const v = value === null || value === undefined ? "" : typeof value === "string" ? value : JSON.stringify(value, null, 2);
+    return `<div class="form-group field-full"><label for="${id}">${esc(label)}</label><textarea id="${id}" rows="${opts.rows || 3}" style="font-family:var(--mono);font-size:12px">${esc(v)}</textarea></div>`;
+  }
+
+  function renderCardServer(s) {
+    return `<div class="form-card" data-section="server">
+      <div class="form-card-title">${t("config.section.server")}</div>
+      <div class="form-card-grid">
+        ${fieldText("cfg-server-host", t("config.field.host"), s.host)}
+        ${fieldNum("cfg-server-port", t("config.field.port"), s.port, { min: 1 })}
+        ${fieldNum("cfg-server-workers", t("config.field.workers"), s.workers, { min: 1 })}
+      </div>
+      <div class="form-card-actions">
+        <button class="btn-primary btn-small" data-save="server">${t("action.save")}</button>
+      </div>
+    </div>`;
+  }
+
+  function renderCardGeneral(g) {
+    const masked = (v) => v ? "****" : "(" + t("common.none_option") + ")";
+    return `<div class="form-card" data-section="general">
+      <div class="form-card-title">${t("config.section.general_settings")}</div>
+      <div class="form-card-grid">
+        <div class="form-group"><label>${t("config.field.master_key")}</label><input value="${esc(masked(g.master_key))}" readonly style="opacity:.6"></div>
+        <div class="form-group"><label>${t("config.field.database_url")}</label><input value="${esc(masked(g.database_url))}" readonly style="opacity:.6"></div>
+        ${fieldFullList("cfg-general-public-models", t("config.field.public_models"), g.public_models || [])}
+      </div>
+      <p class="modal-hint">${t("config.tip.master_key_readonly")}</p>
+      <div class="form-card-actions">
+        <button class="btn-primary btn-small" data-save="general">${t("action.save")}</button>
+      </div>
+    </div>`;
+  }
+
+  function fieldFullList(id, label, list) {
+    const v = Array.isArray(list) ? list.join(", ") : "";
+    return `<div class="form-group field-full"><label for="${id}">${esc(label)}</label><input id="${id}" value="${esc(v)}" placeholder="comma-separated"></div>`;
+  }
+
+  function renderCardRateLimit(r) {
+    return `<div class="form-card" data-section="rate_limit">
+      <div class="form-card-title">${t("config.section.rate_limit")}</div>
+      <div class="form-card-grid">
+        ${fieldCheckbox("cfg-rl-enabled", t("config.field.enabled"), r.enabled !== false)}
+        ${fieldNum("cfg-rl-default-rpm", t("config.field.default_rpm"), r.default_rpm, { min: 0 })}
+        ${fieldTextarea("cfg-rl-windows", t("config.field.window_limits"), r.window_limits || [], { rows: 2 })}
+      </div>
+      <div class="form-card-actions">
+        <button class="btn-primary btn-small" data-save="rate_limit">${t("action.save")}</button>
+      </div>
+    </div>`;
+  }
+
+  function renderCardPlanSettings(p, cfg) {
+    const planRows = (cfg && cfg.plan_settings && cfg.plan_settings.plans) ? Object.keys(cfg.plan_settings.plans) : [];
+    const planOptions = [{ value: "", label: "(" + t("common.none_option") + ")" }].concat(planRows.map((n) => ({ value: n, label: n })));
+    return `<div class="form-card" data-section="plan_settings">
+      <div class="form-card-title">${t("config.section.plan_settings")}</div>
+      <div class="form-card-grid">
+        ${fieldSelect("cfg-ps-default-plan", t("config.field.default_plan"), planOptions, p.default_plan || "")}
+        ${fieldSelect("cfg-ps-default-team-plan", t("config.field.default_team_plan"), planOptions, p.default_team_plan || "")}
+      </div>
+      <p class="modal-hint">${t("config.tip.manage_plans_on_plans_page")}</p>
+      <div class="form-card-actions">
+        <button class="btn-primary btn-small" data-save="plan_defaults">${t("action.save")}</button>
+      </div>
+    </div>`;
+  }
+
+  function renderCardHealthCheck(h) {
+    return `<div class="form-card" data-section="deployment_health_check">
+      <div class="form-card-title">${t("config.section.deployment_health_check")}</div>
+      <div class="form-card-grid">
+        ${fieldCheckbox("cfg-hc-auto-off", t("config.field.auto_offline_enabled"), h.auto_offline_enabled)}
+        ${fieldCheckbox("cfg-hc-auto-rec", t("config.field.auto_recovery_enabled"), h.auto_recovery_enabled)}
+        ${fieldText("cfg-hc-path", t("config.field.path"), h.path)}
+        ${fieldNum("cfg-hc-failure-thr", t("config.field.failure_threshold"), h.failure_threshold, { min: 1 })}
+        ${fieldNum("cfg-hc-recovery-thr", t("config.field.recovery_threshold"), h.recovery_threshold, { min: 1 })}
+        ${fieldNum("cfg-hc-offline-int", t("config.field.offline_check_interval_secs"), h.offline_check_interval_secs, { min: 1 })}
+        ${fieldNum("cfg-hc-recovery-int", t("config.field.recovery_check_interval_secs"), h.recovery_check_interval_secs, { min: 1 })}
+        ${fieldCheckbox("cfg-hc-req-fail-auto", t("config.field.request_failure_auto_offline_enabled"), h.request_failure_auto_offline_enabled)}
+        ${fieldNum("cfg-hc-req-fail-thr", t("config.field.request_failure_threshold"), h.request_failure_threshold, { min: 1 })}
+      </div>
+      <div class="form-card-actions">
+        <button class="btn-primary btn-small" data-save="health_check">${t("action.save")}</button>
+      </div>
+    </div>`;
+  }
+
+  function renderCardPromptLog(p) {
+    return `<div class="form-card" data-section="prompt_log">
+      <div class="form-card-title">${t("config.section.prompt_log")}</div>
+      <div class="form-card-grid">
+        ${fieldCheckbox("cfg-pl-enabled", t("config.field.enabled"), p.enabled)}
+        ${fieldText("cfg-pl-dir", t("config.field.dir"), p.dir)}
+        ${fieldNum("cfg-pl-max-mb", t("config.field.max_file_size_mb"), p.max_file_size_mb, { min: 1 })}
+        ${fieldCheckbox("cfg-pl-capture", t("config.field.capture_raw_upstream"), p.capture_raw_upstream)}
+        ${fieldFullList("cfg-pl-excluded-keys", t("config.field.excluded_keys"), p.excluded_keys || [])}
+        ${fieldFullList("cfg-pl-excluded-teams", t("config.field.excluded_teams"), p.excluded_teams || [])}
+      </div>
+      <div class="form-card-actions">
+        <button class="btn-primary btn-small" data-save="prompt_log">${t("action.save")}</button>
+      </div>
+    </div>`;
+  }
+
+  function renderCardRouter(r) {
+    return `<div class="form-card" data-section="router_settings">
+      <div class="form-card-title">${t("config.section.router_settings")}</div>
+      <div class="form-card-grid">
+        ${fieldSelect("cfg-rs-policy", t("config.field.schedule_policy"),
+          [{ value: "round_robin", label: "round_robin" }, { value: "key_affinity", label: "key_affinity" }],
+          r.schedule_policy || "round_robin")}
+        ${fieldNum("cfg-rs-affinity-ctx", t("config.field.key_affinity_context_threshold"), r.key_affinity_context_threshold || 0, { min: 0 })}
+        ${fieldNum("cfg-rs-affinity-rebal", t("config.field.key_affinity_rebalance_threshold"), r.key_affinity_rebalance_threshold || 20, { min: 1, step: 1 })}
+        ${fieldCheckbox("cfg-rs-priority-hdr", t("config.field.enable_priority_header"), r.enable_priority_header)}
+        ${fieldCheckbox("cfg-rs-strip-cc", t("config.field.strip_claude_code_attribution"), r.strip_claude_code_attribution)}
+        ${fieldTextarea("cfg-rs-aliases", t("config.field.model_group_alias"), r.model_group_alias || {}, { rows: 3 })}
+      </div>
+      <details class="form-card-collapsible">
+        <summary>${t("config.section.kvc_aware")}</summary>
+        <div class="form-card-grid">
+          ${fieldNum("cfg-kvc-block", t("config.field.block_size"), (r.kvc_aware || {}).block_size, { min: 1 })}
+          ${fieldNum("cfg-kvc-cache-w", t("config.field.cache_weight"), (r.kvc_aware || {}).cache_weight, { step: "0.05" })}
+          ${fieldNum("cfg-kvc-load-w", t("config.field.load_weight"), (r.kvc_aware || {}).load_weight, { step: "0.05" })}
+          ${fieldNum("cfg-kvc-tier-w", t("config.field.tier_weight"), (r.kvc_aware || {}).tier_weight, { step: "0.05" })}
+          ${fieldText("cfg-kvc-tokenizer", t("config.field.tokenizer_dir"), (r.kvc_aware || {}).tokenizer_dir)}
+          ${fieldNum("cfg-kvc-max-blocks", t("config.field.max_blocks"), (r.kvc_aware || {}).max_blocks, { min: 1 })}
+          ${fieldNum("cfg-kvc-threshold", t("config.field.full_report_hit_threshold"), (r.kvc_aware || {}).full_report_hit_threshold, { step: "0.05" })}
+          ${fieldFullList("cfg-kvc-zmq", t("config.field.zmq_endpoints"), (r.kvc_aware || {}).zmq_endpoints || [])}
+        </div>
+      </details>
+      <div class="form-card-actions">
+        <button class="btn-primary btn-small" data-save="router">${t("action.save")}</button>
+        <button class="btn-secondary btn-small" data-save="kvc_aware">${t("config.action.save_kvc")}</button>
+      </div>
+    </div>`;
+  }
+
+  function renderCardCostTemplates(templates) {
+    const rows = (templates || []).map((tpl, i) => `
+      <tr>
+        <td><strong>${esc(tpl.name)}</strong></td>
+        <td>${esc(tpl.input_cost_per_million_tokens ?? "-")}</td>
+        <td>${esc(tpl.cached_input_cost_per_million_tokens ?? "-")}</td>
+        <td>${esc(tpl.output_cost_per_million_tokens ?? "-")}</td>
+        <td><button class="btn-small is-danger" onclick="window._deleteCostTemplate('${esc(tpl.name)}')">${t("action.delete")}</button></td>
+      </tr>
+    `).join("");
+    return `<div class="form-card" data-section="cost_templates">
+      <div class="form-card-title">${t("config.section.cost_templates")}</div>
+      <table class="modal-table">
+        <thead><tr><th>${t("config.field.name")}</th><th>${t("config.field.input_cost_per_million_tokens")}</th><th>${t("config.field.cached_input_cost_per_million_tokens")}</th><th>${t("config.field.output_cost_per_million_tokens")}</th><th>${t("common.actions")}</th></tr></thead>
+        <tbody>${rows || `<tr><td colspan="5" class="muted">${t("common.no_data")}</td></tr>`}</tbody>
+      </table>
+      <div class="form-card-actions">
+        <button class="btn-primary btn-small" onclick="window._addCostTemplate()">${t("config.action.add_template")}</button>
+      </div>
+    </div>`;
+  }
+
+  function renderCardModelList(modelList) {
+    const count = (modelList || []).length;
+    return `<div class="form-card" data-section="model_list">
+      <div class="form-card-title">${t("config.section.model_list")}</div>
+      <p>${t("config.tip.model_list_count", { count })}</p>
+      <div class="form-card-actions">
+        <button class="btn-primary btn-small" onclick="window.location.hash='#/admin/models'">${t("config.action.manage_models")}</button>
+      </div>
+    </div>`;
+  }
+
+  function wireConfigPage(cfg) {
+    document.querySelectorAll("[data-save]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const kind = btn.getAttribute("data-save");
+        saveConfigSectionKind(kind, cfg);
+      });
+    });
+    const reloadBtn = document.getElementById("btn-reload-config-page");
+    if (reloadBtn) reloadBtn.addEventListener("click", reloadConfigHandler);
+  }
+
+  async function reloadConfigHandler() {
+    try {
+      await api("/admin/config/reload", { method: "POST" });
+      showToast(t("config.reloaded"));
+      loadConfigPage();
+    } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
+  }
+
+  function parseListInput(el) {
+    const v = (el.value || "").trim();
+    if (!v) return [];
+    return v.split(",").map((s) => s.trim()).filter(Boolean);
+  }
+
+  function parseJsonInput(el, fallback) {
+    const v = (el.value || "").trim();
+    if (!v) return fallback;
+    try { return JSON.parse(v); } catch (e) { throw new Error(t("config.error.invalid_json", { msg: e.message })); }
+  }
+
+  function numOr(el, fallback) {
+    const v = el.value;
+    if (v === "" || v === null || v === undefined) return fallback;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : fallback;
+  }
+
+  async function saveConfigSectionKind(kind, cfg) {
+    try {
+      const $ = (id) => document.getElementById(id);
+      if (kind === "server") {
+        await saveConfigSection("server", {
+          host: $("cfg-server-host").value,
+          port: numOr($("cfg-server-port"), 4000),
+          workers: numOr($("cfg-server-workers"), 4),
+        });
+      } else if (kind === "general") {
+        await saveConfigSection("general_settings.public_models", parseListInput($("cfg-general-public-models")));
+      } else if (kind === "rate_limit") {
+        await saveConfigSection("rate_limit", {
+          enabled: $("cfg-rl-enabled").checked,
+          default_rpm: numOr($("cfg-rl-default-rpm"), 60),
+          window_limits: parseJsonInput($("cfg-rl-windows"), []),
+        });
+      } else if (kind === "plan_defaults") {
+        const dp = $("cfg-ps-default-plan").value;
+        const dtp = $("cfg-ps-default-team-plan").value;
+        await saveConfigSection("plan_settings.default_plan", dp || null);
+        await saveConfigSection("plan_settings.default_team_plan", dtp || null);
+      } else if (kind === "health_check") {
+        await saveConfigSection("deployment_health_check", {
+          auto_offline_enabled: $("cfg-hc-auto-off").checked,
+          auto_recovery_enabled: $("cfg-hc-auto-rec").checked,
+          path: $("cfg-hc-path").value || "/metric",
+          failure_threshold: numOr($("cfg-hc-failure-thr"), 3),
+          recovery_threshold: numOr($("cfg-hc-recovery-thr"), 2),
+          offline_check_interval_secs: numOr($("cfg-hc-offline-int"), 30),
+          recovery_check_interval_secs: numOr($("cfg-hc-recovery-int"), 60),
+          request_failure_auto_offline_enabled: $("cfg-hc-req-fail-auto").checked,
+          request_failure_threshold: numOr($("cfg-hc-req-fail-thr"), 3),
+        });
+      } else if (kind === "prompt_log") {
+        await saveConfigSection("prompt_log", {
+          enabled: $("cfg-pl-enabled").checked,
+          dir: $("cfg-pl-dir").value || "/data/prompt_logs",
+          max_file_size_mb: numOr($("cfg-pl-max-mb"), 50),
+          capture_raw_upstream: $("cfg-pl-capture").checked,
+          excluded_keys: parseListInput($("cfg-pl-excluded-keys")),
+          excluded_teams: parseListInput($("cfg-pl-excluded-teams")),
+        });
+      } else if (kind === "router") {
+        const aliases = parseJsonInput($("cfg-rs-aliases"), {});
+        const routerValue = {
+          schedule_policy: $("cfg-rs-policy").value,
+          key_affinity_context_threshold: numOr($("cfg-rs-affinity-ctx"), 0),
+          key_affinity_rebalance_threshold: numOr($("cfg-rs-affinity-rebal"), 20),
+          enable_priority_header: $("cfg-rs-priority-hdr").checked,
+          strip_claude_code_attribution: $("cfg-rs-strip-cc").checked,
+          model_group_alias: aliases,
+        };
+        await saveConfigSection("router_settings", routerValue);
+      } else if (kind === "kvc_aware") {
+        const kvcValue = {
+          block_size: numOr($("cfg-kvc-block"), 16),
+          cache_weight: numOr($("cfg-kvc-cache-w"), 0.5),
+          load_weight: numOr($("cfg-kvc-load-w"), 0.2),
+          tier_weight: numOr($("cfg-kvc-tier-w"), 0.3),
+          tokenizer_dir: $("cfg-kvc-tokenizer").value || null,
+          max_blocks: numOr($("cfg-kvc-max-blocks"), 500000),
+          full_report_hit_threshold: numOr($("cfg-kvc-threshold"), 0.8),
+          zmq_endpoints: parseListInput($("cfg-kvc-zmq")),
+        };
+        await saveConfigSection("router_settings.kvc_aware", kvcValue);
+      }
+    } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
+  }
+
+  async function saveConfigSection(path, value) {
+    await api("/admin/config", { method: "PUT", body: JSON.stringify({ path, value }) });
+    showToast(t("config.saved"));
+    await loadConfigPage();
+  }
+
+  window._addCostTemplate = () => {
+    const name = prompt(t("config.prompt.template_name"));
+    if (!name) return;
+    showModal(`
+      <h3>${t("config.action.add_template")}</h3>
+      <div class="form-group"><label>${t("config.field.name")}</label><input id="ct-name" value="${esc(name)}" readonly></div>
+      <div class="form-group"><label>${t("config.field.input_cost_per_million_tokens")}</label><input id="ct-input" type="number" step="0.01"></div>
+      <div class="form-group"><label>${t("config.field.cached_input_cost_per_million_tokens")}</label><input id="ct-cached" type="number" step="0.01"></div>
+      <div class="form-group"><label>${t("config.field.output_cost_per_million_tokens")}</label><input id="ct-output" type="number" step="0.01"></div>
+      <div class="modal-actions">
+        <button class="btn-secondary btn-inline" onclick="hideModal()">${t("action.cancel")}</button>
+        <button class="btn-primary" id="ct-save">${t("action.create")}</button>
+      </div>
+    `);
+    document.getElementById("ct-save").addEventListener("click", async () => {
+      const tpl = {
+        name: document.getElementById("ct-name").value,
+        input_cost_per_million_tokens: Number(document.getElementById("ct-input").value) || null,
+        cached_input_cost_per_million_tokens: Number(document.getElementById("ct-cached").value) || null,
+        output_cost_per_million_tokens: Number(document.getElementById("ct-output").value) || null,
+      };
+      const current = (_configCache && _configCache.cost_templates) || [];
+      current.push(tpl);
+      try {
+        await saveConfigSection("cost_templates", current);
+        hideModal();
+      } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
+    });
+  };
+
+  window._deleteCostTemplate = async (name) => {
+    if (!confirm(t("confirm.delete", { name }))) return;
+    const current = ((_configCache && _configCache.cost_templates) || []).filter((t) => t.name !== name);
+    try { await saveConfigSection("cost_templates", current); } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
+  };
+
   let debugEnabled = false;
 
   async function loadDebugStatus() {
@@ -2529,14 +2992,19 @@
     loadPromptLogStatus();
   }
 
-  function showModal(html) {
-    document.getElementById("modal-content").innerHTML = html;
+  function showModal(html, opts = {}) {
+    const content = document.getElementById("modal-content");
+    content.innerHTML = html;
+    content.classList.toggle("modal-wide", opts.wide || false);
+    content.classList.toggle("modal-xwide", opts.xwide || false);
     document.getElementById("modal-overlay").classList.remove("hidden");
   }
 
   function hideModal() {
     document.getElementById("modal-overlay").classList.add("hidden");
-    document.getElementById("modal-content").classList.remove("modal-wide");
+    const content = document.getElementById("modal-content");
+    content.classList.remove("modal-wide");
+    content.classList.remove("modal-xwide");
   }
   window.hideModal = hideModal;
 
@@ -2551,27 +3019,71 @@
 
   function showNewPlanModal(prefill) {
     const p = prefill || {};
-    showModal(`
+    const __html = `
       <h3>${p.name ? t("form.plan.title_edit") : t("form.plan.title_create")}</h3>
-      <div class="form-group"><label>${t("form.plan.name")} ${tip("Unique plan name. Used when assigning keys to plans.")}</label><input id="m-plan-name" value="${esc(p.name || "")}" ${p.name ? "readonly" : ""} required></div>
-      <div class="form-group"><label>${t("form.plan.concurrency")} ${tip("Maximum simultaneous requests per key in this plan. Leave empty for unlimited.")}</label><input id="m-plan-concurrency" type="number" value="${p.concurrency_limit || ""}"></div>
-      <div class="form-group"><label>${t("form.plan.rpm")} ${tip("Maximum requests per minute per key. Leave empty for unlimited.")}</label><input id="m-plan-rpm" type="number" value="${p.rpm_limit || ""}"></div>
-      <div class="form-group"><label>${t("form.plan.windows")} ${tip("Custom time windows as JSON array: [[count, seconds], ...]. E.g. [[100,18000]] = 100 requests per 5 hours. Each request's quota consumption is multiplied by the model's Quota Ratio.")}</label><textarea id="m-plan-windows" rows="2">${JSON.stringify(p.window_limits || [])}</textarea></div>
+      <div class="form-grid">
+        <div class="form-card">
+          <div class="form-card-title">${t("plan_card.basic")}</div>
+          <div class="form-card-grid">
+            <div class="form-group field-full"><label>${t("form.plan.name")} ${tip("Unique plan name. Used when assigning keys to plans.")}</label><input id="m-plan-name" value="${esc(p.name || "")}" ${p.name ? "readonly" : ""} required></div>
+            <div class="form-group"><label>${t("form.plan.type")} ${tip("Key plan: assigned to a key. Team plan: assigned to a team; members inherit member_plan.")}</label><select id="m-plan-type">
+              <option value="key" ${(p.type || "key") === "key" ? "selected" : ""}>Key</option>
+              <option value="team" ${p.type === "team" ? "selected" : ""}>Team</option>
+            </select></div>
+            <div class="form-group"><label>${t("form.plan.member_plan")} ${tip("Only for type=team: plan name applied to each member key.")}</label><input id="m-plan-member-plan" value="${esc(p.member_plan || "")}"></div>
+          </div>
+        </div>
+        <div class="form-card">
+          <div class="form-card-title">${t("plan_card.simple_limits")}</div>
+          <div class="form-card-grid">
+            <div class="form-group"><label>${t("form.plan.concurrency")} ${tip("Max simultaneous requests. Empty = unlimited.")}</label><input id="m-plan-concurrency" type="number" value="${p.concurrency_limit || ""}"></div>
+            <div class="form-group"><label>${t("form.plan.rpm")} ${tip("Requests per minute. Empty = unlimited.")}</label><input id="m-plan-rpm" type="number" value="${p.rpm_limit || ""}"></div>
+            <div class="form-group"><label>${t("form.plan.tpm")} ${tip("Tokens per minute. Empty = unlimited.")}</label><input id="m-plan-tpm" type="number" value="${p.tpm_limit || ""}"></div>
+          </div>
+        </div>
+        <div class="form-card">
+          <div class="form-card-title">${t("plan_card.window_limits")}</div>
+          <div class="form-card-grid">
+            <div class="form-group field-full"><label>${t("form.plan.windows")} ${tip("JSON array: [[counts, tokens, costs, window_secs], ...]. null = no cap on that dimension.")}</label><textarea id="m-plan-windows" rows="3" style="font-family:var(--mono);font-size:12px">${esc(JSON.stringify(p.window_limits || [], null, 2))}</textarea></div>
+          </div>
+        </div>
+        <div class="form-card">
+          <div class="form-card-title">${t("plan_card.total_limits")}</div>
+          <div class="form-card-grid">
+            <div class="form-group"><label>${t("form.plan.total_token")} ${tip("Lifetime token cap. Empty = unlimited.")}</label><input id="m-plan-total-token" type="number" value="${p.total_token_limit || ""}"></div>
+            <div class="form-group"><label>${t("form.plan.total_cost")} ${tip("Lifetime USD cap. Empty = unlimited.")}</label><input id="m-plan-total-cost" type="number" step="0.01" value="${p.total_cost_limit || ""}"></div>
+          </div>
+        </div>
+        <div class="form-card">
+          <div class="form-card-title">${t("plan_card.schedule")}</div>
+          <div class="form-card-grid">
+            <div class="form-group field-full"><label>${t("form.plan.schedule")} ${tip("JSON array of slots: [{hours, concurrency_limit, rpm_limit, tpm_limit, window_limits}].")}</label><textarea id="m-plan-schedule" rows="4" style="font-family:var(--mono);font-size:12px">${esc(JSON.stringify(p.schedule || [], null, 2))}</textarea></div>
+          </div>
+        </div>
+      </div>
       <div class="modal-actions">
         <button class="btn-secondary btn-inline" onclick="hideModal()">${t("action.cancel")}</button>
         <button class="btn-primary" id="m-plan-submit">${p.name ? t("action.update") : t("action.create")}</button>
       </div>
-    `);
+    `;
+    showModal(__html, { xwide: true });
     document.getElementById("m-plan-submit").addEventListener("click", async () => {
       try {
         const windows = JSON.parse(document.getElementById("m-plan-windows").value || "[]");
+        const schedule = JSON.parse(document.getElementById("m-plan-schedule").value || "[]");
         await api("/admin/plans", {
           method: "PUT",
           body: JSON.stringify({
             name: document.getElementById("m-plan-name").value,
+            type: document.getElementById("m-plan-type").value,
+            member_plan: document.getElementById("m-plan-member-plan").value || null,
             concurrency_limit: document.getElementById("m-plan-concurrency").value ? Number(document.getElementById("m-plan-concurrency").value) : null,
             rpm_limit: document.getElementById("m-plan-rpm").value ? Number(document.getElementById("m-plan-rpm").value) : null,
+            tpm_limit: document.getElementById("m-plan-tpm").value ? Number(document.getElementById("m-plan-tpm").value) : null,
+            total_token_limit: document.getElementById("m-plan-total-token").value ? Number(document.getElementById("m-plan-total-token").value) : null,
+            total_cost_limit: document.getElementById("m-plan-total-cost").value ? Number(document.getElementById("m-plan-total-cost").value) : null,
             window_limits: windows,
+            schedule,
           }),
         });
         hideModal();
@@ -2593,20 +3105,37 @@
   function showNewKeyModal() {
     showModal(`
       <h3>${t("form.key.title_create")}</h3>
-      <div class="form-group"><label>${t("form.key.alias")} ${tip("Short unique identifier for this key, e.g. 'alice' or 'team-api'. Used for display in dashboard and debug logging.")}</label><input id="m-key-alias"></div>
-      <div class="form-group"><label>Key Prefix ${tip("Optional 1-8 char alphanumeric label embedded in the raw key, e.g. 'prod' → sk-prod-<secret>. Empty = legacy sk-<secret> form. Not part of authentication.")}</label><input id="m-key-prefix" placeholder="e.g. prod, TeamA, v2" pattern="[a-zA-Z0-9]{1,8}" maxlength="8"></div>
-      <div class="form-group"><label>Tag ${tip("Optional free-text label (≤64 chars, any characters) for your own classification. Not embedded in the raw key. Use cases: environment, customer, purpose.")}</label><input id="m-key-tag" placeholder="e.g. production, customer-acme, exp-2026Q1" maxlength="64"></div>
-      <div class="form-group"><label>${t("form.key.user_id")} ${tip("Optional user identifier for tracking.")}</label><input id="m-key-user"></div>
-      <div class="form-group"><label>${t("form.key.team")} ${tip("Optional team assignment.")}</label><select id="m-key-team"><option value="">${t("common.none_option")}</option></select></div>
-      <div class="form-group"><label>${t("form.key.models")} ${tip("Select model access. Check 'all-team-models' for full access, or pick specific models.")}</label><div class="model-check-combo" id="m-key-models-combo"></div></div>
-      <div class="form-group"><label>${t("form.key.max_budget")} ${tip("Maximum budget in USD. Leave empty for unlimited.")}</label><input id="m-key-budget" type="number" step="0.01"></div>
-      <div class="form-group"><label>${t("form.key.rpm")} ${tip("Per-key RPM override. Leave empty to use plan or default limits.")}</label><input id="m-key-rpm" type="number"></div>
-      <div class="form-group"><label>${t("form.key.plan")} ${tip("Assign this key to a rate limit plan. Leave empty for default plan.")}</label><select id="m-key-plan"><option value="">${t("common.default_option")}</option></select></div>
+      <div class="form-grid">
+        <div class="form-card">
+          <div class="form-card-title">${t("key_card.basic")}</div>
+          <div class="form-card-grid">
+            <div class="form-group"><label>${t("form.key.alias")} ${tip("Short unique identifier for this key, e.g. 'alice' or 'team-api'. Used for display in dashboard and debug logging.")}</label><input id="m-key-alias"></div>
+            <div class="form-group"><label>Key Prefix ${tip("Optional 1-8 char alphanumeric label embedded in the raw key, e.g. 'prod' → sk-prod-<secret>. Empty = legacy sk-<secret> form.")}</label><input id="m-key-prefix" placeholder="e.g. prod, TeamA, v2" pattern="[a-zA-Z0-9]{1,8}" maxlength="8"></div>
+            <div class="form-group"><label>Tag ${tip("Optional free-text label (≤64 chars) for your own classification. Not embedded in the raw key.")}</label><input id="m-key-tag" placeholder="e.g. production, customer-acme, exp-2026Q1" maxlength="64"></div>
+            <div class="form-group"><label>${t("form.key.user_id")} ${tip("Optional user identifier for tracking.")}</label><input id="m-key-user"></div>
+          </div>
+        </div>
+        <div class="form-card">
+          <div class="form-card-title">${t("key_card.assignment")}</div>
+          <div class="form-card-grid">
+            <div class="form-group"><label>${t("form.key.team")} ${tip("Optional team assignment.")}</label><select id="m-key-team"><option value="">${t("common.none_option")}</option></select></div>
+            <div class="form-group"><label>${t("form.key.plan")} ${tip("Assign this key to a rate limit plan. Leave empty for default plan.")}</label><select id="m-key-plan"><option value="">${t("common.default_option")}</option></select></div>
+            <div class="form-group field-full"><label>${t("form.key.models")} ${tip("Select model access. Check 'all-team-models' for full access, or pick specific models.")}</label><div class="model-check-combo" id="m-key-models-combo"></div></div>
+          </div>
+        </div>
+        <div class="form-card">
+          <div class="form-card-title">${t("key_card.limits")}</div>
+          <div class="form-card-grid">
+            <div class="form-group"><label>${t("form.key.max_budget")} ${tip("Maximum budget in USD. Leave empty for unlimited.")}</label><input id="m-key-budget" type="number" step="0.01"></div>
+            <div class="form-group"><label>${t("form.key.rpm")} ${tip("Per-key RPM override. Leave empty to use plan or default limits.")}</label><input id="m-key-rpm" type="number"></div>
+          </div>
+        </div>
+      </div>
       <div class="modal-actions">
         <button class="btn-secondary btn-inline" onclick="hideModal()">${t("action.cancel")}</button>
         <button class="btn-primary" id="m-key-submit">${t("action.create")}</button>
       </div>
-    `);
+    `, { xwide: true });
     // Populate model checkbox combo
     getModelNames().then((names) => {
       const container = document.getElementById("m-key-models-combo");
@@ -3425,19 +3954,26 @@ bob,,,all-team-models,,</pre>
     const currentExplicit = p.team_id ? (tps.assignments[p.team_id] || "") : "";
     showModal(`
       <h3>${p.team_id ? t("form.team.title_edit") : t("form.team.title_create")}</h3>
-      <div class="form-group"><label>${t("form.team.id")} ${tip("Unique identifier for this team. Cannot be changed after creation.")}</label><input id="m-team-id" value="${esc(p.team_id || "")}" ${p.team_id ? "readonly" : ""} required></div>
-      <div class="form-group"><label>${t("form.team.alias")} ${tip("Display name for this team. Can be non-unique.")}</label><input id="m-team-alias" value="${esc(p.team_alias || "")}"></div>
-      <div class="form-group"><label>${t("form.team.models")} ${tip("Select model access for this team. Check 'all-team-models' for full access to all current and future models, or pick specific models.")}</label><div class="model-check-combo" id="m-team-models-combo"></div></div>
-      <div class="form-group"><label>${t("teams.col.plan")} ${tip("Pick a type=team plan, or leave on default to fall back to default_team_plan (YAML-configured).")}</label>
-        <select id="m-team-plan">
-          <option value="">${esc(t("teams.plan_use_default"))}${tps.default_team_plan ? " (" + tps.default_team_plan + ")" : ""}</option>
-        </select>
+      <div class="form-grid">
+        <div class="form-card">
+          <div class="form-card-title">${t("team_card.basic")}</div>
+          <div class="form-card-grid">
+            <div class="form-group field-full"><label>${t("form.team.id")} ${tip("Unique identifier for this team. Cannot be changed after creation.")}</label><input id="m-team-id" value="${esc(p.team_id || "")}" ${p.team_id ? "readonly" : ""} required></div>
+            <div class="form-group"><label>${t("form.team.alias")} ${tip("Display name for this team. Can be non-unique.")}</label><input id="m-team-alias" value="${esc(p.team_alias || "")}"></div>
+            <div class="form-group"><label>${t("teams.col.plan")} ${tip("Pick a type=team plan, or leave on default to fall back to default_team_plan (YAML-configured).")}</label>
+              <select id="m-team-plan">
+                <option value="">${esc(t("teams.plan_use_default"))}${tps.default_team_plan ? " (" + tps.default_team_plan + ")" : ""}</option>
+              </select>
+            </div>
+            <div class="form-group field-full"><label>${t("form.team.models")} ${tip("Select model access for this team. Check 'all-team-models' for full access to all current and future models, or pick specific models.")}</label><div class="model-check-combo" id="m-team-models-combo"></div></div>
+          </div>
+        </div>
       </div>
       <div class="modal-actions">
         <button class="btn-secondary btn-inline" onclick="hideModal()">${t("action.cancel")}</button>
         <button class="btn-primary" id="m-team-submit">${p.team_id ? t("action.update") : t("action.create")}</button>
       </div>
-    `);
+    `, { xwide: true });
     getModelNames().then((names) => {
       const container = document.getElementById("m-team-models-combo");
       if (container) initModelCombo(container, p.models || [], names);

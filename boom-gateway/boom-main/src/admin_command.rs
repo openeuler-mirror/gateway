@@ -18,20 +18,20 @@ pub async fn admin_command_handler(mut rx: tokio::sync::mpsc::Receiver<AdminComm
             AdminCommand::CreateModel { req, reply } => {
                 let result = handle_create_model(&state, req).await;
                 let _ = reply.send(result);
-                state.dump_config_snapshot().await;
+                state.persist_config_in_place().await;
             }
             AdminCommand::UpdateModel { id, req, reply } => {
                 let result = handle_update_model(&state, id, req).await;
                 let _ = reply.send(result);
-                state.dump_config_snapshot().await;
+                state.persist_config_in_place().await;
             }
             AdminCommand::DeleteModel { id, reply } => {
                 let result = handle_delete_model(&state, id).await;
                 let _ = reply.send(result);
-                state.dump_config_snapshot().await;
+                state.persist_config_in_place().await;
             }
             AdminCommand::ConfigChanged => {
-                state.dump_config_snapshot().await;
+                state.persist_config_in_place().await;
             }
             AdminCommand::ReloadConfig { reply } => {
                 match state.reload().await {
@@ -45,9 +45,52 @@ pub async fn admin_command_handler(mut rx: tokio::sync::mpsc::Receiver<AdminComm
                     }
                 }
             }
+            AdminCommand::UpdateConfigSection { path, value, reply } => {
+                let result = state.update_config_section(&path, value).await;
+                let _ = reply.send(result);
+            }
+            AdminCommand::GetConfig { reply } => {
+                let inner = state.inner.load();
+                let mut json = serde_json::to_value(&inner.config)
+                    .map_err(|e| format!("Serialize config: {}", e));
+                if let Ok(ref mut v) = json {
+                    mask_secrets(v);
+                }
+                let _ = reply.send(json);
+            }
         }
     }
     tracing::warn!("Admin command handler stopped (channel closed)");
+}
+
+/// Replace sensitive field values (`master_key`, `database_url`, `api_key`,
+/// `aws_*_key`) with `"****"` so the GET /admin/config response never leaks
+/// secrets to the browser. Null values (field unset) are preserved as null so
+/// the UI can distinguish "configured" (shows ****) from "unset" (shows empty).
+fn mask_secrets(value: &mut serde_json::Value) {
+    const SECRET_KEYS: &[&str] = &[
+        "master_key",
+        "database_url",
+        "api_key",
+        "aws_access_key_id",
+        "aws_secret_access_key",
+    ];
+    const MASK: &str = "****";
+    if let Some(obj) = value.as_object_mut() {
+        for (k, v) in obj.iter_mut() {
+            if SECRET_KEYS.contains(&k.as_str()) {
+                if !v.is_null() {
+                    *v = serde_json::Value::String(MASK.to_string());
+                }
+            } else {
+                mask_secrets(v);
+            }
+        }
+    } else if let Some(arr) = value.as_array_mut() {
+        for v in arr {
+            mask_secrets(v);
+        }
+    }
 }
 
 async fn handle_create_model(
@@ -79,6 +122,8 @@ async fn handle_create_model(
         max_inflight_queue_len: req.max_inflight_queue_len,
         max_context_len: req.max_context_len,
         client_type_header: req.client_type_header,
+        serve_not_match: req.serve_not_match,
+        model_info: req.model_info.clone(),
     };
 
     let id = DeploymentStore::create_db(db_pool, &input)
@@ -131,6 +176,8 @@ async fn handle_update_model(
         max_inflight_queue_len: req.max_inflight_queue_len,
         max_context_len: req.max_context_len,
         client_type_header: req.client_type_header,
+        serve_not_match: req.serve_not_match,
+        model_info: req.model_info.clone(),
     };
 
     let updated = DeploymentStore::update_db(db_pool, id, &input)

@@ -630,42 +630,150 @@ impl AppState {
         })
     }
 
-    /// Dump current runtime config (models, aliases, plans) to a timestamped YAML snapshot.
-    /// Best-effort: errors are logged but not propagated.
-    pub async fn dump_config_snapshot(&self) {
+    /// Persist current runtime model/alias/plan state to the live `config.yaml`.
+    ///
+    /// v3 design: web edits mutate the live config file in place, replacing
+    /// the old "write to timestamped backup file" behavior. The live YAML is
+    /// the single source of truth — DB tables are runtime indexes, not the
+    /// authority.
+    ///
+    /// Reads the raw YAML (preserving `${VAR}` references in untouched
+    /// sections — `load_config` resolves env vars at parse time, so dumping
+    /// the typed Config would leak real secrets to disk). Updates only the
+    /// sections owned by runtime tables:
+    ///   - `model_list` (from boom_model_deployment)
+    ///   - `router_settings.model_group_alias` (from boom_model_alias)
+    ///   - `plan_settings.plans` and optionally `plan_settings.default_plan`
+    ///     (from boom_rate_limit_plan)
+    ///
+    /// Other singleton sections (`server`, `router_settings.schedule_policy`,
+    /// `general_settings`, etc.) are preserved verbatim. Then triggers a
+    /// reload so the new config takes effect.
+    pub async fn persist_config_in_place(&self) {
         let pool = match &self.db_pool {
             Some(p) => p,
             None => return,
         };
 
-        let config_value = match build_config_snapshot_value(pool).await {
+        let mut root: serde_yaml::Value = match boom_config::read_raw_yaml(&self.config_path) {
             Ok(v) => v,
             Err(e) => {
-                tracing::error!("Failed to build config snapshot: {}", e);
+                tracing::error!(
+                    path = %self.config_path,
+                    "Failed to read raw config for in-place persist: {}", e
+                );
                 return;
             }
         };
 
-        let yaml_str = match serde_yaml::to_string(&config_value) {
-            Ok(s) => s,
+        let snapshot = match build_config_snapshot_value(pool).await {
+            Ok(v) => v,
             Err(e) => {
-                tracing::error!("Failed to serialize config snapshot to YAML: {}", e);
+                tracing::error!("Failed to build config snapshot from DB: {}", e);
                 return;
             }
         };
 
-        let timestamp = chrono::Local::now().format("%Y%m%d%H%M%S");
-        let snapshot_path = format!("{}.{}", self.config_path, timestamp);
+        if let Err(e) = merge_runtime_sections(&mut root, &snapshot) {
+            tracing::error!("Failed to merge runtime sections into raw YAML: {}", e);
+            return;
+        }
 
-        match tokio::fs::write(&snapshot_path, &yaml_str).await {
-            Ok(_) => {
-                tracing::info!(path = %snapshot_path, "Config snapshot saved");
-            }
-            Err(e) => {
-                tracing::error!(path = %snapshot_path, "Failed to write config snapshot: {}", e);
-            }
+        if let Err(e) = boom_config::write_yaml_atomic(&self.config_path, &root) {
+            tracing::error!(
+                path = %self.config_path,
+                "Failed to write config in place: {}", e
+            );
+            return;
+        }
+
+        tracing::info!(path = %self.config_path, "Config persisted in place");
+
+        if let Err(e) = self.reload().await {
+            tracing::error!("Config saved but reload failed: {}", e);
         }
     }
+
+    /// Update a single config section in the live `config.yaml` and reload.
+    ///
+    /// `path` is dotted (`server`, `router_settings.kvc_aware`). Reads raw
+    /// YAML, sets the path to `value` (converted from JSON), writes back
+    /// atomically, then reloads.
+    ///
+    /// Returns a summary string on success or an error message. Used by the
+    /// Config page's section editors.
+    pub async fn update_config_section(
+        &self,
+        path: &str,
+        value: serde_json::Value,
+    ) -> Result<String, String> {
+        let segments: Vec<&str> = path.split('.').filter(|s| !s.is_empty()).collect();
+        if segments.is_empty() {
+            return Err("Empty config path".to_string());
+        }
+
+        let mut root: serde_yaml::Value = boom_config::read_raw_yaml(&self.config_path)
+            .map_err(|e| format!("Failed to read config: {}", e))?;
+
+        let yaml_value = json_to_yaml(&value).map_err(|e| format!("JSON→YAML: {}", e))?;
+        boom_config::set_yaml_path(&mut root, &segments, yaml_value)
+            .map_err(|e| format!("Failed to set path: {}", e))?;
+
+        boom_config::write_yaml_atomic(&self.config_path, &root)
+            .map_err(|e| format!("Failed to write config: {}", e))?;
+
+        tracing::info!(path = %path, "Config section updated");
+
+        self.reload()
+            .await
+            .map_err(|e| format!("Saved but reload failed: {}", e))
+    }
+}
+
+/// Merge runtime-derived sections (model_list, aliases, plans) from a JSON
+/// snapshot into the raw YAML value. Singleton sections are preserved as-is.
+fn merge_runtime_sections(
+    root: &mut serde_yaml::Value,
+    snapshot: &serde_json::Value,
+) -> Result<(), String> {
+    let obj = snapshot
+        .as_object()
+        .ok_or_else(|| "snapshot is not a JSON object".to_string())?;
+
+    if let Some(model_list) = obj.get("model_list") {
+        let yaml_val = json_to_yaml(model_list)?;
+        boom_config::set_yaml_path(root, &["model_list"], yaml_val)
+            .map_err(|e| format!("set model_list: {}", e))?;
+    }
+
+    if let Some(aliases) = obj.get("router_settings").and_then(|r| r.get("model_group_alias")) {
+        let yaml_val = json_to_yaml(aliases)?;
+        boom_config::set_yaml_path(root, &["router_settings", "model_group_alias"], yaml_val)
+            .map_err(|e| format!("set model_group_alias: {}", e))?;
+    }
+
+    if let Some(plan_settings) = obj.get("plan_settings") {
+        if let Some(plans) = plan_settings.get("plans") {
+            let yaml_val = json_to_yaml(plans)?;
+            boom_config::set_yaml_path(root, &["plan_settings", "plans"], yaml_val)
+                .map_err(|e| format!("set plan_settings.plans: {}", e))?;
+        }
+        if let Some(default_plan) = plan_settings.get("default_plan") {
+            let yaml_val = json_to_yaml(default_plan)?;
+            boom_config::set_yaml_path(root, &["plan_settings", "default_plan"], yaml_val)
+                .map_err(|e| format!("set plan_settings.default_plan: {}", e))?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Convert a `serde_json::Value` to `serde_yaml::Value` via string round-trip.
+/// Both libraries speak the same data model, so this is lossless for our cases
+/// (no inf/NaN, no numbers beyond u64).
+fn json_to_yaml(value: &serde_json::Value) -> Result<serde_yaml::Value, String> {
+    let s = serde_json::to_string(value).map_err(|e| format!("json serialize: {}", e))?;
+    serde_yaml::from_str(&s).map_err(|e| format!("yaml deserialize: {}", e))
 }
 
 // ═══════════════════════════════════════════════════════════

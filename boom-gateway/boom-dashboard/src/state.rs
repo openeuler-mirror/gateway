@@ -42,10 +42,23 @@ pub enum AdminCommand {
         id: Uuid,
         reply: oneshot::Sender<Result<Value, String>>,
     },
-    /// Fire-and-forget: config changed, dump snapshot.
+    /// Fire-and-forget: config changed, persist to YAML in place.
     ConfigChanged,
     /// Hot-reload config.yaml. Reply contains summary message.
     ReloadConfig {
+        reply: oneshot::Sender<Result<String, String>>,
+    },
+    /// Read the live in-memory config as JSON (secrets masked).
+    GetConfig {
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
+    /// Update a singleton config section (e.g., `server`, `router_settings`)
+    /// by replacing it wholesale in the live `config.yaml`. Path is dotted
+    /// (`router_settings.kvc_aware`); value is the new JSON-serializable content.
+    /// Triggers a reload after writing.
+    UpdateConfigSection {
+        path: String,
+        value: Value,
         reply: oneshot::Sender<Result<String, String>>,
     },
 }

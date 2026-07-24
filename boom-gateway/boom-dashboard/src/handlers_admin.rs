@@ -1386,6 +1386,12 @@ pub struct CreateDeploymentRequest {
     /// Attach `X-BooM-Client-Type` header to outgoing requests (default false).
     #[serde(default)]
     pub client_type_header: bool,
+    /// When true, this deployment also serves as catch-all for unmatched model names.
+    #[serde(default)]
+    pub serve_not_match: bool,
+    /// Cost metadata (input/cached/output cost per million tokens).
+    #[serde(default)]
+    pub model_info: Option<serde_json::Value>,
 }
 
 fn default_timeout() -> i64 {
@@ -2832,6 +2838,83 @@ pub async fn reload_config(
             msg,
         )
             .into_response(),
+        Err(_) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "Admin command handler dropped reply",
+        )
+            .into_response(),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+// Config Page (read full config + surgical section update)
+// ═══════════════════════════════════════════════════════════
+
+/// GET /admin/config — return the live in-memory config as JSON.
+/// Sensitive fields (`master_key`, `database_url`, `api_key`, `aws_*_key`)
+/// are masked to null by boom-main before serialization.
+pub async fn get_config(
+    _session: AdminSession,
+    Extension(state): Extension<Arc<DashboardState>>,
+) -> Response {
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    if state
+        .admin_tx
+        .send(crate::state::AdminCommand::GetConfig { reply: reply_tx })
+        .await
+        .is_err()
+    {
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "Admin command handler unavailable",
+        )
+            .into_response();
+    }
+    match reply_rx.await {
+        Ok(Ok(value)) => Json(value).into_response(),
+        Ok(Err(msg)) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, msg).into_response(),
+        Err(_) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "Admin command handler dropped reply",
+        )
+            .into_response(),
+    }
+}
+
+/// PUT /admin/config — surgical section update.
+/// Body: `{ "path": "dotted.path", "value": <json value> }`.
+/// Triggers reload after writing.
+#[derive(Debug, serde::Deserialize)]
+pub struct UpdateConfigBody {
+    pub path: String,
+    pub value: serde_json::Value,
+}
+
+pub async fn update_config(
+    _session: AdminSession,
+    Extension(state): Extension<Arc<DashboardState>>,
+    body: axum::Json<UpdateConfigBody>,
+) -> Response {
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    if state
+        .admin_tx
+        .send(crate::state::AdminCommand::UpdateConfigSection {
+            path: body.path.clone(),
+            value: body.value.clone(),
+            reply: reply_tx,
+        })
+        .await
+        .is_err()
+    {
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "Admin command handler unavailable",
+        )
+            .into_response();
+    }
+    match reply_rx.await {
+        Ok(Ok(msg)) => Json(json!({"ok": true, "message": msg})).into_response(),
+        Ok(Err(msg)) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, msg).into_response(),
         Err(_) => (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             "Admin command handler dropped reply",

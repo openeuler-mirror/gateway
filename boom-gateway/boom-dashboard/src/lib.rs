@@ -252,6 +252,11 @@ pub fn build_router<S: Clone + Send + Sync + 'static>(state: DashboardState) -> 
             "/dashboard/api/admin/config/reload",
             post(handlers_admin::reload_config),
         )
+        // Admin — Config page (read full config + surgical section update).
+        .route(
+            "/dashboard/api/admin/config",
+            get(handlers_admin::get_config).put(handlers_admin::update_config),
+        )
         // SPA fallback — must be last.
         .route("/dashboard/{*path}", get(handlers_static::spa_fallback))
         // Inject state via Extension layer.

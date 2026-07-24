@@ -170,6 +170,8 @@ pub struct DeploymentInput {
     pub max_inflight_queue_len: Option<i32>,
     pub max_context_len: Option<i64>,
     pub client_type_header: bool,
+    pub serve_not_match: bool,
+    pub model_info: Option<serde_json::Value>,
 }
 
 /// YAML deployment data for sync (no provider needed).
@@ -442,15 +444,25 @@ impl DeploymentStore {
     }
 
     /// Create a deployment in DB. Returns the new row ID.
+    ///
+    /// If `deployment_id` is None, auto-generates a UUID. FlowController
+    /// requires a non-empty deployment_id to register a slot, so without this
+    /// auto-generation, web-configured `max_inflight` / `max_context` would
+    /// silently no-op (the root cause of stats page showing no inflight data).
     pub async fn create_db(pool: &sqlx::PgPool, input: &DeploymentInput) -> Result<uuid::Uuid, sqlx::Error> {
+        let deployment_id: String = match &input.deployment_id {
+            Some(d) if !d.is_empty() => d.clone(),
+            _ => uuid::Uuid::new_v4().to_string(),
+        };
         let row = sqlx::query(
             r#"INSERT INTO boom_model_deployment
                (model_name, litellm_model, api_key, api_key_env, api_base, api_version,
                 aws_region_name, aws_access_key_id, aws_secret_access_key,
                 rpm, tpm, timeout, headers, temperature, max_tokens, enabled, source, deployment_id,
-                quota_count_ratio, max_inflight_queue_len, max_context_len, client_type_header)
+                quota_count_ratio, max_inflight_queue_len, max_context_len, client_type_header,
+                serve_not_match, model_info)
                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, 'db', $17,
-                $18, $19, $20, $21)
+                $18, $19, $20, $21, $22, $23)
                RETURNING id"#,
         )
         .bind(&input.model_name)
@@ -469,11 +481,13 @@ impl DeploymentStore {
         .bind(input.temperature)
         .bind(input.max_tokens)
         .bind(input.enabled)
-        .bind(&input.deployment_id)
+        .bind(&deployment_id)
         .bind(input.quota_count_ratio)
         .bind(input.max_inflight_queue_len)
         .bind(input.max_context_len)
         .bind(input.client_type_header)
+        .bind(input.serve_not_match)
+        .bind(input.model_info.as_ref().unwrap_or(&serde_json::Value::Null))
         .fetch_one(pool)
         .await?;
 
@@ -501,6 +515,8 @@ impl DeploymentStore {
                    quota_count_ratio = $19,
                    max_inflight_queue_len = $20, max_context_len = $21,
                    client_type_header = $22,
+                   serve_not_match = $23,
+                   model_info = COALESCE($24, model_info),
                    updated_at = NOW()
                WHERE id = $1"#,
         )
@@ -526,6 +542,8 @@ impl DeploymentStore {
         .bind(input.max_inflight_queue_len)
         .bind(input.max_context_len)
         .bind(input.client_type_header)
+        .bind(input.serve_not_match)
+        .bind(input.model_info.as_ref().unwrap_or(&serde_json::Value::Null))
         .execute(pool)
         .await?;
 
