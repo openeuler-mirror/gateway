@@ -116,6 +116,15 @@ pub struct DeploymentRow {
     pub max_inflight_queue_len: Option<i32>,
     pub max_context_len: Option<i64>,
     pub client_type_header: Option<bool>,
+    /// Whether this deployment also serves as catch-all for unmatched model
+    /// names. Mirrors ModelEntry.serve_not_match in boom-config. Defaults to
+    /// false for legacy rows.
+    #[sqlx(default)]
+    pub serve_not_match: bool,
+    /// Cost metadata JSONB (input/cached/output cost per million, etc.).
+    /// Mirrors ModelEntry.model_info. NULL for legacy rows.
+    #[sqlx(default)]
+    pub model_info: Option<serde_json::Value>,
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
 }
@@ -641,6 +650,7 @@ impl DeploymentStore {
                       rpm, tpm, timeout, headers, temperature, max_tokens, enabled, auto_disabled,
                       source, deployment_id, quota_count_ratio,
                       max_inflight_queue_len, max_context_len, client_type_header,
+                      serve_not_match, model_info,
                       created_at, updated_at
                FROM boom_model_deployment
                WHERE enabled IS NOT FALSE

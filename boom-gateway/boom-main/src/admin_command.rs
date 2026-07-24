@@ -15,22 +15,53 @@ pub async fn admin_command_handler(mut rx: tokio::sync::mpsc::Receiver<AdminComm
     while let Some(cmd) = rx.recv().await {
         match cmd {
             AdminCommand::CreateModel { req, reply } => {
-                let result = handle_create_model(&state, req).await;
+                let mut result = handle_create_model(&state, req).await;
+                // Persist BEFORE replying so a failure can be surfaced.
+                // DB write has already committed at this point — a persist
+                // failure leaves DB ahead of YAML/memory, which the user
+                // needs to know about (rather than seeing a fake 200 OK).
+                if result.is_ok() {
+                    if let Err(e) = state.persist_config_in_place().await {
+                        augment_with_warning(&mut result, format!(
+                            "DB write succeeded but config did not reload: {}. \
+                             Use the Reload button to retry.", e
+                        ));
+                    }
+                }
                 let _ = reply.send(result);
-                state.persist_config_in_place().await;
             }
             AdminCommand::UpdateModel { id, req, reply } => {
-                let result = handle_update_model(&state, id, req).await;
+                let mut result = handle_update_model(&state, id, req).await;
+                if result.is_ok() {
+                    if let Err(e) = state.persist_config_in_place().await {
+                        augment_with_warning(&mut result, format!(
+                            "DB write succeeded but config did not reload: {}. \
+                             Use the Reload button to retry.", e
+                        ));
+                    }
+                }
                 let _ = reply.send(result);
-                state.persist_config_in_place().await;
             }
             AdminCommand::DeleteModel { id, reply } => {
-                let result = handle_delete_model(&state, id).await;
+                let mut result = handle_delete_model(&state, id).await;
+                if result.is_ok() {
+                    if let Err(e) = state.persist_config_in_place().await {
+                        augment_with_warning(&mut result, format!(
+                            "DB write succeeded but config did not reload: {}. \
+                             Use the Reload button to retry.", e
+                        ));
+                    }
+                }
                 let _ = reply.send(result);
-                state.persist_config_in_place().await;
             }
             AdminCommand::ConfigChanged => {
-                state.persist_config_in_place().await;
+                // Fire-and-forget: no reply channel. Just log on failure.
+                if let Err(e) = state.persist_config_in_place().await {
+                    tracing::error!(
+                        "ConfigChanged persist failed (no reply channel to surface): {}",
+                        e
+                    );
+                }
             }
             AdminCommand::ReloadConfig { reply } => {
                 match state.reload().await {
@@ -60,6 +91,21 @@ pub async fn admin_command_handler(mut rx: tokio::sync::mpsc::Receiver<AdminComm
         }
     }
     tracing::warn!("Admin command handler stopped (channel closed)");
+}
+
+/// Attach a `warning` field to a successful Result<Value, String> so the
+/// frontend can distinguish "fully applied" from "DB-only applied, reload
+/// pending". The Result stays Ok because the user's primary intent (DB
+/// write) succeeded; the warning surfaces the secondary failure.
+fn augment_with_warning(result: &mut Result<Value, String>, warning: String) {
+    if let Ok(json) = result {
+        if let Some(obj) = json.as_object_mut() {
+            obj.insert(
+                "warning".into(),
+                serde_json::Value::String(warning),
+            );
+        }
+    }
 }
 
 /// Replace sensitive field values with `"****"` so the GET /admin/config

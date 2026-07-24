@@ -354,6 +354,7 @@
 
       "common.error_retry": "Operation failed, please retry.",
       "common.error_prefix": "Error: {message}",
+      "common.warning_prefix": "Warning: {message}",
       "common.failed_to_load": "Failed to load {what}: {message}",
       "common.failed_to_load_short": "Failed to load {what}",
       "common.page_of": "Page {page} of {total} ({count} {unit})",
@@ -989,6 +990,7 @@
 
       "common.error_retry": "操作失败，请重试。",
       "common.error_prefix": "错误：{message}",
+      "common.warning_prefix": "警告：{message}",
       "common.failed_to_load": "加载{what}失败：{message}",
       "common.failed_to_load_short": "加载{what}失败",
       "common.page_of": "第 {page} / {total} 页（共 {count} 条{unit}）",

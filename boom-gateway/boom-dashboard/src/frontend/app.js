@@ -199,6 +199,17 @@
     if (res.status === 204) return null;
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data.error || data.message || res.statusText);
+    // Surface partial-success warnings (e.g. DB write ok but reload failed).
+    // The request itself didn't fail, but the user needs to know the
+    // operation didn't fully take effect.
+    if (data && data.warning) {
+      console.warn("Server warning:", data.warning);
+      try {
+        alert(t("common.warning_prefix", { message: data.warning }));
+      } catch {
+        alert("Warning: " + data.warning);
+      }
+    }
     return data;
   }
 

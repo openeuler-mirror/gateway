@@ -653,51 +653,45 @@ impl AppState {
     /// Before writing, rolls a single `.bak` copy so a bad edit can be undone
     /// by hand (serde_yaml serialization drops comments, so the .bak is also
     /// the only record of pre-edit annotation).
-    pub async fn persist_config_in_place(&self) {
+    ///
+    /// Returns `Err(message)` if any step fails so the caller can surface
+    /// the failure to the user. The DB write that triggered this persist has
+    /// already committed by the time we run, so a persist failure leaves a
+    /// real divergence: DB has the new state, YAML/memory don't. The caller
+    /// must NOT silently report success in that case — see
+    /// [`admin_command_handler`] for the warning-augmented reply pattern.
+    pub async fn persist_config_in_place(&self) -> Result<(), String> {
         let pool = match &self.db_pool {
             Some(p) => p,
-            None => return,
+            None => return Err("Database not available".to_string()),
         };
 
         backup_yaml(&self.config_path);
 
-        let mut root: serde_yaml::Value = match boom_config::read_raw_yaml(&self.config_path) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::error!(
-                    path = %self.config_path,
-                    "Failed to read raw config for in-place persist: {}", e
-                );
-                return;
-            }
-        };
+        let mut root: serde_yaml::Value = boom_config::read_raw_yaml(&self.config_path)
+            .map_err(|e| format!("read config: {}", e))?;
 
-        let snapshot = match build_config_snapshot_value(pool).await {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::error!("Failed to build config snapshot from DB: {}", e);
-                return;
-            }
-        };
+        let snapshot = build_config_snapshot_value(pool)
+            .await
+            .map_err(|e| format!("build snapshot from DB: {}", e))?;
 
-        if let Err(e) = merge_runtime_sections(&mut root, &snapshot) {
-            tracing::error!("Failed to merge runtime sections into raw YAML: {}", e);
-            return;
-        }
+        merge_runtime_sections(&mut root, &snapshot)
+            .map_err(|e| format!("merge runtime sections: {}", e))?;
 
-        if let Err(e) = boom_config::write_yaml_atomic(&self.config_path, &root) {
-            tracing::error!(
-                path = %self.config_path,
-                "Failed to write config in place: {}", e
-            );
-            return;
-        }
+        boom_config::write_yaml_atomic(&self.config_path, &root)
+            .map_err(|e| format!("write config: {}", e))?;
 
         tracing::info!(path = %self.config_path, "Config persisted in place");
 
-        if let Err(e) = self.reload().await {
-            tracing::error!("Config saved but reload failed: {}", e);
-        }
+        // Reload after the write succeeded. A reload failure here is less
+        // bad than a write failure (YAML is current; memory just lags and
+        // the next manual reload picks it up), but still report it so the
+        // user knows to retry.
+        self.reload()
+            .await
+            .map_err(|e| format!("reload after persist: {}", e))?;
+
+        Ok(())
     }
 
     /// Update a single config section in the live `config.yaml` and reload.
@@ -1445,12 +1439,12 @@ async fn build_config_snapshot_value(pool: &PgPool) -> Result<serde_json::Value,
             if let Some(m) = r.max_tokens {
                 litellm_params.insert("max_tokens".into(), serde_json::Value::Number(m.into()));
             }
-            if let Some(v) = r.max_inflight_queue_len {
-                litellm_params.insert("max_inflight_queue_len".into(), serde_json::Value::Number(v.into()));
-            }
-            if let Some(v) = r.max_context_len {
-                litellm_params.insert("max_context_len".into(), serde_json::Value::Number(v.into()));
-            }
+            // NOTE: max_inflight_queue_len / max_context_len are deliberately
+            // NOT placed under litellm_params — ProviderParams doesn't have
+            // those fields, so serde would silently drop them on reload,
+            // breaking the flow control wiring that auto-generated
+            // deployment_id was meant to enable. They're emitted under
+            // entry.flow_control below.
             // Only include headers if non-empty.
             if let Some(obj) = r.headers.as_object() {
                 if !obj.is_empty() {
@@ -1463,14 +1457,73 @@ async fn build_config_snapshot_value(pool: &PgPool) -> Result<serde_json::Value,
                 "litellm_params": litellm_params,
             });
 
-            // Include model_info if deployment_id is set.
+            // ── flow_control: emit as a dedicated node. Include only when
+            // at least one limit is set so we don't litter YAML with empty
+            // `flow_control: {}` blocks on every row.
+            if r.max_inflight_queue_len.is_some() || r.max_context_len.is_some() {
+                let mut fc = serde_json::Map::new();
+                if let Some(v) = r.max_inflight_queue_len {
+                    fc.insert("model_queue_limit".into(), serde_json::Value::Number(v.into()));
+                }
+                if let Some(v) = r.max_context_len {
+                    fc.insert("model_context_limit".into(), serde_json::Value::Number(v.into()));
+                }
+                entry.as_object_mut().unwrap().insert(
+                    "flow_control".into(),
+                    serde_json::Value::Object(fc),
+                );
+            }
+
+            // ── model_info: merge DB JSONB (cost fields) + deployment_id
+            // (as `id`) + quota_count_ratio. Each source is optional; emit
+            // the node only when at least one piece is present so legacy
+            // rows without metadata stay clean.
+            let mut mi = serde_json::Map::new();
             if let Some(ref did) = r.deployment_id {
                 if !did.is_empty() {
-                    entry.as_object_mut().unwrap().insert(
-                        "model_info".into(),
-                        serde_json::json!({ "id": did }),
+                    mi.insert("id".into(), serde_json::Value::String(did.clone()));
+                }
+            }
+            if let Some(obj) = r.model_info.as_ref().and_then(|v| v.as_object()) {
+                for (k, v) in obj {
+                    // Don't let a stray `id` in the JSONB override the
+                    // canonical deployment_id from the column.
+                    if k != "id" {
+                        mi.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+            // quota_count_ratio lives in its own DB column but YAML schema
+            // wants it under model_info. Emit only when != 1 (default) to
+            // match how a hand-written YAML would look.
+            if let Some(ratio) = r.quota_count_ratio {
+                if ratio != 1 {
+                    mi.insert(
+                        "quota_count_ratio".into(),
+                        serde_json::Value::Number(ratio.into()),
                     );
                 }
+            }
+            if !mi.is_empty() {
+                entry.as_object_mut().unwrap().insert(
+                    "model_info".into(),
+                    serde_json::Value::Object(mi),
+                );
+            }
+
+            // ── Behavior toggles. serde defaults are false, so emit only
+            // when true to keep YAML noise-free.
+            if r.serve_not_match {
+                entry.as_object_mut().unwrap().insert(
+                    "serve_not_match".into(),
+                    serde_json::Value::Bool(true),
+                );
+            }
+            if r.client_type_header.unwrap_or(false) {
+                entry.as_object_mut().unwrap().insert(
+                    "client_type_header".into(),
+                    serde_json::Value::Bool(true),
+                );
             }
 
             entry
