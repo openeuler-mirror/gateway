@@ -1,5 +1,5 @@
 use crate::extractor::RequiredAuth;
-use crate::request_log::{log_error, log_request, RequestLog};
+use crate::request_log::{log_error, log_error_with_usage, log_request, RequestLog};
 use crate::state::AppState;
 use axum::extract::{ConnectInfo, Path, State};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -8,6 +8,7 @@ use axum::Json;
 use boom_core::anthropic::{
     anthropic_request_to_openai, openai_response_to_anthropic, AnthropicStreamTranscoder,
 };
+use boom_core::provider::{ProviderBilling, ProviderCallContext, ProviderCost};
 use boom_core::types::*;
 use boom_core::GatewayError;
 use boom_ctxaware::AgentStatsTracker;
@@ -59,6 +60,7 @@ async fn acquire_fc_guard<E>(
     state: &AppState,
     deployment_id: &str,
     context_chars: u64,
+    timeout: std::time::Duration,
     is_vip: bool,
     key_alias: Option<String>,
     fc_key_hash: Option<String>,
@@ -72,7 +74,6 @@ async fn acquire_fc_guard<E>(
     client_ip: Option<String>,
     err_wrap: impl Fn(GatewayError, bool) -> E,
 ) -> Result<Option<boom_flowcontrol::FlowControlGuard>, E> {
-    let timeout = std::time::Duration::from_secs(1200);
     match state.flow_controller.acquire(deployment_id, context_chars, timeout, is_vip, key_alias, fc_key_hash, fc_model).await {
         Ok(g) => Ok(Some(g)),
         Err(FlowControlError::Timeout { waiters, .. }) => {
@@ -266,6 +267,8 @@ struct LoggedStream<S> {
     /// Plan charge to settle on drop. None when running without quota tracking
     /// (e.g. legacy per-model RPM path with no plan).
     plan_charge: Option<PlanCharge>,
+    /// Provider-supplied actual cost. Set only by composite providers.
+    provider_billing: Option<ProviderBilling>,
 }
 
 impl<S> LoggedStream<S> {
@@ -286,6 +289,7 @@ impl<S> LoggedStream<S> {
             usage,
             agent_stats,
             plan_charge: None,
+            provider_billing: None,
         }
     }
 
@@ -298,19 +302,33 @@ impl<S> LoggedStream<S> {
         self.plan_charge = Some(charge);
         self
     }
+
+    fn with_provider_billing(mut self, billing: ProviderBilling) -> Self {
+        self.provider_billing = Some(billing);
+        self
+    }
 }
 
 impl<S> Drop for LoggedStream<S> {
     fn drop(&mut self) {
+        let observed_usage = self
+            .usage
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+        let provider_usage = self
+            .provider_billing
+            .as_ref()
+            .and_then(ProviderBilling::actual_usage);
+        let (input_tokens, output_tokens, cached_tokens) =
+            preferred_stream_usage(&observed_usage, provider_usage.as_ref());
+
         if let Some(mut log) = self.log.take() {
             log.duration_ms = Some(self.start.elapsed().as_millis() as i32);
             log.ttft_ms = self.first_token_at.map(|t| (t - self.start).as_millis() as i32);
-            // Read accumulated usage from tracker (written by stream mapper).
-            if let Ok(guard) = self.usage.lock() {
-                log.input_tokens = guard.prompt_tokens;
-                log.output_tokens = guard.completion_tokens;
-                log.cached_tokens = guard.cached_tokens.map(|c| c as i64);
-            }
+            log.input_tokens = input_tokens;
+            log.output_tokens = output_tokens;
+            log.cached_tokens = cached_tokens;
             // Account tokens to agent stats before moving log into log_request.
             if let Some(tracker) = &self.agent_stats {
                 let input = log.input_tokens.unwrap_or(0) as u64;
@@ -323,21 +341,53 @@ impl<S> Drop for LoggedStream<S> {
         }
         // Settle the plan charge with real token counts from the stream.
         // If the stream errored or was cancelled before the final usage
-        // chunk arrived, input/output will be 0 — settle is a no-op on
-        // cumulative counters (cost will be $0), which is the desired
-        // "未拿到 usage 不计费" behavior.
+        // chunk arrived, composite providers can supply usage and cost from
+        // successful child calls through ProviderBilling.
         if let Some(mut charge) = self.plan_charge.take() {
-            let (input, cached, output) = if let Ok(guard) = self.usage.lock() {
-                (
-                    guard.prompt_tokens.unwrap_or(0) as u64,
-                    guard.cached_tokens.unwrap_or(0).max(0) as u64,
-                    guard.completion_tokens.unwrap_or(0) as u64,
-                )
-            } else {
-                (0u64, 0u64, 0u64)
-            };
-            charge.settle(input, cached, output);
+            let actual_cost = self
+                .provider_billing
+                .as_ref()
+                .and_then(ProviderBilling::actual_cost);
+            charge.settle(
+                input_tokens.unwrap_or(0).max(0) as u64,
+                cached_tokens.unwrap_or(0).max(0) as u64,
+                output_tokens.unwrap_or(0).max(0) as u64,
+                actual_cost,
+            );
         }
+    }
+}
+
+fn preferred_stream_usage(
+    observed: &UsageTrackerState,
+    provider: Option<&Usage>,
+) -> (Option<i32>, Option<i32>, Option<i64>) {
+    let observed_total = i64::from(observed.prompt_tokens.unwrap_or(0).max(0))
+        + i64::from(observed.completion_tokens.unwrap_or(0).max(0));
+    let provider_total = provider.map_or(0, |usage| {
+        i64::from(usage.prompt_tokens) + i64::from(usage.completion_tokens)
+    });
+    if provider_total > observed_total {
+        let usage = provider.expect("provider_total is positive only when usage exists");
+        (
+            Some(usage.prompt_tokens.min(i32::MAX as u32) as i32),
+            Some(usage.completion_tokens.min(i32::MAX as u32) as i32),
+            usage
+                .prompt_tokens_details
+                .as_ref()
+                .and_then(|details| details.cached_tokens)
+                .map(i64::from),
+        )
+    } else {
+        let provider_cached = provider
+            .and_then(|usage| usage.prompt_tokens_details.as_ref())
+            .and_then(|details| details.cached_tokens)
+            .map(i64::from);
+        (
+            observed.prompt_tokens,
+            observed.completion_tokens,
+            observed.cached_tokens.map(i64::from).or(provider_cached),
+        )
     }
 }
 
@@ -500,7 +550,11 @@ async fn chat_completions_inner(
     let is_vip = is_vip_key(&identity.metadata);
     let fc_guard = if let Some(ref did) = deployment_id {
         acquire_fc_guard(
-            &state, did, input_chars as u64, is_vip,
+            &state, did, input_chars as u64,
+            std::time::Duration::from_secs(
+                inner.config.router_settings.flow_control_queue_timeout_secs()
+            ),
+            is_vip,
             identity.key_alias.clone(), Some(identity.key_hash.clone()),
             Some(inflight_model.clone()),
             api_path, &identity, &model,
@@ -517,6 +571,14 @@ async fn chat_completions_inner(
         api_path,
         provider.client_type_header(),
     );
+    let provider_billing = ProviderBilling::default();
+    let provider_context = ProviderCallContext {
+        key_hash: identity.key_hash.clone(),
+        key_alias: identity.key_alias.clone(),
+        is_vip,
+        api_path: api_path.to_string(),
+        billing: provider_billing.clone(),
+    };
 
     // Capture request body for debug recording if debug mode is enabled.
     let debug_req_body = if state.debug_store.is_enabled() {
@@ -527,12 +589,13 @@ async fn chat_completions_inner(
 
     // 4. Route to provider (streaming or non-streaming).
     if is_stream {
-        let stream = match provider.chat_stream(req).await {
+        let stream = match provider.chat_stream_with_context(req, provider_context).await {
             Ok(s) => s,
             Err(e) => {
-                log_error(&state, &identity, &model, api_path, true, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()));
+                let partial_usage = provider_billing.actual_usage();
+                settle_partial_provider_accounting(&mut plan_charge, &provider_billing);
+                log_error_with_usage(&state, &identity, &model, api_path, true, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()), partial_usage.as_ref());
                 crate::health_monitor::record_request_failure(&state, &deployment_id, &e);
-                // plan_charge drops here without commit — no quota consumed.
                 return Err(GatewayErrorReply(e, true));
             }
         };
@@ -588,7 +651,8 @@ async fn chat_completions_inner(
             trie_max_blocks,
             request_tokens: request_bytes,
         }, start, usage, Some(state.agent_stats.clone()))
-        .with_plan_charge(plan_charge);
+        .with_plan_charge(plan_charge)
+        .with_provider_billing(provider_billing);
 
         // Wrap with prompt log stream if enabled, then wrap in Sse.
         if let Some(sender) = prompt_log_sender {
@@ -617,12 +681,13 @@ async fn chat_completions_inner(
         } else {
             InFlightGuard::new(state.inflight.clone(), &inflight_model, input_chars as u64)
         };
-        let response = match provider.chat(req).await {
+        let response = match provider.chat_with_context(req, provider_context).await {
             Ok(r) => r,
             Err(e) => {
-                log_error(&state, &identity, &model, api_path, false, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()));
+                let partial_usage = provider_billing.actual_usage();
+                settle_partial_provider_accounting(&mut plan_charge, &provider_billing);
+                log_error_with_usage(&state, &identity, &model, api_path, false, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()), partial_usage.as_ref());
                 crate::health_monitor::record_request_failure(&state, &deployment_id, &e);
-                // plan_charge drops here without commit — no quota consumed.
                 return Err(GatewayErrorReply(e, false));
             }
         };
@@ -649,6 +714,7 @@ async fn chat_completions_inner(
             input_tokens as u64,
             cached_tokens_i64.max(0) as u64,
             output_tokens as u64,
+            provider_billing.actual_cost(),
         );
         let cached_tokens = Some(cached_tokens_i64 as i64);
 
@@ -1269,14 +1335,17 @@ fn check_model_access(
 
 /// A pending plan charge: created by `check_plan_limits` (peek-only, no
 /// counters incremented), committed by `PlanCharge::commit` once the upstream
-/// provider has accepted the request. If dropped without commit, no quota is
-/// consumed — the ConcurrencyGuard is released via its own Drop.
+/// provider has accepted the request. Composite providers also commit when
+/// successful child calls have produced an actual cost before the parent call
+/// fails. If dropped without commit, no quota is consumed — the
+/// ConcurrencyGuard is released via its own Drop.
 ///
 /// Settle is called separately (after the response is fully consumed) to
 /// record token/cost usage against key + team quota counters.
 ///
 /// This implements principle 1: "未服务不计费" — plan counters are only
-/// incremented after `provider.chat_stream`/`provider.chat` returns Ok.
+/// incremented after the provider accepts the request or reports successful
+/// child-call cost.
 #[allow(dead_code)]
 pub struct PlanCharge {
     limiter: Arc<boom_limiter::SlidingWindowLimiter>,
@@ -1324,8 +1393,8 @@ pub struct PlanCharge {
 impl PlanCharge {
     /// Commit the charge: increment counts dimension by `weight` for both
     /// key and (if set) team windows. MUST be called only after
-    /// `provider.chat_stream`/`provider.chat` returned Ok — this is the
-    /// moment the request is truly sent to the upstream and "已服务" begins.
+    /// the provider accepted the request, or after a composite provider
+    /// reported successful child-call cost.
     ///
     /// Tokens/costs dimensions are NOT incremented here — they roll forward
     /// in `settle` once real token counts are known.
@@ -1365,15 +1434,29 @@ impl PlanCharge {
     /// `prompt_tokens_details.cached_tokens`. When the model's cost rate has
     /// a separate `cached_input_cost_per_token`, cached hits are billed at
     /// the discounted rate; otherwise at the regular input rate.
-    pub fn settle(&mut self, input_tokens: u64, cached_tokens: u64, output_tokens: u64) {
+    pub fn settle(
+        &mut self,
+        input_tokens: u64,
+        cached_tokens: u64,
+        output_tokens: u64,
+        actual_cost: Option<ProviderCost>,
+    ) {
         if !self.committed || self.settled {
             return;
         }
         self.settled = true;
 
-        let (regular_input_cost, cached_input_cost, output_cost) = self
-            .cost_rate
-            .compute_cost_breakdown(input_tokens, cached_tokens, output_tokens);
+        let (regular_input_cost, cached_input_cost, output_cost) =
+            actual_cost.map_or_else(
+                || {
+                    self.cost_rate.compute_cost_breakdown(
+                        input_tokens,
+                        cached_tokens,
+                        output_tokens,
+                    )
+                },
+                |cost| (cost.regular_input, cost.cached_input, cost.output),
+            );
         let regular_input_micros = decimal_to_micros(regular_input_cost);
         let cached_input_micros = decimal_to_micros(cached_input_cost);
         let output_micros = decimal_to_micros(output_cost);
@@ -1407,6 +1490,29 @@ impl PlanCharge {
                 output_micros,
             );
         }
+    }
+}
+
+fn settle_partial_provider_accounting(
+    plan_charge: &mut PlanCharge,
+    provider_billing: &ProviderBilling,
+) {
+    let usage = provider_billing.actual_usage();
+    let cost = provider_billing.actual_cost();
+    if usage.is_some() || cost.is_some() {
+        let _ = plan_charge.commit();
+        let usage = usage.unwrap_or_default();
+        let cached_tokens = usage
+            .prompt_tokens_details
+            .as_ref()
+            .and_then(|details| details.cached_tokens)
+            .unwrap_or(0);
+        plan_charge.settle(
+            u64::from(usage.prompt_tokens),
+            u64::from(cached_tokens),
+            u64::from(usage.completion_tokens),
+            cost,
+        );
     }
 }
 
@@ -2309,7 +2415,11 @@ pub async fn messages(
     let is_vip = is_vip_key(&identity.metadata);
     let fc_guard = if let Some(ref did) = deployment_id {
         acquire_fc_guard(
-            &state, did, input_chars as u64, is_vip,
+            &state, did, input_chars as u64,
+            std::time::Duration::from_secs(
+                inner.config.router_settings.flow_control_queue_timeout_secs()
+            ),
+            is_vip,
             identity.key_alias.clone(), Some(identity.key_hash.clone()),
             Some(inflight_model.clone()),
             "/v1/messages", &identity, &model,
@@ -2462,6 +2572,7 @@ pub async fn messages(
             input_tokens as u64,
             cached_tokens_i64.max(0) as u64,
             output_tokens as u64,
+            None,
         );
         let cached_tokens = Some(cached_tokens_i64 as i64);
 
@@ -2797,7 +2908,10 @@ pub async fn kv_index_status(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_gateway_headers, is_vip_key};
+    use super::{
+        build_gateway_headers, is_vip_key, preferred_stream_usage, UsageTrackerState,
+    };
+    use boom_core::types::{PromptTokensDetails, Usage};
     use serde_json::json;
 
     #[test]
@@ -2888,5 +3002,47 @@ mod tests {
     fn client_type_header_omitted_when_disabled() {
         let headers = build_gateway_headers(false, false, "/v1/messages", false);
         assert!(!headers.contains_key("X-BooM-Client-Type"));
+    }
+
+    #[test]
+    fn provider_usage_fills_missing_stream_usage() {
+        let observed = UsageTrackerState::default();
+        let provider = Usage {
+            prompt_tokens: 7,
+            completion_tokens: 3,
+            total_tokens: 10,
+            prompt_tokens_details: Some(PromptTokensDetails {
+                cached_tokens: Some(2),
+            }),
+            ..Usage::default()
+        };
+
+        assert_eq!(
+            preferred_stream_usage(&observed, Some(&provider)),
+            (Some(7), Some(3), Some(2))
+        );
+    }
+
+    #[test]
+    fn observed_stream_usage_is_not_double_counted() {
+        let observed = UsageTrackerState {
+            prompt_tokens: Some(7),
+            completion_tokens: Some(3),
+            cached_tokens: None,
+        };
+        let provider = Usage {
+            prompt_tokens: 7,
+            completion_tokens: 3,
+            total_tokens: 10,
+            prompt_tokens_details: Some(PromptTokensDetails {
+                cached_tokens: Some(2),
+            }),
+            ..Usage::default()
+        };
+
+        assert_eq!(
+            preferred_stream_usage(&observed, Some(&provider)),
+            (Some(7), Some(3), Some(2))
+        );
     }
 }

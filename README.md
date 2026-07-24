@@ -16,6 +16,7 @@
 ## 特性
 
 - **多服务商路由** — OpenAI / Anthropic / Azure / Gemini / Bedrock / vLLM / Ollama 等
+- **Direct Synthesis Workflow** — 并发调用多个 panel，再由 aggregator 合成标准 OpenAI 流式或非流式响应
 - **负载均衡** — 在同名 deployment 之间支持轮询、密钥亲和或 KV-cache 感知调度，并提供实时再平衡计数
 - **速率限制** — 滑动窗口 + 并发控制 + 自定义时间窗口 + 定时套餐切换
 - **套餐体系** — 灵活的密钥套餐与团队套餐（含 `member_plan` 继承），密钥/团队→套餐绑定，三级回退
@@ -127,6 +128,25 @@ model_list:
   #     model: anthropic/claude-opus-4-20250514
   #     api_key: os.environ/ANTHROPIC_API_KEY
 
+# Direct Synthesis：客户端请求 fusion，Gateway 并发调用 panel 后由 aggregator 合成结果
+workflow_settings:
+  models:
+    fusion: direct_synthesis
+  workflows:
+    direct_synthesis:
+      type: direct_synthesis
+      roles:
+        panel:
+          - model: gpt-4o
+            temperature: 0.3
+          - model: claude-sonnet
+            temperature: 0.3
+          - model: deepseek-chat
+            temperature: 0.3
+        aggregator:
+          model: gpt-4o
+          temperature: 0.0
+
 # 通用设置
 general_settings:
   master_key: os.environ/MASTER_KEY
@@ -182,6 +202,11 @@ deployment_health_check:
   failure_threshold: 3
   recovery_threshold: 2
 ```
+
+`fusion` 会像普通模型一样出现在 `/v1/models`，并通过 `/v1/chat/completions`
+使用。Panel 始终并发执行非流式调用，aggregator 根据客户端请求返回流式或非流式
+标准 OpenAI 响应。每个子调用都会重新进入 Gateway Router，继续应用模型解析、调度、
+流量控制和 inflight 治理。Workflow 当前不支持 `/v1/messages`。
 
 完整字段说明见 [CONFIG_EXAMPLE.md](CONFIG_EXAMPLE.md)（另含 `router_settings`、`cost_templates`、KV-cache 感知路由等）。
 
@@ -240,10 +265,11 @@ curl http://localhost:4000/v1/chat/completions \
 
 ```
 BooMGateway/
-├── boom-gateway/           Rust workspace 根目录（13 个 crate）
+├── boom-gateway/           Rust workspace 根目录（14 个 crate）
 │   ├── boom-core/          核心 trait 与公共类型
 │   ├── boom-auth/          密钥认证（SHA-256 + DB + master key）
 │   ├── boom-config/        YAML 配置解析（含环境变量展开）
+│   ├── boom-fusion/        Workflow 抽象与 Direct Synthesis 编排
 │   ├── boom-provider/      LLM Provider 实现
 │   ├── boom-limiter/       滑动窗口限流 + 并发控制 + PlanStore
 │   ├── boom-flowcontrol/   按 deployment 的流量控制（含 VIP 优先）
@@ -281,7 +307,7 @@ BooMGateway/
 
 | 端点 | 说明 |
 |----------|-------------|
-| `POST /v1/chat/completions` | OpenAI 对话（流式 / 非流式） |
+| `POST /v1/chat/completions` | OpenAI 对话（流式 / 非流式，支持 workflow 模型） |
 | `POST /v1/messages` | Anthropic Messages API |
 | `POST /v1/completions` | OpenAI completions |
 | `POST /v1/embeddings` | 返回"不支持" |
@@ -587,6 +613,7 @@ prompt_log:
 | [docs/kvc-aware-design.md](docs/kvc-aware-design.md) | KVC 感知路由设计文档 |
 | [docs/kvc-aware-event-reporting-research.md](docs/kvc-aware-event-reporting-research.md) | KV-cache 事件上报机制调研（NVIDIA Dynamo、llm-d） |
 | [docs/vip-header-forwarding-design.md](docs/vip-header-forwarding-design.md) | VIP 请求信息透传（`X-Gateway-Priority` header） |
+| [docs/direct-synthesis-workflow-design.md](docs/direct-synthesis-workflow-design.md) | Direct Synthesis Workflow 架构、配置与执行语义 |
 | [CLAUDE.md](CLAUDE.md) | 开发指南与架构原则 |
 
 ## 许可证

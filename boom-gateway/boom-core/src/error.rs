@@ -58,6 +58,9 @@ pub enum GatewayError {
     #[error("Endpoint not supported: {0}")]
     NotSupported(String),
 
+    #[error("Unsupported mode: {0}")]
+    UnsupportedMode(String),
+
     #[error("Flow control queue timeout: {message}")]
     FlowControlQueueTimeout {
         deployment_id: String,
@@ -85,6 +88,7 @@ impl GatewayError {
             Self::UpstreamTimeout => 504,
             Self::UpstreamError { .. } => 502,
             Self::NotSupported(_) => 404,
+            Self::UnsupportedMode(_) => 400,
             Self::FlowControlQueueTimeout { .. } => 503,
             Self::InternalError(_) => 500,
         }
@@ -127,6 +131,7 @@ impl GatewayError {
             Self::UpstreamTimeout => "timeout",
             Self::UpstreamError { .. } => "upstream_error",
             Self::NotSupported(_) => "not_supported",
+            Self::UnsupportedMode(_) => "unsupported_mode_error",
             Self::ProviderError(_) => "provider_error",
             Self::FlowControlQueueTimeout { .. } => "flow_control_timeout",
             Self::ConfigError(_) | Self::InternalError(_) => "internal_error",

@@ -7,7 +7,7 @@ use boom_kvindex::{TokenPrefixIndex};
 use boom_core::kv_event::KvIndexBackend;
 use boom_limiter::{PlanStore, RateLimitPlan, ScheduleSlot, SlidingWindowLimiter};
 use boom_flowcontrol::{FlowControlConfig, FlowController};
-use boom_routing::{AliasStore, DeploymentStore, HybridRouter, InFlightTracker, KeyAffinityPolicy, RebalanceMoveTracker, RequestRateTracker, Router, RoundRobinPolicy, SchedulePolicy, StrategyRegistry, TierClassifier};
+use boom_routing::{register_fusion_providers, AliasStore, DeploymentStore, FusionRuntime, HybridRouter, InFlightTracker, KeyAffinityPolicy, RebalanceMoveTracker, RequestRateTracker, Router, RoundRobinPolicy, SchedulePolicy, StrategyRegistry, TierClassifier};
 use boom_ctxaware::AgentStatsTracker;
 use boom_promptlog::PromptLogWriter;
 use boom_provider;
@@ -209,6 +209,8 @@ impl AppState {
             // lock_timeout set on its connection).
             if let Err(e) = boom_dashboard::migrations::run_migrations(pool).await {
                 tracing::error!("Failed to run migrations: {}", e);
+            } else {
+                validate_db_workflow_namespace(pool, &config.workflow_settings).await?;
             }
 
             // Sync YAML config to DB (upsert source='yaml', handle conflicts).
@@ -245,7 +247,7 @@ impl AppState {
             router.clone(),
         );
 
-        Ok(Self {
+        let state = Self {
             config_path,
             inner: Arc::new(ArcSwap::from_pointee(inner)),
             db_pool,
@@ -268,7 +270,9 @@ impl AppState {
             kv_index,
             kv_prune_handle: Arc::new(std::sync::Mutex::new(None)),
             kvc_orchestrator,
-        })
+        };
+        state.register_fusion_models(&state.inner.load().config)?;
+        Ok(state)
     }
 
     /// Hot-reload safety wrapper: bounds total wall time at 60s and converts
@@ -377,6 +381,9 @@ impl AppState {
         } else {
             self.db_pool.clone()
         };
+        if let Some(ref pool) = db_pool {
+            validate_db_workflow_namespace(pool, &new_config.workflow_settings).await?;
+        }
 
         let new_reload_count = old_reload_count + 1;
 
@@ -483,6 +490,8 @@ impl AppState {
                 self.plan_store.load_db_only_plans(pool),
             ).await?;
         }
+
+        self.register_fusion_models(&new_config)?;
 
         // Clean up assignments pointing to plans that no longer exist.
         self.plan_store.cleanup_assignments();
@@ -612,6 +621,27 @@ impl AppState {
             key_alias_lookup,
             health,
         })
+    }
+
+    fn register_fusion_models(&self, config: &Config) -> Result<(), boom_core::GatewayError> {
+        let runtime = FusionRuntime::new(
+            Arc::downgrade(&self.router),
+            self.deployment_store.clone(),
+            self.flow_controller.clone(),
+            self.inflight.clone(),
+            self.request_rate.clone(),
+            self.kv_index.clone(),
+            config.router_settings.enable_priority_header,
+            config
+                .router_settings
+                .flow_control_queue_timeout_secs(),
+        );
+        register_fusion_providers(
+            &config.workflow_settings,
+            &self.deployment_store,
+            &self.alias_store,
+            runtime,
+        )
     }
 
     /// Persist current runtime model/alias/plan state to the live `config.yaml`.
@@ -984,6 +1014,29 @@ async fn load_db_only_deployments(
 /// Load source='db' aliases from DB (delegated to AliasStore).
 async fn load_db_only_aliases(pool: &PgPool, alias_store: &Arc<AliasStore>) {
     alias_store.load_db_only(pool).await;
+}
+
+async fn validate_db_workflow_namespace(
+    pool: &PgPool,
+    settings: &boom_config::WorkflowSettings,
+) -> anyhow::Result<()> {
+    let workflow_models = settings.models.keys().cloned().collect::<Vec<_>>();
+    if workflow_models.is_empty() {
+        return Ok(());
+    }
+
+    let deployment_conflicts =
+        DeploymentStore::db_only_model_conflicts(pool, &workflow_models).await?;
+    let alias_conflicts = AliasStore::db_only_name_conflicts(pool, &workflow_models).await?;
+    if deployment_conflicts.is_empty() && alias_conflicts.is_empty() {
+        return Ok(());
+    }
+
+    Err(anyhow::anyhow!(
+        "workflow model namespace conflicts with DB-only resources: deployments=[{}], aliases=[{}]",
+        deployment_conflicts.join(", "),
+        alias_conflicts.join(", ")
+    ))
 }
 
 

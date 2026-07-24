@@ -116,6 +116,8 @@ pub fn router_settings_fields() -> &'static [FieldMeta] {
                     label_key: "config.field.rebalance_threshold", tip_key: "tip.config.rebalance_threshold" },
         FieldMeta { field: "enable_priority_header", section: "router", input_type: "bool",
                     label_key: "config.field.enable_priority_header", tip_key: "tip.config.enable_priority_header" },
+        FieldMeta { field: "flow_control_queue_timeout_secs", section: "router", input_type: "number",
+                    label_key: "config.field.flow_control_queue_timeout_secs", tip_key: "tip.config.flow_control_queue_timeout_secs" },
         FieldMeta { field: "strip_claude_code_attribution", section: "router", input_type: "bool",
                     label_key: "config.field.strip_claude_code_attribution", tip_key: "tip.config.strip_claude_code_attribution" },
     ]
@@ -227,6 +229,7 @@ mod tests {
             "key_affinity_context_threshold",
             "rebalance_threshold",
             "enable_priority_header",
+            "flow_control_queue_timeout_secs",
             "strip_claude_code_attribution",
         ];
 

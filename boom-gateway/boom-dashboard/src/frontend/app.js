@@ -2634,6 +2634,7 @@
           r.schedule_policy || "round_robin")}
         ${fieldNum("cfg-rs-affinity-ctx", t("config.field.key_affinity_context_threshold"), r.key_affinity_context_threshold || 0, { min: 0 })}
         ${fieldNum("cfg-rs-affinity-rebal", t("config.field.rebalance_threshold"), r.rebalance_threshold || 20, { min: 1, step: 1 })}
+        ${fieldNum("cfg-rs-flow-timeout", t("config.field.flow_control_queue_timeout_secs"), r.flow_control_queue_timeout_secs || 1200, { min: 1, step: 1 })}
         ${fieldCheckbox("cfg-rs-priority-hdr", t("config.field.enable_priority_header"), r.enable_priority_header)}
         ${fieldCheckbox("cfg-rs-strip-cc", t("config.field.strip_claude_code_attribution"), r.strip_claude_code_attribution)}
         ${fieldTextarea("cfg-rs-aliases", t("config.field.model_group_alias"), r.model_group_alias || {}, { rows: 3 })}
@@ -2787,6 +2788,7 @@
           schedule_policy: $("cfg-rs-policy").value,
           key_affinity_context_threshold: numOr($("cfg-rs-affinity-ctx"), 0),
           rebalance_threshold: numOr($("cfg-rs-affinity-rebal"), 20),
+          flow_control_queue_timeout_secs: numOr($("cfg-rs-flow-timeout"), 1200),
           enable_priority_header: $("cfg-rs-priority-hdr").checked,
           strip_claude_code_attribution: $("cfg-rs-strip-cc").checked,
           model_group_alias: aliases,

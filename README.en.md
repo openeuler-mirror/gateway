@@ -16,6 +16,7 @@ A production-grade LLM API gateway built in Rust. Unified request entry point fo
 ## Features
 
 - **Multi-Provider Routing** — OpenAI / Anthropic / Azure / Gemini / Bedrock / vLLM / Ollama etc.
+- **Direct Synthesis Workflow** — Run multiple panels concurrently, then synthesize a standard streaming or non-streaming OpenAI response with an aggregator
 - **Load Balancing** — Round-robin, key-affinity, or KVC-aware scheduling across same-name deployments, with live rebalancing counters
 - **Rate Limiting** — Sliding window + concurrency control + custom time windows + scheduled plans
 - **Plan System** — Flexible key plans and team plans (with `member_plan` inheritance), key/team→plan assignment, 3-level fallback
@@ -127,6 +128,25 @@ model_list:
   #     model: anthropic/claude-opus-4-20250514
   #     api_key: os.environ/ANTHROPIC_API_KEY
 
+# Direct Synthesis: clients request fusion; the Gateway runs panels concurrently and aggregates them
+workflow_settings:
+  models:
+    fusion: direct_synthesis
+  workflows:
+    direct_synthesis:
+      type: direct_synthesis
+      roles:
+        panel:
+          - model: gpt-4o
+            temperature: 0.3
+          - model: claude-sonnet
+            temperature: 0.3
+          - model: deepseek-chat
+            temperature: 0.3
+        aggregator:
+          model: gpt-4o
+          temperature: 0.0
+
 # General settings
 general_settings:
   master_key: os.environ/MASTER_KEY
@@ -182,6 +202,13 @@ deployment_health_check:
   failure_threshold: 3
   recovery_threshold: 2
 ```
+
+`fusion` appears in `/v1/models` like an ordinary model and is invoked through
+`/v1/chat/completions`. Panels always run concurrently with non-streaming
+requests; the aggregator returns a standard streaming or non-streaming OpenAI
+response according to the client request. Every child call re-enters the Gateway
+Router and retains model resolution, scheduling, flow control, and inflight
+governance. Workflows are not currently supported on `/v1/messages`.
 
 See [CONFIG_EXAMPLE.md](CONFIG_EXAMPLE.md) for the complete reference (also covers `router_settings`, `cost_templates`, KV-cache-aware routing, and more).
 
@@ -240,10 +267,11 @@ Open `http://localhost:4000/dashboard` in your browser. Log in as `admin` with y
 
 ```
 BooMGateway/
-├── boom-gateway/           Rust workspace root (13 crates)
+├── boom-gateway/           Rust workspace root (14 crates)
 │   ├── boom-core/          Core traits and shared types
 │   ├── boom-auth/          Key authentication (SHA-256 + DB + master key)
 │   ├── boom-config/        YAML config parsing with env var expansion
+│   ├── boom-fusion/        Workflow abstractions and Direct Synthesis orchestration
 │   ├── boom-provider/      LLM provider implementations
 │   ├── boom-limiter/       Sliding window rate limiter + concurrency + PlanStore
 │   ├── boom-flowcontrol/   Per-deployment flow control with VIP priority
@@ -281,7 +309,7 @@ BooMGateway/
 
 | Endpoint | Description |
 |----------|-------------|
-| `POST /v1/chat/completions` | OpenAI chat (streaming / non-streaming) |
+| `POST /v1/chat/completions` | OpenAI chat (streaming / non-streaming, including workflow models) |
 | `POST /v1/messages` | Anthropic Messages API |
 | `POST /v1/completions` | OpenAI completions |
 | `POST /v1/embeddings` | Returns "not supported" |
@@ -587,6 +615,7 @@ Routes by `host` (wildcard `*.example.com`), `path` prefix, `client_ip` CIDR.
 | [docs/kvc-aware-design.md](docs/kvc-aware-design.md) | KVC-Aware routing design document |
 | [docs/kvc-aware-event-reporting-research.md](docs/kvc-aware-event-reporting-research.md) | KV-cache event reporting research (NVIDIA Dynamo, llm-d) |
 | [docs/vip-header-forwarding-design.md](docs/vip-header-forwarding-design.md) | VIP request info forwarding (`X-Gateway-Priority` header) |
+| [docs/direct-synthesis-workflow-design.md](docs/direct-synthesis-workflow-design.md) | Direct Synthesis Workflow architecture, configuration, and execution semantics |
 | [CLAUDE.md](CLAUDE.md) | Development guidelines and architecture principles |
 
 ## License

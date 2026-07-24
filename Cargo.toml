@@ -14,6 +14,7 @@ members = [
     "boom-gateway/boom-dashboard",
     "boom-gateway/boom-promptlog",
     "boom-gateway/boom-kvindex",
+    "boom-gateway/boom-fusion",
 ]
 
 [workspace.package]
