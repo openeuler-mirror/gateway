@@ -3341,21 +3341,40 @@ bob,,,all-team-models,,</pre>
     const existingModels = Array.isArray(key.models) ? key.models : [];
     const isVip = key.metadata && key.metadata.vip === true;
     const isPromptLogExcluded = (window._promptLogExcludedKeys || []).includes(key.token_hash);
-    showModal(`
+    const __html = `
       <h3>${t("form.key.title_edit")}</h3>
-      <div class="form-group"><label>${t("form.key.alias")} ${tip("Short unique identifier for this key, e.g. 'alice'. Used for dashboard display and debug logging.")}</label><input id="m-edit-alias" value="${esc(key.key_alias || "")}"></div>
-      <div class="form-group"><label>${t("form.key.user_id")} ${tip("Optional user identifier.")}</label><input id="m-edit-user" value="${esc(key.user_id || "")}"></div>
-      <div class="form-group"><label>${t("form.key.models")} ${tip("Select model access. Check 'all-team-models' for full access, or pick specific models.")}</label><div class="model-check-combo" id="m-edit-models-combo"></div></div>
-      <div class="form-group"><label>${t("form.key.max_budget")} ${tip("Maximum budget in USD. Leave empty for unlimited.")}</label><input id="m-edit-budget" type="number" step="0.01" value="${key.max_budget != null ? key.max_budget : ""}"></div>
-      <div class="form-group"><label>${t("form.key.rpm")} ${tip("Per-key RPM override. Leave empty to use plan limits.")}</label><input id="m-edit-rpm" type="number" value="${key.rpm_limit || ""}"></div>
-      <div class="form-group"><label>${t("form.key.plan_locked")} ${tip("Rate limit plan assigned to this key. Change via Assignments page.")}</label><input value="${esc(key.plan_name || t("common.default"))}" readonly style="background:var(--surface3);cursor:not-allowed"></div>
-      <div class="form-group"><label>${t("form.key.vip")} ${tip("VIP keys get priority in flow control queues when deployments are at capacity.")}</label><div style="display:flex;align-items:center;gap:8px;padding-top:4px"><input type="checkbox" id="m-edit-vip" ${isVip ? "checked" : ""}><span style="font-weight:600;color:#b45309;white-space:nowrap">${t("form.key.vip_label")}</span></div></div>
-      <div class="form-group"><label>${t("form.key.prompt_log")} ${tip("Disable prompt logging for this key. When the global prompt log switch is ON, this key will be excluded from capture.")}</label><div style="display:flex;align-items:center;gap:8px;padding-top:4px"><input type="checkbox" id="m-edit-no-prompt-log" ${isPromptLogExcluded ? "checked" : ""}><span style="font-weight:600;color:#dc2626;white-space:nowrap">${t("form.key.prompt_log_label")}</span></div></div>
+      <div class="form-grid">
+        <div class="form-card">
+          <div class="form-card-title">${t("key_card.basic")}</div>
+          <div class="form-card-grid">
+            <div class="form-group field-full"><label>${t("form.key.alias")} ${tip("Short unique identifier for this key, e.g. 'alice'. Used for dashboard display and debug logging.")}</label><input id="m-edit-alias" value="${esc(key.key_alias || "")}"></div>
+            <div class="form-group field-full"><label>${t("form.key.user_id")} ${tip("Optional user identifier.")}</label><input id="m-edit-user" value="${esc(key.user_id || "")}"></div>
+            <div class="form-group field-full"><label>${t("form.key.tag")} ${tip("Free-form classification label shown in the keys list. Leave empty to clear.")}</label><input id="m-edit-tag" value="${esc(key.tag || "")}" maxlength="64"></div>
+          </div>
+        </div>
+        <div class="form-card">
+          <div class="form-card-title">${t("key_card.assignment")}</div>
+          <div class="form-card-grid">
+            <div class="form-group field-full"><label>${t("form.key.models")} ${tip("Select model access. Check 'all-team-models' for full access, or pick specific models.")}</label><div class="model-check-combo" id="m-edit-models-combo"></div></div>
+            <div class="form-group field-full"><label>${t("form.key.plan_locked")} ${tip("Rate limit plan assigned to this key. Change via Assignments page.")}</label><input value="${esc(key.plan_name || t("common.default"))}" readonly style="background:var(--surface3);cursor:not-allowed"></div>
+          </div>
+        </div>
+        <div class="form-card">
+          <div class="form-card-title">${t("key_card.limits")}</div>
+          <div class="form-card-grid">
+            <div class="form-group"><label>${t("form.key.max_budget")} ${tip("Maximum budget in USD. Leave empty for unlimited.")}</label><input id="m-edit-budget" type="number" step="0.01" value="${key.max_budget != null ? key.max_budget : ""}"></div>
+            <div class="form-group"><label>${t("form.key.rpm")} ${tip("Per-key RPM override. Leave empty to use plan limits.")}</label><input id="m-edit-rpm" type="number" value="${key.rpm_limit || ""}"></div>
+            <div class="form-group field-full"><label>${t("form.key.vip")} ${tip("VIP keys get priority in flow control queues when deployments are at capacity.")}</label><div style="display:flex;align-items:center;gap:8px;padding-top:4px"><input type="checkbox" id="m-edit-vip" ${isVip ? "checked" : ""}><span style="font-weight:600;color:#b45309;white-space:nowrap">${t("form.key.vip_label")}</span></div></div>
+            <div class="form-group field-full"><label>${t("form.key.prompt_log")} ${tip("Disable prompt logging for this key. When the global prompt log switch is ON, this key will be excluded from capture.")}</label><div style="display:flex;align-items:center;gap:8px;padding-top:4px"><input type="checkbox" id="m-edit-no-prompt-log" ${isPromptLogExcluded ? "checked" : ""}><span style="font-weight:600;color:#dc2626;white-space:nowrap">${t("form.key.prompt_log_label")}</span></div></div>
+          </div>
+        </div>
+      </div>
       <div class="modal-actions">
         <button class="btn-secondary btn-inline" onclick="hideModal()">${t("action.cancel")}</button>
         <button class="btn-primary" id="m-edit-submit">${t("action.save")}</button>
       </div>
-    `);
+    `;
+    showModal(__html, { xwide: true });
     // Populate model checkbox combo with existing models pre-checked
     getModelNames().then((names) => {
       const container = document.getElementById("m-edit-models-combo");
@@ -3365,6 +3384,7 @@ bob,,,all-team-models,,</pre>
       try {
         const aliasVal = document.getElementById("m-edit-alias").value.trim();
         const userVal = document.getElementById("m-edit-user").value.trim();
+        const tagVal = document.getElementById("m-edit-tag").value.trim();
         const modelsVal = getComboModels("m-edit-models-combo");
         const vipChecked = document.getElementById("m-edit-vip").checked;
         // Preserve existing metadata fields, only update vip flag.
@@ -3372,6 +3392,10 @@ bob,,,all-team-models,,</pre>
         const body = {
           key_alias: aliasVal || null,
           user_id: userVal || null,
+          // tag: empty string clears, null leaves untouched. Always send the
+          // trimmed value so COALESCE on the backend either writes "" or the
+          // new label — never silently preserves stale tag.
+          tag: tagVal,
           models: modelsVal || ["all-team-models"],
           max_budget: document.getElementById("m-edit-budget").value ? Number(document.getElementById("m-edit-budget").value) : null,
           rpm_limit: document.getElementById("m-edit-rpm").value ? Number(document.getElementById("m-edit-rpm").value) : null,

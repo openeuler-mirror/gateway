@@ -554,6 +554,9 @@ pub struct UpdateKeyRequest {
     pub budget_duration: Option<String>,
     pub rpm_limit: Option<i64>,
     pub tpm_limit: Option<i64>,
+    /// Optional user-supplied classification tag (≤64 chars). Empty string
+    /// clears the tag; null leaves it untouched (COALESCE semantics).
+    pub tag: Option<String>,
     pub expires: Option<String>,
     pub metadata: Option<serde_json::Value>,
 }
@@ -593,6 +596,18 @@ pub async fn update_key(
         }
     }
 
+    // Validate tag length if provided. Empty string is allowed (clears tag);
+    // null skips the update entirely.
+    if let Some(ref tag) = req.tag {
+        if tag.chars().count() > MAX_TAG_LEN {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                format!("Invalid tag: length must be <= {} chars", MAX_TAG_LEN),
+            )
+                .into_response();
+        }
+    }
+
     let models_list: Option<Vec<String>> = req.models.as_ref().map(|v| {
         if v.iter().any(|m| m == "all-team-models") {
             vec!["all-team-models".to_string()]
@@ -616,8 +631,9 @@ pub async fn update_key(
                budget_duration = COALESCE($7, budget_duration),
                rpm_limit = COALESCE($8, rpm_limit),
                tpm_limit = COALESCE($9, tpm_limit),
-               expires = COALESCE($10, expires),
-               metadata = COALESCE($11, metadata),
+               tag = COALESCE($10, tag),
+               expires = COALESCE($11, expires),
+               metadata = COALESCE($12, metadata),
                updated_at = NOW()
            WHERE token = $1"#,
     )
@@ -630,6 +646,7 @@ pub async fn update_key(
     .bind(&req.budget_duration)
     .bind(req.rpm_limit)
     .bind(req.tpm_limit)
+    .bind(&req.tag)
     .bind(expires)
     .bind(&req.metadata)
     .execute(db_pool)
@@ -1123,6 +1140,17 @@ async fn insert_single_key(
 /// `multipart/form-data` field name expected from the dashboard uploader.
 const IMPORT_FIELD_NAME: &str = "file";
 
+/// Hard upper bound on a single uploaded file. Guards against accidental
+/// giant uploads (an admin pasting a 100MB log file by mistake) OOMing the
+/// handler — admin permission is already required, but defense in depth.
+/// 1 MiB comfortably covers 10k-line payloads at expected per-row sizes.
+const IMPORT_MAX_BYTES: usize = 1 * 1024 * 1024;
+
+/// Hard upper bound on parsed rows. Even below the byte cap, a malicious or
+/// buggy file with extreme per-line density shouldn't trigger unbounded
+/// inserts. 10k rows matches the byte cap at ~100 B/row headroom.
+const IMPORT_MAX_ROWS: usize = 10_000;
+
 pub async fn import_keys(
     _session: AdminSession,
     Extension(state): Extension<std::sync::Arc<DashboardState>>,
@@ -1138,18 +1166,31 @@ pub async fn import_keys(
     // 1. Pull the first file field from multipart.
     let mut file_bytes: Option<Vec<u8>> = None;
     let mut file_name: Option<String> = None;
-    while let Ok(Some(field)) = multipart.next_field().await {
+    while let Ok(Some(mut field)) = multipart.next_field().await {
         if field.name() == Some(IMPORT_FIELD_NAME) {
             file_name = field.file_name().map(|s| s.to_string());
-            file_bytes = match field.bytes().await {
-                Ok(b) => Some(b.to_vec()),
-                Err(e) => {
-                    return Json(json!({
-                        "error": format!("Failed to read upload: {}", e),
-                    }))
-                    .into_response();
+            // Cap field size by chunked reads — axum's Multipart has no
+            // per-field byte limit by default, so we enforce IMPORT_MAX_BYTES
+            // ourselves. Reject early once the limit is crossed.
+            let mut buf = Vec::new();
+            let mut exceeded = false;
+            while let Ok(Some(chunk)) = field.chunk().await {
+                if buf.len() + chunk.len() > IMPORT_MAX_BYTES {
+                    exceeded = true;
+                    break;
                 }
-            };
+                buf.extend_from_slice(&chunk);
+            }
+            if exceeded {
+                return Json(json!({
+                    "error": format!(
+                        "Upload exceeds the {} byte (1 MiB) limit",
+                        IMPORT_MAX_BYTES
+                    ),
+                }))
+                .into_response();
+            }
+            file_bytes = Some(buf);
             break;
         }
         // Drain any other fields so the connection can be reused.
@@ -1180,9 +1221,19 @@ pub async fn import_keys(
         }
     };
 
+    // 3. Cap parsed row count. Truncate rather than reject so the user can
+    //    still see parse_errors for the rows that did come through, with an
+    //    explicit flag in the response noting that the rest were dropped.
+    let truncated = parsed_reqs.len() > IMPORT_MAX_ROWS;
     let parsed_total = parsed_reqs.len();
+    let inserted_count = if truncated { IMPORT_MAX_ROWS } else { parsed_total };
+    let parsed_reqs = if truncated {
+        parsed_reqs.into_iter().take(IMPORT_MAX_ROWS).collect::<Vec<_>>()
+    } else {
+        parsed_reqs
+    };
 
-    // 3. Insert each parsed request via the shared helper.
+    // 4. Insert each parsed request via the shared helper.
     let mut created = Vec::new();
     let mut skipped = Vec::new();
     for req in parsed_reqs {
@@ -1207,6 +1258,9 @@ pub async fn import_keys(
         "file_name": name,
         "format": ext,
         "parsed": parsed_total,
+        "inserted": inserted_count,
+        "truncated": truncated,
+        "max_rows": IMPORT_MAX_ROWS,
         "parse_errors": parse_errors,
         "created": created,
         "skipped": skipped,

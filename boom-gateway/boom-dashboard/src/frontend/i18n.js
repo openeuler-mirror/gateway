@@ -485,6 +485,7 @@
       "form.key.models": "Models",
       "form.key.max_budget": "Max Budget",
       "form.key.rpm": "RPM Limit",
+      "form.key.tag": "Tag",
       "form.key.plan": "Plan",
       "form.key.vip": "VIP",
       "form.key.vip_label": "Priority queue access",
@@ -538,6 +539,7 @@
 
       "config.title": "Configuration",
       "config.intro": "All settings live in config.yaml. Edits here write back in place and trigger a hot-reload.",
+      "config.comment_notice": "Note: web edits re-serialize the YAML and drop comments. A rolling .bak is saved before each write.",
       "config.saved": "Config saved & reloaded",
       "config.reloaded": "Config reloaded",
       "config.error.invalid_json": "Invalid JSON: {msg}",
@@ -1118,6 +1120,7 @@
       "form.key.models": "模型",
       "form.key.max_budget": "最大预算",
       "form.key.rpm": "RPM 限制",
+      "form.key.tag": "标签",
       "form.key.plan": "套餐",
       "form.key.vip": "VIP",
       "form.key.vip_label": "优先队列访问",
@@ -1171,6 +1174,7 @@
 
       "config.title": "配置",
       "config.intro": "所有配置都在 config.yaml 中。在此处的修改会原地写回并触发热加载。",
+      "config.comment_notice": "提示:web 编辑会重新序列化 YAML 并清除原有注释。每次写入前会滚动保存一份 .bak 备份。",
       "config.saved": "配置已保存并热加载",
       "config.reloaded": "配置已热加载",
       "config.error.invalid_json": "JSON 格式错误：{msg}",

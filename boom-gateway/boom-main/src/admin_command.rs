@@ -1,6 +1,5 @@
 use boom_core::provider::Provider;
 use boom_dashboard::state::AdminCommand;
-use boom_flowcontrol::{FlowControlConfig, FlowController};
 use boom_routing::DeploymentStore;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -63,10 +62,18 @@ pub async fn admin_command_handler(mut rx: tokio::sync::mpsc::Receiver<AdminComm
     tracing::warn!("Admin command handler stopped (channel closed)");
 }
 
-/// Replace sensitive field values (`master_key`, `database_url`, `api_key`,
-/// `aws_*_key`) with `"****"` so the GET /admin/config response never leaks
-/// secrets to the browser. Null values (field unset) are preserved as null so
-/// the UI can distinguish "configured" (shows ****) from "unset" (shows empty).
+/// Replace sensitive field values with `"****"` so the GET /admin/config
+/// response never leaks secrets to the browser. Null values (field unset) are
+/// preserved as null so the UI can distinguish "configured" (shows ****) from
+/// "unset" (shows empty).
+///
+/// Matches keys case-insensitively against a fixed list covering:
+///   - top-level litellm secret fields (master_key, database_url, api_key,
+///     aws credentials)
+///   - common HTTP header names that typically carry secrets (authorization,
+///     x-api-key, token, bearer, cookie, set-cookie, proxy-authorization).
+///     These can land in `model_list[*].litellm_params.headers` since headers
+///     is a free-form map and users routinely put bearer tokens there.
 fn mask_secrets(value: &mut serde_json::Value) {
     const SECRET_KEYS: &[&str] = &[
         "master_key",
@@ -74,11 +81,19 @@ fn mask_secrets(value: &mut serde_json::Value) {
         "api_key",
         "aws_access_key_id",
         "aws_secret_access_key",
+        "authorization",
+        "x-api-key",
+        "api-key",
+        "token",
+        "bearer",
+        "cookie",
+        "set-cookie",
+        "proxy-authorization",
     ];
     const MASK: &str = "****";
     if let Some(obj) = value.as_object_mut() {
         for (k, v) in obj.iter_mut() {
-            if SECRET_KEYS.contains(&k.as_str()) {
+            if SECRET_KEYS.iter().any(|s| k.eq_ignore_ascii_case(s)) {
                 if !v.is_null() {
                     *v = serde_json::Value::String(MASK.to_string());
                 }
@@ -130,18 +145,11 @@ async fn handle_create_model(
         .await
         .map_err(|e| format!("DB insert failed: {}", e))?;
 
-    // Build provider and add to memory (if enabled).
-    if req.enabled {
-        if let Some(provider) = build_provider(&req) {
-            state.deployment_store.add_deployment(&req.model_name, provider);
-            let ratio = req.quota_count_ratio.unwrap_or(1) as u64;
-            state.deployment_store.set_quota_ratio(&req.model_name, ratio);
-            tracing::info!(model = %req.model_name, "Model deployment created and loaded");
-        }
-    }
-
-    // Sync flow control config.
-    sync_flow_control(&state.flow_controller, &req.deployment_id, req.max_inflight_queue_len, req.max_context_len);
+    // Memory rebuild is handled by persist_config_in_place → reload, which
+    // walks the YAML model_list via build_deployments_from_config. Doing it
+    // manually here was both redundant (reload wipes + rebuilds the store)
+    // and lossy (the manual path skipped serve_not_match wildcard registration
+    // that the YAML path handles correctly).
 
     Ok(json!({"ok": true, "id": id, "model_name": req.model_name}))
 }
@@ -188,16 +196,9 @@ async fn handle_update_model(
         return Err("Model deployment not found".to_string());
     }
 
-    // Rebuild provider list for this model from DB (handles enable/disable/rename).
-    reload_model_deployments(db_pool, &state.deployment_store, &req.model_name).await;
-
-    if req.enabled {
-        let ratio = req.quota_count_ratio.unwrap_or(1) as u64;
-        state.deployment_store.set_quota_ratio(&req.model_name, ratio);
-    }
-
-    // Sync flow control config.
-    sync_flow_control(&state.flow_controller, &req.deployment_id, req.max_inflight_queue_len, req.max_context_len);
+    // Memory rebuild deferred to persist_config_in_place → reload (called by
+    // the admin command dispatcher after this handler returns). Doing it
+    // manually here would be wiped and redone by reload anyway.
 
     Ok(json!({"ok": true}))
 }
@@ -212,18 +213,15 @@ async fn handle_delete_model(
         .await
         .map_err(|e| format!("DB delete failed: {}", e))?;
 
-    let (model_name, old_deployment_id) = match info {
+    let (model_name, _old_deployment_id) = match info {
         Some(t) => t,
         None => return Err("Model deployment not found".to_string()),
     };
 
-    // Reload deployments for this model_name from DB to keep memory in sync.
-    reload_model_deployments(db_pool, &state.deployment_store, &model_name).await;
-
-    // Remove flow control slot (in-flight requests drain naturally).
-    if let Some(did) = old_deployment_id {
-        state.flow_controller.remove_slot(&did);
-    }
+    // Memory rebuild + orphan flow-control slot cleanup deferred to
+    // persist_config_in_place → reload. seed_flow_controller_from_config
+    // walks the post-edit YAML and calls retain_slots(active_ids), which
+    // removes any slot whose deployment_id is no longer present.
 
     tracing::info!(model = %model_name, "Model deployment deleted");
     Ok(json!({"ok": true, "model_name": model_name}))
@@ -363,57 +361,5 @@ fn build_provider_from_row(row: &boom_routing::DeploymentProviderRow) -> Option<
             tracing::error!("Failed to build provider for '{}': {}", row.model_name, e);
             None
         }
-    }
-}
-
-/// Build a Provider from a CreateDeploymentRequest (dashboard API).
-fn build_provider(req: &boom_dashboard::handlers_admin::CreateDeploymentRequest) -> Option<Arc<dyn Provider>> {
-    let mut extra = req.headers.clone();
-    if let Some(ref v) = req.api_version {
-        extra.insert("api_version".to_string(), v.clone());
-    }
-    if let Some(ref r) = req.aws_region_name {
-        extra.insert("aws_region_name".to_string(), r.clone());
-    }
-
-    // Resolve api_key (may be env reference).
-    let api_key = req.api_key.as_ref().map(|k| {
-        if req.api_key_env.unwrap_or(false) {
-            boom_config::resolve_env_value(k)
-        } else {
-            k.clone()
-        }
-    });
-
-    match boom_provider::create_provider(
-        &req.litellm_model,
-        api_key,
-        req.api_base.clone(),
-        req.timeout as u64,
-        &extra,
-        req.deployment_id.clone(),
-        req.client_type_header,
-    ) {
-        Ok(provider) => Some(provider),
-        Err(e) => {
-            tracing::error!("Failed to build provider for '{}': {}", req.model_name, e);
-            None
-        }
-    }
-}
-
-/// Sync flow control config for a deployment.
-fn sync_flow_control(
-    flow_controller: &Arc<FlowController>,
-    deployment_id: &Option<String>,
-    max_inflight: Option<i32>,
-    max_context: Option<i64>,
-) {
-    if let Some(ref did) = deployment_id {
-        let cfg = FlowControlConfig {
-            max_inflight: max_inflight.unwrap_or(0) as u32,
-            max_context: max_context.unwrap_or(0) as u64,
-        };
-        flow_controller.ensure_slot(did, &cfg);
     }
 }

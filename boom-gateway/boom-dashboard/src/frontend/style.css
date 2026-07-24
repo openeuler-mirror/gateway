@@ -1157,6 +1157,15 @@ div[id$="-table-wrap"]:not(.bare) > table > thead:first-child > tr:first-child >
   gap: 16px;
   align-items: start;
 }
+.config-notice {
+  margin: 8px 0 16px;
+  padding: 8px 12px;
+  border-left: 3px solid var(--accent, #f59e0b);
+  background: var(--surface2, rgba(245, 158, 11, 0.08));
+  border-radius: 4px;
+  font-size: 12px;
+  color: var(--text2, #6b7280);
+}
 .config-grid .form-card { width: 100%; }
 .kv-editor { display: flex; flex-direction: column; gap: 6px; }
 .kv-row { display: grid; grid-template-columns: 1fr 1fr auto; gap: 6px; }

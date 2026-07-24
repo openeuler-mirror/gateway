@@ -649,11 +649,17 @@ impl AppState {
     /// Other singleton sections (`server`, `router_settings.schedule_policy`,
     /// `general_settings`, etc.) are preserved verbatim. Then triggers a
     /// reload so the new config takes effect.
+    ///
+    /// Before writing, rolls a single `.bak` copy so a bad edit can be undone
+    /// by hand (serde_yaml serialization drops comments, so the .bak is also
+    /// the only record of pre-edit annotation).
     pub async fn persist_config_in_place(&self) {
         let pool = match &self.db_pool {
             Some(p) => p,
             None => return,
         };
+
+        backup_yaml(&self.config_path);
 
         let mut root: serde_yaml::Value = match boom_config::read_raw_yaml(&self.config_path) {
             Ok(v) => v,
@@ -711,6 +717,8 @@ impl AppState {
         if segments.is_empty() {
             return Err("Empty config path".to_string());
         }
+
+        backup_yaml(&self.config_path);
 
         let mut root: serde_yaml::Value = boom_config::read_raw_yaml(&self.config_path)
             .map_err(|e| format!("Failed to read config: {}", e))?;
@@ -774,6 +782,18 @@ fn merge_runtime_sections(
 fn json_to_yaml(value: &serde_json::Value) -> Result<serde_yaml::Value, String> {
     let s = serde_json::to_string(value).map_err(|e| format!("json serialize: {}", e))?;
     serde_yaml::from_str(&s).map_err(|e| format!("yaml deserialize: {}", e))
+}
+
+/// Copy `{path}` to `{path}.bak`, overwriting any prior backup. Single-slot
+/// rolling backup — the previous .bak is lost, but no timestamped files
+/// accumulate. Best-effort: a failed copy logs a warning but does not block
+/// the write, since the in-memory state can still recover via reload.
+fn backup_yaml(path: &str) {
+    let bak = format!("{}.bak", path);
+    match std::fs::copy(path, &bak) {
+        Ok(_) => tracing::debug!(from = %path, to = %bak, "Config backed up"),
+        Err(e) => tracing::warn!(from = %path, to = %bak, "Config backup failed: {}", e),
+    }
 }
 
 // ═══════════════════════════════════════════════════════════
