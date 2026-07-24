@@ -239,6 +239,7 @@ plan_settings:
 | `litellm_params.headers` | map | 自定义请求头 |
 | `litellm_params.temperature` | f64 | 温度覆盖 |
 | `litellm_params.max_tokens` | u32 | 最大 token 数覆盖 |
+| `forward_key_hash` | bool | 部署级开关（默认 `false`）。开启后给该部署注入 `X-Gateway-Key-Hash` 转发调用方 key 哈希，仅对可信自建上游启用，第三方厂商不会收到网关身份信息 |
 
 ### model_list[].model_info
 

@@ -459,6 +459,8 @@ async fn chat_completions_inner(
         inner.config.router_settings.enable_priority_header,
         api_path,
         provider.client_type_header(),
+        &identity.key_hash,
+        provider.forward_key_hash(),
     );
 
     // Capture request body for debug recording if debug mode is enabled.
@@ -1401,6 +1403,8 @@ fn build_gateway_headers(
     enable_priority_header: bool,
     api_path: &str,
     client_type_enabled: bool,
+    key_hash: &str,
+    forward_key_hash: bool,
 ) -> std::collections::HashMap<String, String> {
     let mut headers = std::collections::HashMap::new();
     if enable_priority_header {
@@ -1413,6 +1417,11 @@ fn build_gateway_headers(
             boom_ctxaware::CLIENT_TYPE_HEADER.to_string(),
             kind.wire_label().to_string(),
         );
+    }
+    // Only forward the caller identity to deployments that opt in, so
+    // third-party upstreams never receive the gateway's key hash.
+    if forward_key_hash && !key_hash.is_empty() {
+        headers.insert("X-Gateway-Key-Hash".to_string(), key_hash.to_string());
     }
     headers
 }
@@ -2300,6 +2309,8 @@ pub async fn messages(
         inner.config.router_settings.enable_priority_header,
         "/v1/messages",
         provider.client_type_header(),
+        &identity.key_hash,
+        provider.forward_key_hash(),
     );
 
     // Capture request body for debug recording if debug mode is enabled.
@@ -2808,31 +2819,31 @@ mod tests {
 
     #[test]
     fn headers_enabled_vip_gives_100() {
-        let headers = build_gateway_headers(true, true, "/v1/chat/completions", false);
+        let headers = build_gateway_headers(true, true, "/v1/chat/completions", false, "", false);
         assert_eq!(headers.get("X-Gateway-Priority").map(String::as_str), Some("100"));
     }
 
     #[test]
     fn headers_enabled_normal_gives_0() {
-        let headers = build_gateway_headers(false, true, "/v1/chat/completions", false);
+        let headers = build_gateway_headers(false, true, "/v1/chat/completions", false, "", false);
         assert_eq!(headers.get("X-Gateway-Priority").map(String::as_str), Some("0"));
     }
 
     #[test]
     fn headers_disabled_vip_is_empty() {
-        let headers = build_gateway_headers(true, false, "/v1/chat/completions", false);
+        let headers = build_gateway_headers(true, false, "/v1/chat/completions", false, "", false);
         assert!(headers.is_empty(), "no header should be injected when disabled");
     }
 
     #[test]
     fn headers_disabled_normal_is_empty() {
-        let headers = build_gateway_headers(false, false, "/v1/chat/completions", false);
+        let headers = build_gateway_headers(false, false, "/v1/chat/completions", false, "", false);
         assert!(headers.is_empty(), "no header should be injected when disabled");
     }
 
     #[test]
     fn client_type_header_anthropic_on_messages() {
-        let headers = build_gateway_headers(false, false, "/v1/messages", true);
+        let headers = build_gateway_headers(false, false, "/v1/messages", true, "", false);
         assert_eq!(
             headers.get("X-BooM-Client-Type").map(String::as_str),
             Some("anthropic"),
@@ -2841,7 +2852,7 @@ mod tests {
 
     #[test]
     fn client_type_header_anonymous_on_chat_completions() {
-        let headers = build_gateway_headers(false, false, "/v1/chat/completions", true);
+        let headers = build_gateway_headers(false, false, "/v1/chat/completions", true, "", false);
         assert_eq!(
             headers.get("X-BooM-Client-Type").map(String::as_str),
             Some("anonymous"),
@@ -2850,7 +2861,28 @@ mod tests {
 
     #[test]
     fn client_type_header_omitted_when_disabled() {
-        let headers = build_gateway_headers(false, false, "/v1/messages", false);
+        let headers = build_gateway_headers(false, false, "/v1/messages", false, "", false);
         assert!(!headers.contains_key("X-BooM-Client-Type"));
+    }
+
+    #[test]
+    fn key_hash_forwarded_when_enabled() {
+        let headers = build_gateway_headers(false, false, "/v1/chat/completions", false, "abc123", true);
+        assert_eq!(
+            headers.get("X-Gateway-Key-Hash").map(String::as_str),
+            Some("abc123"),
+        );
+    }
+
+    #[test]
+    fn key_hash_omitted_when_disabled() {
+        let headers = build_gateway_headers(false, false, "/v1/chat/completions", false, "abc123", false);
+        assert!(!headers.contains_key("X-Gateway-Key-Hash"));
+    }
+
+    #[test]
+    fn key_hash_omitted_when_empty() {
+        let headers = build_gateway_headers(false, false, "/v1/chat/completions", false, "", true);
+        assert!(!headers.contains_key("X-Gateway-Key-Hash"));
     }
 }

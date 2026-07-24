@@ -1009,6 +1009,9 @@ pub struct CreateDeploymentRequest {
     /// Attach `X-BooM-Client-Type` header to outgoing requests (default false).
     #[serde(default)]
     pub client_type_header: bool,
+    /// Forward the caller's key hash as `X-Gateway-Key-Hash` to this deployment (default false).
+    #[serde(default)]
+    pub forward_key_hash: bool,
 }
 
 fn default_timeout() -> i64 {

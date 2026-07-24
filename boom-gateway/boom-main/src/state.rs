@@ -738,6 +738,7 @@ async fn sync_yaml_to_db(pool: &PgPool, config: &Config, plan_store: &Arc<PlanSt
                 .and_then(|fc| fc.model_context_limit).map(|v| v as i64),
             enabled: entry.enabled,
             client_type_header: entry.client_type_header,
+            forward_key_hash: entry.forward_key_hash,
         };
         yaml_deployments.push(d);
 
@@ -830,6 +831,7 @@ async fn load_db_only_deployments(
             &extra,
             row.deployment_id.clone(),
             row.client_type_header.unwrap_or(false),
+            row.forward_key_hash.unwrap_or(false),
         ) {
             Ok(provider) => {
                 deployment_store.add_deployment(&row.model_name, provider);
@@ -915,6 +917,7 @@ fn build_deployments_from_config(config: &Config, deployment_store: &Arc<Deploym
             &extra,
             deployment_id,
             entry.client_type_header,
+            entry.forward_key_hash,
         ) {
             Ok(provider) => {
                 // Also register as wildcard catch-all if flagged.

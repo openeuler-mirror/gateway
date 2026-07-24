@@ -67,6 +67,15 @@ model_list:
   #     model: openai/gpt-4o
   #     api_key: ${OPENAI_API_KEY}
 
+  # 向下游转发调用方 key 哈希 — 部署级开关，默认关闭
+  # 开启后网关会给该部署注入 X-Gateway-Key-Hash: <key_hash>，供下游调度器做 key 亲和路由。
+  # 按部署粒度开启，只对可信的自建上游启用，第三方厂商（OpenAI/Anthropic 等）不会收到网关身份信息。
+  # - model_name: my-llama
+  #   forward_key_hash: true             # 仅此部署转发 X-Gateway-Key-Hash
+  #   litellm_params:
+  #     model: hosted_vllm/my-model
+  #     api_base: http://my-router:8000/v1
+
 # ──────────────────────────────────────────────
 # 计费模板（可复用的定价表）
 # ──────────────────────────────────────────────

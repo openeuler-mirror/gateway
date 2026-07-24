@@ -15,16 +15,18 @@ pub struct BedrockProvider {
     region: String,
     deployment_id: Option<String>,
     client_type_header: bool,
+    forward_key_hash: bool,
 }
 
 impl BedrockProvider {
-    pub fn new(client: Client, model: &str, region: &str, deployment_id: Option<String>, client_type_header: bool) -> Self {
+    pub fn new(client: Client, model: &str, region: &str, deployment_id: Option<String>, client_type_header: bool, forward_key_hash: bool) -> Self {
         Self {
             client,
             model: model.to_string(),
             region: region.to_string(),
             deployment_id,
             client_type_header,
+            forward_key_hash,
         }
     }
 
@@ -68,5 +70,9 @@ impl Provider for BedrockProvider {
 
     fn client_type_header(&self) -> bool {
         self.client_type_header
+    }
+
+    fn forward_key_hash(&self) -> bool {
+        self.forward_key_hash
     }
 }

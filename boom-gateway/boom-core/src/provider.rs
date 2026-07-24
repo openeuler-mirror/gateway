@@ -48,6 +48,13 @@ pub trait Provider: Send + Sync + 'static {
     fn client_type_header(&self) -> bool {
         false
     }
+
+    /// Whether to forward the caller's key hash to this deployment as the
+    /// `X-Gateway-Key-Hash` header. Driven by the per-deployment
+    /// `forward_key_hash: bool` config flag; default false.
+    fn forward_key_hash(&self) -> bool {
+        false
+    }
 }
 
 /// Rate limiter trait was removed during the limiter normalization refactor

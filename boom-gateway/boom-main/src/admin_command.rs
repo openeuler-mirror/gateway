@@ -79,6 +79,7 @@ async fn handle_create_model(
         max_inflight_queue_len: req.max_inflight_queue_len,
         max_context_len: req.max_context_len,
         client_type_header: req.client_type_header,
+        forward_key_hash: req.forward_key_hash,
     };
 
     let id = DeploymentStore::create_db(db_pool, &input)
@@ -131,6 +132,7 @@ async fn handle_update_model(
         max_inflight_queue_len: req.max_inflight_queue_len,
         max_context_len: req.max_context_len,
         client_type_header: req.client_type_header,
+        forward_key_hash: req.forward_key_hash,
     };
 
     let updated = DeploymentStore::update_db(db_pool, id, &input)
@@ -310,6 +312,7 @@ fn build_provider_from_row(row: &boom_routing::DeploymentProviderRow) -> Option<
         &extra,
         row.deployment_id.clone(),
         row.client_type_header.unwrap_or(false),
+        row.forward_key_hash.unwrap_or(false),
     ) {
         Ok(provider) => Some(provider),
         Err(e) => {
@@ -346,6 +349,7 @@ fn build_provider(req: &boom_dashboard::handlers_admin::CreateDeploymentRequest)
         &extra,
         req.deployment_id.clone(),
         req.client_type_header,
+        req.forward_key_hash,
     ) {
         Ok(provider) => Some(provider),
         Err(e) => {

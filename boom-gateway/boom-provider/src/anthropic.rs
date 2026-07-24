@@ -23,6 +23,7 @@ pub struct AnthropicProvider {
     kv_worker_id: Option<String>,
     api_version: String,
     client_type_header: bool,
+    forward_key_hash: bool,
 }
 
 impl AnthropicProvider {
@@ -33,6 +34,7 @@ impl AnthropicProvider {
         model: &str,
         deployment_id: Option<String>,
         client_type_header: bool,
+        forward_key_hash: bool,
     ) -> Self {
         let kv_worker_id = crate::kv_worker_id_from_api_base(api_base.as_deref());
         Self {
@@ -45,6 +47,7 @@ impl AnthropicProvider {
             kv_worker_id,
             api_version: "2023-06-01".to_string(),
             client_type_header,
+            forward_key_hash,
         }
     }
 
@@ -933,5 +936,9 @@ impl Provider for AnthropicProvider {
 
     fn client_type_header(&self) -> bool {
         self.client_type_header
+    }
+
+    fn forward_key_hash(&self) -> bool {
+        self.forward_key_hash
     }
 }

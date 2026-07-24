@@ -587,6 +587,7 @@ Routes by `host` (wildcard `*.example.com`), `path` prefix, `client_ip` CIDR.
 | [docs/kvc-aware-design.md](docs/kvc-aware-design.md) | KVC-Aware routing design document |
 | [docs/kvc-aware-event-reporting-research.md](docs/kvc-aware-event-reporting-research.md) | KV-cache event reporting research (NVIDIA Dynamo, llm-d) |
 | [docs/vip-header-forwarding-design.md](docs/vip-header-forwarding-design.md) | VIP request info forwarding (`X-Gateway-Priority` header) |
+| [docs/key-hash-forwarding-design.md](docs/key-hash-forwarding-design.md) | Key hash forwarding (`X-Gateway-Key-Hash` header, per-deployment toggle) |
 | [CLAUDE.md](CLAUDE.md) | Development guidelines and architecture principles |
 
 ## License
