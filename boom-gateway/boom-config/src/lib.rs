@@ -301,6 +301,11 @@ pub struct ModelEntry {
     /// otherwise. Default: false.
     #[serde(default)]
     pub client_type_header: bool,
+    /// Forward the caller's key hash to this deployment as `X-Gateway-Key-Hash`.
+    /// Opt-in per deployment so third-party providers never receive gateway
+    /// identity; enable only for trusted upstreams that consume it. Default: false.
+    #[serde(default)]
+    pub forward_key_hash: bool,
 }
 
 /// Provider params — compatible with litellm's `litellm_params` format.

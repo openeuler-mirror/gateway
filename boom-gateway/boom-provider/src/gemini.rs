@@ -17,16 +17,18 @@ pub struct GeminiProvider {
     model: String,
     deployment_id: Option<String>,
     client_type_header: bool,
+    forward_key_hash: bool,
 }
 
 impl GeminiProvider {
-    pub fn new(client: Client, api_key: Option<String>, model: &str, deployment_id: Option<String>, client_type_header: bool) -> Self {
+    pub fn new(client: Client, api_key: Option<String>, model: &str, deployment_id: Option<String>, client_type_header: bool, forward_key_hash: bool) -> Self {
         Self {
             client,
             api_key,
             model: model.to_string(),
             deployment_id,
             client_type_header,
+            forward_key_hash,
         }
     }
 
@@ -578,5 +580,9 @@ impl Provider for GeminiProvider {
 
     fn client_type_header(&self) -> bool {
         self.client_type_header
+    }
+
+    fn forward_key_hash(&self) -> bool {
+        self.forward_key_hash
     }
 }

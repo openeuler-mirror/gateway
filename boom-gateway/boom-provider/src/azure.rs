@@ -17,6 +17,7 @@ pub struct AzureProvider {
     deployment_id: Option<String>,
     kv_worker_id: Option<String>,
     client_type_header: bool,
+    forward_key_hash: bool,
 }
 
 impl AzureProvider {
@@ -28,6 +29,7 @@ impl AzureProvider {
         api_version: &str,
         deployment_id: Option<String>,
         client_type_header: bool,
+        forward_key_hash: bool,
     ) -> Self {
         let base = api_base.unwrap_or_default();
         let kv_worker_id = crate::kv_worker_id_from_api_base(Some(base.as_str()));
@@ -44,6 +46,7 @@ impl AzureProvider {
             deployment_id,
             kv_worker_id,
             client_type_header,
+            forward_key_hash,
         }
     }
 
@@ -210,5 +213,9 @@ impl Provider for AzureProvider {
 
     fn client_type_header(&self) -> bool {
         self.client_type_header
+    }
+
+    fn forward_key_hash(&self) -> bool {
+        self.forward_key_hash
     }
 }

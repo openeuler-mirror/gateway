@@ -587,6 +587,7 @@ prompt_log:
 | [docs/kvc-aware-design.md](docs/kvc-aware-design.md) | KVC 感知路由设计文档 |
 | [docs/kvc-aware-event-reporting-research.md](docs/kvc-aware-event-reporting-research.md) | KV-cache 事件上报机制调研（NVIDIA Dynamo、llm-d） |
 | [docs/vip-header-forwarding-design.md](docs/vip-header-forwarding-design.md) | VIP 请求信息透传（`X-Gateway-Priority` header） |
+| [docs/key-hash-forwarding-design.md](docs/key-hash-forwarding-design.md) | Key 哈希透传（`X-Gateway-Key-Hash` header，部署级开关） |
 | [CLAUDE.md](CLAUDE.md) | 开发指南与架构原则 |
 
 ## 许可证

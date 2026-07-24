@@ -116,6 +116,7 @@ pub struct DeploymentRow {
     pub max_inflight_queue_len: Option<i32>,
     pub max_context_len: Option<i64>,
     pub client_type_header: Option<bool>,
+    pub forward_key_hash: Option<bool>,
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
 }
@@ -134,6 +135,7 @@ pub struct DeploymentProviderRow {
     pub headers: serde_json::Value,
     pub deployment_id: Option<String>,
     pub client_type_header: Option<bool>,
+    pub forward_key_hash: Option<bool>,
 }
 
 /// Minimal deployment row used by boom-main health monitor.
@@ -170,6 +172,7 @@ pub struct DeploymentInput {
     pub max_inflight_queue_len: Option<i32>,
     pub max_context_len: Option<i64>,
     pub client_type_header: bool,
+    pub forward_key_hash: bool,
 }
 
 /// YAML deployment data for sync (no provider needed).
@@ -195,6 +198,7 @@ pub struct YamlDeploymentData {
     pub max_context_len: Option<i64>,
     pub enabled: bool,
     pub client_type_header: bool,
+    pub forward_key_hash: bool,
 }
 
 impl DeploymentStore {
@@ -369,9 +373,9 @@ impl DeploymentStore {
                    (model_name, litellm_model, api_key, api_key_env, api_base, api_version,
                     aws_region_name, aws_access_key_id, aws_secret_access_key,
                     rpm, tpm, timeout, headers, temperature, max_tokens, enabled, source, deployment_id,
-                    quota_count_ratio, max_inflight_queue_len, max_context_len, client_type_header)
+                    quota_count_ratio, max_inflight_queue_len, max_context_len, client_type_header, forward_key_hash)
                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, 'yaml', $17,
-                   $18, $19, $20, $21)"#,
+                   $18, $19, $20, $21, $22)"#,
             )
             .bind(&d.model_name)
             .bind(&d.litellm_model)
@@ -394,6 +398,7 @@ impl DeploymentStore {
             .bind(d.max_inflight_queue_len)
             .bind(d.max_context_len)
             .bind(d.client_type_header)
+            .bind(d.forward_key_hash)
             .execute(pool)
             .await?;
         }
@@ -406,7 +411,7 @@ impl DeploymentStore {
     pub async fn load_db_only_rows(pool: &sqlx::PgPool) -> Result<Vec<DeploymentProviderRow>, sqlx::Error> {
         sqlx::query_as::<_, DeploymentProviderRow>(
             r#"SELECT model_name, litellm_model, api_key, api_key_env, api_base, api_version,
-                      aws_region_name, timeout, headers, deployment_id, client_type_header
+                      aws_region_name, timeout, headers, deployment_id, client_type_header, forward_key_hash
                FROM boom_model_deployment
                WHERE source = 'db' AND enabled IS NOT FALSE
                ORDER BY model_name, created_at"#,
@@ -431,7 +436,7 @@ impl DeploymentStore {
     pub async fn load_model_rows(pool: &sqlx::PgPool, model_name: &str) -> Result<Vec<DeploymentProviderRow>, sqlx::Error> {
         sqlx::query_as::<_, DeploymentProviderRow>(
             r#"SELECT model_name, litellm_model, api_key, api_key_env, api_base, api_version,
-                      aws_region_name, timeout, headers, deployment_id, client_type_header
+                      aws_region_name, timeout, headers, deployment_id, client_type_header, forward_key_hash
                FROM boom_model_deployment
                WHERE model_name = $1 AND enabled IS NOT FALSE
                ORDER BY created_at"#,
@@ -448,9 +453,9 @@ impl DeploymentStore {
                (model_name, litellm_model, api_key, api_key_env, api_base, api_version,
                 aws_region_name, aws_access_key_id, aws_secret_access_key,
                 rpm, tpm, timeout, headers, temperature, max_tokens, enabled, source, deployment_id,
-                quota_count_ratio, max_inflight_queue_len, max_context_len, client_type_header)
+                quota_count_ratio, max_inflight_queue_len, max_context_len, client_type_header, forward_key_hash)
                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, 'db', $17,
-                $18, $19, $20, $21)
+                $18, $19, $20, $21, $22)
                RETURNING id"#,
         )
         .bind(&input.model_name)
@@ -474,6 +479,7 @@ impl DeploymentStore {
         .bind(input.max_inflight_queue_len)
         .bind(input.max_context_len)
         .bind(input.client_type_header)
+        .bind(input.forward_key_hash)
         .fetch_one(pool)
         .await?;
 
@@ -501,6 +507,7 @@ impl DeploymentStore {
                    quota_count_ratio = $19,
                    max_inflight_queue_len = $20, max_context_len = $21,
                    client_type_header = $22,
+                   forward_key_hash = $23,
                    updated_at = NOW()
                WHERE id = $1"#,
         )
@@ -526,6 +533,7 @@ impl DeploymentStore {
         .bind(input.max_inflight_queue_len)
         .bind(input.max_context_len)
         .bind(input.client_type_header)
+        .bind(input.forward_key_hash)
         .execute(pool)
         .await?;
 
@@ -606,7 +614,7 @@ impl DeploymentStore {
                       aws_region_name, aws_access_key_id, aws_secret_access_key,
                       rpm, tpm, timeout, headers, temperature, max_tokens, enabled, auto_disabled,
                       source, deployment_id, quota_count_ratio,
-                      max_inflight_queue_len, max_context_len, client_type_header,
+                      max_inflight_queue_len, max_context_len, client_type_header, forward_key_hash,
                       created_at, updated_at
                FROM boom_model_deployment
                ORDER BY model_name, created_at"#,
@@ -622,7 +630,7 @@ impl DeploymentStore {
                       aws_region_name, aws_access_key_id, aws_secret_access_key,
                       rpm, tpm, timeout, headers, temperature, max_tokens, enabled, auto_disabled,
                       source, deployment_id, quota_count_ratio,
-                      max_inflight_queue_len, max_context_len, client_type_header,
+                      max_inflight_queue_len, max_context_len, client_type_header, forward_key_hash,
                       created_at, updated_at
                FROM boom_model_deployment
                WHERE enabled IS NOT FALSE

@@ -25,6 +25,7 @@ pub fn create_provider(
     extra: &HashMap<String, String>,
     deployment_id: Option<String>,
     client_type_header: bool,
+    forward_key_hash: bool,
 ) -> Result<Arc<dyn Provider>, GatewayError> {
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(timeout.max(1)))
@@ -77,6 +78,7 @@ pub fn create_provider(
                 &actual_model,
                 deployment_id,
                 client_type_header,
+                forward_key_hash,
             )))
         }
         "anthropic" => {
@@ -87,6 +89,7 @@ pub fn create_provider(
                 &actual_model,
                 deployment_id,
                 client_type_header,
+                forward_key_hash,
             );
             if let Some(version) = extra.get("anthropic_version") {
                 provider = provider.with_api_version(version.clone());
@@ -103,6 +106,7 @@ pub fn create_provider(
                 &api_version,
                 deployment_id,
                 client_type_header,
+                forward_key_hash,
             )))
         }
         "gemini" => Ok(Arc::new(gemini::GeminiProvider::new(
@@ -111,6 +115,7 @@ pub fn create_provider(
             &actual_model,
             deployment_id,
             client_type_header,
+            forward_key_hash,
         ))),
         "bedrock" => {
             let region = extra
@@ -123,6 +128,7 @@ pub fn create_provider(
                 &region,
                 deployment_id,
                 client_type_header,
+                forward_key_hash,
             )))
         }
         _ => Err(GatewayError::ConfigError(format!(

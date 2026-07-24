@@ -15,6 +15,7 @@ pub struct OpenAIProvider {
     deployment_id: Option<String>,
     kv_worker_id: Option<String>,
     client_type_header: bool,
+    forward_key_hash: bool,
 }
 
 impl OpenAIProvider {
@@ -25,6 +26,7 @@ impl OpenAIProvider {
         model: &str,
         deployment_id: Option<String>,
         client_type_header: bool,
+        forward_key_hash: bool,
     ) -> Self {
         let kv_worker_id = crate::kv_worker_id_from_api_base(api_base.as_deref());
         Self {
@@ -36,6 +38,7 @@ impl OpenAIProvider {
             deployment_id,
             kv_worker_id,
             client_type_header,
+            forward_key_hash,
         }
     }
 
@@ -244,6 +247,10 @@ impl Provider for OpenAIProvider {
     fn client_type_header(&self) -> bool {
         self.client_type_header
     }
+
+    fn forward_key_hash(&self) -> bool {
+        self.forward_key_hash
+    }
 }
 
 #[cfg(test)]
@@ -315,7 +322,7 @@ mod tests {
     }
 
     fn provider_for(uri: String, api_key: Option<String>) -> OpenAIProvider {
-        OpenAIProvider::new(Client::new(), api_key, Some(uri), "test-model", None, false)
+        OpenAIProvider::new(Client::new(), api_key, Some(uri), "test-model", None, false, false)
     }
 
     #[tokio::test]
@@ -426,5 +433,23 @@ mod tests {
             !requests[0].headers.contains_key("X-Gateway-Priority"),
             "no X-Gateway-Priority header should be sent when gateway_headers is empty"
         );
+    }
+
+    /// Any entry present in gateway_headers is forwarded upstream, including
+    /// the per-deployment identity header `X-Gateway-Key-Hash`.
+    #[tokio::test]
+    async fn chat_forwards_key_hash_header() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(header("X-Gateway-Key-Hash", "abc123"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fake_completion_response()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = provider_for(server.uri(), None);
+        let req = request_with_headers(&[("X-Gateway-Key-Hash", "abc123")]);
+        assert!(provider.chat(req).await.is_ok());
     }
 }
