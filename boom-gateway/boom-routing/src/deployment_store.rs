@@ -639,6 +639,7 @@ impl DeploymentStore {
                       rpm, tpm, timeout, headers, temperature, max_tokens, enabled, auto_disabled,
                       source, deployment_id, quota_count_ratio,
                       max_inflight_queue_len, max_context_len, client_type_header,
+                      serve_not_match, model_info,
                       created_at, updated_at
                FROM boom_model_deployment
                ORDER BY model_name, created_at"#,
