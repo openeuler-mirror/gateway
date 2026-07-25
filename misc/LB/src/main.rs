@@ -314,6 +314,8 @@ fn run_health_probe(state: Arc<HealthState>) {
 
 pub struct Gateway {
     config: Arc<RwLock<Config>>,
+    rings: Arc<RwLock<HashMap<usize, Ring>>>,
+    health: Arc<HealthState>,
 }
 
 #[async_trait]
@@ -345,13 +347,26 @@ impl ProxyHttp for Gateway {
 
         let config = self.config.read().unwrap();
         let addr = match config.resolve_route(host, path, client_ip) {
-            Some((_idx, route)) => match route.backend {
-                Some(b) => b,
+            Some((idx, route)) => match &route.backends {
+                Some(_) => {
+                    let key = extract_api_key(
+                        header
+                            .headers
+                            .get("authorization")
+                            .and_then(|v| v.to_str().ok()),
+                        header.headers.get("x-api-key").and_then(|v| v.to_str().ok()),
+                        client_ip,
+                    );
+                    let unhealthy = self.health.unhealthy.read().unwrap();
+                    let rings = self.rings.read().unwrap();
+                    let ring = rings
+                        .get(&idx)
+                        .expect("ring must exist for a backends-route");
+                    ring.pick(&key, &*unhealthy)
+                }
                 None => route
-                    .backends
-                    .as_ref()
-                    .and_then(|bs| bs.first().copied())
-                    .unwrap_or(config.default_backend),
+                    .backend
+                    .expect("single-backend route must have backend"),
             },
             None => config.default_backend,
         };
@@ -380,7 +395,36 @@ impl ProxyHttp for Gateway {
     }
 }
 
-fn watch_config(path: String, config: Arc<RwLock<Config>>) {
+fn build_rings(config: &Config) -> HashMap<usize, Ring> {
+    config
+        .routes
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| r.backends.as_ref().map(|bs| (i, Ring::new(bs))))
+        .collect()
+}
+
+fn collect_all_backends(config: &Config) -> Vec<SocketAddr> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for r in &config.routes {
+        if let Some(list) = &r.backends {
+            for a in list {
+                if seen.insert(*a) {
+                    out.push(*a);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn watch_config(
+    path: String,
+    config: Arc<RwLock<Config>>,
+    rings: Arc<RwLock<HashMap<usize, Ring>>>,
+    health: Arc<HealthState>,
+) {
     use notify::{Config as NotifyConfig, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
     std::thread::spawn(move || {
@@ -445,8 +489,16 @@ fn watch_config(path: String, config: Arc<RwLock<Config>>) {
 
             match Config::load(&path) {
                 Ok(new_config) => {
-                    let mut guard = config.write().unwrap();
-                    *guard = new_config;
+                    let new_rings = build_rings(&new_config);
+                    let new_backends = collect_all_backends(&new_config);
+                    let backend_set: HashSet<SocketAddr> = new_backends.iter().copied().collect();
+                    {
+                        let mut u = health.unhealthy.write().unwrap();
+                        u.retain(|a| backend_set.contains(a));
+                    }
+                    *health.backends.write().unwrap() = new_backends;
+                    *config.write().unwrap() = new_config;
+                    *rings.write().unwrap() = new_rings;
                     log::info!("config reloaded from {path}");
                 }
                 Err(e) => {
@@ -469,9 +521,16 @@ fn main() {
     server.bootstrap();
 
     let config = Arc::new(RwLock::new(config));
-    watch_config(config_path, config.clone());
+    let rings = Arc::new(RwLock::new(build_rings(&config.read().unwrap())));
+    let health = HealthState::new(collect_all_backends(&config.read().unwrap()));
+    run_health_probe(health.clone());
+    watch_config(config_path, config.clone(), rings.clone(), health.clone());
 
-    let gateway = Gateway { config };
+    let gateway = Gateway {
+        config,
+        rings,
+        health,
+    };
 
     let mut proxy = pingora_proxy::http_proxy_service(&server.configuration, gateway);
 
@@ -592,5 +651,27 @@ routes:
         assert!(probe_once(addr));
         drop(listener);
         assert!(!probe_once(addr));
+    }
+
+    #[test]
+    fn build_rings_and_collect_backends() {
+        let yaml = r#"
+default_backend: "127.0.0.1:8080"
+routes:
+  - host: a.com
+    backend: "10.0.0.1:80"
+  - host: b.com
+    backends: ["10.0.0.2:80", "10.0.0.3:80"]
+  - host: c.com
+    backends: ["10.0.0.2:80", "10.0.0.4:80"]
+"#;
+        let cfg = Config::from_str(yaml).unwrap();
+        let rings = build_rings(&cfg);
+        assert!(rings.contains_key(&1) && rings.contains_key(&2));
+        assert!(!rings.contains_key(&0), "single-backend route has no ring");
+        let all = collect_all_backends(&cfg);
+        let set: HashSet<SocketAddr> = all.iter().copied().collect();
+        assert_eq!(set.len(), 3, "dedup across routes: .2/.3/.4");
+        assert!(set.contains(&"10.0.0.2:80".parse().unwrap()));
     }
 }
