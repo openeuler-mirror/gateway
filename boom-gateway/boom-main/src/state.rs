@@ -1387,6 +1387,39 @@ fn convert_schedule(slots: &[boom_config::ScheduleSlotConfig]) -> Vec<ScheduleSl
 // ═══════════════════════════════════════════════════════════
 
 /// Build a serde_json::Value representing the current runtime config
+/// Normalize raw JSONB `window_limits` into the canonical object form that
+/// `WindowLimit`'s Serialize derive emits and the untagged-enum Helper can
+/// re-parse.
+///
+/// Why: `plan_settings.plans.X.window_limits` is stored in DB as JSONB. Old
+/// rows (or hand-edited SQL) can carry shapes the Helper at
+/// `boom_core::types::deserialize_window_limit_vec` no longer accepts — e.g.
+/// legacy 2-element tuples, objects missing `window_secs`, or wrong field
+/// names. The previous dump path cloned such entries verbatim into YAML,
+/// which then failed reload with "did not match any variant of untagged enum
+/// Helper". This function runs every entry through the same Helper so the
+/// same schema is enforced on the way OUT of the DB as on the way IN — any
+/// shape that wouldn't survive a YAML round-trip is dropped here instead of
+/// breaking reload later. Mirrors how `model_info` already routes through
+/// `ModelInfo` for the same reason.
+fn normalize_window_limits(raw: &serde_json::Value) -> Vec<serde_json::Value> {
+    #[derive(serde::Deserialize)]
+    struct WindowLimitsWrapper {
+        #[serde(deserialize_with = "boom_core::types::deserialize_window_limit_vec")]
+        inner: Vec<boom_core::types::WindowLimit>,
+    }
+
+    let wrapper = serde_json::from_value::<WindowLimitsWrapper>(serde_json::json!({ "inner": raw }));
+    match wrapper {
+        Ok(w) => w
+            .inner
+            .iter()
+            .filter_map(|wl| serde_json::to_value(wl).ok())
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
 /// (model_list, router_settings.model_group_alias, plan_settings).
 async fn build_config_snapshot_value(pool: &PgPool) -> Result<serde_json::Value, sqlx::Error> {
     // ── Model list (delegated to DeploymentStore) ──
@@ -1546,24 +1579,7 @@ async fn build_config_snapshot_value(pool: &PgPool) -> Result<serde_json::Value,
             default_plan = Some(r.name.clone());
         }
 
-        let window_limits: Vec<serde_json::Value> = r
-            .window_limits
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|item| {
-                        // Pass through the entry as-is. The schema is
-                        // multi-dimensional (compact array or verbose object
-                        // form — see boom_core::types::WindowLimit).
-                        if item.is_array() || item.is_object() {
-                            Some(item.clone())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let window_limits = normalize_window_limits(&r.window_limits);
 
         let schedule: Vec<serde_json::Value> = r
             .schedule
@@ -1582,8 +1598,11 @@ async fn build_config_snapshot_value(pool: &PgPool) -> Result<serde_json::Value,
                         if let Some(v) = obj.get("rpm_limit").and_then(|v| v.as_u64()) {
                             slot.insert("rpm_limit".into(), serde_json::Value::Number(v.into()));
                         }
-                        if let Some(wl) = obj.get("window_limits") {
-                            slot.insert("window_limits".into(), wl.clone());
+                        if let Some(raw_wl) = obj.get("window_limits") {
+                            let normalized = normalize_window_limits(raw_wl);
+                            if !normalized.is_empty() {
+                                slot.insert("window_limits".into(), serde_json::Value::Array(normalized));
+                            }
                         }
                         Some(serde_json::Value::Object(slot))
                     })
