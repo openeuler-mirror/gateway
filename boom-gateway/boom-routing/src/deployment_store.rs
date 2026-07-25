@@ -206,6 +206,8 @@ pub struct YamlDeploymentData {
     pub max_context_len: Option<i64>,
     pub enabled: bool,
     pub client_type_header: bool,
+    pub serve_not_match: bool,
+    pub model_info: Option<serde_json::Value>,
 }
 
 impl DeploymentStore {
@@ -380,9 +382,10 @@ impl DeploymentStore {
                    (model_name, litellm_model, api_key, api_key_env, api_base, api_version,
                     aws_region_name, aws_access_key_id, aws_secret_access_key,
                     rpm, tpm, timeout, headers, temperature, max_tokens, enabled, source, deployment_id,
-                    quota_count_ratio, max_inflight_queue_len, max_context_len, client_type_header)
+                    quota_count_ratio, max_inflight_queue_len, max_context_len, client_type_header,
+                    serve_not_match, model_info)
                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, 'yaml', $17,
-                   $18, $19, $20, $21)"#,
+                   $18, $19, $20, $21, $22, $23)"#,
             )
             .bind(&d.model_name)
             .bind(&d.litellm_model)
@@ -405,6 +408,8 @@ impl DeploymentStore {
             .bind(d.max_inflight_queue_len)
             .bind(d.max_context_len)
             .bind(d.client_type_header)
+            .bind(d.serve_not_match)
+            .bind(d.model_info.as_ref().unwrap_or(&serde_json::Value::Null))
             .execute(pool)
             .await?;
         }

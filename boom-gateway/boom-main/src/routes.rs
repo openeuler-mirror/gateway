@@ -135,18 +135,6 @@ fn new_request_id() -> String {
 // Rate-limit helpers
 // ============================================================
 
-/// Apply `rate_limit.enabled` and global defaults to a key's per-identity limits.
-///
-/// Precedence (highest first):
-/// 1. Explicit per-key DB value (`identity.rpm_limit` / `tpm_limit`) — always wins.
-/// 2. Global fallback (`config.rate_limit.default_rpm` / `default_tpm`) — only when
-///    `enabled=true` AND the key didn't set its own value.
-/// 3. None (no limit).
-///
-/// When `enabled=false`, the entire `rate_limit` section is opted out: defaults
-/// don't apply, `window_limits` is emptied, but the key's own DB-set limits still
-/// hold (those are key attributes, not part of the global section).
-///
 /// Resolve a key's effective (rpm, tpm) limits.
 ///
 /// `rate_limit.enabled` is the **fallback switch**, not a global on/off:
@@ -155,10 +143,9 @@ fn new_request_id() -> String {
 /// - `enabled=false`: unconfigured keys get no fallback — only keys that
 ///   carry their own limits (plan assignment or DB columns) are constrained.
 ///
-/// Keys with explicit configuration are never affected by the switch.
-///
-/// Zero values are dropped — interpreted as "no limit" rather than "block all",
-/// matching how litellm treats `rpm_limit: 0`.
+/// Keys with explicit configuration always win over the fallback. Zero values
+/// are dropped — interpreted as "no limit" rather than "block all", matching
+/// how litellm treats `rpm_limit: 0`.
 fn effective_key_limits(
     identity: &AuthIdentity,
     cfg: &boom_config::RateLimitSettings,

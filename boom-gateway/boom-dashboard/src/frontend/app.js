@@ -2309,6 +2309,12 @@
       const data = await api("/admin/models");
       const m = (data.models || []).find((x) => x.id === id);
       if (!m) return;
+      // Backend masks api_key / aws_* as "****". Clear them so the edit
+      // form's inputs start empty — submitting empty converts to null,
+      // and update_db's COALESCE keeps the stored value untouched.
+      ["api_key", "aws_access_key_id", "aws_secret_access_key"].forEach((k) => {
+        if (m[k] === "****") m[k] = "";
+      });
       showNewModelModal(m);
     } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
   };

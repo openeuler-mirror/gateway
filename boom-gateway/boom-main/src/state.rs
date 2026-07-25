@@ -860,6 +860,10 @@ async fn sync_yaml_to_db(pool: &PgPool, config: &Config, plan_store: &Arc<PlanSt
                 .and_then(|fc| fc.model_context_limit).map(|v| v as i64),
             enabled: entry.enabled,
             client_type_header: entry.client_type_header,
+            serve_not_match: entry.serve_not_match,
+            model_info: entry.model_info.as_ref().map(|mi| {
+                serde_json::to_value(mi).unwrap_or(serde_json::Value::Null)
+            }),
         };
         yaml_deployments.push(d);
 

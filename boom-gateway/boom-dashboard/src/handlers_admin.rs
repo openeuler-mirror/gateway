@@ -400,19 +400,19 @@ pub async fn list_keys(
         });
     }
 
-    // Filter by plan assignment. The "none" sentinel matches keys with no
-    // explicit assignment; default-plan fallbacks are NOT considered "none"
-    // here because the operator wants to find truly unconfigured keys.
+    // Filter by plan assignment. The "none" sentinel matches keys with NO
+    // explicit assignment — checked via plan_store, not the resolved
+    // plan_name (which folds in the default-plan fallback). Comparing the
+    // resolved name against default_plan would incorrectly catch keys that
+    // were explicitly assigned to the default plan.
     if let Some(ref plan_filter) = query.plan {
-        let default_plan = state.plan_store.get_default_plan_name();
         match plan_filter.as_str() {
             "none" => keys.retain(|k| {
-                let p = k.get("plan_name").and_then(|v| v.as_str());
-                // Show keys that have no explicit assignment. If a default
-                // plan is configured, those keys would show plan_name=
-                // default — so we filter by the underlying assignment via
-                // the absence of the resolved-or-default name.
-                p.is_none() || p == default_plan.as_deref()
+                let token = k.get("token_hash").and_then(|v| v.as_str());
+                match token {
+                    Some(t) => state.plan_store.get_plan_name(t).is_none(),
+                    None => true,
+                }
             }),
             name => keys.retain(|k| {
                 k.get("plan_name").and_then(|v| v.as_str()) == Some(name)
@@ -1519,7 +1519,7 @@ pub async fn list_models(
                     (v * one_million).to_string()
                 }
             };
-            json!({
+            let mut v = json!({
                 "id": r.id,
                 "model_name": r.model_name,
                 "litellm_model": r.litellm_model,
@@ -1553,7 +1553,22 @@ pub async fn list_models(
                 },
                 "created_at": r.created_at.map(|d| d.to_string()),
                 "updated_at": r.updated_at.map(|d| d.to_string()),
-            })
+            });
+            // Mask long-lived credentials at the boundary. The edit form
+            // detects "****" and clears the input so COALESCE on update
+            // preserves the stored value when the user leaves it empty.
+            // headers values are NOT masked here — scrubbing them would
+            // break edits (update_db writes headers verbatim, not COALESCE).
+            if let Some(obj) = v.as_object_mut() {
+                for k in ["api_key", "aws_access_key_id", "aws_secret_access_key"] {
+                    if let Some(val) = obj.get_mut(k) {
+                        if !val.is_null() {
+                            *val = Value::String("****".to_string());
+                        }
+                    }
+                }
+            }
+            v
         })
         .collect();
 
