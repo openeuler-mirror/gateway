@@ -8,7 +8,7 @@ use pingora_core::Result;
 use pingora_proxy::{ProxyHttp, Session};
 use serde::Deserialize;
 use std::fs;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -21,10 +21,18 @@ struct Args {
 }
 
 #[derive(Debug, Deserialize)]
-struct Config {
+struct ConfigRaw {
     listen_port: Option<u16>,
     tls: Option<TlsConfig>,
     default_backend: String,
+    routes: Vec<RouteRaw>,
+}
+
+#[derive(Debug)]
+struct Config {
+    listen_port: Option<u16>,
+    tls: Option<TlsConfig>,
+    default_backend: SocketAddr,
     routes: Vec<Route>,
 }
 
@@ -40,35 +48,59 @@ struct Route {
     host: Option<String>,
     path: Option<String>,
     client_ip: Option<IpNet>,
-    backend: String,
+    backend: Option<SocketAddr>,
+    backends: Option<Vec<SocketAddr>>,
 }
 
-impl<'de> Deserialize<'de> for Route {
-    fn deserialize<D>(de: D) -> std::result::Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        struct RouteRaw {
-            host: Option<String>,
-            path: Option<String>,
-            client_ip: Option<String>,
-            backend: String,
-        }
-        let raw = RouteRaw::deserialize(de)?;
+impl Route {
+    fn from_raw(raw: RouteRaw) -> std::result::Result<Self, String> {
         let client_ip = raw
             .client_ip
             .as_deref()
-            .map(|s| parse_client_ip(s))
-            .transpose()
-            .map_err(|e| serde::de::Error::custom(format!("invalid client_ip: {e}")))?;
-        Ok(Route {
-            host: raw.host,
-            path: raw.path,
-            client_ip,
-            backend: raw.backend,
-        })
+            .map(parse_client_ip)
+            .transpose()?;
+        match (raw.backend, raw.backends) {
+            (Some(b), None) => Ok(Route {
+                host: raw.host,
+                path: raw.path,
+                client_ip,
+                backend: Some(parse_addr(&b)?),
+                backends: None,
+            }),
+            (None, Some(list)) => {
+                if list.is_empty() {
+                    return Err("route with `backends` has empty list".into());
+                }
+                let mut addrs = Vec::with_capacity(list.len());
+                for s in list {
+                    addrs.push(parse_addr(&s)?);
+                }
+                Ok(Route {
+                    host: raw.host,
+                    path: raw.path,
+                    client_ip,
+                    backend: None,
+                    backends: Some(addrs),
+                })
+            }
+            (Some(_), Some(_)) => Err("route has both `backend` and `backends`".into()),
+            (None, None) => Err("route has neither `backend` nor `backends`".into()),
+        }
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct RouteRaw {
+    host: Option<String>,
+    path: Option<String>,
+    client_ip: Option<String>,
+    backend: Option<String>,
+    backends: Option<Vec<String>>,
+}
+
+fn parse_addr(s: &str) -> std::result::Result<SocketAddr, String> {
+    s.parse()
+        .map_err(|e: std::net::AddrParseError| format!("invalid address '{s}': {e}"))
 }
 
 fn parse_client_ip(s: &str) -> std::result::Result<IpNet, String> {
@@ -84,12 +116,37 @@ impl Config {
     fn load(path: &str) -> std::result::Result<Self, String> {
         let content = fs::read_to_string(path)
             .map_err(|e| format!("failed to read config {path}: {e}"))?;
-        serde_yaml::from_str(&content)
-            .map_err(|e| format!("failed to parse config {path}: {e}"))
+        Self::from_str(&content)
     }
 
-    fn resolve(&self, host: &str, path: &str, client_ip: Option<IpAddr>) -> &str {
-        for route in &self.routes {
+    fn from_str(content: &str) -> std::result::Result<Self, String> {
+        let raw: ConfigRaw =
+            serde_yaml::from_str(content).map_err(|e| format!("failed to parse config: {e}"))?;
+        Self::from_raw(raw)
+    }
+
+    fn from_raw(raw: ConfigRaw) -> std::result::Result<Self, String> {
+        let default_backend = parse_addr(&raw.default_backend)?;
+        let mut routes = Vec::with_capacity(raw.routes.len());
+        for r in raw.routes {
+            routes.push(Route::from_raw(r)?);
+        }
+        Ok(Config {
+            listen_port: raw.listen_port,
+            tls: raw.tls,
+            default_backend,
+            routes,
+        })
+    }
+
+    /// First-match routing. Returns (route_index, &Route); None => use default_backend.
+    fn resolve_route(
+        &self,
+        host: &str,
+        path: &str,
+        client_ip: Option<IpAddr>,
+    ) -> Option<(usize, &Route)> {
+        for (idx, route) in self.routes.iter().enumerate() {
             if let Some(ref r_host) = route.host {
                 if !host_matches(host, r_host) {
                     continue;
@@ -106,9 +163,9 @@ impl Config {
                     _ => continue,
                 }
             }
-            return &route.backend;
+            return Some((idx, route));
         }
-        &self.default_backend
+        None
     }
 }
 
@@ -154,16 +211,17 @@ impl ProxyHttp for Gateway {
             .map(|a| a.ip());
 
         let config = self.config.read().unwrap();
-        let backend = config.resolve(host, path, client_ip);
-        let addr: std::net::SocketAddr = backend
-            .parse()
-            .map_err(|e| {
-                pingora_core::Error::because(
-                    pingora_core::ErrorType::InternalError,
-                    format!("invalid backend address '{backend}': {e}"),
-                    e,
-                )
-            })?;
+        let addr = match config.resolve_route(host, path, client_ip) {
+            Some((_idx, route)) => match route.backend {
+                Some(b) => b,
+                None => route
+                    .backends
+                    .as_ref()
+                    .and_then(|bs| bs.first().copied())
+                    .unwrap_or(config.default_backend),
+            },
+            None => config.default_backend,
+        };
 
         Ok(Box::new(HttpPeer::new(addr, false, String::new())))
     }
@@ -295,4 +353,39 @@ fn main() {
 
     server.add_service(proxy);
     server.run_forever();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_single_and_multi_backend() {
+        let yaml = r#"
+default_backend: "127.0.0.1:8080"
+routes:
+  - host: a.com
+    backend: "10.0.0.1:80"
+  - host: b.com
+    backends: ["10.0.0.2:80", "10.0.0.3:80"]
+"#;
+        let cfg = Config::from_str(yaml).unwrap();
+        assert_eq!(cfg.default_backend, "127.0.0.1:8080".parse().unwrap());
+        assert_eq!(cfg.routes[0].backend, Some("10.0.0.1:80".parse().unwrap()));
+        assert!(cfg.routes[0].backends.is_none());
+        assert!(cfg.routes[1].backend.is_none());
+        assert_eq!(cfg.routes[1].backends.as_ref().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn config_rejects_invalid_routes() {
+        let both = "default_backend: \"127.0.0.1:80\"\nroutes:\n  - host: a\n    backend: \"1.1.1.1:80\"\n    backends: [\"2.2.2.2:80\"]\n";
+        let empty = "default_backend: \"127.0.0.1:80\"\nroutes:\n  - host: a\n    backends: []\n";
+        let neither = "default_backend: \"127.0.0.1:80\"\nroutes:\n  - host: a\n";
+        let bad = "default_backend: \"127.0.0.1:80\"\nroutes:\n  - host: a\n    backends: [\"not-an-addr\"]\n";
+        assert!(Config::from_str(both).is_err());
+        assert!(Config::from_str(empty).is_err());
+        assert!(Config::from_str(neither).is_err());
+        assert!(Config::from_str(bad).is_err());
+    }
 }
