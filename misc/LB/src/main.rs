@@ -7,7 +7,9 @@ use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::Result;
 use pingora_proxy::{ProxyHttp, Session};
 use serde::Deserialize;
+use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
@@ -176,6 +178,52 @@ fn host_matches(request_host: &str, pattern: &str) -> bool {
         req.ends_with(&format!(".{suffix}"))
     } else {
         req == pat
+    }
+}
+
+const VNODES: usize = 150;
+
+fn hash_str(s: &str) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
+}
+
+/// Consistent-hash ring over a route's backends.
+#[derive(Debug, Clone)]
+struct Ring {
+    nodes: Vec<(u64, SocketAddr)>,
+}
+
+impl Ring {
+    fn new(backends: &[SocketAddr]) -> Self {
+        let mut nodes = Vec::with_capacity(backends.len() * VNODES);
+        for (bi, addr) in backends.iter().enumerate() {
+            for vi in 0..VNODES {
+                nodes.push((hash_str(&format!("{addr}#{bi}#{vi}")), *addr));
+            }
+        }
+        nodes.sort_unstable_by_key(|(h, _)| *h);
+        Ring { nodes }
+    }
+
+    /// Clockwise from hash(key): return first healthy node. If all are unhealthy,
+    /// best-effort return the primary (start) node so traffic still attempts.
+    fn pick(&self, key: &str, unhealthy: &HashSet<SocketAddr>) -> SocketAddr {
+        debug_assert!(!self.nodes.is_empty(), "Ring must have >=1 backend");
+        let h = hash_str(key);
+        let n = self.nodes.len();
+        let start = match self.nodes.binary_search_by_key(&h, |(p, _)| *p) {
+            Ok(i) => i,
+            Err(i) => i % n,
+        };
+        for off in 0..n {
+            let (_, addr) = self.nodes[(start + off) % n];
+            if !unhealthy.contains(&addr) {
+                return addr;
+            }
+        }
+        self.nodes[start].1
     }
 }
 
@@ -387,5 +435,49 @@ routes:
         assert!(Config::from_str(empty).is_err());
         assert!(Config::from_str(neither).is_err());
         assert!(Config::from_str(bad).is_err());
+    }
+
+    #[test]
+    fn ring_same_key_same_backend_and_skip_unhealthy() {
+        let backends: Vec<SocketAddr> = ["127.0.0.1:8001", "127.0.0.1:8002", "127.0.0.1:8003"]
+            .iter()
+            .map(|s| s.parse().unwrap())
+            .collect();
+        let ring = Ring::new(&backends);
+        let a = ring.pick("user-key-1", &HashSet::new());
+        let b = ring.pick("user-key-1", &HashSet::new());
+        assert_eq!(a, b, "same key must map to same backend");
+
+        let mut un = HashSet::new();
+        un.insert(a);
+        let c = ring.pick("user-key-1", &un);
+        assert_ne!(c, a, "must skip unhealthy primary");
+        assert!(!un.contains(&c));
+
+        let all: HashSet<SocketAddr> = backends.iter().copied().collect();
+        let d = ring.pick("user-key-1", &all);
+        assert!(all.contains(&d), "all-unhealthy best-effort still returns a node");
+    }
+
+    #[test]
+    fn ring_consistency_on_eviction() {
+        let backends: Vec<SocketAddr> = (8001..=8004)
+            .map(|p| format!("127.0.0.1:{p}").parse().unwrap())
+            .collect();
+        let ring = Ring::new(&backends);
+        let full: HashMap<String, SocketAddr> = (0..2000)
+            .map(|i| {
+                let k = format!("k{i}");
+                (k.clone(), ring.pick(&k, &HashSet::new()))
+            })
+            .collect();
+        let mut un = HashSet::new();
+        un.insert(backends[1]);
+        let on_evicted = full.values().filter(|a| **a == backends[1]).count();
+        let moved = full
+            .iter()
+            .filter(|(k, orig)| ring.pick(k, &un) != **orig)
+            .count();
+        assert_eq!(moved, on_evicted, "only keys on the evicted node should move");
     }
 }
