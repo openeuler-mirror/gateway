@@ -223,41 +223,24 @@ pub struct PlanSettings {
 
 /// Model metadata — compatible with litellm's `model_info` field.
 ///
-/// Cost fields can be set in two ways:
-/// 1. Inline directly here:
-///    ```yaml
-///    model_info:
-///      input_cost_per_million_tokens: 5.0       # $5 / 1M input tokens
-///      cached_input_cost_per_million_tokens: 1.0  # $1 / 1M cached input tokens
-///      output_cost_per_million_tokens: 15.0
-///    ```
-/// 2. By reference to a `cost_templates` entry:
-///    ```yaml
-///    model_info:
-///      cost_template: deepseek-v3
-///    ```
-///    The template's rates override inline fields when both are present —
-///    this lets ops swap pricing for many models in one place.
+/// Pricing is configured exclusively via `cost_templates` (top-level YAML
+/// section). Inline cost fields were removed to avoid ambiguity with
+/// template rates — a single source of truth per model.
 ///
-/// All `*_per_million_tokens` fields are USD per 1 million tokens. The
-/// gateway converts to per-token internally for accounting.
+/// ```yaml
+/// model_info:
+///   cost_template: deepseek-v3      # reference into cost_templates
+///   quota_count_ratio: 2            # each request counts as 2 against quota
+/// ```
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct ModelInfo {
     pub id: Option<String>,
-    #[serde(default)]
-    pub input_cost_per_million_tokens: Option<f64>,
-    /// USD per million cached input tokens (KV-cache hit). Optional — when
-    /// None/0, cache hits are billed at the regular `input_cost_per_million_tokens` rate.
-    #[serde(default)]
-    pub cached_input_cost_per_million_tokens: Option<f64>,
-    #[serde(default)]
-    pub output_cost_per_million_tokens: Option<f64>,
     /// Quota count multiplier for this model.
     /// Each request consumes `quota_count_ratio` units instead of 1.
     /// Defaults to 1 when not set.
     pub quota_count_ratio: Option<u64>,
-    /// Reference to a `cost_templates` entry by name. Template rates take
-    /// precedence over any inline cost fields above.
+    /// Reference to a `cost_templates` entry by name. Single source of
+    /// pricing truth — the gateway looks up rates here, never inline.
     #[serde(default)]
     pub cost_template: Option<String>,
 }
@@ -697,13 +680,30 @@ fn default_workers() -> usize {
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct RateLimitSettings {
+    /// Fallback switch for keys without explicit rate configuration.
+    ///
+    /// When true (default), `default_rpm` / `default_tpm` / `window_limits`
+    /// are applied to any key that has no plan assignment AND no DB-set
+    /// rpm/tpm_limit — i.e. the unconfigured-key safety net is active.
+    ///
+    /// When false, unconfigured keys are not rate-limited at all by the
+    /// fallback path; only keys that carry their own limits (via plan or
+    /// DB column) are constrained. Keys with explicit configuration are
+    /// never affected by this switch.
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Default RPM per key if not set in the database.
+    /// Per-key fallback RPM. Applied only when a key has neither a plan
+    /// assignment nor its own `rpm_limit` in the DB. Acts as the last-mile
+    /// safety net so unconfigured keys still get a sane rate cap.
     #[serde(default = "default_rpm")]
     pub default_rpm: u64,
+    /// Per-key fallback TPM. Same precedence as `default_rpm` — only kicks in
+    /// for plan-less, DB-unset keys.
+    #[serde(default)]
+    pub default_tpm: Option<u64>,
     /// Custom window limits: [[count, window_seconds], ...].
     /// Example: [[100, 18000]] = 100 requests per 5 hours.
+    /// Applied at the key scope in the legacy (plan-less) path.
     #[serde(default)]
     pub window_limits: Vec<Vec<u64>>,
 }
@@ -713,6 +713,7 @@ impl Default for RateLimitSettings {
         Self {
             enabled: true,
             default_rpm: default_rpm(),
+            default_tpm: None,
             window_limits: vec![],
         }
     }
@@ -750,6 +751,14 @@ impl Config {
         // sections plug in without growing this method.
         self.router_settings.kvc_aware.validate()?;
         Ok(())
+    }
+
+    /// Look up a [`CostTemplate`] by name. Used wherever a model's
+    /// `model_info.cost_template` reference needs to be resolved to actual
+    /// rates. Centralizing the lookup keeps the "cost_templates is the only
+    /// source of pricing truth" rule in one place.
+    pub fn lookup_cost_template(&self, name: &str) -> Option<&CostTemplate> {
+        self.cost_templates.iter().find(|t| t.name == name)
     }
 }
 
@@ -955,9 +964,113 @@ pub fn set_yaml_path(
     Ok(())
 }
 
+/// Field names whose values must never be shown to the browser. Case-insensitive.
+///
+/// Covers litellm secret fields (master_key, database_url, api_key, aws
+/// credentials) plus common HTTP header names that routinely carry secrets
+/// (authorization, x-api-key, token, bearer, cookie, set-cookie,
+/// proxy-authorization). The header set is needed because model deployments
+/// accept a free-form `headers` map.
+const SECRET_FIELD_NAMES: &[&str] = &[
+    "master_key",
+    "database_url",
+    "api_key",
+    "aws_access_key_id",
+    "aws_secret_access_key",
+    "authorization",
+    "x-api-key",
+    "api-key",
+    "token",
+    "bearer",
+    "cookie",
+    "set-cookie",
+    "proxy-authorization",
+];
+
+/// True if a JSON/YAML key (case-insensitive) names a secret field.
+pub fn is_secret_field(name: &str) -> bool {
+    SECRET_FIELD_NAMES
+        .iter()
+        .any(|s| name.eq_ignore_ascii_case(s))
+}
+
+/// Recursively replace values of secret fields with `"****"`. Null values are
+/// preserved so the UI can distinguish "configured" (shows ****) from "unset"
+/// (shows empty). Used to scrub the GET /admin/config response.
+pub fn mask_secrets_in_place(value: &mut serde_json::Value) {
+    const MASK: &str = "****";
+    if let Some(obj) = value.as_object_mut() {
+        for (k, v) in obj.iter_mut() {
+            if is_secret_field(k) {
+                if !v.is_null() {
+                    *v = serde_json::Value::String(MASK.to_string());
+                }
+            } else {
+                mask_secrets_in_place(v);
+            }
+        }
+    } else if let Some(arr) = value.as_array_mut() {
+        for v in arr {
+            mask_secrets_in_place(v);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_mask_secrets_in_place_masks_known_fields() {
+        let mut v = serde_json::json!({
+            "master_key": "sk-live-123",
+            "database_url": "postgres://user:pw@host/db",
+            "model_list": [
+                {
+                    "litellm_params": {
+                        "api_key": "sk-real",
+                        "model": "gpt-4",
+                        "headers": {
+                            "Authorization": "Bearer secret",
+                            "X-Custom": "keep-me"
+                        }
+                    }
+                }
+            ],
+            "router_settings": {
+                "schedule_policy": "round_robin"
+            }
+        });
+        mask_secrets_in_place(&mut v);
+
+        assert_eq!(v["master_key"], "****");
+        assert_eq!(v["database_url"], "****");
+        assert_eq!(v["model_list"][0]["litellm_params"]["api_key"], "****");
+        assert_eq!(
+            v["model_list"][0]["litellm_params"]["headers"]["Authorization"],
+            "****"
+        );
+        // Non-secret fields preserved verbatim, including case-insensitive
+        // matching for Authorization.
+        assert_eq!(v["model_list"][0]["litellm_params"]["model"], "gpt-4");
+        assert_eq!(
+            v["model_list"][0]["litellm_params"]["headers"]["X-Custom"],
+            "keep-me"
+        );
+        assert_eq!(v["router_settings"]["schedule_policy"], "round_robin");
+    }
+
+    #[test]
+    fn test_mask_secrets_in_place_preserves_null() {
+        // Null means "field unset" — UI must distinguish from "configured".
+        let mut v = serde_json::json!({
+            "master_key": null,
+            "api_key": "sk-real"
+        });
+        mask_secrets_in_place(&mut v);
+        assert!(v["master_key"].is_null());
+        assert_eq!(v["api_key"], "****");
+    }
 
     #[test]
     fn test_explicit_provider_prefix() {

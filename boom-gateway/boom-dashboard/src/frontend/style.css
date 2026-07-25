@@ -936,6 +936,30 @@ div[id$="-table-wrap"]:not(.bare) {
 div[id$="-table-wrap"]:not(.bare) > table {
   border: none;
 }
+/* Models table has many columns (model, aliases, litellm_model, cost×3,
+   api_base URL, ratio, rpm, timeout, enabled, source, actions). The api_base
+   URL in particular is long and was getting truncated. Allow horizontal
+   scrolling so URLs and other wide cells stay on a single line; the tooltip
+   from [title] still gives a quick hover-peek without having to scroll. */
+#models-table-wrap {
+  overflow-x: auto;
+}
+.models-table {
+  min-width: 100%;
+  width: max-content;
+  max-width: none;
+}
+.models-table td.cell-url {
+  white-space: nowrap;
+  max-width: 420px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.models-table td.cell-url:hover {
+  white-space: normal;
+  word-break: break-all;
+  overflow: visible;
+}
 .table-card > table > thead:first-child > tr:first-child > th,
 div[id$="-table-wrap"]:not(.bare) > table > thead:first-child > tr:first-child > th {
   /* header bg blends with the card so the top corners stay rounded cleanly */
@@ -1094,6 +1118,18 @@ div[id$="-table-wrap"]:not(.bare) > table > thead:first-child > tr:first-child >
   border-radius: 12px;
   padding: 16px 18px;
   background: var(--surface);
+  display: flex;
+  flex-direction: column;
+}
+/* Inside a config card, the grey hint paragraph is forced to the bottom
+   regardless of where it sits in the HTML — keeps the title at top, fields
+   in the middle, hint + actions stacked at the bottom. */
+.form-card .modal-hint {
+  order: 3;
+  margin-top: 12px;
+}
+.form-card .form-card-actions {
+  order: 4;
 }
 .form-card-title {
   font-size: 11px;

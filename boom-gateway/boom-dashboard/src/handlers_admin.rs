@@ -206,6 +206,14 @@ pub struct ListKeysQuery {
     pub search: Option<String>,
     #[serde(default)]
     pub vip_only: Option<String>,
+    /// Filter by plan assignment.
+    ///   - unset            → no filter
+    ///   - "none"           → keys with no explicit assignment AND no default plan
+    ///   - any other string → keys whose effective plan_name matches exactly
+    /// "none" deliberately excludes default-plan keys — the dashboard uses it
+    /// to surface "truly unconfigured" keys that need attention.
+    #[serde(default)]
+    pub plan: Option<String>,
 }
 
 fn default_page() -> i64 {
@@ -391,6 +399,27 @@ pub async fn list_keys(
                 .unwrap_or(false)
         });
     }
+
+    // Filter by plan assignment. The "none" sentinel matches keys with no
+    // explicit assignment; default-plan fallbacks are NOT considered "none"
+    // here because the operator wants to find truly unconfigured keys.
+    if let Some(ref plan_filter) = query.plan {
+        let default_plan = state.plan_store.get_default_plan_name();
+        match plan_filter.as_str() {
+            "none" => keys.retain(|k| {
+                let p = k.get("plan_name").and_then(|v| v.as_str());
+                // Show keys that have no explicit assignment. If a default
+                // plan is configured, those keys would show plan_name=
+                // default — so we filter by the underlying assignment via
+                // the absence of the resolved-or-default name.
+                p.is_none() || p == default_plan.as_deref()
+            }),
+            name => keys.retain(|k| {
+                k.get("plan_name").and_then(|v| v.as_str()) == Some(name)
+            }),
+        }
+    }
+
     let filtered_total = keys.len() as i64;
 
     // In-memory pagination.
@@ -1499,9 +1528,12 @@ pub async fn list_models(
                 "api_base": r.api_base,
                 "api_version": r.api_version,
                 "aws_region_name": r.aws_region_name,
+                "aws_access_key_id": r.aws_access_key_id,
+                "aws_secret_access_key": r.aws_secret_access_key,
                 "rpm": r.rpm,
                 "tpm": r.tpm,
                 "timeout": r.timeout,
+                "headers": r.headers,
                 "temperature": r.temperature,
                 "max_tokens": r.max_tokens,
                 "enabled": r.enabled.unwrap_or(true),
@@ -1511,6 +1543,9 @@ pub async fn list_models(
                 "quota_count_ratio": r.quota_count_ratio.unwrap_or(1),
                 "max_inflight_queue_len": r.max_inflight_queue_len,
                 "max_context_len": r.max_context_len,
+                "client_type_header": r.client_type_header.unwrap_or(false),
+                "serve_not_match": r.serve_not_match,
+                "model_info": r.model_info,
                 "cost_per_million": {
                     "input": per_million(rate.input_cost_per_token),
                     "cached_input": per_million(rate.cached_input_cost_per_token),

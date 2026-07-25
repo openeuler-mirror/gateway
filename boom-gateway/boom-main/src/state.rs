@@ -1057,11 +1057,12 @@ fn build_deployments_from_config(config: &Config, deployment_store: &Arc<Deploym
                 deployment_store.set_quota_ratio(&entry.model_name, ratio);
 
                 // Per-model cost rates for billing/quota accounting.
-                // Resolution order: cost_template reference overrides inline
-                // cost fields. Inline fields fill in any rate the template
-                // left unset (None). Falls back to inline only when no template.
+                // Pricing is sourced exclusively from `cost_templates` —
+                // model_info no longer carries inline cost fields (v3 single-
+                // source-of-truth refactor). The model_info.cost_template name
+                // selects which template applies; missing template = no rate.
                 //
-                // YAML rates are USD per million tokens (e.g. `0.27` = $0.27/1M
+                // YAML rates are CNY per million tokens (e.g. `0.27` = ¥0.27/1M
                 // tokens). Convert to per-token Decimal internally for accurate
                 // accounting on small requests.
                 if let Some(info) = entry.model_info.as_ref() {
@@ -1071,15 +1072,9 @@ fn build_deployments_from_config(config: &Config, deployment_store: &Arc<Deploym
                             .map(|d| d / rust_decimal::Decimal::from(1_000_000))
                     };
 
-                    let (in_input, in_cached, in_output) = (
-                        info.input_cost_per_million_tokens,
-                        info.cached_input_cost_per_million_tokens,
-                        info.output_cost_per_million_tokens,
-                    );
-
-                    // Template lookup (overrides inline when present).
+                    // Template lookup is the only source of rates now.
                     let template_rates = info.cost_template.as_ref().and_then(|tn| {
-                        config.cost_templates.iter().find(|t| t.name == *tn).map(|t| {
+                        config.lookup_cost_template(tn).map(|t| {
                             (
                                 t.input_cost_per_million_tokens,
                                 t.cached_input_cost_per_million_tokens,
@@ -1088,40 +1083,35 @@ fn build_deployments_from_config(config: &Config, deployment_store: &Arc<Deploym
                         })
                     });
 
-                    // If template name was set but not found, warn and fall
-                    // back to inline fields (don't silently bill at zero).
                     if let (Some(ref tn), None) = (&info.cost_template, &template_rates) {
                         tracing::warn!(
                             model = %entry.model_name,
                             template = %tn,
-                            "cost_template not found in cost_templates — falling back to inline fields"
+                            "cost_template not found in cost_templates — no rate registered"
                         );
                     }
 
-                    let (src_input, src_cached, src_output) = match template_rates {
-                        Some(t) => t,
-                        None => (in_input, in_cached, in_output),
-                    };
+                    if let Some((src_input, src_cached, src_output)) = template_rates {
+                        let input_rate = per_million_to_per_token(src_input);
+                        let cached_rate = per_million_to_per_token(src_cached);
+                        let output_rate = per_million_to_per_token(src_output);
 
-                    let input_rate = per_million_to_per_token(src_input);
-                    let cached_rate = per_million_to_per_token(src_cached);
-                    let output_rate = per_million_to_per_token(src_output);
-
-                    if input_rate.is_some() || output_rate.is_some() || cached_rate.is_some() {
-                        let rate = boom_routing::ModelCostRate::with_cached(
-                            input_rate.unwrap_or_default(),
-                            cached_rate.unwrap_or_default(),
-                            output_rate.unwrap_or_default(),
-                        );
-                        deployment_store.set_cost_rate(&entry.model_name, rate);
-                        tracing::info!(
-                            model = %entry.model_name,
-                            template = ?info.cost_template,
-                            input_per_1m = src_input.unwrap_or(0.0),
-                            cached_per_1m = src_cached.unwrap_or(0.0),
-                            output_per_1m = src_output.unwrap_or(0.0),
-                            "Registered cost rate (USD per million tokens)"
-                        );
+                        if input_rate.is_some() || output_rate.is_some() || cached_rate.is_some() {
+                            let rate = boom_routing::ModelCostRate::with_cached(
+                                input_rate.unwrap_or_default(),
+                                cached_rate.unwrap_or_default(),
+                                output_rate.unwrap_or_default(),
+                            );
+                            deployment_store.set_cost_rate(&entry.model_name, rate);
+                            tracing::info!(
+                                model = %entry.model_name,
+                                template = ?info.cost_template,
+                                input_per_1m = src_input.unwrap_or(0.0),
+                                cached_per_1m = src_cached.unwrap_or(0.0),
+                                output_per_1m = src_output.unwrap_or(0.0),
+                                "Registered cost rate (CNY per million tokens)"
+                            );
+                        }
                     }
                 }
             }
@@ -1474,23 +1464,26 @@ async fn build_config_snapshot_value(pool: &PgPool) -> Result<serde_json::Value,
                 );
             }
 
-            // ── model_info: merge DB JSONB (cost fields) + deployment_id
-            // (as `id`) + quota_count_ratio. Each source is optional; emit
-            // the node only when at least one piece is present so legacy
+            // ── model_info: deserialize DB JSONB through the ModelInfo schema
+            // so unknown fields (including the v3-removed inline cost fields)
+            // are dropped automatically — the schema is the whitelist, no
+            // hardcoded blacklist to keep in sync. Then layer in the
+            // canonical `id` (deployment_id column) and quota_count_ratio.
+            // Emit the node only when at least one piece is present so legacy
             // rows without metadata stay clean.
             let mut mi = serde_json::Map::new();
+            if let Some(info) = r
+                .model_info
+                .as_ref()
+                .and_then(|v| serde_json::from_value::<boom_config::ModelInfo>(v.clone()).ok())
+            {
+                if let Some(ct) = info.cost_template {
+                    mi.insert("cost_template".into(), serde_json::Value::String(ct));
+                }
+            }
             if let Some(ref did) = r.deployment_id {
                 if !did.is_empty() {
                     mi.insert("id".into(), serde_json::Value::String(did.clone()));
-                }
-            }
-            if let Some(obj) = r.model_info.as_ref().and_then(|v| v.as_object()) {
-                for (k, v) in obj {
-                    // Don't let a stray `id` in the JSONB override the
-                    // canonical deployment_id from the column.
-                    if k != "id" {
-                        mi.insert(k.clone(), v.clone());
-                    }
                 }
             }
             // quota_count_ratio lives in its own DB column but YAML schema

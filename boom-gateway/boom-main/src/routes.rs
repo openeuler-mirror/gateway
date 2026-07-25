@@ -131,6 +131,118 @@ fn new_request_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
+// ============================================================
+// Rate-limit helpers
+// ============================================================
+
+/// Apply `rate_limit.enabled` and global defaults to a key's per-identity limits.
+///
+/// Precedence (highest first):
+/// 1. Explicit per-key DB value (`identity.rpm_limit` / `tpm_limit`) — always wins.
+/// 2. Global fallback (`config.rate_limit.default_rpm` / `default_tpm`) — only when
+///    `enabled=true` AND the key didn't set its own value.
+/// 3. None (no limit).
+///
+/// When `enabled=false`, the entire `rate_limit` section is opted out: defaults
+/// don't apply, `window_limits` is emptied, but the key's own DB-set limits still
+/// hold (those are key attributes, not part of the global section).
+///
+/// Resolve a key's effective (rpm, tpm) limits.
+///
+/// `rate_limit.enabled` is the **fallback switch**, not a global on/off:
+/// - `enabled=true` (default): keys with no plan and no DB rpm/tpm_limit
+///   inherit `default_rpm` / `default_tpm` as a safety net.
+/// - `enabled=false`: unconfigured keys get no fallback — only keys that
+///   carry their own limits (plan assignment or DB columns) are constrained.
+///
+/// Keys with explicit configuration are never affected by the switch.
+///
+/// Zero values are dropped — interpreted as "no limit" rather than "block all",
+/// matching how litellm treats `rpm_limit: 0`.
+fn effective_key_limits(
+    identity: &AuthIdentity,
+    cfg: &boom_config::RateLimitSettings,
+) -> (Option<u64>, Option<u64>) {
+    if !cfg.enabled {
+        return (
+            identity.rpm_limit.filter(|v| *v > 0),
+            identity.tpm_limit.filter(|v| *v > 0),
+        );
+    }
+    let rpm = identity
+        .rpm_limit
+        .or(Some(cfg.default_rpm))
+        .filter(|v| *v > 0);
+    let tpm = identity
+        .tpm_limit
+        .or(cfg.default_tpm)
+        .filter(|v| *v > 0);
+    (rpm, tpm)
+}
+
+/// Materialize the fallback `window_limits` list. Empty when the fallback
+/// switch is off — operator explicitly opted out, so the section's custom
+/// windows must not constrain traffic either.
+fn effective_window_limits(
+    raw: &[Vec<u64>],
+    cfg: &boom_config::RateLimitSettings,
+) -> Vec<boom_core::types::WindowLimit> {
+    if !cfg.enabled {
+        return Vec::new();
+    }
+    raw.iter()
+        .filter_map(|w| {
+            if w.len() >= 2 {
+                Some(boom_core::types::WindowLimit {
+                    counts: Some(w[0]),
+                    tokens: None,
+                    costs: None,
+                    window_secs: w[1],
+                })
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Fold rpm/tpm shorthand into the 60s slot of an existing window list.
+///
+/// Rules:
+/// - If a 60s counts window already exists (from explicit `window_limits`),
+///   leave its `counts` alone (user config wins over shorthand) but attach
+///   `tpm` to its `tokens` dimension when unset — so a single window admits
+///   both caps instead of spawning a parallel 60s window.
+/// - Otherwise push a new 60s window carrying whichever of rpm/tpm is set.
+/// - No-op when both are None.
+fn fold_rpm_tpm_into_60s(
+    windows: &mut Vec<boom_core::types::WindowLimit>,
+    rpm: Option<u64>,
+    tpm: Option<u64>,
+) {
+    if rpm.is_none() && tpm.is_none() {
+        return;
+    }
+    let has_60s_counts = windows
+        .iter()
+        .any(|w| w.window_secs == 60 && w.counts.is_some());
+    if !has_60s_counts {
+        windows.push(boom_core::types::WindowLimit {
+            counts: rpm,
+            tokens: tpm,
+            costs: None,
+            window_secs: 60,
+        });
+    } else if tpm.is_some() {
+        if let Some(slot) = windows
+            .iter_mut()
+            .find(|w| w.window_secs == 60 && w.counts.is_some() && w.tokens.is_none())
+        {
+            slot.tokens = tpm;
+        }
+    }
+}
+
 // ═══════════════════════════════════════════════════════════
 // Debug logging — dump full request/response for specific keys
 // ═══════════════════════════════════════════════════════════
@@ -346,26 +458,17 @@ async fn chat_completions_inner(
     );
 
     // 2. Plan-based or default rate limiting.
-    let window_limits: Vec<boom_core::types::WindowLimit> = inner
-        .config
-        .rate_limit
-        .window_limits
-        .iter()
-        .filter_map(|w| {
-            if w.len() >= 2 {
-                Some(boom_core::types::WindowLimit {
-                    counts: Some(w[0]),
-                    tokens: None,
-                    costs: None,
-                    window_secs: w[1],
-                })
-            } else {
-                None
-            }
-        })
-        .collect();
+    let rate_limit_cfg = &inner.config.rate_limit;
+    let window_limits = effective_window_limits(&rate_limit_cfg.window_limits, rate_limit_cfg);
     let weight = resolve_quota_weight(&req.model, &state);
     let resolved_model_for_quota = resolve_model_name(&req.model, &state);
+
+    // Apply global fallbacks so unconfigured keys still get a cap. Without
+    // this, a key with no DB-set rpm/tpm AND no plan would slip past the
+    // legacy rate-limit path entirely. The fallback only fills in gaps —
+    // an explicit DB value always wins. When rate_limit.enabled=false the
+    // defaults are skipped (key's own DB limits still apply).
+    let (effective_rpm, effective_tpm) = effective_key_limits(identity, rate_limit_cfg);
 
     let mut plan_charge = check_plan_limits(
         &state,
@@ -375,7 +478,8 @@ async fn chat_completions_inner(
         identity.team_id.as_deref(),
         &req.model,
         &resolved_model_for_quota,
-        identity.rpm_limit,
+        effective_rpm,
+        effective_tpm,
         &window_limits,
         weight,
     )
@@ -1615,6 +1719,7 @@ async fn check_plan_limits(
     requested_model: &str,
     resolved_model: &str,
     rpm_limit: Option<u64>,
+    tpm_limit: Option<u64>,
     window_limits: &[boom_core::types::WindowLimit],
     weight: u64,
 ) -> Result<PlanCharge, GatewayError> {
@@ -1636,26 +1741,12 @@ async fn check_plan_limits(
     // ── Resolve team plan (if team_id is set) ──
     let team_plan: Option<RateLimitPlan> = team_id.and_then(|tid| plan_store.resolve_team_plan(tid));
 
-    // If neither key nor team has a plan → fall back to legacy per-model RPM limits.
-    // window_limits came from the global rate_limit config; rpm_limit is per-key.
+    // If neither key nor team has a plan → fall back to legacy per-model RPM/TPM limits.
+    // window_limits came from the global rate_limit config; rpm_limit/tpm_limit
+    // are per-key (already merged with global defaults at the call site).
     if key_plan.is_none() && team_plan.is_none() {
         let mut legacy_windows: Vec<boom_core::types::WindowLimit> = window_limits.to_vec();
-        // Fold rpm_limit into a 60s counts entry so peek_only can check it
-        // uniformly. If a 60s counts entry already exists, leave the explicit
-        // one in place (user config wins over shorthand).
-        let has_60s_counts = legacy_windows
-            .iter()
-            .any(|w| w.window_secs == 60 && w.counts.is_some());
-        if !has_60s_counts {
-            if let Some(rpm) = rpm_limit {
-                legacy_windows.push(boom_core::types::WindowLimit {
-                    counts: Some(rpm),
-                    tokens: None,
-                    costs: None,
-                    window_secs: 60,
-                });
-            }
-        }
+        fold_rpm_tpm_into_60s(&mut legacy_windows, rpm_limit, tpm_limit);
 
         let rl_key = RateLimitKey {
             key_hash: key_hash.to_string(),
@@ -1880,22 +1971,10 @@ async fn check_plan_limits(
         }
         d
     } else {
-        // Team-only path: build legacy windows for the key (rpm shorthand +
-        // caller-supplied window_limits, all counts-only).
+        // Team-only path: build legacy windows for the key (rpm/tpm shorthand
+        // + caller-supplied window_limits).
         let mut legacy_windows: Vec<boom_core::types::WindowLimit> = window_limits.to_vec();
-        let has_60s_counts = legacy_windows
-            .iter()
-            .any(|w| w.window_secs == 60 && w.counts.is_some());
-        if !has_60s_counts {
-            if let Some(rpm) = rpm_limit {
-                legacy_windows.push(boom_core::types::WindowLimit {
-                    counts: Some(rpm),
-                    tokens: None,
-                    costs: None,
-                    window_secs: 60,
-                });
-            }
-        }
+        fold_rpm_tpm_into_60s(&mut legacy_windows, rpm_limit, tpm_limit);
         let fallback_key = RateLimitKey {
             key_hash: key_hash.to_string(),
             model: requested_model.to_string(),
@@ -1929,19 +2008,7 @@ async fn check_plan_limits(
             },
             {
                 let mut w = window_limits.to_vec();
-                let has_60s_counts = w
-                    .iter()
-                    .any(|x| x.window_secs == 60 && x.counts.is_some());
-                if !has_60s_counts {
-                    if let Some(rpm) = rpm_limit {
-                        w.push(boom_core::types::WindowLimit {
-                            counts: Some(rpm),
-                            tokens: None,
-                            costs: None,
-                            window_secs: 60,
-                        });
-                    }
-                }
+                fold_rpm_tpm_into_60s(&mut w, rpm_limit, tpm_limit);
                 w
             },
         )
@@ -2191,26 +2258,12 @@ pub async fn messages(
     );
 
     // 2. Plan-based or default rate limiting.
-    let window_limits: Vec<boom_core::types::WindowLimit> = inner
-        .config
-        .rate_limit
-        .window_limits
-        .iter()
-        .filter_map(|w| {
-            if w.len() >= 2 {
-                Some(boom_core::types::WindowLimit {
-                    counts: Some(w[0]),
-                    tokens: None,
-                    costs: None,
-                    window_secs: w[1],
-                })
-            } else {
-                None
-            }
-        })
-        .collect();
+    let rate_limit_cfg = &inner.config.rate_limit;
+    let window_limits = effective_window_limits(&rate_limit_cfg.window_limits, rate_limit_cfg);
     let weight = resolve_quota_weight(&openai_req.model, &state);
     let resolved_model_for_quota = resolve_model_name(&openai_req.model, &state);
+
+    let (effective_rpm, effective_tpm) = effective_key_limits(identity, rate_limit_cfg);
 
     let mut plan_charge = check_plan_limits(
         &state,
@@ -2220,7 +2273,8 @@ pub async fn messages(
         identity.team_id.as_deref(),
         &openai_req.model,
         &resolved_model_for_quota,
-        identity.rpm_limit,
+        effective_rpm,
+        effective_tpm,
         &window_limits,
         weight,
     )

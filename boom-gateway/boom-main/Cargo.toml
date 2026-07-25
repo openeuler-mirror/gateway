@@ -8,7 +8,7 @@ name = "boom-gateway"
 path = "src/main.rs"
 
 [features]
-default = ["debug-tools"]
+default = []
 debug-tools = ["boom-dashboard/debug-tools"]
 
 [dependencies]

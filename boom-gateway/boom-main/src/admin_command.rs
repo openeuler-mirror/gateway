@@ -84,7 +84,7 @@ pub async fn admin_command_handler(mut rx: tokio::sync::mpsc::Receiver<AdminComm
                 let mut json = serde_json::to_value(&inner.config)
                     .map_err(|e| format!("Serialize config: {}", e));
                 if let Ok(ref mut v) = json {
-                    mask_secrets(v);
+                    boom_config::mask_secrets_in_place(v);
                 }
                 let _ = reply.send(json);
             }
@@ -104,52 +104,6 @@ fn augment_with_warning(result: &mut Result<Value, String>, warning: String) {
                 "warning".into(),
                 serde_json::Value::String(warning),
             );
-        }
-    }
-}
-
-/// Replace sensitive field values with `"****"` so the GET /admin/config
-/// response never leaks secrets to the browser. Null values (field unset) are
-/// preserved as null so the UI can distinguish "configured" (shows ****) from
-/// "unset" (shows empty).
-///
-/// Matches keys case-insensitively against a fixed list covering:
-///   - top-level litellm secret fields (master_key, database_url, api_key,
-///     aws credentials)
-///   - common HTTP header names that typically carry secrets (authorization,
-///     x-api-key, token, bearer, cookie, set-cookie, proxy-authorization).
-///     These can land in `model_list[*].litellm_params.headers` since headers
-///     is a free-form map and users routinely put bearer tokens there.
-fn mask_secrets(value: &mut serde_json::Value) {
-    const SECRET_KEYS: &[&str] = &[
-        "master_key",
-        "database_url",
-        "api_key",
-        "aws_access_key_id",
-        "aws_secret_access_key",
-        "authorization",
-        "x-api-key",
-        "api-key",
-        "token",
-        "bearer",
-        "cookie",
-        "set-cookie",
-        "proxy-authorization",
-    ];
-    const MASK: &str = "****";
-    if let Some(obj) = value.as_object_mut() {
-        for (k, v) in obj.iter_mut() {
-            if SECRET_KEYS.iter().any(|s| k.eq_ignore_ascii_case(s)) {
-                if !v.is_null() {
-                    *v = serde_json::Value::String(MASK.to_string());
-                }
-            } else {
-                mask_secrets(v);
-            }
-        }
-    } else if let Some(arr) = value.as_array_mut() {
-        for v in arr {
-            mask_secrets(v);
         }
     }
 }

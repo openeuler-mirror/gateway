@@ -207,7 +207,7 @@
       try {
         alert(t("common.warning_prefix", { message: data.warning }));
       } catch {
-        alert("Warning: " + data.warning);
+        alert(t("common.warning_prefix", { message: data.warning }));
       }
     }
     return data;
@@ -351,7 +351,6 @@
     if (section === "admin-models") loadModels();
     else if (section === "admin-plans") loadPlans();
     else if (section === "admin-keys") { setupKeysSearch(); loadKeys(); }
-    else if (section === "admin-assignments") loadAssignments();
     else if (section === "admin-quota") loadQuota();
     else if (section === "admin-logs") { setupLogsFilters(); loadLogs(); }
     else if (section === "admin-debug") { loadAgentStats(); loadRebalanceMoves(); }
@@ -364,7 +363,6 @@
     if (hash.includes("/admin/plans")) return "admin-plans";
     if (hash.includes("/admin/keys")) return "admin-keys";
     if (hash.includes("/admin/quota")) return "admin-quota";
-    if (hash.includes("/admin/assignments")) return "admin-assignments";
     if (hash.includes("/admin/logs")) return "admin-logs";
     if (hash.includes("/admin/debug")) return "admin-debug";
     if (hash.includes("/admin/config")) return "admin-config";
@@ -1071,7 +1069,7 @@
         if (dimKey === "costs") {
           used = Number(d.current_micros || 0);
           limit = Number(d.limit_micros || 0);
-          const valTxt = "$" + (d.current || "0") + " / " + (limit > 0 ? "$" + (d.limit || "0") : "∞");
+          const valTxt = "¥" + (d.current || "0") + " / " + (limit > 0 ? "¥" + (d.limit || "0") : "∞");
           return meterHtml(label, valTxt, pct(used, limit));
         }
         used = Number(d.current || 0);
@@ -1612,7 +1610,7 @@
           if (k === "costs") {
             cur = Number(d.current_micros || 0);
             limit = Number(d.limit_micros || 0);
-            display = "$" + (d.current || "0") + " / " + (limit > 0 ? "$" + (d.limit || "0") : t("common.unlimited"));
+            display = "¥" + (d.current || "0") + " / " + (limit > 0 ? "¥" + (d.limit || "0") : t("common.unlimited"));
           } else {
             cur = Number(d.current || 0);
             limit = Number(d.limit || 0);
@@ -1684,21 +1682,21 @@
         dimHtml += `
           <div class="dim-row">
             <span class="dim-label">${esc(t("plan.dim.regular_input_cost"))}</span>
-            <div class="dim-value">$${esc(c.regular_input_cost || "0")}</div>
+            <div class="dim-value">¥${esc(c.regular_input_cost || "0")}</div>
           </div>`;
       }
       if ((c.cached_input_cost_micros || 0) > 0) {
         dimHtml += `
           <div class="dim-row">
             <span class="dim-label">${esc(t("plan.dim.cached_input_cost"))}</span>
-            <div class="dim-value">$${esc(c.cached_input_cost || "0")}</div>
+            <div class="dim-value">¥${esc(c.cached_input_cost || "0")}</div>
           </div>`;
       }
       if ((c.output_cost_micros || 0) > 0) {
         dimHtml += `
           <div class="dim-row">
             <span class="dim-label">${esc(t("plan.dim.output_cost"))}</span>
-            <div class="dim-value">$${esc(c.output_cost || "0")}</div>
+            <div class="dim-value">¥${esc(c.output_cost || "0")}</div>
           </div>`;
       }
       if (dimHtml) {
@@ -1752,8 +1750,8 @@
       [t("keyinfo.alias"), info.key_alias || "-"],
       [t("keyinfo.token"), info.token_prefix],
       [t("keyinfo.name"), info.key_name || "-"],
-      [t("keyinfo.spend"), "$" + (info.spend || 0).toFixed(4)],
-      [t("keyinfo.max_budget"), info.max_budget != null ? "$" + info.max_budget : t("common.unlimited")],
+      [t("keyinfo.spend"), "¥" + (info.spend || 0).toFixed(4)],
+      [t("keyinfo.max_budget"), info.max_budget != null ? "¥" + info.max_budget : t("common.unlimited")],
       [t("keyinfo.blocked"), info.blocked ? t("common.yes") : t("common.no")],
       [t("keyinfo.expires"), info.expires || t("common.never")],
       [t("keyinfo.created"), info.created_at || "-"],
@@ -1836,7 +1834,7 @@
     const wrap = document.getElementById("plans-table-wrap");
     if (plans.length === 0) { wrap.innerHTML = "<p>" + t("plans.empty") + "</p>"; return; }
     const fmtOptInt = (v) => (v == null ? "-" : Number(v).toLocaleString());
-    const fmtOptCost = (v) => (v == null ? "-" : "$" + String(v));
+    const fmtOptCost = (v) => (v == null ? "-" : "¥" + String(v));
     const fmtSchedule = (slots) => {
       if (!Array.isArray(slots) || slots.length === 0) return "-";
       return slots.map((s) => esc(s.hours || "")).join(", ");
@@ -1900,19 +1898,51 @@
   let keysSearch = "";
   let keysSearchTimer = null;
   let keysVipOnly = false;
+  let keysPlanFilter = "";  // "" = all, "none" = unassigned, otherwise plan name
   let keysDataCache = [];
 
   function setupKeysSearch() {
     const el = document.getElementById("keys-search");
-    if (!el) return;
-    el.value = keysSearch;
-    el.addEventListener("input", () => {
-      clearTimeout(keysSearchTimer);
-      keysSearchTimer = setTimeout(() => {
-        keysSearch = el.value.trim();
+    if (el) {
+      el.value = keysSearch;
+      el.addEventListener("input", () => {
+        clearTimeout(keysSearchTimer);
+        keysSearchTimer = setTimeout(() => {
+          keysSearch = el.value.trim();
+          keysPage = 1;
+          loadKeys();
+        }, 300);
+      });
+    }
+    // Plan filter dropdown: populated lazily on first focus / section show,
+    // since plans may be added or removed via the Plans page.
+    const planSel = document.getElementById("keys-plan-filter");
+    if (planSel) {
+      refreshKeysPlanFilterOptions(planSel);
+      planSel.addEventListener("change", () => {
+        keysPlanFilter = planSel.value;
         keysPage = 1;
         loadKeys();
-      }, 300);
+      });
+    }
+  }
+
+  // Rebuild the dropdown's <option> list. Preserves the current selection when
+  // possible — falls back to "all" if the selected plan no longer exists.
+  function refreshKeysPlanFilterOptions(sel) {
+    getPlanNames().then((names) => {
+      const opts = [`<option value="">${t("keys.plan_filter.all")}</option>`]
+        .concat([`<option value="none" ${keysPlanFilter === "none" ? "selected" : ""}>${t("keys.plan_filter.none")}</option>`])
+        .concat(names.map((n) => `<option value="${esc(n)}" ${keysPlanFilter === n ? "selected" : ""}>${esc(n)}</option>`));
+      sel.innerHTML = opts.join("");
+      // Drop stale selection (plan deleted on Plans page).
+      const stillExists = keysPlanFilter === "" || keysPlanFilter === "none" || names.includes(keysPlanFilter);
+      if (!stillExists) {
+        keysPlanFilter = "";
+        sel.value = "";
+      } else {
+        sel.value = keysPlanFilter;
+      }
     });
   }
 
@@ -1927,6 +1957,7 @@
       let url = `/admin/keys?page=${keysPage}&per_page=50`;
       if (keysSearch) url += `&search=${encodeURIComponent(keysSearch)}`;
       if (keysVipOnly) url += "&vip_only=true";
+      if (keysPlanFilter) url += `&plan=${encodeURIComponent(keysPlanFilter)}`;
       const data = await api(url);
       keysDataCache = data.keys || [];
       renderKeysTable(keysDataCache);
@@ -1950,9 +1981,9 @@
     };
     const fmtCost = (s) => {
       const v = Number(s) || 0;
-      if (v >= 1) return "$" + v.toFixed(2);
-      if (v > 0) return "$" + v.toFixed(4);
-      return "$0";
+      if (v >= 1) return "¥" + v.toFixed(2);
+      if (v > 0) return "¥" + v.toFixed(4);
+      return "¥0";
     };
     wrap.innerHTML = `<table>
       <tr><th>${t("keys.col.token")}</th><th>${t("keys.col.alias")}</th><th>${t("keys.col.user")}</th><th>${t("keys.col.plan")}</th><th>${t("keys.col.usage")}</th><th>${t("keys.col.spend")}</th><th>${t("keys.col.budget")}</th><th>${t("keys.col.status")}</th><th>${t("keys.col.actions")}</th></tr>
@@ -2019,9 +2050,15 @@
       done();
     }
   };
-  window._editKey = (tokenHash) => {
+  window._editKey = async (tokenHash) => {
     const key = keysDataCache.find((k) => k.token_hash === tokenHash);
-    if (key) showEditKeyModal(key);
+    if (!key) return;
+    try {
+      await showEditKeyModal(key);
+    } catch (err) {
+      console.error("showEditKeyModal failed:", err);
+      alert(t("common.error_prefix", { message: err?.message || String(err) }));
+    }
   };
   window._blockKey = async (hash) => {
     await api(`/admin/keys/${encodeURIComponent(hash)}/block`, { method: "POST" });
@@ -2035,54 +2072,6 @@
     if (!confirm(t("confirm.reset_key"))) return;
     const r = await api(`/admin/limits/reset/${encodeURIComponent(hash)}`, { method: "POST" });
     alert(r.message || t("alert.done"));
-  };
-
-  // ── Admin: Assignments ────────────────────────────────
-  let assignmentsPage = 1;
-  const ASSIGNMENTS_PER_PAGE = 20;
-  let assignmentsTotal = 0;
-  let assignmentsData = [];
-
-  async function loadAssignments(page) {
-    try {
-      assignmentsPage = page || 1;
-      const data = await api(`/admin/assignments?page=${assignmentsPage}&page_size=${ASSIGNMENTS_PER_PAGE}`);
-      assignmentsData = data.assignments || [];
-      assignmentsTotal = data.total || 0;
-      renderAssignmentsTable();
-    } catch {}
-  }
-
-  function renderAssignmentsTable() {
-    const wrap = document.getElementById("assignments-table-wrap");
-    if (assignmentsTotal === 0) { wrap.innerHTML = "<p>" + t("assignments.empty") + "</p>"; renderAssignmentsPagination(); return; }
-    wrap.innerHTML = `<table>
-      <tr><th>${t("assignments.col.key")}</th><th>${t("assignments.col.plan")}</th><th>${t("assignments.col.actions")}</th></tr>
-      ${assignmentsData.map((a) => `<tr>
-        <td><span>${esc(a.key_alias || t("assignments.no_alias"))}</span><br><span class="mono muted">${esc(a.token_prefix || a.key_hash.substring(0, 8) + "...")}</span></td>
-        <td>${esc(a.plan_name)}</td>
-        <td><button class="btn-danger" onclick="window._unassignKey('${esc(a.key_hash)}')">${t("action.remove")}</button></td>
-      </tr>`).join("")}
-    </table>`;
-    renderAssignmentsPagination();
-  }
-
-  function renderAssignmentsPagination() {
-    const el = document.getElementById("assignments-pagination");
-    const pages = Math.ceil(assignmentsTotal / ASSIGNMENTS_PER_PAGE);
-    if (pages <= 1) { el.innerHTML = ""; return; }
-    el.innerHTML = `
-      <button ${assignmentsPage <= 1 ? "disabled" : ""} onclick="window._loadAssignmentsPage(${assignmentsPage - 1})">&lt;</button>
-      <span>${t("common.page_of", { page: assignmentsPage, total: pages, count: assignmentsTotal, unit: t("nav.assignments") })}</span>
-      <button ${assignmentsPage >= pages ? "disabled" : ""} onclick="window._loadAssignmentsPage(${assignmentsPage + 1})">&gt;</button>
-    `;
-  }
-
-  window._loadAssignmentsPage = (p) => loadAssignments(p);
-
-  window._unassignKey = async (hash) => {
-    await api(`/admin/assignments/${encodeURIComponent(hash)}`, { method: "DELETE" });
-    loadAssignments();
   };
 
   // ── Admin: Models ─────────────────────────────────────
@@ -2110,7 +2099,7 @@
     const wrap = document.getElementById("models-table-wrap");
     if (models.length === 0) { wrap.innerHTML = "<p>" + t("models.empty") + "</p>"; return; }
     aliasesMap = aliasesMap || {};
-    wrap.innerHTML = `<table>
+    wrap.innerHTML = `<table class="models-table">
       <tr><th>${t("models.col.model")}</th><th>${t("models.col.aliases")}</th><th>${t("models.col.litellm_model")}</th><th>${t("models.col.cost")}</th><th>${t("models.col.base_url")}</th><th>${t("models.col.ratio")}</th><th>${t("models.col.rpm")}</th><th>${t("models.col.timeout")}</th><th>${t("models.col.enabled")}</th><th>${t("models.col.source")}</th><th>${t("models.col.actions")}</th></tr>
       ${models.map((m) => {
         const isAutoDisabled = !m.enabled && m.auto_disabled;
@@ -2126,7 +2115,7 @@
         // Cost cell: inline "label:$value" per line, three rows. Compact so
         // the column stays narrow even when EN headers squeeze the table.
         const c = m.cost_per_million || {};
-        const fmtCost = (v) => (v == null || v === "0" || v === "") ? "-" : "$" + v;
+        const fmtCost = (v) => (v == null || v === "0" || v === "") ? "-" : "¥" + v;
         const costCell = '<div class="cost-cell">'
           + '<div class="cost-line"><span class="cost-label">' + esc(t("plan.dim.regular_input_cost")) + ':</span><span class="cost-value">' + fmtCost(c.input) + '</span></div>'
           + '<div class="cost-line"><span class="cost-label">' + esc(t("plan.dim.cached_input_cost")) + ':</span><span class="cost-value">' + fmtCost(c.cached_input) + '</span></div>'
@@ -2148,7 +2137,7 @@
         <td>${aliasCell}</td>
         <td class="mono">${esc(m.litellm_model)}</td>
         <td>${costCell}</td>
-        <td class="mono">${esc(m.api_base || "-")}</td>
+        <td class="mono cell-url" title="${esc(m.api_base || "")}">${esc(m.api_base || "-")}</td>
         <td>${m.quota_count_ratio && m.quota_count_ratio !== 1 ? '<span class="badge badge-plan">x' + m.quota_count_ratio + '</span>' : 'x1'}</td>
         <td>${m.rpm || "-"}</td>
         <td>${m.timeout}s</td>
@@ -2163,7 +2152,13 @@
     </table>`;
   }
 
-  function showNewModelModal(prefill) {
+  async function showNewModelModal(prefill) {
+    // Cost templates drive the pricing dropdown — load them lazily so the
+    // modal works even on a fresh page where Config hasn't been visited.
+    if (!_configCache) {
+      try { _configCache = await api("/admin/config"); }
+      catch (_e) { /* dropdown just shows empty — non-fatal */ }
+    }
     const p = prefill || {};
     const headers = p.headers || {};
     const modelInfo = p.model_info || {};
@@ -2173,66 +2168,69 @@
         <div class="form-card">
           <div class="form-card-title">${t("model_card.basic")}</div>
           <div class="form-card-grid">
-            <div class="form-group field-full"><label>${t("form.model.name")} * ${tip("Client-visible model name. Multiple deployments can share the same name for load balancing.")}</label><input id="m-model-name" value="${esc(p.model_name || "")}" required></div>
-            <div class="form-group"><label>${t("form.model.provider")} * ${tip("Upstream provider type. Determines API format and authentication.")}</label><select id="m-model-provider"><option value="">${t("common.select_placeholder")}</option><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option><option value="azure">Azure OpenAI</option><option value="gemini">Google Gemini</option><option value="bedrock">AWS Bedrock</option></select></div>
-            <div class="form-group"><label>${t("form.model.id")} * ${tip("Actual model ID at the provider, e.g. gpt-4o, claude-sonnet-4-20250514.")}</label><input id="m-model-id" value="${esc((p.litellm_model || "").includes("/") ? p.litellm_model.split("/").slice(1).join("/") : p.litellm_model || "")}" required></div>
-            <div class="form-group field-checkbox"><input id="m-model-enabled" type="checkbox" ${p.enabled !== false ? "checked" : ""}><label for="m-model-enabled">${t("form.model.enabled")} ${tip("Disabled deployments are ignored in routing.")}</label></div>
+            <div class="form-group field-full"><label>${t("form.model.name")} * ${tip(t("tip.model.name"))}</label><input id="m-model-name" value="${esc(p.model_name || "")}" required></div>
+            <div class="form-group"><label>${t("form.model.provider")} * ${tip(t("tip.model.provider"))}</label><select id="m-model-provider"><option value="">${t("common.select_placeholder")}</option><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option><option value="azure">Azure OpenAI</option><option value="gemini">Google Gemini</option><option value="bedrock">AWS Bedrock</option></select></div>
+            <div class="form-group"><label>${t("form.model.id")} * ${tip(t("tip.model.id"))}</label><input id="m-model-id" value="${esc((p.litellm_model || "").includes("/") ? p.litellm_model.split("/").slice(1).join("/") : p.litellm_model || "")}" required></div>
+            <div class="form-group field-checkbox"><input id="m-model-enabled" type="checkbox" ${p.enabled !== false ? "checked" : ""}><label for="m-model-enabled">${t("form.model.enabled")} ${tip(t("tip.model.enabled"))}</label></div>
           </div>
         </div>
         <div class="form-card">
           <div class="form-card-title">${t("model_card.auth")}</div>
           <div class="form-card-grid">
-            <div class="form-group"><label>${t("form.model.api_key")} ${tip("Provider API key. Use os.environ/VAR_NAME for env reference.")}</label><input id="m-model-key" type="password" value="${esc(p.api_key || "")}" placeholder="sk-... or os.environ/VAR"></div>
-            <div class="form-group field-checkbox"><input id="m-model-key-env" type="checkbox" ${(p.api_key_env) ? "checked" : ""}><label for="m-model-key-env">${t("form.model.api_key_env")} ${tip("Enable if the API Key field contains an environment variable reference.")}</label></div>
-            <div class="form-group field-full"><label>${t("form.model.headers")} ${tip("Custom headers (JSON object). Values support env-var expansion.")}</label><textarea id="m-model-headers" rows="2" style="font-family:var(--mono);font-size:12px">${esc(Object.keys(headers).length ? JSON.stringify(headers, null, 2) : "")}</textarea></div>
+            <div class="form-group"><label>${t("form.model.api_key")} ${tip(t("tip.model.api_key"))}</label><input id="m-model-key" type="password" value="${esc(p.api_key || "")}" placeholder="sk-... or os.environ/VAR"></div>
+            <div class="form-group field-checkbox"><input id="m-model-key-env" type="checkbox" ${(p.api_key_env) ? "checked" : ""}><label for="m-model-key-env">${t("form.model.api_key_env")} ${tip(t("tip.model.api_key_env"))}</label></div>
+            <div class="form-group field-full"><label>${t("form.model.headers")} ${tip(t("tip.model.headers"))}</label><textarea id="m-model-headers" rows="2" style="font-family:var(--mono);font-size:12px">${esc(Object.keys(headers).length ? JSON.stringify(headers, null, 2) : "")}</textarea></div>
           </div>
         </div>
-        <div class="form-card">
+        <div class="form-card" id="m-model-aws-card" style="display:none">
           <div class="form-card-title">${t("model_card.aws")}</div>
           <div class="form-card-grid">
-            <div class="form-group"><label>${t("form.model.aws_region")} ${tip("AWS region for Bedrock deployments.")}</label><input id="m-model-aws-region" value="${esc(p.aws_region_name || "")}"></div>
-            <div class="form-group"><label>${t("form.model.aws_key_id")} ${tip("AWS access key ID. Use os.environ/VAR_NAME for env reference.")}</label><input id="m-model-aws-key" value="${esc(p.aws_access_key_id || "")}"></div>
-            <div class="form-group field-full"><label>${t("form.model.aws_secret")} ${tip("AWS secret access key. Use os.environ/VAR_NAME for env reference.")}</label><input id="m-model-aws-secret" type="password" value="${esc(p.aws_secret_access_key || "")}"></div>
+            <div class="form-group"><label>${t("form.model.aws_region")} ${tip(t("tip.model.aws_region"))}</label><input id="m-model-aws-region" value="${esc(p.aws_region_name || "")}"></div>
+            <div class="form-group"><label>${t("form.model.aws_key_id")} ${tip(t("tip.model.aws_key_id"))}</label><input id="m-model-aws-key" value="${esc(p.aws_access_key_id || "")}"></div>
+            <div class="form-group field-full"><label>${t("form.model.aws_secret")} ${tip(t("tip.model.aws_secret"))}</label><input id="m-model-aws-secret" type="password" value="${esc(p.aws_secret_access_key || "")}"></div>
           </div>
         </div>
         <div class="form-card">
           <div class="form-card-title">${t("model_card.rate_limit")}</div>
           <div class="form-card-grid">
-            <div class="form-group"><label>${t("form.model.rpm")} ${tip("Per-deployment RPM limit. Leave empty for unlimited.")}</label><input id="m-model-rpm" type="number" value="${p.rpm || ""}"></div>
-            <div class="form-group"><label>${t("form.model.tpm")} ${tip("Per-deployment TPM limit. Leave empty for unlimited.")}</label><input id="m-model-tpm" type="number" value="${p.tpm || ""}"></div>
-            <div class="form-group"><label>${t("form.model.ratio")} ${tip("Quota consumption multiplier. Default: 1.")}</label><input id="m-model-ratio" type="number" min="1" step="1" value="${p.quota_count_ratio || 1}"></div>
+            <div class="form-group"><label>${t("form.model.rpm")} ${tip(t("tip.model.rpm"))}</label><input id="m-model-rpm" type="number" value="${p.rpm || ""}"></div>
+            <div class="form-group"><label>${t("form.model.tpm")} ${tip(t("tip.model.tpm"))}</label><input id="m-model-tpm" type="number" value="${p.tpm || ""}"></div>
+            <div class="form-group"><label>${t("form.model.ratio")} ${tip(t("tip.model.ratio"))}</label><input id="m-model-ratio" type="number" min="1" step="1" value="${p.quota_count_ratio || 1}"></div>
           </div>
         </div>
         <div class="form-card">
           <div class="form-card-title">${t("model_card.flow_control")}</div>
           <div class="form-card-grid">
-            <div class="form-group"><label>${t("form.model.maxinflight")} ${tip("Max concurrent in-flight requests. 0 or empty = unlimited.")}</label><input id="m-model-maxinflight" type="number" min="0" value="${p.max_inflight_queue_len || ""}"></div>
-            <div class="form-group"><label>${t("form.model.maxctx")} ${tip("Max total input characters across all in-flight requests. 0 or empty = unlimited.")}</label><input id="m-model-maxctx" type="number" min="0" value="${p.max_context_len || ""}"></div>
+            <div class="form-group"><label>${t("form.model.maxinflight")} ${tip(t("tip.model.maxinflight"))}</label><input id="m-model-maxinflight" type="number" min="0" value="${p.max_inflight_queue_len || ""}"></div>
+            <div class="form-group"><label>${t("form.model.maxctx")} ${tip(t("tip.model.maxctx"))}</label><input id="m-model-maxctx" type="number" min="0" value="${p.max_context_len || ""}"></div>
           </div>
         </div>
         <div class="form-card">
           <div class="form-card-title">${t("model_card.tuning")}</div>
           <div class="form-card-grid">
-            <div class="form-group"><label>${t("form.model.base")} ${tip("Override the default provider endpoint, e.g. https://api.openai.com/v1")}</label><input id="m-model-base" value="${esc(p.api_base || "")}" placeholder="https://api.openai.com/v1"></div>
-            <div class="form-group"><label>${t("form.model.version")} ${tip("Required for Azure OpenAI deployments, e.g. 2024-02-01")}</label><input id="m-model-version" value="${esc(p.api_version || "")}"></div>
-            <div class="form-group"><label>${t("form.model.timeout")} ${tip("Request timeout (seconds). Default: 1200.")}</label><input id="m-model-timeout" type="number" value="${p.timeout || 1200}"></div>
-            <div class="form-group"><label>${t("form.model.temp")} ${tip("Sampling temperature override (0.0-2.0).")}</label><input id="m-model-temp" type="number" step="0.1" value="${p.temperature || ""}"></div>
-            <div class="form-group"><label>${t("form.model.maxtok")} ${tip("Maximum output tokens.")}</label><input id="m-model-maxtok" type="number" value="${p.max_tokens || ""}"></div>
+            <div class="form-group"><label>${t("form.model.base")} ${tip(t("tip.model.base"))}</label><input id="m-model-base" value="${esc(p.api_base || "")}" placeholder="https://api.openai.com/v1"></div>
+            <div class="form-group"><label>${t("form.model.version")} ${tip(t("tip.model.version"))}</label><input id="m-model-version" value="${esc(p.api_version || "")}"></div>
+            <div class="form-group"><label>${t("form.model.timeout")} ${tip(t("tip.model.timeout"))}</label><input id="m-model-timeout" type="number" value="${p.timeout || 1200}"></div>
+            <div class="form-group"><label>${t("form.model.temp")} ${tip(t("tip.model.temp"))}</label><input id="m-model-temp" type="number" step="0.1" value="${p.temperature || ""}"></div>
+            <div class="form-group"><label>${t("form.model.maxtok")} ${tip(t("tip.model.maxtok"))}</label><input id="m-model-maxtok" type="number" value="${p.max_tokens || ""}"></div>
           </div>
         </div>
         <div class="form-card">
           <div class="form-card-title">${t("model_card.behavior")}</div>
           <div class="form-card-grid">
-            <div class="form-group field-checkbox"><input id="m-model-serve-not-match" type="checkbox" ${p.serve_not_match ? "checked" : ""}><label for="m-model-serve-not-match">${t("form.model.serve_not_match")} ${tip("When true, this deployment also serves as catch-all for unmatched model names.")}</label></div>
-            <div class="form-group field-checkbox"><input id="m-model-client-type" type="checkbox" ${p.client_type_header ? "checked" : ""}><label for="m-model-client-type">${t("form.model.client_type_header")} ${tip("Attach X-BooM-Client-Type header to outgoing requests.")}</label></div>
+            <div class="form-group field-checkbox"><input id="m-model-serve-not-match" type="checkbox" ${p.serve_not_match ? "checked" : ""}><label for="m-model-serve-not-match">${t("form.model.serve_not_match")} ${tip(t("tip.model.serve_not_match"))}</label></div>
+            <div class="form-group field-checkbox"><input id="m-model-client-type" type="checkbox" ${p.client_type_header ? "checked" : ""}><label for="m-model-client-type">${t("form.model.client_type_header")} ${tip(t("tip.model.client_type_header"))}</label></div>
           </div>
         </div>
         <div class="form-card">
           <div class="form-card-title">${t("model_card.cost")}</div>
           <div class="form-card-grid">
-            <div class="form-group"><label>${t("form.model.input_cost")} ${tip("USD per million input tokens. Overrides cost_template.")}</label><input id="m-model-input-cost" type="number" step="0.01" value="${modelInfo.input_cost_per_million_tokens || ""}"></div>
-            <div class="form-group"><label>${t("form.model.cached_cost")} ${tip("USD per million cached input tokens (KV-cache hit).")}</label><input id="m-model-cached-cost" type="number" step="0.01" value="${modelInfo.cached_input_cost_per_million_tokens || ""}"></div>
-            <div class="form-group"><label>${t("form.model.output_cost")} ${tip("USD per million output tokens.")}</label><input id="m-model-output-cost" type="number" step="0.01" value="${modelInfo.output_cost_per_million_tokens || ""}"></div>
+            <div class="form-group field-full"><label>${t("form.model.cost_template")} ${tip(t("tip.model.cost_template"))}</label>
+              <select id="m-model-cost-template">
+                <option value="">${t("common.none_option")}</option>
+                ${((_configCache && _configCache.cost_templates) || []).map((tpl) => `<option value="${esc(tpl.name)}" ${modelInfo.cost_template === tpl.name ? "selected" : ""}>${esc(tpl.name)}</option>`).join("")}
+              </select>
+            </div>
           </div>
         </div>
       </div>
@@ -2243,11 +2241,20 @@
     `;
     showModal(__html, { xwide: true });
     // Pre-select provider dropdown from litellm_model
+    const providerSel = document.getElementById("m-model-provider");
     if (p.litellm_model && p.litellm_model.includes("/")) {
       const prov = p.litellm_model.split("/")[0];
-      const sel = document.getElementById("m-model-provider");
-      if (sel.querySelector(`option[value="${prov}"]`)) sel.value = prov;
+      if (providerSel.querySelector(`option[value="${prov}"]`)) providerSel.value = prov;
     }
+    // Show/hide the AWS Bedrock card based on provider. Only bedrock uses IAM
+    // credentials; for everything else the card is hidden so users don't get
+    // the misleading impression that they need to fill it.
+    const awsCard = document.getElementById("m-model-aws-card");
+    const syncAwsCard = () => {
+      awsCard.style.display = providerSel.value === "bedrock" ? "" : "none";
+    };
+    syncAwsCard();
+    providerSel.addEventListener("change", syncAwsCard);
     document.getElementById("m-model-submit").addEventListener("click", async () => {
       try {
         const providerVal = document.getElementById("m-model-provider").value;
@@ -2259,14 +2266,10 @@
           try { headers = JSON.parse(headersText); }
           catch (e) { throw new Error(t("config.error.invalid_json", { msg: e.message })); }
         }
-        // Build model_info only if cost fields are set.
-        const inputCost = document.getElementById("m-model-input-cost").value;
-        const cachedCost = document.getElementById("m-model-cached-cost").value;
-        const outputCost = document.getElementById("m-model-output-cost").value;
+        // Build model_info only when cost_template is selected.
+        const costTemplate = document.getElementById("m-model-cost-template").value;
         const modelInfo = {};
-        if (inputCost) modelInfo.input_cost_per_million_tokens = Number(inputCost);
-        if (cachedCost) modelInfo.cached_input_cost_per_million_tokens = Number(cachedCost);
-        if (outputCost) modelInfo.output_cost_per_million_tokens = Number(outputCost);
+        if (costTemplate) modelInfo.cost_template = costTemplate;
         const body = {
           model_name: document.getElementById("m-model-name").value,
           litellm_model: litellmModel,
@@ -2325,9 +2328,9 @@
         <div class="form-card">
           <div class="form-card-title">${t("alias_card.basic")}</div>
           <div class="form-card-grid">
-            <div class="form-group field-full"><label>${t("form.alias.name")} * ${tip("The name clients will use in their request. E.g. 'gpt-4' → routes to 'gpt-4o'.")}</label><input id="m-alias-name" value="${esc(p.alias_name || "")}" ${p.alias_name ? "readonly" : ""}></div>
-            <div class="form-group field-full"><label>${t("form.alias.target")} * ${tip("The actual model name to route to. Must match an existing model deployment name.")}</label><input id="m-alias-target" value="${esc(p.target_model || "")}" required list="alias-target-list"><datalist id="alias-target-list"></datalist></div>
-            <div class="form-group field-full"><label>${t("form.alias.hidden")} ${tip("Hidden aliases work for routing but are not listed to users in model discovery endpoints.")}</label><select id="m-alias-hidden"><option value="false" ${!p.hidden ? "selected" : ""}>${t("common.no")}</option><option value="true" ${p.hidden ? "selected" : ""}>${t("common.yes")}</option></select></div>
+            <div class="form-group field-full"><label>${t("form.alias.name")} * ${tip(t("tip.alias.name"))}</label><input id="m-alias-name" value="${esc(p.alias_name || "")}" ${p.alias_name ? "readonly" : ""}></div>
+            <div class="form-group field-full"><label>${t("form.alias.target")} * ${tip(t("tip.alias.target"))}</label><input id="m-alias-target" value="${esc(p.target_model || "")}" required list="alias-target-list"><datalist id="alias-target-list"></datalist></div>
+            <div class="form-group field-full"><label>${t("form.alias.hidden")} ${tip(t("tip.alias.hidden"))}</label><select id="m-alias-hidden"><option value="false" ${!p.hidden ? "selected" : ""}>${t("common.no")}</option><option value="true" ${p.hidden ? "selected" : ""}>${t("common.yes")}</option></select></div>
           </div>
         </div>
       </div>
@@ -2497,13 +2500,16 @@
   }
 
   function renderCardRateLimit(r) {
+    const enabled = r.enabled !== false;
     return `<div class="form-card" data-section="rate_limit">
       <div class="form-card-title">${t("config.section.rate_limit")}</div>
       <div class="form-card-grid">
-        ${fieldCheckbox("cfg-rl-enabled", t("config.field.enabled"), r.enabled !== false)}
+        <div class="form-group field-checkbox"><input id="cfg-rl-enabled" type="checkbox" ${enabled ? "checked" : ""}><label for="cfg-rl-enabled">${t("config.field.rate_limit_enabled")}</label></div>
         ${fieldNum("cfg-rl-default-rpm", t("config.field.default_rpm"), r.default_rpm, { min: 0 })}
+        ${fieldNum("cfg-rl-default-tpm", t("config.field.default_tpm"), r.default_tpm, { min: 0 })}
         ${fieldTextarea("cfg-rl-windows", t("config.field.window_limits"), r.window_limits || [], { rows: 2 })}
       </div>
+      <p class="modal-hint">${t("config.tip.rate_limit_scope")}</p>
       <div class="form-card-actions">
         <button class="btn-primary btn-small" data-save="rate_limit">${t("action.save")}</button>
       </div>
@@ -2551,7 +2557,7 @@
       <div class="form-card-title">${t("config.section.prompt_log")}</div>
       <div class="form-card-grid">
         ${fieldCheckbox("cfg-pl-enabled", t("config.field.enabled"), p.enabled)}
-        ${fieldText("cfg-pl-dir", t("config.field.dir"), p.dir)}
+        ${fieldText("cfg-pl-dir", t("config.field.dir"), p.dir, { full: true })}
         ${fieldNum("cfg-pl-max-mb", t("config.field.max_file_size_mb"), p.max_file_size_mb, { min: 1 })}
         ${fieldCheckbox("cfg-pl-capture", t("config.field.capture_raw_upstream"), p.capture_raw_upstream)}
         ${fieldFullList("cfg-pl-excluded-keys", t("config.field.excluded_keys"), p.excluded_keys || [])}
@@ -2568,7 +2574,7 @@
       <div class="form-card-title">${t("config.section.router_settings")}</div>
       <div class="form-card-grid">
         ${fieldSelect("cfg-rs-policy", t("config.field.schedule_policy"),
-          [{ value: "round_robin", label: "round_robin" }, { value: "key_affinity", label: "key_affinity" }],
+          [{ value: "round_robin", label: "L0 round_robin" }, { value: "key_affinity", label: "L1 key_affinity" }],
           r.schedule_policy || "round_robin")}
         ${fieldNum("cfg-rs-affinity-ctx", t("config.field.key_affinity_context_threshold"), r.key_affinity_context_threshold || 0, { min: 0 })}
         ${fieldNum("cfg-rs-affinity-rebal", t("config.field.key_affinity_rebalance_threshold"), r.key_affinity_rebalance_threshold || 20, { min: 1, step: 1 })}
@@ -2603,7 +2609,10 @@
         <td>${esc(tpl.input_cost_per_million_tokens ?? "-")}</td>
         <td>${esc(tpl.cached_input_cost_per_million_tokens ?? "-")}</td>
         <td>${esc(tpl.output_cost_per_million_tokens ?? "-")}</td>
-        <td><button class="btn-small is-danger" onclick="window._deleteCostTemplate('${esc(tpl.name)}')">${t("action.delete")}</button></td>
+        <td>
+          <button class="btn-small" onclick="window._editCostTemplate('${esc(tpl.name)}')">${t("action.edit")}</button>
+          <button class="btn-small is-danger" onclick="window._deleteCostTemplate('${esc(tpl.name)}')">${t("action.delete")}</button>
+        </td>
       </tr>
     `).join("");
     return `<div class="form-card" data-section="cost_templates">
@@ -2679,9 +2688,11 @@
       } else if (kind === "general") {
         await saveConfigSection("general_settings.public_models", parseListInput($("cfg-general-public-models")));
       } else if (kind === "rate_limit") {
+        const tpmRaw = $("cfg-rl-default-tpm").value;
         await saveConfigSection("rate_limit", {
           enabled: $("cfg-rl-enabled").checked,
           default_rpm: numOr($("cfg-rl-default-rpm"), 60),
+          default_tpm: tpmRaw === "" ? null : Number(tpmRaw),
           window_limits: parseJsonInput($("cfg-rl-windows"), []),
         });
       } else if (kind === "plan_defaults") {
@@ -2743,34 +2754,50 @@
     await loadConfigPage();
   }
 
-  window._addCostTemplate = () => {
-    const name = prompt(t("config.prompt.template_name"));
-    if (!name) return;
+  function showCostTemplateModal(existing) {
+    const isEdit = !!existing;
+    const tpl = existing || { name: "", input_cost_per_million_tokens: null, cached_input_cost_per_million_tokens: null, output_cost_per_million_tokens: null };
     showModal(`
-      <h3>${t("config.action.add_template")}</h3>
-      <div class="form-group"><label>${t("config.field.name")}</label><input id="ct-name" value="${esc(name)}" readonly></div>
-      <div class="form-group"><label>${t("config.field.input_cost_per_million_tokens")}</label><input id="ct-input" type="number" step="0.01"></div>
-      <div class="form-group"><label>${t("config.field.cached_input_cost_per_million_tokens")}</label><input id="ct-cached" type="number" step="0.01"></div>
-      <div class="form-group"><label>${t("config.field.output_cost_per_million_tokens")}</label><input id="ct-output" type="number" step="0.01"></div>
+      <h3>${isEdit ? t("config.action.edit_template") : t("config.action.add_template")}</h3>
+      <div class="form-group"><label>${t("config.field.name")}</label><input id="ct-name" value="${esc(tpl.name)}" ${isEdit ? "readonly" : ""}></div>
+      <div class="form-group"><label>${t("config.field.input_cost_per_million_tokens")}</label><input id="ct-input" type="number" step="0.01" value="${tpl.input_cost_per_million_tokens ?? ""}"></div>
+      <div class="form-group"><label>${t("config.field.cached_input_cost_per_million_tokens")}</label><input id="ct-cached" type="number" step="0.01" value="${tpl.cached_input_cost_per_million_tokens ?? ""}"></div>
+      <div class="form-group"><label>${t("config.field.output_cost_per_million_tokens")}</label><input id="ct-output" type="number" step="0.01" value="${tpl.output_cost_per_million_tokens ?? ""}"></div>
       <div class="modal-actions">
         <button class="btn-secondary btn-inline" onclick="hideModal()">${t("action.cancel")}</button>
-        <button class="btn-primary" id="ct-save">${t("action.create")}</button>
+        <button class="btn-primary" id="ct-save">${isEdit ? t("action.save") : t("action.create")}</button>
       </div>
     `);
     document.getElementById("ct-save").addEventListener("click", async () => {
-      const tpl = {
-        name: document.getElementById("ct-name").value,
+      const nameVal = document.getElementById("ct-name").value.trim();
+      if (!nameVal) { alert(t("common.error_prefix", { message: t("config.field.name") })); return; }
+      const updated = {
+        name: nameVal,
         input_cost_per_million_tokens: Number(document.getElementById("ct-input").value) || null,
         cached_input_cost_per_million_tokens: Number(document.getElementById("ct-cached").value) || null,
         output_cost_per_million_tokens: Number(document.getElementById("ct-output").value) || null,
       };
-      const current = (_configCache && _configCache.cost_templates) || [];
-      current.push(tpl);
+      const current = ((_configCache && _configCache.cost_templates) || []);
+      // Replace by name on edit; append on create. Name is the identity, so
+      // editing keeps the template at its original slot.
+      const next = isEdit
+        ? current.map((t) => (t.name === existing.name ? updated : t))
+        : current.concat([updated]);
       try {
-        await saveConfigSection("cost_templates", current);
+        await saveConfigSection("cost_templates", next);
         hideModal();
       } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
     });
+  }
+
+  window._addCostTemplate = () => {
+    showCostTemplateModal(null);
+  };
+
+  window._editCostTemplate = (name) => {
+    const existing = ((_configCache && _configCache.cost_templates) || []).find((t) => t.name === name);
+    if (!existing) return;
+    showCostTemplateModal(existing);
   };
 
   window._deleteCostTemplate = async (name) => {
@@ -2963,7 +2990,6 @@
       keysPage = 1;
       loadKeys();
     });
-    document.getElementById("btn-new-assignment").addEventListener("click", showNewAssignmentModal);
     const btnModel = document.getElementById("btn-new-model");
     if (btnModel) btnModel.addEventListener("click", showNewModelModal);
     const btnAlias = document.getElementById("btn-new-alias");
@@ -3036,39 +3062,39 @@
         <div class="form-card">
           <div class="form-card-title">${t("plan_card.basic")}</div>
           <div class="form-card-grid">
-            <div class="form-group field-full"><label>${t("form.plan.name")} ${tip("Unique plan name. Used when assigning keys to plans.")}</label><input id="m-plan-name" value="${esc(p.name || "")}" ${p.name ? "readonly" : ""} required></div>
-            <div class="form-group"><label>${t("form.plan.type")} ${tip("Key plan: assigned to a key. Team plan: assigned to a team; members inherit member_plan.")}</label><select id="m-plan-type">
+            <div class="form-group field-full"><label>${t("form.plan.name")} ${tip(t("tip.plan.name"))}</label><input id="m-plan-name" value="${esc(p.name || "")}" ${p.name ? "readonly" : ""} required></div>
+            <div class="form-group"><label>${t("form.plan.type")} ${tip(t("tip.plan.type"))}</label><select id="m-plan-type">
               <option value="key" ${(p.type || "key") === "key" ? "selected" : ""}>Key</option>
               <option value="team" ${p.type === "team" ? "selected" : ""}>Team</option>
             </select></div>
-            <div class="form-group"><label>${t("form.plan.member_plan")} ${tip("Only for type=team: plan name applied to each member key.")}</label><input id="m-plan-member-plan" value="${esc(p.member_plan || "")}"></div>
+            <div class="form-group"><label>${t("form.plan.member_plan")} ${tip(t("tip.plan.member_plan"))}</label><input id="m-plan-member-plan" value="${esc(p.member_plan || "")}"></div>
           </div>
         </div>
         <div class="form-card">
           <div class="form-card-title">${t("plan_card.simple_limits")}</div>
           <div class="form-card-grid">
-            <div class="form-group"><label>${t("form.plan.concurrency")} ${tip("Max simultaneous requests. Empty = unlimited.")}</label><input id="m-plan-concurrency" type="number" value="${p.concurrency_limit || ""}"></div>
-            <div class="form-group"><label>${t("form.plan.rpm")} ${tip("Requests per minute. Empty = unlimited.")}</label><input id="m-plan-rpm" type="number" value="${p.rpm_limit || ""}"></div>
-            <div class="form-group"><label>${t("form.plan.tpm")} ${tip("Tokens per minute. Empty = unlimited.")}</label><input id="m-plan-tpm" type="number" value="${p.tpm_limit || ""}"></div>
+            <div class="form-group"><label>${t("form.plan.concurrency")} ${tip(t("tip.plan.concurrency"))}</label><input id="m-plan-concurrency" type="number" value="${p.concurrency_limit || ""}"></div>
+            <div class="form-group"><label>${t("form.plan.rpm")} ${tip(t("tip.plan.rpm"))}</label><input id="m-plan-rpm" type="number" value="${p.rpm_limit || ""}"></div>
+            <div class="form-group"><label>${t("form.plan.tpm")} ${tip(t("tip.plan.tpm"))}</label><input id="m-plan-tpm" type="number" value="${p.tpm_limit || ""}"></div>
           </div>
         </div>
         <div class="form-card">
           <div class="form-card-title">${t("plan_card.window_limits")}</div>
           <div class="form-card-grid">
-            <div class="form-group field-full"><label>${t("form.plan.windows")} ${tip("JSON array: [[counts, tokens, costs, window_secs], ...]. null = no cap on that dimension.")}</label><textarea id="m-plan-windows" rows="3" style="font-family:var(--mono);font-size:12px">${esc(JSON.stringify(p.window_limits || [], null, 2))}</textarea></div>
+            <div class="form-group field-full"><label>${t("form.plan.windows")} ${tip(t("tip.plan.windows"))}</label><textarea id="m-plan-windows" rows="3" style="font-family:var(--mono);font-size:12px">${esc(JSON.stringify(p.window_limits || [], null, 2))}</textarea></div>
           </div>
         </div>
         <div class="form-card">
           <div class="form-card-title">${t("plan_card.total_limits")}</div>
           <div class="form-card-grid">
-            <div class="form-group"><label>${t("form.plan.total_token")} ${tip("Lifetime token cap. Empty = unlimited.")}</label><input id="m-plan-total-token" type="number" value="${p.total_token_limit || ""}"></div>
-            <div class="form-group"><label>${t("form.plan.total_cost")} ${tip("Lifetime USD cap. Empty = unlimited.")}</label><input id="m-plan-total-cost" type="number" step="0.01" value="${p.total_cost_limit || ""}"></div>
+            <div class="form-group"><label>${t("form.plan.total_token")} ${tip(t("tip.plan.total_token"))}</label><input id="m-plan-total-token" type="number" value="${p.total_token_limit || ""}"></div>
+            <div class="form-group"><label>${t("form.plan.total_cost")} ${tip(t("tip.plan.total_cost"))}</label><input id="m-plan-total-cost" type="number" step="0.01" value="${p.total_cost_limit || ""}"></div>
           </div>
         </div>
         <div class="form-card">
           <div class="form-card-title">${t("plan_card.schedule")}</div>
           <div class="form-card-grid">
-            <div class="form-group field-full"><label>${t("form.plan.schedule")} ${tip("JSON array of slots: [{hours, concurrency_limit, rpm_limit, tpm_limit, window_limits}].")}</label><textarea id="m-plan-schedule" rows="4" style="font-family:var(--mono);font-size:12px">${esc(JSON.stringify(p.schedule || [], null, 2))}</textarea></div>
+            <div class="form-group field-full"><label>${t("form.plan.schedule")} ${tip(t("tip.plan.schedule"))}</label><textarea id="m-plan-schedule" rows="4" style="font-family:var(--mono);font-size:12px">${esc(JSON.stringify(p.schedule || [], null, 2))}</textarea></div>
           </div>
         </div>
       </div>
@@ -3120,25 +3146,25 @@
         <div class="form-card">
           <div class="form-card-title">${t("key_card.basic")}</div>
           <div class="form-card-grid">
-            <div class="form-group"><label>${t("form.key.alias")} ${tip("Short unique identifier for this key, e.g. 'alice' or 'team-api'. Used for display in dashboard and debug logging.")}</label><input id="m-key-alias"></div>
-            <div class="form-group"><label>Key Prefix ${tip("Optional 1-8 char alphanumeric label embedded in the raw key, e.g. 'prod' → sk-prod-<secret>. Empty = legacy sk-<secret> form.")}</label><input id="m-key-prefix" placeholder="e.g. prod, TeamA, v2" pattern="[a-zA-Z0-9]{1,8}" maxlength="8"></div>
-            <div class="form-group"><label>Tag ${tip("Optional free-text label (≤64 chars) for your own classification. Not embedded in the raw key.")}</label><input id="m-key-tag" placeholder="e.g. production, customer-acme, exp-2026Q1" maxlength="64"></div>
-            <div class="form-group"><label>${t("form.key.user_id")} ${tip("Optional user identifier for tracking.")}</label><input id="m-key-user"></div>
+            <div class="form-group"><label>${t("form.key.alias")} ${tip(t("tip.key.alias"))}</label><input id="m-key-alias"></div>
+            <div class="form-group"><label>${t("form.key.prefix")} ${tip(t("tip.key.prefix"))}</label><input id="m-key-prefix" placeholder="e.g. prod, TeamA, v2" pattern="[a-zA-Z0-9]{1,8}" maxlength="8"></div>
+            <div class="form-group"><label>${t("form.key.tag")} ${tip(t("tip.key.tag"))}</label><input id="m-key-tag" placeholder="e.g. production, customer-acme, exp-2026Q1" maxlength="64"></div>
+            <div class="form-group"><label>${t("form.key.user_id")} ${tip(t("tip.key.user_id"))}</label><input id="m-key-user"></div>
           </div>
         </div>
         <div class="form-card">
           <div class="form-card-title">${t("key_card.assignment")}</div>
           <div class="form-card-grid">
-            <div class="form-group"><label>${t("form.key.team")} ${tip("Optional team assignment.")}</label><select id="m-key-team"><option value="">${t("common.none_option")}</option></select></div>
-            <div class="form-group"><label>${t("form.key.plan")} ${tip("Assign this key to a rate limit plan. Leave empty for default plan.")}</label><select id="m-key-plan"><option value="">${t("common.default_option")}</option></select></div>
-            <div class="form-group field-full"><label>${t("form.key.models")} ${tip("Select model access. Check 'all-team-models' for full access, or pick specific models.")}</label><div class="model-check-combo" id="m-key-models-combo"></div></div>
+            <div class="form-group"><label>${t("form.key.team")} ${tip(t("tip.key.team"))}</label><select id="m-key-team"><option value="">${t("common.none_option")}</option></select></div>
+            <div class="form-group"><label>${t("form.key.plan")} ${tip(t("tip.key.plan"))}</label><select id="m-key-plan"><option value="">${t("common.default_option")}</option></select></div>
+            <div class="form-group field-full"><label>${t("form.key.models")} ${tip(t("tip.key.models"))}</label><div class="model-check-combo" id="m-key-models-combo"></div></div>
           </div>
         </div>
         <div class="form-card">
           <div class="form-card-title">${t("key_card.limits")}</div>
           <div class="form-card-grid">
-            <div class="form-group"><label>${t("form.key.max_budget")} ${tip("Maximum budget in USD. Leave empty for unlimited.")}</label><input id="m-key-budget" type="number" step="0.01"></div>
-            <div class="form-group"><label>${t("form.key.rpm")} ${tip("Per-key RPM override. Leave empty to use plan or default limits.")}</label><input id="m-key-rpm" type="number"></div>
+            <div class="form-group"><label>${t("form.key.max_budget")} ${tip(t("tip.key.max_budget"))}</label><input id="m-key-budget" type="number" step="0.01"></div>
+            <div class="form-group"><label>${t("form.key.rpm")} ${tip(t("tip.key.rpm"))}</label><input id="m-key-rpm" type="number"></div>
           </div>
         </div>
       </div>
@@ -3220,38 +3246,21 @@
 alice,Alice Wang,prod,production,alice,team-eng,"gpt-4|claude-3",60,100000,100.0,30d,"2026-12-31 23:59:59","{""env"":""prod"",""tier"":""paid""}",default
 bob,,stg,staging,,team-eng,all-team-models,,,,,,,
 ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
-    const fieldsTable = `
-      <table style="width:100%;font-size:12px">
-        <tr><th>Field</th><th>Type</th><th>Required</th><th>Notes</th></tr>
-        <tr><td><code>key_alias</code></td><td>string</td><td>recommended</td><td>Unique display identifier. Empty = unidentifiable in dashboard.</td></tr>
-        <tr><td><code>key_name</code></td><td>string</td><td>optional</td><td>Defaults to key_alias if omitted.</td></tr>
-        <tr><td><code>key_prefix</code></td><td>string</td><td>optional</td><td>1-8 chars <code>[a-zA-Z0-9]</code>. Embedded in raw key: <code>sk-{prefix}-{secret}</code>. Invalid → row skipped.</td></tr>
-        <tr><td><code>tag</code></td><td>string</td><td>optional</td><td>Free text ≤64 chars. Your own classification label (env, customer, purpose). Not embedded in key.</td></tr>
-        <tr><td><code>user_id</code></td><td>string</td><td>optional</td><td>User identifier for tracking.</td></tr>
-        <tr><td><code>team_id</code></td><td>string</td><td>optional</td><td>Team assignment. Resolves <code>all-team-models</code> via team's model list.</td></tr>
-        <tr><td><code>models</code></td><td>array (JSONL) <br>pipe-separated (CSV)</td><td>optional</td><td>Model whitelist. <code>["all-team-models"]</code> = full access. CSV uses <code>|</code> separator.</td></tr>
-        <tr><td><code>rpm_limit</code></td><td>integer</td><td>optional</td><td>Per-key requests-per-minute cap. Empty = use plan default.</td></tr>
-        <tr><td><code>tpm_limit</code></td><td>integer</td><td>optional</td><td>Per-key tokens-per-minute cap.</td></tr>
-        <tr><td><code>max_budget</code></td><td>number</td><td>optional</td><td>USD spend cap. Empty = unlimited.</td></tr>
-        <tr><td><code>budget_duration</code></td><td>string</td><td>optional</td><td>Reset period. Examples: <code>"1d"</code>, <code>"7d"</code>, <code>"30d"</code>.</td></tr>
-        <tr><td><code>expires</code></td><td>string</td><td>optional</td><td>Format: <code>"YYYY-MM-DD HH:MM:SS"</code>. Empty = never expires.</td></tr>
-        <tr><td><code>metadata</code></td><td>object (JSONL)<br>JSON string (CSV)</td><td>optional</td><td>Arbitrary JSON. CSV must double-quote inner <code>"</code>. Special key <code>vip: true</code> = priority queue.</td></tr>
-        <tr><td><code>plan_name</code></td><td>string</td><td>optional</td><td>Rate-limit plan assignment. Empty = default plan.</td></tr>
-      </table>`;
+    const fieldsTable = t("keys.import_help.fields_table");
     showModal(`
-      <h3>Batch Import — Format Reference</h3>
-      <p class="muted">Supported formats: <code>.jsonl</code> (one JSON object per line) and <code>.csv</code> (header row required). Parse errors are reported with line numbers; valid rows still import.</p>
+      <h3>${t("keys.import_help.title")}</h3>
+      <p class="muted">${t("keys.import_help.intro")}</p>
 
-      <h4>Field reference</h4>
+      <h4>${t("keys.import_help.fields_title")}</h4>
       ${fieldsTable}
 
-      <h4>JSONL example <span class="muted" style="font-size:11px">(click Copy to grab the template)</span></h4>
+      <h4>${t("keys.import_help.jsonl_title")} <span class="muted" style="font-size:11px">${t("keys.import_help.copy_hint")}</span></h4>
       <pre id="help-jsonl" style="background:var(--surface3);padding:8px;border-radius:4px;font-size:11px;overflow-x:auto;max-height:200px">${esc(jsonlTemplate)}</pre>
-      <button class="btn-small" onclick="window._copyText(this, document.getElementById('help-jsonl').textContent)">Copy JSONL</button>
+      <button class="btn-small" onclick="window._copyText(this, document.getElementById('help-jsonl').textContent)">${t("keys.import_help.copy_jsonl")}</button>
 
-      <h4>CSV example</h4>
+      <h4>${t("keys.import_help.csv_title")}</h4>
       <pre id="help-csv" style="background:var(--surface3);padding:8px;border-radius:4px;font-size:11px;overflow-x:auto;max-height:200px">${esc(csvTemplate)}</pre>
-      <button class="btn-small" onclick="window._copyText(this, document.getElementById('help-csv').textContent)">Copy CSV</button>
+      <button class="btn-small" onclick="window._copyText(this, document.getElementById('help-csv').textContent)">${t("keys.import_help.copy_csv")}</button>
 
       <div class="modal-actions">
         <button class="btn-primary" onclick="hideModal()">${t("action.close")}</button>
@@ -3261,32 +3270,25 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
 
   function showImportKeysModal() {
     showModal(`
-      <h3>Batch Import Keys</h3>
-      <p class="muted">Upload a <code>.jsonl</code> or <code>.csv</code> file. Each line/row becomes one key. Parsing failures are reported per-line and do not block other rows.</p>
+      <h3>${t("keys.import.title")}</h3>
+      <p class="muted">${t("keys.import.intro")}</p>
       <div class="form-group">
-        <label>File (.jsonl or .csv)</label>
+        <label>${t("keys.import.file_label")}</label>
         <input type="file" id="m-import-file" accept=".jsonl,.csv">
       </div>
       <details style="margin:8px 0">
-        <summary class="muted" style="cursor:pointer">Format reference</summary>
-        <pre style="background:var(--surface3);padding:8px;border-radius:4px;font-size:11px;overflow-x:auto">// keys.jsonl
-{"key_alias":"alice","key_prefix":"prod","models":["gpt-4"],"rpm_limit":60}
-{"key_alias":"bob","models":["all-team-models"],"team_id":"team-1"}
-
-// keys.csv (models pipe-separated, metadata JSON string)
-key_alias,key_prefix,user_id,models,rpm_limit,metadata
-alice,prod,alice,"gpt-4|claude-3",60,"{&quot;env&quot;:&quot;prod&quot;}"
-bob,,,all-team-models,,</pre>
+        <summary class="muted" style="cursor:pointer">${t("keys.import_help.format_ref")}</summary>
+        <pre style="background:var(--surface3);padding:8px;border-radius:4px;font-size:11px;overflow-x:auto">${t("keys.import.sample_block")}</pre>
       </details>
       <div class="modal-actions">
-        <button class="btn-secondary btn-inline" onclick="hideModal()">Cancel</button>
-        <button class="btn-primary" id="m-import-submit">Upload &amp; Import</button>
+        <button class="btn-secondary btn-inline" onclick="hideModal()">${t("action.cancel")}</button>
+        <button class="btn-primary" id="m-import-submit">${t("keys.import.submit")}</button>
       </div>
     `);
     document.getElementById("m-import-submit").addEventListener("click", async () => {
       const fileInput = document.getElementById("m-import-file");
       const file = fileInput && fileInput.files && fileInput.files[0];
-      if (!file) { alert("Please choose a file first."); return; }
+      if (!file) { alert(t("keys.import.no_file")); return; }
       const fd = new FormData();
       fd.append("file", file);
       try {
@@ -3297,11 +3299,11 @@ bob,,,all-team-models,,</pre>
         });
         const data = await resp.json();
         if (!resp.ok) {
-          alert("Import failed: " + (data.error || resp.status));
+          alert(t("keys.import.failed", { reason: data.error || resp.status }));
           return;
         }
         renderImportResult(data);
-      } catch (err) { alert("Import error: " + err.message); }
+      } catch (err) { alert(t("keys.import.error", { reason: err.message })); }
     });
   }
 
@@ -3309,74 +3311,91 @@ bob,,,all-team-models,,</pre>
     const createdRows = (data.created || []).map((c) => `<tr>
       <td class="mono">${esc(c.key_alias || "-")}</td>
       <td class="mono" style="font-size:11px">${esc(c.key)}</td>
-      <td><button class="btn-small" onclick="window._copyText(this,'${esc(c.key)}')">Copy</button></td>
+      <td><button class="btn-small" onclick="window._copyText(this,'${esc(c.key)}')">${t("action.copy")}</button></td>
     </tr>`).join("");
     const skippedRows = (data.skipped || []).map((s) => `<tr>
       <td>${esc(s.key_alias || "-")}</td>
       <td class="muted">${esc(s.reason)}</td>
     </tr>`).join("");
     const parseErrorRows = (data.parse_errors || []).map((e) => `<tr>
-      <td class="mono">line ${e.line}</td>
+      <td class="mono">${t("keys.import.line_n", { n: e.line })}</td>
       <td class="muted">${esc(e.reason)}</td>
     </tr>`).join("");
     showModal(`
-      <h3>Import Result</h3>
-      <p>File: <code>${esc(data.file_name)}</code> &middot; Parsed: <b>${data.parsed}</b> &middot;
-         Created: <b style="color:var(--success)">${data.created_count}</b> &middot;
-         Skipped: <b style="color:var(--danger)">${data.skipped_count}</b></p>
+      <h3>${t("keys.import.result_title")}</h3>
+      <p>${t("keys.import.result_summary", {
+        file: `<code>${esc(data.file_name)}</code>`,
+        parsed: `<b>${data.parsed}</b>`,
+        created: `<b style="color:var(--success)">${data.created_count}</b>`,
+        skipped: `<b style="color:var(--danger)">${data.skipped_count}</b>`,
+      })}</p>
       ${data.created && data.created.length ? `
-        <h4>Created Keys <span class="muted" style="font-size:11px">(shown once — copy now)</span></h4>
+        <h4>${t("keys.import.created_title")} <span class="muted" style="font-size:11px">${t("keys.import.copy_now_hint")}</span></h4>
         <table style="width:100%">
-          <tr><th>Alias</th><th>Raw Key</th><th></th></tr>
+          <tr><th>${t("keys.import.col_alias")}</th><th>${t("keys.import.col_raw_key")}</th><th></th></tr>
           ${createdRows}
         </table>` : ""}
       ${data.skipped && data.skipped.length ? `
-        <h4>Skipped</h4>
+        <h4>${t("keys.import.skipped_title")}</h4>
         <table style="width:100%">
-          <tr><th>Alias</th><th>Reason</th></tr>
+          <tr><th>${t("keys.import.col_alias")}</th><th>${t("keys.import.col_reason")}</th></tr>
           ${skippedRows}
         </table>` : ""}
       ${data.parse_errors && data.parse_errors.length ? `
-        <h4>Parse Errors</h4>
+        <h4>${t("keys.import.parse_errors_title")}</h4>
         <table style="width:100%">
-          <tr><th>Location</th><th>Reason</th></tr>
+          <tr><th>${t("keys.import.col_location")}</th><th>${t("keys.import.col_reason")}</th></tr>
           ${parseErrorRows}
         </table>` : ""}
       <div class="modal-actions">
-        <button class="btn-primary" onclick="hideModal(); window._loadKeysPage();">Done</button>
+        <button class="btn-primary" onclick="hideModal(); window._loadKeysPage();">${t("action.done")}</button>
       </div>
     `);
   }
 
-  function showEditKeyModal(key) {
+  async function showEditKeyModal(key) {
     const existingModels = Array.isArray(key.models) ? key.models : [];
     const isVip = key.metadata && key.metadata.vip === true;
     const isPromptLogExcluded = (window._promptLogExcludedKeys || []).includes(key.token_hash);
+    // Plans drive the assignment dropdown — load before rendering so the
+    // <select> can populate synchronously.
+    const planNames = await getPlanNames();
+    const currentPlan = key.plan_name || "";
+    const planOptions = [{ value: "", label: t("form.key.plan_none") }]
+      .concat(planNames.map((n) => ({ value: n, label: n })))
+      .map((o) => `<option value="${esc(o.value)}" ${o.value === currentPlan ? "selected" : ""}>${esc(o.label)}</option>`)
+      .join("");
     const __html = `
       <h3>${t("form.key.title_edit")}</h3>
       <div class="form-grid">
         <div class="form-card">
           <div class="form-card-title">${t("key_card.basic")}</div>
           <div class="form-card-grid">
-            <div class="form-group field-full"><label>${t("form.key.alias")} ${tip("Short unique identifier for this key, e.g. 'alice'. Used for dashboard display and debug logging.")}</label><input id="m-edit-alias" value="${esc(key.key_alias || "")}"></div>
-            <div class="form-group field-full"><label>${t("form.key.user_id")} ${tip("Optional user identifier.")}</label><input id="m-edit-user" value="${esc(key.user_id || "")}"></div>
-            <div class="form-group field-full"><label>${t("form.key.tag")} ${tip("Free-form classification label shown in the keys list. Leave empty to clear.")}</label><input id="m-edit-tag" value="${esc(key.tag || "")}" maxlength="64"></div>
+            <div class="form-group"><label>${t("form.key.key_name")} ${tip(t("tip.key.key_name"))}</label><input id="m-edit-key-name" value="${esc(key.key_name || "")}"></div>
+            <div class="form-group"><label>${t("form.key.alias")} ${tip(t("tip.key.alias_short"))}</label><input id="m-edit-alias" value="${esc(key.key_alias || "")}"></div>
+            <div class="form-group"><label>${t("form.key.user_id")} ${tip(t("tip.key.user_id_short"))}</label><input id="m-edit-user" value="${esc(key.user_id || "")}"></div>
+            <div class="form-group"><label>${t("form.key.team_id")} ${tip(t("tip.key.team_id"))}</label><input value="${esc(key.team_id || "-")}" readonly style="background:var(--surface3);cursor:not-allowed"></div>
+            <div class="form-group"><label>${t("form.key.prefix")} ${tip(t("tip.key.prefix_readonly"))}</label><input value="${esc(key.key_prefix ? "sk-" + key.key_prefix + "-***" : "sk-***")}" readonly style="background:var(--surface3);cursor:not-allowed;font-family:var(--mono);font-size:12px"></div>
+            <div class="form-group field-full"><label>${t("form.key.tag")} ${tip(t("tip.key.tag_clearable"))}</label><input id="m-edit-tag" value="${esc(key.tag || "")}" maxlength="64"></div>
           </div>
         </div>
         <div class="form-card">
           <div class="form-card-title">${t("key_card.assignment")}</div>
           <div class="form-card-grid">
-            <div class="form-group field-full"><label>${t("form.key.models")} ${tip("Select model access. Check 'all-team-models' for full access, or pick specific models.")}</label><div class="model-check-combo" id="m-edit-models-combo"></div></div>
-            <div class="form-group field-full"><label>${t("form.key.plan_locked")} ${tip("Rate limit plan assigned to this key. Change via Assignments page.")}</label><input value="${esc(key.plan_name || t("common.default"))}" readonly style="background:var(--surface3);cursor:not-allowed"></div>
+            <div class="form-group field-full"><label>${t("form.key.models")} ${tip(t("tip.key.models"))}</label><div class="model-check-combo" id="m-edit-models-combo"></div></div>
+            <div class="form-group field-full"><label>${t("form.key.plan")} ${tip(t("tip.key.plan_edit"))}</label><select id="m-edit-plan">${planOptions}</select></div>
           </div>
         </div>
         <div class="form-card">
           <div class="form-card-title">${t("key_card.limits")}</div>
           <div class="form-card-grid">
-            <div class="form-group"><label>${t("form.key.max_budget")} ${tip("Maximum budget in USD. Leave empty for unlimited.")}</label><input id="m-edit-budget" type="number" step="0.01" value="${key.max_budget != null ? key.max_budget : ""}"></div>
-            <div class="form-group"><label>${t("form.key.rpm")} ${tip("Per-key RPM override. Leave empty to use plan limits.")}</label><input id="m-edit-rpm" type="number" value="${key.rpm_limit || ""}"></div>
-            <div class="form-group field-full"><label>${t("form.key.vip")} ${tip("VIP keys get priority in flow control queues when deployments are at capacity.")}</label><div style="display:flex;align-items:center;gap:8px;padding-top:4px"><input type="checkbox" id="m-edit-vip" ${isVip ? "checked" : ""}><span style="font-weight:600;color:#b45309;white-space:nowrap">${t("form.key.vip_label")}</span></div></div>
-            <div class="form-group field-full"><label>${t("form.key.prompt_log")} ${tip("Disable prompt logging for this key. When the global prompt log switch is ON, this key will be excluded from capture.")}</label><div style="display:flex;align-items:center;gap:8px;padding-top:4px"><input type="checkbox" id="m-edit-no-prompt-log" ${isPromptLogExcluded ? "checked" : ""}><span style="font-weight:600;color:#dc2626;white-space:nowrap">${t("form.key.prompt_log_label")}</span></div></div>
+            <div class="form-group"><label>${t("form.key.rpm")} ${tip(t("tip.key.rpm_edit"))}</label><input id="m-edit-rpm" type="number" min="0" value="${key.rpm_limit != null ? key.rpm_limit : ""}"></div>
+            <div class="form-group"><label>${t("form.key.tpm")} ${tip(t("tip.key.tpm_edit"))}</label><input id="m-edit-tpm" type="number" min="0" value="${key.tpm_limit != null ? key.tpm_limit : ""}"></div>
+            <div class="form-group"><label>${t("form.key.max_budget")} ${tip(t("tip.key.max_budget_edit"))}</label><input id="m-edit-budget" type="number" step="0.01" min="0" value="${key.max_budget != null ? key.max_budget : ""}"></div>
+            <div class="form-group"><label>${t("form.key.budget_duration")} ${tip(t("tip.key.budget_duration"))}</label><input id="m-edit-budget-duration" value="${esc(key.budget_duration || "")}" placeholder="1d / 7d / 30d"></div>
+            <div class="form-group field-full"><label>${t("form.key.expires")} ${tip(t("tip.key.expires"))}</label><input id="m-edit-expires" value="${esc(key.expires || "")}" placeholder="2026-12-31 23:59:59" style="font-family:var(--mono);font-size:12px"></div>
+            <div class="form-group field-full"><label>${t("form.key.vip")} ${tip(t("tip.key.vip"))}</label><div style="display:flex;align-items:center;gap:8px;padding-top:4px"><input type="checkbox" id="m-edit-vip" ${isVip ? "checked" : ""}><span style="font-weight:600;color:#b45309;white-space:nowrap">${t("form.key.vip_label")}</span></div></div>
+            <div class="form-group field-full"><label>${t("form.key.prompt_log")} ${tip(t("tip.key.prompt_log"))}</label><div style="display:flex;align-items:center;gap:8px;padding-top:4px"><input type="checkbox" id="m-edit-no-prompt-log" ${isPromptLogExcluded ? "checked" : ""}><span style="font-weight:600;color:#dc2626;white-space:nowrap">${t("form.key.prompt_log_label")}</span></div></div>
           </div>
         </div>
       </div>
@@ -3393,14 +3412,18 @@ bob,,,all-team-models,,</pre>
     });
     document.getElementById("m-edit-submit").addEventListener("click", async () => {
       try {
+        const keyNameVal = document.getElementById("m-edit-key-name").value.trim();
         const aliasVal = document.getElementById("m-edit-alias").value.trim();
         const userVal = document.getElementById("m-edit-user").value.trim();
         const tagVal = document.getElementById("m-edit-tag").value.trim();
         const modelsVal = getComboModels("m-edit-models-combo");
         const vipChecked = document.getElementById("m-edit-vip").checked;
+        const budgetDurVal = document.getElementById("m-edit-budget-duration").value.trim();
+        const expiresVal = document.getElementById("m-edit-expires").value.trim();
         // Preserve existing metadata fields, only update vip flag.
         const existingMeta = key.metadata && typeof key.metadata === "object" ? key.metadata : {};
         const body = {
+          key_name: keyNameVal || null,
           key_alias: aliasVal || null,
           user_id: userVal || null,
           // tag: empty string clears, null leaves untouched. Always send the
@@ -3410,12 +3433,31 @@ bob,,,all-team-models,,</pre>
           models: modelsVal || ["all-team-models"],
           max_budget: document.getElementById("m-edit-budget").value ? Number(document.getElementById("m-edit-budget").value) : null,
           rpm_limit: document.getElementById("m-edit-rpm").value ? Number(document.getElementById("m-edit-rpm").value) : null,
+          tpm_limit: document.getElementById("m-edit-tpm").value ? Number(document.getElementById("m-edit-tpm").value) : null,
+          // budget_duration/expires: empty string means "clear" (not "skip"),
+          // so send "" rather than null when the user wiped the field.
+          budget_duration: budgetDurVal,
+          expires: expiresVal || null,
           metadata: Object.assign({}, existingMeta, { vip: vipChecked }),
         };
         await api(`/admin/keys/${encodeURIComponent(key.token_hash)}`, {
           method: "PUT",
           body: JSON.stringify(body),
         });
+        // Plan assignment lives in a separate table (boom_key_plan_assignment)
+        // so it has its own endpoints. Sync only when the dropdown changed —
+        // avoids a spurious POST/DELETE churn on every save.
+        const newPlan = document.getElementById("m-edit-plan").value;
+        if (newPlan !== currentPlan) {
+          if (newPlan) {
+            await api("/admin/assignments", {
+              method: "POST",
+              body: JSON.stringify({ key_hash: key.token_hash, plan_name: newPlan }),
+            });
+          } else {
+            await api(`/admin/assignments/${encodeURIComponent(key.token_hash)}`, { method: "DELETE" });
+          }
+        }
         // Update prompt log exclusion for this key.
         const noPromptLog = document.getElementById("m-edit-no-prompt-log").checked;
         if (noPromptLog !== isPromptLogExcluded) {
@@ -3426,84 +3468,6 @@ bob,,,all-team-models,,</pre>
         }
         hideModal();
         loadKeys();
-      } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
-    });
-  }
-
-  function showNewAssignmentModal() {
-    showModal(`
-      <h3>${t("form.asgn.title")}</h3>
-      <div class="form-group"><label>${t("form.asgn.key")} ${tip("Search by key alias or token prefix, then select from the list.")}</label>
-        <input id="m-asgn-search" placeholder="${t("common.search_keys_ph")}" autocomplete="off">
-        <div id="m-asgn-key-list" class="key-select-list"></div>
-        <input type="hidden" id="m-asgn-hash">
-      </div>
-      <div class="form-group"><label>${t("form.asgn.plan")} ${tip("Select an existing plan to assign this key to.")}</label><select id="m-asgn-plan" required><option value="">${t("common.select_plan")}</option></select></div>
-      <div class="modal-actions">
-        <button class="btn-secondary btn-inline" onclick="hideModal()">${t("action.cancel")}</button>
-        <button class="btn-primary" id="m-asgn-submit">${t("action.assign")}</button>
-      </div>
-    `);
-    // Populate plan dropdown
-    getPlanNames().then((names) => {
-      const sel = document.getElementById("m-asgn-plan");
-      if (sel) names.forEach((n) => { const o = document.createElement("option"); o.value = n; o.textContent = n; sel.appendChild(o); });
-    });
-    // Key search: use backend API for consistent, unlimited search
-    const searchInput = document.getElementById("m-asgn-search");
-    const listEl = document.getElementById("m-asgn-key-list");
-    const hashInput = document.getElementById("m-asgn-hash");
-    let searchTimer = null;
-
-    function renderKeyResults(keys) {
-      if (keys.length === 0) {
-        listEl.innerHTML = '<div class="key-select-empty">' + t("common.no_matching_keys") + '</div>';
-        return;
-      }
-      listEl.innerHTML = keys.map((k) => {
-        const alias = k.key_alias || t("assignments.no_alias");
-        const prefix = k.token_prefix || (k.token_hash || "").substring(0, 12) + "...";
-        return `<div class="key-select-item" data-hash="${esc(k.token_hash)}" data-alias="${esc(k.key_alias || "")}" data-prefix="${esc(k.token_prefix || "")}">
-          <span class="key-select-alias">${esc(alias)}</span>
-          <span class="mono muted">${esc(prefix)}</span>
-        </div>`;
-      }).join("");
-      listEl.querySelectorAll(".key-select-item").forEach((el) => {
-        el.addEventListener("click", () => {
-          hashInput.value = el.dataset.hash;
-          searchInput.value = el.dataset.alias || el.dataset.prefix || el.dataset.hash.substring(0, 12) + "...";
-          listEl.innerHTML = "";
-        });
-      });
-    }
-
-    searchInput.addEventListener("input", () => {
-      const q = searchInput.value.trim();
-      hashInput.value = "";
-      clearTimeout(searchTimer);
-      if (!q) { listEl.innerHTML = ""; return; }
-      searchTimer = setTimeout(async () => {
-        try {
-          const data = await api(`/admin/keys?per_page=12&search=${encodeURIComponent(q)}`);
-          renderKeyResults(data.keys || []);
-        } catch (err) {
-          listEl.innerHTML = '<div class="key-select-empty">' + t("common.search_failed") + '</div>';
-        }
-      }, 200);
-    });
-
-    document.getElementById("m-asgn-submit").addEventListener("click", async () => {
-      if (!hashInput.value) { alert(t("confirm.select_key")); return; }
-      try {
-        await api("/admin/assignments", {
-          method: "POST",
-          body: JSON.stringify({
-            key_hash: hashInput.value,
-            plan_name: document.getElementById("m-asgn-plan").value,
-          }),
-        });
-        hideModal();
-        loadAssignments();
       } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
     });
   }
@@ -3574,7 +3538,7 @@ bob,,,all-team-models,,</pre>
     const INF = "∞";
     const fmtOrInf = (v, fmt) => (v == null ? INF : fmt(v));
     const fmtNum = (v) => formatNumber(Number(v));
-    const fmtCost = (v) => "$" + (Number(v) || 0).toLocaleString(undefined, { maximumFractionDigits: 2 });
+    const fmtCost = (v) => "¥" + (Number(v) || 0).toLocaleString(undefined, { maximumFractionDigits: 2 });
 
     // Title line: "套餐规格 · <planName>" or "套餐规格 · 默认/无套餐".
     // planExplicit=false means the team is falling back to the default team plan
@@ -3912,7 +3876,7 @@ bob,,,all-team-models,,</pre>
         if (k === "costs") {
           cur = Number(d.current_micros || 0);
           limit = Number(d.limit_micros || 0);
-          display = "$" + (d.current || "0") + " / " + (limit > 0 ? "$" + (d.limit || "0") : t("common.unlimited"));
+          display = "¥" + (d.current || "0") + " / " + (limit > 0 ? "¥" + (d.limit || "0") : t("common.unlimited"));
         } else {
           cur = Number(d.current || 0);
           limit = Number(d.limit || 0);
@@ -3949,7 +3913,7 @@ bob,,,all-team-models,,</pre>
       const tid = _currentQuotaTeamId();
       _loadQuotaKeys(tid);
     } catch (err) {
-      alert("Reset failed: " + err.message);
+      alert(t("common.error_prefix", { message: err.message }));
     }
   };
 
@@ -3971,7 +3935,7 @@ bob,,,all-team-models,,</pre>
         loadQuotaOverview();
       }
     } catch (err) {
-      alert("Reset failed: " + err.message);
+      alert(t("common.error_prefix", { message: err.message }));
     }
   };
 
@@ -3993,14 +3957,14 @@ bob,,,all-team-models,,</pre>
         <div class="form-card">
           <div class="form-card-title">${t("team_card.basic")}</div>
           <div class="form-card-grid">
-            <div class="form-group field-full"><label>${t("form.team.id")} ${tip("Unique identifier for this team. Cannot be changed after creation.")}</label><input id="m-team-id" value="${esc(p.team_id || "")}" ${p.team_id ? "readonly" : ""} required></div>
-            <div class="form-group"><label>${t("form.team.alias")} ${tip("Display name for this team. Can be non-unique.")}</label><input id="m-team-alias" value="${esc(p.team_alias || "")}"></div>
-            <div class="form-group"><label>${t("teams.col.plan")} ${tip("Pick a type=team plan, or leave on default to fall back to default_team_plan (YAML-configured).")}</label>
+            <div class="form-group field-full"><label>${t("form.team.id")} ${tip(t("tip.team.id"))}</label><input id="m-team-id" value="${esc(p.team_id || "")}" ${p.team_id ? "readonly" : ""} required></div>
+            <div class="form-group"><label>${t("form.team.alias")} ${tip(t("tip.team.alias"))}</label><input id="m-team-alias" value="${esc(p.team_alias || "")}"></div>
+            <div class="form-group"><label>${t("teams.col.plan")} ${tip(t("tip.team.plan"))}</label>
               <select id="m-team-plan">
                 <option value="">${esc(t("teams.plan_use_default"))}${tps.default_team_plan ? " (" + tps.default_team_plan + ")" : ""}</option>
               </select>
             </div>
-            <div class="form-group field-full"><label>${t("form.team.models")} ${tip("Select model access for this team. Check 'all-team-models' for full access to all current and future models, or pick specific models.")}</label><div class="model-check-combo" id="m-team-models-combo"></div></div>
+            <div class="form-group field-full"><label>${t("form.team.models")} ${tip(t("tip.team.models"))}</label><div class="model-check-combo" id="m-team-models-combo"></div></div>
           </div>
         </div>
       </div>
