@@ -7,8 +7,10 @@ use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::Result;
 use pingora_proxy::{ProxyHttp, Session};
 use serde::Deserialize;
+use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::net::IpAddr;
+use std::hash::{Hash, Hasher};
+use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -21,10 +23,18 @@ struct Args {
 }
 
 #[derive(Debug, Deserialize)]
-struct Config {
+struct ConfigRaw {
     listen_port: Option<u16>,
     tls: Option<TlsConfig>,
     default_backend: String,
+    routes: Vec<RouteRaw>,
+}
+
+#[derive(Debug)]
+struct Config {
+    listen_port: Option<u16>,
+    tls: Option<TlsConfig>,
+    default_backend: SocketAddr,
     routes: Vec<Route>,
 }
 
@@ -40,35 +50,59 @@ struct Route {
     host: Option<String>,
     path: Option<String>,
     client_ip: Option<IpNet>,
-    backend: String,
+    backend: Option<SocketAddr>,
+    backends: Option<Vec<SocketAddr>>,
 }
 
-impl<'de> Deserialize<'de> for Route {
-    fn deserialize<D>(de: D) -> std::result::Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        struct RouteRaw {
-            host: Option<String>,
-            path: Option<String>,
-            client_ip: Option<String>,
-            backend: String,
-        }
-        let raw = RouteRaw::deserialize(de)?;
+impl Route {
+    fn from_raw(raw: RouteRaw) -> std::result::Result<Self, String> {
         let client_ip = raw
             .client_ip
             .as_deref()
-            .map(|s| parse_client_ip(s))
-            .transpose()
-            .map_err(|e| serde::de::Error::custom(format!("invalid client_ip: {e}")))?;
-        Ok(Route {
-            host: raw.host,
-            path: raw.path,
-            client_ip,
-            backend: raw.backend,
-        })
+            .map(parse_client_ip)
+            .transpose()?;
+        match (raw.backend, raw.backends) {
+            (Some(b), None) => Ok(Route {
+                host: raw.host,
+                path: raw.path,
+                client_ip,
+                backend: Some(parse_addr(&b)?),
+                backends: None,
+            }),
+            (None, Some(list)) => {
+                if list.is_empty() {
+                    return Err("route with `backends` has empty list".into());
+                }
+                let mut addrs = Vec::with_capacity(list.len());
+                for s in list {
+                    addrs.push(parse_addr(&s)?);
+                }
+                Ok(Route {
+                    host: raw.host,
+                    path: raw.path,
+                    client_ip,
+                    backend: None,
+                    backends: Some(addrs),
+                })
+            }
+            (Some(_), Some(_)) => Err("route has both `backend` and `backends`".into()),
+            (None, None) => Err("route has neither `backend` nor `backends`".into()),
+        }
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct RouteRaw {
+    host: Option<String>,
+    path: Option<String>,
+    client_ip: Option<String>,
+    backend: Option<String>,
+    backends: Option<Vec<String>>,
+}
+
+fn parse_addr(s: &str) -> std::result::Result<SocketAddr, String> {
+    s.parse()
+        .map_err(|e: std::net::AddrParseError| format!("invalid address '{s}': {e}"))
 }
 
 fn parse_client_ip(s: &str) -> std::result::Result<IpNet, String> {
@@ -84,12 +118,37 @@ impl Config {
     fn load(path: &str) -> std::result::Result<Self, String> {
         let content = fs::read_to_string(path)
             .map_err(|e| format!("failed to read config {path}: {e}"))?;
-        serde_yaml::from_str(&content)
-            .map_err(|e| format!("failed to parse config {path}: {e}"))
+        Self::from_str(&content)
     }
 
-    fn resolve(&self, host: &str, path: &str, client_ip: Option<IpAddr>) -> &str {
-        for route in &self.routes {
+    fn from_str(content: &str) -> std::result::Result<Self, String> {
+        let raw: ConfigRaw =
+            serde_yaml::from_str(content).map_err(|e| format!("failed to parse config: {e}"))?;
+        Self::from_raw(raw)
+    }
+
+    fn from_raw(raw: ConfigRaw) -> std::result::Result<Self, String> {
+        let default_backend = parse_addr(&raw.default_backend)?;
+        let mut routes = Vec::with_capacity(raw.routes.len());
+        for r in raw.routes {
+            routes.push(Route::from_raw(r)?);
+        }
+        Ok(Config {
+            listen_port: raw.listen_port,
+            tls: raw.tls,
+            default_backend,
+            routes,
+        })
+    }
+
+    /// First-match routing. Returns (route_index, &Route); None => use default_backend.
+    fn resolve_route(
+        &self,
+        host: &str,
+        path: &str,
+        client_ip: Option<IpAddr>,
+    ) -> Option<(usize, &Route)> {
+        for (idx, route) in self.routes.iter().enumerate() {
             if let Some(ref r_host) = route.host {
                 if !host_matches(host, r_host) {
                     continue;
@@ -106,9 +165,9 @@ impl Config {
                     _ => continue,
                 }
             }
-            return &route.backend;
+            return Some((idx, route));
         }
-        &self.default_backend
+        None
     }
 }
 
@@ -122,8 +181,141 @@ fn host_matches(request_host: &str, pattern: &str) -> bool {
     }
 }
 
+const VNODES: usize = 150;
+
+fn hash_str(s: &str) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
+}
+
+/// Consistent-hash ring over a route's backends.
+#[derive(Debug, Clone)]
+struct Ring {
+    nodes: Vec<(u64, SocketAddr)>,
+}
+
+impl Ring {
+    fn new(backends: &[SocketAddr]) -> Self {
+        let mut nodes = Vec::with_capacity(backends.len() * VNODES);
+        for (bi, addr) in backends.iter().enumerate() {
+            for vi in 0..VNODES {
+                nodes.push((hash_str(&format!("{addr}#{bi}#{vi}")), *addr));
+            }
+        }
+        nodes.sort_unstable_by_key(|(h, _)| *h);
+        Ring { nodes }
+    }
+
+    /// Clockwise from hash(key): return first healthy node. If all are unhealthy,
+    /// best-effort return the primary (start) node so traffic still attempts.
+    fn pick(&self, key: &str, unhealthy: &HashSet<SocketAddr>) -> SocketAddr {
+        debug_assert!(!self.nodes.is_empty(), "Ring must have >=1 backend");
+        let h = hash_str(key);
+        let n = self.nodes.len();
+        let start = match self.nodes.binary_search_by_key(&h, |(p, _)| *p) {
+            Ok(i) => i,
+            Err(i) => i % n,
+        };
+        for off in 0..n {
+            let (_, addr) = self.nodes[(start + off) % n];
+            if !unhealthy.contains(&addr) {
+                return addr;
+            }
+        }
+        self.nodes[start].1
+    }
+}
+
+/// Affinity key: `Authorization: Bearer <key>` -> `x-api-key` -> client IP -> "unknown".
+fn extract_api_key(
+    auth: Option<&str>,
+    x_api_key: Option<&str>,
+    client_ip: Option<IpAddr>,
+) -> String {
+    if let Some(a) = auth {
+        let trimmed = a.trim();
+        if let Some(prefix) = trimmed.get(..6) {
+            if prefix.eq_ignore_ascii_case("Bearer") {
+                if let Some(rest) = trimmed.get(6..) {
+                    let rest = rest.trim();
+                    if !rest.is_empty() {
+                        return rest.to_string();
+                    }
+                }
+            }
+        }
+        return trimmed.to_string();
+    }
+    if let Some(k) = x_api_key {
+        return k.trim().to_string();
+    }
+    match client_ip {
+        Some(ip) => ip.to_string(),
+        None => "unknown".to_string(),
+    }
+}
+
+const PROBE_INTERVAL: Duration = Duration::from_secs(5);
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const FAIL_THRESHOLD: u32 = 3;
+
+struct HealthState {
+    backends: Arc<RwLock<Vec<SocketAddr>>>,
+    unhealthy: Arc<RwLock<HashSet<SocketAddr>>>,
+}
+
+impl HealthState {
+    fn new(backends: Vec<SocketAddr>) -> Arc<Self> {
+        Arc::new(HealthState {
+            backends: Arc::new(RwLock::new(backends)),
+            unhealthy: Arc::new(RwLock::new(HashSet::new())),
+        })
+    }
+}
+
+/// (prev_consecutive_failures, probe_healthy) -> (new_failures, mark_unhealthy)
+fn classify_health(prev_failures: u32, probe_healthy: bool) -> (u32, bool) {
+    if probe_healthy {
+        (0, false)
+    } else {
+        let n = prev_failures + 1;
+        (n, n >= FAIL_THRESHOLD)
+    }
+}
+
+fn probe_once(addr: SocketAddr) -> bool {
+    std::net::TcpStream::connect_timeout(&addr, PROBE_TIMEOUT).is_ok()
+}
+
+/// Background TCP prober: every PROBE_INTERVAL, probe each known backend and
+/// mark/unmark unhealthy in the shared set.
+fn run_health_probe(state: Arc<HealthState>) {
+    std::thread::spawn(move || {
+        let mut failures: HashMap<SocketAddr, u32> = HashMap::new();
+        loop {
+            let backends = state.backends.read().unwrap().clone();
+            for addr in &backends {
+                let healthy = probe_once(*addr);
+                let prev = *failures.get(addr).unwrap_or(&0);
+                let (nf, mark) = classify_health(prev, healthy);
+                failures.insert(*addr, nf);
+                let mut set = state.unhealthy.write().unwrap();
+                if mark {
+                    set.insert(*addr);
+                } else {
+                    set.remove(addr);
+                }
+            }
+            std::thread::sleep(PROBE_INTERVAL);
+        }
+    });
+}
+
 pub struct Gateway {
     config: Arc<RwLock<Config>>,
+    rings: Arc<RwLock<HashMap<usize, Ring>>>,
+    health: Arc<HealthState>,
 }
 
 #[async_trait]
@@ -154,16 +346,30 @@ impl ProxyHttp for Gateway {
             .map(|a| a.ip());
 
         let config = self.config.read().unwrap();
-        let backend = config.resolve(host, path, client_ip);
-        let addr: std::net::SocketAddr = backend
-            .parse()
-            .map_err(|e| {
-                pingora_core::Error::because(
-                    pingora_core::ErrorType::InternalError,
-                    format!("invalid backend address '{backend}': {e}"),
-                    e,
-                )
-            })?;
+        let addr = match config.resolve_route(host, path, client_ip) {
+            Some((idx, route)) => match &route.backends {
+                Some(_) => {
+                    let key = extract_api_key(
+                        header
+                            .headers
+                            .get("authorization")
+                            .and_then(|v| v.to_str().ok()),
+                        header.headers.get("x-api-key").and_then(|v| v.to_str().ok()),
+                        client_ip,
+                    );
+                    let unhealthy = self.health.unhealthy.read().unwrap();
+                    let rings = self.rings.read().unwrap();
+                    let ring = rings
+                        .get(&idx)
+                        .expect("ring must exist for a backends-route");
+                    ring.pick(&key, &*unhealthy)
+                }
+                None => route
+                    .backend
+                    .expect("single-backend route must have backend"),
+            },
+            None => config.default_backend,
+        };
 
         Ok(Box::new(HttpPeer::new(addr, false, String::new())))
     }
@@ -189,7 +395,36 @@ impl ProxyHttp for Gateway {
     }
 }
 
-fn watch_config(path: String, config: Arc<RwLock<Config>>) {
+fn build_rings(config: &Config) -> HashMap<usize, Ring> {
+    config
+        .routes
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| r.backends.as_ref().map(|bs| (i, Ring::new(bs))))
+        .collect()
+}
+
+fn collect_all_backends(config: &Config) -> Vec<SocketAddr> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for r in &config.routes {
+        if let Some(list) = &r.backends {
+            for a in list {
+                if seen.insert(*a) {
+                    out.push(*a);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn watch_config(
+    path: String,
+    config: Arc<RwLock<Config>>,
+    rings: Arc<RwLock<HashMap<usize, Ring>>>,
+    health: Arc<HealthState>,
+) {
     use notify::{Config as NotifyConfig, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
     std::thread::spawn(move || {
@@ -254,8 +489,16 @@ fn watch_config(path: String, config: Arc<RwLock<Config>>) {
 
             match Config::load(&path) {
                 Ok(new_config) => {
-                    let mut guard = config.write().unwrap();
-                    *guard = new_config;
+                    let new_rings = build_rings(&new_config);
+                    let new_backends = collect_all_backends(&new_config);
+                    let backend_set: HashSet<SocketAddr> = new_backends.iter().copied().collect();
+                    {
+                        let mut u = health.unhealthy.write().unwrap();
+                        u.retain(|a| backend_set.contains(a));
+                    }
+                    *health.backends.write().unwrap() = new_backends;
+                    *config.write().unwrap() = new_config;
+                    *rings.write().unwrap() = new_rings;
                     log::info!("config reloaded from {path}");
                 }
                 Err(e) => {
@@ -278,9 +521,16 @@ fn main() {
     server.bootstrap();
 
     let config = Arc::new(RwLock::new(config));
-    watch_config(config_path, config.clone());
+    let rings = Arc::new(RwLock::new(build_rings(&config.read().unwrap())));
+    let health = HealthState::new(collect_all_backends(&config.read().unwrap()));
+    run_health_probe(health.clone());
+    watch_config(config_path, config.clone(), rings.clone(), health.clone());
 
-    let gateway = Gateway { config };
+    let gateway = Gateway {
+        config,
+        rings,
+        health,
+    };
 
     let mut proxy = pingora_proxy::http_proxy_service(&server.configuration, gateway);
 
@@ -295,4 +545,133 @@ fn main() {
 
     server.add_service(proxy);
     server.run_forever();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_single_and_multi_backend() {
+        let yaml = r#"
+default_backend: "127.0.0.1:8080"
+routes:
+  - host: a.com
+    backend: "10.0.0.1:80"
+  - host: b.com
+    backends: ["10.0.0.2:80", "10.0.0.3:80"]
+"#;
+        let cfg = Config::from_str(yaml).unwrap();
+        assert_eq!(cfg.default_backend, "127.0.0.1:8080".parse().unwrap());
+        assert_eq!(cfg.routes[0].backend, Some("10.0.0.1:80".parse().unwrap()));
+        assert!(cfg.routes[0].backends.is_none());
+        assert!(cfg.routes[1].backend.is_none());
+        assert_eq!(cfg.routes[1].backends.as_ref().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn config_rejects_invalid_routes() {
+        let both = "default_backend: \"127.0.0.1:80\"\nroutes:\n  - host: a\n    backend: \"1.1.1.1:80\"\n    backends: [\"2.2.2.2:80\"]\n";
+        let empty = "default_backend: \"127.0.0.1:80\"\nroutes:\n  - host: a\n    backends: []\n";
+        let neither = "default_backend: \"127.0.0.1:80\"\nroutes:\n  - host: a\n";
+        let bad = "default_backend: \"127.0.0.1:80\"\nroutes:\n  - host: a\n    backends: [\"not-an-addr\"]\n";
+        assert!(Config::from_str(both).is_err());
+        assert!(Config::from_str(empty).is_err());
+        assert!(Config::from_str(neither).is_err());
+        assert!(Config::from_str(bad).is_err());
+    }
+
+    #[test]
+    fn ring_same_key_same_backend_and_skip_unhealthy() {
+        let backends: Vec<SocketAddr> = ["127.0.0.1:8001", "127.0.0.1:8002", "127.0.0.1:8003"]
+            .iter()
+            .map(|s| s.parse().unwrap())
+            .collect();
+        let ring = Ring::new(&backends);
+        let a = ring.pick("user-key-1", &HashSet::new());
+        let b = ring.pick("user-key-1", &HashSet::new());
+        assert_eq!(a, b, "same key must map to same backend");
+
+        let mut un = HashSet::new();
+        un.insert(a);
+        let c = ring.pick("user-key-1", &un);
+        assert_ne!(c, a, "must skip unhealthy primary");
+        assert!(!un.contains(&c));
+
+        let all: HashSet<SocketAddr> = backends.iter().copied().collect();
+        let d = ring.pick("user-key-1", &all);
+        assert!(all.contains(&d), "all-unhealthy best-effort still returns a node");
+    }
+
+    #[test]
+    fn ring_consistency_on_eviction() {
+        let backends: Vec<SocketAddr> = (8001..=8004)
+            .map(|p| format!("127.0.0.1:{p}").parse().unwrap())
+            .collect();
+        let ring = Ring::new(&backends);
+        let full: HashMap<String, SocketAddr> = (0..2000)
+            .map(|i| {
+                let k = format!("k{i}");
+                (k.clone(), ring.pick(&k, &HashSet::new()))
+            })
+            .collect();
+        let mut un = HashSet::new();
+        un.insert(backends[1]);
+        let on_evicted = full.values().filter(|a| **a == backends[1]).count();
+        let moved = full
+            .iter()
+            .filter(|(k, orig)| ring.pick(k, &un) != **orig)
+            .count();
+        assert_eq!(moved, on_evicted, "only keys on the evicted node should move");
+    }
+
+    #[test]
+    fn api_key_extraction_priority() {
+        let ip = Some(IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)));
+        assert_eq!(extract_api_key(Some("Bearer abc123"), None, ip), "abc123");
+        assert_eq!(extract_api_key(Some("bearer XYZ"), None, ip), "XYZ");
+        assert_eq!(extract_api_key(None, Some("sk-xyz"), ip), "sk-xyz");
+        assert_eq!(extract_api_key(Some("Bearer a"), Some("b"), ip), "a");
+        assert_eq!(extract_api_key(None, None, ip), "10.0.0.1");
+        assert_eq!(extract_api_key(None, None, None), "unknown");
+    }
+
+    #[test]
+    fn classify_health_threshold_and_recovery() {
+        assert_eq!(classify_health(0, true), (0, false));
+        assert_eq!(classify_health(1, false), (2, false));
+        assert_eq!(classify_health(2, false), (3, true));
+        assert_eq!(classify_health(9, true), (0, false));
+    }
+
+    #[test]
+    fn probe_once_alive_then_closed() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        assert!(probe_once(addr));
+        drop(listener);
+        assert!(!probe_once(addr));
+    }
+
+    #[test]
+    fn build_rings_and_collect_backends() {
+        let yaml = r#"
+default_backend: "127.0.0.1:8080"
+routes:
+  - host: a.com
+    backend: "10.0.0.1:80"
+  - host: b.com
+    backends: ["10.0.0.2:80", "10.0.0.3:80"]
+  - host: c.com
+    backends: ["10.0.0.2:80", "10.0.0.4:80"]
+"#;
+        let cfg = Config::from_str(yaml).unwrap();
+        let rings = build_rings(&cfg);
+        assert!(rings.contains_key(&1) && rings.contains_key(&2));
+        assert!(!rings.contains_key(&0), "single-backend route has no ring");
+        let all = collect_all_backends(&cfg);
+        let set: HashSet<SocketAddr> = all.iter().copied().collect();
+        assert_eq!(set.len(), 3, "dedup across routes: .2/.3/.4");
+        assert!(set.contains(&"10.0.0.2:80".parse().unwrap()));
+    }
 }
