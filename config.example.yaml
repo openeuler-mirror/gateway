@@ -126,8 +126,42 @@ router_settings:
       hidden: true
 
   # key_affinity 策略参数（仅 routing_strategy: key_affinity 时生效）
-  # key_affinity_context_threshold: 0     # 上下文字符数阈值，低于此值优先最低负载
-  # key_affinity_rebalance_threshold: 10  # 再均衡阈值（请求数差异超过此值时重新分配）
+  # key_affinity_context_threshold: 0  # 上下文字符数阈值，低于此值优先最低负载
+
+  # 再均衡阈值（百分比，1..=100，默认 20）—— key_affinity 与 kvc_aware 共用同一参数：
+  # 当优选/命中 worker 的利用率比最低负载候选高出此百分比时，把请求交给最低负载者
+  # （让其建缓存 / 按容量分流）。利用率 = (in-flight + queued) * 100 / max_inflight。
+  # key_affinity 按 key 迁移应用；kvc_aware 在打分阶段按请求应用。
+  # rebalance_threshold: 20
+  # 兼容旧配置名 key_affinity_rebalance_threshold（serde alias）。
+
+  # ── kvc_aware：自包含前缀亲和路由（零外部依赖）──────────────────────
+  # 启用：routing_strategy: kvc_aware
+  # 原理：gateway 把每个请求的前缀（system+tools+messages）序列化成字节，
+  #       按 block_size 切块、xxhash 当 trie 边 key；路由选中 worker 后把
+  #       该前缀记到 worker 名下，下个相同前缀的请求即命中。不调 vLLM
+  #       /tokenize、不订阅 ZMQ、不需要 tokenizer 文件。
+  # routing_strategy: kvc_aware
+  # kvc_aware:
+  #   # 块大小（字节）。512 ≈ 128 token（英文）/ ~170 token（中文）。
+  #   # 想完整支持 128K 上下文（hit_ratio 能到 1.0）用 2048：
+  #   #   256 块 × 2048 = 512KB ≈ 128K+ token。
+  #   block_size: 512
+  #   # 统一评分权重：score = cache_weight·hit + load_weight·(1-load%)。
+  #   # 二者各自取 0.0..=1.0，且 cache_weight + load_weight ≤ 1.0（归一化）。
+  #   cache_weight: 0.7
+  #   load_weight: 0.3
+  #   # trie 容量上限（块数），超出按 LRU 淘汰最久未访问的块。
+  #   max_blocks: 500000
+  #   # 过载硬门控：inflight 负载 ≥ 此百分比容量的候选直接排除。100=禁用。
+  #   overload_threshold_pct: 90
+  #   # TTL（秒）：自学习块无真实 evict 信号，到期由后台扫描删除。
+  #   # 0 = 禁用 TTL 扫描（只用 LRU 淘汰）；>0 = 秒数，后台每 ttl/2 扫一次。默认 1200。
+  #   router_ttl_secs: 1200.0
+  #   # 单请求最多记录 256 块（≈ block_size×256 字节前缀），封顶防长请求
+  #   # 占用过多 record/锁开销。256×512B=128KB≈36K token；
+  #   # 256×2048B=512KB≈128K token。
+  #   # 128K 上下文建议 block_size: 2048。
 
   # 内容路由：根据请求内容自动选择模型（可选）
   # hybrid_router:

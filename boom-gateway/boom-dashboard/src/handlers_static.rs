@@ -61,8 +61,16 @@ pub async fn redirect_root() -> Response {
         .into_response()
 }
 
-pub async fn index() -> Html<&'static str> {
-    Html(INDEX_HTML)
+pub async fn index() -> Response {
+    #[cfg(feature = "debug-tools")]
+    let body = INDEX_HTML.replace(r#"nav-admin-debug" style="display:none"#, r#"nav-admin-debug""#);
+    #[cfg(not(feature = "debug-tools"))]
+    let body = INDEX_HTML.to_string();
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8"),
+         (header::CACHE_CONTROL, "no-cache")],
+        body,
+    ).into_response()
 }
 
 pub async fn style_css() -> Response {
@@ -74,9 +82,17 @@ pub async fn style_css() -> Response {
 }
 
 pub async fn app_js() -> Response {
+    // #[cfg] conditional compilation — guarantees the correct prefix string
+    // is baked into the binary at compile time.
+    // Build with --features boom-dashboard/debug-tools to enable the Debug page.
+    #[cfg(feature = "debug-tools")]
+    let body = format!("window.__KVC_DEBUG=true;\n{}", APP_JS);
+    #[cfg(not(feature = "debug-tools"))]
+    let body = format!("window.__KVC_DEBUG=false;\n{}", APP_JS);
     (
-        [(header::CONTENT_TYPE, "application/javascript; charset=utf-8")],
-        APP_JS,
+        [(header::CONTENT_TYPE, "application/javascript; charset=utf-8"),
+         (header::CACHE_CONTROL, "no-cache")],
+        body,
     )
         .into_response()
 }
