@@ -4,7 +4,7 @@ use axum::Extension;
 use axum::Json;
 use boom_core::key_format::is_valid_prefix;
 use chrono::NaiveDateTime;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::FromRow;
 use std::sync::Arc;
@@ -440,7 +440,7 @@ pub async fn list_keys(
     .into_response()
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct CreateKeyRequest {
     pub key_alias: Option<String>,
     /// Legacy display name. Defaults to key_alias if not provided.
@@ -769,6 +769,63 @@ pub async fn unblock_key(
                 "Internal error",
             )
                 .into_response()
+        }
+    }
+}
+
+/// Hard-delete a key and every trace of it across the gateway's tables.
+///
+/// Order matters: clear rate-limit state and plan assignment BEFORE the
+/// token row, so a concurrent request that resolves the identity doesn't
+/// race against an in-flight limiter check and leave orphan counters. The
+/// cleanup helpers are owned by boom-limiter (`SlidingWindowLimiter` and
+/// `PlanStore`); `boom_verification_token` is the litellm-compatible row
+/// we already write to in `block_key` / `unblock_key`.
+///
+/// Cleanup failures are logged as warnings, not returned as errors — the
+/// user's intent is "delete this key", and a stale counter or dangling
+/// plan assignment is harmless once the token row is gone (no future
+/// request can resolve to a deleted token).
+pub async fn delete_key(
+    _session: AdminSession,
+    Extension(state): Extension<std::sync::Arc<DashboardState>>,
+    Path(token_hash): Path<String>,
+) -> Response {
+    let db_pool = match &state.db_pool {
+        Some(pool) => pool,
+        None => {
+            return Json(json!({"error": "Database not available"})).into_response();
+        }
+    };
+
+    if let Err(e) = state.limiter.clear_key_all(db_pool, &token_hash).await {
+        tracing::warn!(error = %e, "delete_key: clear_key_all failed (continuing)");
+    }
+    if let Err(e) = state.plan_store.unassign_key_db(db_pool, &token_hash).await {
+        tracing::warn!(error = %e, "delete_key: unassign_key_db failed (continuing)");
+    }
+
+    let result = sqlx::query(
+        r#"DELETE FROM "boom_verification_token" WHERE token = $1"#,
+    )
+    .bind(&token_hash)
+    .execute(db_pool)
+    .await;
+
+    match result {
+        Ok(r) if r.rows_affected() > 0 => Json(json!({"ok": true})).into_response(),
+        Ok(_) => (
+            axum::http::StatusCode::NOT_FOUND,
+            "Key not found",
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!("Dashboard delete_key failed: {}", e);
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal error",
+            )
+            .into_response()
         }
     }
 }
@@ -1263,11 +1320,19 @@ pub async fn import_keys(
     };
 
     // 4. Insert each parsed request via the shared helper.
+    //
+    // The original CreateKeyRequest is cloned so we can hand it to the insert
+    // helper (which takes it by value) AND keep a copy to build the download
+    // attachment. The download mirrors the upload format with one extra
+    // `api_key` column appended, so the user can keep the same file as their
+    // roster without re-keying the rest of the fields by hand.
     let mut created = Vec::new();
+    let mut created_with_req: Vec<(CreateKeyRequest, String)> = Vec::new();
     let mut skipped = Vec::new();
     for req in parsed_reqs {
-        match insert_single_key(&state, db_pool, req).await {
+        match insert_single_key(&state, db_pool, req.clone()).await {
             CreateOutcome::Created { key, token_hash, key_alias } => {
+                created_with_req.push((req, key.clone()));
                 created.push(json!({
                     "key": key,
                     "token_hash": token_hash,
@@ -1283,6 +1348,8 @@ pub async fn import_keys(
         }
     }
 
+    let download = build_key_download(&name, &created_with_req);
+
     Json(json!({
         "file_name": name,
         "format": ext,
@@ -1295,8 +1362,96 @@ pub async fn import_keys(
         "skipped": skipped,
         "created_count": created.len(),
         "skipped_count": skipped.len(),
+        "download": download,
     }))
     .into_response()
+}
+
+/// Build a same-format download attachment that mirrors the upload and
+/// appends an `api_key` column/field for each successfully created key.
+///
+/// Rows that were skipped or failed to parse are NOT included — they have no
+/// key to ship back. The user still sees them in the on-screen tables, but
+/// the download is the canonical "what just got created" artifact.
+///
+/// CSV output keeps the same column order as `CsvKeyRow` (the parse schema)
+/// plus a trailing `api_key` column; `models` is rejoined with `|` to round-
+/// trip the in-cell separator. JSONL output adds an `api_key` field to each
+/// object, preserving the original field set.
+fn build_key_download(
+    original_name: &str,
+    created: &[(CreateKeyRequest, String)],
+) -> Value {
+    if created.is_empty() {
+        return Value::Null;
+    }
+
+    let stem = original_name.rsplit_once('.').map(|(s, _)| s).unwrap_or(original_name);
+    let ext = original_name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
+    let (ext, content, mime) = match ext.as_deref() {
+        Some("csv") => {
+            let mut buf = Vec::new();
+            {
+                let mut wtr = csv::Writer::from_writer(&mut buf);
+                // Header must mirror CsvKeyRow field order, plus api_key.
+                let _ = wtr.write_record(&[
+                    "key_alias", "key_name", "key_prefix", "tag",
+                    "user_id", "team_id", "models",
+                    "rpm_limit", "tpm_limit", "max_budget", "budget_duration",
+                    "expires", "metadata", "plan_name", "api_key",
+                ]);
+                for (req, key) in created {
+                    let _ = wtr.write_record(&[
+                        req.key_alias.clone().unwrap_or_default(),
+                        req.key_name.clone().unwrap_or_default(),
+                        req.key_prefix.clone().unwrap_or_default(),
+                        req.tag.clone().unwrap_or_default(),
+                        req.user_id.clone().unwrap_or_default(),
+                        req.team_id.clone().unwrap_or_default(),
+                        req.models.as_ref()
+                            .map(|v| v.join("|"))
+                            .unwrap_or_default(),
+                        req.rpm_limit.map(|v| v.to_string()).unwrap_or_default(),
+                        req.tpm_limit.map(|v| v.to_string()).unwrap_or_default(),
+                        req.max_budget.map(|v| v.to_string()).unwrap_or_default(),
+                        req.budget_duration.clone().unwrap_or_default(),
+                        req.expires.clone().unwrap_or_default(),
+                        req.metadata.as_ref()
+                            .map(|v| v.to_string())
+                            .unwrap_or_default(),
+                        req.plan_name.clone().unwrap_or_default(),
+                        key.clone(),
+                    ]);
+                }
+                let _ = wtr.flush();
+            }
+            ("csv".to_string(), String::from_utf8_lossy(&buf).to_string(), "text/csv")
+        }
+        _ => {
+            // Default to JSONL — covers .jsonl uploads and the unlikely case
+            // of an unknown extension (we still want to give the user a file).
+            let mut lines = Vec::with_capacity(created.len());
+            for (req, key) in created {
+                // Serialize the original request, then merge `api_key` in.
+                // Round-tripping via Value preserves field order and avoids
+                // hand-listing every field here.
+                let mut obj = serde_json::to_value(req).unwrap_or_else(|_| json!({}));
+                if let Some(map) = obj.as_object_mut() {
+                    map.insert("api_key".to_string(), Value::String(key.clone()));
+                }
+                lines.push(serde_json::to_string(&obj).unwrap_or_default());
+            }
+            let content = lines.join("\n");
+            ("jsonl".to_string(), content, "application/x-ndjson")
+        }
+    };
+
+    json!({
+        "filename": format!("{}-with-keys.{}", stem, ext),
+        "content": content,
+        "mime": mime,
+        "rows": created.len(),
+    })
 }
 
 /// Parse a JSONL file into requests plus per-line errors.

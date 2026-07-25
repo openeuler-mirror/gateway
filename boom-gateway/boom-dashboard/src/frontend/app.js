@@ -2006,6 +2006,7 @@
           ${k.blocked
             ? `<button class="btn-small" onclick="window._unblockKey('${esc(k.token_hash)}')">${t("action.unblock")}</button>`
             : `<button class="btn-danger" onclick="window._blockKey('${esc(k.token_hash)}')">${t("action.block")}</button>`}
+          <button class="btn-danger btn-small" onclick="window._deleteKey('${esc(k.token_hash)}','${esc(k.key_alias || k.token_prefix || "")}')">${t("action.delete")}</button>
         </td>
       </tr>`).join("")}
     </table>`;
@@ -2072,6 +2073,13 @@
     if (!confirm(t("confirm.reset_key"))) return;
     const r = await api(`/admin/limits/reset/${encodeURIComponent(hash)}`, { method: "POST" });
     alert(r.message || t("alert.done"));
+  };
+  window._deleteKey = async (hash, alias) => {
+    if (!confirm(t("confirm.delete_key", { name: alias || hash.slice(0, 12) }))) return;
+    try {
+      await api(`/admin/keys/${encodeURIComponent(hash)}`, { method: "DELETE" });
+      loadKeys();
+    } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
   };
 
   // ── Admin: Models ─────────────────────────────────────
@@ -3327,6 +3335,22 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
       <td class="mono">${t("keys.import.line_n", { n: e.line })}</td>
       <td class="muted">${esc(e.reason)}</td>
     </tr>`).join("");
+    // Download button: server returns a same-format attachment with the
+    // generated api_key column/field appended. We trigger it client-side
+    // via Blob so we don't need a second round-trip.
+    const dl = data.download;
+    const downloadBlock = (dl && dl.content) ? `
+      <div class="form-card" style="margin:12px 0;background:var(--surface3)">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:12px">
+          <div>
+            <div style="font-weight:600">${t("keys.import.download_ready")}</div>
+            <div class="muted" style="font-size:12px;margin-top:4px">
+              ${t("keys.import.download_hint", { rows: dl.rows, file: `<code>${esc(dl.filename)}</code>` })}
+            </div>
+          </div>
+          <button class="btn-primary" id="m-import-download">${t("keys.import.download_btn")}</button>
+        </div>
+      </div>` : "";
     showModal(`
       <h3>${t("keys.import.result_title")}</h3>
       <p>${t("keys.import.result_summary", {
@@ -3335,6 +3359,7 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
         created: `<b style="color:var(--success)">${data.created_count}</b>`,
         skipped: `<b style="color:var(--danger)">${data.skipped_count}</b>`,
       })}</p>
+      ${downloadBlock}
       ${data.created && data.created.length ? `
         <h4>${t("keys.import.created_title")} <span class="muted" style="font-size:11px">${t("keys.import.copy_now_hint")}</span></h4>
         <table style="width:100%">
@@ -3357,6 +3382,20 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
         <button class="btn-primary" onclick="hideModal(); window._loadKeysPage();">${t("action.done")}</button>
       </div>
     `);
+    if (dl && dl.content) {
+      const btn = document.getElementById("m-import-download");
+      if (btn) btn.addEventListener("click", () => {
+        const blob = new Blob([dl.content], { type: dl.mime || "text/plain" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = dl.filename;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+      });
+    }
   }
 
   async function showEditKeyModal(key) {

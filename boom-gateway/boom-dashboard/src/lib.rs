@@ -83,7 +83,7 @@ pub fn build_router<S: Clone + Send + Sync + 'static>(state: DashboardState) -> 
         )
         .route(
             "/dashboard/api/admin/keys/{token_hash}",
-            put(handlers_admin::update_key),
+            put(handlers_admin::update_key).delete(handlers_admin::delete_key),
         )
         .route(
             "/dashboard/api/admin/keys/{token_hash}/block",
