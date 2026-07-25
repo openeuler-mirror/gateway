@@ -256,6 +256,62 @@ fn extract_api_key(
     }
 }
 
+const PROBE_INTERVAL: Duration = Duration::from_secs(5);
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const FAIL_THRESHOLD: u32 = 3;
+
+struct HealthState {
+    backends: Arc<RwLock<Vec<SocketAddr>>>,
+    unhealthy: Arc<RwLock<HashSet<SocketAddr>>>,
+}
+
+impl HealthState {
+    fn new(backends: Vec<SocketAddr>) -> Arc<Self> {
+        Arc::new(HealthState {
+            backends: Arc::new(RwLock::new(backends)),
+            unhealthy: Arc::new(RwLock::new(HashSet::new())),
+        })
+    }
+}
+
+/// (prev_consecutive_failures, probe_healthy) -> (new_failures, mark_unhealthy)
+fn classify_health(prev_failures: u32, probe_healthy: bool) -> (u32, bool) {
+    if probe_healthy {
+        (0, false)
+    } else {
+        let n = prev_failures + 1;
+        (n, n >= FAIL_THRESHOLD)
+    }
+}
+
+fn probe_once(addr: SocketAddr) -> bool {
+    std::net::TcpStream::connect_timeout(&addr, PROBE_TIMEOUT).is_ok()
+}
+
+/// Background TCP prober: every PROBE_INTERVAL, probe each known backend and
+/// mark/unmark unhealthy in the shared set.
+fn run_health_probe(state: Arc<HealthState>) {
+    std::thread::spawn(move || {
+        let mut failures: HashMap<SocketAddr, u32> = HashMap::new();
+        loop {
+            let backends = state.backends.read().unwrap().clone();
+            for addr in &backends {
+                let healthy = probe_once(*addr);
+                let prev = *failures.get(addr).unwrap_or(&0);
+                let (nf, mark) = classify_health(prev, healthy);
+                failures.insert(*addr, nf);
+                let mut set = state.unhealthy.write().unwrap();
+                if mark {
+                    set.insert(*addr);
+                } else {
+                    set.remove(addr);
+                }
+            }
+            std::thread::sleep(PROBE_INTERVAL);
+        }
+    });
+}
+
 pub struct Gateway {
     config: Arc<RwLock<Config>>,
 }
@@ -519,5 +575,22 @@ routes:
         assert_eq!(extract_api_key(Some("Bearer a"), Some("b"), ip), "a");
         assert_eq!(extract_api_key(None, None, ip), "10.0.0.1");
         assert_eq!(extract_api_key(None, None, None), "unknown");
+    }
+
+    #[test]
+    fn classify_health_threshold_and_recovery() {
+        assert_eq!(classify_health(0, true), (0, false));
+        assert_eq!(classify_health(1, false), (2, false));
+        assert_eq!(classify_health(2, false), (3, true));
+        assert_eq!(classify_health(9, true), (0, false));
+    }
+
+    #[test]
+    fn probe_once_alive_then_closed() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        assert!(probe_once(addr));
+        drop(listener);
+        assert!(!probe_once(addr));
     }
 }
