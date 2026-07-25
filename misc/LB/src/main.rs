@@ -227,6 +227,35 @@ impl Ring {
     }
 }
 
+/// Affinity key: `Authorization: Bearer <key>` -> `x-api-key` -> client IP -> "unknown".
+fn extract_api_key(
+    auth: Option<&str>,
+    x_api_key: Option<&str>,
+    client_ip: Option<IpAddr>,
+) -> String {
+    if let Some(a) = auth {
+        let trimmed = a.trim();
+        if let Some(prefix) = trimmed.get(..6) {
+            if prefix.eq_ignore_ascii_case("Bearer") {
+                if let Some(rest) = trimmed.get(6..) {
+                    let rest = rest.trim();
+                    if !rest.is_empty() {
+                        return rest.to_string();
+                    }
+                }
+            }
+        }
+        return trimmed.to_string();
+    }
+    if let Some(k) = x_api_key {
+        return k.trim().to_string();
+    }
+    match client_ip {
+        Some(ip) => ip.to_string(),
+        None => "unknown".to_string(),
+    }
+}
+
 pub struct Gateway {
     config: Arc<RwLock<Config>>,
 }
@@ -479,5 +508,16 @@ routes:
             .filter(|(k, orig)| ring.pick(k, &un) != **orig)
             .count();
         assert_eq!(moved, on_evicted, "only keys on the evicted node should move");
+    }
+
+    #[test]
+    fn api_key_extraction_priority() {
+        let ip = Some(IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)));
+        assert_eq!(extract_api_key(Some("Bearer abc123"), None, ip), "abc123");
+        assert_eq!(extract_api_key(Some("bearer XYZ"), None, ip), "XYZ");
+        assert_eq!(extract_api_key(None, Some("sk-xyz"), ip), "sk-xyz");
+        assert_eq!(extract_api_key(Some("Bearer a"), Some("b"), ip), "a");
+        assert_eq!(extract_api_key(None, None, ip), "10.0.0.1");
+        assert_eq!(extract_api_key(None, None, None), "unknown");
     }
 }
