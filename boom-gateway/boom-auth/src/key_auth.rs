@@ -1,5 +1,4 @@
 use crate::models::{TeamRow, VerificationToken};
-use boom_core::key_format::{parse_raw_key, ParsedKey};
 use boom_core::provider::{Authenticator, KeyAliasLookup};
 use boom_core::types::AuthIdentity;
 use boom_core::GatewayError;
@@ -177,53 +176,18 @@ impl Authenticator for DbAuthenticator {
             });
         }
 
-        // 2. Hash the key. For `sk-{prefix}-{secret}` keys only `secret`
-        //    participates; legacy `sk-{hex}` keys keep hashing the entire
-        //    raw_key so historical DB rows match byte-for-byte.
-        let parsed = parse_raw_key(raw_key);
-        let hashed = match parsed {
-            ParsedKey::Prefixed { secret, .. } => Self::hash_token(secret),
-            ParsedKey::Legacy => Self::hash_token(raw_key),
-        };
+        // 2. Hash the entire raw key. Prefix (if any) participates in the hash,
+        //    so any tampering with the prefix portion changes the digest and the
+        //    DB lookup naturally fails — no separate prefix-string check needed.
+        //    This matches litellm's `hash_token` byte-for-byte, so legacy rows
+        //    (including litellm-generated keys with embedded `-`) keep working.
+        let hashed = Self::hash_token(raw_key);
 
         // 3. Look up in cache / DB
         let token = self
             .lookup_token(&hashed)
             .await?
             .ok_or_else(|| GatewayError::AuthError("Invalid API key".to_string()))?;
-
-        // 3b. Prefix tampering check: if the DB row was created with a prefix,
-        //     the raw key must carry that same prefix. Rejects the case where
-        //     an attacker pairs a stolen secret with a different prefix to
-        //     muddy audit trails. A legacy (unprefixed) row also must not
-        //     suddenly arrive wrapped in a prefix.
-        match (&parsed, &token.key_prefix) {
-            (ParsedKey::Prefixed { prefix, .. }, Some(db_prefix)) if prefix == db_prefix => {}
-            (ParsedKey::Prefixed { .. }, Some(_)) => {
-                tracing::warn!(
-                    "Prefix mismatch on key {:?}: rejected",
-                    token.key_name
-                );
-                return Err(GatewayError::AuthError("Invalid API key".to_string()));
-            }
-            (ParsedKey::Prefixed { .. }, None) => {
-                // Raw key has prefix but DB row has none — reject.
-                tracing::warn!(
-                    "Prefixed raw key on unprefixed row {:?}: rejected",
-                    token.key_name
-                );
-                return Err(GatewayError::AuthError("Invalid API key".to_string()));
-            }
-            (ParsedKey::Legacy, Some(_)) => {
-                // Raw key has no prefix but DB row expects one — reject.
-                tracing::warn!(
-                    "Unprefixed raw key on prefixed row {:?}: rejected",
-                    token.key_name
-                );
-                return Err(GatewayError::AuthError("Invalid API key".to_string()));
-            }
-            (ParsedKey::Legacy, None) => {}
-        }
 
         // 4. Validate the token
         let mut identity = self.token_to_identity(token);
@@ -344,37 +308,39 @@ impl KeyAliasLookup for DbAuthenticator {
 mod tests {
     use super::*;
 
-    /// Critical compatibility guarantee: a legacy 32-hex key hashed via the
-    /// legacy path must produce the same digest as the pre-prefix code did.
-    /// If this ever breaks, every existing DB row stops matching.
+    /// The hash input is always the entire raw key, byte-for-byte. This is the
+    /// litellm-compatible contract — if it ever breaks, every existing DB row
+    /// (boom-issued keys, litellm-issued keys, anything with embedded `-`)
+    /// stops matching.
     #[test]
-    fn legacy_hash_matches_pre_prefix_behavior() {
+    fn hash_covers_entire_raw_key() {
         let raw = "sk-deadbeefdeadbeefdeadbeefdeadbeef";
-        // Old code: hash_token(raw_key).
-        // New code: parse_raw_key says Legacy → hash_token(raw_key).
-        let digest = match parse_raw_key(raw) {
-            ParsedKey::Legacy => DbAuthenticator::hash_token(raw),
-            _ => panic!("expected Legacy"),
-        };
-        // Hard-coded expectation: SHA-256 of the literal string.
+        let digest = DbAuthenticator::hash_token(raw);
         let mut h = Sha256::new();
         h.update(raw.as_bytes());
         let expected = hex::encode(h.finalize());
         assert_eq!(digest, expected);
     }
 
-    /// Prefixed keys hash only the secret portion. This is what makes the
-    /// prefix purely informational — strip it and you still get the same hash.
+    /// The prefix portion participates in the hash — that's what makes prefix
+    /// tamper detection implicit. Flip one character of the prefix and the
+    /// digest must change.
     #[test]
-    fn prefixed_hash_ignores_prefix_bytes() {
-        let secret = "deadbeefdeadbeefdeadbeefdeadbeef";
-        let raw = format!("sk-teama-{}", secret);
-        let digest = match parse_raw_key(&raw) {
-            ParsedKey::Prefixed { secret: s, .. } => DbAuthenticator::hash_token(s),
-            _ => panic!("expected Prefixed"),
-        };
+    fn prefix_participates_in_hash() {
+        let a = "sk-prod-deadbeefdeadbeefdeadbeefdeadbeef";
+        let b = "sk-test-deadbeefdeadbeefdeadbeefdeadbeef";
+        assert_ne!(DbAuthenticator::hash_token(a), DbAuthenticator::hash_token(b));
+    }
+
+    /// A litellm-issued key with an embedded `-` (e.g. token_urlsafe output)
+    /// must hash identically to litellm's own hash_token. This is the
+    /// regression that motivated switching away from raw_key shape parsing.
+    #[test]
+    fn litellm_style_key_with_dash_hashes_as_whole_string() {
+        let raw = "sk-a-beEoPxxx";
+        let digest = DbAuthenticator::hash_token(raw);
         let mut h = Sha256::new();
-        h.update(secret.as_bytes());
+        h.update(raw.as_bytes());
         let expected = hex::encode(h.finalize());
         assert_eq!(digest, expected);
     }

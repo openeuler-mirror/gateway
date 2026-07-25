@@ -4,7 +4,6 @@ use axum::http::header::{COOKIE, SET_COOKIE};
 use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
-use boom_core::key_format::{parse_raw_key, ParsedKey};
 use chrono::Utc;
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
@@ -324,14 +323,10 @@ pub async fn login(
         }
     };
 
-    // All keys are stored as SHA-256 hash in DB. The hash input depends on
-    // key shape: legacy `sk-{hex}` hashes the entire raw key; prefixed
-    // `sk-{prefix}-{secret}` hashes only `secret`. This MUST match the
-    // creation path in boom-auth/handlers_admin — see boom_core::key_format.
-    let token_hash = match parse_raw_key(&api_key) {
-        ParsedKey::Prefixed { secret, .. } => hash_token(secret),
-        ParsedKey::Legacy => hash_token(&api_key),
-    };
+    // All keys are stored as SHA-256 of the entire raw key. This matches the
+    // /v1 authenticate path (boom-auth) and the dashboard create-key path,
+    // and is litellm-compatible. Prefix (if any) participates in the hash.
+    let token_hash = hash_token(&api_key);
 
     let row_result: Result<Option<(Option<String>, Option<String>, Option<bool>)>, _> = sqlx::query_as(
         r#"SELECT user_id, key_alias, blocked FROM "boom_verification_token" WHERE token = $1"#,

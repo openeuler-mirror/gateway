@@ -10,7 +10,7 @@ pub mod types;
 
 pub use debug_store::{DebugErrorEntry, DebugErrorStore};
 pub use error::GatewayError;
-pub use key_format::{is_valid_prefix, parse_raw_key, ParsedKey};
+pub use key_format::is_valid_prefix;
 pub use kv_event::KvIndexBackend;
 pub use provider::{Authenticator, DeploymentQueueInfo, KeyAliasLookup, Provider};
 

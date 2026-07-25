@@ -19,11 +19,10 @@ const MAX_TAG_LEN: usize = 64;
 
 /// Generate a (raw_key, hashed_token, optional_prefix) triple for a new key.
 ///
-/// When `requested_prefix` is `Some` and passes [`is_valid_prefix`], emits a
-/// prefixed key whose secret portion is hashed (prefix is metadata only).
-/// Otherwise emits a legacy `sk-{32 hex}` key whose entire raw string is
-/// hashed — byte-for-byte identical to the pre-prefix code path, so DB rows
-/// created by older binaries remain matchable.
+/// The hash always covers the entire raw key (e.g. `sk-{prefix}-{secret}` or
+/// `sk-{secret}`), matching the /v1 authenticate path byte-for-byte. Prefix
+/// tamper detection is implicit — any change to the prefix portion changes
+/// the digest, so the DB lookup fails.
 ///
 /// Callers must validate the prefix themselves and reject invalid values
 /// with a 400 — this helper silently drops an invalid prefix to keep the
@@ -33,7 +32,7 @@ fn generate_key_material(requested_prefix: Option<&str>) -> (String, String, Opt
     match requested_prefix.filter(|p| is_valid_prefix(p)) {
         Some(p) => {
             let raw = format!("sk-{}-{}", p, secret);
-            let hashed = hash_token(&secret);
+            let hashed = hash_token(&raw);
             (raw, hashed, Some(p.to_string()))
         }
         None => {
