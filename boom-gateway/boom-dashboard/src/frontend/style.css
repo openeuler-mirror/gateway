@@ -1348,6 +1348,14 @@ tr.filter-row td { padding: 3px 4px; background: var(--surface2); border-bottom:
 .badge-active { background: var(--success-bg); color: var(--success); }
 .badge-blocked { background: var(--danger-bg); color: var(--danger); }
 .badge-plan { background: var(--primary-bg); color: var(--primary); }
+.badge-plan-default {
+  background: var(--surface3); color: var(--text-muted);
+  font-weight: 500; margin-left: 6px; padding: 2px 7px; font-size: 10px;
+}
+.badge-plan-no-plan {
+  background: var(--danger-bg); color: var(--danger);
+  font-weight: 600;
+}
 .badge-prefix { background: var(--surface3); color: var(--text-muted); margin-left: 6px; font-family: var(--mono-font, monospace); }
 .badge-tag { background: rgba(59,130,246,.12); color: #2563eb; margin-left: 6px; font-weight: 500; max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block; vertical-align: middle; }
 [data-theme="dark"] .badge-tag { color: #93c5fd; }

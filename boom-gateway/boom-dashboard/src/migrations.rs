@@ -100,6 +100,9 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
     tracing::info!("Migration 4/13: done");
     tracing::info!("Migration 5/13: assignment...");
     run_ddl_on_conn(&mut conn, boom_limiter::migrations::assignment_ddl()).await?;
+    // Idempotent: relax plan_name to NULL so "explicit no-plan" is distinct
+    // from "never configured". See assignment_alter_ddl doc.
+    run_ddl_on_conn(&mut conn, boom_limiter::migrations::assignment_alter_ddl()).await?;
     tracing::info!("Migration 5/13: done");
     tracing::info!("Migration 6/13: plan...");
     run_ddl_on_conn(&mut conn, boom_limiter::migrations::plan_ddl()).await?;

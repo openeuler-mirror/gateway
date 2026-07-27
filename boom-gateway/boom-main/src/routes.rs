@@ -1710,19 +1710,27 @@ async fn check_plan_limits(
     window_limits: &[boom_core::types::WindowLimit],
     weight: u64,
 ) -> Result<PlanCharge, GatewayError> {
-    // ── Resolve key plan (with default_plan fallback) ──
-    let key_plan: Option<RateLimitPlan> = match plan_store.resolve_plan(key_hash) {
-        Some(p) if p.r#type == boom_core::types::PlanType::Team => {
-            tracing::warn!(
-                key_hash = %key_hash,
-                plan = %p.name,
-                "Key is assigned a type=team plan — falling back to default_plan. \
-                 Team plans cannot be assigned to individual keys."
-            );
-            plan_store.get_default_plan()
-        }
-        Some(p) => Some(p),
+    // ── Resolve key plan with 3-state semantics ──
+    //   None              → key never configured: follow default_plan
+    //   Some(None)        → user explicitly chose "no plan": NO default fallback
+    //   Some(Some(name))  → user explicitly assigned plan `name`
+    let key_plan: Option<RateLimitPlan> = match plan_store.get_plan_name_explicit(key_hash) {
         None => plan_store.get_default_plan(),
+        Some(None) => None,
+        Some(Some(plan_name)) => match plan_store.get_plan(&plan_name) {
+            Some(p) if p.r#type == boom_core::types::PlanType::Team => {
+                tracing::warn!(
+                    key_hash = %key_hash,
+                    plan = %p.name,
+                    "Key is assigned a type=team plan — falling back to default_plan. \
+                     Team plans cannot be assigned to individual keys."
+                );
+                plan_store.get_default_plan()
+            }
+            Some(p) => Some(p),
+            // Plan row was deleted out from under us — graceful fallback.
+            None => plan_store.get_default_plan(),
+        },
     };
 
     // ── Resolve team plan (if team_id is set) ──

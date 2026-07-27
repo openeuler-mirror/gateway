@@ -4,7 +4,7 @@ use axum::Extension;
 use axum::Json;
 use boom_core::key_format::is_valid_prefix;
 use chrono::NaiveDateTime;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
 use sqlx::FromRow;
 use std::sync::Arc;
@@ -12,6 +12,20 @@ use uuid::Uuid;
 
 use crate::auth::{hash_token, AdminSession};
 use crate::state::DashboardState;
+
+/// Deserialize `Option<Option<T>>` so JSON `null` is distinguished from a
+/// missing field. Used for `plan_name` in key-assignment requests where the
+/// three states must round-trip through the API:
+///   - field absent       → `None`             (no-op for assign; "use default" for create)
+///   - `plan_name: null`  → `Some(None)`       (explicit "no plan" — does NOT fall back)
+///   - `plan_name: "x"`   → `Some(Some("x"))`  (explicit plan assignment)
+fn deserialize_some<'de, T, D>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: Deserializer<'de>,
+{
+    Deserialize::deserialize(deserializer).map(Some)
+}
 
 /// Maximum allowed length of the user-supplied `tag` string. Tags are free
 /// text (Unicode OK) but capped to keep cell rendering sane.
@@ -207,10 +221,10 @@ pub struct ListKeysQuery {
     pub vip_only: Option<String>,
     /// Filter by plan assignment.
     ///   - unset            → no filter
-    ///   - "none"           → keys with no explicit assignment AND no default plan
+    ///   - "unassigned"     → keys with no DB row (follows default_plan)
+    ///   - "no_plan"        → keys explicitly configured to have no plan
+    ///   - "none"           → legacy alias for "unassigned"
     ///   - any other string → keys whose effective plan_name matches exactly
-    /// "none" deliberately excludes default-plan keys — the dashboard uses it
-    /// to surface "truly unconfigured" keys that need attention.
     #[serde(default)]
     pub plan: Option<String>,
 }
@@ -298,13 +312,23 @@ pub async fn list_keys(
         .map(|r| {
             let token_prefix = format!("{}...", &r.token[..8.min(r.token.len())]);
             let (usage_count, usage_reset_secs) = all_usage.get(&r.token).copied().unwrap_or((0, 0));
-            // Effective plan: explicit assignment → default plan → null.
-            // get_plan_name only returns explicit assignments; we fall back to
-            // the configured default so the UI shows *what's actually applied*.
-            let plan_name = state
-                .plan_store
-                .get_plan_name(&r.token)
-                .or_else(|| state.plan_store.get_default_plan_name());
+            // Three-state plan assignment. The frontend distinguishes:
+            //   - "default"   → no DB row (follows default_plan at runtime)
+            //   - "no_plan"   → row with plan_name IS NULL (explicit opt-out)
+            //   - "plan"      → row with plan_name = "x"
+            let explicit = state.plan_store.get_plan_name_explicit(&r.token);
+            let plan_assignment_kind = match explicit {
+                None => "default",
+                Some(None) => "no_plan",
+                Some(Some(_)) => "plan",
+            };
+            // Effective plan name (what the runtime actually uses). Falls back
+            // to default_plan for None and Some(None)-without-default.
+            let plan_name = match &explicit {
+                Some(Some(n)) => Some(n.clone()),
+                None => state.plan_store.get_default_plan_name(),
+                Some(None) => None,
+            };
 
             // Aggregate current-window tokens & cost from limiter. We pick
             // the smallest window_secs per kind — that's the "tightest" current
@@ -378,6 +402,7 @@ pub async fn list_keys(
                 "usage_tokens": usage_tokens,
                 "usage_cost": usage_cost.to_string(),
                 "plan_name": plan_name,
+                "plan_assignment_kind": plan_assignment_kind,
             })
         })
         .collect();
@@ -399,19 +424,18 @@ pub async fn list_keys(
         });
     }
 
-    // Filter by plan assignment. The "none" sentinel matches keys with NO
-    // explicit assignment — checked via plan_store, not the resolved
-    // plan_name (which folds in the default-plan fallback). Comparing the
-    // resolved name against default_plan would incorrectly catch keys that
-    // were explicitly assigned to the default plan.
+    // Filter by plan assignment. Three sentinels + name match:
+    //   - "unassigned" → no DB row (follows default_plan at runtime)
+    //   - "no_plan"    → explicit row with plan_name IS NULL
+    //   - "none"       → legacy alias for "unassigned"
+    //   - any other    → keys whose effective plan_name matches exactly
     if let Some(ref plan_filter) = query.plan {
         match plan_filter.as_str() {
-            "none" => keys.retain(|k| {
-                let token = k.get("token_hash").and_then(|v| v.as_str());
-                match token {
-                    Some(t) => state.plan_store.get_plan_name(t).is_none(),
-                    None => true,
-                }
+            "unassigned" | "none" => keys.retain(|k| {
+                k.get("plan_assignment_kind").and_then(|v| v.as_str()) == Some("default")
+            }),
+            "no_plan" => keys.retain(|k| {
+                k.get("plan_assignment_kind").and_then(|v| v.as_str()) == Some("no_plan")
             }),
             name => keys.retain(|k| {
                 k.get("plan_name").and_then(|v| v.as_str()) == Some(name)
@@ -459,7 +483,12 @@ pub struct CreateKeyRequest {
     pub tpm_limit: Option<i64>,
     pub expires: Option<String>,
     pub metadata: Option<serde_json::Value>,
-    pub plan_name: Option<String>,
+    /// Plan assignment for the new key. Three states:
+    ///   - field absent (`None`)            → follow default_plan at runtime
+    ///   - `null`   (`Some(None)`)          → explicit "no plan" (no default fallback)
+    ///   - `"name"` (`Some(Some(name))`)    → assign to plan `name`
+    #[serde(default, deserialize_with = "deserialize_some")]
+    pub plan_name: Option<Option<String>>,
 }
 
 pub async fn create_key(
@@ -550,16 +579,34 @@ pub async fn create_key(
             .into_response();
     }
 
-    // 4. Optionally assign to plan (skip DB write if same as default).
-    if let Some(ref plan_name) = req.plan_name {
-        let is_default = state.plan_store.get_default_plan_name().as_deref() == Some(plan_name.as_str());
-        let result = if is_default {
-            state.plan_store.assign_key(&token_hash, plan_name)
-        } else {
-            state.plan_store.assign_key_db(db_pool, &token_hash, plan_name).await
-        };
-        if let Err(e) = result {
-            tracing::warn!("Key created but plan assignment failed: {}", e);
+    // 4. Plan assignment (3 states — see CreateKeyRequest::plan_name).
+    //    - None            → no row written (runtime follows default_plan)
+    //    - Some(None)      → row with plan_name IS NULL (no default fallback)
+    //    - Some(Some(name))→ row with plan_name = name
+    //    Skip DB write when the explicit assignment is the same as default_plan:
+    //    no row needed; default fallback already yields the right plan at runtime.
+    match req.plan_name {
+        None => {}
+        Some(None) => {
+            if let Err(e) = state
+                .plan_store
+                .assign_key_no_plan_db(db_pool, &token_hash)
+                .await
+            {
+                tracing::warn!("Key created but 'no plan' assignment failed: {}", e);
+            }
+        }
+        Some(Some(ref plan_name)) => {
+            let is_default = state.plan_store.get_default_plan_name().as_deref()
+                == Some(plan_name.as_str());
+            let result = if is_default {
+                state.plan_store.assign_key(&token_hash, plan_name)
+            } else {
+                state.plan_store.assign_key_db(db_pool, &token_hash, plan_name).await
+            };
+            if let Err(e) = result {
+                tracing::warn!("Key created but plan assignment failed: {}", e);
+            }
         }
     }
 
@@ -889,7 +936,12 @@ pub async fn list_assignments(
 #[derive(Debug, Deserialize)]
 pub struct AssignRequest {
     pub key_hash: String,
-    pub plan_name: String,
+    /// Three states (same semantics as CreateKeyRequest::plan_name):
+    ///   - field absent (`None`)            → no-op (preserved for legacy callers that always send a string)
+    ///   - `null`   (`Some(None)`)          → explicit "no plan" (no default fallback)
+    ///   - `"name"` (`Some(Some(name))`)    → assign to plan `name`
+    #[serde(default, deserialize_with = "deserialize_some")]
+    pub plan_name: Option<Option<String>>,
 }
 
 pub async fn assign_key(
@@ -897,22 +949,61 @@ pub async fn assign_key(
     Extension(state): Extension<std::sync::Arc<DashboardState>>,
     Json(req): Json<AssignRequest>,
 ) -> Response {
-    if let Some(ref pool) = state.db_pool {
-        match state.plan_store.assign_key_db(pool, &req.key_hash, &req.plan_name).await {
-            Ok(()) => {
-                let _ = state.admin_tx.send(crate::state::AdminCommand::ConfigChanged).await;
+    // For backward compat: callers that send a non-null plan_name route to
+    // assign_key_db. Sending null routes to assign_key_no_plan_db. Sending
+    // the field absent is a no-op (legacy callers always include it).
+    match req.plan_name {
+        Some(None) => {
+            if let Some(ref pool) = state.db_pool {
+                match state.plan_store.assign_key_no_plan_db(pool, &req.key_hash).await {
+                    Ok(()) => {
+                        let _ = state
+                            .admin_tx
+                            .send(crate::state::AdminCommand::ConfigChanged)
+                            .await;
+                        Json(json!({"ok": true})).into_response()
+                    }
+                    Err(e) => (axum::http::StatusCode::BAD_REQUEST, e).into_response(),
+                }
+            } else {
+                state.plan_store.assign_key_no_plan(&req.key_hash);
+                let _ = state
+                    .admin_tx
+                    .send(crate::state::AdminCommand::ConfigChanged)
+                    .await;
                 Json(json!({"ok": true})).into_response()
             }
-            Err(e) => (axum::http::StatusCode::BAD_REQUEST, e).into_response(),
         }
-    } else {
-        match state.plan_store.assign_key(&req.key_hash, &req.plan_name) {
-            Ok(()) => {
-                let _ = state.admin_tx.send(crate::state::AdminCommand::ConfigChanged).await;
-                Json(json!({"ok": true})).into_response()
+        Some(Some(ref name)) => {
+            if let Some(ref pool) = state.db_pool {
+                match state.plan_store.assign_key_db(pool, &req.key_hash, name).await {
+                    Ok(()) => {
+                        let _ = state
+                            .admin_tx
+                            .send(crate::state::AdminCommand::ConfigChanged)
+                            .await;
+                        Json(json!({"ok": true})).into_response()
+                    }
+                    Err(e) => (axum::http::StatusCode::BAD_REQUEST, e).into_response(),
+                }
+            } else {
+                match state.plan_store.assign_key(&req.key_hash, name) {
+                    Ok(()) => {
+                        let _ = state
+                            .admin_tx
+                            .send(crate::state::AdminCommand::ConfigChanged)
+                            .await;
+                        Json(json!({"ok": true})).into_response()
+                    }
+                    Err(e) => (axum::http::StatusCode::BAD_REQUEST, e).into_response(),
+                }
             }
-            Err(e) => (axum::http::StatusCode::BAD_REQUEST, e).into_response(),
         }
+        None => (
+            axum::http::StatusCode::BAD_REQUEST,
+            "plan_name is required (send null for explicit no-plan)",
+        )
+            .into_response(),
     }
 }
 
@@ -1190,16 +1281,29 @@ async fn insert_single_key(
 
     match result {
         Ok(_) => {
-            if let Some(ref plan_name) = req.plan_name {
-                let is_default =
-                    state.plan_store.get_default_plan_name().as_deref() == Some(plan_name.as_str());
-                let result = if is_default {
-                    state.plan_store.assign_key(&token_hash, plan_name)
-                } else {
-                    state.plan_store.assign_key_db(db_pool, &token_hash, plan_name).await
-                };
-                if let Err(e) = result {
-                    tracing::warn!("Key created but plan assignment failed: {}", e);
+            // Plan assignment — 3 states (see CreateKeyRequest::plan_name).
+            match req.plan_name {
+                None => {}
+                Some(None) => {
+                    if let Err(e) = state
+                        .plan_store
+                        .assign_key_no_plan_db(db_pool, &token_hash)
+                        .await
+                    {
+                        tracing::warn!("Key created but 'no plan' assignment failed: {}", e);
+                    }
+                }
+                Some(Some(ref plan_name)) => {
+                    let is_default = state.plan_store.get_default_plan_name().as_deref()
+                        == Some(plan_name.as_str());
+                    let result = if is_default {
+                        state.plan_store.assign_key(&token_hash, plan_name)
+                    } else {
+                        state.plan_store.assign_key_db(db_pool, &token_hash, plan_name).await
+                    };
+                    if let Err(e) = result {
+                        tracing::warn!("Key created but plan assignment failed: {}", e);
+                    }
                 }
             }
             CreateOutcome::Created {
@@ -1418,7 +1522,11 @@ fn build_key_download(
                         req.metadata.as_ref()
                             .map(|v| v.to_string())
                             .unwrap_or_default(),
-                        req.plan_name.clone().unwrap_or_default(),
+                        req.plan_name
+                            .as_ref()
+                            .and_then(|inner| inner.as_deref())
+                            .unwrap_or_default()
+                            .to_string(),
                         key.clone(),
                     ]);
                 }
@@ -1578,7 +1686,14 @@ fn parse_csv(bytes: &[u8]) -> (Vec<CreateKeyRequest>, Vec<Value>) {
             tpm_limit: row.tpm_limit,
             expires: row.expires.filter(|s| !s.is_empty()),
             metadata,
-            plan_name: row.plan_name.filter(|s| !s.is_empty()),
+            // CSV is a flat-string format — can't carry the three-state
+            // Option<Option<String>>. Non-empty string → Some(Some(name));
+            // empty/missing → None (use default at runtime). "Explicit no-plan"
+            // cannot be expressed in CSV; use JSONL import/export instead.
+            plan_name: row
+                .plan_name
+                .filter(|s| !s.is_empty())
+                .map(|s| Some(s)),
         });
     }
     (reqs, errors)
@@ -4422,12 +4537,31 @@ pub async fn quota_reset_team_windows(
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_pagination;
+    use super::{normalize_pagination, CreateKeyRequest};
 
     #[test]
     fn normalize_pagination_clamps_invalid_values() {
         assert_eq!(normalize_pagination(0, 0), (1, 1));
         assert_eq!(normalize_pagination(-3, -20), (1, 1));
         assert_eq!(normalize_pagination(2, 5000), (2, 1000));
+    }
+
+    /// Lock in the three-state JSON semantics of `CreateKeyRequest::plan_name`:
+    ///   - field absent      → None             (use default_plan at runtime)
+    ///   - `plan_name: null`  → Some(None)       (explicit "no plan")
+    ///   - `plan_name: "x"`   → Some(Some("x"))  (assign to plan "x")
+    /// Regression guard: if the deserialize_some helper breaks, these will fail.
+    #[test]
+    fn create_key_request_plan_name_three_state_deserialization() {
+        let absent: CreateKeyRequest = serde_json::from_str(r#"{"key_alias":"a"}"#).unwrap();
+        assert_eq!(absent.plan_name, None);
+
+        let null: CreateKeyRequest =
+            serde_json::from_str(r#"{"key_alias":"a","plan_name":null}"#).unwrap();
+        assert_eq!(null.plan_name, Some(None));
+
+        let named: CreateKeyRequest =
+            serde_json::from_str(r#"{"key_alias":"a","plan_name":"default"}"#).unwrap();
+        assert_eq!(named.plan_name, Some(Some("default".to_string())));
     }
 }

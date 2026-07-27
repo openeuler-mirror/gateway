@@ -1898,7 +1898,7 @@
   let keysSearch = "";
   let keysSearchTimer = null;
   let keysVipOnly = false;
-  let keysPlanFilter = "";  // "" = all, "none" = unassigned, otherwise plan name
+  let keysPlanFilter = "";  // "" = all, "unassigned"/"none" = follows default, "no_plan" = explicit no-plan, otherwise plan name
   let keysDataCache = [];
 
   function setupKeysSearch() {
@@ -1932,11 +1932,14 @@
   function refreshKeysPlanFilterOptions(sel) {
     getPlanNames().then((names) => {
       const opts = [`<option value="">${t("keys.plan_filter.all")}</option>`]
-        .concat([`<option value="none" ${keysPlanFilter === "none" ? "selected" : ""}>${t("keys.plan_filter.none")}</option>`])
+        .concat([`<option value="unassigned" ${keysPlanFilter === "unassigned" ? "selected" : ""}>${t("keys.plan_filter.unassigned")}</option>`])
+        .concat([`<option value="no_plan" ${keysPlanFilter === "no_plan" ? "selected" : ""}>${t("keys.plan_filter.no_plan")}</option>`])
         .concat(names.map((n) => `<option value="${esc(n)}" ${keysPlanFilter === n ? "selected" : ""}>${esc(n)}</option>`));
       sel.innerHTML = opts.join("");
-      // Drop stale selection (plan deleted on Plans page).
-      const stillExists = keysPlanFilter === "" || keysPlanFilter === "none" || names.includes(keysPlanFilter);
+      // Drop stale selection (plan deleted on Plans page). Legacy "none" maps
+      // to "unassigned" now — silently migrate.
+      if (keysPlanFilter === "none") keysPlanFilter = "unassigned";
+      const stillExists = keysPlanFilter === "" || keysPlanFilter === "unassigned" || keysPlanFilter === "no_plan" || names.includes(keysPlanFilter);
       if (!stillExists) {
         keysPlanFilter = "";
         sel.value = "";
@@ -1969,6 +1972,27 @@
     }
   }
 
+  // Render the plan cell for a key row. Three kinds:
+  //   - "default" → no DB row; runtime follows default_plan. Show effective
+  //                 plan name with a muted "(默认)" suffix badge.
+  //   - "no_plan" → row with plan_name IS NULL; runtime does NOT fall back.
+  //                 Show "无套餐" with a "兜底" badge.
+  //   - "plan"    → explicit plan name. Show the name plain.
+  function renderKeyPlanCell(k) {
+    const kind = k.plan_assignment_kind || (k.plan_name ? "plan" : "default");
+    if (kind === "no_plan") {
+      return `<span class="badge badge-plan-no-plan">${t("keys.plan.no_plan")}</span> <span class="muted" style="font-size:11px">${t("keys.plan.fallback_hint")}</span>`;
+    }
+    if (kind === "default") {
+      if (!k.plan_name) {
+        // No default_plan configured either — effectively unbounded.
+        return `<span class="muted">-</span>`;
+      }
+      return `${esc(k.plan_name)} <span class="badge badge-plan-default">${t("keys.plan.default_suffix")}</span>`;
+    }
+    return esc(k.plan_name || "-");
+  }
+
   function renderKeysTable(keys) {
     const wrap = document.getElementById("keys-table-wrap");
     if (keys.length === 0) { wrap.innerHTML = "<p>" + t("keys.empty") + "</p>"; return; }
@@ -1991,7 +2015,7 @@
         <td class="mono">${esc(k.token_prefix)}</td>
         <td>${esc(k.key_alias || "-")}${k.key_prefix ? ' <span class="badge badge-prefix">' + esc(k.key_prefix) + "</span>" : ""}${k.tag ? ' <span class="badge badge-tag">' + esc(k.tag) + "</span>" : ""}</td>
         <td>${esc(k.user_id || "-")}</td>
-        <td>${esc(k.plan_name || "-")}</td>
+        <td>${renderKeyPlanCell(k)}</td>
         <td><span class="mono">${k.usage_count || 0}/${fmtTokens(k.usage_tokens)}/${fmtCost(k.usage_cost)}</span><br><span class="muted" style="font-size:11px">${formatCountdown(k.usage_reset_secs || 0)}</span></td>
         <td>${fmtCost(k.spend)}</td>
         <td>${k.max_budget != null ? "$" + k.max_budget : "-"}</td>
@@ -3193,7 +3217,7 @@
           <div class="form-card-title">${t("key_card.assignment")}</div>
           <div class="form-card-grid">
             <div class="form-group"><label>${t("form.key.team")} ${tip(t("tip.key.team"))}</label><select id="m-key-team"><option value="">${t("common.none_option")}</option></select></div>
-            <div class="form-group"><label>${t("form.key.plan")} ${tip(t("tip.key.plan"))}</label><select id="m-key-plan"><option value="">${t("common.default_option")}</option></select></div>
+            <div class="form-group"><label>${t("form.key.plan")} ${tip(t("tip.key.plan"))}</label><select id="m-key-plan"><option value="">${t("form.key.plan_default")}</option><option value="__no_plan__">${t("form.key.plan_no_plan")}</option></select></div>
             <div class="form-group field-full"><label>${t("form.key.models")} ${tip(t("tip.key.models"))}</label><div class="model-check-combo" id="m-key-models-combo"></div></div>
           </div>
         </div>
@@ -3241,6 +3265,16 @@
       const sel = document.getElementById("m-key-plan");
       if (sel) names.forEach((n) => { const o = document.createElement("option"); o.value = n; o.textContent = n; sel.appendChild(o); });
     });
+    // Helper: convert select value to API payload. Three states:
+    //   ""            → field omitted (use default_plan at runtime)
+    //   "__no_plan__" → null (explicit opt-out, no default fallback)
+    //   "{name}"      → name string
+    const planPayload = () => {
+      const v = document.getElementById("m-key-plan").value;
+      if (v === "__no_plan__") return null;
+      if (v === "") return undefined; // omitted from JSON body entirely
+      return v;
+    };
     document.getElementById("m-key-submit").addEventListener("click", async () => {
       try {
         const modelsVal = getComboModels("m-key-models-combo");
@@ -3255,7 +3289,7 @@
             models: modelsVal || ["all-team-models"],
             max_budget: document.getElementById("m-key-budget").value ? Number(document.getElementById("m-key-budget").value) : null,
             rpm_limit: document.getElementById("m-key-rpm").value ? Number(document.getElementById("m-key-rpm").value) : null,
-            plan_name: document.getElementById("m-key-plan").value || null,
+            ...(planPayload() === undefined ? {} : { plan_name: planPayload() }),
           }),
         });
         const rawKey = data.key;
@@ -3428,10 +3462,22 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
     // Plans drive the assignment dropdown — load before rendering so the
     // <select> can populate synchronously.
     const planNames = await getPlanNames();
-    const currentPlan = key.plan_name || "";
-    const planOptions = [{ value: "", label: t("form.key.plan_none") }]
+    // Three plan-assignment states map to <select> values:
+    //   ""              → no DB row (follows default_plan at runtime)
+    //   "__no_plan__"   → row with plan_name IS NULL (explicit opt-out)
+    //   "{plan_name}"   → row with plan_name = name
+    let currentPlanSel = "";
+    if (key.plan_assignment_kind === "no_plan") {
+      currentPlanSel = "__no_plan__";
+    } else if (key.plan_assignment_kind === "plan") {
+      currentPlanSel = key.plan_name || "";
+    }
+    const planOptions = [
+        { value: "", label: t("form.key.plan_default") },
+        { value: "__no_plan__", label: t("form.key.plan_no_plan") },
+      ]
       .concat(planNames.map((n) => ({ value: n, label: n })))
-      .map((o) => `<option value="${esc(o.value)}" ${o.value === currentPlan ? "selected" : ""}>${esc(o.label)}</option>`)
+      .map((o) => `<option value="${esc(o.value)}" ${o.value === currentPlanSel ? "selected" : ""}>${esc(o.label)}</option>`)
       .join("");
     const __html = `
       <h3>${t("form.key.title_edit")}</h3>
@@ -3515,15 +3561,23 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
         // Plan assignment lives in a separate table (boom_key_plan_assignment)
         // so it has its own endpoints. Sync only when the dropdown changed —
         // avoids a spurious POST/DELETE churn on every save.
-        const newPlan = document.getElementById("m-edit-plan").value;
-        if (newPlan !== currentPlan) {
-          if (newPlan) {
+        //   ""            → DELETE (row goes away, follows default_plan)
+        //   "__no_plan__" → POST with plan_name=null (explicit opt-out)
+        //   "{name}"      → POST with plan_name=name
+        const newPlanSel = document.getElementById("m-edit-plan").value;
+        if (newPlanSel !== currentPlanSel) {
+          if (newPlanSel === "") {
+            await api(`/admin/assignments/${encodeURIComponent(key.token_hash)}`, { method: "DELETE" });
+          } else if (newPlanSel === "__no_plan__") {
             await api("/admin/assignments", {
               method: "POST",
-              body: JSON.stringify({ key_hash: key.token_hash, plan_name: newPlan }),
+              body: JSON.stringify({ key_hash: key.token_hash, plan_name: null }),
             });
           } else {
-            await api(`/admin/assignments/${encodeURIComponent(key.token_hash)}`, { method: "DELETE" });
+            await api("/admin/assignments", {
+              method: "POST",
+              body: JSON.stringify({ key_hash: key.token_hash, plan_name: newPlanSel }),
+            });
           }
         }
         // Update prompt log exclusion for this key.
@@ -3866,7 +3920,7 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
             ${k.user_id ? `<br><span class="muted">${esc(k.user_id)}</span>` : ""}
             ${k.blocked ? `<br><span class="badge-danger">blocked</span>` : ""}
           </td>
-          <td>${esc(k.plan_name || "-")}</td>
+          <td>${renderKeyPlanCell(k)}</td>
           <td>${k.concurrency || 0}</td>
           <td>${formatNumber(tokens)}</td>
           <td>$${esc(k.total_cost || "0")}</td>

@@ -314,7 +314,12 @@
         <tr><td><code>plan_name</code></td><td>string</td><td>optional</td><td>Rate-limit plan assignment. Empty = default plan.</td></tr>
       </table>`,
       "keys.plan_filter.all": "All plans",
+      "keys.plan_filter.unassigned": "Unassigned (uses default)",
       "keys.plan_filter.none": "No plan (fallback limits)",
+      "keys.plan_filter.no_plan": "Explicitly no plan",
+      "keys.plan.no_plan": "No plan",
+      "keys.plan.default_suffix": "default",
+      "keys.plan.fallback_hint": "(fallback limits apply)",
       "keys.col.alias": "Key Alias",
       "keys.col.key_name": "Name",
       "keys.col.user": "User",
@@ -542,6 +547,8 @@
       "form.key.prompt_log_label": "Disable prompt logging",
       "form.key.plan": "Plan",
       "form.key.plan_none": "(no plan — use fallback limits)",
+      "form.key.plan_default": "(use default plan)",
+      "form.key.plan_no_plan": "(explicit no plan)",
 
       "teams.col.team_id": "Team ID",
       "teams.col.models": "Models",
@@ -1072,7 +1079,12 @@
         <tr><td><code>plan_name</code></td><td>string</td><td>可选</td><td>限流套餐分配。留空 = 默认套餐。</td></tr>
       </table>`,
       "keys.plan_filter.all": "全部套餐",
+      "keys.plan_filter.unassigned": "未配置 (走默认)",
       "keys.plan_filter.none": "无套餐 (兜底限流)",
+      "keys.plan_filter.no_plan": "显式无套餐",
+      "keys.plan.no_plan": "无套餐",
+      "keys.plan.default_suffix": "默认",
+      "keys.plan.fallback_hint": "(走兜底限流)",
       "keys.col.alias": "密钥别名",
       "keys.col.key_name": "名称",
       "keys.col.user": "用户",
@@ -1300,6 +1312,8 @@
       "form.key.prompt_log_label": "禁用 Prompt 日志记录",
       "form.key.plan": "套餐",
       "form.key.plan_none": "（无套餐 — 使用兜底限流）",
+      "form.key.plan_default": "（使用默认套餐）",
+      "form.key.plan_no_plan": "（显式无套餐）",
 
       "teams.col.team_id": "团队 ID",
       "teams.col.models": "模型",
