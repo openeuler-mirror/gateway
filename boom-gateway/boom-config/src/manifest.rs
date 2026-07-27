@@ -112,8 +112,8 @@ pub fn router_settings_fields() -> &'static [FieldMeta] {
                     label_key: "config.field.schedule_policy", tip_key: "tip.config.schedule_policy" },
         FieldMeta { field: "key_affinity_context_threshold", section: "router", input_type: "number",
                     label_key: "config.field.affinity_context_threshold", tip_key: "tip.config.affinity_context_threshold" },
-        FieldMeta { field: "key_affinity_rebalance_threshold", section: "router", input_type: "number",
-                    label_key: "config.field.affinity_rebalance_threshold", tip_key: "tip.config.affinity_rebalance_threshold" },
+        FieldMeta { field: "rebalance_threshold", section: "router", input_type: "number",
+                    label_key: "config.field.rebalance_threshold", tip_key: "tip.config.rebalance_threshold" },
         FieldMeta { field: "enable_priority_header", section: "router", input_type: "bool",
                     label_key: "config.field.enable_priority_header", tip_key: "tip.config.enable_priority_header" },
         FieldMeta { field: "strip_claude_code_attribution", section: "router", input_type: "bool",
@@ -196,6 +196,48 @@ mod tests {
             assert!(!m.section.is_empty(), "field `{}` has empty section", m.field);
             assert!(!m.input_type.is_empty(), "field `{}` has empty input_type", m.field);
             assert!(!m.label_key.is_empty(), "field `{}` has empty label_key", m.field);
+        }
+    }
+
+    /// `router_settings_fields()` must register every RouterSettings field
+    /// that's exposed in the dashboard config page (excludes `kvc_aware`
+    /// sub-tree — it has its own card — and `model_group_alias` — free-form
+    /// JSON). Adding a new RouterSettings field without registering it here
+    /// fails this test, mirroring the deployment-field contract above.
+    ///
+    /// This test exists because RouterSettings/KvcAwareSettings used to drift
+    /// silently: when upstream renamed `key_affinity_rebalance_threshold` →
+    /// `rebalance_threshold` and deleted several KvcAwareSettings fields
+    /// (tier_weight, zmq_endpoints, etc.), the manifest + frontend were not
+    /// updated and the change was caught only by manual audit. The test now
+    /// locks the contract.
+    #[test]
+    fn router_settings_manifest_covers_editable_fields() {
+        let manifest_fields: Vec<&str> = router_settings_fields()
+            .iter()
+            .map(|m| m.field)
+            .collect();
+
+        // Every field rendered on the dashboard router-settings card must be
+        // registered here. `kvc_aware` is rendered in its own collapsible card
+        // (separate `KvcAwareSettings` struct); `model_group_alias` is a
+        // free-form JSON textarea without per-field schema.
+        let required_fields = [
+            "schedule_policy",
+            "key_affinity_context_threshold",
+            "rebalance_threshold",
+            "enable_priority_header",
+            "strip_claude_code_attribution",
+        ];
+
+        for f in &required_fields {
+            assert!(
+                manifest_fields.contains(f),
+                "field `{}` is missing from `router_settings_fields()` manifest.\n\
+                 This breaks the frontend auto-render contract (CLAUDE.md §9).\n\
+                 Add a FieldMeta entry in `boom-config/src/manifest.rs`.",
+                f
+            );
         }
     }
 }

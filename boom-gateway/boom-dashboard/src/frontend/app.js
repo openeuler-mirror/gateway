@@ -2633,7 +2633,7 @@
           [{ value: "round_robin", label: "L0 round_robin" }, { value: "key_affinity", label: "L1 key_affinity" }],
           r.schedule_policy || "round_robin")}
         ${fieldNum("cfg-rs-affinity-ctx", t("config.field.key_affinity_context_threshold"), r.key_affinity_context_threshold || 0, { min: 0 })}
-        ${fieldNum("cfg-rs-affinity-rebal", t("config.field.key_affinity_rebalance_threshold"), r.key_affinity_rebalance_threshold || 20, { min: 1, step: 1 })}
+        ${fieldNum("cfg-rs-affinity-rebal", t("config.field.rebalance_threshold"), r.rebalance_threshold || 20, { min: 1, step: 1 })}
         ${fieldCheckbox("cfg-rs-priority-hdr", t("config.field.enable_priority_header"), r.enable_priority_header)}
         ${fieldCheckbox("cfg-rs-strip-cc", t("config.field.strip_claude_code_attribution"), r.strip_claude_code_attribution)}
         ${fieldTextarea("cfg-rs-aliases", t("config.field.model_group_alias"), r.model_group_alias || {}, { rows: 3 })}
@@ -2648,11 +2648,9 @@
           ${fieldNum("cfg-kvc-block", t("config.field.block_size"), (r.kvc_aware || {}).block_size, { min: 1 })}
           ${fieldNum("cfg-kvc-cache-w", t("config.field.cache_weight"), (r.kvc_aware || {}).cache_weight, { step: "0.05" })}
           ${fieldNum("cfg-kvc-load-w", t("config.field.load_weight"), (r.kvc_aware || {}).load_weight, { step: "0.05" })}
-          ${fieldNum("cfg-kvc-tier-w", t("config.field.tier_weight"), (r.kvc_aware || {}).tier_weight, { step: "0.05" })}
-          ${fieldText("cfg-kvc-tokenizer", t("config.field.tokenizer_dir"), (r.kvc_aware || {}).tokenizer_dir)}
           ${fieldNum("cfg-kvc-max-blocks", t("config.field.max_blocks"), (r.kvc_aware || {}).max_blocks, { min: 1 })}
-          ${fieldNum("cfg-kvc-threshold", t("config.field.full_report_hit_threshold"), (r.kvc_aware || {}).full_report_hit_threshold, { step: "0.05" })}
-          ${fieldFullList("cfg-kvc-zmq", t("config.field.zmq_endpoints"), (r.kvc_aware || {}).zmq_endpoints || [])}
+          ${fieldNum("cfg-kvc-overload", t("config.field.overload_threshold_pct"), (r.kvc_aware || {}).overload_threshold_pct, { min: 1, max: 100, step: 1 })}
+          ${fieldNum("cfg-kvc-ttl", t("config.field.router_ttl_secs"), (r.kvc_aware || {}).router_ttl_secs, { min: 0, step: 1 })}
         </div>
       </details>
       <div class="form-card-actions">
@@ -2788,7 +2786,7 @@
         const routerValue = {
           schedule_policy: $("cfg-rs-policy").value,
           key_affinity_context_threshold: numOr($("cfg-rs-affinity-ctx"), 0),
-          key_affinity_rebalance_threshold: numOr($("cfg-rs-affinity-rebal"), 20),
+          rebalance_threshold: numOr($("cfg-rs-affinity-rebal"), 20),
           enable_priority_header: $("cfg-rs-priority-hdr").checked,
           strip_claude_code_attribution: $("cfg-rs-strip-cc").checked,
           model_group_alias: aliases,
@@ -2799,11 +2797,9 @@
           block_size: numOr($("cfg-kvc-block"), 16),
           cache_weight: numOr($("cfg-kvc-cache-w"), 0.5),
           load_weight: numOr($("cfg-kvc-load-w"), 0.2),
-          tier_weight: numOr($("cfg-kvc-tier-w"), 0.3),
-          tokenizer_dir: $("cfg-kvc-tokenizer").value || null,
           max_blocks: numOr($("cfg-kvc-max-blocks"), 500000),
-          full_report_hit_threshold: numOr($("cfg-kvc-threshold"), 0.8),
-          zmq_endpoints: parseListInput($("cfg-kvc-zmq")),
+          overload_threshold_pct: numOr($("cfg-kvc-overload"), 90),
+          router_ttl_secs: numOr($("cfg-kvc-ttl"), 1200),
         };
         await saveConfigSection("router_settings.kvc_aware", kvcValue);
       }
