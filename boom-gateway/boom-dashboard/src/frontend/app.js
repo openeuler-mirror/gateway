@@ -2179,6 +2179,7 @@
             <div class="form-group field-full"><label>${t("form.model.name")} * ${tip(t("tip.model.name"))}</label><input id="m-model-name" value="${esc(p.model_name || "")}" required></div>
             <div class="form-group"><label>${t("form.model.provider")} * ${tip(t("tip.model.provider"))}</label><select id="m-model-provider"><option value="">${t("common.select_placeholder")}</option><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option><option value="azure">Azure OpenAI</option><option value="gemini">Google Gemini</option><option value="bedrock">AWS Bedrock</option></select></div>
             <div class="form-group"><label>${t("form.model.id")} * ${tip(t("tip.model.id"))}</label><input id="m-model-id" value="${esc((p.litellm_model || "").includes("/") ? p.litellm_model.split("/").slice(1).join("/") : p.litellm_model || "")}" required></div>
+            <div class="form-group"><label>${t("form.model.deployment_id")} ${tip(t("tip.model.deployment_id"))}</label><input id="m-model-deployment-id" value="${esc(p.deployment_id || "")}" placeholder="(auto UUID)"></div>
             <div class="form-group field-checkbox"><input id="m-model-enabled" type="checkbox" ${p.enabled !== false ? "checked" : ""}><label for="m-model-enabled">${t("form.model.enabled")} ${tip(t("tip.model.enabled"))}</label></div>
           </div>
         </div>
@@ -2281,6 +2282,7 @@
         const body = {
           model_name: document.getElementById("m-model-name").value,
           litellm_model: litellmModel,
+          deployment_id: document.getElementById("m-model-deployment-id").value.trim() || null,
           api_key: document.getElementById("m-model-key").value || null,
           api_key_env: document.getElementById("m-model-key-env").checked,
           api_base: document.getElementById("m-model-base").value || null,
@@ -2629,12 +2631,14 @@
         </td>
       </tr>
     `).join("");
-    return `<div class="form-card" data-section="cost_templates">
+    return `<div class="form-card is-wide" data-section="cost_templates">
       <div class="form-card-title">${t("config.section.cost_templates")}</div>
-      <table class="modal-table">
-        <thead><tr><th>${t("config.field.name")}</th><th>${t("config.field.input_cost_per_million_tokens")}</th><th>${t("config.field.cached_input_cost_per_million_tokens")}</th><th>${t("config.field.output_cost_per_million_tokens")}</th><th>${t("common.actions")}</th></tr></thead>
-        <tbody>${rows || `<tr><td colspan="5" class="muted">${t("common.no_data")}</td></tr>`}</tbody>
-      </table>
+      <div class="modal-table-wrap">
+        <table class="modal-table">
+          <thead><tr><th>${t("config.field.name")}</th><th>${t("config.field.input_cost_per_million_tokens")}</th><th>${t("config.field.cached_input_cost_per_million_tokens")}</th><th>${t("config.field.output_cost_per_million_tokens")}</th><th>${t("common.actions")}</th></tr></thead>
+          <tbody>${rows || `<tr><td colspan="5" class="muted">${t("common.no_data")}</td></tr>`}</tbody>
+        </table>
+      </div>
       <div class="form-card-actions">
         <button class="btn-primary btn-small" onclick="window._addCostTemplate()">${t("config.action.add_template")}</button>
       </div>

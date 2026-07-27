@@ -1203,6 +1203,24 @@ div[id$="-table-wrap"]:not(.bare) > table > thead:first-child > tr:first-child >
   color: var(--text2, #6b7280);
 }
 .config-grid .form-card { width: 100%; }
+/* Wide-content cards (e.g. cost template tables with long column names)
+   break out of the equal-width grid and span the full row, so tables can
+   grow to fit content without overflowing the card padding. */
+.config-grid .form-card.is-wide { grid-column: 1 / -1; }
+.config-grid .form-card.is-wide .modal-table-wrap {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+.modal-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.modal-table th, .modal-table td {
+  padding: 8px 10px; text-align: left; vertical-align: top;
+  border-bottom: 1px solid var(--border, #e5e7eb);
+}
+.modal-table th {
+  font-weight: 600; color: var(--text3, #6b7280);
+  font-size: 11px; text-transform: uppercase; letter-spacing: .6px;
+  white-space: nowrap;
+}
 .kv-editor { display: flex; flex-direction: column; gap: 6px; }
 .kv-row { display: grid; grid-template-columns: 1fr 1fr auto; gap: 6px; }
 .kv-row input { padding: 6px 8px; font-size: 12px; }
