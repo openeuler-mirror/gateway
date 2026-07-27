@@ -1187,11 +1187,29 @@ div[id$="-table-wrap"]:not(.bare) > table > thead:first-child > tr:first-child >
 .form-card-collapsible[open] summary { margin-bottom: 14px; }
 
 /* ── Config page (uses form-card primitives) ──────────────────── */
+.config-page {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+.config-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.config-group-title {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .8px;
+  color: var(--text3, #9ca3af);
+  padding: 0 4px;
+}
 .config-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
   gap: 16px;
-  align-items: start;
+  align-items: stretch;
 }
 .config-notice {
   margin: 8px 0 16px;
@@ -1203,11 +1221,9 @@ div[id$="-table-wrap"]:not(.bare) > table > thead:first-child > tr:first-child >
   color: var(--text2, #6b7280);
 }
 .config-grid .form-card { width: 100%; }
-/* Wide-content cards (e.g. cost template tables with long column names)
-   break out of the equal-width grid and span the full row, so tables can
-   grow to fit content without overflowing the card padding. */
-.config-grid .form-card.is-wide { grid-column: 1 / -1; }
-.config-grid .form-card.is-wide .modal-table-wrap {
+/* Cost-template table wraps inside its card; horizontal scroll only kicks
+   in on very narrow viewports. */
+.config-grid .form-card .modal-table-wrap {
   overflow-x: auto;
   -webkit-overflow-scrolling: touch;
 }
@@ -1220,6 +1236,43 @@ div[id$="-table-wrap"]:not(.bare) > table > thead:first-child > tr:first-child >
   font-weight: 600; color: var(--text3, #6b7280);
   font-size: 11px; text-transform: uppercase; letter-spacing: .6px;
   white-space: nowrap;
+}
+/* WIP / disabled section — used for kvc_aware advanced config while the
+   feature is still in development. The collapsible still opens (so users
+   can see what's coming), but inputs are non-interactive and visually
+   dimmed. */
+.badge-wip {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 1px 8px;
+  background: var(--warn-bg, #fef3c7);
+  color: var(--warn-text, #92400e);
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .5px;
+  vertical-align: middle;
+}
+.form-card-collapsible.is-disabled > .form-card-grid {
+  pointer-events: none;
+  opacity: 0.45;
+  filter: grayscale(0.6);
+}
+.form-card-collapsible.is-disabled summary {
+  cursor: default;
+  user-select: none;
+}
+/* Explicitly-styled disabled buttons (btn-*) — native disabled styling
+   doesn't always override the class, so we dim and drop interactions. */
+.form-card .btn-small:disabled,
+.form-card .btn-primary:disabled,
+.form-card .btn-secondary:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  pointer-events: none;
+  box-shadow: none;
+  transform: none;
 }
 .kv-editor { display: flex; flex-direction: column; gap: 6px; }
 .kv-row { display: grid; grid-template-columns: 1fr 1fr auto; gap: 6px; }

@@ -2440,16 +2440,31 @@
 
   function renderConfigPage(cfg) {
     return `
-      <div class="config-grid">
-        ${renderCardServer(cfg.server || {})}
-        ${renderCardGeneral(cfg.general_settings || {})}
-        ${renderCardRateLimit(cfg.rate_limit || {})}
-        ${renderCardPlanSettings(cfg.plan_settings || {}, cfg)}
-        ${renderCardHealthCheck(cfg.deployment_health_check || {})}
-        ${renderCardPromptLog(cfg.prompt_log || {})}
-        ${renderCardRouter(cfg.router_settings || {})}
-        ${renderCardCostTemplates(cfg.cost_templates || [])}
-        ${renderCardModelList(cfg.model_list || [])}
+      <div class="config-page">
+        <div class="config-group">
+          <div class="config-group-title">${t("config.group.runtime")}</div>
+          <div class="config-grid">
+            ${renderCardServer(cfg.server || {})}
+            ${renderCardGeneral(cfg.general_settings || {})}
+            ${renderCardHealthCheck(cfg.deployment_health_check || {})}
+            ${renderCardPromptLog(cfg.prompt_log || {})}
+          </div>
+        </div>
+        <div class="config-group">
+          <div class="config-group-title">${t("config.group.traffic")}</div>
+          <div class="config-grid">
+            ${renderCardRateLimit(cfg.rate_limit || {})}
+            ${renderCardPlanSettings(cfg.plan_settings || {}, cfg)}
+          </div>
+        </div>
+        <div class="config-group">
+          <div class="config-group-title">${t("config.group.routing")}</div>
+          <div class="config-grid">
+            ${renderCardRouter(cfg.router_settings || {})}
+            ${renderCardCostTemplates(cfg.cost_templates || [])}
+            ${renderCardModelList(cfg.model_list || [])}
+          </div>
+        </div>
       </div>
     `;
   }
@@ -2598,9 +2613,13 @@
         ${fieldCheckbox("cfg-rs-strip-cc", t("config.field.strip_claude_code_attribution"), r.strip_claude_code_attribution)}
         ${fieldTextarea("cfg-rs-aliases", t("config.field.model_group_alias"), r.model_group_alias || {}, { rows: 3 })}
       </div>
-      <details class="form-card-collapsible">
-        <summary>${t("config.section.kvc_aware")}</summary>
-        <div class="form-card-grid">
+      <details class="form-card-collapsible is-disabled">
+        <summary>
+          <span>${t("config.section.kvc_aware")}</span>
+          <span class="badge-wip">${t("common.wip")}</span>
+        </summary>
+        <p class="modal-hint">${t("config.tip.kvc_aware_wip")}</p>
+        <div class="form-card-grid" aria-disabled="true">
           ${fieldNum("cfg-kvc-block", t("config.field.block_size"), (r.kvc_aware || {}).block_size, { min: 1 })}
           ${fieldNum("cfg-kvc-cache-w", t("config.field.cache_weight"), (r.kvc_aware || {}).cache_weight, { step: "0.05" })}
           ${fieldNum("cfg-kvc-load-w", t("config.field.load_weight"), (r.kvc_aware || {}).load_weight, { step: "0.05" })}
@@ -2613,7 +2632,7 @@
       </details>
       <div class="form-card-actions">
         <button class="btn-primary btn-small" data-save="router">${t("action.save")}</button>
-        <button class="btn-secondary btn-small" data-save="kvc_aware">${t("config.action.save_kvc")}</button>
+        <button class="btn-secondary btn-small" data-save="kvc_aware" disabled title="${esc(t("config.tip.kvc_aware_wip"))}">${t("config.action.save_kvc")}</button>
       </div>
     </div>`;
   }
@@ -2631,7 +2650,7 @@
         </td>
       </tr>
     `).join("");
-    return `<div class="form-card is-wide" data-section="cost_templates">
+    return `<div class="form-card" data-section="cost_templates">
       <div class="form-card-title">${t("config.section.cost_templates")}</div>
       <div class="modal-table-wrap">
         <table class="modal-table">

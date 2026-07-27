@@ -415,6 +415,7 @@
       "common.items_count": "{n} items",
       "common.keys_count": "{n} keys",
       "common.actions": "Actions",
+      "common.wip": "WIP",
 
       "action.copy": "Copy",
       "action.done": "Done",
@@ -670,6 +671,10 @@
       "config.section.cost_templates": "Cost Templates",
       "config.section.model_list": "Model List",
       "config.section.kvc_aware": "KV-cache Aware (advanced)",
+      "config.tip.kvc_aware_wip": "KV-cache aware routing is still in development. Configuration here is not yet honored — fields are shown for preview only.",
+      "config.group.runtime": "Runtime",
+      "config.group.traffic": "Traffic & Billing",
+      "config.group.routing": "Routing & Models",
 
       "config.field.host": "Host",
       "config.field.port": "Port",
@@ -1168,6 +1173,7 @@
       "common.items_count": "{n} 项",
       "common.keys_count": "{n} 键",
       "common.actions": "操作",
+      "common.wip": "开发中",
 
       "action.copy": "复制",
       "action.done": "完成",
@@ -1423,6 +1429,10 @@
       "config.section.cost_templates": "成本模板",
       "config.section.model_list": "模型列表",
       "config.section.kvc_aware": "KV 缓存感知(高级)",
+      "config.tip.kvc_aware_wip": "KV 缓存感知路由正在开发中,此处配置暂不生效,字段仅供预览。",
+      "config.group.runtime": "运行时",
+      "config.group.traffic": "流量与计费",
+      "config.group.routing": "路由与模型",
 
       "config.field.host": "Host",
       "config.field.port": "端口",
