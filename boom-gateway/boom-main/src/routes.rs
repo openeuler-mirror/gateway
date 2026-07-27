@@ -26,33 +26,6 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Instant;
 
-/// Determine whether to request full KV-cache block reporting from vLLM.
-///
-/// vLLM defaults to incremental event reporting (only newly allocated blocks).
-/// Full reporting asks vLLM to re-emit the request's currently cached prefix
-/// blocks, backfilling the trie.
-///
-/// Decision logic (kvc-aware enabled):
-///   - hit ratio ≥ threshold → false (the trie already covers the prefix vLLM
-///     will reuse, so incremental reporting is sufficient — vLLM reuses those
-///     blocks without re-reporting them, but they are already in the trie)
-///   - hit ratio < threshold → true (the trie is missing part of the prefix;
-///     request a full report to backfill, also self-healing future requests)
-/// kvc-aware disabled (no kv_index) → false (vLLM default incremental).
-fn need_full_kv_report(
-    kvc_enabled: bool,
-    kv_hit_ratio: f64,
-    threshold: f64,
-) -> bool {
-    if !kvc_enabled {
-        // kvc-aware disabled → vLLM default (incremental).
-        return false;
-    }
-    // kvc-aware enabled: full report only when the trie doesn't yet
-    // cover enough of the request's prefix.
-    kv_hit_ratio < threshold
-}
-
 /// Extract client IP from request headers with TCP fallback.
 /// Priority: X-Real-IP > X-Forwarded-For (first IP) > TCP remote addr > "unknown".
 fn extract_client_ip(headers: &axum::http::HeaderMap, remote_addr: Option<std::net::SocketAddr>) -> String {
@@ -489,46 +462,39 @@ async fn chat_completions_inner(
         api_path, &plan_charge,
     );
 
-    // 3. Select provider deployment.
-    // Tokenize request if tokenizer pool is available (for KV-cache prefix matching).
-    let token_ids = {
-        let pool_guard = state.tokenizer_pool.load();
-        match &**pool_guard {
-            Some(pool) => {
-                let msgs: Vec<serde_json::Value> = req.messages.iter().map(|m| serde_json::to_value(m).unwrap_or_default()).collect();
-                let tools_vals: Option<Vec<serde_json::Value>> = req.tools.as_ref().map(|t| t.iter().map(|tool| serde_json::to_value(tool).unwrap_or_default()).collect());
-                let result = pool.tokenize_openai(&resolved_model, &msgs, tools_vals.as_deref());
-                tracing::debug!(model = %resolved_model, tokens = result.token_ids.len(), "request tokenized");
-                result.token_ids
-            }
-            None => Vec::new(),
+    // 3. Route (kvc-aware or default). All kvc business logic (tokenize +
+    //    trie + select + dfx) is inside kvc_orchestrator — the handler just
+    //    gets a RouteResult or None (fallback). plan_charge is NOT passed in;
+    //    it stays in the handler scope, preserving the two-phase commit.
+    let candidates = state.router.candidates_for(&resolved_model);
+    let kvc_route = state.kvc_orchestrator.route(
+        &inner.config, &resolved_model, &identity.key_hash, input_chars as u64,
+        &req, candidates.as_ref().map(|c| c.as_slice()).unwrap_or(&[]),
+    )
+    .await;
+
+    let (provider, deployment_id, inflight_model,
+        schedule_policy, kv_hit_blocks, kv_input_blocks,
+        trie_blocks, trie_max_blocks, request_bytes) = match kvc_route {
+        Some(r) => {
+            (r.provider, r.deployment_id, r.inflight_model.unwrap_or_default(),
+             r.schedule_policy, r.kv_hit_blocks, r.kv_input_blocks,
+             r.trie_blocks, r.trie_max_blocks, r.request_bytes)
+        }
+        None => {
+            // kvc disabled / no match — fallback to default routing
+            let selection = state.router.select_provider_with_prefix(
+                &resolved_model, Some(&identity.key_hash), input_chars as u64, &[],
+            ).ok_or_else(|| {
+                let e = GatewayError::ModelNotFound(resolved_model.clone());
+                log_error(&state, &identity, &model, api_path, is_stream, start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()));
+                GatewayErrorReply(e, false)
+            })?;
+            let did = selection.provider.deployment_id().map(|s| s.to_string());
+            let im = state.router.resolve_model_name(&resolved_model);
+            (selection.provider, did, im, None, None, None, None, None, None)
         }
     };
-
-    let selection = state
-        .router
-        .select_provider_with_prefix(&resolved_model, Some(&identity.key_hash), input_chars as u64, &token_ids)
-        .ok_or_else(|| {
-            let e = GatewayError::ModelNotFound(resolved_model.clone());
-            log_error(&state, &identity, &model, api_path, is_stream, start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()));
-            GatewayErrorReply(e, false)
-        })?;
-    let provider = selection.provider;
-    let kv_hit_ratio = selection.kv_hit_ratio;
-
-    let deployment_id = provider.deployment_id().map(|s| s.to_string());
-    let inflight_model = state.router.resolve_model_name(&resolved_model);
-
-    // 3.2. Determine KV-cache reporting mode.
-    //      Full reporting is needed when kvc-aware is enabled so the trie
-    //      stays in sync with vLLM's internal prefix cache — vLLM reuses
-    //      cached blocks without reporting them in incremental mode.
-    //      When kvc-aware is disabled, vLLM uses its default incremental mode.
-    req.kv_cache_report_full = need_full_kv_report(
-        state.kv_index.load().is_some(),
-        kv_hit_ratio,
-        inner.config.router_settings.kvc_aware.full_report_hit_threshold,
-    );
 
     // 3.5. Flow control — queue if per-deployment limits exceeded.
     let is_vip = is_vip_key(&identity.metadata);
@@ -615,6 +581,12 @@ async fn chat_completions_inner(
             deployment_id,
             client_ip: Some(client_ip.clone()),
             cached_tokens: None,
+            schedule_policy: schedule_policy.clone(),
+            kv_hit_blocks,
+            kv_input_blocks,
+            trie_blocks,
+            trie_max_blocks,
+            request_tokens: request_bytes,
         }, start, usage, Some(state.agent_stats.clone()))
         .with_plan_charge(plan_charge);
 
@@ -708,6 +680,12 @@ async fn chat_completions_inner(
                 deployment_id,
                 client_ip: Some(client_ip.clone()),
                 cached_tokens,
+                schedule_policy: schedule_policy.clone(),
+                kv_hit_blocks,
+                kv_input_blocks,
+                trie_blocks,
+                trie_max_blocks,
+                request_tokens: request_bytes,
             },
         );
         state.agent_stats.record_tokens(api_path, input_tokens as u64, output_tokens as u64);
@@ -2291,43 +2269,41 @@ pub async fn messages(
         "/v1/messages", &plan_charge,
     );
 
-    // 3. Select provider deployment.
-    // Tokenize request if tokenizer pool is available (for KV-cache prefix matching).
-    let token_ids = {
-        let pool_guard = state.tokenizer_pool.load();
-        match &**pool_guard {
-            Some(pool) => {
-                let system_str = req.system.as_ref().and_then(|s| match s {
-                    boom_core::types::AnthropicSystemContent::Text(t) => Some(t.as_str()),
-                    _ => None,
-                });
-                let msgs: Vec<serde_json::Value> = req.messages.iter().map(|m| serde_json::to_value(m).unwrap_or_default()).collect();
-                pool.tokenize_anthropic(&resolved_model, system_str, &msgs).token_ids
-            }
-            None => Vec::new(),
+    // 3. Route (kvc-aware or default). All kvc business logic is inside
+    //    kvc_orchestrator — the handler just gets a RouteResult or None.
+    //    Resolve real candidates here (mirrors the OpenAI path): route() needs
+    //    them for select_with_candidates — passing empty makes it return None
+    //    before the trie query, which would degrade every /v1/messages request
+    //    to key_affinity and never request a full KV report.
+    let candidates = state.router.candidates_for(&resolved_model);
+    let kvc_route = state.kvc_orchestrator.route(
+        &inner.config, &resolved_model, &identity.key_hash, input_chars as u64,
+        &openai_req, candidates.as_ref().map(|c| c.as_slice()).unwrap_or(&[]),
+    )
+    .await;
+
+    let (provider, deployment_id, inflight_model,
+        schedule_policy, kv_hit_blocks, kv_input_blocks,
+        trie_blocks, trie_max_blocks, request_bytes) = match kvc_route {
+        Some(r) => {
+            (r.provider, r.deployment_id, r.inflight_model.unwrap_or_default(),
+             r.schedule_policy, r.kv_hit_blocks, r.kv_input_blocks,
+             r.trie_blocks, r.trie_max_blocks, r.request_bytes)
+        }
+        None => {
+            // kvc disabled / no match — fallback to default routing
+            let selection = state.router.select_provider_with_prefix(
+                &resolved_model, Some(&identity.key_hash), input_chars as u64, &[],
+            ).ok_or_else(|| {
+                let e = GatewayError::ModelNotFound(resolved_model.clone());
+                log_error(&state, &identity, &model, "/v1/messages", is_stream, start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()));
+                AnthropicErrorReply(e, is_stream)
+            })?;
+            let did = selection.provider.deployment_id().map(|s| s.to_string());
+            let im = state.router.resolve_model_name(&resolved_model);
+            (selection.provider, did, im, None, None, None, None, None, None)
         }
     };
-
-    let selection = state
-        .router
-        .select_provider_with_prefix(&resolved_model, Some(&identity.key_hash), input_chars as u64, &token_ids)
-        .ok_or_else(|| {
-            let e = GatewayError::ModelNotFound(resolved_model.clone());
-            log_error(&state, &identity, &model, "/v1/messages", is_stream, start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()));
-            AnthropicErrorReply(e, is_stream)
-        })?;
-    let provider = selection.provider;
-    let kv_hit_ratio = selection.kv_hit_ratio;
-
-    let deployment_id = provider.deployment_id().map(|s| s.to_string());
-    let inflight_model = state.router.resolve_model_name(&resolved_model);
-
-    // 3.2. Determine KV-cache reporting mode (same logic as OpenAI path).
-    openai_req.kv_cache_report_full = need_full_kv_report(
-        state.kv_index.load().is_some(),
-        kv_hit_ratio,
-        inner.config.router_settings.kvc_aware.full_report_hit_threshold,
-    );
 
     // 3.5. Flow control — queue if per-deployment limits exceeded.
     let is_vip = is_vip_key(&identity.metadata);
@@ -2419,6 +2395,12 @@ pub async fn messages(
             deployment_id,
             client_ip: Some(client_ip.clone()),
             cached_tokens: None,
+            schedule_policy: schedule_policy.clone(),
+            kv_hit_blocks,
+            kv_input_blocks,
+            trie_blocks,
+            trie_max_blocks,
+            request_tokens: request_bytes,
         }, start, usage, Some(state.agent_stats.clone()))
         .with_plan_charge(plan_charge);
 
@@ -2511,6 +2493,12 @@ pub async fn messages(
                 deployment_id,
                 client_ip: Some(client_ip.clone()),
                 cached_tokens,
+                schedule_policy: schedule_policy.clone(),
+                kv_hit_blocks,
+                kv_input_blocks,
+                trie_blocks,
+                trie_max_blocks,
+                request_tokens: request_bytes,
             },
         );
         state.agent_stats.record_tokens("/v1/messages", input_tokens as u64, output_tokens as u64);
@@ -2759,11 +2747,10 @@ pub async fn kv_index_status(
         "block_size": kvc_cfg.block_size,
         "max_blocks": kvc_cfg.max_blocks,
         "cache_weight": kvc_cfg.cache_weight,
-        "tier_weight": kvc_cfg.tier_weight,
+        "tier_weight": 0.0, // removed (self-contained mode: all blocks Gpu)
         "load_weight": kvc_cfg.load_weight,
-        "full_report_hit_threshold": kvc_cfg.full_report_hit_threshold,
-        "zmq_endpoints": kvc_cfg.zmq_endpoints,
-        "tokenizer_dir": kvc_cfg.tokenizer_dir,
+        "router_ttl_secs": kvc_cfg.router_ttl_secs,
+        "overload_threshold_pct": kvc_cfg.overload_threshold_pct,
     });
 
     let kv_index_guard = state.kv_index.load();

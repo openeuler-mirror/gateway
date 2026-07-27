@@ -353,7 +353,7 @@
     else if (section === "admin-keys") { setupKeysSearch(); loadKeys(); }
     else if (section === "admin-quota") loadQuota();
     else if (section === "admin-logs") { setupLogsFilters(); loadLogs(); }
-    else if (section === "admin-debug") { loadAgentStats(); loadRebalanceMoves(); }
+    else if (section === "admin-debug") { loadAgentStats(); loadRebalanceMoves(); loadKvcDfx(); }
     else if (section === "admin-config") loadConfigPage();
   }
 
@@ -1484,9 +1484,10 @@
       ${logs.map((l) => {
         // Prefix hit rate = cached_tokens / input_tokens * 100, truncated to
         // 1 decimal and capped at 99.9 (no rounding to 100%). "-" if missing.
-        var kvCell = (l.cached_tokens != null && l.input_tokens > 0)
-          ? esc(fmtPrefixHit(l.cached_tokens / l.input_tokens * 100))
+        var pct = (l.cached_tokens != null && l.input_tokens > 0)
+          ? fmtPrefixHit(l.cached_tokens / l.input_tokens * 100)
           : "-";
+        var kvCell = '<span class="mono">' + esc(pct) + "</span>";
         var inOutCell = (l.input_tokens != null || l.output_tokens != null)
           ? formatNumber(l.input_tokens) + " / " + formatNumber(l.output_tokens)
           : "- / -";
@@ -4281,7 +4282,7 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
     const tbody = document.getElementById("logs-tbody");
     if (!tbody) return;
     if (logs.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="14" class="no-results">' + t("common.no_matching", { what: t("logs.title").toLowerCase() }) + '</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="15" class="no-results">' + t("common.no_matching", { what: t("logs.title").toLowerCase() }) + '</td></tr>';
       return;
     }
     tbody.innerHTML = logs.map((l) => {
@@ -4314,13 +4315,14 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
         }
         // Prefix hit rate = cached_tokens / input_tokens * 100, truncated to
         // 1 decimal and capped at 99.9 (no rounding to 100%). "-" if missing.
-        var kvCell = (l.cached_tokens != null && l.input_tokens > 0)
-          ? esc(fmtPrefixHit(l.cached_tokens / l.input_tokens * 100))
+        var pct = (l.cached_tokens != null && l.input_tokens > 0)
+          ? fmtPrefixHit(l.cached_tokens / l.input_tokens * 100)
           : "-";
         // IN/OUT: show input and output tokens in one cell, slash-separated.
         var inOutCell = (l.input_tokens != null || l.output_tokens != null)
           ? formatNumber(l.input_tokens) + " / " + formatNumber(l.output_tokens)
           : "- / -";
+        var kvCell = '<span class="mono">' + esc(pct) + "</span>";
         return `<tr>
         <td>${tsCell}</td>
         <td>${ipCell}</td>
@@ -4350,6 +4352,150 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
   }
 
   window._loadLogsPage = (p) => loadLogs(p);
+
+  // ── Debug page: KVC DFX table ─────────────────────
+  // Show the Debug nav link if compiled with debug-tools.
+  if (window.__KVC_DEBUG) {
+    var navDebug = document.getElementById("nav-admin-debug");
+    if (navDebug) navDebug.style.display = "";
+  }
+
+  // Filter state for the KVC DFX table (mirrors the Logs page filter pattern).
+  var kvcFilters = {};
+  var kvcFiltersTimer = null;
+  var kvcPage = 1;
+
+  // Table shell (header + filter row). Built once; only <tbody> is re-rendered
+  // on each load so an active filter input keeps focus.
+  function kvcDfxShellHtml() {
+    return '<table class="data-table" id="kvc-dfx-table"><thead>' +
+      '<tr>' +
+        '<th>Time</th><th>IP</th><th>Team</th><th>Key</th><th>Model</th><th>Path</th>' +
+        '<th>Status</th><th>Stream</th><th>IN/OUT</th><th>Prefix Hit</th>' +
+        '<th>Policy</th><th>Req Bytes</th><th>Duration</th><th>TTFT</th><th>Error</th>' +
+      '</tr>' +
+      '<tr class="filter-row">' +
+        '<td></td>' +
+        '<td><input class="col-filter" data-col="client_ip" placeholder="filter"></td>' +
+        '<td><input class="col-filter" data-col="team_alias" placeholder="filter"></td>' +
+        '<td><input class="col-filter" data-col="key_alias" placeholder="filter"></td>' +
+        '<td><input class="col-filter" data-col="model" placeholder="filter"></td>' +
+        '<td><input class="col-filter" data-col="api_path" placeholder="filter"></td>' +
+        '<td><input class="col-filter" data-col="status_code" placeholder="filter"></td>' +
+        '<td><input class="col-filter" data-col="stream" placeholder="filter"></td>' +
+        '<td></td><td></td><td></td><td></td><td></td><td></td>' +
+        '<td><input class="col-filter" data-col="error" placeholder="filter"></td>' +
+      '</tr>' +
+      '</thead><tbody id="kvc-dfx-tbody"></tbody></table>' +
+      '<div id="kvc-dfx-pagination" class="pagination"></div>';
+  }
+
+  function renderKvcDfxRow(l) {
+    var inOut = (l.input_tokens != null || l.output_tokens != null)
+      ? formatNumber(l.input_tokens) + " / " + formatNumber(l.output_tokens) : "- / -";
+    var pct = (l.cached_tokens != null && l.input_tokens > 0)
+      ? fmtPrefixHit(l.cached_tokens / l.input_tokens * 100) : "-";
+    var trieHit = (l.kv_hit_blocks != null && l.kv_input_blocks != null && l.kv_input_blocks > 0)
+      ? (l.kv_hit_blocks / l.kv_input_blocks * 100).toFixed(1) + "%" : "-";
+    var trieFill = (l.trie_blocks != null && l.trie_max_blocks != null && l.trie_max_blocks > 0)
+      ? (l.trie_blocks / l.trie_max_blocks * 100).toFixed(2) + "%" : "-";
+    var modelVal = esc(l.model || "-");
+    if (l.model && l.model.includes(":")) {
+      var mp = l.model.split(":");
+      modelVal = '<span class="log-model-name">' + esc(mp[0]) + '</span><span class="log-model-sep">:</span><span class="log-model-deploy">' + esc(mp.slice(1).join(":")) + '</span>';
+    }
+    // Trie-Hit and Trie Fill are folded into the Prefix Hit cell.
+    var prefixCell =
+      '<div class="kvc-pct">' + esc(pct) + '</div>' +
+      '<div class="kvc-sub">Trie-Hit ' + esc(trieHit) + '</div>' +
+      '<div class="kvc-sub">Trie Fill ' + esc(trieFill) + '</div>';
+    return '<tr>' +
+      '<td class="mono">' + esc(formatTimestamp(l.created_at)) + '</td>' +
+      '<td class="mono">' + esc(l.client_ip || "-") + '</td>' +
+      '<td>' + esc(l.team_alias || l.team_id || "-") + '</td>' +
+      '<td>' + esc(l.key_alias || l.key_name || "-") + '</td>' +
+      '<td>' + modelVal + '</td>' +
+      '<td class="mono">' + esc(l.api_path) + '</td>' +
+      '<td>' + (l.status_code >= 400 ? '<span style="color:var(--danger)">' + l.status_code + '</span>' : l.status_code) + '</td>' +
+      '<td>' + (l.is_stream ? t("common.yes") : t("common.no")) + '</td>' +
+      '<td class="mono">' + inOut + '</td>' +
+      '<td class="mono kvc-prefix">' + prefixCell + '</td>' +
+      '<td class="mono">' + esc(l.policy || "-") + '</td>' +
+      '<td class="mono">' + (l.request_tokens != null ? formatNumber(l.request_tokens) : "-") + '</td>' +
+      '<td>' + (l.duration_ms != null ? l.duration_ms + "ms" : "-") + '</td>' +
+      '<td>' + (l.ttft_ms != null ? l.ttft_ms + "ms" : "-") + '</td>' +
+      '<td>' + (l.error_message ? '<span style="color:var(--danger)" title="' + esc(l.error_message) + '">' + esc((l.error_type || "").substring(0, 20)) + '</span>' : "-") + '</td>' +
+      '</tr>';
+  }
+
+  function setupKvcFilters() {
+    var table = document.getElementById("kvc-dfx-table");
+    if (!table) return;
+    // Debounced column filters forwarded to /admin/logs as query params.
+    table.addEventListener("input", function(e) {
+      if (!e.target.classList.contains("col-filter")) return;
+      var inp = e.target;
+      clearTimeout(kvcFiltersTimer);
+      kvcFiltersTimer = setTimeout(function() {
+        var col = inp.dataset.col;
+        var val = inp.value.trim();
+        if (val) { kvcFilters[col] = val; } else { delete kvcFilters[col]; }
+        loadKvcDfx(1);
+      }, 400);
+    });
+    var resetBtn = document.getElementById("btn-reset-kvc-filters");
+    if (resetBtn) {
+      resetBtn.addEventListener("click", function() {
+        kvcFilters = {};
+        table.querySelectorAll(".col-filter").forEach(function(inp) { inp.value = ""; });
+        loadKvcDfx(1);
+      });
+    }
+  }
+
+  async function loadKvcDfx(page) {
+    if (page !== undefined) kvcPage = page;
+    var wrap = document.getElementById("kvc-dfx-wrap");
+    if (!wrap) return;
+    if (!window.__KVC_DEBUG) {
+      wrap.innerHTML = '<p class="muted">Compile with --features boom-dashboard/debug-tools to enable.</p>';
+      return;
+    }
+    if (!document.getElementById("kvc-dfx-table")) {
+      wrap.innerHTML = kvcDfxShellHtml();
+      setupKvcFilters();
+    }
+    var tbody = document.getElementById("kvc-dfx-tbody");
+    if (!tbody) return;
+    try {
+      var url = "/admin/logs?page=" + kvcPage + "&per_page=50";
+      for (var k in kvcFilters) {
+        url += "&" + encodeURIComponent(k) + "=" + encodeURIComponent(kvcFilters[k]);
+      }
+      var data = await api(url);
+      var rows = data.logs || [];
+      tbody.innerHTML = rows.length
+        ? rows.map(renderKvcDfxRow).join("")
+        : '<tr><td colspan="15" class="muted">No logs.</td></tr>';
+      renderKvcPagination(data);
+    } catch (e) {
+      tbody.innerHTML = '<tr><td colspan="15" class="muted">Failed to load: ' + esc(String(e)) + '</td></tr>';
+    }
+  }
+
+  function renderKvcPagination(data) {
+    var el = document.getElementById("kvc-dfx-pagination");
+    if (!el) return;
+    if (!data || data.page == null) { el.innerHTML = ""; return; }
+    el.innerHTML =
+      '<button ' + (data.page <= 1 ? "disabled" : "") +
+        ' onclick="window._loadKvcDfxPage(' + (data.page - 1) + ')">&lt;</button>' +
+      '<span>' + t("common.page_only", { page: data.page }) + '</span>' +
+      '<button ' + (!data.has_next ? "disabled" : "") +
+        ' onclick="window._loadKvcDfxPage(' + (data.page + 1) + ')">&gt;</button>';
+  }
+
+  window._loadKvcDfxPage = function(p) { loadKvcDfx(p); };
 
   // ── Prompt Log Entry Viewer ──────────────────────────
   window._viewPromptLog = async function(requestId, keyHash, teamAlias) {

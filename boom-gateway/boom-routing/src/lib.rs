@@ -17,6 +17,7 @@ pub use hybrid_router::{
     ClassifyRequest, ClassificationStrategy, HybridRouter, StrategyRegistry, TierClassifier,
 };
 pub use inflight::{DeploymentInFlightStat, InFlightGuard, InFlightStat, InFlightTracker};
+pub use policy::load_helpers;
 pub use policy::SchedulePolicy;
 pub use policy::round_robin::RoundRobinPolicy;
 pub use policy::key_affinity::KeyAffinityPolicy;
