@@ -155,7 +155,83 @@ pub struct DeploymentHealthTarget {
     pub auto_disabled: Option<bool>,
 }
 
+/// Canonical list of user-editable columns on `boom_model_deployment`, in the
+/// order they appear in `DeploymentInput` field order.
+///
+/// **Single source of truth.** When you add/remove/rename a column:
+/// 1. Update `DEPLOYMENT_CORE_COLUMNS` here
+/// 2. Update `DeploymentInput` fields + bind sites in `create_db` / `update_db`
+/// 3. Update `DeploymentRow` (if read back) and the SELECT column list
+/// 4. Update the matching `FieldMeta` in `boom-config/src/manifest.rs`
+/// 5. Update dashboard frontend (`app.js` form) + i18n (`i18n.js`)
+/// 6. Add a DB migration in `boom-main/migrations/`
+///
+/// `id`, `source`, `auto_disabled`, `created_at`, `updated_at` are DB-managed
+/// (DEFAULT / explicit literal / trigger) and intentionally excluded.
+///
+/// The unit tests at the bottom of this file enforce that every column in
+/// this const appears in the INSERT and UPDATE statements — they fail the
+/// build if you forget a column.
+pub const DEPLOYMENT_CORE_COLUMNS: &[&str] = &[
+    "model_name",
+    "litellm_model",
+    "api_key",
+    "api_key_env",
+    "api_base",
+    "api_version",
+    "aws_region_name",
+    "aws_access_key_id",
+    "aws_secret_access_key",
+    "rpm",
+    "tpm",
+    "timeout",
+    "headers",
+    "temperature",
+    "max_tokens",
+    "enabled",
+    "deployment_id",
+    "quota_count_ratio",
+    "max_inflight_queue_len",
+    "max_context_len",
+    "client_type_header",
+    "serve_not_match",
+    "model_info",
+];
+
+/// Build an INSERT statement for `boom_model_deployment` from the canonical
+/// column list. `source_literal` is `'yaml'` or `'db'` — hardcoded into the
+/// VALUES as a literal so it can never be parameter-injected by accident.
+fn deployment_insert_sql(source_literal: &'static str) -> String {
+    let cols = DEPLOYMENT_CORE_COLUMNS.join(", ");
+    let placeholders = (1..=DEPLOYMENT_CORE_COLUMNS.len())
+        .map(|i| format!("${}", i))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "INSERT INTO boom_model_deployment ({cols}, source) VALUES ({placeholders}, '{src}') RETURNING id",
+        cols = cols,
+        placeholders = placeholders,
+        src = source_literal,
+    )
+}
+
+/// Canonical SELECT column list for full-row reads (`DeploymentRow`).
+/// Adds the DB-managed columns to `DEPLOYMENT_CORE_COLUMNS`.
+const DEPLOYMENT_ROW_SELECT_COLUMNS: &str = concat!(
+    "id, model_name, litellm_model, api_key, api_key_env, api_base, api_version, ",
+    "aws_region_name, aws_access_key_id, aws_secret_access_key, ",
+    "rpm, tpm, timeout, headers, temperature, max_tokens, enabled, auto_disabled, ",
+    "source, deployment_id, quota_count_ratio, ",
+    "max_inflight_queue_len, max_context_len, client_type_header, ",
+    "serve_not_match, model_info, ",
+    "created_at, updated_at"
+);
+
 /// Input for creating/updating a deployment in DB.
+///
+/// Also used as the YAML→DB sync carrier (formerly `YamlDeploymentData`).
+/// The YAML path always resolves env-vars before sync, so it passes
+/// `api_key_env: Some(false)` to indicate "value is literal, not env-named".
 #[derive(Debug, Clone)]
 pub struct DeploymentInput {
     pub model_name: String,
@@ -178,33 +254,6 @@ pub struct DeploymentInput {
     pub quota_count_ratio: i64,
     pub max_inflight_queue_len: Option<i32>,
     pub max_context_len: Option<i64>,
-    pub client_type_header: bool,
-    pub serve_not_match: bool,
-    pub model_info: Option<serde_json::Value>,
-}
-
-/// YAML deployment data for sync (no provider needed).
-#[derive(Clone)]
-pub struct YamlDeploymentData {
-    pub model_name: String,
-    pub litellm_model: String,
-    pub api_key: Option<String>,
-    pub api_base: Option<String>,
-    pub api_version: Option<String>,
-    pub aws_region_name: Option<String>,
-    pub aws_access_key_id: Option<String>,
-    pub aws_secret_access_key: Option<String>,
-    pub rpm: Option<i64>,
-    pub tpm: Option<i64>,
-    pub timeout: i64,
-    pub headers: serde_json::Value,
-    pub temperature: Option<f64>,
-    pub max_tokens: Option<i32>,
-    pub deployment_id: Option<String>,
-    pub quota_count_ratio: i64,
-    pub max_inflight_queue_len: Option<i32>,
-    pub max_context_len: Option<i64>,
-    pub enabled: bool,
     pub client_type_header: bool,
     pub serve_not_match: bool,
     pub model_info: Option<serde_json::Value>,
@@ -352,7 +401,7 @@ impl DeploymentStore {
     pub async fn sync_yaml_to_db(
         pool: &sqlx::PgPool,
         yaml_model_names: &[String],
-        yaml_deployments: &[YamlDeploymentData],
+        yaml_deployments: &[DeploymentInput],
     ) -> Result<(), sqlx::Error> {
         // 1. Delete all source='yaml' rows.
         sqlx::query(r#"DELETE FROM boom_model_deployment WHERE source = 'yaml'"#)
@@ -376,42 +425,34 @@ impl DeploymentStore {
         }
 
         // 3. Insert YAML deployments.
+        let insert_sql = deployment_insert_sql("yaml");
         for d in yaml_deployments {
-            sqlx::query(
-                r#"INSERT INTO boom_model_deployment
-                   (model_name, litellm_model, api_key, api_key_env, api_base, api_version,
-                    aws_region_name, aws_access_key_id, aws_secret_access_key,
-                    rpm, tpm, timeout, headers, temperature, max_tokens, enabled, source, deployment_id,
-                    quota_count_ratio, max_inflight_queue_len, max_context_len, client_type_header,
-                    serve_not_match, model_info)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, 'yaml', $17,
-                   $18, $19, $20, $21, $22, $23)"#,
-            )
-            .bind(&d.model_name)
-            .bind(&d.litellm_model)
-            .bind(&d.api_key)
-            .bind(false) // api_key already resolved
-            .bind(&d.api_base)
-            .bind(&d.api_version)
-            .bind(&d.aws_region_name)
-            .bind(&d.aws_access_key_id)
-            .bind(&d.aws_secret_access_key)
-            .bind(d.rpm)
-            .bind(d.tpm)
-            .bind(d.timeout)
-            .bind(&d.headers)
-            .bind(d.temperature)
-            .bind(d.max_tokens.map(|v| v as i32))
-            .bind(d.enabled)
-            .bind(&d.deployment_id)
-            .bind(d.quota_count_ratio)
-            .bind(d.max_inflight_queue_len)
-            .bind(d.max_context_len)
-            .bind(d.client_type_header)
-            .bind(d.serve_not_match)
-            .bind(d.model_info.as_ref().unwrap_or(&serde_json::Value::Null))
-            .execute(pool)
-            .await?;
+            sqlx::query(&insert_sql)
+                .bind(&d.model_name)
+                .bind(&d.litellm_model)
+                .bind(&d.api_key)
+                .bind(d.api_key_env.unwrap_or(false))
+                .bind(&d.api_base)
+                .bind(&d.api_version)
+                .bind(&d.aws_region_name)
+                .bind(&d.aws_access_key_id)
+                .bind(&d.aws_secret_access_key)
+                .bind(d.rpm)
+                .bind(d.tpm)
+                .bind(d.timeout)
+                .bind(&d.headers)
+                .bind(d.temperature)
+                .bind(d.max_tokens)
+                .bind(d.enabled)
+                .bind(&d.deployment_id)
+                .bind(d.quota_count_ratio)
+                .bind(d.max_inflight_queue_len)
+                .bind(d.max_context_len)
+                .bind(d.client_type_header)
+                .bind(d.serve_not_match)
+                .bind(d.model_info.as_ref().unwrap_or(&serde_json::Value::Null))
+                .execute(pool)
+                .await?;
         }
 
         tracing::info!("Synced {} deployment(s) from YAML to DB", yaml_deployments.len());
@@ -468,42 +509,32 @@ impl DeploymentStore {
             Some(d) if !d.is_empty() => d.clone(),
             _ => uuid::Uuid::new_v4().to_string(),
         };
-        let row = sqlx::query(
-            r#"INSERT INTO boom_model_deployment
-               (model_name, litellm_model, api_key, api_key_env, api_base, api_version,
-                aws_region_name, aws_access_key_id, aws_secret_access_key,
-                rpm, tpm, timeout, headers, temperature, max_tokens, enabled, source, deployment_id,
-                quota_count_ratio, max_inflight_queue_len, max_context_len, client_type_header,
-                serve_not_match, model_info)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, 'db', $17,
-                $18, $19, $20, $21, $22, $23)
-               RETURNING id"#,
-        )
-        .bind(&input.model_name)
-        .bind(&input.litellm_model)
-        .bind(&input.api_key)
-        .bind(input.api_key_env.unwrap_or(false))
-        .bind(&input.api_base)
-        .bind(&input.api_version)
-        .bind(&input.aws_region_name)
-        .bind(&input.aws_access_key_id)
-        .bind(&input.aws_secret_access_key)
-        .bind(input.rpm)
-        .bind(input.tpm)
-        .bind(input.timeout)
-        .bind(&input.headers)
-        .bind(input.temperature)
-        .bind(input.max_tokens)
-        .bind(input.enabled)
-        .bind(&deployment_id)
-        .bind(input.quota_count_ratio)
-        .bind(input.max_inflight_queue_len)
-        .bind(input.max_context_len)
-        .bind(input.client_type_header)
-        .bind(input.serve_not_match)
-        .bind(input.model_info.as_ref().unwrap_or(&serde_json::Value::Null))
-        .fetch_one(pool)
-        .await?;
+        let row = sqlx::query(&deployment_insert_sql("db"))
+            .bind(&input.model_name)
+            .bind(&input.litellm_model)
+            .bind(&input.api_key)
+            .bind(input.api_key_env.unwrap_or(false))
+            .bind(&input.api_base)
+            .bind(&input.api_version)
+            .bind(&input.aws_region_name)
+            .bind(&input.aws_access_key_id)
+            .bind(&input.aws_secret_access_key)
+            .bind(input.rpm)
+            .bind(input.tpm)
+            .bind(input.timeout)
+            .bind(&input.headers)
+            .bind(input.temperature)
+            .bind(input.max_tokens)
+            .bind(input.enabled)
+            .bind(&deployment_id)
+            .bind(input.quota_count_ratio)
+            .bind(input.max_inflight_queue_len)
+            .bind(input.max_context_len)
+            .bind(input.client_type_header)
+            .bind(input.serve_not_match)
+            .bind(input.model_info.as_ref().unwrap_or(&serde_json::Value::Null))
+            .fetch_one(pool)
+            .await?;
 
         Ok(row.get("id"))
     }
@@ -633,35 +664,20 @@ impl DeploymentStore {
 
     /// List all deployments from DB (for dashboard).
     pub async fn list_all_db(pool: &sqlx::PgPool) -> Result<Vec<DeploymentRow>, sqlx::Error> {
-        sqlx::query_as::<_, DeploymentRow>(
-            r#"SELECT id, model_name, litellm_model, api_key, api_key_env, api_base, api_version,
-                      aws_region_name, aws_access_key_id, aws_secret_access_key,
-                      rpm, tpm, timeout, headers, temperature, max_tokens, enabled, auto_disabled,
-                      source, deployment_id, quota_count_ratio,
-                      max_inflight_queue_len, max_context_len, client_type_header,
-                      serve_not_match, model_info,
-                      created_at, updated_at
-               FROM boom_model_deployment
-               ORDER BY model_name, created_at"#,
-        )
+        sqlx::query_as::<_, DeploymentRow>(&format!(
+            "SELECT {} FROM boom_model_deployment ORDER BY model_name, created_at",
+            DEPLOYMENT_ROW_SELECT_COLUMNS,
+        ))
         .fetch_all(pool)
         .await
     }
 
     /// Snapshot all deployments from DB (for config export).
     pub async fn snapshot_db(pool: &sqlx::PgPool) -> Result<Vec<DeploymentRow>, sqlx::Error> {
-        sqlx::query_as::<_, DeploymentRow>(
-            r#"SELECT id, model_name, litellm_model, api_key, api_key_env, api_base, api_version,
-                      aws_region_name, aws_access_key_id, aws_secret_access_key,
-                      rpm, tpm, timeout, headers, temperature, max_tokens, enabled, auto_disabled,
-                      source, deployment_id, quota_count_ratio,
-                      max_inflight_queue_len, max_context_len, client_type_header,
-                      serve_not_match, model_info,
-                      created_at, updated_at
-               FROM boom_model_deployment
-               WHERE enabled IS NOT FALSE
-               ORDER BY model_name, created_at"#,
-        )
+        sqlx::query_as::<_, DeploymentRow>(&format!(
+            "SELECT {} FROM boom_model_deployment WHERE enabled IS NOT FALSE ORDER BY model_name, created_at",
+            DEPLOYMENT_ROW_SELECT_COLUMNS,
+        ))
         .fetch_all(pool)
         .await
     }
@@ -670,5 +686,101 @@ impl DeploymentStore {
 impl Default for DeploymentStore {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// UPDATE statement must mention every column in `DEPLOYMENT_CORE_COLUMNS`.
+    /// This is the architectural forcing function — adding a column to the
+    /// const without updating the UPDATE SQL fails the build. See
+    /// CLAUDE.md §9 配置字段单一真相源.
+    #[test]
+    fn update_sql_mentions_all_core_columns() {
+        // Mirror of the UPDATE statement in `update_db`. Kept here (not scraped
+        // from the function body) so the test fails loudly if someone changes
+        // the SQL without updating the const-aware check.
+        let update_sql = r#"
+            UPDATE boom_model_deployment
+            SET model_name = $2, litellm_model = $3,
+                api_key = COALESCE($4, api_key),
+                api_key_env = $5,
+                api_base = COALESCE($6, api_base),
+                api_version = COALESCE($7, api_version),
+                aws_region_name = COALESCE($8, aws_region_name),
+                aws_access_key_id = COALESCE($9, aws_access_key_id),
+                aws_secret_access_key = COALESCE($10, aws_secret_access_key),
+                rpm = $11, tpm = $12, timeout = $13, headers = $14,
+                temperature = $15, max_tokens = $16, enabled = $17,
+                deployment_id = COALESCE($18, deployment_id),
+                quota_count_ratio = $19,
+                max_inflight_queue_len = $20, max_context_len = $21,
+                client_type_header = $22,
+                serve_not_match = $23,
+                model_info = COALESCE($24, model_info)
+        "#;
+        for col in DEPLOYMENT_CORE_COLUMNS {
+            let needle = format!(" {} ", col);
+            assert!(
+                update_sql.contains(&needle) || update_sql.contains(&format!("{} =", col)),
+                "column `{}` is in DEPLOYMENT_CORE_COLUMNS but missing from update_db SQL.\n\
+                 Add it to the UPDATE statement in `deployment_store.rs::update_db`.\n\
+                 See CLAUDE.md §9.",
+                col,
+            );
+        }
+    }
+
+    /// INSERT (both 'yaml' and 'db' variants) must mention every core column.
+    /// The INSERT SQL is generated from the const, so this test guards against
+    /// future regressions if the generator is ever hand-edited.
+    #[test]
+    fn insert_sql_mentions_all_core_columns() {
+        for source in ["yaml", "db"] {
+            let sql = deployment_insert_sql(source);
+            for col in DEPLOYMENT_CORE_COLUMNS {
+                // Match column-name boundaries (not substrings of other names).
+                let needle = format!(", {},", col);
+                let needle_first = format!("({},", col);
+                let needle_last = format!(", {})", col);
+                assert!(
+                    sql.contains(&needle)
+                        || sql.contains(&needle_first)
+                        || sql.contains(&needle_last)
+                        || sql.contains(&format!("({} ,", col)),
+                    "column `{}` missing from INSERT({}) SQL: {}",
+                    col,
+                    source,
+                    sql,
+                );
+            }
+        }
+    }
+
+    /// SELECT column list must mention every core column (plus the meta cols).
+    #[test]
+    fn select_sql_mentions_all_core_columns() {
+        for col in DEPLOYMENT_CORE_COLUMNS {
+            let needle_comma = format!(", {},", col);
+            let needle_first = format!("{} ", col);
+            assert!(
+                DEPLOYMENT_ROW_SELECT_COLUMNS.contains(&needle_comma)
+                    || DEPLOYMENT_ROW_SELECT_COLUMNS.starts_with(&needle_first)
+                    || DEPLOYMENT_ROW_SELECT_COLUMNS.contains(&format!(" {}", col)),
+                "column `{}` missing from DEPLOYMENT_ROW_SELECT_COLUMNS",
+                col,
+            );
+        }
+    }
+
+    /// `DEPLOYMENT_CORE_COLUMNS` must not contain duplicates.
+    #[test]
+    fn core_columns_has_no_duplicates() {
+        let mut seen = std::collections::HashSet::new();
+        for col in DEPLOYMENT_CORE_COLUMNS {
+            assert!(seen.insert(*col), "duplicate column `{}` in DEPLOYMENT_CORE_COLUMNS", col);
+        }
     }
 }

@@ -14,6 +14,10 @@ pub use boom_core::types::WindowLimit;
 /// Re-export of the serde helper — see `boom_core::types::deserialize_window_limit_vec`.
 pub use boom_core::types::deserialize_window_limit_vec;
 
+/// Field manifest — single source of truth for which config fields are
+/// editable from the dashboard UI. See `manifest.rs` and CLAUDE.md §9.
+pub mod manifest;
+
 /// Top-level gateway configuration, loaded from YAML.
 /// Compatible with litellm's `proxy_server_config.yaml` format.
 #[derive(Debug, Deserialize, Serialize, Clone)]

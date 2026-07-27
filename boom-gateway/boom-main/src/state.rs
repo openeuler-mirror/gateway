@@ -831,13 +831,15 @@ async fn sync_yaml_to_db(pool: &PgPool, config: &Config, plan_store: &Arc<PlanSt
     // ── Deployments (delegated to DeploymentStore) ──
     let yaml_model_names: Vec<String> = config.model_list.iter()
         .map(|e| e.model_name.clone()).collect();
-    let mut yaml_deployments: Vec<boom_routing::YamlDeploymentData> = Vec::new();
+    let mut yaml_deployments: Vec<boom_routing::DeploymentInput> = Vec::new();
     for entry in &config.model_list {
         let p = &entry.litellm_params;
-        let d = boom_routing::YamlDeploymentData {
+        let d = boom_routing::DeploymentInput {
             model_name: entry.model_name.clone(),
             litellm_model: p.model.clone(),
             api_key: p.api_key.clone(),
+            // YAML path resolves env vars before this point — value is literal.
+            api_key_env: Some(false),
             api_base: p.api_base.clone(),
             api_version: p.api_version.clone(),
             aws_region_name: p.aws_region_name.clone(),

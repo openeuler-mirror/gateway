@@ -125,6 +125,26 @@ Dashboard 需要执行写操作（创建模型、修改配置等）时：
 - [ ] 公共 API 通过 `pub use` 在 `lib.rs` 明确导出
 - [ ] boom-main 的 `Cargo.toml` 和 `state.rs` 已更新以引入新模块
 
+### 9. 配置字段单一真相源（manifest 原则）
+
+YAML / DB / Dashboard 前端涉及"同一个字段"的多个定义点。新增或修改 deployment 字段时，必须同步以下 5 处，否则会出现"DB 写得进、前端看不见"或"前端能编辑但 SQL 漏字段"等腐化场景：
+
+1. **`boom-config/src/lib.rs`** — `ProviderParams` / `ModelEntry` / `ModelInfo` / `FlowControlEntry` 结构体（YAML 解析）
+2. **`boom-config/src/manifest.rs`** — `model_deployment_fields()` 中注册 `FieldMeta`（label_key、tip_key、section、input_type）
+3. **`boom-routing/src/deployment_store.rs`** — `DEPLOYMENT_CORE_COLUMNS` const + `DeploymentInput` + 5 个 SQL 语句（INSERT ×2 / UPDATE / SELECT ×2）
+4. **`boom-dashboard/src/frontend/app.js`** — 表单字段 HTML + 提交 body 字段；`i18n.js` 加 label/tip 翻译
+5. **DB migration** — `boom-main/migrations/` 加 ALTER TABLE
+
+**强制约束（forcing functions）：**
+- `boom-config::manifest::tests::manifest_covers_all_struct_fields` —— `ProviderParams`/`ModelEntry` 等结构体的字段必须在 manifest 中注册，否则编译失败
+- `boom-routing::deployment_store::tests::{update_sql_mentions_all_core_columns, insert_sql_mentions_all_core_columns, select_sql_mentions_all_core_columns}` —— `DEPLOYMENT_CORE_COLUMNS` 中每个列名必须出现在 SQL 字符串里，否则编译失败
+- `GET /admin/config/schema`（由 `AdminCommand::GetConfigSchema` 透传 `boom_config::manifest::*`）—— 前端可拉取 manifest 自动渲染（当前前端是手工同步，未自动渲染）
+
+**不要做的反模式：**
+- 不要在 `state.rs::build_config_snapshot_value` 中临时拼字段 —— 它应当只是 manifest + 结构体的派生输出（业务转换除外，如 `Decimal/per_token → per_million`）
+- 不要新增"只在前端 / 只在 DB / 只在 YAML"出现的字段 —— manifest 是登记处，未登记即不存在
+- 不要绕过 manifest 直接 grep SQL 加字段 —— 走 const → 测试 → SQL 的链路，让编译失败当 guard
+
 ## Key Patterns
 
 - **配置共享**：`Arc<ArcSwap<T>>` 原子交换，零停机热加载

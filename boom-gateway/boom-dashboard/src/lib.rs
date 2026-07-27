@@ -257,6 +257,12 @@ pub fn build_router<S: Clone + Send + Sync + 'static>(state: DashboardState) -> 
             "/dashboard/api/admin/config",
             get(handlers_admin::get_config).put(handlers_admin::update_config),
         )
+        // Admin — Config field manifest (declarative UI schema).
+        // See CLAUDE.md §9.
+        .route(
+            "/dashboard/api/admin/config/schema",
+            get(handlers_admin::get_config_schema),
+        )
         // SPA fallback — must be last.
         .route("/dashboard/{*path}", get(handlers_static::spa_fallback))
         // Inject state via Extension layer.

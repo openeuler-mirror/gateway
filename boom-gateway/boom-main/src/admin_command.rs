@@ -88,6 +88,14 @@ pub async fn admin_command_handler(mut rx: tokio::sync::mpsc::Receiver<AdminComm
                 }
                 let _ = reply.send(json);
             }
+            AdminCommand::GetConfigSchema { reply } => {
+                let schema = json!({
+                    "model_deployments": boom_config::manifest::model_deployment_fields(),
+                    "general_settings": boom_config::manifest::general_settings_fields(),
+                    "router_settings": boom_config::manifest::router_settings_fields(),
+                });
+                let _ = reply.send(Ok(schema));
+            }
         }
     }
     tracing::warn!("Admin command handler stopped (channel closed)");

@@ -52,6 +52,13 @@ pub enum AdminCommand {
     GetConfig {
         reply: oneshot::Sender<Result<Value, String>>,
     },
+    /// Read the field manifest — declarative list of which config fields
+    /// are editable from the dashboard UI. See boom-config `manifest` module
+    /// and CLAUDE.md §9. Used by `GET /admin/config/schema` and (future)
+    /// auto-rendering frontend code.
+    GetConfigSchema {
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
     /// Update a singleton config section (e.g., `server`, `router_settings`)
     /// by replacing it wholesale in the live `config.yaml`. Path is dotted
     /// (`router_settings.kvc_aware`); value is the new JSON-serializable content.

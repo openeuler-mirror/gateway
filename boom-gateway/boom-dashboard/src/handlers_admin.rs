@@ -3139,6 +3139,37 @@ pub async fn get_config(
     }
 }
 
+/// GET /admin/config/schema — return the field manifest (declarative UI schema).
+/// Transparent passthrough: boom-main serializes `boom_config::manifest::*`
+/// and forwards. See CLAUDE.md §9.
+pub async fn get_config_schema(
+    _session: AdminSession,
+    Extension(state): Extension<Arc<DashboardState>>,
+) -> Response {
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    if state
+        .admin_tx
+        .send(crate::state::AdminCommand::GetConfigSchema { reply: reply_tx })
+        .await
+        .is_err()
+    {
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "Admin command handler unavailable",
+        )
+            .into_response();
+    }
+    match reply_rx.await {
+        Ok(Ok(value)) => Json(value).into_response(),
+        Ok(Err(msg)) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, msg).into_response(),
+        Err(_) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "Admin command handler dropped reply",
+        )
+            .into_response(),
+    }
+}
+
 /// PUT /admin/config — surgical section update.
 /// Body: `{ "path": "dotted.path", "value": <json value> }`.
 /// Triggers reload after writing.
