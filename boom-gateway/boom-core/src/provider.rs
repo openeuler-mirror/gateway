@@ -1,7 +1,108 @@
-use crate::types::{AuthIdentity, ChatCompletionRequest, ChatCompletionResponse, ChatStream};
+use crate::types::{
+    AuthIdentity, ChatCompletionRequest, ChatCompletionResponse, ChatStream, PromptTokensDetails,
+    Usage,
+};
 use crate::GatewayError;
 use async_trait::async_trait;
+use rust_decimal::Decimal;
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+/// Actual provider cost for one logical request.
+///
+/// Ordinary providers leave this unset and the gateway computes cost from the
+/// selected model's rate. Composite providers use it to return the sum of
+/// successful child calls without exposing billing metadata in the API body.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ProviderCost {
+    pub regular_input: Decimal,
+    pub cached_input: Decimal,
+    pub output: Decimal,
+}
+
+impl ProviderCost {
+    pub fn total(&self) -> Decimal {
+        self.regular_input + self.cached_input + self.output
+    }
+
+    pub fn add(&mut self, other: &Self) {
+        self.regular_input += other.regular_input;
+        self.cached_input += other.cached_input;
+        self.output += other.output;
+    }
+}
+
+/// Shared return channel for provider-specific usage and actual cost.
+#[derive(Debug, Clone, Default)]
+pub struct ProviderBilling {
+    actual_cost: Arc<Mutex<Option<ProviderCost>>>,
+    actual_usage: Arc<Mutex<Option<Usage>>>,
+}
+
+impl ProviderBilling {
+    pub fn add_actual_cost(&self, cost: &ProviderCost) {
+        if let Ok(mut actual_cost) = self.actual_cost.lock() {
+            actual_cost
+                .get_or_insert_with(ProviderCost::default)
+                .add(cost);
+        }
+    }
+
+    pub fn actual_cost(&self) -> Option<ProviderCost> {
+        self.actual_cost
+            .lock()
+            .ok()
+            .and_then(|actual_cost| actual_cost.clone())
+    }
+
+    pub fn add_actual_usage(&self, usage: &Usage) {
+        if let Ok(mut actual_usage) = self.actual_usage.lock() {
+            let target = actual_usage.get_or_insert_with(Usage::default);
+            target.prompt_tokens = target.prompt_tokens.saturating_add(usage.prompt_tokens);
+            target.completion_tokens = target
+                .completion_tokens
+                .saturating_add(usage.completion_tokens);
+            target.total_tokens = target.total_tokens.saturating_add(usage.total_tokens);
+            add_optional_usage(
+                &mut target.cache_creation_input_tokens,
+                usage.cache_creation_input_tokens,
+            );
+            add_optional_usage(
+                &mut target.cache_read_input_tokens,
+                usage.cache_read_input_tokens,
+            );
+            if let Some(details) = &usage.prompt_tokens_details {
+                let target_details = target
+                    .prompt_tokens_details
+                    .get_or_insert_with(PromptTokensDetails::default);
+                add_optional_usage(&mut target_details.cached_tokens, details.cached_tokens);
+            }
+        }
+    }
+
+    pub fn actual_usage(&self) -> Option<Usage> {
+        self.actual_usage
+            .lock()
+            .ok()
+            .and_then(|actual_usage| actual_usage.clone())
+    }
+}
+
+fn add_optional_usage(target: &mut Option<u32>, value: Option<u32>) {
+    if let Some(value) = value {
+        *target = Some(target.unwrap_or(0).saturating_add(value));
+    }
+}
+
+/// Gateway context attached to a provider call after parent-request
+/// authentication and quota admission have completed.
+pub struct ProviderCallContext {
+    pub key_hash: String,
+    pub key_alias: Option<String>,
+    pub is_vip: bool,
+    pub api_path: String,
+    pub billing: ProviderBilling,
+}
 
 /// Provider trait — each LLM provider implements this.
 ///
@@ -15,6 +116,26 @@ pub trait Provider: Send + Sync + 'static {
     /// Streaming chat completion. Returns an SSE byte stream from the upstream provider,
     /// already transformed into OpenAI-compatible chunks.
     async fn chat_stream(&self, request: ChatCompletionRequest) -> Result<ChatStream, GatewayError>;
+
+    /// Context-aware entry point used by the gateway route. Ordinary providers
+    /// use the direct implementation; virtual providers can override it to
+    /// perform nested routing while retaining key-affinity and priority context.
+    async fn chat_with_context(
+        &self,
+        request: ChatCompletionRequest,
+        _context: ProviderCallContext,
+    ) -> Result<ChatCompletionResponse, GatewayError> {
+        self.chat(request).await
+    }
+
+    /// Streaming counterpart of [`Provider::chat_with_context`].
+    async fn chat_stream_with_context(
+        &self,
+        request: ChatCompletionRequest,
+        _context: ProviderCallContext,
+    ) -> Result<ChatStream, GatewayError> {
+        self.chat_stream(request).await
+    }
 
     /// Provider identifier (e.g. "openai", "anthropic").
     fn name(&self) -> &str;

@@ -1,0 +1,61 @@
+{
+  "model": "fusion",
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are a coding agent working in /testbed."
+    },
+    {
+      "role": "user",
+      "content": "Fix astropy__astropy-13236 and run the relevant tests."
+    },
+    {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [
+        {
+          "id": "call_1",
+          "type": "function",
+          "function": {
+            "name": "bash",
+            "arguments": "{\"command\":\"sed -n '1,220p' astropy/modeling/separable.py\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "def _separable(transform):\n    ...",
+      "tool_call_id": "call_1"
+    }
+  ],
+  "temperature": 0.0,
+  "max_tokens": 4096,
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "bash",
+        "description": "Run a shell command in the repository.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "command": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "command"
+          ]
+        }
+      }
+    }
+  ],
+  "tool_choice": "auto",
+  "metadata": {
+    "benchmark": "swebench",
+    "run_id": "gateway-direct-synthesis-smoke",
+    "instance_id": "astropy__astropy-13236",
+    "agent_step_index": 2
+  }
+}

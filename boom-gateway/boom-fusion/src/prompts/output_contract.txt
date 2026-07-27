@@ -1,0 +1,7 @@
+你的输出必须是当前对话的下一条 assistant response，而不是对内部候选、分析、选择或渲染过程的总结。
+
+要求：
+- 优先遵守原始对话中的任务目标、格式约束和 agent 协议。
+- 当当前请求包含 tools，且任务状态需要继续执行动作时，请返回符合 tools schema 的 tool_call。
+- 当当前请求未提供 tools 时，仍应遵守原始对话约定的输出协议；只有协议允许时才输出最终文本。
+- 不要暴露 panel、analyzer、selector、renderer 等内部流程或中间材料。

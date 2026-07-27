@@ -178,6 +178,24 @@ impl AliasStore {
         tracing::info!("Loaded {} DB-only alias(es)", rows.len());
     }
 
+    pub async fn db_only_name_conflicts(
+        pool: &PgPool,
+        model_names: &[String],
+    ) -> Result<Vec<String>, sqlx::Error> {
+        if model_names.is_empty() {
+            return Ok(Vec::new());
+        }
+        sqlx::query_scalar::<_, String>(
+            r#"SELECT DISTINCT alias_name
+               FROM boom_model_alias
+               WHERE source = 'db' AND alias_name = ANY($1)
+               ORDER BY alias_name"#,
+        )
+        .bind(model_names)
+        .fetch_all(pool)
+        .await
+    }
+
     /// List all aliases from DB (for dashboard).
     pub async fn list_all_db(pool: &PgPool) -> Result<Vec<AliasRow>, sqlx::Error> {
         sqlx::query_as::<_, AliasRow>(

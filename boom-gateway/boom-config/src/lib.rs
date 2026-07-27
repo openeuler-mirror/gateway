@@ -3,6 +3,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
 
+mod workflow;
+
+pub use workflow::{
+    DirectSynthesisRolesConfig, WorkflowDefinitionConfig, WorkflowModelInstanceConfig,
+    WorkflowSettings,
+};
+
 /// Re-export of `boom_core::types::WindowLimit` — single source of truth.
 ///
 /// Defined in boom-core (the leaf crate) so both boom-config (YAML parse) and
@@ -28,6 +35,8 @@ pub struct Config {
     pub general_settings: GeneralSettings,
     #[serde(default)]
     pub router_settings: RouterSettings,
+    #[serde(default)]
+    pub workflow_settings: WorkflowSettings,
     #[serde(default)]
     pub server: ServerSettings,
     #[serde(default)]
@@ -497,6 +506,11 @@ pub struct RouterSettings {
     /// rolling out downstream so that downstream schedulers can read request priority.
     #[serde(default)]
     pub enable_priority_header: bool,
+    /// Maximum time a parent or workflow child request may wait in a
+    /// deployment flow-control queue. Omitted configs retain the historical
+    /// 1200-second behavior.
+    #[serde(default)]
+    pub flow_control_queue_timeout_secs: Option<u64>,
     /// Strip Claude Code's `x-anthropic-billing-header` attribution block from
     /// `/v1/messages` request bodies before forwarding upstream.
     ///
@@ -517,6 +531,12 @@ pub struct RouterSettings {
     /// protocol).
     #[serde(default)]
     pub strip_claude_code_attribution: bool,
+}
+
+impl RouterSettings {
+    pub fn flow_control_queue_timeout_secs(&self) -> u64 {
+        self.flow_control_queue_timeout_secs.unwrap_or(1200)
+    }
 }
 
 /// Settings for KV-cache aware routing.
@@ -792,6 +812,17 @@ impl Config {
         // semantic checks; Config::validate just orchestrates them so new
         // sections plug in without growing this method.
         self.router_settings.kvc_aware.validate()?;
+        if self
+            .router_settings
+            .flow_control_queue_timeout_secs
+            .is_some_and(|seconds| seconds == 0)
+        {
+            return Err(GatewayError::ConfigError(
+                "router_settings.flow_control_queue_timeout_secs must be greater than zero"
+                    .to_string(),
+            ));
+        }
+        self.workflow_settings.validate(self)?;
         Ok(())
     }
 

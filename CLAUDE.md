@@ -38,7 +38,8 @@ Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
 ### 1. 模块依赖方向：单向、无环
 
 ```
-boom-core ← boom-auth, boom-provider, boom-config, boom-limiter, boom-routing, boom-audit
+boom-core ← boom-auth, boom-provider, boom-config, boom-limiter, boom-audit
+boom-routing → boom-core, boom-config, boom-ctxaware, boom-flowcontrol, boom-fusion
 boom-main → 依赖所有 boom-* 模块（组装层）
 boom-dashboard → boom-core, boom-limiter, boom-routing, boom-audit（禁止依赖 boom-provider, boom-config）
 ```
@@ -56,7 +57,7 @@ boom-dashboard → boom-core, boom-limiter, boom-routing, boom-audit（禁止依
 | boom-config | YAML 配置解析、环境变量展开 | 不持有运行时状态 |
 | boom-provider | 构建 Provider 实例（OpenAI/Anthropic/Bedrock 等） | 不做密钥校验、不做计费 |
 | boom-limiter | 滑动窗口限流、并发控制、PlanStore | 不感知 Provider |
-| boom-routing | DeploymentStore（模型→Provider 映射）、AliasStore（别名解析） | 不做 HTTP 请求 |
+| boom-routing | DeploymentStore、AliasStore、调度策略、Fusion 虚拟 Provider 编排 | 不实现上游 HTTP 协议；只调用 `Provider` trait |
 | boom-audit | 请求日志读写（boom_request_log 表） | 不做路由决策 |
 | boom-dashboard | Web UI + REST API + JWT 认证 | 不直接操作 Provider/Config |
 | boom-main | 路由处理、状态组装、热加载、后台任务 | 不在 handler 里写业务逻辑 |

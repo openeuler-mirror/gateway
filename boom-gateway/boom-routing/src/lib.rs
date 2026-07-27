@@ -1,5 +1,6 @@
 pub mod alias_store;
 pub mod deployment_store;
+pub mod fusion;
 pub mod hybrid_router;
 pub mod inflight;
 pub mod migrations;
@@ -13,6 +14,7 @@ pub use deployment_store::{
     DeploymentHealthTarget, DeploymentInput, DeploymentProviderRow, DeploymentRow, DeploymentStore,
     ModelCostRate,
 };
+pub use fusion::{register_fusion_providers, FusionRuntime};
 pub use hybrid_router::{
     ClassifyRequest, ClassificationStrategy, HybridRouter, StrategyRegistry, TierClassifier,
 };

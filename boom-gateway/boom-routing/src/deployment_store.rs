@@ -1,4 +1,5 @@
 use boom_core::provider::Provider;
+use boom_core::GatewayError;
 use dashmap::DashMap;
 use rust_decimal::Decimal;
 use serde::Serialize;
@@ -86,6 +87,8 @@ pub struct DeploymentStore {
     quota_ratios: DashMap<String, u64>,
     /// model_name → cost rates for billing.
     cost_rates: DashMap<String, ModelCostRate>,
+    /// model_name → provider name for models whose candidate set is exclusive.
+    exclusive_providers: DashMap<String, String>,
 }
 
 /// Full deployment row from boom_model_deployment table.
@@ -266,28 +269,86 @@ impl DeploymentStore {
             rr_counters: DashMap::new(),
             quota_ratios: DashMap::new(),
             cost_rates: DashMap::new(),
+            exclusive_providers: DashMap::new(),
         }
     }
 
     // ── In-memory operations ──
 
     /// Replace all deployments for a model name.
-    pub fn set_deployments(&self, model_name: String, providers: Vec<Arc<dyn Provider>>) {
+    pub fn set_deployments(
+        &self,
+        model_name: String,
+        providers: Vec<Arc<dyn Provider>>,
+    ) -> bool {
+        if let Some(expected) = self.exclusive_providers.get(&model_name) {
+            tracing::error!(
+                model = %model_name,
+                exclusive_provider = %expected.value(),
+                "refused to replace an exclusive model deployment"
+            );
+            return false;
+        }
         self.rr_counters.remove(&model_name);
         self.deployments.insert(model_name, providers);
+        true
     }
 
     /// Add a single deployment to an existing model group (or create it).
-    pub fn add_deployment(&self, model_name: &str, provider: Arc<dyn Provider>) {
+    pub fn add_deployment(&self, model_name: &str, provider: Arc<dyn Provider>) -> bool {
+        if let Some(expected) = self.exclusive_providers.get(model_name) {
+            tracing::error!(
+                model = model_name,
+                provider = provider.name(),
+                exclusive_provider = %expected.value(),
+                "refused to add a deployment to an exclusive model"
+            );
+            return false;
+        }
         self.deployments
             .entry(model_name.to_string())
             .or_default()
             .push(provider);
+        true
+    }
+
+    /// Register a model whose candidate set must remain owned by one virtual
+    /// provider. Fails instead of replacing any existing deployment.
+    pub fn set_exclusive_deployment(
+        &self,
+        model_name: String,
+        provider: Arc<dyn Provider>,
+    ) -> Result<(), GatewayError> {
+        if self.deployments.contains_key(&model_name)
+            || self.exclusive_providers.contains_key(&model_name)
+        {
+            return Err(GatewayError::ConfigError(format!(
+                "exclusive model '{}' conflicts with an existing deployment",
+                model_name
+            )));
+        }
+        let provider_name = provider.name().to_string();
+        self.rr_counters.remove(&model_name);
+        self.deployments.insert(model_name.clone(), vec![provider]);
+        self.exclusive_providers.insert(model_name, provider_name);
+        Ok(())
+    }
+
+    pub fn is_exclusive_model(&self, model_name: &str) -> bool {
+        self.exclusive_providers.contains_key(model_name)
     }
 
     /// Remove all deployments for the given model name.
     /// Returns true if the model existed.
     pub fn remove_deployments(&self, model_name: &str) -> bool {
+        if let Some(expected) = self.exclusive_providers.get(model_name) {
+            tracing::error!(
+                model = model_name,
+                exclusive_provider = %expected.value(),
+                "refused to remove an exclusive model deployment"
+            );
+            return false;
+        }
         self.rr_counters.remove(model_name);
         self.deployments.remove(model_name).is_some()
     }
@@ -298,6 +359,7 @@ impl DeploymentStore {
         self.deployments.clear();
         self.quota_ratios.clear();
         self.cost_rates.clear();
+        self.exclusive_providers.clear();
     }
 
     /// Set the quota count ratio for a model.
@@ -468,6 +530,26 @@ impl DeploymentStore {
                WHERE source = 'db' AND enabled IS NOT FALSE
                ORDER BY model_name, created_at"#,
         )
+        .fetch_all(pool)
+        .await
+    }
+
+    pub async fn db_only_model_conflicts(
+        pool: &sqlx::PgPool,
+        model_names: &[String],
+    ) -> Result<Vec<String>, sqlx::Error> {
+        if model_names.is_empty() {
+            return Ok(Vec::new());
+        }
+        sqlx::query_scalar::<_, String>(
+            r#"SELECT DISTINCT model_name
+               FROM boom_model_deployment
+               WHERE source = 'db'
+                 AND enabled IS NOT FALSE
+                 AND model_name = ANY($1)
+               ORDER BY model_name"#,
+        )
+        .bind(model_names)
         .fetch_all(pool)
         .await
     }

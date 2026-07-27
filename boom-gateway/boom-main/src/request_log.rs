@@ -2,6 +2,7 @@ use sqlx::PgPool;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 use boom_core::types::AuthIdentity;
+use boom_core::types::Usage;
 use boom_core::{DebugErrorEntry, GatewayError};
 use crate::state::AppState;
 
@@ -118,6 +119,38 @@ pub fn log_error(
     request_body: Option<String>,
     client_ip: Option<String>,
 ) {
+    log_error_with_usage(
+        state,
+        identity,
+        model,
+        api_path,
+        is_stream,
+        start,
+        error,
+        request_id,
+        deployment_id,
+        request_body,
+        client_ip,
+        None,
+    );
+}
+
+/// Error logging variant for composite providers that may have completed
+/// successful child calls before the parent request failed.
+pub fn log_error_with_usage(
+    state: &AppState,
+    identity: &AuthIdentity,
+    model: &str,
+    api_path: &str,
+    is_stream: bool,
+    start: Instant,
+    error: &GatewayError,
+    request_id: Option<String>,
+    deployment_id: Option<String>,
+    request_body: Option<String>,
+    client_ip: Option<String>,
+    usage: Option<&Usage>,
+) {
     if !error.should_log_to_db() {
         let dedup_key = format!("{}:{}:{}", error.error_type(), identity.key_hash, model);
         if REJECTION_DEDUP.get(&dedup_key).is_some() {
@@ -151,13 +184,20 @@ pub fn log_error(
             status_code: error.status_code(),
             error_type: Some(error.error_type().to_string()),
             error_message: Some(error.to_string()),
-            input_tokens: None,
-            output_tokens: None,
+            input_tokens: usage.map(|usage| {
+                usage.prompt_tokens.min(i32::MAX as u32) as i32
+            }),
+            output_tokens: usage.map(|usage| {
+                usage.completion_tokens.min(i32::MAX as u32) as i32
+            }),
             duration_ms: Some(start.elapsed().as_millis() as i32),
             ttft_ms: None,
             deployment_id,
             client_ip: client_ip.clone(),
-            cached_tokens: None,
+            cached_tokens: usage
+                .and_then(|usage| usage.prompt_tokens_details.as_ref())
+                .and_then(|details| details.cached_tokens)
+                .map(i64::from),
             schedule_policy: None,
             kv_hit_blocks: None,
             kv_input_blocks: None,

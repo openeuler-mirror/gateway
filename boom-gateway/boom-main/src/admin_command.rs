@@ -120,6 +120,7 @@ async fn handle_create_model(
     state: &AppState,
     req: boom_dashboard::handlers_admin::CreateDeploymentRequest,
 ) -> Result<Value, String> {
+    ensure_not_workflow_model(state, &req.model_name)?;
     let db_pool = state.db_pool.as_ref().ok_or("Database not available")?;
     let headers_json = serde_json::to_value(&req.headers).unwrap_or(json!({}));
 
@@ -167,6 +168,7 @@ async fn handle_update_model(
     id: Uuid,
     req: boom_dashboard::handlers_admin::CreateDeploymentRequest,
 ) -> Result<Value, String> {
+    ensure_not_workflow_model(state, &req.model_name)?;
     let db_pool = state.db_pool.as_ref().ok_or("Database not available")?;
     let headers_json = serde_json::to_value(&req.headers).unwrap_or(json!({}));
 
@@ -209,6 +211,23 @@ async fn handle_update_model(
     // manually here would be wiped and redone by reload anyway.
 
     Ok(json!({"ok": true}))
+}
+
+fn ensure_not_workflow_model(state: &AppState, model_name: &str) -> Result<(), String> {
+    if state
+        .inner
+        .load()
+        .config
+        .workflow_settings
+        .models
+        .contains_key(model_name)
+    {
+        return Err(format!(
+            "model '{}' is reserved by workflow_settings",
+            model_name
+        ));
+    }
+    Ok(())
 }
 
 async fn handle_delete_model(
@@ -259,7 +278,12 @@ pub async fn reload_model_deployments(
     // Always set (even empty) so resolve_candidates can distinguish
     // "configured but all down" from "never configured". An empty provider
     // list prevents silent fallthrough to the wildcard catch-all.
-    deployment_store.set_deployments(model_name.to_string(), providers);
+    if !deployment_store.set_deployments(model_name.to_string(), providers) {
+        tracing::error!(
+            model = model_name,
+            "refused to reload deployments for an exclusive model"
+        );
+    }
 }
 
 /// Auto-disable a faulty deployment: mark `enabled = false, auto_disabled = true` in DB,

@@ -1,0 +1,29 @@
+model_list:
+  - model_name: legacy-model
+    model_info:
+      id: legacy-deployment
+    litellm_params:
+      model: openai/legacy-upstream-model
+      api_key: legacy-upstream-key
+      api_base: http://127.0.0.1:__UPSTREAM_PORT__/v1
+      timeout: 30
+
+general_settings:
+  master_key: legacy-master-key
+
+router_settings:
+  routing_strategy: round_robin
+
+server:
+  host: 127.0.0.1
+  port: 4000
+  workers: 1
+
+rate_limit:
+  enabled: true
+  default_rpm: 60
+
+deployment_health_check:
+  auto_offline_enabled: false
+  auto_recovery_enabled: false
+  request_failure_auto_offline_enabled: false

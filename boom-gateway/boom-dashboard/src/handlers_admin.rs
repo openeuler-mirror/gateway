@@ -1975,6 +1975,15 @@ pub async fn create_alias(
     Extension(state): Extension<std::sync::Arc<DashboardState>>,
     Json(req): Json<CreateAliasRequest>,
 ) -> Response {
+    if state.deployment_store.is_exclusive_model(&req.alias_name) {
+        return Json(json!({
+            "error": format!(
+                "alias '{}' conflicts with an exclusive workflow model",
+                req.alias_name
+            )
+        }))
+        .into_response();
+    }
     let db_pool = match &state.db_pool {
         Some(pool) => pool,
         None => {
@@ -2004,6 +2013,15 @@ pub async fn update_alias(
     Path(alias_name): Path<String>,
     Json(req): Json<CreateAliasRequest>,
 ) -> Response {
+    if state.deployment_store.is_exclusive_model(&req.alias_name) {
+        return Json(json!({
+            "error": format!(
+                "alias '{}' conflicts with an exclusive workflow model",
+                req.alias_name
+            )
+        }))
+        .into_response();
+    }
     let db_pool = match &state.db_pool {
         Some(pool) => pool,
         None => {

@@ -392,6 +392,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "boom-fusion"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "boom-core",
+ "futures",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+]
+
+[[package]]
 name = "boom-kvindex"
 version = "0.1.0"
 dependencies = [
@@ -505,13 +519,21 @@ name = "boom-routing"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "async-trait",
+ "boom-config",
  "boom-core",
+ "boom-ctxaware",
+ "boom-flowcontrol",
+ "boom-fusion",
  "chrono",
  "dashmap",
+ "futures",
  "rust_decimal",
  "serde",
  "serde_json",
+ "serde_yaml",
  "sqlx",
+ "tokio",
  "tracing",
  "uuid",
 ]
