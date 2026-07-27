@@ -110,8 +110,8 @@ impl SchedulePolicy for KvcAwarePolicy {
         &self,
         model: &str,
         candidates: &[Arc<dyn Provider>],
-        key_hash: Option<&str>,
-        input_chars: u64,
+        _key_hash: Option<&str>,
+        _input_chars: u64,
         prefix_bytes: &[u8],
     ) -> Option<Selection> {
         if candidates.is_empty() {

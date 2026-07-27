@@ -170,7 +170,7 @@ impl KvIndexBackend for TokenPrefixIndex {
                 block_bytes,
                 parent_hash,
                 storage_tier,
-                block_size,
+                block_size: _,
                 ..
             } => {
                 if block_bytes.is_empty() {
@@ -465,10 +465,6 @@ impl KvIndexBackend for TokenPrefixIndex {
             while let Some((node, depth)) = stack.pop() {
                 let children: Vec<(u64, SharedBlock)> = {
                     let guard = node.read();
-                    for (&trie_key, _) in &guard.children {
-                        // Will check child below
-                    }
-                    // Collect children info under read lock
                     let mut cs: Vec<(u64, SharedBlock)> = Vec::new();
                     for (&tk, child) in &guard.children {
                         cs.push((tk, child.clone()));
