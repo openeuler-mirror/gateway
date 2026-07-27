@@ -323,7 +323,9 @@ pub async fn login(
         }
     };
 
-    // All keys are stored as SHA-256 hash in DB.
+    // All keys are stored as SHA-256 of the entire raw key. This matches the
+    // /v1 authenticate path (boom-auth) and the dashboard create-key path,
+    // and is litellm-compatible. Prefix (if any) participates in the hash.
     let token_hash = hash_token(&api_key);
 
     let row_result: Result<Option<(Option<String>, Option<String>, Option<bool>)>, _> = sqlx::query_as(

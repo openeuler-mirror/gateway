@@ -614,41 +614,163 @@ impl AppState {
         })
     }
 
-    /// Dump current runtime config (models, aliases, plans) to a timestamped YAML snapshot.
-    /// Best-effort: errors are logged but not propagated.
-    pub async fn dump_config_snapshot(&self) {
+    /// Persist current runtime model/alias/plan state to the live `config.yaml`.
+    ///
+    /// v3 design: web edits mutate the live config file in place, replacing
+    /// the old "write to timestamped backup file" behavior. The live YAML is
+    /// the single source of truth — DB tables are runtime indexes, not the
+    /// authority.
+    ///
+    /// Reads the raw YAML (preserving `${VAR}` references in untouched
+    /// sections — `load_config` resolves env vars at parse time, so dumping
+    /// the typed Config would leak real secrets to disk). Updates only the
+    /// sections owned by runtime tables:
+    ///   - `model_list` (from boom_model_deployment)
+    ///   - `router_settings.model_group_alias` (from boom_model_alias)
+    ///   - `plan_settings.plans` and optionally `plan_settings.default_plan`
+    ///     (from boom_rate_limit_plan)
+    ///
+    /// Other singleton sections (`server`, `router_settings.schedule_policy`,
+    /// `general_settings`, etc.) are preserved verbatim. Then triggers a
+    /// reload so the new config takes effect.
+    ///
+    /// Before writing, rolls a single `.bak` copy so a bad edit can be undone
+    /// by hand (serde_yaml serialization drops comments, so the .bak is also
+    /// the only record of pre-edit annotation).
+    ///
+    /// Returns `Err(message)` if any step fails so the caller can surface
+    /// the failure to the user. The DB write that triggered this persist has
+    /// already committed by the time we run, so a persist failure leaves a
+    /// real divergence: DB has the new state, YAML/memory don't. The caller
+    /// must NOT silently report success in that case — see
+    /// [`admin_command_handler`] for the warning-augmented reply pattern.
+    pub async fn persist_config_in_place(&self) -> Result<(), String> {
         let pool = match &self.db_pool {
             Some(p) => p,
-            None => return,
+            None => return Err("Database not available".to_string()),
         };
 
-        let config_value = match build_config_snapshot_value(pool).await {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::error!("Failed to build config snapshot: {}", e);
-                return;
-            }
-        };
+        backup_yaml(&self.config_path);
 
-        let yaml_str = match serde_yaml::to_string(&config_value) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!("Failed to serialize config snapshot to YAML: {}", e);
-                return;
-            }
-        };
+        let mut root: serde_yaml::Value = boom_config::read_raw_yaml(&self.config_path)
+            .map_err(|e| format!("read config: {}", e))?;
 
-        let timestamp = chrono::Local::now().format("%Y%m%d%H%M%S");
-        let snapshot_path = format!("{}.{}", self.config_path, timestamp);
+        let snapshot = build_config_snapshot_value(pool)
+            .await
+            .map_err(|e| format!("build snapshot from DB: {}", e))?;
 
-        match tokio::fs::write(&snapshot_path, &yaml_str).await {
-            Ok(_) => {
-                tracing::info!(path = %snapshot_path, "Config snapshot saved");
-            }
-            Err(e) => {
-                tracing::error!(path = %snapshot_path, "Failed to write config snapshot: {}", e);
-            }
+        merge_runtime_sections(&mut root, &snapshot)
+            .map_err(|e| format!("merge runtime sections: {}", e))?;
+
+        boom_config::write_yaml_atomic(&self.config_path, &root)
+            .map_err(|e| format!("write config: {}", e))?;
+
+        tracing::info!(path = %self.config_path, "Config persisted in place");
+
+        // Reload after the write succeeded. A reload failure here is less
+        // bad than a write failure (YAML is current; memory just lags and
+        // the next manual reload picks it up), but still report it so the
+        // user knows to retry.
+        self.reload()
+            .await
+            .map_err(|e| format!("reload after persist: {}", e))?;
+
+        Ok(())
+    }
+
+    /// Update a single config section in the live `config.yaml` and reload.
+    ///
+    /// `path` is dotted (`server`, `router_settings.kvc_aware`). Reads raw
+    /// YAML, sets the path to `value` (converted from JSON), writes back
+    /// atomically, then reloads.
+    ///
+    /// Returns a summary string on success or an error message. Used by the
+    /// Config page's section editors.
+    pub async fn update_config_section(
+        &self,
+        path: &str,
+        value: serde_json::Value,
+    ) -> Result<String, String> {
+        let segments: Vec<&str> = path.split('.').filter(|s| !s.is_empty()).collect();
+        if segments.is_empty() {
+            return Err("Empty config path".to_string());
         }
+
+        backup_yaml(&self.config_path);
+
+        let mut root: serde_yaml::Value = boom_config::read_raw_yaml(&self.config_path)
+            .map_err(|e| format!("Failed to read config: {}", e))?;
+
+        let yaml_value = json_to_yaml(&value).map_err(|e| format!("JSON→YAML: {}", e))?;
+        boom_config::set_yaml_path(&mut root, &segments, yaml_value)
+            .map_err(|e| format!("Failed to set path: {}", e))?;
+
+        boom_config::write_yaml_atomic(&self.config_path, &root)
+            .map_err(|e| format!("Failed to write config: {}", e))?;
+
+        tracing::info!(path = %path, "Config section updated");
+
+        self.reload()
+            .await
+            .map_err(|e| format!("Saved but reload failed: {}", e))
+    }
+}
+
+/// Merge runtime-derived sections (model_list, aliases, plans) from a JSON
+/// snapshot into the raw YAML value. Singleton sections are preserved as-is.
+fn merge_runtime_sections(
+    root: &mut serde_yaml::Value,
+    snapshot: &serde_json::Value,
+) -> Result<(), String> {
+    let obj = snapshot
+        .as_object()
+        .ok_or_else(|| "snapshot is not a JSON object".to_string())?;
+
+    if let Some(model_list) = obj.get("model_list") {
+        let yaml_val = json_to_yaml(model_list)?;
+        boom_config::set_yaml_path(root, &["model_list"], yaml_val)
+            .map_err(|e| format!("set model_list: {}", e))?;
+    }
+
+    if let Some(aliases) = obj.get("router_settings").and_then(|r| r.get("model_group_alias")) {
+        let yaml_val = json_to_yaml(aliases)?;
+        boom_config::set_yaml_path(root, &["router_settings", "model_group_alias"], yaml_val)
+            .map_err(|e| format!("set model_group_alias: {}", e))?;
+    }
+
+    if let Some(plan_settings) = obj.get("plan_settings") {
+        if let Some(plans) = plan_settings.get("plans") {
+            let yaml_val = json_to_yaml(plans)?;
+            boom_config::set_yaml_path(root, &["plan_settings", "plans"], yaml_val)
+                .map_err(|e| format!("set plan_settings.plans: {}", e))?;
+        }
+        if let Some(default_plan) = plan_settings.get("default_plan") {
+            let yaml_val = json_to_yaml(default_plan)?;
+            boom_config::set_yaml_path(root, &["plan_settings", "default_plan"], yaml_val)
+                .map_err(|e| format!("set plan_settings.default_plan: {}", e))?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Convert a `serde_json::Value` to `serde_yaml::Value` via string round-trip.
+/// Both libraries speak the same data model, so this is lossless for our cases
+/// (no inf/NaN, no numbers beyond u64).
+fn json_to_yaml(value: &serde_json::Value) -> Result<serde_yaml::Value, String> {
+    let s = serde_json::to_string(value).map_err(|e| format!("json serialize: {}", e))?;
+    serde_yaml::from_str(&s).map_err(|e| format!("yaml deserialize: {}", e))
+}
+
+/// Copy `{path}` to `{path}.bak`, overwriting any prior backup. Single-slot
+/// rolling backup — the previous .bak is lost, but no timestamped files
+/// accumulate. Best-effort: a failed copy logs a warning but does not block
+/// the write, since the in-memory state can still recover via reload.
+fn backup_yaml(path: &str) {
+    let bak = format!("{}.bak", path);
+    match std::fs::copy(path, &bak) {
+        Ok(_) => tracing::debug!(from = %path, to = %bak, "Config backed up"),
+        Err(e) => tracing::warn!(from = %path, to = %bak, "Config backup failed: {}", e),
     }
 }
 
@@ -693,13 +815,15 @@ async fn sync_yaml_to_db(pool: &PgPool, config: &Config, plan_store: &Arc<PlanSt
     // ── Deployments (delegated to DeploymentStore) ──
     let yaml_model_names: Vec<String> = config.model_list.iter()
         .map(|e| e.model_name.clone()).collect();
-    let mut yaml_deployments: Vec<boom_routing::YamlDeploymentData> = Vec::new();
+    let mut yaml_deployments: Vec<boom_routing::DeploymentInput> = Vec::new();
     for entry in &config.model_list {
         let p = &entry.litellm_params;
-        let d = boom_routing::YamlDeploymentData {
+        let d = boom_routing::DeploymentInput {
             model_name: entry.model_name.clone(),
             litellm_model: p.model.clone(),
             api_key: p.api_key.clone(),
+            // YAML path resolves env vars before this point — value is literal.
+            api_key_env: Some(false),
             api_base: p.api_base.clone(),
             api_version: p.api_version.clone(),
             aws_region_name: p.aws_region_name.clone(),
@@ -722,6 +846,10 @@ async fn sync_yaml_to_db(pool: &PgPool, config: &Config, plan_store: &Arc<PlanSt
                 .and_then(|fc| fc.model_context_limit).map(|v| v as i64),
             enabled: entry.enabled,
             client_type_header: entry.client_type_header,
+            serve_not_match: entry.serve_not_match,
+            model_info: entry.model_info.as_ref().map(|mi| {
+                serde_json::to_value(mi).unwrap_or(serde_json::Value::Null)
+            }),
         };
         yaml_deployments.push(d);
 
@@ -919,11 +1047,12 @@ fn build_deployments_from_config(config: &Config, deployment_store: &Arc<Deploym
                 deployment_store.set_quota_ratio(&entry.model_name, ratio);
 
                 // Per-model cost rates for billing/quota accounting.
-                // Resolution order: cost_template reference overrides inline
-                // cost fields. Inline fields fill in any rate the template
-                // left unset (None). Falls back to inline only when no template.
+                // Pricing is sourced exclusively from `cost_templates` —
+                // model_info no longer carries inline cost fields (v3 single-
+                // source-of-truth refactor). The model_info.cost_template name
+                // selects which template applies; missing template = no rate.
                 //
-                // YAML rates are USD per million tokens (e.g. `0.27` = $0.27/1M
+                // YAML rates are CNY per million tokens (e.g. `0.27` = ¥0.27/1M
                 // tokens). Convert to per-token Decimal internally for accurate
                 // accounting on small requests.
                 if let Some(info) = entry.model_info.as_ref() {
@@ -933,15 +1062,9 @@ fn build_deployments_from_config(config: &Config, deployment_store: &Arc<Deploym
                             .map(|d| d / rust_decimal::Decimal::from(1_000_000))
                     };
 
-                    let (in_input, in_cached, in_output) = (
-                        info.input_cost_per_million_tokens,
-                        info.cached_input_cost_per_million_tokens,
-                        info.output_cost_per_million_tokens,
-                    );
-
-                    // Template lookup (overrides inline when present).
+                    // Template lookup is the only source of rates now.
                     let template_rates = info.cost_template.as_ref().and_then(|tn| {
-                        config.cost_templates.iter().find(|t| t.name == *tn).map(|t| {
+                        config.lookup_cost_template(tn).map(|t| {
                             (
                                 t.input_cost_per_million_tokens,
                                 t.cached_input_cost_per_million_tokens,
@@ -950,40 +1073,35 @@ fn build_deployments_from_config(config: &Config, deployment_store: &Arc<Deploym
                         })
                     });
 
-                    // If template name was set but not found, warn and fall
-                    // back to inline fields (don't silently bill at zero).
                     if let (Some(ref tn), None) = (&info.cost_template, &template_rates) {
                         tracing::warn!(
                             model = %entry.model_name,
                             template = %tn,
-                            "cost_template not found in cost_templates — falling back to inline fields"
+                            "cost_template not found in cost_templates — no rate registered"
                         );
                     }
 
-                    let (src_input, src_cached, src_output) = match template_rates {
-                        Some(t) => t,
-                        None => (in_input, in_cached, in_output),
-                    };
+                    if let Some((src_input, src_cached, src_output)) = template_rates {
+                        let input_rate = per_million_to_per_token(src_input);
+                        let cached_rate = per_million_to_per_token(src_cached);
+                        let output_rate = per_million_to_per_token(src_output);
 
-                    let input_rate = per_million_to_per_token(src_input);
-                    let cached_rate = per_million_to_per_token(src_cached);
-                    let output_rate = per_million_to_per_token(src_output);
-
-                    if input_rate.is_some() || output_rate.is_some() || cached_rate.is_some() {
-                        let rate = boom_routing::ModelCostRate::with_cached(
-                            input_rate.unwrap_or_default(),
-                            cached_rate.unwrap_or_default(),
-                            output_rate.unwrap_or_default(),
-                        );
-                        deployment_store.set_cost_rate(&entry.model_name, rate);
-                        tracing::info!(
-                            model = %entry.model_name,
-                            template = ?info.cost_template,
-                            input_per_1m = src_input.unwrap_or(0.0),
-                            cached_per_1m = src_cached.unwrap_or(0.0),
-                            output_per_1m = src_output.unwrap_or(0.0),
-                            "Registered cost rate (USD per million tokens)"
-                        );
+                        if input_rate.is_some() || output_rate.is_some() || cached_rate.is_some() {
+                            let rate = boom_routing::ModelCostRate::with_cached(
+                                input_rate.unwrap_or_default(),
+                                cached_rate.unwrap_or_default(),
+                                output_rate.unwrap_or_default(),
+                            );
+                            deployment_store.set_cost_rate(&entry.model_name, rate);
+                            tracing::info!(
+                                model = %entry.model_name,
+                                template = ?info.cost_template,
+                                input_per_1m = src_input.unwrap_or(0.0),
+                                cached_per_1m = src_cached.unwrap_or(0.0),
+                                output_per_1m = src_output.unwrap_or(0.0),
+                                "Registered cost rate (CNY per million tokens)"
+                            );
+                        }
                     }
                 }
             }
@@ -1269,6 +1387,39 @@ fn convert_schedule(slots: &[boom_config::ScheduleSlotConfig]) -> Vec<ScheduleSl
 // ═══════════════════════════════════════════════════════════
 
 /// Build a serde_json::Value representing the current runtime config
+/// Normalize raw JSONB `window_limits` into the canonical object form that
+/// `WindowLimit`'s Serialize derive emits and the untagged-enum Helper can
+/// re-parse.
+///
+/// Why: `plan_settings.plans.X.window_limits` is stored in DB as JSONB. Old
+/// rows (or hand-edited SQL) can carry shapes the Helper at
+/// `boom_core::types::deserialize_window_limit_vec` no longer accepts — e.g.
+/// legacy 2-element tuples, objects missing `window_secs`, or wrong field
+/// names. The previous dump path cloned such entries verbatim into YAML,
+/// which then failed reload with "did not match any variant of untagged enum
+/// Helper". This function runs every entry through the same Helper so the
+/// same schema is enforced on the way OUT of the DB as on the way IN — any
+/// shape that wouldn't survive a YAML round-trip is dropped here instead of
+/// breaking reload later. Mirrors how `model_info` already routes through
+/// `ModelInfo` for the same reason.
+fn normalize_window_limits(raw: &serde_json::Value) -> Vec<serde_json::Value> {
+    #[derive(serde::Deserialize)]
+    struct WindowLimitsWrapper {
+        #[serde(deserialize_with = "boom_core::types::deserialize_window_limit_vec")]
+        inner: Vec<boom_core::types::WindowLimit>,
+    }
+
+    let wrapper = serde_json::from_value::<WindowLimitsWrapper>(serde_json::json!({ "inner": raw }));
+    match wrapper {
+        Ok(w) => w
+            .inner
+            .iter()
+            .filter_map(|wl| serde_json::to_value(wl).ok())
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
 /// (model_list, router_settings.model_group_alias, plan_settings).
 async fn build_config_snapshot_value(pool: &PgPool) -> Result<serde_json::Value, sqlx::Error> {
     // ── Model list (delegated to DeploymentStore) ──
@@ -1315,12 +1466,12 @@ async fn build_config_snapshot_value(pool: &PgPool) -> Result<serde_json::Value,
             if let Some(m) = r.max_tokens {
                 litellm_params.insert("max_tokens".into(), serde_json::Value::Number(m.into()));
             }
-            if let Some(v) = r.max_inflight_queue_len {
-                litellm_params.insert("max_inflight_queue_len".into(), serde_json::Value::Number(v.into()));
-            }
-            if let Some(v) = r.max_context_len {
-                litellm_params.insert("max_context_len".into(), serde_json::Value::Number(v.into()));
-            }
+            // NOTE: max_inflight_queue_len / max_context_len are deliberately
+            // NOT placed under litellm_params — ProviderParams doesn't have
+            // those fields, so serde would silently drop them on reload,
+            // breaking the flow control wiring that auto-generated
+            // deployment_id was meant to enable. They're emitted under
+            // entry.flow_control below.
             // Only include headers if non-empty.
             if let Some(obj) = r.headers.as_object() {
                 if !obj.is_empty() {
@@ -1333,14 +1484,76 @@ async fn build_config_snapshot_value(pool: &PgPool) -> Result<serde_json::Value,
                 "litellm_params": litellm_params,
             });
 
-            // Include model_info if deployment_id is set.
+            // ── flow_control: emit as a dedicated node. Include only when
+            // at least one limit is set so we don't litter YAML with empty
+            // `flow_control: {}` blocks on every row.
+            if r.max_inflight_queue_len.is_some() || r.max_context_len.is_some() {
+                let mut fc = serde_json::Map::new();
+                if let Some(v) = r.max_inflight_queue_len {
+                    fc.insert("model_queue_limit".into(), serde_json::Value::Number(v.into()));
+                }
+                if let Some(v) = r.max_context_len {
+                    fc.insert("model_context_limit".into(), serde_json::Value::Number(v.into()));
+                }
+                entry.as_object_mut().unwrap().insert(
+                    "flow_control".into(),
+                    serde_json::Value::Object(fc),
+                );
+            }
+
+            // ── model_info: deserialize DB JSONB through the ModelInfo schema
+            // so unknown fields (including the v3-removed inline cost fields)
+            // are dropped automatically — the schema is the whitelist, no
+            // hardcoded blacklist to keep in sync. Then layer in the
+            // canonical `id` (deployment_id column) and quota_count_ratio.
+            // Emit the node only when at least one piece is present so legacy
+            // rows without metadata stay clean.
+            let mut mi = serde_json::Map::new();
+            if let Some(info) = r
+                .model_info
+                .as_ref()
+                .and_then(|v| serde_json::from_value::<boom_config::ModelInfo>(v.clone()).ok())
+            {
+                if let Some(ct) = info.cost_template {
+                    mi.insert("cost_template".into(), serde_json::Value::String(ct));
+                }
+            }
             if let Some(ref did) = r.deployment_id {
                 if !did.is_empty() {
-                    entry.as_object_mut().unwrap().insert(
-                        "model_info".into(),
-                        serde_json::json!({ "id": did }),
+                    mi.insert("id".into(), serde_json::Value::String(did.clone()));
+                }
+            }
+            // quota_count_ratio lives in its own DB column but YAML schema
+            // wants it under model_info. Emit only when != 1 (default) to
+            // match how a hand-written YAML would look.
+            if let Some(ratio) = r.quota_count_ratio {
+                if ratio != 1 {
+                    mi.insert(
+                        "quota_count_ratio".into(),
+                        serde_json::Value::Number(ratio.into()),
                     );
                 }
+            }
+            if !mi.is_empty() {
+                entry.as_object_mut().unwrap().insert(
+                    "model_info".into(),
+                    serde_json::Value::Object(mi),
+                );
+            }
+
+            // ── Behavior toggles. serde defaults are false, so emit only
+            // when true to keep YAML noise-free.
+            if r.serve_not_match {
+                entry.as_object_mut().unwrap().insert(
+                    "serve_not_match".into(),
+                    serde_json::Value::Bool(true),
+                );
+            }
+            if r.client_type_header.unwrap_or(false) {
+                entry.as_object_mut().unwrap().insert(
+                    "client_type_header".into(),
+                    serde_json::Value::Bool(true),
+                );
             }
 
             entry
@@ -1366,24 +1579,7 @@ async fn build_config_snapshot_value(pool: &PgPool) -> Result<serde_json::Value,
             default_plan = Some(r.name.clone());
         }
 
-        let window_limits: Vec<serde_json::Value> = r
-            .window_limits
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|item| {
-                        // Pass through the entry as-is. The schema is
-                        // multi-dimensional (compact array or verbose object
-                        // form — see boom_core::types::WindowLimit).
-                        if item.is_array() || item.is_object() {
-                            Some(item.clone())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let window_limits = normalize_window_limits(&r.window_limits);
 
         let schedule: Vec<serde_json::Value> = r
             .schedule
@@ -1402,8 +1598,11 @@ async fn build_config_snapshot_value(pool: &PgPool) -> Result<serde_json::Value,
                         if let Some(v) = obj.get("rpm_limit").and_then(|v| v.as_u64()) {
                             slot.insert("rpm_limit".into(), serde_json::Value::Number(v.into()));
                         }
-                        if let Some(wl) = obj.get("window_limits") {
-                            slot.insert("window_limits".into(), wl.clone());
+                        if let Some(raw_wl) = obj.get("window_limits") {
+                            let normalized = normalize_window_limits(raw_wl);
+                            if !normalized.is_empty() {
+                                slot.insert("window_limits".into(), serde_json::Value::Array(normalized));
+                            }
                         }
                         Some(serde_json::Value::Object(slot))
                     })

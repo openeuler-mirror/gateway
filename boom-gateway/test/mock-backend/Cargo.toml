@@ -1,0 +1,31 @@
+[package]
+name = "mock-backend"
+version = "0.1.0"
+edition = "2021"
+
+# Empty [workspace] table keeps this package OUT of the parent gateway workspace
+# so `cargo build --workspace` from /Users/icecream/code/atomgit/gateway doesn't
+# compile these test tools. Build explicitly: `cd boom-gateway/test/mock-backend
+# && cargo build --release`.
+[workspace]
+
+[[bin]]
+name = "mock-backend"
+path = "src/main.rs"
+
+[dependencies]
+axum = { version = "0.8", features = ["macros"] }
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rand = "0.8"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+futures = "0.3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"

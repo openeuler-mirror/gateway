@@ -64,6 +64,25 @@ CREATE TABLE IF NOT EXISTS boom_key_plan_assignment (
 "#
 }
 
+/// Idempotent ALTER for boom_key_plan_assignment: relax `plan_name` to NULL
+/// so the table can represent three distinct states:
+/// - **row absent**                → key was never explicitly assigned (follows default_plan at runtime)
+/// - **plan_name IS NULL**         → user explicitly chose "no plan" (does NOT follow default_plan)
+/// - **plan_name = 'some_name'**   → user explicitly assigned a plan
+///
+/// Without NULL support, "unassign" deletes the row, which is indistinguishable
+/// from "never configured" — both then fall back to default_plan, masking the
+/// user's intent. See CLAUDE.md §9 (single source of truth for assignment state).
+pub fn assignment_alter_ddl() -> &'static str {
+    r#"
+DO $$
+BEGIN
+    ALTER TABLE boom_key_plan_assignment ALTER COLUMN plan_name DROP NOT NULL;
+EXCEPTION WHEN OTHERS THEN NULL;
+END $$;
+"#
+}
+
 /// DDL for boom_team_plan_assignment table.
 pub fn team_assignment_ddl() -> &'static str {
     r#"

@@ -1,9 +1,10 @@
-use axum::extract::{Path, Query};
+use axum::extract::{Multipart, Path, Query};
 use axum::response::{IntoResponse, Response};
 use axum::Extension;
 use axum::Json;
+use boom_core::key_format::is_valid_prefix;
 use chrono::NaiveDateTime;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
 use sqlx::FromRow;
 use std::sync::Arc;
@@ -11,6 +12,81 @@ use uuid::Uuid;
 
 use crate::auth::{hash_token, AdminSession};
 use crate::state::DashboardState;
+
+/// Deserialize `Option<Option<T>>` so JSON `null` is distinguished from a
+/// missing field. Used for `plan_name` in key-assignment requests where the
+/// three states must round-trip through the API:
+///   - field absent       → `None`             (no-op for assign; "use default" for create)
+///   - `plan_name: null`  → `Some(None)`       (explicit "no plan" — does NOT fall back)
+///   - `plan_name: "x"`   → `Some(Some("x"))`  (explicit plan assignment)
+fn deserialize_some<'de, T, D>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: Deserializer<'de>,
+{
+    Deserialize::deserialize(deserializer).map(Some)
+}
+
+/// Maximum allowed length of the user-supplied `tag` string. Tags are free
+/// text (Unicode OK) but capped to keep cell rendering sane.
+const MAX_TAG_LEN: usize = 64;
+
+/// Generate a (raw_key, hashed_token, optional_prefix) triple for a new key.
+///
+/// The hash always covers the entire raw key (e.g. `sk-{prefix}-{secret}` or
+/// `sk-{secret}`), matching the /v1 authenticate path byte-for-byte. Prefix
+/// tamper detection is implicit — any change to the prefix portion changes
+/// the digest, so the DB lookup fails.
+///
+/// Callers must validate the prefix themselves and reject invalid values
+/// with a 400 — this helper silently drops an invalid prefix to keep the
+/// invariant "DB never stores an invalid prefix" at the validation layer.
+fn generate_key_material(requested_prefix: Option<&str>) -> (String, String, Option<String>) {
+    let secret = hex::encode(Uuid::new_v4().as_bytes());
+    match requested_prefix.filter(|p| is_valid_prefix(p)) {
+        Some(p) => {
+            let raw = format!("sk-{}-{}", p, secret);
+            let hashed = hash_token(&raw);
+            (raw, hashed, Some(p.to_string()))
+        }
+        None => {
+            let raw = format!("sk-{}", secret);
+            let hashed = hash_token(&raw);
+            (raw, hashed, None)
+        }
+    }
+}
+
+/// Validate the `key_prefix` and `tag` fields of a creation request.
+///
+/// Returns `Some(Response)` (a 400) when validation fails, otherwise `None`.
+/// Centralized here so the single-key, batch, and import paths all enforce
+/// the same rule — invalid prefixes get rejected rather than silently
+/// falling back to the legacy `sk-{secret}` form.
+fn validate_prefix_and_tag(req: &CreateKeyRequest) -> Option<Response> {
+    if let Some(ref p) = req.key_prefix {
+        if !p.is_empty() && !is_valid_prefix(p) {
+            return Some((
+                axum::http::StatusCode::BAD_REQUEST,
+                format!(
+                    "Invalid key_prefix '{}': must be 1-8 ASCII alphanumeric chars [a-zA-Z0-9]",
+                    p
+                ),
+            )
+                .into_response());
+        }
+    }
+    if let Some(ref tag) = req.tag {
+        if tag.chars().count() > MAX_TAG_LEN {
+            return Some((
+                axum::http::StatusCode::BAD_REQUEST,
+                format!("Invalid tag: length must be <= {} chars", MAX_TAG_LEN),
+            )
+                .into_response());
+        }
+    }
+    None
+}
 
 // ═══════════════════════════════════════════════════════════
 // Plan management (delegated to PlanStore)
@@ -116,6 +192,10 @@ struct KeyRow {
     token: String,
     key_name: Option<String>,
     key_alias: Option<String>,
+    #[sqlx(default)]
+    key_prefix: Option<String>,
+    #[sqlx(default)]
+    tag: Option<String>,
     user_id: Option<String>,
     team_id: Option<String>,
     /// litellm stores models as text[] in PostgreSQL.
@@ -139,6 +219,14 @@ pub struct ListKeysQuery {
     pub search: Option<String>,
     #[serde(default)]
     pub vip_only: Option<String>,
+    /// Filter by plan assignment.
+    ///   - unset            → no filter
+    ///   - "unassigned"     → keys with no DB row (follows default_plan)
+    ///   - "no_plan"        → keys explicitly configured to have no plan
+    ///   - "none"           → legacy alias for "unassigned"
+    ///   - any other string → keys whose effective plan_name matches exactly
+    #[serde(default)]
+    pub plan: Option<String>,
 }
 
 fn default_page() -> i64 {
@@ -172,7 +260,7 @@ pub async fn list_keys(
     // Fetch ALL keys from DB (no LIMIT/OFFSET) for global usage sorting.
     let rows: Vec<KeyRow> = if let Some(ref pattern) = search_pattern {
         match sqlx::query_as(
-            r#"SELECT token, key_name, key_alias, user_id, team_id, models,
+            r#"SELECT token, key_name, key_alias, key_prefix, tag, user_id, team_id, models,
                       blocked, rpm_limit, tpm_limit, max_budget,
                       budget_duration, expires, metadata, created_at
                FROM "boom_verification_token"
@@ -194,7 +282,7 @@ pub async fn list_keys(
         }
     } else {
         match sqlx::query_as(
-            r#"SELECT token, key_name, key_alias, user_id, team_id, models,
+            r#"SELECT token, key_name, key_alias, key_prefix, tag, user_id, team_id, models,
                       blocked, rpm_limit, tpm_limit, max_budget,
                       budget_duration, expires, metadata, created_at
                FROM "boom_verification_token""#,
@@ -224,13 +312,23 @@ pub async fn list_keys(
         .map(|r| {
             let token_prefix = format!("{}...", &r.token[..8.min(r.token.len())]);
             let (usage_count, usage_reset_secs) = all_usage.get(&r.token).copied().unwrap_or((0, 0));
-            // Effective plan: explicit assignment → default plan → null.
-            // get_plan_name only returns explicit assignments; we fall back to
-            // the configured default so the UI shows *what's actually applied*.
-            let plan_name = state
-                .plan_store
-                .get_plan_name(&r.token)
-                .or_else(|| state.plan_store.get_default_plan_name());
+            // Three-state plan assignment. The frontend distinguishes:
+            //   - "default"   → no DB row (follows default_plan at runtime)
+            //   - "no_plan"   → row with plan_name IS NULL (explicit opt-out)
+            //   - "plan"      → row with plan_name = "x"
+            let explicit = state.plan_store.get_plan_name_explicit(&r.token);
+            let plan_assignment_kind = match explicit {
+                None => "default",
+                Some(None) => "no_plan",
+                Some(Some(_)) => "plan",
+            };
+            // Effective plan name (what the runtime actually uses). Falls back
+            // to default_plan for None and Some(None)-without-default.
+            let plan_name = match &explicit {
+                Some(Some(n)) => Some(n.clone()),
+                None => state.plan_store.get_default_plan_name(),
+                Some(None) => None,
+            };
 
             // Aggregate current-window tokens & cost from limiter. We pick
             // the smallest window_secs per kind — that's the "tightest" current
@@ -284,6 +382,8 @@ pub async fn list_keys(
                 "token_hash": r.token,
                 "key_name": r.key_name,
                 "key_alias": r.key_alias,
+                "key_prefix": r.key_prefix,
+                "tag": r.tag,
                 "user_id": r.user_id,
                 "team_id": r.team_id,
                 "models": r.models,
@@ -302,6 +402,7 @@ pub async fn list_keys(
                 "usage_tokens": usage_tokens,
                 "usage_cost": usage_cost.to_string(),
                 "plan_name": plan_name,
+                "plan_assignment_kind": plan_assignment_kind,
             })
         })
         .collect();
@@ -322,6 +423,26 @@ pub async fn list_keys(
                 .unwrap_or(false)
         });
     }
+
+    // Filter by plan assignment. Three sentinels + name match:
+    //   - "unassigned" → no DB row (follows default_plan at runtime)
+    //   - "no_plan"    → explicit row with plan_name IS NULL
+    //   - "none"       → legacy alias for "unassigned"
+    //   - any other    → keys whose effective plan_name matches exactly
+    if let Some(ref plan_filter) = query.plan {
+        match plan_filter.as_str() {
+            "unassigned" | "none" => keys.retain(|k| {
+                k.get("plan_assignment_kind").and_then(|v| v.as_str()) == Some("default")
+            }),
+            "no_plan" => keys.retain(|k| {
+                k.get("plan_assignment_kind").and_then(|v| v.as_str()) == Some("no_plan")
+            }),
+            name => keys.retain(|k| {
+                k.get("plan_name").and_then(|v| v.as_str()) == Some(name)
+            }),
+        }
+    }
+
     let filtered_total = keys.len() as i64;
 
     // In-memory pagination.
@@ -342,11 +463,17 @@ pub async fn list_keys(
     .into_response()
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct CreateKeyRequest {
     pub key_alias: Option<String>,
     /// Legacy display name. Defaults to key_alias if not provided.
     pub key_name: Option<String>,
+    /// Optional key prefix shown in the raw key (e.g. `sk-prod-<secret>`).
+    /// Must match `[a-zA-Z0-9]{1,8}`; invalid values are rejected with 400.
+    pub key_prefix: Option<String>,
+    /// Optional user-supplied classification tag. Free text, ≤64 chars.
+    /// Not part of the raw key — purely a dashboard/display field.
+    pub tag: Option<String>,
     pub user_id: Option<String>,
     pub team_id: Option<String>,
     pub models: Option<Vec<String>>,
@@ -356,7 +483,12 @@ pub struct CreateKeyRequest {
     pub tpm_limit: Option<i64>,
     pub expires: Option<String>,
     pub metadata: Option<serde_json::Value>,
-    pub plan_name: Option<String>,
+    /// Plan assignment for the new key. Three states:
+    ///   - field absent (`None`)            → follow default_plan at runtime
+    ///   - `null`   (`Some(None)`)          → explicit "no plan" (no default fallback)
+    ///   - `"name"` (`Some(Some(name))`)    → assign to plan `name`
+    #[serde(default, deserialize_with = "deserialize_some")]
+    pub plan_name: Option<Option<String>>,
 }
 
 pub async fn create_key(
@@ -371,9 +503,17 @@ pub async fn create_key(
         }
     };
 
-    // 1. Generate raw key: sk- + 32 bytes random hex.
-    let raw_key = format!("sk-{}", hex::encode(Uuid::new_v4().as_bytes()));
-    let token_hash = hash_token(&raw_key);
+    // 0. Validate user-supplied prefix and tag. Reject instead of silently
+    //    falling back, so users learn the rule rather than getting mystery
+    //    legacy keys.
+    if let Some(resp) = validate_prefix_and_tag(&req) {
+        return resp;
+    }
+
+    // 1. Generate raw key + token hash + optional prefix metadata.
+    //    Prefixed keys hash only the secret portion; legacy keys hash the
+    //    whole raw_key so old DB rows remain matchable.
+    let (raw_key, token_hash, key_prefix) = generate_key_material(req.key_prefix.as_deref());
 
     // 1b. Check key_alias dedup (if provided).
     if let Some(ref alias) = req.key_alias {
@@ -408,14 +548,16 @@ pub async fn create_key(
     let key_name = req.key_name.or(req.key_alias.clone());
     let result = sqlx::query(
         r#"INSERT INTO "boom_verification_token"
-           (token, key_name, key_alias, user_id, team_id, models, spend, blocked,
+           (token, key_name, key_alias, key_prefix, tag, user_id, team_id, models, spend, blocked,
             rpm_limit, tpm_limit, max_budget, budget_duration, expires,
             metadata, created_at, updated_at)
-           VALUES ($1, $2, $3, $4, $5, $6, 0.0, false, $7, $8, $9, $10, $11, $12, NOW(), NOW())"#,
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0.0, false, $9, $10, $11, $12, $13, $14, NOW(), NOW())"#,
     )
     .bind(&token_hash)
     .bind(&key_name)
     .bind(&req.key_alias)
+    .bind(&key_prefix)
+    .bind(&req.tag)
     .bind(&req.user_id)
     .bind(&req.team_id)
     .bind(&models_list)
@@ -437,16 +579,34 @@ pub async fn create_key(
             .into_response();
     }
 
-    // 4. Optionally assign to plan (skip DB write if same as default).
-    if let Some(ref plan_name) = req.plan_name {
-        let is_default = state.plan_store.get_default_plan_name().as_deref() == Some(plan_name.as_str());
-        let result = if is_default {
-            state.plan_store.assign_key(&token_hash, plan_name)
-        } else {
-            state.plan_store.assign_key_db(db_pool, &token_hash, plan_name).await
-        };
-        if let Err(e) = result {
-            tracing::warn!("Key created but plan assignment failed: {}", e);
+    // 4. Plan assignment (3 states — see CreateKeyRequest::plan_name).
+    //    - None            → no row written (runtime follows default_plan)
+    //    - Some(None)      → row with plan_name IS NULL (no default fallback)
+    //    - Some(Some(name))→ row with plan_name = name
+    //    Skip DB write when the explicit assignment is the same as default_plan:
+    //    no row needed; default fallback already yields the right plan at runtime.
+    match req.plan_name {
+        None => {}
+        Some(None) => {
+            if let Err(e) = state
+                .plan_store
+                .assign_key_no_plan_db(db_pool, &token_hash)
+                .await
+            {
+                tracing::warn!("Key created but 'no plan' assignment failed: {}", e);
+            }
+        }
+        Some(Some(ref plan_name)) => {
+            let is_default = state.plan_store.get_default_plan_name().as_deref()
+                == Some(plan_name.as_str());
+            let result = if is_default {
+                state.plan_store.assign_key(&token_hash, plan_name)
+            } else {
+                state.plan_store.assign_key_db(db_pool, &token_hash, plan_name).await
+            };
+            if let Err(e) = result {
+                tracing::warn!("Key created but plan assignment failed: {}", e);
+            }
         }
     }
 
@@ -469,6 +629,9 @@ pub struct UpdateKeyRequest {
     pub budget_duration: Option<String>,
     pub rpm_limit: Option<i64>,
     pub tpm_limit: Option<i64>,
+    /// Optional user-supplied classification tag (≤64 chars). Empty string
+    /// clears the tag; null leaves it untouched (COALESCE semantics).
+    pub tag: Option<String>,
     pub expires: Option<String>,
     pub metadata: Option<serde_json::Value>,
 }
@@ -508,6 +671,18 @@ pub async fn update_key(
         }
     }
 
+    // Validate tag length if provided. Empty string is allowed (clears tag);
+    // null skips the update entirely.
+    if let Some(ref tag) = req.tag {
+        if tag.chars().count() > MAX_TAG_LEN {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                format!("Invalid tag: length must be <= {} chars", MAX_TAG_LEN),
+            )
+                .into_response();
+        }
+    }
+
     let models_list: Option<Vec<String>> = req.models.as_ref().map(|v| {
         if v.iter().any(|m| m == "all-team-models") {
             vec!["all-team-models".to_string()]
@@ -531,8 +706,9 @@ pub async fn update_key(
                budget_duration = COALESCE($7, budget_duration),
                rpm_limit = COALESCE($8, rpm_limit),
                tpm_limit = COALESCE($9, tpm_limit),
-               expires = COALESCE($10, expires),
-               metadata = COALESCE($11, metadata),
+               tag = COALESCE($10, tag),
+               expires = COALESCE($11, expires),
+               metadata = COALESCE($12, metadata),
                updated_at = NOW()
            WHERE token = $1"#,
     )
@@ -545,6 +721,7 @@ pub async fn update_key(
     .bind(&req.budget_duration)
     .bind(req.rpm_limit)
     .bind(req.tpm_limit)
+    .bind(&req.tag)
     .bind(expires)
     .bind(&req.metadata)
     .execute(db_pool)
@@ -642,6 +819,63 @@ pub async fn unblock_key(
     }
 }
 
+/// Hard-delete a key and every trace of it across the gateway's tables.
+///
+/// Order matters: clear rate-limit state and plan assignment BEFORE the
+/// token row, so a concurrent request that resolves the identity doesn't
+/// race against an in-flight limiter check and leave orphan counters. The
+/// cleanup helpers are owned by boom-limiter (`SlidingWindowLimiter` and
+/// `PlanStore`); `boom_verification_token` is the litellm-compatible row
+/// we already write to in `block_key` / `unblock_key`.
+///
+/// Cleanup failures are logged as warnings, not returned as errors — the
+/// user's intent is "delete this key", and a stale counter or dangling
+/// plan assignment is harmless once the token row is gone (no future
+/// request can resolve to a deleted token).
+pub async fn delete_key(
+    _session: AdminSession,
+    Extension(state): Extension<std::sync::Arc<DashboardState>>,
+    Path(token_hash): Path<String>,
+) -> Response {
+    let db_pool = match &state.db_pool {
+        Some(pool) => pool,
+        None => {
+            return Json(json!({"error": "Database not available"})).into_response();
+        }
+    };
+
+    if let Err(e) = state.limiter.clear_key_all(db_pool, &token_hash).await {
+        tracing::warn!(error = %e, "delete_key: clear_key_all failed (continuing)");
+    }
+    if let Err(e) = state.plan_store.unassign_key_db(db_pool, &token_hash).await {
+        tracing::warn!(error = %e, "delete_key: unassign_key_db failed (continuing)");
+    }
+
+    let result = sqlx::query(
+        r#"DELETE FROM "boom_verification_token" WHERE token = $1"#,
+    )
+    .bind(&token_hash)
+    .execute(db_pool)
+    .await;
+
+    match result {
+        Ok(r) if r.rows_affected() > 0 => Json(json!({"ok": true})).into_response(),
+        Ok(_) => (
+            axum::http::StatusCode::NOT_FOUND,
+            "Key not found",
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!("Dashboard delete_key failed: {}", e);
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal error",
+            )
+            .into_response()
+        }
+    }
+}
+
 // ═══════════════════════════════════════════════════════════
 // Assignment management
 // ═══════════════════════════════════════════════════════════
@@ -702,7 +936,12 @@ pub async fn list_assignments(
 #[derive(Debug, Deserialize)]
 pub struct AssignRequest {
     pub key_hash: String,
-    pub plan_name: String,
+    /// Three states (same semantics as CreateKeyRequest::plan_name):
+    ///   - field absent (`None`)            → no-op (preserved for legacy callers that always send a string)
+    ///   - `null`   (`Some(None)`)          → explicit "no plan" (no default fallback)
+    ///   - `"name"` (`Some(Some(name))`)    → assign to plan `name`
+    #[serde(default, deserialize_with = "deserialize_some")]
+    pub plan_name: Option<Option<String>>,
 }
 
 pub async fn assign_key(
@@ -710,22 +949,61 @@ pub async fn assign_key(
     Extension(state): Extension<std::sync::Arc<DashboardState>>,
     Json(req): Json<AssignRequest>,
 ) -> Response {
-    if let Some(ref pool) = state.db_pool {
-        match state.plan_store.assign_key_db(pool, &req.key_hash, &req.plan_name).await {
-            Ok(()) => {
-                let _ = state.admin_tx.send(crate::state::AdminCommand::ConfigChanged).await;
+    // For backward compat: callers that send a non-null plan_name route to
+    // assign_key_db. Sending null routes to assign_key_no_plan_db. Sending
+    // the field absent is a no-op (legacy callers always include it).
+    match req.plan_name {
+        Some(None) => {
+            if let Some(ref pool) = state.db_pool {
+                match state.plan_store.assign_key_no_plan_db(pool, &req.key_hash).await {
+                    Ok(()) => {
+                        let _ = state
+                            .admin_tx
+                            .send(crate::state::AdminCommand::ConfigChanged)
+                            .await;
+                        Json(json!({"ok": true})).into_response()
+                    }
+                    Err(e) => (axum::http::StatusCode::BAD_REQUEST, e).into_response(),
+                }
+            } else {
+                state.plan_store.assign_key_no_plan(&req.key_hash);
+                let _ = state
+                    .admin_tx
+                    .send(crate::state::AdminCommand::ConfigChanged)
+                    .await;
                 Json(json!({"ok": true})).into_response()
             }
-            Err(e) => (axum::http::StatusCode::BAD_REQUEST, e).into_response(),
         }
-    } else {
-        match state.plan_store.assign_key(&req.key_hash, &req.plan_name) {
-            Ok(()) => {
-                let _ = state.admin_tx.send(crate::state::AdminCommand::ConfigChanged).await;
-                Json(json!({"ok": true})).into_response()
+        Some(Some(ref name)) => {
+            if let Some(ref pool) = state.db_pool {
+                match state.plan_store.assign_key_db(pool, &req.key_hash, name).await {
+                    Ok(()) => {
+                        let _ = state
+                            .admin_tx
+                            .send(crate::state::AdminCommand::ConfigChanged)
+                            .await;
+                        Json(json!({"ok": true})).into_response()
+                    }
+                    Err(e) => (axum::http::StatusCode::BAD_REQUEST, e).into_response(),
+                }
+            } else {
+                match state.plan_store.assign_key(&req.key_hash, name) {
+                    Ok(()) => {
+                        let _ = state
+                            .admin_tx
+                            .send(crate::state::AdminCommand::ConfigChanged)
+                            .await;
+                        Json(json!({"ok": true})).into_response()
+                    }
+                    Err(e) => (axum::http::StatusCode::BAD_REQUEST, e).into_response(),
+                }
             }
-            Err(e) => (axum::http::StatusCode::BAD_REQUEST, e).into_response(),
         }
+        None => (
+            axum::http::StatusCode::BAD_REQUEST,
+            "plan_name is required (send null for explicit no-plan)",
+        )
+            .into_response(),
     }
 }
 
@@ -879,83 +1157,18 @@ pub async fn batch_create_keys(
     let mut skipped = Vec::new();
 
     for req in reqs {
-        // Dedup check on key_alias.
-        if let Some(ref alias) = req.key_alias {
-            let exists: bool = sqlx::query_scalar(
-                r#"SELECT EXISTS(SELECT 1 FROM "boom_verification_token" WHERE key_alias = $1)"#,
-            )
-            .bind(alias)
-            .fetch_one(db_pool)
-            .await
-            .unwrap_or(false);
-
-            if exists {
-                skipped.push(json!({
-                    "key_alias": alias,
-                    "reason": "duplicate",
-                }));
-                continue;
-            }
-        }
-
-        let raw_key = format!("sk-{}", hex::encode(Uuid::new_v4().as_bytes()));
-        let token_hash = hash_token(&raw_key);
-
-        let expires: Option<NaiveDateTime> = req
-            .expires
-            .as_deref()
-            .and_then(|s| NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").ok());
-
-        let models_list: Vec<String> = req.models.clone().unwrap_or_default();
-        let key_name = req.key_name.clone().or(req.key_alias.clone());
-
-        let result = sqlx::query(
-            r#"INSERT INTO "boom_verification_token"
-               (token, key_name, key_alias, user_id, team_id, models, spend, blocked,
-                rpm_limit, tpm_limit, max_budget, budget_duration, expires,
-                metadata, created_at, updated_at)
-               VALUES ($1, $2, $3, $4, $5, $6, 0.0, false, $7, $8, $9, $10, $11, $12, NOW(), NOW())"#,
-        )
-        .bind(&token_hash)
-        .bind(&key_name)
-        .bind(&req.key_alias)
-        .bind(&req.user_id)
-        .bind(&req.team_id)
-        .bind(&models_list)
-        .bind(req.rpm_limit)
-        .bind(req.tpm_limit)
-        .bind(req.max_budget)
-        .bind(&req.budget_duration)
-        .bind(expires)
-        .bind(req.metadata.as_ref().unwrap_or(&serde_json::json!({})))
-        .execute(db_pool)
-        .await;
-
-        match result {
-            Ok(_) => {
-                // Optionally assign to plan (skip DB write if same as default).
-                if let Some(ref plan_name) = req.plan_name {
-                    let is_default = state.plan_store.get_default_plan_name().as_deref() == Some(plan_name.as_str());
-                    let result = if is_default {
-                        state.plan_store.assign_key(&token_hash, plan_name)
-                    } else {
-                        state.plan_store.assign_key_db(db_pool, &token_hash, plan_name).await
-                    };
-                    if let Err(e) = result {
-                        tracing::warn!("Batch: key created but plan assignment failed: {}", e);
-                    }
-                }
+        match insert_single_key(&state, db_pool, req).await {
+            CreateOutcome::Created { key, token_hash, key_alias } => {
                 created.push(json!({
-                    "key": raw_key,
+                    "key": key,
                     "token_hash": token_hash,
-                    "key_alias": req.key_alias,
+                    "key_alias": key_alias,
                 }));
             }
-            Err(e) => {
-                tracing::error!("Dashboard batch_create_keys insert failed: {}", e);
+            CreateOutcome::Skipped { key_alias, reason } => {
                 skipped.push(json!({
-                    "key_alias": req.key_alias,
-                    "reason": "db_error",
+                    "key_alias": key_alias,
+                    "reason": reason,
                 }));
             }
         }
@@ -968,6 +1181,522 @@ pub async fn batch_create_keys(
         "skipped_count": skipped.len(),
     }))
     .into_response()
+}
+
+/// Outcome of inserting one key. Shared by [`batch_create_keys`] and
+/// [`import_keys`] so they report identical shapes.
+enum CreateOutcome {
+    Created {
+        key: String,
+        token_hash: String,
+        key_alias: Option<String>,
+    },
+    Skipped {
+        key_alias: Option<String>,
+        reason: &'static str,
+    },
+}
+
+/// Insert a single key from a [`CreateKeyRequest`]. Encapsulates alias dedup,
+/// generation, INSERT, and optional plan assignment so both the JSON-array
+/// batch endpoint and the file-import endpoint stay in lockstep.
+async fn insert_single_key(
+    state: &DashboardState,
+    db_pool: &sqlx::PgPool,
+    req: CreateKeyRequest,
+) -> CreateOutcome {
+    // Validate prefix and tag up front so batch/import paths reject bad
+    // rows with a precise reason rather than silently degrading.
+    if let Some(p) = req.key_prefix.as_ref() {
+        if !p.is_empty() && !is_valid_prefix(p) {
+            return CreateOutcome::Skipped {
+                key_alias: req.key_alias,
+                reason: "invalid_prefix",
+            };
+        }
+    }
+    if let Some(t) = req.tag.as_ref() {
+        if t.chars().count() > MAX_TAG_LEN {
+            return CreateOutcome::Skipped {
+                key_alias: req.key_alias,
+                reason: "invalid_tag",
+            };
+        }
+    }
+
+    // Dedup check on key_alias.
+    if let Some(ref alias) = req.key_alias {
+        let exists: bool = sqlx::query_scalar(
+            r#"SELECT EXISTS(SELECT 1 FROM "boom_verification_token" WHERE key_alias = $1)"#,
+        )
+        .bind(alias)
+        .fetch_one(db_pool)
+        .await
+        .unwrap_or(false);
+
+        if exists {
+            return CreateOutcome::Skipped {
+                key_alias: req.key_alias,
+                reason: "duplicate",
+            };
+        }
+    }
+
+    let (raw_key, token_hash, key_prefix) = generate_key_material(req.key_prefix.as_deref());
+
+    let expires: Option<NaiveDateTime> = req
+        .expires
+        .as_deref()
+        .and_then(|s| NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").ok());
+
+    let mut models_list: Vec<String> = req.models.clone().unwrap_or_default();
+    if models_list.iter().any(|m| m == "all-team-models") {
+        models_list = vec!["all-team-models".to_string()];
+    }
+    let key_name = req.key_name.clone().or(req.key_alias.clone());
+
+    let result = sqlx::query(
+        r#"INSERT INTO "boom_verification_token"
+           (token, key_name, key_alias, key_prefix, tag, user_id, team_id, models, spend, blocked,
+            rpm_limit, tpm_limit, max_budget, budget_duration, expires,
+            metadata, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0.0, false, $9, $10, $11, $12, $13, $14, NOW(), NOW())"#,
+    )
+    .bind(&token_hash)
+    .bind(&key_name)
+    .bind(&req.key_alias)
+    .bind(&key_prefix)
+    .bind(&req.tag)
+    .bind(&req.user_id)
+    .bind(&req.team_id)
+    .bind(&models_list)
+    .bind(req.rpm_limit)
+    .bind(req.tpm_limit)
+    .bind(req.max_budget)
+    .bind(&req.budget_duration)
+    .bind(expires)
+    .bind(req.metadata.as_ref().unwrap_or(&serde_json::json!({})))
+    .execute(db_pool)
+    .await;
+
+    match result {
+        Ok(_) => {
+            // Plan assignment — 3 states (see CreateKeyRequest::plan_name).
+            match req.plan_name {
+                None => {}
+                Some(None) => {
+                    if let Err(e) = state
+                        .plan_store
+                        .assign_key_no_plan_db(db_pool, &token_hash)
+                        .await
+                    {
+                        tracing::warn!("Key created but 'no plan' assignment failed: {}", e);
+                    }
+                }
+                Some(Some(ref plan_name)) => {
+                    let is_default = state.plan_store.get_default_plan_name().as_deref()
+                        == Some(plan_name.as_str());
+                    let result = if is_default {
+                        state.plan_store.assign_key(&token_hash, plan_name)
+                    } else {
+                        state.plan_store.assign_key_db(db_pool, &token_hash, plan_name).await
+                    };
+                    if let Err(e) = result {
+                        tracing::warn!("Key created but plan assignment failed: {}", e);
+                    }
+                }
+            }
+            CreateOutcome::Created {
+                key: raw_key,
+                token_hash,
+                key_alias: req.key_alias,
+            }
+        }
+        Err(e) => {
+            tracing::error!("Dashboard insert_single_key failed: {}", e);
+            CreateOutcome::Skipped {
+                key_alias: req.key_alias,
+                reason: "db_error",
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+// File-based batch import (JSONL or CSV)
+// ═══════════════════════════════════════════════════════════
+
+/// `multipart/form-data` field name expected from the dashboard uploader.
+const IMPORT_FIELD_NAME: &str = "file";
+
+/// Hard upper bound on a single uploaded file. Guards against accidental
+/// giant uploads (an admin pasting a 100MB log file by mistake) OOMing the
+/// handler — admin permission is already required, but defense in depth.
+/// 1 MiB comfortably covers 10k-line payloads at expected per-row sizes.
+const IMPORT_MAX_BYTES: usize = 1 * 1024 * 1024;
+
+/// Hard upper bound on parsed rows. Even below the byte cap, a malicious or
+/// buggy file with extreme per-line density shouldn't trigger unbounded
+/// inserts. 10k rows matches the byte cap at ~100 B/row headroom.
+const IMPORT_MAX_ROWS: usize = 10_000;
+
+pub async fn import_keys(
+    _session: AdminSession,
+    Extension(state): Extension<std::sync::Arc<DashboardState>>,
+    mut multipart: Multipart,
+) -> Response {
+    let db_pool = match &state.db_pool {
+        Some(pool) => pool,
+        None => {
+            return Json(json!({"error": "Database not available"})).into_response();
+        }
+    };
+
+    // 1. Pull the first file field from multipart.
+    let mut file_bytes: Option<Vec<u8>> = None;
+    let mut file_name: Option<String> = None;
+    while let Ok(Some(mut field)) = multipart.next_field().await {
+        if field.name() == Some(IMPORT_FIELD_NAME) {
+            file_name = field.file_name().map(|s| s.to_string());
+            // Cap field size by chunked reads — axum's Multipart has no
+            // per-field byte limit by default, so we enforce IMPORT_MAX_BYTES
+            // ourselves. Reject early once the limit is crossed.
+            let mut buf = Vec::new();
+            let mut exceeded = false;
+            while let Ok(Some(chunk)) = field.chunk().await {
+                if buf.len() + chunk.len() > IMPORT_MAX_BYTES {
+                    exceeded = true;
+                    break;
+                }
+                buf.extend_from_slice(&chunk);
+            }
+            if exceeded {
+                return Json(json!({
+                    "error": format!(
+                        "Upload exceeds the {} byte (1 MiB) limit",
+                        IMPORT_MAX_BYTES
+                    ),
+                }))
+                .into_response();
+            }
+            file_bytes = Some(buf);
+            break;
+        }
+        // Drain any other fields so the connection can be reused.
+        let _ = field.bytes().await;
+    }
+    let (bytes, name) = match (file_bytes, file_name) {
+        (Some(b), Some(n)) => (b, n),
+        _ => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                "Missing 'file' field in multipart upload",
+            )
+                .into_response();
+        }
+    };
+
+    // 2. Route by extension.
+    let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
+    let (parsed_reqs, parse_errors) = match ext.as_deref() {
+        Some("jsonl") => parse_jsonl(&bytes),
+        Some("csv") => parse_csv(&bytes),
+        _ => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                "Unsupported file extension; use .jsonl or .csv",
+            )
+                .into_response();
+        }
+    };
+
+    // 3. Cap parsed row count. Truncate rather than reject so the user can
+    //    still see parse_errors for the rows that did come through, with an
+    //    explicit flag in the response noting that the rest were dropped.
+    let truncated = parsed_reqs.len() > IMPORT_MAX_ROWS;
+    let parsed_total = parsed_reqs.len();
+    let inserted_count = if truncated { IMPORT_MAX_ROWS } else { parsed_total };
+    let parsed_reqs = if truncated {
+        parsed_reqs.into_iter().take(IMPORT_MAX_ROWS).collect::<Vec<_>>()
+    } else {
+        parsed_reqs
+    };
+
+    // 4. Insert each parsed request via the shared helper.
+    //
+    // The original CreateKeyRequest is cloned so we can hand it to the insert
+    // helper (which takes it by value) AND keep a copy to build the download
+    // attachment. The download mirrors the upload format with one extra
+    // `api_key` column appended, so the user can keep the same file as their
+    // roster without re-keying the rest of the fields by hand.
+    let mut created = Vec::new();
+    let mut created_with_req: Vec<(CreateKeyRequest, String)> = Vec::new();
+    let mut skipped = Vec::new();
+    for req in parsed_reqs {
+        match insert_single_key(&state, db_pool, req.clone()).await {
+            CreateOutcome::Created { key, token_hash, key_alias } => {
+                created_with_req.push((req, key.clone()));
+                created.push(json!({
+                    "key": key,
+                    "token_hash": token_hash,
+                    "key_alias": key_alias,
+                }));
+            }
+            CreateOutcome::Skipped { key_alias, reason } => {
+                skipped.push(json!({
+                    "key_alias": key_alias,
+                    "reason": reason,
+                }));
+            }
+        }
+    }
+
+    let download = build_key_download(&name, &created_with_req);
+
+    Json(json!({
+        "file_name": name,
+        "format": ext,
+        "parsed": parsed_total,
+        "inserted": inserted_count,
+        "truncated": truncated,
+        "max_rows": IMPORT_MAX_ROWS,
+        "parse_errors": parse_errors,
+        "created": created,
+        "skipped": skipped,
+        "created_count": created.len(),
+        "skipped_count": skipped.len(),
+        "download": download,
+    }))
+    .into_response()
+}
+
+/// Build a same-format download attachment that mirrors the upload and
+/// appends an `api_key` column/field for each successfully created key.
+///
+/// Rows that were skipped or failed to parse are NOT included — they have no
+/// key to ship back. The user still sees them in the on-screen tables, but
+/// the download is the canonical "what just got created" artifact.
+///
+/// CSV output keeps the same column order as `CsvKeyRow` (the parse schema)
+/// plus a trailing `api_key` column; `models` is rejoined with `|` to round-
+/// trip the in-cell separator. JSONL output adds an `api_key` field to each
+/// object, preserving the original field set.
+fn build_key_download(
+    original_name: &str,
+    created: &[(CreateKeyRequest, String)],
+) -> Value {
+    if created.is_empty() {
+        return Value::Null;
+    }
+
+    let stem = original_name.rsplit_once('.').map(|(s, _)| s).unwrap_or(original_name);
+    let ext = original_name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
+    let (ext, content, mime) = match ext.as_deref() {
+        Some("csv") => {
+            let mut buf = Vec::new();
+            {
+                let mut wtr = csv::Writer::from_writer(&mut buf);
+                // Header must mirror CsvKeyRow field order, plus api_key.
+                let _ = wtr.write_record(&[
+                    "key_alias", "key_name", "key_prefix", "tag",
+                    "user_id", "team_id", "models",
+                    "rpm_limit", "tpm_limit", "max_budget", "budget_duration",
+                    "expires", "metadata", "plan_name", "api_key",
+                ]);
+                for (req, key) in created {
+                    let _ = wtr.write_record(&[
+                        req.key_alias.clone().unwrap_or_default(),
+                        req.key_name.clone().unwrap_or_default(),
+                        req.key_prefix.clone().unwrap_or_default(),
+                        req.tag.clone().unwrap_or_default(),
+                        req.user_id.clone().unwrap_or_default(),
+                        req.team_id.clone().unwrap_or_default(),
+                        req.models.as_ref()
+                            .map(|v| v.join("|"))
+                            .unwrap_or_default(),
+                        req.rpm_limit.map(|v| v.to_string()).unwrap_or_default(),
+                        req.tpm_limit.map(|v| v.to_string()).unwrap_or_default(),
+                        req.max_budget.map(|v| v.to_string()).unwrap_or_default(),
+                        req.budget_duration.clone().unwrap_or_default(),
+                        req.expires.clone().unwrap_or_default(),
+                        req.metadata.as_ref()
+                            .map(|v| v.to_string())
+                            .unwrap_or_default(),
+                        req.plan_name
+                            .as_ref()
+                            .and_then(|inner| inner.as_deref())
+                            .unwrap_or_default()
+                            .to_string(),
+                        key.clone(),
+                    ]);
+                }
+                let _ = wtr.flush();
+            }
+            ("csv".to_string(), String::from_utf8_lossy(&buf).to_string(), "text/csv")
+        }
+        _ => {
+            // Default to JSONL — covers .jsonl uploads and the unlikely case
+            // of an unknown extension (we still want to give the user a file).
+            let mut lines = Vec::with_capacity(created.len());
+            for (req, key) in created {
+                // Serialize the original request, then merge `api_key` in.
+                // Round-tripping via Value preserves field order and avoids
+                // hand-listing every field here.
+                let mut obj = serde_json::to_value(req).unwrap_or_else(|_| json!({}));
+                if let Some(map) = obj.as_object_mut() {
+                    map.insert("api_key".to_string(), Value::String(key.clone()));
+                }
+                lines.push(serde_json::to_string(&obj).unwrap_or_default());
+            }
+            let content = lines.join("\n");
+            ("jsonl".to_string(), content, "application/x-ndjson")
+        }
+    };
+
+    json!({
+        "filename": format!("{}-with-keys.{}", stem, ext),
+        "content": content,
+        "mime": mime,
+        "rows": created.len(),
+    })
+}
+
+/// Parse a JSONL file into requests plus per-line errors.
+///
+/// Each non-empty line is one JSON object matching `CreateKeyRequest`.
+/// Blank lines are skipped silently. Lines that fail JSON parsing or fail
+/// required-field checks (`key_alias` is the only soft-required field,
+/// since blank alias rows would otherwise be unidentifiable in the UI)
+/// are reported with 1-based line numbers.
+fn parse_jsonl(bytes: &[u8]) -> (Vec<CreateKeyRequest>, Vec<Value>) {
+    let text = match std::str::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(_) => {
+            return (
+                vec![],
+                vec![json!({
+                    "line": 0,
+                    "reason": "file is not valid UTF-8",
+                })],
+            );
+        }
+    };
+
+    let mut reqs = Vec::new();
+    let mut errors = Vec::new();
+    for (idx, raw_line) in text.lines().enumerate() {
+        let line_no = idx + 1;
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<CreateKeyRequest>(trimmed) {
+            Ok(req) => reqs.push(req),
+            Err(e) => {
+                errors.push(json!({
+                    "line": line_no,
+                    "reason": format!("invalid JSON: {}", e),
+                }));
+            }
+        }
+    }
+    (reqs, errors)
+}
+
+/// CSV row schema. Fields map 1:1 onto [`CreateKeyRequest`].
+///
+/// `models` uses `|` (pipe) as in-cell separator so Excel users don't have
+/// to fight quoted commas. `metadata` is a single JSON object string.
+/// Empty cells become `None`.
+#[derive(Debug, Deserialize)]
+struct CsvKeyRow {
+    key_alias: Option<String>,
+    key_name: Option<String>,
+    key_prefix: Option<String>,
+    tag: Option<String>,
+    user_id: Option<String>,
+    team_id: Option<String>,
+    models: Option<String>,
+    rpm_limit: Option<i64>,
+    tpm_limit: Option<i64>,
+    max_budget: Option<f64>,
+    budget_duration: Option<String>,
+    expires: Option<String>,
+    metadata: Option<String>,
+    plan_name: Option<String>,
+}
+
+fn parse_csv(bytes: &[u8]) -> (Vec<CreateKeyRequest>, Vec<Value>) {
+    let mut rdr = csv::Reader::from_reader(bytes);
+
+    let mut reqs = Vec::new();
+    let mut errors = Vec::new();
+    for (idx, record) in rdr.deserialize::<CsvKeyRow>().enumerate() {
+        let line_no = idx + 2; // 1-based header + 1-based data offset
+        let row = match record {
+            Ok(r) => r,
+            Err(e) => {
+                errors.push(json!({
+                    "line": line_no,
+                    "reason": format!("CSV parse error: {}", e),
+                }));
+                continue;
+            }
+        };
+
+        // Split `models` on `|`, dropping empty fragments.
+        let models = row
+            .models
+            .map(|s| {
+                s.split('|')
+                    .map(|x| x.trim().to_string())
+                    .filter(|x| !x.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|v| !v.is_empty());
+
+        // Parse `metadata` JSON string → Value. Bad JSON leaves the field as
+        // an error rather than silently dropping it.
+        let metadata = match row.metadata.as_deref() {
+            None => None,
+            Some("") => None,
+            Some(s) => match serde_json::from_str::<serde_json::Value>(s) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    errors.push(json!({
+                        "line": line_no,
+                        "reason": format!("metadata is not valid JSON: {}", e),
+                    }));
+                    continue;
+                }
+            },
+        };
+
+        reqs.push(CreateKeyRequest {
+            key_alias: row.key_alias.filter(|s| !s.is_empty()),
+            key_name: row.key_name.filter(|s| !s.is_empty()),
+            key_prefix: row.key_prefix.filter(|s| !s.is_empty()),
+            tag: row.tag.filter(|s| !s.is_empty()),
+            user_id: row.user_id.filter(|s| !s.is_empty()),
+            team_id: row.team_id.filter(|s| !s.is_empty()),
+            models,
+            max_budget: row.max_budget,
+            budget_duration: row.budget_duration.filter(|s| !s.is_empty()),
+            rpm_limit: row.rpm_limit,
+            tpm_limit: row.tpm_limit,
+            expires: row.expires.filter(|s| !s.is_empty()),
+            metadata,
+            // CSV is a flat-string format — can't carry the three-state
+            // Option<Option<String>>. Non-empty string → Some(Some(name));
+            // empty/missing → None (use default at runtime). "Explicit no-plan"
+            // cannot be expressed in CSV; use JSONL import/export instead.
+            plan_name: row
+                .plan_name
+                .filter(|s| !s.is_empty())
+                .map(|s| Some(s)),
+        });
+    }
+    (reqs, errors)
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -1009,6 +1738,12 @@ pub struct CreateDeploymentRequest {
     /// Attach `X-BooM-Client-Type` header to outgoing requests (default false).
     #[serde(default)]
     pub client_type_header: bool,
+    /// When true, this deployment also serves as catch-all for unmatched model names.
+    #[serde(default)]
+    pub serve_not_match: bool,
+    /// Cost metadata (input/cached/output cost per million tokens).
+    #[serde(default)]
+    pub model_info: Option<serde_json::Value>,
 }
 
 fn default_timeout() -> i64 {
@@ -1053,7 +1788,7 @@ pub async fn list_models(
                     (v * one_million).to_string()
                 }
             };
-            json!({
+            let mut v = json!({
                 "id": r.id,
                 "model_name": r.model_name,
                 "litellm_model": r.litellm_model,
@@ -1062,9 +1797,12 @@ pub async fn list_models(
                 "api_base": r.api_base,
                 "api_version": r.api_version,
                 "aws_region_name": r.aws_region_name,
+                "aws_access_key_id": r.aws_access_key_id,
+                "aws_secret_access_key": r.aws_secret_access_key,
                 "rpm": r.rpm,
                 "tpm": r.tpm,
                 "timeout": r.timeout,
+                "headers": r.headers,
                 "temperature": r.temperature,
                 "max_tokens": r.max_tokens,
                 "enabled": r.enabled.unwrap_or(true),
@@ -1074,6 +1812,9 @@ pub async fn list_models(
                 "quota_count_ratio": r.quota_count_ratio.unwrap_or(1),
                 "max_inflight_queue_len": r.max_inflight_queue_len,
                 "max_context_len": r.max_context_len,
+                "client_type_header": r.client_type_header.unwrap_or(false),
+                "serve_not_match": r.serve_not_match,
+                "model_info": r.model_info,
                 "cost_per_million": {
                     "input": per_million(rate.input_cost_per_token),
                     "cached_input": per_million(rate.cached_input_cost_per_token),
@@ -1081,7 +1822,22 @@ pub async fn list_models(
                 },
                 "created_at": r.created_at.map(|d| d.to_string()),
                 "updated_at": r.updated_at.map(|d| d.to_string()),
-            })
+            });
+            // Mask long-lived credentials at the boundary. The edit form
+            // detects "****" and clears the input so COALESCE on update
+            // preserves the stored value when the user leaves it empty.
+            // headers values are NOT masked here — scrubbing them would
+            // break edits (update_db writes headers verbatim, not COALESCE).
+            if let Some(obj) = v.as_object_mut() {
+                for k in ["api_key", "aws_access_key_id", "aws_secret_access_key"] {
+                    if let Some(val) = obj.get_mut(k) {
+                        if !val.is_null() {
+                            *val = Value::String("****".to_string());
+                        }
+                    }
+                }
+            }
+            v
         })
         .collect();
 
@@ -2488,6 +3244,114 @@ pub async fn reload_config(
 }
 
 // ═══════════════════════════════════════════════════════════
+// Config Page (read full config + surgical section update)
+// ═══════════════════════════════════════════════════════════
+
+/// GET /admin/config — return the live in-memory config as JSON.
+/// Sensitive fields (`master_key`, `database_url`, `api_key`, `aws_*_key`)
+/// are masked to null by boom-main before serialization.
+pub async fn get_config(
+    _session: AdminSession,
+    Extension(state): Extension<Arc<DashboardState>>,
+) -> Response {
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    if state
+        .admin_tx
+        .send(crate::state::AdminCommand::GetConfig { reply: reply_tx })
+        .await
+        .is_err()
+    {
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "Admin command handler unavailable",
+        )
+            .into_response();
+    }
+    match reply_rx.await {
+        Ok(Ok(value)) => Json(value).into_response(),
+        Ok(Err(msg)) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, msg).into_response(),
+        Err(_) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "Admin command handler dropped reply",
+        )
+            .into_response(),
+    }
+}
+
+/// GET /admin/config/schema — return the field manifest (declarative UI schema).
+/// Transparent passthrough: boom-main serializes `boom_config::manifest::*`
+/// and forwards. See CLAUDE.md §9.
+pub async fn get_config_schema(
+    _session: AdminSession,
+    Extension(state): Extension<Arc<DashboardState>>,
+) -> Response {
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    if state
+        .admin_tx
+        .send(crate::state::AdminCommand::GetConfigSchema { reply: reply_tx })
+        .await
+        .is_err()
+    {
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "Admin command handler unavailable",
+        )
+            .into_response();
+    }
+    match reply_rx.await {
+        Ok(Ok(value)) => Json(value).into_response(),
+        Ok(Err(msg)) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, msg).into_response(),
+        Err(_) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "Admin command handler dropped reply",
+        )
+            .into_response(),
+    }
+}
+
+/// PUT /admin/config — surgical section update.
+/// Body: `{ "path": "dotted.path", "value": <json value> }`.
+/// Triggers reload after writing.
+#[derive(Debug, serde::Deserialize)]
+pub struct UpdateConfigBody {
+    pub path: String,
+    pub value: serde_json::Value,
+}
+
+pub async fn update_config(
+    _session: AdminSession,
+    Extension(state): Extension<Arc<DashboardState>>,
+    body: axum::Json<UpdateConfigBody>,
+) -> Response {
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    if state
+        .admin_tx
+        .send(crate::state::AdminCommand::UpdateConfigSection {
+            path: body.path.clone(),
+            value: body.value.clone(),
+            reply: reply_tx,
+        })
+        .await
+        .is_err()
+    {
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "Admin command handler unavailable",
+        )
+            .into_response();
+    }
+    match reply_rx.await {
+        Ok(Ok(msg)) => Json(json!({"ok": true, "message": msg})).into_response(),
+        Ok(Err(msg)) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, msg).into_response(),
+        Err(_) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "Admin command handler dropped reply",
+        )
+            .into_response(),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
 // Prompt Log Controls
 // ═══════════════════════════════════════════════════════════
 
@@ -3697,12 +4561,31 @@ pub async fn quota_reset_team_windows(
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_pagination;
+    use super::{normalize_pagination, CreateKeyRequest};
 
     #[test]
     fn normalize_pagination_clamps_invalid_values() {
         assert_eq!(normalize_pagination(0, 0), (1, 1));
         assert_eq!(normalize_pagination(-3, -20), (1, 1));
         assert_eq!(normalize_pagination(2, 5000), (2, 1000));
+    }
+
+    /// Lock in the three-state JSON semantics of `CreateKeyRequest::plan_name`:
+    ///   - field absent      → None             (use default_plan at runtime)
+    ///   - `plan_name: null`  → Some(None)       (explicit "no plan")
+    ///   - `plan_name: "x"`   → Some(Some("x"))  (assign to plan "x")
+    /// Regression guard: if the deserialize_some helper breaks, these will fail.
+    #[test]
+    fn create_key_request_plan_name_three_state_deserialization() {
+        let absent: CreateKeyRequest = serde_json::from_str(r#"{"key_alias":"a"}"#).unwrap();
+        assert_eq!(absent.plan_name, None);
+
+        let null: CreateKeyRequest =
+            serde_json::from_str(r#"{"key_alias":"a","plan_name":null}"#).unwrap();
+        assert_eq!(null.plan_name, Some(None));
+
+        let named: CreateKeyRequest =
+            serde_json::from_str(r#"{"key_alias":"a","plan_name":"default"}"#).unwrap();
+        assert_eq!(named.plan_name, Some(Some("default".to_string())));
     }
 }

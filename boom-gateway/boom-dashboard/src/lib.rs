@@ -78,8 +78,12 @@ pub fn build_router<S: Clone + Send + Sync + 'static>(state: DashboardState) -> 
             post(handlers_admin::batch_create_keys),
         )
         .route(
+            "/dashboard/api/admin/keys/import",
+            post(handlers_admin::import_keys),
+        )
+        .route(
             "/dashboard/api/admin/keys/{token_hash}",
-            put(handlers_admin::update_key),
+            put(handlers_admin::update_key).delete(handlers_admin::delete_key),
         )
         .route(
             "/dashboard/api/admin/keys/{token_hash}/block",
@@ -247,6 +251,17 @@ pub fn build_router<S: Clone + Send + Sync + 'static>(state: DashboardState) -> 
         .route(
             "/dashboard/api/admin/config/reload",
             post(handlers_admin::reload_config),
+        )
+        // Admin — Config page (read full config + surgical section update).
+        .route(
+            "/dashboard/api/admin/config",
+            get(handlers_admin::get_config).put(handlers_admin::update_config),
+        )
+        // Admin — Config field manifest (declarative UI schema).
+        // See CLAUDE.md §9.
+        .route(
+            "/dashboard/api/admin/config/schema",
+            get(handlers_admin::get_config_schema),
         )
         // SPA fallback — must be last.
         .route("/dashboard/{*path}", get(handlers_static::spa_fallback))

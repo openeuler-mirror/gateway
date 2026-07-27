@@ -237,7 +237,11 @@ fn parse_hm(s: &str) -> Option<u32> {
 #[derive(Debug)]
 pub struct PlanStore {
     plans: DashMap<String, RateLimitPlan>,
-    key_assignments: DashMap<String, String>,
+    /// key_hash → explicit plan choice. Outer Option:
+    /// - `None`              → key has no assignment row (follows default_plan at runtime)
+    /// - `Some(None)`        → user explicitly chose "no plan" (does NOT follow default)
+    /// - `Some(Some(name))`  → user explicitly assigned plan `name`
+    key_assignments: DashMap<String, Option<String>>,
     team_assignments: DashMap<String, String>,
     key_concurrency_counters: DashMap<String, Arc<AtomicU32>>,
     team_concurrency_counters: DashMap<String, Arc<AtomicU32>>,
@@ -300,10 +304,16 @@ impl PlanStore {
         self.plans.get(&name).map(|r| r.value().clone())
     }
 
-    /// Resolve the plan assigned to a key.
+    /// Resolve the **explicitly assigned** plan for a key.
+    ///
+    /// Returns `Some(plan)` only when the key has an explicit assignment *and*
+    /// that assignment names a non-null plan that still exists. Returns
+    /// `None` for both "no row" and "explicit no-plan" — callers that need to
+    /// distinguish those (e.g. to decide whether to fall back to default_plan)
+    /// must call `get_plan_name_explicit` first.
     pub fn resolve_plan(&self, key_hash: &str) -> Option<RateLimitPlan> {
-        let plan_name = self.key_assignments.get(key_hash)?;
-        let plan = self.plans.get(plan_name.value())?;
+        let plan_name = self.key_assignments.get(key_hash)?.clone()?;
+        let plan = self.plans.get(&plan_name)?;
         Some(plan.value().clone())
     }
 
@@ -318,9 +328,29 @@ impl PlanStore {
         self.get_default_team_plan()
     }
 
-    /// Get the plan name assigned to a key (for display purposes).
+    /// Get the **explicit** plan choice for a key (does NOT fold in default_plan).
+    ///
+    /// Returns a nested Option to distinguish three states:
+    /// - `None`              → key has no assignment row (follows default_plan)
+    /// - `Some(None)`        → user explicitly chose "no plan" (does NOT follow default)
+    /// - `Some(Some(name))`  → user explicitly assigned plan `name`
+    ///
+    /// Callers that want the *effective* plan (with default fallback) should
+    /// use `resolve_plan` / `get_default_plan` themselves.
+    pub fn get_plan_name_explicit(&self, key_hash: &str) -> Option<Option<String>> {
+        self.key_assignments
+            .get(key_hash)
+            .map(|n| n.value().clone())
+    }
+
+    /// Back-comat shim: returns the explicit plan name when the user assigned
+    /// one, otherwise None. Loses the "explicit no-plan" distinction — prefer
+    /// `get_plan_name_explicit` for new code.
     pub fn get_plan_name(&self, key_hash: &str) -> Option<String> {
-        self.key_assignments.get(key_hash).map(|n| n.value().clone())
+        match self.get_plan_name_explicit(key_hash) {
+            Some(Some(name)) => Some(name),
+            _ => None,
+        }
     }
 
     /// Get the plan name assigned to a team (for display purposes).
@@ -381,10 +411,13 @@ impl PlanStore {
 
     /// Delete a plan and remove all key/team assignments referencing it.
     /// In-flight concurrency counters are untouched — they drain naturally
-    /// as guards are dropped.
+    /// as guards are dropped. Explicit "no plan" assignments (Some(None)) are
+    /// preserved — they don't reference any plan name.
     pub fn delete_plan(&self, name: &str) -> bool {
-        self.key_assignments
-            .retain(|_, plan_name| plan_name != name);
+        self.key_assignments.retain(|_, explicit| match explicit {
+            None => true,
+            Some(p) => p != name,
+        });
         self.team_assignments
             .retain(|_, plan_name| plan_name != name);
         self.plans.remove(name).is_some()
@@ -409,15 +442,24 @@ impl PlanStore {
             ));
         }
         self.key_assignments
-            .insert(key_hash.to_string(), plan_name.to_string());
+            .insert(key_hash.to_string(), Some(plan_name.to_string()));
         Ok(())
+    }
+
+    /// Mark a key as explicitly having no plan. Distinct from `unassign_key`
+    /// (which removes the row entirely): this writes `Some(None)` so the key
+    /// does NOT fall back to default_plan at runtime. The user has actively
+    /// opted out of plan-based limits.
+    pub fn assign_key_no_plan(&self, key_hash: &str) {
+        self.key_assignments
+            .insert(key_hash.to_string(), None);
     }
 
     pub fn unassign_key(&self, key_hash: &str) -> bool {
         self.key_assignments.remove(key_hash).is_some()
     }
 
-    pub fn list_assignments(&self) -> Vec<(String, String)> {
+    pub fn list_assignments(&self) -> Vec<(String, Option<String>)> {
         self.key_assignments
             .iter()
             .map(|r| (r.key().clone(), r.value().clone()))
@@ -475,7 +517,9 @@ impl PlanStore {
     // ── Persistence helpers ───────────────────────────────────
 
     /// Snapshot all key→plan assignments for DB persistence.
-    pub fn snapshot_assignments(&self) -> Vec<(String, String)> {
+    /// Returns the explicit choice (outer Option) per key — callers writing
+    /// to DB must handle `None` (write SQL NULL) distinctly from missing rows.
+    pub fn snapshot_assignments(&self) -> Vec<(String, Option<String>)> {
         self.key_assignments
             .iter()
             .map(|r| (r.key().clone(), r.value().clone()))
@@ -492,9 +536,11 @@ impl PlanStore {
 
     /// Restore a single key→plan assignment from DB into memory.
     /// Called at startup. Does NOT validate plan existence (plan may be loaded later).
-    pub fn restore_assignment(&self, key_hash: &str, plan_name: &str) {
+    /// `plan_name = None` means the user explicitly chose "no plan" — record
+    /// it as `Some(None)` so runtime does NOT fall back to default_plan.
+    pub fn restore_assignment(&self, key_hash: &str, plan_name: Option<&str>) {
         self.key_assignments
-            .insert(key_hash.to_string(), plan_name.to_string());
+            .insert(key_hash.to_string(), plan_name.map(|s| s.to_string()));
     }
 
     /// Restore a single team→plan assignment from DB into memory.
@@ -525,10 +571,15 @@ impl PlanStore {
     }
 
     /// Remove assignments pointing to plans that no longer exist.
-    /// Call after reloading plans to clean up orphaned entries.
+    /// Call after reloading plans to clean up orphaned entries. Explicit
+    /// "no plan" assignments (Some(None)) are preserved — the user opted out
+    /// of plan-based limits and that intent survives reloads.
     pub fn cleanup_assignments(&self) {
         self.key_assignments
-            .retain(|_, plan_name| self.plans.contains_key(plan_name));
+            .retain(|_, explicit| match explicit {
+                None => true,                  // explicit "no plan" — keep
+                Some(name) => self.plans.contains_key(name),
+            });
         self.team_assignments
             .retain(|_, plan_name| self.plans.contains_key(plan_name));
     }
@@ -694,7 +745,7 @@ impl PlanStore {
 
     /// Restore key→plan assignments from DB.
     pub async fn restore_assignments_from_db(&self, pool: &sqlx::PgPool) {
-        match sqlx::query_as::<_, (String, String)>(
+        match sqlx::query_as::<_, (String, Option<String>)>(
             r#"SELECT key_hash, plan_name FROM boom_key_plan_assignment"#,
         )
         .fetch_all(pool)
@@ -703,7 +754,7 @@ impl PlanStore {
             Ok(rows) => {
                 let count = rows.len();
                 for (key_hash, plan_name) in rows {
-                    self.restore_assignment(&key_hash, &plan_name);
+                    self.restore_assignment(&key_hash, plan_name.as_deref());
                 }
                 tracing::info!("Restored {} key→plan assignment(s) from DB", count);
             }
@@ -849,6 +900,45 @@ impl PlanStore {
 
         // DB succeeded — now safe to update memory.
         self.assign_key(key_hash, plan_name)?;
+        Ok(())
+    }
+
+    /// Mark a key as explicitly having no plan (DB + memory). Distinct from
+    /// `unassign_key_db`: this writes a row with `plan_name IS NULL` so the
+    /// runtime knows the user actively opted out of plan-based limits, and
+    /// must NOT fall back to default_plan.
+    pub async fn assign_key_no_plan_db(
+        &self,
+        pool: &sqlx::PgPool,
+        key_hash: &str,
+    ) -> Result<(), String> {
+        let updated = sqlx::query(
+            r#"UPDATE boom_key_plan_assignment SET plan_name = NULL WHERE key_hash = $1"#,
+        )
+        .bind(key_hash)
+        .execute(pool)
+        .await
+        .map_err(|e| format!("DB error: {}", e))?;
+        if updated.rows_affected() == 0 {
+            if let Err(_) = sqlx::query(
+                r#"INSERT INTO boom_key_plan_assignment (key_hash, plan_name, assigned_at)
+                   VALUES ($1, NULL, NOW())"#,
+            )
+            .bind(key_hash)
+            .execute(pool)
+            .await
+            {
+                sqlx::query(
+                    r#"UPDATE boom_key_plan_assignment SET plan_name = NULL WHERE key_hash = $1"#,
+                )
+                .bind(key_hash)
+                .execute(pool)
+                .await
+                .map_err(|e| format!("DB error: {}", e))?;
+            }
+        }
+
+        self.assign_key_no_plan(key_hash);
         Ok(())
     }
 

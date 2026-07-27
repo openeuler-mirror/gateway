@@ -79,7 +79,7 @@ impl DbAuthenticator {
         // 3. Query database
         tracing::debug!("Token cache miss, querying DB: {}", &hashed[..8]);
         let result = sqlx::query_as::<_, VerificationToken>(
-            r#"SELECT token, key_name, key_alias, spend, expires, models,
+            r#"SELECT token, key_name, key_alias, key_prefix, tag, spend, expires, models,
                       aliases, config, user_id, team_id,
                       max_parallel_requests, metadata, blocked,
                       tpm_limit, rpm_limit, max_budget, budget_duration,
@@ -176,7 +176,11 @@ impl Authenticator for DbAuthenticator {
             });
         }
 
-        // 2. Hash the key — all keys are stored as SHA-256 hash in DB.
+        // 2. Hash the entire raw key. Prefix (if any) participates in the hash,
+        //    so any tampering with the prefix portion changes the digest and the
+        //    DB lookup naturally fails — no separate prefix-string check needed.
+        //    This matches litellm's `hash_token` byte-for-byte, so legacy rows
+        //    (including litellm-generated keys with embedded `-`) keep working.
         let hashed = Self::hash_token(raw_key);
 
         // 3. Look up in cache / DB
@@ -297,5 +301,47 @@ impl KeyAliasLookup for DbAuthenticator {
                 HashMap::new()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The hash input is always the entire raw key, byte-for-byte. This is the
+    /// litellm-compatible contract — if it ever breaks, every existing DB row
+    /// (boom-issued keys, litellm-issued keys, anything with embedded `-`)
+    /// stops matching.
+    #[test]
+    fn hash_covers_entire_raw_key() {
+        let raw = "sk-deadbeefdeadbeefdeadbeefdeadbeef";
+        let digest = DbAuthenticator::hash_token(raw);
+        let mut h = Sha256::new();
+        h.update(raw.as_bytes());
+        let expected = hex::encode(h.finalize());
+        assert_eq!(digest, expected);
+    }
+
+    /// The prefix portion participates in the hash — that's what makes prefix
+    /// tamper detection implicit. Flip one character of the prefix and the
+    /// digest must change.
+    #[test]
+    fn prefix_participates_in_hash() {
+        let a = "sk-prod-deadbeefdeadbeefdeadbeefdeadbeef";
+        let b = "sk-test-deadbeefdeadbeefdeadbeefdeadbeef";
+        assert_ne!(DbAuthenticator::hash_token(a), DbAuthenticator::hash_token(b));
+    }
+
+    /// A litellm-issued key with an embedded `-` (e.g. token_urlsafe output)
+    /// must hash identically to litellm's own hash_token. This is the
+    /// regression that motivated switching away from raw_key shape parsing.
+    #[test]
+    fn litellm_style_key_with_dash_hashes_as_whole_string() {
+        let raw = "sk-a-beEoPxxx";
+        let digest = DbAuthenticator::hash_token(raw);
+        let mut h = Sha256::new();
+        h.update(raw.as_bytes());
+        let expected = hex::encode(h.finalize());
+        assert_eq!(digest, expected);
     }
 }

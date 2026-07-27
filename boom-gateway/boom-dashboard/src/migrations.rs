@@ -77,6 +77,18 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
     )
     .execute(&mut *conn)
     .await;
+    // Add serve_not_match column (no-op if already present).
+    let _ = sqlx::query(
+        r#"ALTER TABLE boom_model_deployment ADD COLUMN IF NOT EXISTS serve_not_match BOOLEAN NOT NULL DEFAULT false"#,
+    )
+    .execute(&mut *conn)
+    .await;
+    // Add model_info column as JSONB for cost metadata (no-op if already present).
+    let _ = sqlx::query(
+        r#"ALTER TABLE boom_model_deployment ADD COLUMN IF NOT EXISTS model_info JSONB"#,
+    )
+    .execute(&mut *conn)
+    .await;
     tracing::info!("Migration 2/7: done");
     tracing::info!("Migration 3/7: alias...");
     run_ddl_on_conn(&mut conn, boom_routing::migrations::alias_ddl()).await?;
@@ -88,6 +100,9 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
     tracing::info!("Migration 4/13: done");
     tracing::info!("Migration 5/13: assignment...");
     run_ddl_on_conn(&mut conn, boom_limiter::migrations::assignment_ddl()).await?;
+    // Idempotent: relax plan_name to NULL so "explicit no-plan" is distinct
+    // from "never configured". See assignment_alter_ddl doc.
+    run_ddl_on_conn(&mut conn, boom_limiter::migrations::assignment_alter_ddl()).await?;
     tracing::info!("Migration 5/13: done");
     tracing::info!("Migration 6/13: plan...");
     run_ddl_on_conn(&mut conn, boom_limiter::migrations::plan_ddl()).await?;
@@ -153,6 +168,20 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
     // 6. Verification token table (boom-auth).
     tracing::info!("Migration 9/9: boom_verification_token...");
     run_ddl_on_conn(&mut conn, verification_token_ddl()).await?;
+    // Idempotent ALTER: add key_prefix column for prefixed-key feature
+    // (no-op if already present). New tables created above already include it.
+    let _ = sqlx::query(
+        r#"ALTER TABLE "boom_verification_token" ADD COLUMN IF NOT EXISTS key_prefix TEXT"#,
+    )
+    .execute(&mut *conn)
+    .await;
+    // Idempotent ALTER: add tag column for user-supplied key classification
+    // (no-op if already present). Forward-compatible — old rows have NULL.
+    let _ = sqlx::query(
+        r#"ALTER TABLE "boom_verification_token" ADD COLUMN IF NOT EXISTS tag TEXT"#,
+    )
+    .execute(&mut *conn)
+    .await;
     tracing::info!("Migration 9/9: done");
 
     // Connection returns to pool on drop.
@@ -184,6 +213,8 @@ CREATE TABLE IF NOT EXISTS "boom_verification_token" (
     token TEXT PRIMARY KEY,
     key_name TEXT,
     key_alias TEXT,
+    key_prefix TEXT,
+    tag TEXT,
     user_id TEXT,
     team_id TEXT,
     models TEXT[] DEFAULT '{}',

@@ -14,9 +14,13 @@ pub use boom_core::types::WindowLimit;
 /// Re-export of the serde helper — see `boom_core::types::deserialize_window_limit_vec`.
 pub use boom_core::types::deserialize_window_limit_vec;
 
+/// Field manifest — single source of truth for which config fields are
+/// editable from the dashboard UI. See `manifest.rs` and CLAUDE.md §9.
+pub mod manifest;
+
 /// Top-level gateway configuration, loaded from YAML.
 /// Compatible with litellm's `proxy_server_config.yaml` format.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Config {
     #[serde(default)]
     pub model_list: Vec<ModelEntry>,
@@ -58,7 +62,7 @@ pub struct Config {
 /// Bind a model to a template via `model_info.cost_template: deepseek-v3`.
 /// Template fields override any inline cost fields on the model (avoids
 /// ambiguity when both are set).
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct CostTemplate {
     pub name: String,
     #[serde(default)]
@@ -71,7 +75,7 @@ pub struct CostTemplate {
     pub output_cost_per_million_tokens: Option<f64>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct DeploymentHealthCheckSettings {
     #[serde(default)]
     pub auto_offline_enabled: bool,
@@ -137,7 +141,7 @@ pub use boom_core::types::PlanType;
 /// convenience shorthand; they get merged into the effective window list as
 /// a synthetic 60s entry at evaluation time, so configs can mix the
 /// shorthand and the explicit `window_limits`.
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct PlanConfig {
     #[serde(default)]
     pub r#type: PlanType,
@@ -181,7 +185,7 @@ pub struct PlanConfig {
 ///     concurrency_limit: 8
 ///     rpm_limit: 120
 /// ```
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ScheduleSlotConfig {
     /// Time range, e.g. "9:00-21:00" or "21:00-9:00" (cross-midnight).
     pub hours: String,
@@ -210,7 +214,7 @@ pub struct ScheduleSlotConfig {
 ///       rpm_limit: 60
 ///       window_limits: [[100, 18000]]
 /// ```
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct PlanSettings {
     /// Name of the plan to use for keys without an explicit assignment.
     pub default_plan: Option<String>,
@@ -223,41 +227,24 @@ pub struct PlanSettings {
 
 /// Model metadata — compatible with litellm's `model_info` field.
 ///
-/// Cost fields can be set in two ways:
-/// 1. Inline directly here:
-///    ```yaml
-///    model_info:
-///      input_cost_per_million_tokens: 5.0       # $5 / 1M input tokens
-///      cached_input_cost_per_million_tokens: 1.0  # $1 / 1M cached input tokens
-///      output_cost_per_million_tokens: 15.0
-///    ```
-/// 2. By reference to a `cost_templates` entry:
-///    ```yaml
-///    model_info:
-///      cost_template: deepseek-v3
-///    ```
-///    The template's rates override inline fields when both are present —
-///    this lets ops swap pricing for many models in one place.
+/// Pricing is configured exclusively via `cost_templates` (top-level YAML
+/// section). Inline cost fields were removed to avoid ambiguity with
+/// template rates — a single source of truth per model.
 ///
-/// All `*_per_million_tokens` fields are USD per 1 million tokens. The
-/// gateway converts to per-token internally for accounting.
-#[derive(Debug, Deserialize, Clone, Default)]
+/// ```yaml
+/// model_info:
+///   cost_template: deepseek-v3      # reference into cost_templates
+///   quota_count_ratio: 2            # each request counts as 2 against quota
+/// ```
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct ModelInfo {
     pub id: Option<String>,
-    #[serde(default)]
-    pub input_cost_per_million_tokens: Option<f64>,
-    /// USD per million cached input tokens (KV-cache hit). Optional — when
-    /// None/0, cache hits are billed at the regular `input_cost_per_million_tokens` rate.
-    #[serde(default)]
-    pub cached_input_cost_per_million_tokens: Option<f64>,
-    #[serde(default)]
-    pub output_cost_per_million_tokens: Option<f64>,
     /// Quota count multiplier for this model.
     /// Each request consumes `quota_count_ratio` units instead of 1.
     /// Defaults to 1 when not set.
     pub quota_count_ratio: Option<u64>,
-    /// Reference to a `cost_templates` entry by name. Template rates take
-    /// precedence over any inline cost fields above.
+    /// Reference to a `cost_templates` entry by name. Single source of
+    /// pricing truth — the gateway looks up rates here, never inline.
     #[serde(default)]
     pub cost_template: Option<String>,
 }
@@ -269,7 +256,7 @@ pub struct ModelInfo {
 ///   model_queue_limit: 50
 ///   model_context_limit: 5000000
 /// ```
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct FlowControlEntry {
     /// Max concurrent in-flight requests. 0 or unset = no limit.
     #[serde(default)]
@@ -279,7 +266,7 @@ pub struct FlowControlEntry {
     pub model_context_limit: Option<u64>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ModelEntry {
     pub model_name: String,
     pub litellm_params: ProviderParams,
@@ -313,7 +300,7 @@ pub struct ModelEntry {
 ///   - `bedrock/anthropic.claude-3-sonnet` → AWS Bedrock
 ///   - `gpt-4` → auto-detected as OpenAI
 ///   - `claude-3-opus` → auto-detected as Anthropic
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ProviderParams {
     /// Model string in litellm format: `[provider/]model-id`.
     pub model: String,
@@ -413,7 +400,7 @@ fn auto_detect_provider(model: &str) -> String {
     "openai".to_string()
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct GeneralSettings {
     /// Master key for admin access.
     pub master_key: Option<String>,
@@ -446,7 +433,7 @@ impl Default for GeneralSettings {
 /// Examples in YAML:
 ///   Simple:    `"gpt-4": "gpt-4o"`
 ///   Extended:  `"GPT-4": { model: "gpt-4o", hidden: true }`
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(untagged)]
 pub enum ModelGroupAlias {
     Simple(String),
@@ -473,7 +460,7 @@ impl ModelGroupAlias {
     }
 }
 
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct RouterSettings {
     /// Scheduling policy: round_robin (default) or key_affinity.
     #[serde(default = "default_schedule_policy", alias = "routing_strategy")]
@@ -533,7 +520,7 @@ pub struct RouterSettings {
 }
 
 /// Settings for KV-cache aware routing.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct KvcAwareSettings {
     /// Block size in BYTES for the gateway-side prefix serialization chunking.
     /// The request's serialized prefix (system+tools+messages) is sliced into
@@ -670,7 +657,7 @@ fn default_max_blocks() -> usize {
 ///
 /// When enabled, requesting the virtual `model_name` triggers content
 /// analysis which maps to a real model from `model_list`.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct HybridRouterConfig {
     /// Virtual model name that triggers classification (e.g. "auto").
     pub model_name: String,
@@ -685,7 +672,7 @@ pub struct HybridRouterConfig {
 }
 
 /// A single tier in the hybrid router configuration.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct HybridRouterTier {
     /// Target model_name in model_list to route to for this tier.
     pub target_model: String,
@@ -703,7 +690,7 @@ fn default_rebalance_threshold() -> u8 {
     20
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ServerSettings {
     #[serde(default = "default_host")]
     pub host: String,
@@ -735,13 +722,30 @@ fn default_workers() -> usize {
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct RateLimitSettings {
+    /// Fallback switch for keys without explicit rate configuration.
+    ///
+    /// When true (default), `default_rpm` / `default_tpm` / `window_limits`
+    /// are applied to any key that has no plan assignment AND no DB-set
+    /// rpm/tpm_limit — i.e. the unconfigured-key safety net is active.
+    ///
+    /// When false, unconfigured keys are not rate-limited at all by the
+    /// fallback path; only keys that carry their own limits (via plan or
+    /// DB column) are constrained. Keys with explicit configuration are
+    /// never affected by this switch.
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Default RPM per key if not set in the database.
+    /// Per-key fallback RPM. Applied only when a key has neither a plan
+    /// assignment nor its own `rpm_limit` in the DB. Acts as the last-mile
+    /// safety net so unconfigured keys still get a sane rate cap.
     #[serde(default = "default_rpm")]
     pub default_rpm: u64,
+    /// Per-key fallback TPM. Same precedence as `default_rpm` — only kicks in
+    /// for plan-less, DB-unset keys.
+    #[serde(default)]
+    pub default_tpm: Option<u64>,
     /// Custom window limits: [[count, window_seconds], ...].
     /// Example: [[100, 18000]] = 100 requests per 5 hours.
+    /// Applied at the key scope in the legacy (plan-less) path.
     #[serde(default)]
     pub window_limits: Vec<Vec<u64>>,
 }
@@ -751,6 +755,7 @@ impl Default for RateLimitSettings {
         Self {
             enabled: true,
             default_rpm: default_rpm(),
+            default_tpm: None,
             window_limits: vec![],
         }
     }
@@ -788,6 +793,14 @@ impl Config {
         // sections plug in without growing this method.
         self.router_settings.kvc_aware.validate()?;
         Ok(())
+    }
+
+    /// Look up a [`CostTemplate`] by name. Used wherever a model's
+    /// `model_info.cost_template` reference needs to be resolved to actual
+    /// rates. Centralizing the lookup keeps the "cost_templates is the only
+    /// source of pricing truth" rule in one place.
+    pub fn lookup_cost_template(&self, name: &str) -> Option<&CostTemplate> {
+        self.cost_templates.iter().find(|t| t.name == name)
     }
 }
 
@@ -915,9 +928,192 @@ fn is_valid_env_var(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| c.is_alphanumeric() || c == '_')
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// Raw YAML I/O (used by web admin path)
+// ─────────────────────────────────────────────────────────────────────
+
+/// Read a YAML file as a raw `serde_yaml::Value` WITHOUT resolving env vars.
+///
+/// The typed `load_config()` resolves env vars at parse time, which would leak
+/// secrets (`${OPENAI_API_KEY}` → `sk-...`) if serialized back to disk. The web
+/// admin path must read raw, mutate only the edited section, and write back —
+/// preserving env references in untouched sections.
+pub fn read_raw_yaml(path: &str) -> Result<serde_yaml::Value, GatewayError> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| GatewayError::ConfigError(format!("Failed to read config {}: {}", path, e)))?;
+    serde_yaml::from_str(&content)
+        .map_err(|e| GatewayError::ConfigError(format!("Failed to parse YAML: {}", e)))
+}
+
+/// Write a `serde_yaml::Value` to a file atomically.
+///
+/// Writes to `{path}.tmp`, fsyncs, then renames to the target. The atomic
+/// rename guarantees the target file is never in a half-written state, so a
+/// crash mid-write leaves the previous config intact.
+pub fn write_yaml_atomic(path: &str, value: &serde_yaml::Value) -> Result<(), GatewayError> {
+    let yaml_str = serde_yaml::to_string(value)
+        .map_err(|e| GatewayError::ConfigError(format!("Failed to serialize YAML: {}", e)))?;
+
+    let tmp_path = format!("{}.tmp", path);
+    std::fs::write(&tmp_path, &yaml_str)
+        .map_err(|e| GatewayError::ConfigError(format!("Failed to write tmp file {}: {}", tmp_path, e)))?;
+
+    let file = std::fs::File::open(&tmp_path)
+        .map_err(|e| GatewayError::ConfigError(format!("Failed to open tmp file for fsync: {}", e)))?;
+    file.sync_all()
+        .map_err(|e| GatewayError::ConfigError(format!("Failed to fsync tmp file: {}", e)))?;
+    drop(file);
+
+    std::fs::rename(&tmp_path, path)
+        .map_err(|e| GatewayError::ConfigError(format!("Failed to rename tmp file to {}: {}", path, e)))?;
+
+    Ok(())
+}
+
+/// Set a value at a nested YAML path (e.g., `["server", "host"]`).
+///
+/// Creates intermediate mappings as needed. Used by the web admin path to
+/// apply surgical edits without disturbing the rest of the document.
+pub fn set_yaml_path(
+    root: &mut serde_yaml::Value,
+    path: &[&str],
+    new_value: serde_yaml::Value,
+) -> Result<(), GatewayError> {
+    if path.is_empty() {
+        *root = new_value;
+        return Ok(());
+    }
+
+    let mut current = root;
+    for (i, segment) in path.iter().enumerate() {
+        let is_last = i == path.len() - 1;
+        if !current.is_mapping() {
+            return Err(GatewayError::ConfigError(format!(
+                "YAML path segment '{}' expects a mapping",
+                segment
+            )));
+        }
+        let mapping = current.as_mapping_mut().unwrap();
+        let key = serde_yaml::Value::String((*segment).to_string());
+        if is_last {
+            mapping.insert(key, new_value);
+            return Ok(());
+        }
+        if !mapping.contains_key(&key) {
+            mapping.insert(key.clone(), serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+        }
+        current = mapping.get_mut(&key).unwrap();
+    }
+    Ok(())
+}
+
+/// Field names whose values must never be shown to the browser. Case-insensitive.
+///
+/// Covers litellm secret fields (master_key, database_url, api_key, aws
+/// credentials) plus common HTTP header names that routinely carry secrets
+/// (authorization, x-api-key, token, bearer, cookie, set-cookie,
+/// proxy-authorization). The header set is needed because model deployments
+/// accept a free-form `headers` map.
+const SECRET_FIELD_NAMES: &[&str] = &[
+    "master_key",
+    "database_url",
+    "api_key",
+    "aws_access_key_id",
+    "aws_secret_access_key",
+    "authorization",
+    "x-api-key",
+    "api-key",
+    "token",
+    "bearer",
+    "cookie",
+    "set-cookie",
+    "proxy-authorization",
+];
+
+/// True if a JSON/YAML key (case-insensitive) names a secret field.
+pub fn is_secret_field(name: &str) -> bool {
+    SECRET_FIELD_NAMES
+        .iter()
+        .any(|s| name.eq_ignore_ascii_case(s))
+}
+
+/// Recursively replace values of secret fields with `"****"`. Null values are
+/// preserved so the UI can distinguish "configured" (shows ****) from "unset"
+/// (shows empty). Used to scrub the GET /admin/config response.
+pub fn mask_secrets_in_place(value: &mut serde_json::Value) {
+    const MASK: &str = "****";
+    if let Some(obj) = value.as_object_mut() {
+        for (k, v) in obj.iter_mut() {
+            if is_secret_field(k) {
+                if !v.is_null() {
+                    *v = serde_json::Value::String(MASK.to_string());
+                }
+            } else {
+                mask_secrets_in_place(v);
+            }
+        }
+    } else if let Some(arr) = value.as_array_mut() {
+        for v in arr {
+            mask_secrets_in_place(v);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_mask_secrets_in_place_masks_known_fields() {
+        let mut v = serde_json::json!({
+            "master_key": "sk-live-123",
+            "database_url": "postgres://user:pw@host/db",
+            "model_list": [
+                {
+                    "litellm_params": {
+                        "api_key": "sk-real",
+                        "model": "gpt-4",
+                        "headers": {
+                            "Authorization": "Bearer secret",
+                            "X-Custom": "keep-me"
+                        }
+                    }
+                }
+            ],
+            "router_settings": {
+                "schedule_policy": "round_robin"
+            }
+        });
+        mask_secrets_in_place(&mut v);
+
+        assert_eq!(v["master_key"], "****");
+        assert_eq!(v["database_url"], "****");
+        assert_eq!(v["model_list"][0]["litellm_params"]["api_key"], "****");
+        assert_eq!(
+            v["model_list"][0]["litellm_params"]["headers"]["Authorization"],
+            "****"
+        );
+        // Non-secret fields preserved verbatim, including case-insensitive
+        // matching for Authorization.
+        assert_eq!(v["model_list"][0]["litellm_params"]["model"], "gpt-4");
+        assert_eq!(
+            v["model_list"][0]["litellm_params"]["headers"]["X-Custom"],
+            "keep-me"
+        );
+        assert_eq!(v["router_settings"]["schedule_policy"], "round_robin");
+    }
+
+    #[test]
+    fn test_mask_secrets_in_place_preserves_null() {
+        // Null means "field unset" — UI must distinguish from "configured".
+        let mut v = serde_json::json!({
+            "master_key": null,
+            "api_key": "sk-real"
+        });
+        mask_secrets_in_place(&mut v);
+        assert!(v["master_key"].is_null());
+        assert_eq!(v["api_key"], "****");
+    }
 
     #[test]
     fn test_explicit_provider_prefix() {
@@ -1093,5 +1289,103 @@ plan_settings:
         assert_eq!(legacy.tpm_limit, Some(100_000));
         // No window_limits configured → empty vec.
         assert!(legacy.window_limits.is_empty());
+    }
+
+    #[test]
+    fn test_set_yaml_path_overwrites_existing() {
+        let yaml = "server:\n  host: 0.0.0.0\n  port: 4000\n";
+        let mut value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        set_yaml_path(
+            &mut value,
+            &["server", "port"],
+            serde_yaml::Value::Number(serde_yaml::Number::from(8080)),
+        )
+        .unwrap();
+        let port = value
+            .get("server")
+            .unwrap()
+            .get("port")
+            .unwrap()
+            .as_u64()
+            .unwrap();
+        assert_eq!(port, 8080);
+        // Untouched field preserved.
+        let host = value
+            .get("server")
+            .unwrap()
+            .get("host")
+            .unwrap()
+            .as_str()
+            .unwrap();
+        assert_eq!(host, "0.0.0.0");
+    }
+
+    #[test]
+    fn test_set_yaml_path_creates_missing_intermediate() {
+        let mut value: serde_yaml::Value = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        set_yaml_path(
+            &mut value,
+            &["router_settings", "schedule_policy"],
+            serde_yaml::Value::String("key_affinity".to_string()),
+        )
+        .unwrap();
+        let policy = value
+            .get("router_settings")
+            .unwrap()
+            .get("schedule_policy")
+            .unwrap()
+            .as_str()
+            .unwrap();
+        assert_eq!(policy, "key_affinity");
+    }
+
+    #[test]
+    fn test_read_raw_yaml_preserves_env_refs() {
+        // env var references like ${VAR} must survive the raw read; if they
+        // were resolved, dumping the value back would leak real secrets.
+        let dir = std::env::temp_dir();
+        let path = dir.join("boom_config_test_raw.yaml");
+        std::fs::write(
+            &path,
+            "model_list:\n  - model_name: gpt-4\n    litellm_params:\n      model: openai/gpt-4\n      api_key: ${OPENAI_API_KEY}\n",
+        )
+        .unwrap();
+
+        let raw = read_raw_yaml(path.to_str().unwrap()).unwrap();
+        let api_key = raw
+            .get("model_list")
+            .unwrap()
+            .get(0)
+            .unwrap()
+            .get("litellm_params")
+            .unwrap()
+            .get("api_key")
+            .unwrap()
+            .as_str()
+            .unwrap();
+        assert_eq!(api_key, "${OPENAI_API_KEY}");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_write_yaml_atomic_round_trip() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("boom_config_test_atomic.yaml");
+        let mut value: serde_yaml::Value = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        set_yaml_path(
+            &mut value,
+            &["server", "host"],
+            serde_yaml::Value::String("127.0.0.1".to_string()),
+        )
+        .unwrap();
+        write_yaml_atomic(path.to_str().unwrap(), &value).unwrap();
+
+        // File should exist with expected content; no .tmp leftover.
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("127.0.0.1"));
+        assert!(!std::path::Path::exists(path.with_extension("yaml.tmp").as_ref()));
+
+        let _ = std::fs::remove_file(&path);
     }
 }
