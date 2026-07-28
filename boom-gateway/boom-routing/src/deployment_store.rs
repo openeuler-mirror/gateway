@@ -230,6 +230,15 @@ const DEPLOYMENT_ROW_SELECT_COLUMNS: &str = concat!(
     "created_at, updated_at"
 );
 
+/// SQL for `snapshot_db` — config export MUST include disabled rows.
+///
+/// Extracted as a const so the `snapshot_db_includes_disabled_rows` test can
+/// statically verify the absence of `enabled IS NOT FALSE`. Putting the filter
+/// back here would silently turn "disable" into "delete" on the next
+/// `persist_config_in_place` → `sync_yaml_to_db` round-trip in
+/// `store_model_in_db: false` mode.
+const SNAPSHOT_DB_SQL: &str = "SELECT id, model_name, litellm_model, api_key, api_key_env, api_base, api_version, aws_region_name, aws_access_key_id, aws_secret_access_key, rpm, tpm, timeout, headers, temperature, max_tokens, enabled, auto_disabled, source, deployment_id, quota_count_ratio, max_inflight_queue_len, max_context_len, client_type_header, serve_not_match, model_info, created_at, updated_at FROM boom_model_deployment ORDER BY model_name, created_at";
+
 /// Input for creating/updating a deployment in DB.
 ///
 /// Also used as the YAML→DB sync carrier (formerly `YamlDeploymentData`).
@@ -755,13 +764,19 @@ impl DeploymentStore {
     }
 
     /// Snapshot all deployments from DB (for config export).
+    ///
+    /// Includes disabled rows so YAML round-trip preserves `enabled: false`
+    /// state. The earlier `WHERE enabled IS NOT FALSE` filter caused
+    /// disabled deployments to vanish from YAML after `persist_config_in_place`,
+    /// and in `store_model_in_db: false` mode the subsequent `sync_yaml_to_db`
+    /// would physically DELETE the source='db' row — effectively turning
+    /// "disable" into "delete". Routing exclusion is handled separately by
+    /// `load_db_only_rows`, which correctly filters disabled rows for the
+    /// in-memory routing table.
     pub async fn snapshot_db(pool: &sqlx::PgPool) -> Result<Vec<DeploymentRow>, sqlx::Error> {
-        sqlx::query_as::<_, DeploymentRow>(&format!(
-            "SELECT {} FROM boom_model_deployment WHERE enabled IS NOT FALSE ORDER BY model_name, created_at",
-            DEPLOYMENT_ROW_SELECT_COLUMNS,
-        ))
-        .fetch_all(pool)
-        .await
+        sqlx::query_as::<_, DeploymentRow>(SNAPSHOT_DB_SQL)
+            .fetch_all(pool)
+            .await
     }
 }
 
@@ -855,6 +870,27 @@ mod tests {
                 col,
             );
         }
+    }
+
+    /// `snapshot_db` MUST include disabled rows so YAML round-trip preserves
+    /// `enabled: false` state. The earlier `WHERE enabled IS NOT FALSE` filter
+    /// caused disabled deployments to vanish from YAML after
+    /// `persist_config_in_place`, and in `store_model_in_db: false` mode the
+    /// subsequent `sync_yaml_to_db` would physically DELETE the source='db'
+    /// row — effectively turning "disable" into "delete". This test prevents
+    /// the filter from being re-introduced.
+    #[test]
+    fn snapshot_db_includes_disabled_rows() {
+        assert!(
+            !SNAPSHOT_DB_SQL.to_lowercase().contains("enabled is not false"),
+            "snapshot_db SQL must NOT filter by enabled. \
+             Putting `WHERE enabled IS NOT FALSE` back here causes disabled \
+             deployments to be lost on YAML round-trip. See CLAUDE.md §9."
+        );
+        assert!(
+            SNAPSHOT_DB_SQL.to_lowercase().contains("order by model_name"),
+            "snapshot_db SQL must ORDER BY model_name for deterministic output"
+        );
     }
 
     /// `DEPLOYMENT_CORE_COLUMNS` must not contain duplicates.

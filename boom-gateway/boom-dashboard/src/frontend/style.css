@@ -1744,6 +1744,23 @@ input[list] {
 .rbm-legend-item { display: flex; align-items: center; gap: 4px; }
 .rbm-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; }
 
+/* ── Audit Log Stats card ─────────────────────────────── */
+.audit-log-stats {
+  display: flex; flex-direction: column; gap: 8px;
+  padding: 12px 16px; border: 1px solid var(--border2);
+  border-radius: 6px; max-width: 480px;
+}
+.als-row {
+  display: flex; align-items: baseline; justify-content: space-between;
+  padding: 8px 12px; border-radius: 4px;
+}
+.als-ok    { background: rgba(34,197,94,.08);  color: var(--text1); }
+.als-warn  { background: rgba(234,179,8,.10);  color: var(--text1); }
+.als-bad   { background: rgba(239,68,68,.10);  color: var(--text1); }
+.als-label { font-size: 13px; color: var(--text3); }
+.als-value { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.als-hint  { font-size: 12px; color: var(--text3); margin: 0; line-height: 1.5; }
+
 /* ── Agent Statistics (stacked bar: anthropic vs other) ─── */
 .agent-summary {
   display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));

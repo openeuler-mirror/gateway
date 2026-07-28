@@ -145,6 +145,11 @@ pub fn build_router<S: Clone + Send + Sync + 'static>(state: DashboardState) -> 
             "/dashboard/api/admin/stats/rebalance-moves",
             get(handlers_admin::get_rebalance_moves),
         )
+        // Admin — Audit Log Drop Counter (channel full / batch failures).
+        .route(
+            "/dashboard/api/admin/stats/audit-log",
+            get(handlers_admin::get_audit_log_stats),
+        )
         // Admin — Request Rate Stats per deployment (last 60 minutes).
         .route(
             "/dashboard/api/admin/stats/request_rate",

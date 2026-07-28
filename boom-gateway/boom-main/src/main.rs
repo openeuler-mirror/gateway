@@ -10,6 +10,7 @@ mod state;
 use axum::routing::{delete, get, post, put};
 use axum::Router;
 use clap::Parser;
+use std::sync::Arc;
 use state::AppState;
 use tower_http::cors::CorsLayer;
 
@@ -195,6 +196,7 @@ fn build_router(state: AppState) -> Router {
         state.request_rate.clone(),
         state.agent_stats.clone(),
         key_alias_lookup,
+        state.log_writer.clone().map(|w| w as Arc<dyn boom_core::LogDroppedCounter>),
     );
     let dashboard_router = boom_dashboard::build_router(dashboard_state);
 

@@ -2733,6 +2733,27 @@ pub async fn get_rebalance_moves(
 }
 
 // ═══════════════════════════════════════════════════════════
+// Audit Log Drop Counter (channel full or batch INSERT failures)
+// ═══════════════════════════════════════════════════════════
+
+pub async fn get_audit_log_stats(
+    _session: AdminSession,
+    Extension(state): Extension<Arc<DashboardState>>,
+) -> Response {
+    let dropped = state
+        .log_dropped
+        .as_ref()
+        .map(|c| c.dropped_count())
+        .unwrap_or(0);
+    let db_configured = state.log_dropped.is_some();
+    Json(json!({
+        "dropped": dropped,
+        "db_configured": db_configured,
+    }))
+    .into_response()
+}
+
+// ═══════════════════════════════════════════════════════════
 // Time-windowed Stats (Agent Statistics + Request Rate)
 // ═══════════════════════════════════════════════════════════
 

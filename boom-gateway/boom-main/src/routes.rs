@@ -20,7 +20,6 @@ use boom_limiter::{
 use boom_promptlog::{PromptLogEntry, PromptLogStream};
 use boom_routing::{InFlightGuard, ModelCostRate, Router};
 use futures::StreamExt;
-use sqlx::PgPool;
 use std::convert::Infallible;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -258,7 +257,7 @@ struct UsageTrackerState {
 /// the final usage from `usage_tracker` once the stream has completed.
 struct LoggedStream<S> {
     inner: S,
-    pool: Option<PgPool>,
+    log_writer: Option<Arc<crate::request_log::LogWriter>>,
     log: Option<RequestLog>,
     start: Instant,
     first_token_at: Option<Instant>,
@@ -274,7 +273,7 @@ struct LoggedStream<S> {
 impl<S> LoggedStream<S> {
     fn new(
         inner: S,
-        pool: Option<PgPool>,
+        log_writer: Option<Arc<crate::request_log::LogWriter>>,
         log: RequestLog,
         start: Instant,
         usage: UsageTracker,
@@ -282,7 +281,7 @@ impl<S> LoggedStream<S> {
     ) -> Self {
         Self {
             inner,
-            pool,
+            log_writer,
             log: Some(log),
             start,
             first_token_at: None,
@@ -337,7 +336,7 @@ impl<S> Drop for LoggedStream<S> {
                     tracker.record_tokens(&log.api_path, input, output);
                 }
             }
-            log_request(self.pool.clone(), log);
+            log_request(self.log_writer.as_deref(), log);
         }
         // Settle the plan charge with real token counts from the stream.
         // If the stream errored or was cancelled before the final usage
@@ -624,7 +623,7 @@ async fn chat_completions_inner(
         }
 
         let api_path_owned = api_path.to_string();
-        let logged = LoggedStream::new(guarded, state.db_pool.clone(), RequestLog {
+        let logged = LoggedStream::new(guarded, state.log_writer.clone(), RequestLog {
             request_id: Some(request_id),
             key_hash: identity.key_hash.clone(),
             key_name: identity.key_name.clone(),
@@ -725,7 +724,7 @@ async fn chat_completions_inner(
         }
 
         log_request(
-            state.db_pool.clone(),
+            state.log_writer.as_deref(),
             RequestLog {
                 request_id: Some(request_id),
                 key_hash: identity.key_hash.clone(),
@@ -2485,7 +2484,7 @@ pub async fn messages(
         }
 
         // Wrap with LoggedStream — log is written when stream finishes (Drop).
-        let logged = LoggedStream::new(guarded, state.db_pool.clone(), RequestLog {
+        let logged = LoggedStream::new(guarded, state.log_writer.clone(), RequestLog {
             request_id: Some(request_id),
             key_hash: identity.key_hash.clone(),
             key_name: identity.key_name.clone(),
@@ -2583,7 +2582,7 @@ pub async fn messages(
         }
 
         log_request(
-            state.db_pool.clone(),
+            state.log_writer.as_deref(),
             RequestLog {
                 request_id: Some(request_id),
                 key_hash: identity.key_hash.clone(),

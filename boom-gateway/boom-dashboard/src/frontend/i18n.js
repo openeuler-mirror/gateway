@@ -158,6 +158,11 @@
       "debug.rebalance_moves.no_data": "No rebalance moves recorded.",
       "debug.rebalance_moves.in": "Migrated in",
       "debug.rebalance_moves.out": "Migrated out",
+      "debug.audit_log.title": "Audit Log Writer",
+      "debug.audit_log.subtitle": "Drop counter — process lifetime cumulative",
+      "debug.audit_log.dropped": "Logs dropped",
+      "debug.audit_log.hint": "Non-zero means the DB fell behind the mpsc channel (sustained outage >2s at peak QPS) or batch INSERT failed twice. Inspect server logs for the 60s delta warnings.",
+      "debug.audit_log.no_db": "Database not configured — audit logging is disabled.",
 
       "models.title": "Model Deployments",
       "models.add": "+ Add Model",
@@ -922,6 +927,11 @@
       "debug.rebalance_moves.no_data": "暂无再平衡迁移记录。",
       "debug.rebalance_moves.in": "迁入",
       "debug.rebalance_moves.out": "迁出",
+      "debug.audit_log.title": "审计日志写入器",
+      "debug.audit_log.subtitle": "丢弃计数 — 进程生命周期累计",
+      "debug.audit_log.dropped": "已丢弃日志",
+      "debug.audit_log.hint": "非零表示 DB 跟不上 mpsc channel（峰值 QPS 持续故障 >2s）或批量 INSERT 两次重试均失败。查看服务端日志的 60s 增量告警定位时段。",
+      "debug.audit_log.no_db": "未配置数据库 — 审计日志功能未启用。",
 
       "models.title": "模型部署",
       "models.add": "+ 新增模型",
