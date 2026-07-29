@@ -39,6 +39,9 @@ pub struct AppState {
     /// Dashboard-only DB pool with tiny max_connections so heavy stats
     /// aggregations can never starve the forwarding path. max=3, acquire_timeout=10s.
     pub dashboard_db_pool: Option<PgPool>,
+    /// Audit log writer — single-task, batch INSERT, dedicated pool.
+    /// Cross-reload (DB pool itself survives). None only when no DB configured.
+    pub log_writer: Option<Arc<crate::request_log::LogWriter>>,
     /// Limiter survives reloads (preserves in-flight counters).
     pub limiter: Arc<SlidingWindowLimiter>,
     /// Plan store survives reloads (preserves plan definitions and key assignments).
@@ -153,6 +156,25 @@ impl AppState {
             None => None,
         };
 
+        // Audit log writer: dedicated 8-conn pool + single batch-INSERT task.
+        // See `request_log::LogWriter` for architecture. Replaces the old
+        // per-request `tokio::spawn + sqlx::query` pattern which competed
+        // with auth/routing for the main pool's 30 connections and silently
+        // dropped logs at high QPS (5s timeout fired more than warn! revealed).
+        let log_writer = match &config.general_settings.database_url {
+            Some(url) => {
+                let log_pool = sqlx::postgres::PgPoolOptions::new()
+                    .max_connections(8)
+                    .acquire_timeout(std::time::Duration::from_secs(10))
+                    .idle_timeout(std::time::Duration::from_secs(600))
+                    .max_lifetime(std::time::Duration::from_secs(1800))
+                    .connect(url)
+                    .await?;
+                Some(crate::request_log::start_log_writer(log_pool))
+            }
+            None => None,
+        };
+
         // 2. Limiter survives across reloads.
         let limiter = Arc::new(SlidingWindowLimiter::new());
 
@@ -252,6 +274,7 @@ impl AppState {
             inner: Arc::new(ArcSwap::from_pointee(inner)),
             db_pool,
             dashboard_db_pool,
+            log_writer,
             limiter,
             plan_store,
             deployment_store,
@@ -1606,6 +1629,17 @@ async fn build_config_snapshot_value(pool: &PgPool) -> Result<serde_json::Value,
                 entry.as_object_mut().unwrap().insert(
                     "client_type_header".into(),
                     serde_json::Value::Bool(true),
+                );
+            }
+
+            // ── Enabled flag. Unlike the toggles above, ModelEntry.enabled
+            // has serde default true, so emit only when false — omitting it
+            // would make reload fall back to the default and silently lose
+            // the disabled state (the very bug we're fixing).
+            if !r.enabled.unwrap_or(true) {
+                entry.as_object_mut().unwrap().insert(
+                    "enabled".into(),
+                    serde_json::Value::Bool(false),
                 );
             }
 

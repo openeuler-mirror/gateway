@@ -353,7 +353,7 @@
     else if (section === "admin-keys") { setupKeysSearch(); loadKeys(); }
     else if (section === "admin-quota") loadQuota();
     else if (section === "admin-logs") { setupLogsFilters(); loadLogs(); }
-    else if (section === "admin-debug") { loadAgentStats(); loadRebalanceMoves(); loadKvcDfx(); }
+    else if (section === "admin-debug") { loadAgentStats(); loadRebalanceMoves(); loadKvcDfx(); loadAuditLogStats(); }
     else if (section === "admin-config") loadConfigPage();
   }
 
@@ -770,6 +770,37 @@
       '<div class="rbm-legend">' +
       '<span class="rbm-legend-item"><span class="rbm-swatch rbm-bar-out"></span>' + t("debug.rebalance_moves.out") + '</span>' +
       '<span class="rbm-legend-item"><span class="rbm-swatch rbm-bar-in"></span>'  + t("debug.rebalance_moves.in")  + '</span>' +
+      '</div>';
+  }
+
+  // ── Audit Log Stats (dropped counter) ───────────────────
+  async function loadAuditLogStats() {
+    try {
+      const data = await api("/admin/stats/audit-log");
+      renderAuditLogStats(data || {});
+    } catch (err) {
+      console.error("loadAuditLogStats error:", err);
+    }
+  }
+
+  function renderAuditLogStats(data) {
+    const wrap = document.getElementById("audit-log-stats-wrap");
+    if (!wrap) return;
+
+    if (!data.db_configured) {
+      wrap.innerHTML = '<p class="muted">' + t("debug.audit_log.no_db") + '</p>';
+      return;
+    }
+
+    const dropped = Number(data.dropped || 0);
+    const tone = dropped === 0 ? "ok" : (dropped < 1000 ? "warn" : "bad");
+    wrap.innerHTML =
+      '<div class="audit-log-stats">' +
+        '<div class="als-row als-' + tone + '">' +
+          '<span class="als-label">' + t("debug.audit_log.dropped") + '</span>' +
+          '<span class="als-value">' + dropped.toLocaleString() + '</span>' +
+        '</div>' +
+        '<p class="als-hint">' + t("debug.audit_log.hint") + '</p>' +
       '</div>';
   }
 
@@ -4497,11 +4528,7 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
 
   // ── Prompt Log Entry Viewer ──────────────────────────
   window._viewPromptLog = async function(requestId, keyHash, teamAlias) {
-    const overlay = document.getElementById("modal-overlay");
-    const modalEl = overlay ? overlay.querySelector(".modal") : null;
-    // Widen modal for JSON viewing via CSS class (cleared on hideModal).
-    if (modalEl) modalEl.classList.add("modal-wide");
-    showModal('<div style="text-align:center;padding:40px">' + t("common.loading") + '</div>');
+    showModal('<div style="text-align:center;padding:40px">' + t("common.loading") + '</div>', { wide: true });
     try {
       const params = new URLSearchParams({ key_hash: keyHash });
       if (teamAlias) params.set("team_alias", teamAlias);
@@ -4516,7 +4543,8 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
         '<button class="btn-small" id="' + containerId + '-raw">' + t("action.raw_json") + '</button>' +
         '</div></div>' +
         '<div id="' + containerId + '" style="max-height:72vh;overflow:auto;background:var(--surface2);color:var(--text);padding:16px;border-radius:8px;font-size:13px;line-height:1.5;font-family:var(--mono)"></div>' +
-        '<pre id="' + containerId + '-rawpre" style="display:none;max-height:72vh;overflow:auto;background:var(--surface2);color:var(--text);padding:16px;border-radius:8px;font-size:13px;line-height:1.5;white-space:pre-wrap;word-break:break-word;font-family:var(--mono)">' + esc(JSON.stringify(data, null, 2)) + '</pre>'
+        '<pre id="' + containerId + '-rawpre" style="display:none;max-height:72vh;overflow:auto;background:var(--surface2);color:var(--text);padding:16px;border-radius:8px;font-size:13px;line-height:1.5;white-space:pre-wrap;word-break:break-word;font-family:var(--mono)">' + esc(JSON.stringify(data, null, 2)) + '</pre>',
+        { wide: true }
       );
       const tree = document.getElementById(containerId);
       renderJsonTree(data, tree);
@@ -4534,7 +4562,7 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
         e.target.textContent = showing ? t("action.raw_json") : t("action.tree_view");
       };
     } catch (err) {
-      showModal('<div style="padding:20px;color:var(--danger)">' + t("logs.failed_prompt", { message: esc(err.message) }) + '</div>');
+      showModal('<div style="padding:20px;color:var(--danger)">' + t("logs.failed_prompt", { message: esc(err.message) }) + '</div>', { wide: true });
     }
   };
 

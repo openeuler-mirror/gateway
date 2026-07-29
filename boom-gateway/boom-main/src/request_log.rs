@@ -1,10 +1,24 @@
 use sqlx::PgPool;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 use boom_core::types::AuthIdentity;
 use boom_core::types::Usage;
-use boom_core::{DebugErrorEntry, GatewayError};
+use boom_core::{DebugErrorEntry, GatewayError, LogDroppedCounter};
 use crate::state::AppState;
+use tokio::sync::mpsc;
+
+/// Channel capacity — sized to absorb ~2s of DB outage at 50K QPS.
+/// Single RequestLog ≈ 850 bytes → 100K slots × 850B ≈ 85 MB peak.
+const LOG_CHANNEL_CAPACITY: usize = 100_000;
+/// Max rows per batch INSERT. PG parameter limit (65535) / 25 columns ≈ 2621.
+/// 2000 leaves headroom and aligns with flush interval at 50K QPS.
+const LOG_BATCH_SIZE: usize = 2_000;
+/// Flush window. At 50K QPS this batches ~5000 rows (3 INSERTs).
+const LOG_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
+/// Per-batch INSERT timeout. 2000-row INSERT can take ~1s under load.
+const LOG_INSERT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Dedup cache for expected rejections (rate-limit, concurrency, budget).
 /// Key: "{error_type}:{key_hash}:{model}", auto-expires after 60 s.
@@ -48,59 +62,257 @@ pub struct RequestLog {
     pub request_tokens: Option<i64>,
 }
 
-/// Fire-and-forget: spawn a tokio task to INSERT the log record.
-/// Does nothing if `pool` is None (no DB configured).
-/// Includes a 5s timeout to prevent log writes from starving the connection pool.
-pub fn log_request(pool: Option<PgPool>, log: RequestLog) {
-    if let Some(pool) = pool {
-        tokio::spawn(async move {
-            let result = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                sqlx::query(
-                    r#"INSERT INTO boom_request_log
-                       (request_id, key_hash, key_name, key_alias, team_id, model, model_name, api_path,
-                        is_stream, status_code, error_type, error_message,
-                        input_tokens, output_tokens, duration_ms, deployment_id, client_ip, ttft_ms,
-                        cached_tokens, schedule_policy, kv_hit_blocks, kv_input_blocks,
-                        trie_blocks, trie_max_blocks, request_tokens)
-                       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
-                               $19, $20, $21, $22, $23, $24, $25)"#,
-                )
-                .bind(&log.request_id)
-                .bind(&log.key_hash)
-                .bind(&log.key_name)
-                .bind(&log.key_alias)
-                .bind(&log.team_id)
-                .bind(&log.model)
-                .bind(&log.model_name)
-                .bind(&log.api_path)
-                .bind(log.is_stream)
-                .bind(log.status_code as i16)
-                .bind(&log.error_type)
-                .bind(&log.error_message)
-                .bind(log.input_tokens)
-                .bind(log.output_tokens)
-                .bind(log.duration_ms)
-                .bind(&log.deployment_id)
-                .bind(&log.client_ip)
-                .bind(log.ttft_ms)
-                .bind(log.cached_tokens)
-                .bind(&log.schedule_policy)
-                .bind(log.kv_hit_blocks)
-                .bind(log.kv_input_blocks)
-                .bind(log.trie_blocks)
-                .bind(log.trie_max_blocks)
-                .bind(log.request_tokens)
-                .execute(&pool),
-            )
-            .await;
+/// Background audit-log writer.
+///
+/// Replaces the previous per-request `tokio::spawn + sqlx::query` pattern
+/// which competed with auth/routing for the shared 30-conn PgPool and silently
+/// dropped logs at high QPS (the 5s timeout fired far more often than the
+/// `tracing::warn!` revealed).
+///
+/// Architecture:
+///   - Sender side (hot path): `try_send` into mpsc channel (100K capacity).
+///     Non-blocking, returns immediately. On full channel, drops the incoming
+///     log and bumps `dropped` counter — at 50K QPS this only triggers during
+///     sustained DB outages >2s.
+///   - Receiver side (single task): drains channel into a buffer, flushes every
+///     100ms or when buffer hits 2000 rows. Uses a dedicated 8-conn PgPool so
+///     log writes never compete with auth/routing. Batch INSERT (2000 rows in
+///     one statement) amortizes DB round-trip from N to N/2000.
+///   - Retry: one retry on failure (deadlock / transient DB error). Second
+///     failure drops the batch and bumps `dropped`.
+///
+/// Lifecycle: spawned once at startup, lives for the process. On AppState
+/// reload, the writer is preserved (DB pool itself survives reload — the
+/// `Option<PgPool>` swap-in-place is fine).
+pub struct LogWriter {
+    tx: mpsc::Sender<RequestLog>,
+    dropped: Arc<AtomicU64>,
+}
 
-            match result {
-                Ok(Err(e)) => tracing::debug!("Failed to insert request log: {}", e),
-                Err(_) => tracing::warn!("Request log write timed out after 5s, dropping"),
-                Ok(Ok(_)) => {}
+impl LogWriter {
+    /// Enqueue a log record. Non-blocking; on full channel the record is
+    /// dropped and `dropped` counter incremented.
+    ///
+    /// Public API: `log_request(writer, log)` should be preferred over this
+    /// to keep call sites readable.
+    pub fn try_enqueue(&self, log: RequestLog) {
+        match self.tx.try_send(log) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
             }
-        });
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+                // Channel closed = writer task died. Static flag would be cleaner,
+                // but emitting on every drop is fine — at 50K QPS the log spam is
+                // self-limiting because new logs aren't being enqueued either.
+                tracing::error!("LogWriter channel closed — log_writer task not running");
+            }
+        }
+    }
+}
+
+impl LogDroppedCounter for LogWriter {
+    fn dropped_count(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+}
+
+/// Spawn the background writer task and return a handle for enqueueing logs.
+///
+/// `pool` should be a *dedicated* PgPool (not the shared main pool) — log
+/// writes must not compete with auth/routing for connections.
+pub fn start_log_writer(pool: PgPool) -> Arc<LogWriter> {
+    let (tx, rx) = mpsc::channel(LOG_CHANNEL_CAPACITY);
+    let dropped = Arc::new(AtomicU64::new(0));
+    let writer = Arc::new(LogWriter {
+        tx,
+        dropped: dropped.clone(),
+    });
+    tokio::spawn(log_writer_task(rx, pool, dropped));
+    writer
+}
+
+async fn log_writer_task(
+    mut rx: mpsc::Receiver<RequestLog>,
+    pool: PgPool,
+    dropped: Arc<AtomicU64>,
+) {
+    tracing::info!(
+        channel_capacity = LOG_CHANNEL_CAPACITY,
+        batch_size = LOG_BATCH_SIZE,
+        flush_ms = LOG_FLUSH_INTERVAL.as_millis() as u64,
+        "log_writer task started"
+    );
+
+    let mut buffer: Vec<RequestLog> = Vec::with_capacity(LOG_BATCH_SIZE);
+    // Skip missed ticks — under load the channel arm fires more often than
+    // the timer; default tokio interval would "catch up" with rapid flushes
+    // we don't need.
+    let mut flush_timer = tokio::time::interval(LOG_FLUSH_INTERVAL);
+    flush_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Discard the immediate first tick (interval fires at t=0).
+    flush_timer.tick().await;
+
+    // Periodic stats logger — surfaces drop rate so operators can size the
+    // channel vs. actual DB throughput. Every 60s.
+    let mut stats_timer = tokio::time::interval(Duration::from_secs(60));
+    stats_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    stats_timer.tick().await;
+    let mut last_dropped: u64 = 0;
+
+    loop {
+        tokio::select! {
+            // recv() returns None when all senders dropped — only happens at shutdown.
+            Some(log) = rx.recv() => {
+                buffer.push(log);
+                if buffer.len() >= LOG_BATCH_SIZE {
+                    flush_batch(&pool, &mut buffer, &dropped).await;
+                }
+            }
+            _ = flush_timer.tick() => {
+                if !buffer.is_empty() {
+                    flush_batch(&pool, &mut buffer, &dropped).await;
+                }
+            }
+            _ = stats_timer.tick() => {
+                let total = dropped.load(Ordering::Relaxed);
+                if total != last_dropped {
+                    tracing::warn!(
+                        total_dropped = total,
+                        delta = total - last_dropped,
+                        "audit log drops in past 60s (channel full or batch failures)",
+                    );
+                    last_dropped = total;
+                }
+            }
+        }
+    }
+}
+
+/// Drain `buffer` and INSERT all rows in a single batch statement.
+/// One retry on transient failure; second failure drops the batch + counts.
+async fn flush_batch(pool: &PgPool, buffer: &mut Vec<RequestLog>, dropped: &AtomicU64) {
+    // Drain into an owned Vec — leaves `buffer` empty (capacity preserved)
+    // so the next batch doesn't reallocate.
+    let batch: Vec<RequestLog> = buffer.drain(..).collect();
+    let batch_len = batch.len();
+
+    for attempt in 0..=1 {
+        let result = tokio::time::timeout(
+            LOG_INSERT_TIMEOUT,
+            batch_insert(pool, &batch),
+        ).await;
+
+        match result {
+            Ok(Ok(rows_affected)) => {
+                if (rows_affected as usize) < batch_len {
+                    // PG can report fewer rows affected under rare conditions
+                    // (e.g. trigger-suppressed INSERTs). Surface the gap.
+                    let missing = batch_len - rows_affected as usize;
+                    dropped.fetch_add(missing as u64, Ordering::Relaxed);
+                    tracing::warn!(
+                        batch_len,
+                        rows_affected,
+                        "Batch INSERT partial — {} logs not persisted",
+                        missing,
+                    );
+                }
+                return;
+            }
+            Ok(Err(e)) => {
+                if attempt == 0 {
+                    tracing::warn!(batch_len, error = %e, "Batch INSERT failed, retrying once");
+                    continue;
+                }
+                tracing::error!(
+                    batch_len,
+                    error = %e,
+                    "Batch INSERT failed twice, dropping {} logs",
+                    batch_len,
+                );
+                dropped.fetch_add(batch_len as u64, Ordering::Relaxed);
+                return;
+            }
+            Err(_) => {
+                if attempt == 0 {
+                    tracing::warn!(
+                        batch_len,
+                        timeout_secs = LOG_INSERT_TIMEOUT.as_secs(),
+                        "Batch INSERT timed out, retrying once"
+                    );
+                    continue;
+                }
+                tracing::error!(
+                    batch_len,
+                    "Batch INSERT timed out twice, dropping {} logs",
+                    batch_len,
+                );
+                dropped.fetch_add(batch_len as u64, Ordering::Relaxed);
+                return;
+            }
+        }
+    }
+}
+
+/// Build and execute a multi-row INSERT via sqlx QueryBuilder.
+///
+/// Uses `push_values` to construct `VALUES ($1,$2,...), ($26,...), ...` with
+/// 25 placeholders per row. At LOG_BATCH_SIZE=2000, this is 50000 placeholders
+/// — under PG's 65535 protocol limit.
+async fn batch_insert(pool: &PgPool, batch: &[RequestLog]) -> Result<u64, sqlx::Error> {
+    use sqlx::QueryBuilder;
+
+    let mut qb: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
+        "INSERT INTO boom_request_log \
+         (request_id, key_hash, key_name, key_alias, team_id, model, model_name, api_path, \
+          is_stream, status_code, error_type, error_message, \
+          input_tokens, output_tokens, duration_ms, deployment_id, client_ip, ttft_ms, \
+          cached_tokens, schedule_policy, kv_hit_blocks, kv_input_blocks, \
+          trie_blocks, trie_max_blocks, request_tokens) "
+    );
+    qb.push_values(batch.iter(), |mut b, log| {
+        b.push_bind(log.request_id.clone())
+            .push_bind(&log.key_hash)
+            .push_bind(log.key_name.clone())
+            .push_bind(log.key_alias.clone())
+            .push_bind(log.team_id.clone())
+            .push_bind(&log.model)
+            .push_bind(log.model_name.clone())
+            .push_bind(&log.api_path)
+            .push_bind(log.is_stream)
+            .push_bind(log.status_code as i16)
+            .push_bind(log.error_type.clone())
+            .push_bind(log.error_message.clone())
+            .push_bind(log.input_tokens)
+            .push_bind(log.output_tokens)
+            .push_bind(log.duration_ms)
+            .push_bind(log.deployment_id.clone())
+            .push_bind(log.client_ip.clone())
+            .push_bind(log.ttft_ms)
+            .push_bind(log.cached_tokens)
+            .push_bind(log.schedule_policy.clone())
+            .push_bind(log.kv_hit_blocks)
+            .push_bind(log.kv_input_blocks)
+            .push_bind(log.trie_blocks)
+            .push_bind(log.trie_max_blocks)
+            .push_bind(log.request_tokens);
+    });
+
+    let result = qb.build().execute(pool).await?;
+    Ok(result.rows_affected())
+}
+
+/// Enqueue a log record through the writer. Public API.
+///
+/// Replaces the old `log_request(pool, log)` which spawned a per-request task.
+/// The hot path now does one mpsc `try_send` (sub-microsecond) and returns.
+///
+/// `None` writer (no DB configured) is a no-op, matching the prior behavior
+/// of `if let Some(pool) = pool { ... }`.
+pub fn log_request(writer: Option<&LogWriter>, log: RequestLog) {
+    if let Some(w) = writer {
+        w.try_enqueue(log);
     }
 }
 
@@ -170,7 +382,7 @@ pub fn log_error_with_usage(
     }
 
     log_request(
-        state.db_pool.clone(),
+        state.log_writer.as_deref(),
         RequestLog {
             request_id: request_id.clone(),
             key_hash: identity.key_hash.clone(),
