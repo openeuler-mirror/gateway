@@ -3174,6 +3174,8 @@
             <div class="form-group"><label>${t("form.plan.concurrency")} ${tip(t("tip.plan.concurrency"))}</label><input id="m-plan-concurrency" type="number" value="${p.concurrency_limit || ""}"></div>
             <div class="form-group"><label>${t("form.plan.rpm")} ${tip(t("tip.plan.rpm"))}</label><input id="m-plan-rpm" type="number" value="${p.rpm_limit || ""}"></div>
             <div class="form-group"><label>${t("form.plan.tpm")} ${tip(t("tip.plan.tpm"))}</label><input id="m-plan-tpm" type="number" value="${p.tpm_limit || ""}"></div>
+            <div class="form-group"><label>${t("form.plan.total_token")} ${tip(t("tip.plan.total_token"))}</label><input id="m-plan-total-token" type="number" value="${p.total_token_limit || ""}"></div>
+            <div class="form-group"><label>${t("form.plan.total_cost")} ${tip(t("tip.plan.total_cost"))}</label><input id="m-plan-total-cost" type="number" step="0.01" value="${p.total_cost_limit || ""}"></div>
           </div>
         </div>
         <div class="form-card">
@@ -3182,14 +3184,7 @@
             <div class="form-group field-full"><label>${t("form.plan.windows")} ${tip(t("tip.plan.windows"))}</label><div id="m-plan-windows-container" class="wl-editor"></div></div>
           </div>
         </div>
-        <div class="form-card">
-          <div class="form-card-title">${t("plan_card.total_limits")}</div>
-          <div class="form-card-grid">
-            <div class="form-group"><label>${t("form.plan.total_token")} ${tip(t("tip.plan.total_token"))}</label><input id="m-plan-total-token" type="number" value="${p.total_token_limit || ""}"></div>
-            <div class="form-group"><label>${t("form.plan.total_cost")} ${tip(t("tip.plan.total_cost"))}</label><input id="m-plan-total-cost" type="number" step="0.01" value="${p.total_cost_limit || ""}"></div>
-          </div>
-        </div>
-        <div class="form-card">
+        <div class="form-card form-card-full">
           <div class="form-card-title">${t("plan_card.schedule")}</div>
           <div class="form-card-grid">
             <div class="form-group field-full"><label>${t("form.plan.schedule")} ${tip(t("tip.plan.schedule"))}</label><div id="m-plan-schedule-container" class="schedule-editor"></div><div id="m-plan-schedule-warning" class="schedule-warning"></div></div>
@@ -3204,13 +3199,13 @@
     showModal(__html, { xwide: true });
 
     // ── Window-limits sub-editor ──────────────────────────
-    // Each row = one WindowLimit {counts, tokens, costs, window_secs}.
-    // Reads existing data via normalizeWindowLimit (handles both array and
-    // object forms); writes back as the verbose object form — the backend's
-    // deserialize_window_limit_vec accepts both, but the object form is the
-    // least ambiguous for human review in DB.
+    // A plan has exactly ONE window_limits entry. Pass the first item only.
+    // normalizeWindowLimit accepts both array and object forms so legacy DB
+    // rows written as `[[100, null, null, 60]]` still display correctly.
     const windowsContainer = document.getElementById("m-plan-windows-container");
-    const wlRows = Array.isArray(p.window_limits) ? p.window_limits.map(normalizeWindowLimit).filter(Boolean) : [];
+    const wlRows = Array.isArray(p.window_limits) && p.window_limits.length
+      ? [normalizeWindowLimit(p.window_limits[0])].filter(Boolean)
+      : [];
     renderWindowLimitsEditor(windowsContainer, wlRows, "wl");
 
     // ── Schedule sub-editor ───────────────────────────────
@@ -3267,129 +3262,114 @@
   }
 
   // ── Window-limits editor helpers ─────────────────────────
-  // Renders rows into the container; each row has 4 inputs + a × button.
-  // `prefix` is the DOM id prefix so the same helper can be reused for
-  // per-slot window_limits (prefix="slot-N-wl") without colliding with the
-  // plan-level editor (prefix="wl").
+  // Renders a single 4-field row: counts / tokens / costs / window_secs.
+  // Each plan has exactly ONE window_limits entry; each schedule slot has
+  // exactly ONE too. No add/remove buttons — the row count is fixed at 1
+  // so the UI matches the backend's effective_limits() logic (which picks the
+  // slot's window_limits[0] or falls back to the plan's window_limits[0]).
+  // If `rows` is empty, a blank row is rendered so the user can fill it in.
   function renderWindowLimitsEditor(container, rows, prefix) {
     if (!container) return;
-    const renderRow = (idx, w) => {
-      w = w || { counts: null, tokens: null, costs: null, window_secs: 60 };
-      return `
-        <div class="wl-row" data-wl-row="${idx}">
-          <input type="number" min="0" step="1" class="wl-input" data-wl-field="counts"
-            value="${w.counts == null ? "" : esc(String(w.counts))}" placeholder="${esc(t("form.plan.window_counts"))}">
-          <input type="number" min="0" step="1" class="wl-input" data-wl-field="tokens"
-            value="${w.tokens == null ? "" : esc(String(w.tokens))}" placeholder="${esc(t("form.plan.window_tokens"))}">
-          <input type="number" min="0" step="0.01" class="wl-input" data-wl-field="costs"
-            value="${w.costs == null ? "" : esc(String(w.costs))}" placeholder="${esc(t("form.plan.window_costs"))}">
-          <input type="number" min="1" step="1" class="wl-input wl-secs" data-wl-field="window_secs"
-            value="${w.window_secs == null ? "" : esc(String(w.window_secs))}" placeholder="${esc(t("form.plan.window_secs"))}">
-          <button type="button" class="wl-remove" aria-label="${esc(t("form.plan.remove_row"))}">×</button>
-        </div>`;
-    };
-    const state = rows.length ? rows.map(renderRow).join("") : `<div class="wl-empty">${esc(t("form.plan.window_limits_empty"))}</div>`;
+    const w = rows && rows.length ? rows[0] : { counts: null, tokens: null, costs: null, window_secs: 60 };
     container.innerHTML = `
-      <div class="wl-header">
-        <span>${esc(t("form.plan.window_counts"))}</span>
-        <span>${esc(t("form.plan.window_tokens"))}</span>
-        <span>${esc(t("form.plan.window_costs"))}</span>
-        <span>${esc(t("form.plan.window_secs"))}</span>
-        <span></span>
-      </div>
-      <div class="wl-rows">${state}</div>
-      <button type="button" class="wl-add btn-secondary btn-small">${esc(t("form.plan.add_window"))}</button>
-    `;
-    container.querySelector(".wl-add").addEventListener("click", () => {
-      const rowsEl = container.querySelector(".wl-rows");
-      const empty = rowsEl.querySelector(".wl-empty");
-      if (empty) empty.remove();
-      const nextIdx = rowsEl.querySelectorAll("[data-wl-row]").length;
-      rowsEl.insertAdjacentHTML("beforeend", renderRow(nextIdx, null));
-    });
-    container.querySelectorAll(".wl-remove").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        const row = btn.closest("[data-wl-row]");
-        if (row) row.remove();
-        // If we deleted the last row, show the empty-state hint so the
-        // header doesn't dangle visually.
-        if (!container.querySelector("[data-wl-row]")) {
-          const rowsEl = container.querySelector(".wl-rows");
-          if (rowsEl) rowsEl.innerHTML = `<div class="wl-empty">${esc(t("form.plan.window_limits_empty"))}</div>`;
-        }
-      });
-    });
+      <div class="wl-row" data-wl-row="0">
+        <label class="wl-cell">
+          <span class="wl-cell-label">${esc(t("form.plan.window_counts"))}</span>
+          <input type="number" min="0" step="1" class="wl-input" data-wl-field="counts"
+            value="${w.counts == null ? "" : esc(String(w.counts))}" placeholder="—">
+        </label>
+        <label class="wl-cell">
+          <span class="wl-cell-label">${esc(t("form.plan.window_tokens"))}</span>
+          <input type="number" min="0" step="1" class="wl-input" data-wl-field="tokens"
+            value="${w.tokens == null ? "" : esc(String(w.tokens))}" placeholder="—">
+        </label>
+        <label class="wl-cell">
+          <span class="wl-cell-label">${esc(t("form.plan.window_costs"))}</span>
+          <input type="number" min="0" step="0.01" class="wl-input" data-wl-field="costs"
+            value="${w.costs == null ? "" : esc(String(w.costs))}" placeholder="—">
+        </label>
+        <label class="wl-cell wl-cell-secs">
+          <span class="wl-cell-label">${esc(t("form.plan.window_secs"))}</span>
+          <input type="number" min="1" step="1" class="wl-input" data-wl-field="window_secs"
+            value="${w.window_secs == null ? "" : esc(String(w.window_secs))}" placeholder="60">
+        </label>
+      </div>`;
   }
 
-  // Collect window_limits from a sub-editor container into the object form.
-  // Drops fully-empty rows (no dimension set) so saving a "blank" editor
-  // produces `[]` rather than `[{counts:null,tokens:null,costs:null,window_secs:60}]`.
+  // Collect window_limits from a sub-editor container. Returns [] when the
+  // single row is entirely empty (no limits set), otherwise [{...}].
   function collectWindowLimits(container) {
     if (!container) return [];
-    const out = [];
-    container.querySelectorAll("[data-wl-row]").forEach((row) => {
-      const get = (f) => {
-        const el = row.querySelector(`[data-wl-field="${f}"]`);
-        const v = el && el.value.trim();
-        if (!v) return null;
-        return f === "costs" ? Number(v) : Math.max(0, Math.floor(Number(v)));
-      };
-      const counts = get("counts");
-      const tokens = get("tokens");
-      const costs = get("costs");
-      const secsRaw = row.querySelector('[data-wl-field="window_secs"]');
-      const secsVal = secsRaw && secsRaw.value.trim();
-      const window_secs = secsVal ? Math.max(1, Math.floor(Number(secsVal))) : 60;
-      // Skip rows where the user didn't fill any of the 3 limit dimensions.
-      // window_secs alone is meaningless.
-      if (counts == null && tokens == null && costs == null) return;
-      out.push({ counts, tokens, costs, window_secs });
-    });
-    return out;
+    const row = container.querySelector("[data-wl-row]");
+    if (!row) return [];
+    const get = (f) => {
+      const el = row.querySelector(`[data-wl-field="${f}"]`);
+      const v = el && el.value.trim();
+      if (!v) return null;
+      return f === "costs" ? Number(v) : Math.max(0, Math.floor(Number(v)));
+    };
+    const counts = get("counts");
+    const tokens = get("tokens");
+    const costs = get("costs");
+    const secsRaw = row.querySelector('[data-wl-field="window_secs"]');
+    const secsVal = secsRaw && secsRaw.value.trim();
+    const window_secs = secsVal ? Math.max(1, Math.floor(Number(secsVal))) : 60;
+    // window_secs alone is meaningless — only emit an entry if at least one
+    // limit dimension is set. Otherwise the backend would treat the plan /
+    // slot as having a window cap when the user actually left it blank.
+    if (counts == null && tokens == null && costs == null) return [];
+    return [{ counts, tokens, costs, window_secs }];
   }
 
   // ── Schedule sub-editor helpers ─────────────────────────
   function renderScheduleEditor(container, warningEl, slots) {
     if (!container) return;
-    const renderSlot = (idx, s) => {
+    // Note: signature is (slot, idx) so it can be passed directly to
+    // Array.prototype.map (which calls back with (element, index)).
+    // Swapping these two would render "Slot [object Object]1" and read all
+    // field values off the number index — silent data-loss bug.
+    const renderSlot = (s, idx) => {
       s = s || {};
-      // Parse hours "HH:MM-HH:MM" into start/end for <input type="time">.
-      // Tolerate missing/odd values — never block the editor from rendering.
+      // Parse hours "H:MM-HH:MM" (backend tolerates single-digit hours like
+      // "9:00-21:00") into start/end for <input type="time">, which REQUIRES
+      // the strict "HH:MM" 2-digit form. Without zero-pad the input renders
+      // empty and the user thinks their config was lost.
       let start = "", end = "";
       if (s.hours && s.hours.includes("-")) {
         const [a, b] = s.hours.split("-");
-        start = (a || "").trim();
-        end = (b || "").trim();
+        start = padTime((a || "").trim());
+        end = padTime((b || "").trim());
       }
       const crossBadge = start && end && toMinutes(end) <= toMinutes(start)
         ? `<span class="slot-cross-badge">${esc(t("form.plan.slot_cross_midnight"))}</span>` : "";
-      // Per-slot window-limits sub-editor: reuse renderWindowLimitsEditor
-      // with a unique prefix so its DOM ids don't collide with the plan-level
-      // editor or other slots.
+      // Per-slot window-limits: a slot has at most ONE entry — render it as
+      // a single row, no add/remove buttons.
       const wlRows = Array.isArray(s.window_limits) ? s.window_limits.map(normalizeWindowLimit).filter(Boolean) : [];
       return `
         <div class="schedule-slot-card" data-slot-idx="${idx}">
           <div class="slot-card-header">
             <span class="slot-card-title">${esc("Slot " + (idx + 1))}</span>
             <span class="slot-time">
-              <input type="time" class="slot-time-input" data-slot-field="start" value="${esc(start)}" aria-label="${esc(t("form.plan.slot_start"))}">
+              <input type="time" step="600" class="slot-time-input" data-slot-field="start" value="${esc(start)}" aria-label="${esc(t("form.plan.slot_start"))}">
               <span class="slot-dash">—</span>
-              <input type="time" class="slot-time-input" data-slot-field="end" value="${esc(end)}" aria-label="${esc(t("form.plan.slot_end"))}">
+              <input type="time" step="600" class="slot-time-input" data-slot-field="end" value="${esc(end)}" aria-label="${esc(t("form.plan.slot_end"))}">
               ${crossBadge}
             </span>
             <button type="button" class="slot-remove" aria-label="${esc(t("form.plan.remove_row"))}">×</button>
           </div>
-          <div class="slot-card-grid">
-            <label>${esc(t("form.plan.concurrency"))}<input type="number" min="0" step="1" class="slot-input" data-slot-field="concurrency_limit"
-              value="${s.concurrency_limit == null ? "" : esc(String(s.concurrency_limit))}"></label>
-            <label>${esc(t("form.plan.rpm"))}<input type="number" min="0" step="1" class="slot-input" data-slot-field="rpm_limit"
-              value="${s.rpm_limit == null ? "" : esc(String(s.rpm_limit))}"></label>
-            <label>${esc(t("form.plan.tpm"))}<input type="number" min="0" step="1" class="slot-input" data-slot-field="tpm_limit"
-              value="${s.tpm_limit == null ? "" : esc(String(s.tpm_limit))}"></label>
-          </div>
-          <div class="slot-card-section">
-            <div class="slot-section-label">${esc(t("form.plan.windows"))}</div>
-            <div class="slot-wl-editor" data-slot-wl="${idx}"></div>
+          <div class="slot-card-body">
+            <div class="slot-card-grid">
+              <label class="slot-cell">${esc(t("form.plan.concurrency"))}<input type="number" min="0" step="1" class="slot-input" data-slot-field="concurrency_limit"
+                value="${s.concurrency_limit == null ? "" : esc(String(s.concurrency_limit))}"></label>
+              <label class="slot-cell">${esc(t("form.plan.rpm"))}<input type="number" min="0" step="1" class="slot-input" data-slot-field="rpm_limit"
+                value="${s.rpm_limit == null ? "" : esc(String(s.rpm_limit))}"></label>
+              <label class="slot-cell">${esc(t("form.plan.tpm"))}<input type="number" min="0" step="1" class="slot-input" data-slot-field="tpm_limit"
+                value="${s.tpm_limit == null ? "" : esc(String(s.tpm_limit))}"></label>
+            </div>
+            <div class="slot-card-section">
+              <div class="slot-section-label">${esc(t("form.plan.windows"))} ${tip(t("tip.plan.windows"))}</div>
+              <div class="slot-wl-editor" data-slot-wl="${idx}"></div>
+            </div>
           </div>
         </div>`;
     };
@@ -3417,7 +3397,7 @@
     // Wire up add button.
     container.querySelector(".slot-add").addEventListener("click", () => {
       const nextIdx = container.querySelectorAll("[data-slot-idx]").length;
-      container.insertAdjacentHTML("beforeend", renderSlot(nextIdx, {}));
+      container.insertAdjacentHTML("beforeend", renderSlot({}, nextIdx));
       const newCard = container.querySelector(`[data-slot-idx="${nextIdx}"]`);
       const wlHost = newCard.querySelector("[data-slot-wl]");
       renderWindowLimitsEditor(wlHost, [], "slot-" + nextIdx + "-wl");
@@ -3429,6 +3409,17 @@
         renderScheduleWarning(warningEl, container, slots2);
       });
     });
+  }
+
+  // Pad "9:00" → "09:00" for <input type="time"> which requires strict HH:MM.
+  // Tolerates already-padded values and odd whitespace.
+  function padTime(hm) {
+    if (!hm || !hm.includes(":")) return hm || "";
+    const [h, ...rest] = hm.split(":");
+    const m = rest.join(":");
+    const hNum = parseInt(h, 10);
+    if (isNaN(hNum)) return hm;
+    return String(hNum).padStart(2, "0") + ":" + m;
   }
 
   // Renumber slot cards after add/remove so the "Slot N" labels stay in order.
