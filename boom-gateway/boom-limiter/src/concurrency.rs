@@ -179,10 +179,68 @@ impl RateLimitPlan {
         }
         windows
     }
+
+    /// Validate that no two schedule slots overlap in time.
+    ///
+    /// Each slot's `hours` field is parsed into a minute-range within a 24h day.
+    /// Cross-midnight slots (e.g. "21:00-9:00") are split into two ranges
+    /// `[start, 1440) ∪ [0, end)`. Two slots conflict if any of their ranges
+    /// overlap. Returns `Err(message)` on the first conflict found.
+    ///
+    /// This is the server-side guard: the dashboard frontend does the same
+    /// check live, but a client could bypass it by calling `PUT /admin/plans`
+    /// directly. Without this guard, `effective_limits` would silently pick
+    /// the first matching slot and the user's intended second-slot limits would
+    /// never take effect — a confusing failure mode.
+    pub fn validate_schedule_overlap(&self) -> Result<(), String> {
+        let ranges: Vec<(usize, u32, u32)> = self
+            .schedule
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| parse_hours(&s.hours).map(|(start, end)| (i, start, end)))
+            .collect();
+
+        for a in 0..ranges.len() {
+            for b in (a + 1)..ranges.len() {
+                let (i, a_start, a_end) = ranges[a];
+                let (j, b_start, b_end) = ranges[b];
+                let a_ranges = expand_range(a_start, a_end);
+                let b_ranges = expand_range(b_start, b_end);
+                let overlap = a_ranges.iter().any(|ra| {
+                    b_ranges
+                        .iter()
+                        .any(|rb| ra.0.max(rb.0) < ra.1.min(rb.1))
+                });
+                if overlap {
+                    return Err(format!(
+                        "schedule slots {} and {} overlap in time",
+                        i + 1,
+                        j + 1
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Split a minute-range into 1-or-2 within-day intervals.
+/// `(9:00, 21:00)` → `[(540, 1260)]`; `(21:00, 9:00)` → `[(1260, 1440), (0, 540)]`.
+fn expand_range(start: u32, end: u32) -> Vec<(u32, u32)> {
+    if start < end {
+        vec![(start, end)]
+    } else if start == end {
+        // "9:00-9:00" is treated as a full-day range (no overlap with self
+        // beyond the obvious — caller would have already rejected via index
+        // pair check since we skip same-index pairs).
+        vec![(0, 1440)]
+    } else {
+        vec![(start, 1440), (0, end)]
+    }
 }
 
 /// A time-based schedule slot within a plan.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ScheduleSlot {
     /// Time range, e.g. "9:00-21:00" or "21:00-9:00" (cross-midnight).
     pub hours: String,
@@ -1428,5 +1486,47 @@ mod tests {
                 schedule: Vec::new(),
             }
         }
+    }
+
+    /// Non-overlapping slots must pass — covers the cross-midnight case:
+    /// "9:00-21:00" and "21:00-9:00" partition the full day with no gap and
+    /// no overlap. This is the canonical "day/night split" config.
+    #[test]
+    fn test_schedule_overlap_ok_for_complementary_slots() {
+        let mut plan = RateLimitPlan::default_for_test();
+        plan.schedule = vec![
+            ScheduleSlot { hours: "9:00-21:00".to_string(), ..Default::default() },
+            ScheduleSlot { hours: "21:00-9:00".to_string(), ..Default::default() },
+        ];
+        assert!(plan.validate_schedule_overlap().is_ok());
+    }
+
+    /// Overlapping slots must be rejected — "9:00-21:00" and "10:00-11:00"
+    /// share [600, 660). This is the bug the boss asked to prevent.
+    #[test]
+    fn test_schedule_overlap_rejects_nested_range() {
+        let mut plan = RateLimitPlan::default_for_test();
+        plan.schedule = vec![
+            ScheduleSlot { hours: "9:00-21:00".to_string(), ..Default::default() },
+            ScheduleSlot { hours: "10:00-11:00".to_string(), ..Default::default() },
+        ];
+        let err = plan.validate_schedule_overlap().unwrap_err();
+        assert!(err.contains("overlap"), "error must mention overlap: {}", err);
+        // Slot numbers are 1-indexed for user-facing display.
+        assert!(err.contains("1") && err.contains("2"));
+    }
+
+    /// Slots 1 and 3 are both "21:00-9:00" — both cover [1260,1440)∪[0,540),
+    /// so they overlap everywhere. Must reject. Slot 2 (9:00-21:00) doesn't
+    /// matter — the pair (1,3) is enough to fail.
+    #[test]
+    fn test_schedule_overlap_rejects_identical_cross_midnight_pair() {
+        let mut plan = RateLimitPlan::default_for_test();
+        plan.schedule = vec![
+            ScheduleSlot { hours: "21:00-9:00".to_string(), ..Default::default() },
+            ScheduleSlot { hours: "9:00-21:00".to_string(), ..Default::default() },
+            ScheduleSlot { hours: "21:00-9:00".to_string(), ..Default::default() },
+        ];
+        assert!(plan.validate_schedule_overlap().is_err());
     }
 }

@@ -1,4 +1,5 @@
 use axum::extract::{Multipart, Path, Query};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Extension;
 use axum::Json;
@@ -130,7 +131,7 @@ pub async fn upsert_plan(
     _session: AdminSession,
     Extension(state): Extension<std::sync::Arc<DashboardState>>,
     Json(req): Json<UpsertPlanRequest>,
-) -> Json<Value> {
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let plan = boom_limiter::RateLimitPlan {
         name: req.name.clone(),
         r#type: req.r#type,
@@ -144,6 +145,13 @@ pub async fn upsert_plan(
         schedule: req.schedule.clone(),
     };
 
+    if let Err(msg) = plan.validate_schedule_overlap() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": msg })),
+        ));
+    }
+
     // Persist to DB via PlanStore.
     if let Some(ref pool) = state.db_pool {
         if let Err(e) = state.plan_store.upsert_plan_db(pool, &plan).await {
@@ -154,7 +162,7 @@ pub async fn upsert_plan(
     }
 
     let _ = state.admin_tx.send(crate::state::AdminCommand::ConfigChanged).await;
-    Json(json!({"ok": true, "plan_name": req.name}))
+    Ok(Json(json!({"ok": true, "plan_name": req.name})))
 }
 
 pub async fn delete_plan(

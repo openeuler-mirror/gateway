@@ -1151,6 +1151,118 @@ div[id$="-table-wrap"]:not(.bare) > table > thead:first-child > tr:first-child >
 .form-card-grid .field-full input,
 .form-card-grid .field-full select,
 .form-card-grid .field-full textarea { width: 100%; }
+
+/* ── Window-limits editor (multi-row, in Plan modal) ───── */
+.wl-editor { display: flex; flex-direction: column; gap: 8px; }
+.wl-header {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr 1fr 28px;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text2);
+  padding: 0 2px;
+}
+.wl-rows { display: flex; flex-direction: column; gap: 6px; }
+.wl-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr 1fr 28px;
+  gap: 6px;
+  align-items: center;
+}
+.wl-input {
+  width: 100%; padding: 6px 8px; background: var(--surface2);
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  font-size: 12px; color: var(--text);
+  font-family: var(--mono);
+}
+.wl-input:focus { border-color: var(--primary); box-shadow: 0 0 0 2px var(--primary-bg); outline: none; }
+.wl-remove {
+  width: 26px; height: 26px; padding: 0; line-height: 1;
+  background: var(--surface3); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); color: var(--text2); cursor: pointer;
+  font-size: 14px; transition: all var(--transition);
+}
+.wl-remove:hover { color: var(--danger); border-color: var(--danger); background: var(--danger-bg); }
+.wl-empty {
+  padding: 14px 10px; text-align: center;
+  color: var(--text3); font-size: 12px;
+  background: var(--surface2); border: 1px dashed var(--border);
+  border-radius: var(--radius-sm);
+}
+
+/* ── Schedule editor (per-slot cards, in Plan modal) ────── */
+.schedule-editor { display: flex; flex-direction: column; gap: 10px; }
+.schedule-slot-card {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface2);
+  padding: 12px;
+  transition: border-color var(--transition), background var(--transition);
+}
+.schedule-slot-card.slot-conflict {
+  border-color: var(--danger);
+  background: var(--danger-bg);
+}
+.slot-card-header {
+  display: flex; align-items: center; gap: 10px;
+  margin-bottom: 10px;
+}
+.slot-card-title { font-weight: 600; font-size: 13px; color: var(--text); min-width: 56px; }
+.slot-time { display: flex; align-items: center; gap: 6px; flex: 1; }
+.slot-time-input {
+  padding: 6px 8px; background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); font-size: 12px; color: var(--text);
+  font-family: var(--mono);
+}
+.slot-time-input:focus { border-color: var(--primary); box-shadow: 0 0 0 2px var(--primary-bg); outline: none; }
+.slot-dash { color: var(--text3); }
+.slot-cross-badge {
+  padding: 2px 8px; font-size: 10px; font-weight: 600;
+  color: var(--primary); background: var(--primary-bg);
+  border-radius: 10px; border: 1px solid var(--primary);
+}
+.slot-remove {
+  width: 26px; height: 26px; padding: 0; line-height: 1;
+  background: var(--surface3); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); color: var(--text2); cursor: pointer;
+  font-size: 14px; transition: all var(--transition);
+}
+.slot-remove:hover { color: var(--danger); border-color: var(--danger); background: var(--danger-bg); }
+.slot-card-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.slot-card-grid label {
+  display: flex; flex-direction: column; gap: 4px;
+  font-size: 11px; color: var(--text2);
+}
+.slot-input {
+  width: 100%; padding: 6px 8px; background: var(--surface);
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  font-size: 12px; color: var(--text); font-family: var(--mono);
+}
+.slot-input:focus { border-color: var(--primary); box-shadow: 0 0 0 2px var(--primary-bg); outline: none; }
+.slot-card-section { border-top: 1px dashed var(--border); padding-top: 8px; }
+.slot-section-label {
+  font-size: 11px; font-weight: 600; color: var(--text2); margin-bottom: 6px;
+}
+.schedule-warning {
+  margin-top: 6px;
+  padding: 8px 10px;
+  background: var(--danger-bg);
+  border: 1px solid var(--danger);
+  border-radius: var(--radius-sm);
+  color: var(--danger);
+  font-size: 12px;
+}
+.schedule-warning:empty { display: none; }
+.schedule-warning div { padding: 1px 0; }
+@media (max-width: 720px) {
+  .slot-card-grid { grid-template-columns: 1fr; }
+}
 .form-card-actions {
   display: flex;
   justify-content: flex-end;
@@ -1404,6 +1516,11 @@ td.kvc-prefix .kvc-sub { font-size: 11px; color: var(--text3); }
 }
 
 /* ── Field tooltip (?) ──────────────────────────────────── */
+/* The hint text itself is rendered by the global #vtip element (JS-positioned,
+   viewport-clamped — see setupViewportTooltip in app.js). The ? icon here is
+   just the trigger; we no longer use a CSS ::after pseudo-element because it
+   cannot escape `overflow:auto` containers (modals, scroll panels) and would
+   get clipped at the screen edges. */
 .field-tip {
   display: inline-block;
   width: 16px; height: 16px; line-height: 16px; text-align: center;
@@ -1414,20 +1531,6 @@ td.kvc-prefix .kvc-sub { font-size: 11px; color: var(--text3); }
   position: relative; transition: all var(--transition);
 }
 .field-tip:hover { color: var(--primary); border-color: var(--primary); background: var(--primary-bg); }
-.field-tip::after {
-  content: attr(data-tip);
-  position: absolute; left: 50%; bottom: calc(100% + 8px);
-  transform: translateX(-50%);
-  background: var(--text); color: var(--text-inv);
-  font-size: 12px; font-weight: 400; line-height: 1.5;
-  letter-spacing: 0; text-transform: none;
-  padding: 8px 12px; border-radius: 8px;
-  white-space: pre-wrap; width: max-content; max-width: 320px;
-  z-index: 200; pointer-events: none;
-  opacity: 0; transition: opacity .15s ease;
-  box-shadow: var(--shadow-md);
-}
-.field-tip:hover::after { opacity: 1; }
 
 /* ── Table cell tooltip ─────────────────────────────────── */
 .cell-tip { position: relative; cursor: default; }
