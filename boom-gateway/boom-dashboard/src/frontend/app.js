@@ -148,13 +148,20 @@
     document.documentElement.setAttribute("lang", current === "en" ? "en" : "zh-CN");
   }
 
-  // ── Viewport-aware tooltip for .cell-tip ──────────────
+  // ── Viewport-aware tooltip for .cell-tip and .field-tip ──────
   // Positions tooltip above or below the element depending on available space.
+  // Both the table-cell hover hints and the form-field "?" buttons route
+  // through this single JS-positioned tooltip so that:
+  //   1. The tooltip can escape containers with `overflow:auto` (modals,
+  //      scrollable panels) — a CSS `::after` pseudo-element cannot.
+  //   2. The same viewport-clamping logic applies everywhere, so a "?"
+  //      button near the right edge or bottom of the screen no longer
+  //      has its hint clipped.
   function setupViewportTooltip() {
     var tip = document.getElementById("vtip");
     if (!tip) return;
     document.addEventListener("mouseover", function(e) {
-      var el = e.target.closest(".cell-tip");
+      var el = e.target.closest(".cell-tip, .field-tip");
       if (!el || !el.dataset.tip) { tip.classList.remove("show"); return; }
       tip.textContent = el.dataset.tip;
       tip.classList.add("show");
@@ -178,7 +185,7 @@
       tip.style.left = left + "px";
     });
     document.addEventListener("mouseout", function(e) {
-      var el = e.target.closest(".cell-tip");
+      var el = e.target.closest(".cell-tip, .field-tip");
       if (el) tip.classList.remove("show");
     });
   }
@@ -3167,25 +3174,20 @@
             <div class="form-group"><label>${t("form.plan.concurrency")} ${tip(t("tip.plan.concurrency"))}</label><input id="m-plan-concurrency" type="number" value="${p.concurrency_limit || ""}"></div>
             <div class="form-group"><label>${t("form.plan.rpm")} ${tip(t("tip.plan.rpm"))}</label><input id="m-plan-rpm" type="number" value="${p.rpm_limit || ""}"></div>
             <div class="form-group"><label>${t("form.plan.tpm")} ${tip(t("tip.plan.tpm"))}</label><input id="m-plan-tpm" type="number" value="${p.tpm_limit || ""}"></div>
-          </div>
-        </div>
-        <div class="form-card">
-          <div class="form-card-title">${t("plan_card.window_limits")}</div>
-          <div class="form-card-grid">
-            <div class="form-group field-full"><label>${t("form.plan.windows")} ${tip(t("tip.plan.windows"))}</label><textarea id="m-plan-windows" rows="3" style="font-family:var(--mono);font-size:12px">${esc(JSON.stringify(p.window_limits || [], null, 2))}</textarea></div>
-          </div>
-        </div>
-        <div class="form-card">
-          <div class="form-card-title">${t("plan_card.total_limits")}</div>
-          <div class="form-card-grid">
             <div class="form-group"><label>${t("form.plan.total_token")} ${tip(t("tip.plan.total_token"))}</label><input id="m-plan-total-token" type="number" value="${p.total_token_limit || ""}"></div>
             <div class="form-group"><label>${t("form.plan.total_cost")} ${tip(t("tip.plan.total_cost"))}</label><input id="m-plan-total-cost" type="number" step="0.01" value="${p.total_cost_limit || ""}"></div>
           </div>
         </div>
         <div class="form-card">
+          <div class="form-card-title">${t("plan_card.window_limits")}</div>
+          <div class="form-card-grid">
+            <div class="form-group field-full"><label>${t("form.plan.windows")} ${tip(t("tip.plan.windows"))}</label><div id="m-plan-windows-container" class="wl-editor"></div></div>
+          </div>
+        </div>
+        <div class="form-card form-card-full">
           <div class="form-card-title">${t("plan_card.schedule")}</div>
           <div class="form-card-grid">
-            <div class="form-group field-full"><label>${t("form.plan.schedule")} ${tip(t("tip.plan.schedule"))}</label><textarea id="m-plan-schedule" rows="4" style="font-family:var(--mono);font-size:12px">${esc(JSON.stringify(p.schedule || [], null, 2))}</textarea></div>
+            <div class="form-group field-full"><label>${t("form.plan.schedule")} ${tip(t("tip.plan.schedule"))}</label><div id="m-plan-schedule-container" class="schedule-editor"></div><div id="m-plan-schedule-warning" class="schedule-warning"></div></div>
           </div>
         </div>
       </div>
@@ -3195,10 +3197,48 @@
       </div>
     `;
     showModal(__html, { xwide: true });
+
+    // ── Window-limits sub-editor ──────────────────────────
+    // A plan has exactly ONE window_limits entry. Pass the first item only.
+    // normalizeWindowLimit accepts both array and object forms so legacy DB
+    // rows written as `[[100, null, null, 60]]` still display correctly.
+    const windowsContainer = document.getElementById("m-plan-windows-container");
+    const wlRows = Array.isArray(p.window_limits) && p.window_limits.length
+      ? [normalizeWindowLimit(p.window_limits[0])].filter(Boolean)
+      : [];
+    renderWindowLimitsEditor(windowsContainer, wlRows, "wl");
+
+    // ── Schedule sub-editor ───────────────────────────────
+    // Each slot card = one ScheduleSlot {hours, concurrency, rpm, tpm, window_limits}.
+    // hours is rendered as two <input type="time">; on submit we join them
+    // back into the "HH:MM-HH:MM" string the backend expects.
+    const scheduleContainer = document.getElementById("m-plan-schedule-container");
+    const scheduleWarning = document.getElementById("m-plan-schedule-warning");
+    const slotRows = Array.isArray(p.schedule) ? p.schedule.slice() : [];
+    renderScheduleEditor(scheduleContainer, scheduleWarning, slotRows);
+
+    // Re-run schedule overlap validation on every input change so the
+    // warning surfaces live (not only at submit time).
+    const revalidate = () => {
+      const slots = collectSchedule(scheduleContainer);
+      renderScheduleWarning(scheduleWarning, scheduleContainer, slots);
+    };
+    scheduleContainer.addEventListener("input", revalidate);
+    revalidate();
+
     document.getElementById("m-plan-submit").addEventListener("click", async () => {
       try {
-        const windows = JSON.parse(document.getElementById("m-plan-windows").value || "[]");
-        const schedule = JSON.parse(document.getElementById("m-plan-schedule").value || "[]");
+        const windows = collectWindowLimits(windowsContainer);
+        const schedule = collectSchedule(scheduleContainer);
+        const conflicts = validateScheduleOverlap(schedule);
+        if (conflicts.length) {
+          renderScheduleWarning(scheduleWarning, scheduleContainer, schedule);
+          // Surface the first conflict to the user as an alert so they don't
+          // have to scroll to spot the red border.
+          const c = conflicts[0];
+          alert(t("form.plan.schedule_conflict", { i: c.i + 1, j: c.j + 1 }));
+          return;
+        }
         await api("/admin/plans", {
           method: "PUT",
           body: JSON.stringify({
@@ -3219,6 +3259,263 @@
         loadPlans();
       } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
     });
+  }
+
+  // ── Window-limits editor helpers ─────────────────────────
+  // Renders a single 4-field row: counts / tokens / costs / window_secs.
+  // Each plan has exactly ONE window_limits entry; each schedule slot has
+  // exactly ONE too. No add/remove buttons — the row count is fixed at 1
+  // so the UI matches the backend's effective_limits() logic (which picks the
+  // slot's window_limits[0] or falls back to the plan's window_limits[0]).
+  // If `rows` is empty, a blank row is rendered so the user can fill it in.
+  function renderWindowLimitsEditor(container, rows, prefix) {
+    if (!container) return;
+    const w = rows && rows.length ? rows[0] : { counts: null, tokens: null, costs: null, window_secs: 60 };
+    container.innerHTML = `
+      <div class="wl-row" data-wl-row="0">
+        <label class="wl-cell">
+          <span class="wl-cell-label">${esc(t("form.plan.window_counts"))}</span>
+          <input type="number" min="0" step="1" class="wl-input" data-wl-field="counts"
+            value="${w.counts == null ? "" : esc(String(w.counts))}" placeholder="—">
+        </label>
+        <label class="wl-cell">
+          <span class="wl-cell-label">${esc(t("form.plan.window_tokens"))}</span>
+          <input type="number" min="0" step="1" class="wl-input" data-wl-field="tokens"
+            value="${w.tokens == null ? "" : esc(String(w.tokens))}" placeholder="—">
+        </label>
+        <label class="wl-cell">
+          <span class="wl-cell-label">${esc(t("form.plan.window_costs"))}</span>
+          <input type="number" min="0" step="0.01" class="wl-input" data-wl-field="costs"
+            value="${w.costs == null ? "" : esc(String(w.costs))}" placeholder="—">
+        </label>
+        <label class="wl-cell wl-cell-secs">
+          <span class="wl-cell-label">${esc(t("form.plan.window_secs"))}</span>
+          <input type="number" min="1" step="1" class="wl-input" data-wl-field="window_secs"
+            value="${w.window_secs == null ? "" : esc(String(w.window_secs))}" placeholder="60">
+        </label>
+      </div>`;
+  }
+
+  // Collect window_limits from a sub-editor container. Returns [] when the
+  // single row is entirely empty (no limits set), otherwise [{...}].
+  function collectWindowLimits(container) {
+    if (!container) return [];
+    const row = container.querySelector("[data-wl-row]");
+    if (!row) return [];
+    const get = (f) => {
+      const el = row.querySelector(`[data-wl-field="${f}"]`);
+      const v = el && el.value.trim();
+      if (!v) return null;
+      return f === "costs" ? Number(v) : Math.max(0, Math.floor(Number(v)));
+    };
+    const counts = get("counts");
+    const tokens = get("tokens");
+    const costs = get("costs");
+    const secsRaw = row.querySelector('[data-wl-field="window_secs"]');
+    const secsVal = secsRaw && secsRaw.value.trim();
+    const window_secs = secsVal ? Math.max(1, Math.floor(Number(secsVal))) : 60;
+    // window_secs alone is meaningless — only emit an entry if at least one
+    // limit dimension is set. Otherwise the backend would treat the plan /
+    // slot as having a window cap when the user actually left it blank.
+    if (counts == null && tokens == null && costs == null) return [];
+    return [{ counts, tokens, costs, window_secs }];
+  }
+
+  // ── Schedule sub-editor helpers ─────────────────────────
+  function renderScheduleEditor(container, warningEl, slots) {
+    if (!container) return;
+    // Note: signature is (slot, idx) so it can be passed directly to
+    // Array.prototype.map (which calls back with (element, index)).
+    // Swapping these two would render "Slot [object Object]1" and read all
+    // field values off the number index — silent data-loss bug.
+    const renderSlot = (s, idx) => {
+      s = s || {};
+      // Parse hours "H:MM-HH:MM" (backend tolerates single-digit hours like
+      // "9:00-21:00") into start/end for <input type="time">, which REQUIRES
+      // the strict "HH:MM" 2-digit form. Without zero-pad the input renders
+      // empty and the user thinks their config was lost.
+      let start = "", end = "";
+      if (s.hours && s.hours.includes("-")) {
+        const [a, b] = s.hours.split("-");
+        start = padTime((a || "").trim());
+        end = padTime((b || "").trim());
+      }
+      const crossBadge = start && end && toMinutes(end) <= toMinutes(start)
+        ? `<span class="slot-cross-badge">${esc(t("form.plan.slot_cross_midnight"))}</span>` : "";
+      // Per-slot window-limits: a slot has at most ONE entry — render it as
+      // a single row, no add/remove buttons.
+      const wlRows = Array.isArray(s.window_limits) ? s.window_limits.map(normalizeWindowLimit).filter(Boolean) : [];
+      return `
+        <div class="schedule-slot-card" data-slot-idx="${idx}">
+          <div class="slot-card-header">
+            <span class="slot-card-title">${esc("Slot " + (idx + 1))}</span>
+            <span class="slot-time">
+              <input type="time" step="600" class="slot-time-input" data-slot-field="start" value="${esc(start)}" aria-label="${esc(t("form.plan.slot_start"))}">
+              <span class="slot-dash">—</span>
+              <input type="time" step="600" class="slot-time-input" data-slot-field="end" value="${esc(end)}" aria-label="${esc(t("form.plan.slot_end"))}">
+              ${crossBadge}
+            </span>
+            <button type="button" class="slot-remove" aria-label="${esc(t("form.plan.remove_row"))}">×</button>
+          </div>
+          <div class="slot-card-body">
+            <div class="slot-card-grid">
+              <label class="slot-cell">${esc(t("form.plan.concurrency"))}<input type="number" min="0" step="1" class="slot-input" data-slot-field="concurrency_limit"
+                value="${s.concurrency_limit == null ? "" : esc(String(s.concurrency_limit))}"></label>
+              <label class="slot-cell">${esc(t("form.plan.rpm"))}<input type="number" min="0" step="1" class="slot-input" data-slot-field="rpm_limit"
+                value="${s.rpm_limit == null ? "" : esc(String(s.rpm_limit))}"></label>
+              <label class="slot-cell">${esc(t("form.plan.tpm"))}<input type="number" min="0" step="1" class="slot-input" data-slot-field="tpm_limit"
+                value="${s.tpm_limit == null ? "" : esc(String(s.tpm_limit))}"></label>
+            </div>
+            <div class="slot-card-section">
+              <div class="slot-section-label">${esc(t("form.plan.windows"))} ${tip(t("tip.plan.windows"))}</div>
+              <div class="slot-wl-editor" data-slot-wl="${idx}"></div>
+            </div>
+          </div>
+        </div>`;
+    };
+    const slotHtml = slots.map(renderSlot).join("");
+    container.innerHTML = slotHtml + `<button type="button" class="slot-add btn-secondary btn-small">${esc(t("form.plan.add_slot"))}</button>`;
+    // Wire up per-slot window-limits sub-editors.
+    container.querySelectorAll("[data-slot-wl]").forEach((el) => {
+      const slotIdx = Number(el.getAttribute("data-slot-wl"));
+      const wlRows = Array.isArray(slots[slotIdx] && slots[slotIdx].window_limits)
+        ? slots[slotIdx].window_limits.map(normalizeWindowLimit).filter(Boolean)
+        : [];
+      renderWindowLimitsEditor(el, wlRows, "slot-" + slotIdx + "-wl");
+    });
+    // Wire up remove buttons (after sub-editors render so children retain their
+    // own listeners; removing the parent card tears them down automatically).
+    container.querySelectorAll(".slot-remove").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const card = btn.closest("[data-slot-idx]");
+        if (card) card.remove();
+        renumberScheduleSlots(container);
+        const slots2 = collectSchedule(container);
+        renderScheduleWarning(warningEl, container, slots2);
+      });
+    });
+    // Wire up add button.
+    container.querySelector(".slot-add").addEventListener("click", () => {
+      const nextIdx = container.querySelectorAll("[data-slot-idx]").length;
+      container.insertAdjacentHTML("beforeend", renderSlot({}, nextIdx));
+      const newCard = container.querySelector(`[data-slot-idx="${nextIdx}"]`);
+      const wlHost = newCard.querySelector("[data-slot-wl]");
+      renderWindowLimitsEditor(wlHost, [], "slot-" + nextIdx + "-wl");
+      const rm = newCard.querySelector(".slot-remove");
+      rm.addEventListener("click", () => {
+        newCard.remove();
+        renumberScheduleSlots(container);
+        const slots2 = collectSchedule(container);
+        renderScheduleWarning(warningEl, container, slots2);
+      });
+    });
+  }
+
+  // Pad "9:00" → "09:00" for <input type="time"> which requires strict HH:MM.
+  // Tolerates already-padded values and odd whitespace.
+  function padTime(hm) {
+    if (!hm || !hm.includes(":")) return hm || "";
+    const [h, ...rest] = hm.split(":");
+    const m = rest.join(":");
+    const hNum = parseInt(h, 10);
+    if (isNaN(hNum)) return hm;
+    return String(hNum).padStart(2, "0") + ":" + m;
+  }
+
+  // Renumber slot cards after add/remove so the "Slot N" labels stay in order.
+  // Doesn't touch the underlying data — collectSchedule reads from current DOM.
+  function renumberScheduleSlots(container) {
+    if (!container) return;
+    container.querySelectorAll("[data-slot-idx]").forEach((card, i) => {
+      card.setAttribute("data-slot-idx", String(i));
+      const title = card.querySelector(".slot-card-title");
+      if (title) title.textContent = "Slot " + (i + 1);
+      const wlHost = card.querySelector("[data-slot-wl]");
+      if (wlHost) wlHost.setAttribute("data-slot-wl", String(i));
+    });
+  }
+
+  // Read the schedule editor into the backend payload shape:
+  // [{hours:"HH:MM-HH:MM", concurrency_limit, rpm_limit, tpm_limit, window_limits}, ...].
+  function collectSchedule(container) {
+    if (!container) return [];
+    const out = [];
+    container.querySelectorAll("[data-slot-idx]").forEach((card) => {
+      const start = (card.querySelector('[data-slot-field="start"]') || {}).value || "";
+      const end = (card.querySelector('[data-slot-field="end"]') || {}).value || "";
+      const num = (f) => {
+        const el = card.querySelector(`[data-slot-field="${f}"]`);
+        const v = el && el.value.trim();
+        if (!v) return null;
+        return Math.max(0, Math.floor(Number(v)));
+      };
+      const wlHost = card.querySelector("[data-slot-wl]");
+      const window_limits = collectWindowLimits(wlHost);
+      out.push({
+        hours: start && end ? start + "-" + end : "",
+        concurrency_limit: num("concurrency_limit"),
+        rpm_limit: num("rpm_limit"),
+        tpm_limit: num("tpm_limit"),
+        window_limits,
+      });
+    });
+    return out;
+  }
+
+  // Convert "HH:MM" to minutes since midnight. Returns null on bad input.
+  function toMinutes(hm) {
+    if (!hm || !hm.includes(":")) return null;
+    const [h, m] = hm.split(":").map((x) => parseInt(x, 10));
+    if (isNaN(h) || isNaN(m)) return null;
+    return h * 60 + m;
+  }
+
+  // Check overlap between schedule slots. Returns array of {i, j} conflict
+  // pairs (0-indexed). Cross-midnight slots (end<=start) are split into
+  // [start, 1440) ∪ [0, end); the standard interval-overlap test then applies.
+  function validateScheduleOverlap(slots) {
+    const ranges = slots
+      .map((s) => {
+        if (!s || !s.hours || !s.hours.includes("-")) return null;
+        const [a, b] = s.hours.split("-");
+        const start = toMinutes((a || "").trim());
+        const end = toMinutes((b || "").trim());
+        if (start == null || end == null) return null;
+        if (start < end) return [[start, end]];
+        if (start === end) return [[0, 1440]]; // empty range treats as full day
+        return [[start, 1440], [0, end]];
+      });
+    const conflicts = [];
+    for (let i = 0; i < ranges.length; i++) {
+      if (!ranges[i]) continue;
+      for (let j = i + 1; j < ranges.length; j++) {
+        if (!ranges[j]) continue;
+        const overlap = ranges[i].some((ra) =>
+          ranges[j].some((rb) => Math.max(ra[0], rb[0]) < Math.min(ra[1], rb[1]))
+        );
+        if (overlap) conflicts.push({ i, j });
+      }
+    }
+    return conflicts;
+  }
+
+  // Render the live overlap warning + apply/remove red border on conflicting
+  // slot cards. Called on every input/change in the schedule editor.
+  function renderScheduleWarning(warningEl, container, slots) {
+    if (!warningEl || !container) return;
+    const conflicts = validateScheduleOverlap(slots);
+    container.querySelectorAll(".schedule-slot-card").forEach((card, idx) => {
+      const inConflict = conflicts.some((c) => c.i === idx || c.j === idx);
+      card.classList.toggle("slot-conflict", inConflict);
+    });
+    if (!conflicts.length) {
+      warningEl.innerHTML = "";
+      return;
+    }
+    const lines = conflicts
+      .map((c) => "<div>" + esc(t("form.plan.schedule_conflict", { i: c.i + 1, j: c.j + 1 })) + "</div>")
+      .join("");
+    warningEl.innerHTML = lines;
   }
 
   window._editPlan = async (name) => {

@@ -1106,12 +1106,15 @@ div[id$="-table-wrap"]:not(.bare) > table > thead:first-child > tr:first-child >
 .modal-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 22px; }
 
 /* ── Form Grid / Cards (matrix layout for modals & Config page) ──── */
-.modal-xwide { width: 980px; max-width: 95vw; max-height: 90vh; }
+.modal-xwide { width: 1000px; max-width: 95vw; max-height: 90vh; }
 .form-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
   gap: 16px;
-  align-items: start;
+  /* stretch (the default) makes cards on the same row equal-height — without
+     it, a short card next to a tall one leaves a visible gap below the short
+     card's background. */
+  align-items: stretch;
 }
 .form-card {
   border: 1px solid var(--border);
@@ -1121,6 +1124,10 @@ div[id$="-table-wrap"]:not(.bare) > table > thead:first-child > tr:first-child >
   display: flex;
   flex-direction: column;
 }
+/* Force a card to span the full row inside .form-grid's auto-fit layout so
+   multi-row sub-editors (window_limits, schedule slots) get the full modal
+   width instead of being squeezed into one ~360px column. */
+.form-card-full { grid-column: 1 / -1; }
 /* Inside a config card, the grey hint paragraph is forced to the bottom
    regardless of where it sits in the HTML — keeps the title at top, fields
    in the middle, hint + actions stacked at the bottom. */
@@ -1151,6 +1158,125 @@ div[id$="-table-wrap"]:not(.bare) > table > thead:first-child > tr:first-child >
 .form-card-grid .field-full input,
 .form-card-grid .field-full select,
 .form-card-grid .field-full textarea { width: 100%; }
+
+/* ── Window-limits editor (one parameter per row, in Plan modal) ── */
+/* Fixed at exactly one entry per plan / per schedule slot — matches the
+   backend's effective_limits() logic which reads window_limits[0]. Each
+   field gets its own full-width row so labels and inputs stay legible
+   even on narrow viewports. */
+.wl-editor { display: flex; flex-direction: column; gap: 6px; }
+.wl-row {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 14px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+.wl-cell {
+  display: flex; flex-direction: column; gap: 4px;
+  font-size: 12px; font-weight: 600; color: var(--text2);
+}
+.wl-cell-label { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.wl-input {
+  width: 100%; padding: 8px 12px; background: var(--surface);
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  font-size: 13px; color: var(--text);
+  font-family: var(--mono);
+}
+.wl-input:focus { border-color: var(--primary); box-shadow: 0 0 0 2px var(--primary-bg); outline: none; }
+
+/* ── Schedule editor (per-slot cards, in Plan modal) ────── */
+.schedule-editor { display: flex; flex-direction: column; gap: 10px; }
+.schedule-slot-card {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface2);
+  padding: 14px;
+  transition: border-color var(--transition), background var(--transition);
+}
+.schedule-slot-card.slot-conflict {
+  border-color: var(--danger);
+  background: var(--danger-bg);
+}
+.slot-card-header {
+  display: flex; align-items: center; flex-wrap: nowrap;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+.slot-card-title { font-weight: 600; font-size: 13px; color: var(--text); flex: 0 0 auto; }
+.slot-time { display: flex; align-items: center; flex-wrap: nowrap; gap: 6px; flex: 1 1 auto; min-width: 0; }
+.slot-time-input {
+  padding: 8px 12px; background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); font-size: 13px; color: var(--text);
+  font-family: var(--mono);
+  flex: 0 1 130px;
+  min-width: 0;
+}
+.slot-time-input:focus { border-color: var(--primary); box-shadow: 0 0 0 2px var(--primary-bg); outline: none; }
+.slot-dash { color: var(--text3); }
+.slot-cross-badge {
+  padding: 2px 8px; font-size: 10px; font-weight: 600;
+  color: var(--primary); background: var(--primary-bg);
+  border-radius: 10px; border: 1px solid var(--primary);
+}
+.slot-remove {
+  width: 28px; height: 28px; padding: 0; line-height: 1;
+  background: var(--surface3); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); color: var(--text2); cursor: pointer;
+  font-size: 14px; transition: all var(--transition);
+}
+.slot-remove:hover { color: var(--danger); border-color: var(--danger); background: var(--danger-bg); }
+.slot-card-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+/* Left-right layout inside a slot: simple limits card on the left,
+   window-limits card on the right. Wraps to single column on narrow
+   viewports so neither card gets squeezed below legible width. */
+.slot-card-body {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) minmax(220px, 1.5fr);
+  gap: 12px;
+  align-items: start;
+}
+@media (max-width: 720px) {
+  .slot-card-body { grid-template-columns: 1fr; }
+}
+.slot-card-body > .slot-card-grid { margin-bottom: 0; }
+.slot-card-body > .slot-card-section {
+  border-top: none;
+  padding-top: 0;
+  padding-left: 12px;
+  border-left: 1px dashed var(--border);
+}
+.slot-card-grid .slot-cell {
+  display: flex; flex-direction: column; gap: 4px;
+  font-size: 12px; font-weight: 600; color: var(--text2);
+}
+.slot-input {
+  width: 100%; padding: 8px 12px; background: var(--surface);
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  font-size: 13px; color: var(--text); font-family: var(--mono);
+}
+.slot-input:focus { border-color: var(--primary); box-shadow: 0 0 0 2px var(--primary-bg); outline: none; }
+.slot-section-label {
+  font-size: 12px; font-weight: 600; color: var(--text2); margin-bottom: 6px;
+}
+.schedule-warning {
+  margin-top: 6px;
+  padding: 8px 10px;
+  background: var(--danger-bg);
+  border: 1px solid var(--danger);
+  border-radius: var(--radius-sm);
+  color: var(--danger);
+  font-size: 12px;
+}
+.schedule-warning:empty { display: none; }
+.schedule-warning div { padding: 1px 0; }
 .form-card-actions {
   display: flex;
   justify-content: flex-end;
@@ -1404,6 +1530,11 @@ td.kvc-prefix .kvc-sub { font-size: 11px; color: var(--text3); }
 }
 
 /* ── Field tooltip (?) ──────────────────────────────────── */
+/* The hint text itself is rendered by the global #vtip element (JS-positioned,
+   viewport-clamped — see setupViewportTooltip in app.js). The ? icon here is
+   just the trigger; we no longer use a CSS ::after pseudo-element because it
+   cannot escape `overflow:auto` containers (modals, scroll panels) and would
+   get clipped at the screen edges. */
 .field-tip {
   display: inline-block;
   width: 16px; height: 16px; line-height: 16px; text-align: center;
@@ -1414,20 +1545,6 @@ td.kvc-prefix .kvc-sub { font-size: 11px; color: var(--text3); }
   position: relative; transition: all var(--transition);
 }
 .field-tip:hover { color: var(--primary); border-color: var(--primary); background: var(--primary-bg); }
-.field-tip::after {
-  content: attr(data-tip);
-  position: absolute; left: 50%; bottom: calc(100% + 8px);
-  transform: translateX(-50%);
-  background: var(--text); color: var(--text-inv);
-  font-size: 12px; font-weight: 400; line-height: 1.5;
-  letter-spacing: 0; text-transform: none;
-  padding: 8px 12px; border-radius: 8px;
-  white-space: pre-wrap; width: max-content; max-width: 320px;
-  z-index: 200; pointer-events: none;
-  opacity: 0; transition: opacity .15s ease;
-  box-shadow: var(--shadow-md);
-}
-.field-tip:hover::after { opacity: 1; }
 
 /* ── Table cell tooltip ─────────────────────────────────── */
 .cell-tip { position: relative; cursor: default; }

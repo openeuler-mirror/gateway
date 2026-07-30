@@ -406,6 +406,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "boom-hooks-sdk"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "boom-kvindex"
 version = "0.1.0"
 dependencies = [
@@ -454,6 +464,7 @@ dependencies = [
  "boom-ctxaware",
  "boom-dashboard",
  "boom-flowcontrol",
+ "boom-hooks-sdk",
  "boom-kvindex",
  "boom-limiter",
  "boom-promptlog",
@@ -463,6 +474,7 @@ dependencies = [
  "clap",
  "dashmap",
  "futures",
+ "libloading",
  "moka",
  "reqwest",
  "rust_decimal",
@@ -1009,6 +1021,15 @@ checksum = "8be9f3dfaaffdae2972880079a491a1a8bb7cbed0b8dd7a347f668b4150a3b93"
 dependencies = [
  "event-listener",
  "pin-project-lite",
+]
+
+[[package]]
+name = "example-pre-auth-hook"
+version = "0.1.0"
+dependencies = [
+ "boom-hooks-sdk",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1681,6 +1702,16 @@ name = "libc"
 version = "0.2.183"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b5b646652bf6661599e1da8901b3b9522896f01e736bad5f723fe7a3a27f899d"
+
+[[package]]
+name = "libloading"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
 
 [[package]]
 name = "libm"

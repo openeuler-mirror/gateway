@@ -1,0 +1,13 @@
+[package]
+name = "example-pre-auth-hook"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+boom-hooks-sdk = { path = "../boom-hooks-sdk" }
+serde = { workspace = true }
+serde_json = { workspace = true }

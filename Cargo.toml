@@ -15,6 +15,8 @@ members = [
     "boom-gateway/boom-promptlog",
     "boom-gateway/boom-kvindex",
     "boom-gateway/boom-fusion",
+    "boom-gateway/boom-hooks-sdk",
+    "boom-gateway/example-hooks",
 ]
 
 [workspace.package]
@@ -93,3 +95,6 @@ rmpv = "1"
 # Decimal arithmetic (cost / billing)
 rust_decimal = { version = "1", features = ["serde", "db-postgres"] }
 rust_decimal_macros = { version = "1" }
+
+# Dynamic library loading (hook framework)
+libloading = "0.8"

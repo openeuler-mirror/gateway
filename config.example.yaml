@@ -286,3 +286,39 @@ prompt_log:
   capture_raw_upstream: false       # 同时记录上游原始响应（仅格式转换路径如 /v1/messages）
   excluded_keys: []                 # 跳过这些 key（key_hash），不记录
   excluded_teams: []                # 跳过这些 team（team_id），不记录
+
+# ──────────────────────────────────────────────────────────────────────
+# Hook 机制（可选，默认完全关闭）
+#
+# 用途：把场景化定制逻辑（如 key 加前缀、删后缀、查表转换）从 gateway
+# 主体剥离出来，由各家业务方自己写 .so 接入。gateway 二进制不需要为某
+# 家定制逻辑重编。
+#
+# 工作流程（pre_auth 为例）：
+#   1. 请求到达，从 Authorization / x-api-key / api-key 提取 raw_key
+#   2. 如果配置了 pre_auth hook，gateway 调用 .so 里的 pre_auth 符号
+#   3. hook 返回三种 action 之一：
+#        continue  → 用原 raw_key 走原生认证
+#        replace   → 用 new_key 替换后走原生认证
+#        reject    → 直接 401
+#   4. hook 调用本身失败（panic / 错误码 / buffer 溢出）→ 按 failure_mode
+#      处理：allow=降级走原生认证（默认）；deny=返回 500
+#
+# 编写 hook：参考 boom-gateway/example-hooks/ 目录的示例 crate，用
+# boom-hooks-sdk 的 pre_auth_entry / hook_init_entry 助手，只写业务
+# 闭包即可，序列化、catch_unwind、return code 都由 SDK 处理。
+# ──────────────────────────────────────────────────────────────────────
+hooks:
+  pre_auth:
+    enabled: false                          # 默认关闭。整个字段不写等同关闭
+    path: ""                                # .so / .dylib 的绝对路径
+    failure_mode: allow                     # allow（默认）| deny
+    allowed_headers: []                     # 只把这些 header 传给 hook，默认不传
+    config: ""                              # 自由文本，原样传给 hook_init
+    # —— 完整示例（加前缀场景，对应 example-hooks crate）——
+    # enabled: true
+    # path: /etc/gateway/hooks/libexample_pre_auth_hook.so
+    # failure_mode: allow
+    # allowed_headers: [ucid]               # 业务方需要从 header 取的字段
+    # config: '{"prefix":"sk-customer-"}'   # hook 自行解析
+
