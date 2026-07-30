@@ -49,6 +49,18 @@ struct TlsConfig {
     key: String,
 }
 
+/// Selection policy for a multi-backend (`backends`) route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum LbMode {
+    /// Consistent-hash across all healthy backends (default; load-spreading).
+    #[default]
+    ActiveActive,
+    /// Primary-standby: traffic goes to backends[0], failing over in order
+    /// only when the earlier backends are unhealthy.
+    ActiveStandby,
+}
+
 #[derive(Debug)]
 struct Route {
     host: Option<String>,
@@ -56,6 +68,7 @@ struct Route {
     client_ip: Option<IpNet>,
     backend: Option<SocketAddr>,
     backends: Option<Vec<SocketAddr>>,
+    mode: LbMode,
 }
 
 impl Route {
@@ -72,6 +85,7 @@ impl Route {
                 client_ip,
                 backend: Some(parse_addr(&b)?),
                 backends: None,
+                mode: raw.mode,
             }),
             (None, Some(list)) => {
                 if list.is_empty() {
@@ -87,6 +101,7 @@ impl Route {
                     client_ip,
                     backend: None,
                     backends: Some(addrs),
+                    mode: raw.mode,
                 })
             }
             (Some(_), Some(_)) => Err("route has both `backend` and `backends`".into()),
@@ -102,6 +117,8 @@ struct RouteRaw {
     client_ip: Option<String>,
     backend: Option<String>,
     backends: Option<Vec<String>>,
+    #[serde(default)]
+    mode: LbMode,
 }
 
 fn parse_addr(s: &str) -> std::result::Result<SocketAddr, String> {
@@ -343,6 +360,18 @@ impl Ring {
     }
 }
 
+/// Primary-standby selection: the first healthy backend in list order, so all
+/// traffic prefers `backends[0]` and only fails over when earlier ones are down.
+/// If every backend is unhealthy, fall back to `backends[0]` (best-effort).
+fn pick_primary(backends: &[SocketAddr], unhealthy: &HashSet<SocketAddr>) -> SocketAddr {
+    for addr in backends {
+        if !unhealthy.contains(addr) {
+            return *addr;
+        }
+    }
+    backends[0]
+}
+
 /// Affinity key: `Authorization: Bearer <key>` -> `x-api-key` -> client IP -> "unknown".
 fn extract_api_key(
     auth: Option<&str>,
@@ -488,21 +517,26 @@ impl ProxyHttp for Gateway {
         let config = self.config.read().unwrap();
         let addr = match config.resolve_route(host, path, client_ip) {
             Some((idx, route)) => match &route.backends {
-                Some(_) => {
-                    let key = extract_api_key(
-                        header
-                            .headers
-                            .get("authorization")
-                            .and_then(|v| v.to_str().ok()),
-                        header.headers.get("x-api-key").and_then(|v| v.to_str().ok()),
-                        client_ip,
-                    );
+                Some(list) => {
                     let unhealthy = self.health.unhealthy.read().unwrap();
-                    let rings = self.rings.read().unwrap();
-                    let ring = rings
-                        .get(&idx)
-                        .expect("ring must exist for a backends-route");
-                    ring.pick(&key, &*unhealthy)
+                    match route.mode {
+                        LbMode::ActiveStandby => pick_primary(list, &unhealthy),
+                        LbMode::ActiveActive => {
+                            let key = extract_api_key(
+                                header
+                                    .headers
+                                    .get("authorization")
+                                    .and_then(|v| v.to_str().ok()),
+                                header.headers.get("x-api-key").and_then(|v| v.to_str().ok()),
+                                client_ip,
+                            );
+                            let rings = self.rings.read().unwrap();
+                            let ring = rings
+                                .get(&idx)
+                                .expect("ring must exist for an active-active backends-route");
+                            ring.pick(&key, &*unhealthy)
+                        }
+                    }
                 }
                 None => route
                     .backend
@@ -545,7 +579,14 @@ fn build_rings(config: &Config) -> HashMap<usize, Ring> {
         .routes
         .iter()
         .enumerate()
-        .filter_map(|(i, r)| r.backends.as_ref().map(|bs| (i, Ring::new(bs))))
+        .filter_map(|(i, r)| {
+            // Active-standby routes select by ordered failover, no ring needed.
+            if r.mode == LbMode::ActiveActive {
+                r.backends.as_ref().map(|bs| (i, Ring::new(bs)))
+            } else {
+                None
+            }
+        })
         .collect()
 }
 
@@ -985,6 +1026,42 @@ routes:
         assert!(probe_once(addr));
         drop(listener);
         assert!(!probe_once(addr));
+    }
+
+    #[test]
+    fn pick_primary_prefers_healthiest_in_order() {
+        let bs: Vec<SocketAddr> = ["10.0.0.1:80", "10.0.0.2:80", "10.0.0.3:80"]
+            .iter()
+            .map(|s| s.parse().unwrap())
+            .collect();
+        // all healthy -> primary (backends[0])
+        assert_eq!(pick_primary(&bs, &HashSet::new()), bs[0]);
+        // primary down -> first standby in order
+        let mut un = HashSet::new();
+        un.insert(bs[0]);
+        assert_eq!(pick_primary(&bs, &un), bs[1]);
+        // first two down -> third
+        un.insert(bs[1]);
+        assert_eq!(pick_primary(&bs, &un), bs[2]);
+        // all down -> best-effort primary (still attempt backends[0])
+        un.insert(bs[2]);
+        assert_eq!(pick_primary(&bs, &un), bs[0]);
+    }
+
+    #[test]
+    fn config_backends_mode_parse() {
+        let yaml = r#"
+default_backend: "127.0.0.1:8080"
+routes:
+  - host: aa.com
+    backends: ["10.0.0.1:80", "10.0.0.2:80"]
+  - host: as.com
+    backends: ["10.0.0.3:80", "10.0.0.4:80"]
+    mode: active-standby
+"#;
+        let cfg = Config::from_str(yaml).unwrap();
+        assert_eq!(cfg.routes[0].mode, LbMode::ActiveActive, "default is multi-active");
+        assert_eq!(cfg.routes[1].mode, LbMode::ActiveStandby);
     }
 
     #[test]
