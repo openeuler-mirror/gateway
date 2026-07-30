@@ -29,6 +29,7 @@ RUN dnf install -y ca-certificates openssl-libs && \
 COPY --from=builder /app/target/release/gateway-lb /usr/bin/gateway-lb
 
 COPY config.yaml /etc/gateway/routes.yaml
+COPY blacklist.txt /etc/gateway/blacklist.txt
 
 ENV CONFIG_PATH=/etc/gateway/routes.yaml
 
