@@ -3198,10 +3198,11 @@ pub async fn reset_limits_all(
 // ═══════════════════════════════════════════════════════════
 // Debug Error Recording
 // ═══════════════════════════════════════════════════════════
-// Conditionally compiled — only included when the `debug-tools` feature is
-// enabled. Release builds exclude this code so debug endpoints return 404.
+// Always compiled — the log page's "debug toggle" + "view error detail"
+// workflow must work without the `debug-tools` feature. The feature only
+// gates the standalone Debug page (nav link + /dashboard/debug entry, see
+// handlers_static.rs).
 
-#[cfg(feature = "debug-tools")]
 pub async fn get_debug_status(
     _session: AdminSession,
     Extension(state): Extension<Arc<DashboardState>>,
@@ -3212,13 +3213,11 @@ pub async fn get_debug_status(
     }))
 }
 
-#[cfg(feature = "debug-tools")]
 #[derive(Debug, Deserialize)]
 pub struct DebugToggleRequest {
     pub enabled: bool,
 }
 
-#[cfg(feature = "debug-tools")]
 pub async fn toggle_debug(
     _session: AdminSession,
     Extension(state): Extension<Arc<DashboardState>>,
@@ -3236,7 +3235,6 @@ pub async fn toggle_debug(
     }))
 }
 
-#[cfg(feature = "debug-tools")]
 pub async fn get_debug_error(
     _session: AdminSession,
     Extension(state): Extension<Arc<DashboardState>>,
