@@ -53,6 +53,76 @@ pub struct Config {
     /// Prompt log configuration (transparent pass-through to boom-promptlog).
     #[serde(default)]
     pub prompt_log: Option<serde_json::Value>,
+    /// Gateway hook configuration. Optional — when absent or all entries
+    /// disabled, the gateway runs as if the hook framework didn't exist.
+    #[serde(default)]
+    pub hooks: HooksConfig,
+}
+
+/// Top-level hook configuration. Each entry corresponds to one hook point
+/// the gateway exposes. All entries default to disabled, so omitting the
+/// whole `hooks` block is equivalent to "no hooks".
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct HooksConfig {
+    #[serde(default)]
+    pub pre_auth: PreAuthHookConfig,
+}
+
+/// Configuration for the `pre_auth` hook point.
+///
+/// ```yaml
+/// hooks:
+///   pre_auth:
+///     enabled: true
+///     path: /etc/gateway/hooks/libmyhook.so
+///     failure_mode: allow          # "allow" (default) | "deny"
+///     allowed_headers: [ucid]      # headers forwarded to the hook
+///     config: |                     # free-form string, passed to hook_init
+///       db_url: postgres://…
+/// ```
+///
+/// When `enabled` is false (or `path` is empty), the gateway skips this hook
+/// point entirely and authentication runs as if no hook existed.
+///
+/// `failure_mode`:
+/// - `allow`: hook call failure (panic / error code / overflow) → fall back to
+///   the original raw_key and run native authentication. Default. Keeps the
+///   gateway fully functional when a misconfigured hook breaks.
+/// - `deny`: hook call failure → reject the request with 500. Use when a
+///   missing hook is a security-relevant event and silent fallback is worse.
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct PreAuthHookConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub failure_mode: HookFailureMode,
+    #[serde(default)]
+    pub allowed_headers: Vec<String>,
+    #[serde(default)]
+    pub config: String,
+}
+
+/// Behaviour when a hook call itself fails (panic, error code, overflow).
+///
+/// `Allow` is the default because the hook framework is optional — a broken
+/// hook must not bring down the gateway. `Deny` is opt-in for sites that
+/// treat hook failure as a security event.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum HookFailureMode {
+    #[default]
+    Allow,
+    Deny,
+}
+
+impl HooksConfig {
+    /// Returns true if no hook point is enabled. Lets the gateway skip all
+    /// hook machinery with a single check in the hot path.
+    pub fn is_empty(&self) -> bool {
+        !self.pre_auth.enabled
+    }
 }
 
 /// A reusable billing rate template.

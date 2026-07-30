@@ -1,3 +1,4 @@
+use crate::hooks::PreAuthOutcome;
 use crate::routes::GatewayErrorReply;
 use crate::state::AppState;
 use axum::extract::FromRequestParts;
@@ -35,9 +36,33 @@ impl FromRequestParts<AppState> for RequiredAuth {
         })?;
 
         let inner = state.inner.load();
+
+        // — pre_auth hook (optional) —
+        // When no plugin is configured for this point (`NoHook`), or the hook
+        // said `Continue`, the original raw_key is forwarded to the
+        // authenticator unchanged. `Replace` swaps the key. `Reject` short-
+        // circuits with 401. `Deny` (only when failure_mode=deny and the call
+        // failed) returns 500.
+        let effective_key = match inner.hooks.pre_auth(&raw_key, &parts.headers) {
+            PreAuthOutcome::NoHook | PreAuthOutcome::Continue => raw_key,
+            PreAuthOutcome::Replace(new_key) => new_key,
+            PreAuthOutcome::Reject(reason) => {
+                return Err(GatewayErrorReply(
+                    GatewayError::AuthError(reason),
+                    false,
+                ));
+            }
+            PreAuthOutcome::Deny => {
+                return Err(GatewayErrorReply(
+                    GatewayError::InternalError("pre_auth hook failure (deny mode)".into()),
+                    false,
+                ));
+            }
+        };
+
         let identity = inner
             .auth
-            .authenticate(&raw_key)
+            .authenticate(&effective_key)
             .await
             .map_err(|e| GatewayErrorReply(e, false))?;
 

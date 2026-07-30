@@ -1,6 +1,7 @@
 mod admin_command;
 mod extractor;
 mod health_monitor;
+mod hooks;
 mod kvc;
 mod request_log;
 mod rewrite;

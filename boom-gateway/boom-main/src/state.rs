@@ -100,6 +100,10 @@ pub struct AppStateInner {
     pub auth: Arc<dyn Authenticator>,
     /// Narrow view for Dashboard — only exposes key alias lookups, not full auth.
     pub key_alias_lookup: Arc<dyn KeyAliasLookup>,
+    /// Loaded hook plugins. `None`-equivalent (empty registry) when `hooks`
+    /// config block is absent or all entries disabled — the hot path then
+    /// short-circuits with `is_empty()` and pays zero hook cost.
+    pub hooks: Arc<crate::hooks::HookRegistry>,
     pub health: HealthStatus,
 }
 
@@ -638,10 +642,13 @@ impl AppState {
             reload_count,
         };
 
+        let hooks = Arc::new(crate::hooks::HookRegistry::from_config(&config.hooks)?);
+
         Ok(AppStateInner {
             config,
             auth,
             key_alias_lookup,
+            hooks,
             health,
         })
     }
