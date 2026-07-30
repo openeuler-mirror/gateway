@@ -27,6 +27,8 @@ struct ConfigRaw {
     listen_port: Option<u16>,
     tls: Option<TlsConfig>,
     default_backend: String,
+    /// Path to a blacklist file (one IP/CIDR per line). Optional.
+    blacklist: Option<String>,
     routes: Vec<RouteRaw>,
 }
 
@@ -35,6 +37,8 @@ struct Config {
     listen_port: Option<u16>,
     tls: Option<TlsConfig>,
     default_backend: SocketAddr,
+    /// Path to a blacklist file. The parsed entries live in `Gateway::blacklist`.
+    blacklist: Option<String>,
     routes: Vec<Route>,
 }
 
@@ -114,6 +118,66 @@ fn parse_client_ip(s: &str) -> std::result::Result<IpNet, String> {
     }
 }
 
+/// True if `ip` falls inside any blacklist network (single IP or CIDR).
+fn is_blacklisted(ip: IpAddr, nets: &[IpNet]) -> bool {
+    nets.iter().any(|net| net.contains(&ip))
+}
+
+/// Parse blacklist file content: one IP/CIDR per line. `#` introduces comments
+/// (full-line or trailing), blank lines are ignored, and invalid entries are
+/// skipped with a warning so a single bad line never disables the blacklist.
+fn parse_blacklist(content: &str) -> Vec<IpNet> {
+    content
+        .lines()
+        .map(|line| line.split('#').next().unwrap_or("").trim())
+        .filter(|line| !line.is_empty())
+        .filter_map(|line| match parse_client_ip(line) {
+            Ok(net) => Some(net),
+            Err(e) => {
+                log::warn!("blacklist: skipping invalid entry '{line}': {e}");
+                None
+            }
+        })
+        .collect()
+}
+
+/// Read and parse a blacklist file. Errors only on file-read failure.
+fn load_blacklist(path: &str) -> std::result::Result<Vec<IpNet>, String> {
+    let content =
+        fs::read_to_string(path).map_err(|e| format!("failed to read blacklist {path}: {e}"))?;
+    Ok(parse_blacklist(&content))
+}
+
+/// Load the blacklist for a path that may be `None`. A missing/unreadable file
+/// is logged and treated as an empty list — availability over strictness, so a
+/// transient read error never blocks all traffic.
+fn load_blacklist_state(path: Option<&str>) -> Vec<IpNet> {
+    match path {
+        Some(p) => match load_blacklist(p) {
+            Ok(v) => v,
+            Err(e) => {
+                log::error!("{e}; treating blacklist as empty");
+                Vec::new()
+            }
+        },
+        None => Vec::new(),
+    }
+}
+
+/// Build the structured "request dispatched to backend" log line.
+fn dispatch_line(
+    method: &str,
+    host: &str,
+    path: &str,
+    client: Option<IpAddr>,
+    backend: SocketAddr,
+) -> String {
+    let client = client
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|| "-".into());
+    format!("dispatch method={method} host={host} path={path} client={client} backend={backend}")
+}
+
 impl Config {
     fn load(path: &str) -> std::result::Result<Self, String> {
         let content = fs::read_to_string(path)
@@ -137,6 +201,7 @@ impl Config {
             listen_port: raw.listen_port,
             tls: raw.tls,
             default_backend,
+            blacklist: raw.blacklist,
             routes,
         })
     }
@@ -316,6 +381,7 @@ pub struct Gateway {
     config: Arc<RwLock<Config>>,
     rings: Arc<RwLock<HashMap<usize, Ring>>>,
     health: Arc<HealthState>,
+    blacklist: Arc<RwLock<Vec<IpNet>>>,
 }
 
 #[async_trait]
@@ -323,6 +389,29 @@ impl ProxyHttp for Gateway {
     type CTX = ();
 
     fn new_ctx(&self) -> Self::CTX {}
+
+    async fn request_filter(
+        &self,
+        session: &mut Session,
+        _ctx: &mut Self::CTX,
+    ) -> Result<bool> {
+        // Block blacklisted client IPs before any routing. Uses the TCP peer
+        // address (not X-Forwarded-For) so the value can't be spoofed.
+        let blocked = session
+            .client_addr()
+            .and_then(|a| a.as_inet())
+            .map(|a| a.ip())
+            .map(|ip| {
+                let bl = self.blacklist.read().unwrap();
+                (ip, is_blacklisted(ip, &bl))
+            });
+        if let Some((ip, true)) = blocked {
+            log::warn!("blocked request from blacklisted client IP {ip}");
+            session.respond_error(403).await?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
 
     async fn upstream_peer(
         &self,
@@ -370,6 +459,11 @@ impl ProxyHttp for Gateway {
             },
             None => config.default_backend,
         };
+
+        log::info!(
+            "{}",
+            dispatch_line(header.method.as_str(), host, path, client_ip, addr)
+        );
 
         Ok(Box::new(HttpPeer::new(addr, false, String::new())))
     }
@@ -419,13 +513,50 @@ fn collect_all_backends(config: &Config) -> Vec<SocketAddr> {
     out
 }
 
+/// Classify a watcher event by whether it touches the config file and/or the
+/// blacklist file (matched by file name). Only create/modify-like events count.
+fn event_targets(
+    event: &notify::Event,
+    config_name: &str,
+    blacklist_name: Option<&str>,
+) -> (bool, bool) {
+    let kind_ok = matches!(
+        event.kind,
+        notify::EventKind::Create(_)
+            | notify::EventKind::Modify(_)
+            | notify::EventKind::Any
+            | notify::EventKind::Other
+    );
+    if !kind_ok {
+        return (false, false);
+    }
+    let mut cfg = false;
+    let mut bl = false;
+    for p in &event.paths {
+        let name = match p.file_name().and_then(|n| n.to_str()) {
+            Some(s) => s,
+            None => continue,
+        };
+        if name == config_name {
+            cfg = true;
+        }
+        if let Some(bn) = blacklist_name {
+            if bn == name {
+                bl = true;
+            }
+        }
+    }
+    (cfg, bl)
+}
+
 fn watch_config(
     path: String,
     config: Arc<RwLock<Config>>,
     rings: Arc<RwLock<HashMap<usize, Ring>>>,
     health: Arc<HealthState>,
+    blacklist: Arc<RwLock<Vec<IpNet>>>,
 ) {
-    use notify::{Config as NotifyConfig, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+    use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, Watcher};
 
     std::thread::spawn(move || {
         let (tx, rx) = std::sync::mpsc::channel::<Event>();
@@ -455,10 +586,24 @@ fn watch_config(
             return;
         }
 
-        let file_name = Path::new(&path)
+        let config_file_name = Path::new(&path)
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
+
+        // Also watch the blacklist file's directory so edits to it hot-reload.
+        let mut watched_blacklist_dir: Option<std::path::PathBuf> = None;
+        {
+            let bl_path = config.read().unwrap().blacklist.clone();
+            if let Some(bp) = bl_path.as_deref() {
+                if let Some(dir) = Path::new(bp).parent() {
+                    if dir != watch_dir.as_path() {
+                        let _ = watcher.watch(dir, RecursiveMode::NonRecursive);
+                    }
+                    watched_blacklist_dir = Some(dir.to_path_buf());
+                }
+            }
+        }
 
         loop {
             let event = match rx.recv() {
@@ -466,52 +611,180 @@ fn watch_config(
                 Err(_) => break,
             };
 
-            let relevant = event.paths.iter().any(|p| {
-                p.file_name()
-                    .map(|n| n.to_string_lossy() == file_name)
-                    .unwrap_or(false)
-            });
+            // Blacklist file name is read fresh; the path may change after a reload.
+            let bl_name = config
+                .read()
+                .unwrap()
+                .blacklist
+                .as_deref()
+                .and_then(|p| Path::new(p).file_name())
+                .map(|n| n.to_string_lossy().into_owned());
 
-            if !relevant {
+            let (mut cfg_changed, mut bl_changed) =
+                event_targets(&event, &config_file_name, bl_name.as_deref());
+
+            // Debounce: drain rapid successive events, merging their targets.
+            while let Ok(e) = rx.recv_timeout(Duration::from_millis(200)) {
+                let (c, b) = event_targets(&e, &config_file_name, bl_name.as_deref());
+                cfg_changed |= c;
+                bl_changed |= b;
+            }
+
+            if !cfg_changed && !bl_changed {
                 continue;
             }
 
-            match event.kind {
-                EventKind::Create(_)
-                | EventKind::Modify(_)
-                | EventKind::Any
-                | EventKind::Other => {}
-                _ => continue,
+            if cfg_changed {
+                match Config::load(&path) {
+                    Ok(new_config) => {
+                        let new_rings = build_rings(&new_config);
+                        let new_backends = collect_all_backends(&new_config);
+                        let backend_set: HashSet<SocketAddr> =
+                            new_backends.iter().copied().collect();
+                        {
+                            let mut u = health.unhealthy.write().unwrap();
+                            u.retain(|a| backend_set.contains(a));
+                        }
+                        *health.backends.write().unwrap() = new_backends;
+
+                        // If the blacklist file path changed, reload its content
+                        // and (best-effort) watch the new directory.
+                        let prev_bl = config.read().unwrap().blacklist.clone();
+                        let new_bl = new_config.blacklist.clone();
+                        if new_bl != prev_bl {
+                            *blacklist.write().unwrap() = load_blacklist_state(new_bl.as_deref());
+                            let new_dir = new_bl
+                                .as_deref()
+                                .and_then(|p| Path::new(p).parent())
+                                .map(|p| p.to_path_buf());
+                            if new_dir != watched_blacklist_dir {
+                                if let Some(d) = &new_dir {
+                                    let _ = watcher.watch(d, RecursiveMode::NonRecursive);
+                                }
+                                watched_blacklist_dir = new_dir;
+                            }
+                            log::info!("blacklist path changed to {:?}", new_bl);
+                        }
+
+                        *config.write().unwrap() = new_config;
+                        *rings.write().unwrap() = new_rings;
+                        log::info!("config reloaded from {path}");
+                    }
+                    Err(e) => {
+                        log::error!("failed to reload config: {e}");
+                    }
+                }
             }
 
-            // Debounce: drain rapid successive events
-            while rx.recv_timeout(Duration::from_millis(200)).is_ok() {}
-
-            match Config::load(&path) {
-                Ok(new_config) => {
-                    let new_rings = build_rings(&new_config);
-                    let new_backends = collect_all_backends(&new_config);
-                    let backend_set: HashSet<SocketAddr> = new_backends.iter().copied().collect();
-                    {
-                        let mut u = health.unhealthy.write().unwrap();
-                        u.retain(|a| backend_set.contains(a));
+            if bl_changed {
+                let bl_path = config.read().unwrap().blacklist.clone();
+                if let Some(p) = bl_path.as_deref() {
+                    match load_blacklist(p) {
+                        Ok(v) => {
+                            *blacklist.write().unwrap() = v;
+                            log::info!("blacklist reloaded from {p}");
+                        }
+                        Err(e) => log::error!("failed to reload blacklist {p}: {e}"),
                     }
-                    *health.backends.write().unwrap() = new_backends;
-                    *config.write().unwrap() = new_config;
-                    *rings.write().unwrap() = new_rings;
-                    log::info!("config reloaded from {path}");
-                }
-                Err(e) => {
-                    log::error!("failed to reload config: {e}");
                 }
             }
         }
     });
 }
 
+use log::{Level, LevelFilter, Log, Metadata, Record};
+use std::os::unix::net::UnixDatagram;
+
+/// syslog LOG_USER facility code.
+const FACILITY_USER: u8 = 1;
+
+/// Map a `log::Level` to a syslog PRI value = facility * 8 + severity.
+fn syslog_priority(level: Level) -> u8 {
+    let severity = match level {
+        Level::Error => 3, // ERR
+        Level::Warn => 4,  // WARNING
+        Level::Info => 6,  // INFO
+        Level::Debug => 7, // DEBUG
+        Level::Trace => 7, // (no severity below DEBUG)
+    };
+    FACILITY_USER * 8 + severity
+}
+
+/// Writes log records to a local syslog daemon over a connected Unix datagram
+/// socket, in RFC 3164 form: `<PRI>ident[pid]: message`.
+struct SyslogLogger {
+    sock: UnixDatagram,
+    ident: String,
+    pid: u32,
+}
+
+impl Log for SyslogLogger {
+    fn enabled(&self, _metadata: &Metadata) -> bool {
+        true
+    }
+
+    fn log(&self, record: &Record) {
+        let line = format!(
+            "<{}>{}[{}]: {}",
+            syslog_priority(record.level()),
+            self.ident,
+            self.pid,
+            record.args()
+        );
+        // Best-effort: syslog is fire-and-forget, never block the data path.
+        let _ = self.sock.send(line.as_bytes());
+    }
+
+    fn flush(&self) {}
+}
+
+/// Last-resort logger: writes to stderr so records are never silently dropped
+/// when no local syslog socket is available (e.g. some containers).
+struct StderrLogger;
+
+impl Log for StderrLogger {
+    fn enabled(&self, _metadata: &Metadata) -> bool {
+        true
+    }
+
+    fn log(&self, record: &Record) {
+        eprintln!("{} {}", record.level().as_str().to_lowercase(), record.args());
+    }
+
+    fn flush(&self) {}
+}
+
+/// Install the global `log` backend: prefer a local syslog Unix socket
+/// (`/dev/log`, then the macOS/BSD variants), otherwise fall back to stderr.
+/// pingora's own `log::` calls route through here too.
+fn init_logging(ident: &str) {
+    let pid = std::process::id();
+    for path in ["/dev/log", "/var/run/syslog", "/var/run/log"] {
+        // Create an unbound datagram socket and connect it to the syslog path.
+        let sock = match UnixDatagram::unbound().and_then(|s| s.connect(path).map(|()| s)) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let logger = SyslogLogger {
+            sock,
+            ident: ident.to_string(),
+            pid,
+        };
+        if log::set_boxed_logger(Box::new(logger)).is_ok() {
+            log::set_max_level(LevelFilter::Info);
+            return;
+        }
+    }
+    // No syslog socket reachable — log to stderr instead of dropping records.
+    let _ = log::set_boxed_logger(Box::new(StderrLogger));
+    log::set_max_level(LevelFilter::Info);
+    eprintln!("{ident}: no syslog socket found, logging to stderr");
+}
+
 fn main() {
     let args = Args::parse();
     let config_path = args.config;
+    init_logging("gateway-lb");
     let config = Config::load(&config_path).expect("failed to load config");
 
     let listen_port = config.listen_port.unwrap_or(6198);
@@ -523,13 +796,23 @@ fn main() {
     let config = Arc::new(RwLock::new(config));
     let rings = Arc::new(RwLock::new(build_rings(&config.read().unwrap())));
     let health = HealthState::new(collect_all_backends(&config.read().unwrap()));
+    let blacklist = Arc::new(RwLock::new(load_blacklist_state(
+        config.read().unwrap().blacklist.as_deref(),
+    )));
     run_health_probe(health.clone());
-    watch_config(config_path, config.clone(), rings.clone(), health.clone());
+    watch_config(
+        config_path,
+        config.clone(),
+        rings.clone(),
+        health.clone(),
+        blacklist.clone(),
+    );
 
     let gateway = Gateway {
         config,
         rings,
         health,
+        blacklist,
     };
 
     let mut proxy = pingora_proxy::http_proxy_service(&server.configuration, gateway);
@@ -673,5 +956,147 @@ routes:
         let set: HashSet<SocketAddr> = all.iter().copied().collect();
         assert_eq!(set.len(), 3, "dedup across routes: .2/.3/.4");
         assert!(set.contains(&"10.0.0.2:80".parse().unwrap()));
+    }
+
+    #[test]
+    fn config_blacklist_is_optional_path() {
+        let with_path = r#"
+default_backend: "127.0.0.1:8080"
+blacklist: "/etc/gateway/blacklist.txt"
+routes: []
+"#;
+        let cfg = Config::from_str(with_path).unwrap();
+        assert_eq!(cfg.blacklist.as_deref(), Some("/etc/gateway/blacklist.txt"));
+
+        let without = r#"
+default_backend: "127.0.0.1:8080"
+routes: []
+"#;
+        let cfg2 = Config::from_str(without).unwrap();
+        assert!(cfg2.blacklist.is_none());
+    }
+
+    #[test]
+    fn parse_blacklist_handles_comments_blanks_invalid() {
+        let content = "\
+# full-line comment
+10.0.5.100
+
+192.168.66.0/24
+   # indented comment
+not-an-ip
+1.2.3.0/24   # trailing comment
+";
+        let nets = parse_blacklist(content);
+        assert_eq!(nets.len(), 3, "3 valid entries; invalid line skipped");
+        let contains = |ip: &str| {
+            let ip: IpAddr = ip.parse().unwrap();
+            nets.iter().any(|n| n.contains(&ip))
+        };
+        assert!(contains("10.0.5.100"));
+        assert!(contains("192.168.66.42"));
+        assert!(contains("1.2.3.9"));
+    }
+
+    #[test]
+    fn parse_blacklist_empty_or_comments_only() {
+        assert!(parse_blacklist("").is_empty());
+        assert!(parse_blacklist("# only comments\n\n   \n").is_empty());
+    }
+
+    #[test]
+    fn load_blacklist_reads_file() {
+        let path = format!(
+            "{}/lb_bl_test_{}.txt",
+            std::env::temp_dir().to_string_lossy(),
+            std::process::id()
+        );
+        std::fs::write(&path, "# header\n10.0.0.9\n10.0.0.0/24\n").unwrap();
+        let nets = load_blacklist(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(nets.len(), 2);
+        let nine: IpAddr = "10.0.0.9".parse().unwrap();
+        assert!(nets.iter().any(|n| n.contains(&nine)));
+    }
+
+    #[test]
+    fn load_blacklist_missing_file_errors() {
+        assert!(load_blacklist("/nonexistent/lb_bl_missing.txt").is_err());
+    }
+
+    #[test]
+    fn dispatch_line_contains_all_fields() {
+        let ip: IpAddr = "10.0.0.9".parse().unwrap();
+        let backend: SocketAddr = "10.0.1.2:8080".parse().unwrap();
+        let line = dispatch_line("POST", "api.lb.local", "/v1/chat", Some(ip), backend);
+        assert!(line.contains("method=POST"));
+        assert!(line.contains("host=api.lb.local"));
+        assert!(line.contains("path=/v1/chat"));
+        assert!(line.contains("client=10.0.0.9"));
+        assert!(line.contains("backend=10.0.1.2:8080"));
+
+        // Missing client IP is rendered as "-".
+        let line2 = dispatch_line("GET", "h", "/p", None, backend);
+        assert!(line2.contains("client=-"));
+    }
+
+    #[test]
+    fn syslog_priority_maps_levels_to_user_facility() {
+        use log::Level;
+        assert_eq!(syslog_priority(Level::Error), 1 * 8 + 3);
+        assert_eq!(syslog_priority(Level::Warn), 1 * 8 + 4);
+        assert_eq!(syslog_priority(Level::Info), 1 * 8 + 6);
+        assert_eq!(syslog_priority(Level::Debug), 1 * 8 + 7);
+        assert_eq!(syslog_priority(Level::Trace), 1 * 8 + 7);
+    }
+
+    #[test]
+    fn syslog_logger_emits_rfc3164_to_socket() {
+        // Stand up a local datagram sink, point the logger at it, and read back
+        // exactly what it emits — a deterministic end-to-end check of the wire
+        // format without depending on the host syslogd.
+        let sock_path = std::env::temp_dir()
+            .join(format!("lb_syslog_test_{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock_path);
+        let listener = UnixDatagram::bind(&sock_path).unwrap();
+
+        let sock = UnixDatagram::unbound().unwrap();
+        sock.connect(&sock_path).unwrap();
+        let logger = SyslogLogger {
+            sock,
+            ident: "gateway-lb".to_string(),
+            pid: 4242,
+        };
+
+        logger.log(
+            &Record::builder()
+                .args(format_args!("dispatch method=GET backend=10.0.0.1:80"))
+                .level(Level::Info)
+                .target("gateway-lb")
+                .build(),
+        );
+
+        let mut buf = [0u8; 256];
+        let (n, _) = listener.recv_from(&mut buf).unwrap();
+        let msg = std::str::from_utf8(&buf[..n]).unwrap();
+        assert_eq!(msg, "<14>gateway-lb[4242]: dispatch method=GET backend=10.0.0.1:80");
+        let _ = std::fs::remove_file(&sock_path);
+    }
+
+    #[test]
+    fn is_blacklisted_matches_single_ip_and_cidr() {
+        let nets: Vec<IpNet> = vec![
+            parse_client_ip("10.0.5.100").unwrap(),
+            parse_client_ip("192.168.66.0/24").unwrap(),
+        ];
+        // exact single-IP hit
+        assert!(is_blacklisted("10.0.5.100".parse().unwrap(), &nets));
+        // inside CIDR
+        assert!(is_blacklisted("192.168.66.42".parse().unwrap(), &nets));
+        // outside everything
+        assert!(!is_blacklisted("10.0.5.99".parse().unwrap(), &nets));
+        assert!(!is_blacklisted("192.168.99.1".parse().unwrap(), &nets));
+        // empty list never blocks
+        assert!(!is_blacklisted("10.0.5.100".parse().unwrap(), &[]));
     }
 }

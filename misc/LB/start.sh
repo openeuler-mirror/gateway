@@ -88,6 +88,19 @@ do_start() {
         -v "$(cd "$(dirname "$CONFIG_FILE")" && pwd)/$(basename "$CONFIG_FILE"):/etc/gateway/routes.yaml:ro"
     )
 
+    # Mount the blacklist file (configured path's basename, beside the config)
+    # so edits to it hot-reload inside the container.
+    local blacklist_target blacklist_host
+    blacklist_target="$(grep '^blacklist:' "$CONFIG_FILE" | head -1 | awk '{print $2}' | tr -d '"')"
+    if [ -n "$blacklist_target" ]; then
+        blacklist_host="$(cd "$(dirname "$CONFIG_FILE")" && pwd)/$(basename "$blacklist_target")"
+        if [ -f "$blacklist_host" ]; then
+            docker_opts+=(-v "$blacklist_host:$blacklist_target:ro")
+        else
+            echo "Note: blacklist file '$blacklist_host' not found; using image default (no hot-reload)."
+        fi
+    fi
+
     # Mount certs if TLS is enabled
     if [ -d "$SCRIPT_DIR/certs" ]; then
         docker_opts+=(
@@ -98,8 +111,8 @@ do_start() {
 
     # Detect ports from config
     local http_port https_port
-    http_port=$(grep "^listen_port:" "$CONFIG_FILE" | awk '{print $2}' | tr -d '"'"'")
-    https_port=$(grep "port:" "$CONFIG_FILE" | head -2 | tail -1 | awk '{print $2}' | tr -d '"'"'')
+    http_port=$(grep "^listen_port:" "$CONFIG_FILE" | awk '{print $2}' | tr -d '"')
+    https_port=$(grep "port:" "$CONFIG_FILE" | head -2 | tail -1 | awk '{print $2}' | tr -d '"')
 
     [ -n "$http_port" ] && docker_opts+=(-p "${http_port}:${http_port}")
     [ -n "$https_port" ] && docker_opts+=(-p "${https_port}:${https_port}")

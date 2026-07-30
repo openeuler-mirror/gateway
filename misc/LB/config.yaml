@@ -7,6 +7,10 @@ tls:
 
 default_backend: "127.0.0.1:8080"
 
+# IP 黑名单文件路径：文件中每行一个 IP 或 CIDR（# 为注释），命中即返回 403。
+# 文件独立于本配置，可单独热加载（编辑后立即生效，无需改动 config.yaml）。
+blacklist: "/etc/gateway/blacklist.txt"
+
 routes:
   - client_ip: "10.0.0.0/24"
     backend: "10.0.1.1:8080"
