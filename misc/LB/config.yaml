@@ -34,3 +34,10 @@ routes:
       - "10.0.0.10:8080"
       - "10.0.0.11:8080"
       - "10.0.0.12:8080"
+  # 主备路由：mode: active-standby 时流量优先走 backends[0]，
+  # 其不可用（TCP 健康检查判定）才依次切到备机；不写 mode 即默认多活（active-active）。
+  - host: "ha.lb.local"
+    mode: active-standby
+    backends:
+      - "10.0.0.20:8080"   # 主
+      - "10.0.0.21:8080"   # 备
