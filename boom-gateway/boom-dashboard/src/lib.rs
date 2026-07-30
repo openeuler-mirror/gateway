@@ -278,9 +278,12 @@ pub fn build_router<S: Clone + Send + Sync + 'static>(state: DashboardState) -> 
     main_router
 }
 
-/// Debug-only routes — empty router unless `debug-tools` feature is enabled.
+/// Debug routes for the log page's "debug toggle" + "view error detail"
+/// workflow. Always registered — these endpoints must work without the
+/// `debug-tools` feature. The standalone Debug page (nav link + entry) is
+/// the only thing still gated by the feature (see handlers_static.rs).
+///
 /// State is injected via the same Extension layer used by the main router.
-#[cfg(feature = "debug-tools")]
 fn debug_router<S: Clone + Send + Sync + 'static>(
     state: Arc<DashboardState>,
 ) -> Router<S> {
@@ -302,11 +305,4 @@ fn debug_router<S: Clone + Send + Sync + 'static>(
             get(handlers_admin::get_debug_error),
         )
         .layer(axum::Extension(state))
-}
-
-#[cfg(not(feature = "debug-tools"))]
-fn debug_router<S: Clone + Send + Sync + 'static>(
-    _state: Arc<DashboardState>,
-) -> Router<S> {
-    Router::new()
 }

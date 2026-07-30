@@ -2914,11 +2914,11 @@
       debugEnabled = data.enabled;
       updateDebugButton(btn);
     } catch {
-      // Release builds compile out debug endpoints — hide the toggle button
-      // and the Debug nav-link (404 → catch branch).
+      // Debug status endpoint unreachable (network/probe failure) — hide the
+      // toggle button only. The standalone Debug nav-link is gated solely by
+      // window.__KVC_DEBUG (set at HTML injection time by handlers_static),
+      // independent of this endpoint's availability.
       btn.style.display = "none";
-      document.querySelectorAll('.nav-link[data-section="admin-debug"]')
-        .forEach((el) => el.style.display = "none");
     }
   }
 
