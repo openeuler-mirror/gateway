@@ -41,3 +41,10 @@ routes:
     backends:
       - "10.0.0.20:8080"   # 主
       - "10.0.0.21:8080"   # 备
+  # 重定向路由：命中后 LB 直接返回 3xx + Location，不经过后端。
+  # redirect 与 backend/backends 互斥；redirect_code 可选(默认 302)。
+  - host: "old.example.com"
+    redirect: "https://new.example.com/"
+    redirect_code: 301        # 永久重定向
+  - path: "/legacy/"
+    redirect: "https://new.example.com/"

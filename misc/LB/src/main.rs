@@ -68,6 +68,10 @@ struct Route {
     client_ip: Option<IpNet>,
     backend: Option<SocketAddr>,
     backends: Option<Vec<SocketAddr>>,
+    /// If set, the LB returns a 3xx redirect to this URL instead of proxying.
+    redirect: Option<String>,
+    /// Redirect status code (3xx). Defaults to 302.
+    redirect_code: u16,
     mode: LbMode,
 }
 
@@ -78,15 +82,42 @@ impl Route {
             .as_deref()
             .map(parse_client_ip)
             .transpose()?;
-        match (raw.backend, raw.backends) {
-            (Some(b), None) => Ok(Route {
-                host: raw.host,
-                path: raw.path,
-                client_ip,
-                backend: Some(parse_addr(&b)?),
-                backends: None,
-                mode: raw.mode,
-            }),
+
+        // Exactly one of backend / backends / redirect must be set.
+        let set_count = [
+            raw.backend.is_some(),
+            raw.backends.is_some(),
+            raw.redirect.is_some(),
+        ]
+        .iter()
+        .filter(|&&b| b)
+        .count();
+        if set_count != 1 {
+            return Err(format!(
+                "route must set exactly one of `backend`, `backends`, `redirect` (found {set_count})"
+            ));
+        }
+
+        // redirect must point somewhere (reject empty / whitespace-only).
+        if let Some(r) = raw.redirect.as_ref() {
+            if r.trim().is_empty() {
+                return Err("redirect target must not be empty".into());
+            }
+        }
+
+        // redirect_code must be a standard 3xx redirect status when provided.
+        let redirect_code = match raw.redirect_code {
+            Some(c) if [301u16, 302, 303, 307, 308].contains(&c) => c,
+            Some(c) => {
+                return Err(format!(
+                    "redirect_code must be one of 301/302/303/307/308, got {c}"
+                ));
+            }
+            None => 302,
+        };
+
+        let (backend, backends) = match (raw.backend, raw.backends) {
+            (Some(b), None) => (Some(parse_addr(&b)?), None),
             (None, Some(list)) => {
                 if list.is_empty() {
                     return Err("route with `backends` has empty list".into());
@@ -95,18 +126,23 @@ impl Route {
                 for s in list {
                     addrs.push(parse_addr(&s)?);
                 }
-                Ok(Route {
-                    host: raw.host,
-                    path: raw.path,
-                    client_ip,
-                    backend: None,
-                    backends: Some(addrs),
-                    mode: raw.mode,
-                })
+                (None, Some(addrs))
             }
-            (Some(_), Some(_)) => Err("route has both `backend` and `backends`".into()),
-            (None, None) => Err("route has neither `backend` nor `backends`".into()),
-        }
+            // redirect-only route: neither backend nor backends.
+            (None, None) => (None, None),
+            _ => unreachable!("set_count == 1 rules out both backend and backends"),
+        };
+
+        Ok(Route {
+            host: raw.host,
+            path: raw.path,
+            client_ip,
+            backend,
+            backends,
+            redirect: raw.redirect,
+            redirect_code,
+            mode: raw.mode,
+        })
     }
 }
 
@@ -117,6 +153,8 @@ struct RouteRaw {
     client_ip: Option<String>,
     backend: Option<String>,
     backends: Option<Vec<String>>,
+    redirect: Option<String>,
+    redirect_code: Option<u16>,
     #[serde(default)]
     mode: LbMode,
 }
@@ -372,6 +410,23 @@ fn pick_primary(backends: &[SocketAddr], unhealthy: &HashSet<SocketAddr>) -> Soc
     backends[0]
 }
 
+/// Active-active selection with a graceful fallback: consistent-hash via the
+/// ring when present; if the ring is missing for `idx` (e.g. a config reload
+/// invalidated the index between resolve and lookup), degrade to ordered
+/// primary selection so routing never panics.
+fn pick_active_active(
+    idx: usize,
+    backends: &[SocketAddr],
+    rings: &HashMap<usize, Ring>,
+    key: &str,
+    unhealthy: &HashSet<SocketAddr>,
+) -> SocketAddr {
+    match rings.get(&idx) {
+        Some(ring) => ring.pick(key, unhealthy),
+        None => pick_primary(backends, unhealthy),
+    }
+}
+
 /// Affinity key: `Authorization: Bearer <key>` -> `x-api-key` -> client IP -> "unknown".
 fn extract_api_key(
     auth: Option<&str>,
@@ -464,40 +519,28 @@ pub struct Gateway {
     blacklist: Arc<RwLock<Vec<BlacklistEntry>>>,
 }
 
+/// Per-request routing context. `request_filter` resolves the route once and
+/// stores the chosen backend here, so `upstream_peer` can reuse it without
+/// re-resolving (and without re-scanning the route table).
+#[derive(Default)]
+pub struct RoutingCtx {
+    backend: Option<SocketAddr>,
+}
+
 #[async_trait]
 impl ProxyHttp for Gateway {
-    type CTX = ();
+    type CTX = RoutingCtx;
 
-    fn new_ctx(&self) -> Self::CTX {}
+    fn new_ctx(&self) -> Self::CTX {
+        RoutingCtx::default()
+    }
 
     async fn request_filter(
         &self,
         session: &mut Session,
-        _ctx: &mut Self::CTX,
+        ctx: &mut Self::CTX,
     ) -> Result<bool> {
-        // Block blacklisted client IPs before any routing. Uses the TCP peer
-        // address (not X-Forwarded-For) so the value can't be spoofed.
-        let blocked = session
-            .client_addr()
-            .and_then(|a| a.as_inet())
-            .map(|a| a.ip())
-            .map(|ip| {
-                let bl = self.blacklist.read().unwrap();
-                (ip, is_blacklisted(ip, &bl))
-            });
-        if let Some((ip, true)) = blocked {
-            log::warn!("blocked request from blacklisted client IP {ip}");
-            session.respond_error(403).await?;
-            return Ok(true);
-        }
-        Ok(false)
-    }
-
-    async fn upstream_peer(
-        &self,
-        session: &mut Session,
-        _ctx: &mut Self::CTX,
-    ) -> Result<Box<HttpPeer>> {
+        // Gather request fields once; reused for blacklist, routing, and logging.
         let header = session.req_header();
         let host = header
             .headers
@@ -508,48 +551,92 @@ impl ProxyHttp for Gateway {
             .next()
             .unwrap_or("");
         let path = header.uri.path();
-
         let client_ip = session
             .client_addr()
             .and_then(|a| a.as_inet())
             .map(|a| a.ip());
+        let method = header.method.as_str();
 
-        let config = self.config.read().unwrap();
-        let addr = match config.resolve_route(host, path, client_ip) {
-            Some((idx, route)) => match &route.backends {
-                Some(list) => {
-                    let unhealthy = self.health.unhealthy.read().unwrap();
-                    match route.mode {
-                        LbMode::ActiveStandby => pick_primary(list, &unhealthy),
-                        LbMode::ActiveActive => {
-                            let key = extract_api_key(
-                                header
-                                    .headers
-                                    .get("authorization")
-                                    .and_then(|v| v.to_str().ok()),
-                                header.headers.get("x-api-key").and_then(|v| v.to_str().ok()),
-                                client_ip,
-                            );
-                            let rings = self.rings.read().unwrap();
-                            let ring = rings
-                                .get(&idx)
-                                .expect("ring must exist for an active-active backends-route");
-                            ring.pick(&key, &*unhealthy)
-                        }
-                    }
-                }
-                None => route
-                    .backend
-                    .expect("single-backend route must have backend"),
-            },
-            None => config.default_backend,
+        // 1. Blacklist: block before any routing. Uses the TCP peer address
+        //    (not X-Forwarded-For) so the value can't be spoofed.
+        if let Some(ip) = client_ip {
+            let blocked = {
+                let bl = self.blacklist.read().unwrap();
+                is_blacklisted(ip, &bl)
+            };
+            if blocked {
+                log::warn!("blocked request from blacklisted client IP {ip}");
+                session.respond_error(403).await?;
+                return Ok(true);
+            }
+        }
+
+        // 2. Resolve the route ONCE and decide redirect vs backend. All of this
+        //    is synchronous, so the config read-guard is held only briefly and
+        //    never across an await.
+        enum Decision {
+            Redirect(String, u16),
+            Proxy(SocketAddr),
+        }
+        let decision = {
+            let config = self.config.read().unwrap();
+            match config.resolve_route(host, path, client_ip) {
+                Some((idx, route)) => match &route.redirect {
+                    Some(location) => Decision::Redirect(location.clone(), route.redirect_code),
+                    None => Decision::Proxy(match &route.backends {
+                        Some(list) => match route.mode {
+                            LbMode::ActiveStandby => {
+                                let unhealthy = self.health.unhealthy.read().unwrap();
+                                pick_primary(list, &unhealthy)
+                            }
+                            LbMode::ActiveActive => {
+                                let key = extract_api_key(
+                                    header
+                                        .headers
+                                        .get("authorization")
+                                        .and_then(|v| v.to_str().ok()),
+                                    header.headers.get("x-api-key").and_then(|v| v.to_str().ok()),
+                                    client_ip,
+                                );
+                                let unhealthy = self.health.unhealthy.read().unwrap();
+                                let rings = self.rings.read().unwrap();
+                                pick_active_active(idx, list, &rings, &key, &unhealthy)
+                            }
+                        },
+                        None => route.backend.expect("single-backend route must have backend"),
+                    }),
+                },
+                None => Decision::Proxy(config.default_backend),
+            }
         };
 
-        log::info!(
-            "{}",
-            dispatch_line(header.method.as_str(), host, path, client_ip, addr)
-        );
+        match decision {
+            Decision::Redirect(location, code) => {
+                log::info!("redirect {code} {host}{path} -> {location}");
+                let mut resp = pingora_http::ResponseHeader::build(code, None)?;
+                resp.insert_header("Location", &location)?;
+                session.write_response_header(Box::new(resp), true).await?;
+                Ok(true)
+            }
+            Decision::Proxy(addr) => {
+                ctx.backend = Some(addr);
+                log::info!("{}", dispatch_line(method, host, path, client_ip, addr));
+                Ok(false)
+            }
+        }
+    }
 
+    async fn upstream_peer(
+        &self,
+        _session: &mut Session,
+        ctx: &mut Self::CTX,
+    ) -> Result<Box<HttpPeer>> {
+        // Routing was resolved once in `request_filter`; just reuse it.
+        // The unwrap_or_else fallback only triggers if `request_filter` did not
+        // set a backend, which never happens on the proxy path.
+        let addr = ctx
+            .backend
+            .unwrap_or_else(|| self.config.read().unwrap().default_backend);
         Ok(Box::new(HttpPeer::new(addr, false, String::new())))
     }
 
@@ -846,16 +933,25 @@ impl Log for StderrLogger {
     fn flush(&self) {}
 }
 
+/// Create a datagram socket connected to a syslog path. The socket is
+/// non-blocking so a slow/jammed syslogd can never stall the data path: a full
+/// buffer drops the log line (best-effort) instead of blocking the worker.
+fn connect_syslog(path: &str) -> Option<UnixDatagram> {
+    let sock = UnixDatagram::unbound().ok()?;
+    sock.set_nonblocking(true).ok()?;
+    sock.connect(path).ok()?;
+    Some(sock)
+}
+
 /// Install the global `log` backend: prefer a local syslog Unix socket
 /// (`/dev/log`, then the macOS/BSD variants), otherwise fall back to stderr.
 /// pingora's own `log::` calls route through here too.
 fn init_logging(ident: &str) {
     let pid = std::process::id();
     for path in ["/dev/log", "/var/run/syslog", "/var/run/log"] {
-        // Create an unbound datagram socket and connect it to the syslog path.
-        let sock = match UnixDatagram::unbound().and_then(|s| s.connect(path).map(|()| s)) {
-            Ok(s) => s,
-            Err(_) => continue,
+        let sock = match connect_syslog(path) {
+            Some(s) => s,
+            None => continue,
         };
         let logger = SyslogLogger {
             sock,
@@ -1049,6 +1145,28 @@ routes:
     }
 
     #[test]
+    fn pick_active_active_uses_ring_or_falls_back() {
+        let bs: Vec<SocketAddr> = ["10.0.0.1:80", "10.0.0.2:80", "10.0.0.3:80"]
+            .iter()
+            .map(|s| s.parse().unwrap())
+            .collect();
+        let mut rings: HashMap<usize, Ring> = HashMap::new();
+        rings.insert(7, Ring::new(&bs));
+        let un = HashSet::new();
+
+        // ring present -> consistent-hash pick (deterministic per key)
+        let a = pick_active_active(7, &bs, &rings, "some-key", &un);
+        let b = pick_active_active(7, &bs, &rings, "some-key", &un);
+        assert_eq!(a, b, "same key via ring -> same backend");
+        assert!(bs.contains(&a));
+
+        // ring missing for idx (e.g. stale after a reload) -> graceful fallback
+        // to ordered primary selection instead of panicking.
+        let c = pick_active_active(999, &bs, &rings, "some-key", &un);
+        assert_eq!(c, bs[0], "missing ring falls back to pick_primary -> backends[0]");
+    }
+
+    #[test]
     fn config_backends_mode_parse() {
         let yaml = r#"
 default_backend: "127.0.0.1:8080"
@@ -1102,6 +1220,43 @@ routes: []
 "#;
         let cfg2 = Config::from_str(without).unwrap();
         assert!(cfg2.blacklist.is_none());
+    }
+
+    #[test]
+    fn config_parses_redirect_route() {
+        let yaml = r#"
+default_backend: "127.0.0.1:8080"
+routes:
+  - host: "old.example.com"
+    redirect: "https://new.example.com/"
+  - path: "/go"
+    redirect: "https://example.com/dest"
+    redirect_code: 301
+"#;
+        let cfg = Config::from_str(yaml).unwrap();
+        assert_eq!(cfg.routes[0].redirect.as_deref(), Some("https://new.example.com/"));
+        assert_eq!(cfg.routes[0].redirect_code, 302, "default redirect code is 302");
+        assert!(cfg.routes[0].backend.is_none() && cfg.routes[0].backends.is_none());
+        assert_eq!(cfg.routes[1].redirect.as_deref(), Some("https://example.com/dest"));
+        assert_eq!(cfg.routes[1].redirect_code, 301);
+    }
+
+    #[test]
+    fn config_redirect_validates_mutual_exclusive_and_code() {
+        let both = "default_backend: \"127.0.0.1:80\"\nroutes:\n  - host: a\n    backend: \"1.1.1.1:80\"\n    redirect: \"https://x\"\n";
+        let bad_code = "default_backend: \"127.0.0.1:80\"\nroutes:\n  - host: a\n    redirect: \"https://x\"\n    redirect_code: 200\n";
+        let nonstandard = "default_backend: \"127.0.0.1:80\"\nroutes:\n  - host: a\n    redirect: \"https://x\"\n    redirect_code: 304\n";
+        assert!(Config::from_str(both).is_err(), "redirect + backend is ambiguous");
+        assert!(Config::from_str(bad_code).is_err(), "redirect_code must be a standard redirect status");
+        assert!(Config::from_str(nonstandard).is_err(), "304 is not a redirect status");
+    }
+
+    #[test]
+    fn config_rejects_empty_redirect() {
+        let empty = "default_backend: \"127.0.0.1:80\"\nroutes:\n  - host: a\n    redirect: \"\"\n";
+        let blank = "default_backend: \"127.0.0.1:80\"\nroutes:\n  - host: a\n    redirect: \"   \"\n";
+        assert!(Config::from_str(empty).is_err(), "empty redirect target rejected");
+        assert!(Config::from_str(blank).is_err(), "whitespace-only redirect target rejected");
     }
 
     #[test]
@@ -1208,6 +1363,35 @@ not-an-ip
         let (n, _) = listener.recv_from(&mut buf).unwrap();
         let msg = std::str::from_utf8(&buf[..n]).unwrap();
         assert_eq!(msg, "<14>gateway-lb[4242]: dispatch method=GET backend=10.0.0.1:80");
+        let _ = std::fs::remove_file(&sock_path);
+    }
+
+    #[test]
+    fn connect_syslog_socket_is_nonblocking() {
+        // Bind a listener that never reads, so its receive buffer fills. A
+        // non-blocking sender must then error (drop) instead of blocking the
+        // worker forever under syslog pressure.
+        let sock_path = std::env::temp_dir()
+            .join(format!("lb_syslog_nb_{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock_path);
+        let listener = UnixDatagram::bind(&sock_path).unwrap();
+
+        let sock = connect_syslog(sock_path.to_str().unwrap())
+            .expect("should connect to the bound listener");
+
+        let payload = b"<14>t[0]: padded-log-message-bytes-aaaaaaaaaaaaaaaa";
+        let mut errored = false;
+        for _ in 0..200_000 {
+            if sock.send(payload).is_err() {
+                errored = true;
+                break;
+            }
+        }
+        assert!(
+            errored,
+            "non-blocking syslog socket must drop under pressure, not block"
+        );
+        drop(listener);
         let _ = std::fs::remove_file(&sock_path);
     }
 
