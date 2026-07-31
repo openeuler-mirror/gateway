@@ -1714,6 +1714,14 @@ fn peek_total_cost_limit(
 
 /// Map a RateLimitDecision rejection to a RateLimitExceeded error, choosing
 /// a `limit_type` and message based on which window dimension rejected.
+///
+/// Three orthogonal axes determine the output:
+/// - `rejected_kind`: Counts (RPM) / Tokens (TPM) / Costs (cost-per-window)
+/// - `rejected_window_secs`: 60 = per-minute, other = custom window
+/// - `scope_label + plan_name`: key / team / plan / default
+///
+/// 12 base combinations (3 kinds × 2 window sizes × 2 scope paths), plus
+/// plan-name variants for the team/key-with-plan cases.
 fn map_decision_to_err(
     decision: &RateLimitDecision,
     scope_label: &'static str,
@@ -1723,69 +1731,164 @@ fn map_decision_to_err(
 ) -> GatewayError {
     let is_team = scope_label == "team";
     let secs = decision.rejected_window_secs;
-    let (limit_type, message) = match secs {
-        Some(60) | None => {
-            match plan_name {
-                Some(pn) if is_team => (
+    let per_min = matches!(secs, Some(60) | None);
+    // Default to Counts when peek_only didn't populate rejected_kind (legacy
+    // callers / defensive). Counts is the RPM dimension — the historical
+    // default before TPM/cost were added — so old paths keep their old message.
+    let kind = decision.rejected_kind.unwrap_or(LimitDimension::Counts);
+
+    // ── Per-axis label components ──
+    // kind → ("RPM"/"TPM"/"cost", unit suffix for /min and per-Ns)
+    let (kind_word, kind_unit_min, kind_unit_window) = match kind {
+        LimitDimension::Counts => ("RPM", "req/min", "requests"),
+        LimitDimension::Tokens => ("TPM", "tokens/min", "tokens"),
+        LimitDimension::Costs => ("cost", "/min", "cost"),
+    };
+    // limit display: cost uses micros_to_decimal for human-readable $.
+    let limit_display = match kind {
+        LimitDimension::Costs => format!("${}", boom_limiter::micros_to_decimal(decision.limit)),
+        _ => decision.limit.to_string(),
+    };
+
+    // ── limit_type + message ──
+    let (limit_type, message) = if per_min {
+        // Per-minute window (60s or legacy None).
+        match (is_team, plan_name) {
+            (true, Some(pn)) => match kind {
+                LimitDimension::Counts => (
                     "team_rpm_limit",
                     format!(
                         "Team '{}' RPM limit exceeded. Plan: {}, Limit: {}/min",
                         scope_id, pn, decision.limit
                     ),
                 ),
-                Some(pn) => (
-                    "plan_rpm_limit",
-                    format!("Plan '{}' RPM limit exceeded. Limit: {}/min", pn, decision.limit),
+                LimitDimension::Tokens => (
+                    "team_tpm_limit",
+                    format!(
+                        "Team '{}' TPM limit exceeded. Plan: {}, Limit: {} tokens/min",
+                        scope_id, pn, decision.limit
+                    ),
                 ),
-                None if is_team => (
+                LimitDimension::Costs => (
+                    "team_cost_limit",
+                    format!(
+                        "Team '{}' cost limit exceeded. Plan: {}, Limit: ${}/min",
+                        scope_id, pn,
+                        boom_limiter::micros_to_decimal(decision.limit)
+                    ),
+                ),
+            },
+            (false, Some(pn)) => match kind {
+                LimitDimension::Counts => (
+                    "plan_rpm_limit",
+                    format!(
+                        "Plan '{}' RPM limit exceeded. Limit: {}/min",
+                        pn, decision.limit
+                    ),
+                ),
+                LimitDimension::Tokens => (
+                    "plan_tpm_limit",
+                    format!(
+                        "Plan '{}' TPM limit exceeded. Limit: {} tokens/min",
+                        pn, decision.limit
+                    ),
+                ),
+                LimitDimension::Costs => (
+                    "plan_cost_limit",
+                    format!(
+                        "Plan '{}' cost limit exceeded. Limit: ${}/min",
+                        pn,
+                        boom_limiter::micros_to_decimal(decision.limit)
+                    ),
+                ),
+            },
+            (true, None) => match kind {
+                LimitDimension::Counts => (
                     "team_rpm_limit",
                     format!(
                         "Team '{}' RPM limit exceeded. Limit: {}/min",
                         scope_id, decision.limit
                     ),
                 ),
-                None => (
+                LimitDimension::Tokens => (
+                    "team_tpm_limit",
+                    format!(
+                        "Team '{}' TPM limit exceeded. Limit: {} tokens/min",
+                        scope_id, decision.limit
+                    ),
+                ),
+                LimitDimension::Costs => (
+                    "team_cost_limit",
+                    format!(
+                        "Team '{}' cost limit exceeded. Limit: ${}/min",
+                        scope_id,
+                        boom_limiter::micros_to_decimal(decision.limit)
+                    ),
+                ),
+            },
+            (false, None) => match kind {
+                LimitDimension::Counts => (
                     "rpm_limit",
                     format!(
                         "RPM limit exceeded. Model: {}, Limit: {}/min",
                         requested_model, decision.limit
                     ),
                 ),
-            }
+                LimitDimension::Tokens => (
+                    "tpm_limit",
+                    format!(
+                        "TPM limit exceeded. Model: {}, Limit: {} tokens/min",
+                        requested_model, decision.limit
+                    ),
+                ),
+                LimitDimension::Costs => (
+                    "cost_limit",
+                    format!(
+                        "Cost limit exceeded. Model: {}, Limit: ${}/min",
+                        requested_model,
+                        boom_limiter::micros_to_decimal(decision.limit)
+                    ),
+                ),
+            },
         }
-        Some(s) => {
-            match plan_name {
-                Some(pn) if is_team => (
-                    "team_window_limit",
-                    format!(
-                        "Team '{}' window limit exceeded. Plan: {}, Limit: {} per {}s",
-                        scope_id, pn, decision.limit, s
-                    ),
+    } else {
+        // Custom window (not 60s, not None).
+        let s = secs.unwrap_or(60);
+        match (is_team, plan_name) {
+            (true, Some(pn)) => (
+                "team_window_limit",
+                format!(
+                    "Team '{}' window {} limit exceeded. Plan: {}, Limit: {} {} per {}s",
+                    scope_id, kind_word, pn, limit_display, kind_unit_window, s
                 ),
-                Some(pn) => (
-                    "plan_window_limit",
-                    format!(
-                        "Plan '{}' window limit exceeded. Limit: {} per {}s",
-                        pn, decision.limit, s
-                    ),
+            ),
+            (false, Some(pn)) => (
+                "plan_window_limit",
+                format!(
+                    "Plan '{}' window {} limit exceeded. Limit: {} {} per {}s",
+                    pn, kind_word, limit_display, kind_unit_window, s
                 ),
-                None if is_team => (
-                    "team_window_limit",
-                    format!(
-                        "Team '{}' window limit exceeded. Limit: {} per {}s",
-                        scope_id, decision.limit, s
-                    ),
+            ),
+            (true, None) => (
+                "team_window_limit",
+                format!(
+                    "Team '{}' window {} limit exceeded. Limit: {} {} per {}s",
+                    scope_id, kind_word, limit_display, kind_unit_window, s
                 ),
-                None => (
-                    "window_limit",
-                    format!(
-                        "Window limit exceeded. Model: {}, Limit: {} per {}s",
-                        requested_model, decision.limit, s
-                    ),
+            ),
+            (false, None) => (
+                "window_limit",
+                format!(
+                    "Window {} limit exceeded. Model: {}, Limit: {} {} per {}s",
+                    kind_word, requested_model, limit_display, kind_unit_window, s
                 ),
-            }
+            ),
         }
     };
+
+    // Suppress unused warning when kind_word isn't read in per-min path.
+    let _ = (kind_word, kind_unit_min);
+
     GatewayError::RateLimitExceeded {
         retry_after_secs: decision.retry_after_secs,
         message,
