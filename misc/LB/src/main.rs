@@ -1,3 +1,4 @@
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use clap::Parser;
 use ipnet::IpNet;
@@ -12,7 +13,7 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Parser, Debug)]
@@ -218,7 +219,9 @@ fn parse_blacklist_entry(line: &str) -> std::result::Result<BlacklistEntry, Stri
     match parts.as_slice() {
         // exactly two `-`-separated parts -> range
         [start, end] => parse_range(start, end),
-        // no `-` (or >2, which won't parse as a network) -> single IP / CIDR
+        // 3+ parts (e.g. a typo'd `a-b-c`) -> explicit error, not a silent fallthrough
+        [_, _, _, ..] => Err(format!("invalid range '{line}' (expected exactly one '-')")),
+        // no `-` -> single IP / CIDR
         _ => parse_client_ip(line).map(BlacklistEntry::Net),
     }
 }
@@ -460,18 +463,19 @@ const PROBE_INTERVAL: Duration = Duration::from_secs(5);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const FAIL_THRESHOLD: u32 = 3;
 
-struct HealthState {
-    backends: Arc<RwLock<Vec<SocketAddr>>>,
-    unhealthy: Arc<RwLock<HashSet<SocketAddr>>>,
+/// Hot-swappable snapshot: the config plus its purely-derived `rings` and
+/// `backends` list. Swapped atomically on reload, so a reader that `.load()`s
+/// this guard sees a consistent config+rings+backends triple (no torn reads).
+struct ConfigSnapshot {
+    config: Config,
+    rings: HashMap<usize, Ring>,
+    backends: Vec<SocketAddr>,
 }
 
-impl HealthState {
-    fn new(backends: Vec<SocketAddr>) -> Arc<Self> {
-        Arc::new(HealthState {
-            backends: Arc::new(RwLock::new(backends)),
-            unhealthy: Arc::new(RwLock::new(HashSet::new())),
-        })
-    }
+pub struct Gateway {
+    snapshot: Arc<ArcSwap<ConfigSnapshot>>,
+    unhealthy: Arc<ArcSwap<HashSet<SocketAddr>>>,
+    blacklist: Arc<ArcSwap<Vec<BlacklistEntry>>>,
 }
 
 /// (prev_consecutive_failures, probe_healthy) -> (new_failures, mark_unhealthy)
@@ -489,34 +493,31 @@ fn probe_once(addr: SocketAddr) -> bool {
 }
 
 /// Background TCP prober: every PROBE_INTERVAL, probe each known backend and
-/// mark/unmark unhealthy in the shared set.
-fn run_health_probe(state: Arc<HealthState>) {
+/// publish a fresh `unhealthy` set. It is the SOLE writer of `unhealthy`, so a
+/// plain `.store()` is safe. Rebuilding from the current `backends` each cycle
+/// also self-prunes backends that were removed from the config.
+fn run_health_probe(
+    snapshot: Arc<ArcSwap<ConfigSnapshot>>,
+    unhealthy: Arc<ArcSwap<HashSet<SocketAddr>>>,
+) {
     std::thread::spawn(move || {
         let mut failures: HashMap<SocketAddr, u32> = HashMap::new();
         loop {
-            let backends = state.backends.read().unwrap().clone();
+            let backends = snapshot.load().backends.clone();
+            let mut new_unhealthy = HashSet::new();
             for addr in &backends {
                 let healthy = probe_once(*addr);
                 let prev = *failures.get(addr).unwrap_or(&0);
                 let (nf, mark) = classify_health(prev, healthy);
                 failures.insert(*addr, nf);
-                let mut set = state.unhealthy.write().unwrap();
                 if mark {
-                    set.insert(*addr);
-                } else {
-                    set.remove(addr);
+                    new_unhealthy.insert(*addr);
                 }
             }
+            unhealthy.store(Arc::new(new_unhealthy));
             std::thread::sleep(PROBE_INTERVAL);
         }
     });
-}
-
-pub struct Gateway {
-    config: Arc<RwLock<Config>>,
-    rings: Arc<RwLock<HashMap<usize, Ring>>>,
-    health: Arc<HealthState>,
-    blacklist: Arc<RwLock<Vec<BlacklistEntry>>>,
 }
 
 /// Per-request routing context. `request_filter` resolves the route once and
@@ -551,6 +552,8 @@ impl ProxyHttp for Gateway {
             .next()
             .unwrap_or("");
         let path = header.uri.path();
+        // `as_inet()` is None for non-INET (e.g. Unix-socket) clients, so for a
+        // UDS listener the IP-based blacklist and client_ip routes silently no-op.
         let client_ip = session
             .client_addr()
             .and_then(|a| a.as_inet())
@@ -560,35 +563,32 @@ impl ProxyHttp for Gateway {
         // 1. Blacklist: block before any routing. Uses the TCP peer address
         //    (not X-Forwarded-For) so the value can't be spoofed.
         if let Some(ip) = client_ip {
-            let blocked = {
-                let bl = self.blacklist.read().unwrap();
-                is_blacklisted(ip, &bl)
-            };
-            if blocked {
+            let bl = self.blacklist.load();
+            if is_blacklisted(ip, &bl) {
                 log::warn!("blocked request from blacklisted client IP {ip}");
                 session.respond_error(403).await?;
                 return Ok(true);
             }
         }
 
-        // 2. Resolve the route ONCE and decide redirect vs backend. All of this
-        //    is synchronous, so the config read-guard is held only briefly and
-        //    never across an await.
+        // 2. Resolve the route ONCE and decide redirect vs backend. All reads
+        //    here are lock-free ArcSwap `.load()`s; the guards are dropped at
+        //    the end of this sync block, before any `.await` below. Because
+        //    `config` and `rings` come from the SAME snapshot guard, the route
+        //    index and its ring are always coherent (no torn read on reload).
         enum Decision {
             Redirect(String, u16),
             Proxy(SocketAddr),
         }
         let decision = {
-            let config = self.config.read().unwrap();
-            match config.resolve_route(host, path, client_ip) {
+            let snap = self.snapshot.load();
+            let unhealthy = self.unhealthy.load();
+            match snap.config.resolve_route(host, path, client_ip) {
                 Some((idx, route)) => match &route.redirect {
                     Some(location) => Decision::Redirect(location.clone(), route.redirect_code),
                     None => Decision::Proxy(match &route.backends {
                         Some(list) => match route.mode {
-                            LbMode::ActiveStandby => {
-                                let unhealthy = self.health.unhealthy.read().unwrap();
-                                pick_primary(list, &unhealthy)
-                            }
+                            LbMode::ActiveStandby => pick_primary(list, &unhealthy),
                             LbMode::ActiveActive => {
                                 let key = extract_api_key(
                                     header
@@ -598,15 +598,13 @@ impl ProxyHttp for Gateway {
                                     header.headers.get("x-api-key").and_then(|v| v.to_str().ok()),
                                     client_ip,
                                 );
-                                let unhealthy = self.health.unhealthy.read().unwrap();
-                                let rings = self.rings.read().unwrap();
-                                pick_active_active(idx, list, &rings, &key, &unhealthy)
+                                pick_active_active(idx, list, &snap.rings, &key, &unhealthy)
                             }
                         },
                         None => route.backend.expect("single-backend route must have backend"),
                     }),
                 },
-                None => Decision::Proxy(config.default_backend),
+                None => Decision::Proxy(snap.config.default_backend),
             }
         };
 
@@ -636,7 +634,7 @@ impl ProxyHttp for Gateway {
         // set a backend, which never happens on the proxy path.
         let addr = ctx
             .backend
-            .unwrap_or_else(|| self.config.read().unwrap().default_backend);
+            .unwrap_or_else(|| self.snapshot.load().config.default_backend);
         Ok(Box::new(HttpPeer::new(addr, false, String::new())))
     }
 
@@ -730,10 +728,8 @@ fn event_targets(
 
 fn watch_config(
     path: String,
-    config: Arc<RwLock<Config>>,
-    rings: Arc<RwLock<HashMap<usize, Ring>>>,
-    health: Arc<HealthState>,
-    blacklist: Arc<RwLock<Vec<BlacklistEntry>>>,
+    snapshot: Arc<ArcSwap<ConfigSnapshot>>,
+    blacklist: Arc<ArcSwap<Vec<BlacklistEntry>>>,
 ) {
     use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, Watcher};
 
@@ -773,7 +769,7 @@ fn watch_config(
         // Also watch the blacklist file's directory so edits to it hot-reload.
         let mut watched_blacklist_dir: Option<std::path::PathBuf> = None;
         {
-            let bl_path = config.read().unwrap().blacklist.clone();
+            let bl_path = snapshot.load().config.blacklist.clone();
             if let Some(bp) = bl_path.as_deref() {
                 if let Some(dir) = Path::new(bp).parent() {
                     if dir != watch_dir.as_path() {
@@ -791,9 +787,9 @@ fn watch_config(
             };
 
             // Blacklist file name is read fresh; the path may change after a reload.
-            let bl_name = config
-                .read()
-                .unwrap()
+            let bl_name = snapshot
+                .load()
+                .config
                 .blacklist
                 .as_deref()
                 .and_then(|p| Path::new(p).file_name())
@@ -818,20 +814,13 @@ fn watch_config(
                     Ok(new_config) => {
                         let new_rings = build_rings(&new_config);
                         let new_backends = collect_all_backends(&new_config);
-                        let backend_set: HashSet<SocketAddr> =
-                            new_backends.iter().copied().collect();
-                        {
-                            let mut u = health.unhealthy.write().unwrap();
-                            u.retain(|a| backend_set.contains(a));
-                        }
-                        *health.backends.write().unwrap() = new_backends;
 
                         // If the blacklist file path changed, reload its content
                         // and (best-effort) watch the new directory.
-                        let prev_bl = config.read().unwrap().blacklist.clone();
+                        let prev_bl = snapshot.load().config.blacklist.clone();
                         let new_bl = new_config.blacklist.clone();
                         if new_bl != prev_bl {
-                            *blacklist.write().unwrap() = load_blacklist_state(new_bl.as_deref());
+                            blacklist.store(Arc::new(load_blacklist_state(new_bl.as_deref())));
                             let new_dir = new_bl
                                 .as_deref()
                                 .and_then(|p| Path::new(p).parent())
@@ -845,8 +834,13 @@ fn watch_config(
                             log::info!("blacklist path changed to {:?}", new_bl);
                         }
 
-                        *config.write().unwrap() = new_config;
-                        *rings.write().unwrap() = new_rings;
+                        // Atomic swap: config + rings + backends together, so
+                        // readers never see a torn (new config, old rings) pair.
+                        snapshot.store(Arc::new(ConfigSnapshot {
+                            config: new_config,
+                            rings: new_rings,
+                            backends: new_backends,
+                        }));
                         log::info!("config reloaded from {path}");
                     }
                     Err(e) => {
@@ -856,11 +850,11 @@ fn watch_config(
             }
 
             if bl_changed {
-                let bl_path = config.read().unwrap().blacklist.clone();
+                let bl_path = snapshot.load().config.blacklist.clone();
                 if let Some(p) = bl_path.as_deref() {
                     match load_blacklist(p) {
                         Ok(v) => {
-                            *blacklist.write().unwrap() = v;
+                            blacklist.store(Arc::new(v));
                             log::info!("blacklist reloaded from {p}");
                         }
                         Err(e) => log::error!("failed to reload blacklist {p}: {e}"),
@@ -981,25 +975,20 @@ fn main() {
     let mut server = Server::new(None).unwrap();
     server.bootstrap();
 
-    let config = Arc::new(RwLock::new(config));
-    let rings = Arc::new(RwLock::new(build_rings(&config.read().unwrap())));
-    let health = HealthState::new(collect_all_backends(&config.read().unwrap()));
-    let blacklist = Arc::new(RwLock::new(load_blacklist_state(
-        config.read().unwrap().blacklist.as_deref(),
-    )));
-    run_health_probe(health.clone());
-    watch_config(
-        config_path,
-        config.clone(),
-        rings.clone(),
-        health.clone(),
-        blacklist.clone(),
-    );
+    let blacklist_init = load_blacklist_state(config.blacklist.as_deref());
+    let snapshot = Arc::new(ArcSwap::from_pointee(ConfigSnapshot {
+        rings: build_rings(&config),
+        backends: collect_all_backends(&config),
+        config,
+    }));
+    let unhealthy = Arc::new(ArcSwap::from_pointee(HashSet::<SocketAddr>::new()));
+    let blacklist = Arc::new(ArcSwap::from_pointee(blacklist_init));
+    run_health_probe(snapshot.clone(), unhealthy.clone());
+    watch_config(config_path, snapshot.clone(), blacklist.clone());
 
     let gateway = Gateway {
-        config,
-        rings,
-        health,
+        snapshot,
+        unhealthy,
         blacklist,
     };
 
@@ -1326,11 +1315,11 @@ not-an-ip
     #[test]
     fn syslog_priority_maps_levels_to_user_facility() {
         use log::Level;
-        assert_eq!(syslog_priority(Level::Error), 1 * 8 + 3);
-        assert_eq!(syslog_priority(Level::Warn), 1 * 8 + 4);
-        assert_eq!(syslog_priority(Level::Info), 1 * 8 + 6);
-        assert_eq!(syslog_priority(Level::Debug), 1 * 8 + 7);
-        assert_eq!(syslog_priority(Level::Trace), 1 * 8 + 7);
+        assert_eq!(syslog_priority(Level::Error), FACILITY_USER * 8 + 3);
+        assert_eq!(syslog_priority(Level::Warn), FACILITY_USER * 8 + 4);
+        assert_eq!(syslog_priority(Level::Info), FACILITY_USER * 8 + 6);
+        assert_eq!(syslog_priority(Level::Debug), FACILITY_USER * 8 + 7);
+        assert_eq!(syslog_priority(Level::Trace), FACILITY_USER * 8 + 7);
     }
 
     #[test]
@@ -1444,8 +1433,9 @@ not-an-ip
 10.0.0.5-10.0.0.1
 1.2.3.4-foo
 1.2.3.4-::1
+10.0.0.1-10.0.0.2-3
 ";
         let entries = parse_blacklist(content);
-        assert!(entries.is_empty(), "all three are invalid ranges");
+        assert!(entries.is_empty(), "all four are invalid ranges");
     }
 }
