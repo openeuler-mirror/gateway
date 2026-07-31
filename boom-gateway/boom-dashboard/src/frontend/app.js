@@ -72,6 +72,17 @@
     return cachedPlanNames;
   }
 
+  // Return plan names filtered to type=key (for key create/edit dropdown).
+  // Mirrors getTeamPlanNames' filter pattern — type=key plans only.
+  async function getKeyPlanNames() {
+    try {
+      const data = await api("/admin/plans");
+      return (data.plans || [])
+        .filter((p) => !p.type || p.type === "key")
+        .map((p) => p.name);
+    } catch { return []; }
+  }
+
   // Return plan names filtered to type=team (for team modal dropdown).
   async function getTeamPlanNames() {
     try {
@@ -3590,7 +3601,7 @@
       });
     };
     populateTeams();
-    getPlanNames().then((names) => {
+    getKeyPlanNames().then((names) => {
       const sel = document.getElementById("m-key-plan");
       if (sel) names.forEach((n) => { const o = document.createElement("option"); o.value = n; o.textContent = n; sel.appendChild(o); });
     });
@@ -3790,7 +3801,27 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
     const isPromptLogExcluded = (window._promptLogExcludedKeys || []).includes(key.token_hash);
     // Plans drive the assignment dropdown — load before rendering so the
     // <select> can populate synchronously.
-    const planNames = await getPlanNames();
+    // Build team options for the editable team_id select. Uses window._teams
+    // cache (populated by loadQuotaOverview); falls back to fetching overview
+    // if cold. The first option is "no team" (value=""), which sets team_id
+    // to NULL via the backend's empty-string→NULL translation.
+    const teamOptionsHtml = await (async () => {
+      let teams = window._teams;
+      if (!teams) {
+        try {
+          const data = await api("/admin/quota/overview");
+          teams = data.teams || [];
+          window._teams = teams;
+        } catch { teams = []; }
+      }
+      const opts = [`<option value="">${t("common.none_option")}</option>`];
+      teams.forEach((tm) => {
+        const sel = (tm.team_id === key.team_id) ? "selected" : "";
+        opts.push(`<option value="${esc(tm.team_id)}" ${sel}>${esc(tm.team_alias || tm.team_id)}</option>`);
+      });
+      return opts.join("");
+    })();
+    const planNames = await getKeyPlanNames();
     // Three plan-assignment states map to <select> values:
     //   ""              → no DB row (follows default_plan at runtime)
     //   "__no_plan__"   → row with plan_name IS NULL (explicit opt-out)
@@ -3817,7 +3848,7 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
             <div class="form-group"><label>${t("form.key.key_name")} ${tip(t("tip.key.key_name"))}</label><input id="m-edit-key-name" value="${esc(key.key_name || "")}"></div>
             <div class="form-group"><label>${t("form.key.alias")} ${tip(t("tip.key.alias_short"))}</label><input id="m-edit-alias" value="${esc(key.key_alias || "")}"></div>
             <div class="form-group"><label>${t("form.key.user_id")} ${tip(t("tip.key.user_id_short"))}</label><input id="m-edit-user" value="${esc(key.user_id || "")}"></div>
-            <div class="form-group"><label>${t("form.key.team_id")} ${tip(t("tip.key.team_id"))}</label><input value="${esc(key.team_id || "-")}" readonly style="background:var(--surface3);cursor:not-allowed"></div>
+            <div class="form-group"><label>${t("form.key.team_id")} ${tip(t("tip.key.team_id"))}</label><select id="m-edit-team" style="background:var(--surface3)">${teamOptionsHtml}</select></div>
             <div class="form-group"><label>${t("form.key.prefix")} ${tip(t("tip.key.prefix_readonly"))}</label><input value="${esc(key.key_prefix ? "sk-" + key.key_prefix + "-***" : "sk-***")}" readonly style="background:var(--surface3);cursor:not-allowed;font-family:var(--mono);font-size:12px"></div>
             <div class="form-group field-full"><label>${t("form.key.tag")} ${tip(t("tip.key.tag_clearable"))}</label><input id="m-edit-tag" value="${esc(key.tag || "")}" maxlength="64"></div>
           </div>
@@ -3869,6 +3900,10 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
           key_name: keyNameVal || null,
           key_alias: aliasVal || null,
           user_id: userVal || null,
+          // team_id: empty string = remove from team (NULL), value = move to
+          // that team. Always send the select's value so COALESCE+CASE on the
+          // backend writes NULL or the new id — null would skip the update.
+          team_id: document.getElementById("m-edit-team").value,
           // tag: empty string clears, null leaves untouched. Always send the
           // trimmed value so COALESCE on the backend either writes "" or the
           // new label — never silently preserves stale tag.
@@ -4243,6 +4278,9 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
       </tr>
       ${keys.map((k) => {
         const tokens = Number(k.total_input_tokens || 0) + Number(k.total_output_tokens || 0);
+        const removeBtn = teamId
+          ? `<button class="btn-small btn-secondary" onclick="window._removeKeyFromTeam('${esc(k.token)}', this)">${t("quota.remove_from_team")}</button>`
+          : "";
         return `<tr class="quota-key-row" data-token="${esc(k.token)}">
           <td>
             <strong>${esc(k.key_alias || k.key_name || k.token_prefix)}</strong>
@@ -4255,6 +4293,7 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
           <td>$${esc(k.total_cost || "0")}</td>
           <td>
             <button class="btn-small" onclick="window._quotaToggleWindows('${esc(k.token)}', this)">${t("quota.expand_windows")}</button>
+            ${removeBtn}
             <select class="search-input" style="max-width:120px" onchange="window._quotaKeyAction('${esc(k.token)}', this.value); this.value=''">
               <option value="">${esc(t("quota.actions_label"))}</option>
               <option value="cumulative">${esc(t("quota.reset_cumulative"))}</option>
@@ -4365,6 +4404,25 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
       _loadQuotaKeys(tid);
     } catch (err) {
       alert(t("common.error_prefix", { message: err.message }));
+    }
+  };
+
+  // Remove a key from its team by PUTting team_id="" (backend translates
+  // empty string to NULL). Only shown on team detail pages (teamId set).
+  window._removeKeyFromTeam = async (token, btn) => {
+    if (!confirm(t("quota.confirm_remove_from_team"))) return;
+    btn.disabled = true;
+    try {
+      await api(`/admin/keys/${encodeURIComponent(token)}`, {
+        method: "PUT",
+        body: JSON.stringify({ team_id: "" }),
+      });
+      const tid = _currentQuotaTeamId();
+      _loadQuotaKeys(tid);
+    } catch (err) {
+      alert(t("common.error_prefix", { message: err.message }));
+    } finally {
+      btn.disabled = false;
     }
   };
 

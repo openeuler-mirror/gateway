@@ -487,6 +487,23 @@ impl PlanStore {
     /// cannot be assigned to individual keys. The caller (dashboard) should
     /// catch this and fall back to default_plan with a warning.
     pub fn assign_key(&self, key_hash: &str, plan_name: &str) -> Result<(), String> {
+        self.validate_plan_for_key(plan_name, key_hash)?;
+        self.apply_key_assignment(key_hash, plan_name);
+        Ok(())
+    }
+
+    /// Apply a key→plan assignment to memory without re-validating. Used by
+    /// `assign_key_db` after the type check has already passed and the DB
+    /// row is committed — avoids running the same check twice.
+    fn apply_key_assignment(&self, key_hash: &str, plan_name: &str) {
+        self.key_assignments
+            .insert(key_hash.to_string(), Some(plan_name.to_string()));
+    }
+
+    /// Type-only check used by `assign_key_db` to fail fast before any DB
+    /// write. Same rule as `assign_key`: type=team plans cannot be assigned
+    /// to individual keys. Returns the resolved plan name for caller logging.
+    fn validate_plan_for_key(&self, plan_name: &str, key_hash: &str) -> Result<(), String> {
         let plan = self
             .plans
             .get(plan_name)
@@ -499,8 +516,6 @@ impl PlanStore {
                 plan_name, key_hash
             ));
         }
-        self.key_assignments
-            .insert(key_hash.to_string(), Some(plan_name.to_string()));
         Ok(())
     }
 
@@ -544,6 +559,22 @@ impl PlanStore {
 
     /// Assign a team to a plan. Rejects if the plan's type=Key.
     pub fn assign_team(&self, team_id: &str, plan_name: &str) -> Result<(), String> {
+        self.validate_plan_for_team(plan_name, team_id)?;
+        self.apply_team_assignment(team_id, plan_name);
+        Ok(())
+    }
+
+    /// Apply a team→plan assignment to memory without re-validating. Used by
+    /// `assign_team_db` after the type check has already passed.
+    fn apply_team_assignment(&self, team_id: &str, plan_name: &str) {
+        self.team_assignments
+            .insert(team_id.to_string(), plan_name.to_string());
+    }
+
+    /// Type-only check used by `assign_team_db` to fail fast before any DB
+    /// write. Same rule as `assign_team`: type=key plans cannot be assigned
+    /// to teams.
+    fn validate_plan_for_team(&self, plan_name: &str, team_id: &str) -> Result<(), String> {
         let plan = self
             .plans
             .get(plan_name)
@@ -556,8 +587,6 @@ impl PlanStore {
                 plan_name, team_id
             ));
         }
-        self.team_assignments
-            .insert(team_id.to_string(), plan_name.to_string());
         Ok(())
     }
 
@@ -924,8 +953,13 @@ impl PlanStore {
     }
 
     /// Assign a key to a plan in DB and memory.
-    /// Writes DB first, then updates memory — avoids concurrent dirty reads on failure.
+    ///
+    /// Type check runs first — before any DB write — so a type=team plan
+    /// cannot dirty the `boom_key_plan_assignment` table. The in-memory
+    /// `assign_key` call after the DB write is a no-op type-wise (already
+    /// validated); it just applies the assignment to memory.
     pub async fn assign_key_db(&self, pool: &sqlx::PgPool, key_hash: &str, plan_name: &str) -> Result<(), String> {
+        self.validate_plan_for_key(plan_name, key_hash)?;
         // GaussDB-compatible upsert: UPDATE → INSERT → UPDATE (no ON CONFLICT support).
         let updated = sqlx::query(
             r#"UPDATE boom_key_plan_assignment SET plan_name = $2 WHERE key_hash = $1"#,
@@ -957,7 +991,7 @@ impl PlanStore {
         }
 
         // DB succeeded — now safe to update memory.
-        self.assign_key(key_hash, plan_name)?;
+        self.apply_key_assignment(key_hash, plan_name);
         Ok(())
     }
 
@@ -1017,7 +1051,11 @@ impl PlanStore {
     }
 
     /// Assign a team to a plan in DB and memory.
+    ///
+    /// Type check runs first — before any DB write — so a type=key plan
+    /// cannot dirty the `boom_team_plan_assignment` table.
     pub async fn assign_team_db(&self, pool: &sqlx::PgPool, team_id: &str, plan_name: &str) -> Result<(), String> {
+        self.validate_plan_for_team(plan_name, team_id)?;
         let updated = sqlx::query(
             r#"UPDATE boom_team_plan_assignment SET plan_name = $2 WHERE team_id = $1"#,
         )
@@ -1046,7 +1084,7 @@ impl PlanStore {
                 .map_err(|e| format!("DB error: {}", e))?;
             }
         }
-        self.assign_team(team_id, plan_name)?;
+        self.apply_team_assignment(team_id, plan_name);
         Ok(())
     }
 
