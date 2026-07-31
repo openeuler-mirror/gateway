@@ -933,16 +933,25 @@ impl Log for StderrLogger {
     fn flush(&self) {}
 }
 
+/// Create a datagram socket connected to a syslog path. The socket is
+/// non-blocking so a slow/jammed syslogd can never stall the data path: a full
+/// buffer drops the log line (best-effort) instead of blocking the worker.
+fn connect_syslog(path: &str) -> Option<UnixDatagram> {
+    let sock = UnixDatagram::unbound().ok()?;
+    sock.set_nonblocking(true).ok()?;
+    sock.connect(path).ok()?;
+    Some(sock)
+}
+
 /// Install the global `log` backend: prefer a local syslog Unix socket
 /// (`/dev/log`, then the macOS/BSD variants), otherwise fall back to stderr.
 /// pingora's own `log::` calls route through here too.
 fn init_logging(ident: &str) {
     let pid = std::process::id();
     for path in ["/dev/log", "/var/run/syslog", "/var/run/log"] {
-        // Create an unbound datagram socket and connect it to the syslog path.
-        let sock = match UnixDatagram::unbound().and_then(|s| s.connect(path).map(|()| s)) {
-            Ok(s) => s,
-            Err(_) => continue,
+        let sock = match connect_syslog(path) {
+            Some(s) => s,
+            None => continue,
         };
         let logger = SyslogLogger {
             sock,
@@ -1354,6 +1363,35 @@ not-an-ip
         let (n, _) = listener.recv_from(&mut buf).unwrap();
         let msg = std::str::from_utf8(&buf[..n]).unwrap();
         assert_eq!(msg, "<14>gateway-lb[4242]: dispatch method=GET backend=10.0.0.1:80");
+        let _ = std::fs::remove_file(&sock_path);
+    }
+
+    #[test]
+    fn connect_syslog_socket_is_nonblocking() {
+        // Bind a listener that never reads, so its receive buffer fills. A
+        // non-blocking sender must then error (drop) instead of blocking the
+        // worker forever under syslog pressure.
+        let sock_path = std::env::temp_dir()
+            .join(format!("lb_syslog_nb_{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock_path);
+        let listener = UnixDatagram::bind(&sock_path).unwrap();
+
+        let sock = connect_syslog(sock_path.to_str().unwrap())
+            .expect("should connect to the bound listener");
+
+        let payload = b"<14>t[0]: padded-log-message-bytes-aaaaaaaaaaaaaaaa";
+        let mut errored = false;
+        for _ in 0..200_000 {
+            if sock.send(payload).is_err() {
+                errored = true;
+                break;
+            }
+        }
+        assert!(
+            errored,
+            "non-blocking syslog socket must drop under pressure, not block"
+        );
+        drop(listener);
         let _ = std::fs::remove_file(&sock_path);
     }
 
