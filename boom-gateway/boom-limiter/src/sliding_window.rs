@@ -16,7 +16,7 @@
 //! - `settle_usage` — increment tokens/costs dimensions of windows + cumulative
 //!   (usage-rate semantics, called after upstream returns real usage).
 
-use boom_core::types::{RateLimitDecision, RateLimitKey, WindowLimit};
+use boom_core::types::{LimitDimension, RateLimitDecision, RateLimitKey, WindowLimit};
 use dashmap::DashMap;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -244,6 +244,7 @@ impl SlidingWindowLimiter {
                             + chrono::Duration::seconds(retry_after as i64),
                         retry_after_secs: Some(retry_after),
                         rejected_window_secs: Some(w.window_secs),
+                        rejected_kind: Some(LimitDimension::Counts),
                     };
                 }
             }
@@ -264,6 +265,7 @@ impl SlidingWindowLimiter {
                             + chrono::Duration::seconds(retry_after as i64),
                         retry_after_secs: Some(retry_after),
                         rejected_window_secs: Some(w.window_secs),
+                        rejected_kind: Some(LimitDimension::Tokens),
                     };
                 }
             }
@@ -285,6 +287,7 @@ impl SlidingWindowLimiter {
                             + chrono::Duration::seconds(retry_after as i64),
                         retry_after_secs: Some(retry_after),
                         rejected_window_secs: Some(w.window_secs),
+                        rejected_kind: Some(LimitDimension::Costs),
                     };
                 }
             }
@@ -317,6 +320,7 @@ impl SlidingWindowLimiter {
             reset_at: chrono::Utc::now() + chrono::Duration::seconds(60),
             retry_after_secs: None,
             rejected_window_secs: None,
+            rejected_kind: None,
         }
     }
 
@@ -368,6 +372,7 @@ impl SlidingWindowLimiter {
             reset_at: chrono::Utc::now() + chrono::Duration::seconds(60),
             retry_after_secs: None,
             rejected_window_secs: None,
+            rejected_kind: None,
         }
     }
 

@@ -632,6 +632,10 @@ pub struct UpdateKeyRequest {
     pub key_name: Option<String>,
     pub key_alias: Option<String>,
     pub user_id: Option<String>,
+    /// Team reassignment. Some("team_id") moves the key to that team;
+    /// Some("") (empty string) removes the key from its team (sets NULL).
+    /// None leaves the team_id untouched.
+    pub team_id: Option<String>,
     pub models: Option<Vec<String>>,
     pub max_budget: Option<f64>,
     pub budget_duration: Option<String>,
@@ -699,6 +703,34 @@ pub async fn update_key(
         }
     });
 
+    // Team reassignment: Some("") → NULL (remove from team), Some(id) → id
+    // (must exist in boom_team_table), None → leave untouched. We bind the
+    // validated Option<&str> separately so SQL `COALESCE($N, team_id)` keeps
+    // the old value when client omitted the field.
+    let team_id_resolved: Option<&str> = match req.team_id.as_deref() {
+        None => None,
+        Some("") => Some(""),
+        Some(id) => Some(id),
+    };
+    if let Some(id) = team_id_resolved {
+        if !id.is_empty() {
+            let exists: bool = sqlx::query_scalar(
+                r#"SELECT EXISTS(SELECT 1 FROM boom_team_table WHERE team_id = $1)"#,
+            )
+            .bind(id)
+            .fetch_one(db_pool)
+            .await
+            .unwrap_or(false);
+            if !exists {
+                return (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    format!("Team '{}' not found", id),
+                )
+                    .into_response();
+            }
+        }
+    }
+
     let expires: Option<NaiveDateTime> = req
         .expires
         .as_deref()
@@ -709,14 +741,17 @@ pub async fn update_key(
            SET key_name = COALESCE($2, key_name),
                key_alias = COALESCE($3, key_alias),
                user_id = COALESCE($4, user_id),
-               models = COALESCE($5, models),
-               max_budget = COALESCE($6, max_budget),
-               budget_duration = COALESCE($7, budget_duration),
-               rpm_limit = COALESCE($8, rpm_limit),
-               tpm_limit = COALESCE($9, tpm_limit),
-               tag = COALESCE($10, tag),
-               expires = COALESCE($11, expires),
-               metadata = COALESCE($12, metadata),
+               team_id = CASE WHEN $5::text IS NULL THEN team_id
+                              WHEN $5::text = '' THEN NULL
+                              ELSE $5::text END,
+               models = COALESCE($6, models),
+               max_budget = COALESCE($7, max_budget),
+               budget_duration = COALESCE($8, budget_duration),
+               rpm_limit = COALESCE($9, rpm_limit),
+               tpm_limit = COALESCE($10, tpm_limit),
+               tag = COALESCE($11, tag),
+               expires = COALESCE($12, expires),
+               metadata = COALESCE($13, metadata),
                updated_at = NOW()
            WHERE token = $1"#,
     )
@@ -724,6 +759,7 @@ pub async fn update_key(
     .bind(&req.key_name)
     .bind(&req.key_alias)
     .bind(&req.user_id)
+    .bind(team_id_resolved)
     .bind(&models_list)
     .bind(req.max_budget)
     .bind(&req.budget_duration)

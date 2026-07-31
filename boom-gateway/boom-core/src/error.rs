@@ -12,10 +12,15 @@ pub enum GatewayError {
     RateLimitExceeded {
         retry_after_secs: Option<u64>,
         message: String,
-        /// Specific limit type for diagnostics: "plan_rpm_limit", "plan_window_limit",
-        /// "rpm_limit", "window_limit", "key_window_tokens", "key_window_cost",
-        /// "team_window_tokens", "team_window_cost", "key_total_token",
-        /// "team_total_token", "key_total_cost", "team_total_cost", etc.
+        /// Specific limit type for diagnostics. Per-minute window variants:
+        /// `rpm_limit`/`tpm_limit`/`cost_limit` (default key, no plan),
+        /// `plan_rpm_limit`/`plan_tpm_limit`/`plan_cost_limit` (key with plan),
+        /// `team_rpm_limit`/`team_tpm_limit`/`team_cost_limit` (team scope).
+        /// Custom-window variants (non-60s):
+        /// `window_limit`/`plan_window_limit`/`team_window_limit` (the message
+        /// body disambiguates counts/tokens/costs since these share a code).
+        /// Cumulative totals (separate path, not via map_decision_to_err):
+        /// `key_total_token`/`team_total_token`/`key_total_cost`/`team_total_cost`.
         limit_type: &'static str,
         /// Which entity hit the limit: "key" or "team". None for legacy paths.
         scope: Option<&'static str>,

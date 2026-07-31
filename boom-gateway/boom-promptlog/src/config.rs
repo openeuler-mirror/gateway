@@ -10,6 +10,7 @@ use serde::Deserialize;
 ///   capture_raw_upstream: false
 ///   excluded_keys: []
 ///   excluded_teams: []
+///   record_headers: []
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 pub struct PromptLogConfig {
@@ -28,6 +29,12 @@ pub struct PromptLogConfig {
     pub excluded_keys: Vec<String>,
     #[serde(default)]
     pub excluded_teams: Vec<String>,
+    /// Whitelist of request header names (lowercase) to capture into each prompt
+    /// log entry. Empty list = no headers recorded. Only listed headers are
+    /// stored — never the full HeaderMap — to avoid leaking sensitive headers
+    /// (Authorization, Cookie, etc.).
+    #[serde(default)]
+    pub record_headers: Vec<String>,
 }
 
 impl Default for PromptLogConfig {
@@ -39,6 +46,7 @@ impl Default for PromptLogConfig {
             capture_raw_upstream: false,
             excluded_keys: Vec::new(),
             excluded_teams: Vec::new(),
+            record_headers: Vec::new(),
         }
     }
 }

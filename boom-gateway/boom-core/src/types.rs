@@ -698,6 +698,21 @@ pub struct RateLimitKey {
     pub model: String,
 }
 
+/// Which dimension of a `WindowLimit` triggered a rejection.
+///
+/// `WindowLimit` is three-dimensional (counts / tokens / costs); when a peek
+/// rejects, the limiter reports which dimension denied so the gateway can
+/// produce an accurate error message (RPM vs TPM vs cost, etc.).
+#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
+pub enum LimitDimension {
+    /// Request-count dimension (`WindowLimit.counts`). RPM-style limit.
+    Counts,
+    /// Token-count dimension (`WindowLimit.tokens`). TPM-style limit.
+    Tokens,
+    /// Cost dimension (`WindowLimit.costs`, USD Decimal → micros internally).
+    Costs,
+}
+
 #[derive(Debug, Clone)]
 pub struct RateLimitDecision {
     pub allowed: bool,
@@ -706,8 +721,11 @@ pub struct RateLimitDecision {
     pub reset_at: chrono::DateTime<chrono::Utc>,
     pub retry_after_secs: Option<u64>,
     /// When `allowed` is false, the window duration that triggered the rejection.
-    /// 60 = RPM window, other = custom window limit.
+    /// 60 = RPM/TPM/cost-per-minute window, other = custom window limit.
     pub rejected_window_secs: Option<u64>,
+    /// When `allowed` is false, which dimension (counts/tokens/costs) denied.
+    /// `None` for the allowed path or for legacy callers that don't populate it.
+    pub rejected_kind: Option<LimitDimension>,
 }
 
 /// A multi-dimensional sliding-window limit entry.

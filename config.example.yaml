@@ -286,6 +286,7 @@ prompt_log:
   capture_raw_upstream: false       # 同时记录上游原始响应（仅格式转换路径如 /v1/messages）
   excluded_keys: []                 # 跳过这些 key（key_hash），不记录
   excluded_teams: []                # 跳过这些 team（team_id），不记录
+  record_headers: []                # 记录到 prompt log 的请求 header 白名单（小写）；空=不记录任何 header，避免泄漏 Authorization/Cookie 等
 
 # ──────────────────────────────────────────────────────────────────────
 # Hook 机制（可选，默认完全关闭）
