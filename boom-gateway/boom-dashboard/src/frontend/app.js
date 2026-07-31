@@ -2656,6 +2656,7 @@
         ${fieldCheckbox("cfg-pl-capture", t("config.field.capture_raw_upstream"), p.capture_raw_upstream)}
         ${fieldFullList("cfg-pl-excluded-keys", t("config.field.excluded_keys"), p.excluded_keys || [])}
         ${fieldFullList("cfg-pl-excluded-teams", t("config.field.excluded_teams"), p.excluded_teams || [])}
+        ${fieldFullList("cfg-pl-record-headers", t("config.field.record_headers"), p.record_headers || [])}
       </div>
       <div class="form-card-actions">
         <button class="btn-primary btn-small" data-save="prompt_log">${t("action.save")}</button>
@@ -2819,6 +2820,7 @@
           capture_raw_upstream: $("cfg-pl-capture").checked,
           excluded_keys: parseListInput($("cfg-pl-excluded-keys")),
           excluded_teams: parseListInput($("cfg-pl-excluded-teams")),
+          record_headers: parseListInput($("cfg-pl-record-headers")),
         });
       } else if (kind === "router") {
         const aliases = parseJsonInput($("cfg-rs-aliases"), {});

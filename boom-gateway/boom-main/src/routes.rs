@@ -453,6 +453,33 @@ async fn chat_completions_inner(
     // Clone request_id and model for prompt log (they get moved into RequestLog later).
     let prompt_log_rid = if prompt_log_should { Some(request_id.clone()) } else { None };
     let prompt_log_model = if prompt_log_should { Some(model.clone()) } else { None };
+    // Snapshot whitelisted request headers (only when configured). Empty
+    // record_headers = capture nothing (security default to avoid leaking
+    // Authorization/Cookie/etc). Header names lowercased on both sides.
+    let prompt_log_headers: Option<std::collections::HashMap<String, String>> = if prompt_log_should {
+        let cfg = state.prompt_log_writer.config();
+        if cfg.record_headers.is_empty() {
+            None
+        } else {
+            let allow: std::collections::HashSet<&str> = cfg
+                .record_headers
+                .iter()
+                .map(|s| s.as_str())
+                .collect();
+            let mut map = std::collections::HashMap::new();
+            for (name, val) in headers.iter() {
+                let name_lower = name.as_str().to_lowercase();
+                if allow.contains(name_lower.as_str()) {
+                    if let Ok(v) = val.to_str() {
+                        map.insert(name_lower, v.to_string());
+                    }
+                }
+            }
+            if map.is_empty() { None } else { Some(map) }
+        }
+    } else {
+        None
+    };
 
     // 1. Model access check (deployment-aware, alias-aware).
     check_model_access(identity, &req.model, &state.router, &inner.config.general_settings.public_models)
@@ -666,6 +693,7 @@ async fn chat_completions_inner(
                     true,
                     req_body,
                     Some(&client_ip),
+                    prompt_log_headers.clone(),
                 );
                 let prompt_logged = PromptLogStream::new(logged, sender, prompt_entry, sse_raw_data_extractor(), None);
                 let response = Sse::new(sse_item_to_event(prompt_logged)).keep_alive(KeepAlive::default());
@@ -776,6 +804,7 @@ async fn chat_completions_inner(
                     false,
                     req_body,
                     Some(client_ip.as_str()),
+                    prompt_log_headers.clone(),
                 );
                 prompt_entry.set_response(serde_json::to_value(&resp).unwrap_or(serde_json::Value::Null));
                 prompt_entry.set_status(200, duration_ms as u64);
@@ -2322,6 +2351,33 @@ pub async fn messages(
     // Clone request_id and model for prompt log (they get moved into RequestLog later).
     let prompt_log_rid = if prompt_log_should { Some(request_id.clone()) } else { None };
     let prompt_log_model = if prompt_log_should { Some(model.clone()) } else { None };
+    // Snapshot whitelisted request headers (only when configured). Empty
+    // record_headers = capture nothing (security default to avoid leaking
+    // Authorization/Cookie/etc). Header names lowercased on both sides.
+    let prompt_log_headers: Option<std::collections::HashMap<String, String>> = if prompt_log_should {
+        let cfg = state.prompt_log_writer.config();
+        if cfg.record_headers.is_empty() {
+            None
+        } else {
+            let allow: std::collections::HashSet<&str> = cfg
+                .record_headers
+                .iter()
+                .map(|s| s.as_str())
+                .collect();
+            let mut map = std::collections::HashMap::new();
+            for (name, val) in headers.iter() {
+                let name_lower = name.as_str().to_lowercase();
+                if allow.contains(name_lower.as_str()) {
+                    if let Ok(v) = val.to_str() {
+                        map.insert(name_lower, v.to_string());
+                    }
+                }
+            }
+            if map.is_empty() { None } else { Some(map) }
+        }
+    } else {
+        None
+    };
 
     // 1. Model access check (deployment-aware, alias-aware).
     check_model_access(identity, &openai_req.model, &state.router, &inner.config.general_settings.public_models)
@@ -2526,6 +2582,7 @@ pub async fn messages(
                     true,
                     req_body,
                     Some(&client_ip.as_str()),
+                    prompt_log_headers.clone(),
                 );
                 let prompt_logged = PromptLogStream::new(logged, sender, prompt_entry, sse_raw_data_extractor(), raw_upstream_buf);
                 let response = Sse::new(sse_item_to_event(prompt_logged)).keep_alive(KeepAlive::default());
@@ -2628,6 +2685,7 @@ pub async fn messages(
                     false,
                     req_body,
                     Some(client_ip.as_str()),
+                    prompt_log_headers.clone(),
                 );
                 // Capture raw upstream response (exact bytes from provider, if enabled).
                 if prompt_log_capture_raw {

@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// A single prompt log entry — one line in a JSONL file.
 ///
@@ -28,6 +29,11 @@ pub struct PromptLogEntry {
     /// Domain account derived from key_alias (last space-separated segment).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub domain_account: Option<String>,
+    /// Whitelisted request headers snapshot (keys lowercased). Populated only
+    /// when `prompt_log.record_headers` is non-empty; otherwise `None` so the
+    /// field is omitted from the JSON line entirely.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub headers: Option<HashMap<String, String>>,
     /// Original request body (OpenAI or Anthropic format, stored as-is).
     pub request: serde_json::Value,
     /// Full response body (non-stream) or raw SSE chunks array (stream).
@@ -54,6 +60,7 @@ impl PromptLogEntry {
         is_stream: bool,
         request_body: serde_json::Value,
         client_ip: Option<&str>,
+        headers: Option<HashMap<String, String>>,
     ) -> Self {
         let domain_account = key_alias
             .and_then(|a| a.rsplit_once(' ').map(|(_, last)| last.to_string()));
@@ -70,6 +77,7 @@ impl PromptLogEntry {
             error_message: None,
             client_ip: client_ip.map(|s| s.to_string()),
             domain_account,
+            headers,
             request: request_body,
             response: None,
             raw_upstream_response: None,
