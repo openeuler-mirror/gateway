@@ -16,10 +16,11 @@ use std::time::Instant;
 use crate::backends::{build_rings, collect_all_backends, pick_active_active, pick_primary, Ring};
 use crate::blacklist::{load_blacklist, load_blacklist_state, Blacklist};
 use crate::client::effective_client_ip;
-use crate::config::{Config, LbMode, UpstreamTimeouts};
+use crate::config::{AccessLogConfig, Config, LbMode, UpstreamTimeouts};
 use crate::logging::{complete_line, dispatch_line, generate_request_id, redirect_line};
 use crate::metrics::Metrics;
 use crate::routes::request_host;
+use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, Watcher};
 
 fn extract_api_key(
     auth: Option<&str>,
@@ -78,9 +79,10 @@ pub struct RoutingCtx {
     route: Option<RouteCtx>,
     /// Upstream timeouts captured at request_filter time (stable snapshot).
     timeouts: UpstreamTimeouts,
-    /// Set when the request will be access-logged: request identity for the
-    /// completion line emitted from `logging()`.
-    log_ctx: Option<LogCtx>,
+    /// Set when the dispatch line was access-logged; `logging()` emits the
+    /// completion line for exactly these requests (sampling is deterministic,
+    /// so no re-evaluation is needed).
+    log_backend: Option<SocketAddr>,
     /// Bytes of request body seen so far (for `max_body_size` enforcement).
     body_seen: u64,
     /// Wall-clock start of the request, for the duration in the completion log.
@@ -98,21 +100,12 @@ impl Default for RoutingCtx {
             client_ip: None,
             route: None,
             timeouts: UpstreamTimeouts::default(),
-            log_ctx: None,
+            log_backend: None,
             body_seen: 0,
             started: Instant::now(),
             forwarded_proto: None,
         }
     }
-}
-
-/// Minimal request identity kept until `logging()` so the completion line can
-/// correlate status/duration/bytes back to a dispatched request.
-struct LogCtx {
-    method: String,
-    host: String,
-    path: String,
-    backend: SocketAddr,
 }
 
 /// Built-in LB health endpoint, used by the container HEALTHCHECK (and handy
@@ -128,7 +121,7 @@ const LB_METRICS_PATH: &str = "/__lb_metrics";
 /// config reload mid-request never tears the route index from its ring.
 #[derive(Clone)]
 struct RouteCtx {
-    idx: usize,
+    idx: Option<usize>,
     mode: LbMode,
     backends: Arc<Vec<SocketAddr>>,
     key: String,
@@ -140,6 +133,24 @@ struct RouteCtx {
 /// internally too; this is an explicit second layer.
 fn smuggling_ambiguous(version: &http::Version, has_cl: bool, has_te: bool) -> bool {
     has_te && (has_cl || *version != http::Version::HTTP_11)
+}
+
+/// Log the dispatch line and remember the backend for the completion line in
+/// `logging()`. Sampling is deterministic per request signature, so `logging()`
+/// can trust `log_backend` being set and never re-evaluates `should_log`.
+fn log_dispatch(
+    access_log: &AccessLogConfig,
+    ctx: &mut RoutingCtx,
+    method: &str,
+    host: &str,
+    path: &str,
+    client_ip: Option<IpAddr>,
+    addr: SocketAddr,
+) {
+    if access_log.should_log(method, host, path, client_ip) {
+        log::info!("{}", dispatch_line(method, host, path, client_ip, addr));
+        ctx.log_backend = Some(addr);
+    }
 }
 
 #[async_trait]
@@ -326,24 +337,20 @@ impl ProxyHttp for Gateway {
                                 .expect("single-backend route must have backend"),
                         };
                         let route_ctx = route.backends.as_ref().map(|list| RouteCtx {
-                            idx,
+                            idx: Some(idx),
                             mode: route.mode,
                             backends: Arc::new(list.clone()),
                             key,
                         });
-                        if snap
-                            .config
-                            .access_log
-                            .should_log(method, host, path, client_ip)
-                        {
-                            log::info!("{}", dispatch_line(method, host, path, client_ip, addr));
-                            ctx.log_ctx = Some(LogCtx {
-                                method: method.to_string(),
-                                host: host.to_string(),
-                                path: path.to_string(),
-                                backend: addr,
-                            });
-                        }
+                        log_dispatch(
+                            &snap.config.access_log,
+                            ctx,
+                            method,
+                            host,
+                            path,
+                            client_ip,
+                            addr,
+                        );
                         ctx.backend = Some(addr);
                         ctx.route = route_ctx;
                         ctx.timeouts = snap.config.timeouts;
@@ -357,25 +364,21 @@ impl ProxyHttp for Gateway {
                     // Keep a route context so retries fail over across the
                     // default list instead of hammering the same dead node.
                     ctx.route = Some(RouteCtx {
-                        idx: usize::MAX,
+                        idx: None,
                         mode: LbMode::ActiveStandby,
                         backends: Arc::new(snap.config.default_backends.clone()),
                         key: String::new(),
                     });
                     ctx.timeouts = snap.config.timeouts;
-                    if snap
-                        .config
-                        .access_log
-                        .should_log(method, host, path, client_ip)
-                    {
-                        log::info!("{}", dispatch_line(method, host, path, client_ip, addr));
-                        ctx.log_ctx = Some(LogCtx {
-                            method: method.to_string(),
-                            host: host.to_string(),
-                            path: path.to_string(),
-                            backend: addr,
-                        });
-                    }
+                    log_dispatch(
+                        &snap.config.access_log,
+                        ctx,
+                        method,
+                        host,
+                        path,
+                        client_ip,
+                        addr,
+                    );
                     return Ok(false);
                 }
             }
@@ -393,20 +396,23 @@ impl ProxyHttp for Gateway {
         // fail over instead of hammering the same dead node.
         let addr = if ctx.attempted.is_empty() {
             ctx.backend
-                .unwrap_or_else(|| self.snapshot.load().config.default_backend)
+                .unwrap_or_else(|| self.snapshot.load().config.default_backends[0])
         } else if let Some(route) = &ctx.route {
             let snap = self.snapshot.load();
             let unhealthy = self.unhealthy.load();
             match route.mode {
                 LbMode::ActiveStandby => pick_primary(&route.backends, &unhealthy, &ctx.attempted),
-                LbMode::ActiveActive => pick_active_active(
-                    route.idx,
-                    &route.backends,
-                    &snap.rings,
-                    &route.key,
-                    &unhealthy,
-                    &ctx.attempted,
-                ),
+                LbMode::ActiveActive => {
+                    let idx = route.idx.expect("active-active route has an index");
+                    pick_active_active(
+                        idx,
+                        &route.backends,
+                        &snap.rings,
+                        &route.key,
+                        &unhealthy,
+                        &ctx.attempted,
+                    )
+                }
             }
         } else {
             // Single-backend route or default backend: no alternative exists,
@@ -542,22 +548,13 @@ impl ProxyHttp for Gateway {
         _e: Option<&pingora_core::Error>,
         ctx: &mut Self::CTX,
     ) {
-        let Some(log_ctx) = &ctx.log_ctx else {
+        let Some(backend) = ctx.log_backend else {
             return;
         };
-        let snap = self.snapshot.load();
-        if !snap.config.access_log.should_log(
-            &log_ctx.method,
-            &log_ctx.host,
-            &log_ctx.path,
-            ctx.client_ip,
-        ) {
-            return;
-        }
         let status = session.response_written().map_or(0, |r| r.status.as_u16());
         let bytes = session.body_bytes_sent() as u64;
         let ms = ctx.started.elapsed().as_millis();
-        log::info!("{}", complete_line(log_ctx.backend, status, ms, bytes));
+        log::info!("{}", complete_line(backend, status, ms, bytes));
     }
 }
 
@@ -604,17 +601,25 @@ fn blacklist_dir(blacklist: Option<&str>) -> Option<std::path::PathBuf> {
     })
 }
 
+/// Mutable watcher state shared by the reload helpers: the watcher itself plus
+/// every directory currently watched (config dir is permanent; blacklist dirs
+/// may be swapped when the config changes the blacklist path).
+struct WatchState {
+    watcher: RecommendedWatcher,
+    watched_dirs: HashSet<std::path::PathBuf>,
+    watched_blacklist_dir: Option<std::path::PathBuf>,
+    watch_dir: std::path::PathBuf,
+}
+
 pub(crate) fn watch_config(
     path: String,
     snapshot: Arc<ArcSwap<ConfigSnapshot>>,
     blacklist: Arc<ArcSwap<Blacklist>>,
 ) {
-    use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, Watcher};
-
     std::thread::spawn(move || {
         let (tx, rx) = std::sync::mpsc::channel::<Event>();
 
-        let mut watcher = match RecommendedWatcher::new(
+        let watcher = match RecommendedWatcher::new(
             move |res: std::result::Result<Event, notify::Error>| {
                 if let Ok(event) = res {
                     let _ = tx.send(event);
@@ -636,9 +641,17 @@ pub(crate) fn watch_config(
 
         // Track every directory we watch so blacklist path changes can unwatch
         // the stale directory instead of accumulating watches.
-        let mut watched_dirs: HashSet<std::path::PathBuf> = HashSet::new();
-        watched_dirs.insert(watch_dir.clone());
-        if let Err(e) = watcher.watch(&watch_dir, RecursiveMode::NonRecursive) {
+        let mut state = WatchState {
+            watcher,
+            watched_dirs: HashSet::new(),
+            watched_blacklist_dir: None,
+            watch_dir,
+        };
+        state.watched_dirs.insert(state.watch_dir.clone());
+        if let Err(e) = state
+            .watcher
+            .watch(&state.watch_dir, RecursiveMode::NonRecursive)
+        {
             log::error!("failed to watch config directory: {e}");
             return;
         }
@@ -649,15 +662,14 @@ pub(crate) fn watch_config(
             .unwrap_or_default();
 
         // Also watch the blacklist file's directory so edits to it hot-reload.
-        let mut watched_blacklist_dir: Option<std::path::PathBuf> = None;
         {
             let bl_path = snapshot.load().config.blacklist.clone();
             if let Some(dir) = blacklist_dir(bl_path.as_deref()) {
-                if dir != watch_dir {
-                    let _ = watcher.watch(&dir, RecursiveMode::NonRecursive);
-                    watched_dirs.insert(dir.clone());
+                if dir != state.watch_dir {
+                    let _ = state.watcher.watch(&dir, RecursiveMode::NonRecursive);
+                    state.watched_dirs.insert(dir.clone());
                 }
-                watched_blacklist_dir = Some(dir);
+                state.watched_blacklist_dir = Some(dir);
             }
         }
 
@@ -686,73 +698,85 @@ pub(crate) fn watch_config(
             }
 
             if cfg_changed {
-                match Config::load(&path) {
-                    Ok(new_config) => {
-                        let new_rings = build_rings(&new_config);
-                        let new_backends = collect_all_backends(&new_config);
-
-                        // If the blacklist file path changed, reload its content
-                        // and (best-effort) watch the new directory.
-                        let prev_bl = snapshot.load().config.blacklist.clone();
-                        let new_bl = new_config.blacklist.clone();
-                        if new_bl != prev_bl {
-                            blacklist.store(Arc::new(load_blacklist_state(new_bl.as_deref())));
-                            let new_dir = blacklist_dir(new_bl.as_deref());
-                            if new_dir != watched_blacklist_dir {
-                                // Drop watches on directories no longer used
-                                // (only the blacklist dir can change; the
-                                // config dir is permanent).
-                                let stale: Vec<std::path::PathBuf> = watched_dirs
-                                    .iter()
-                                    .filter(|d| {
-                                        **d != watch_dir && Some(d.as_path()) != new_dir.as_deref()
-                                    })
-                                    .cloned()
-                                    .collect();
-                                for d in stale {
-                                    let _ = watcher.unwatch(&d);
-                                    watched_dirs.remove(&d);
-                                }
-                                if let Some(d) = &new_dir {
-                                    if watched_dirs.insert(d.clone()) {
-                                        let _ = watcher.watch(d, RecursiveMode::NonRecursive);
-                                    }
-                                }
-                                watched_blacklist_dir = new_dir;
-                            }
-                            log::info!("blacklist path changed to {:?}", new_bl);
-                        }
-
-                        // Atomic swap: config + rings + backends together, so
-                        // readers never see a torn (new config, old rings) pair.
-                        snapshot.store(Arc::new(ConfigSnapshot {
-                            config: new_config,
-                            rings: new_rings,
-                            backends: new_backends,
-                        }));
-                        log::info!("config reloaded from {path}");
-                    }
-                    Err(e) => {
-                        log::error!("failed to reload config: {e}");
-                    }
-                }
+                reload_config(&path, &snapshot, &blacklist, &mut state);
             }
-
             if bl_changed {
-                let bl_path = snapshot.load().config.blacklist.clone();
-                if let Some(p) = bl_path.as_deref() {
-                    match load_blacklist(p) {
-                        Ok(v) => {
-                            let entries = v.len();
-                            blacklist.store(Arc::new(v));
-                            log::info!("blacklist reloaded from {p}: {entries} entries");
-                        }
-                        Err(e) => log::error!("failed to reload blacklist {p}: {e}"),
-                    }
-                }
+                reload_blacklist(&snapshot, &blacklist);
             }
         }
     });
+}
+
+/// Reload the config on file change: rebuild rings/backends, handle blacklist
+/// path changes (reload + rewatch the new directory), and atomically swap the
+/// snapshot so readers never see a torn (new config, old rings) pair.
+fn reload_config(
+    path: &str,
+    snapshot: &Arc<ArcSwap<ConfigSnapshot>>,
+    blacklist: &Arc<ArcSwap<Blacklist>>,
+    state: &mut WatchState,
+) {
+    match Config::load(path) {
+        Ok(new_config) => {
+            let new_rings = build_rings(&new_config);
+            let new_backends = collect_all_backends(&new_config);
+
+            // If the blacklist file path changed, reload its content and
+            // (best-effort) watch the new directory.
+            let prev_bl = snapshot.load().config.blacklist.clone();
+            let new_bl = new_config.blacklist.clone();
+            if new_bl != prev_bl {
+                blacklist.store(Arc::new(load_blacklist_state(new_bl.as_deref())));
+                let new_dir = blacklist_dir(new_bl.as_deref());
+                if new_dir != state.watched_blacklist_dir {
+                    // Drop watches on directories no longer used (only the
+                    // blacklist dir can change; the config dir is permanent).
+                    let stale: Vec<std::path::PathBuf> = state
+                        .watched_dirs
+                        .iter()
+                        .filter(|d| {
+                            **d != state.watch_dir && Some(d.as_path()) != new_dir.as_deref()
+                        })
+                        .cloned()
+                        .collect();
+                    for d in stale {
+                        let _ = state.watcher.unwatch(&d);
+                        state.watched_dirs.remove(&d);
+                    }
+                    if let Some(d) = &new_dir {
+                        if state.watched_dirs.insert(d.clone()) {
+                            let _ = state.watcher.watch(d, RecursiveMode::NonRecursive);
+                        }
+                    }
+                    state.watched_blacklist_dir = new_dir;
+                }
+                log::info!("blacklist path changed to {:?}", new_bl);
+            }
+
+            snapshot.store(Arc::new(ConfigSnapshot {
+                config: new_config,
+                rings: new_rings,
+                backends: new_backends,
+            }));
+            log::info!("config reloaded from {path}");
+        }
+        Err(e) => log::error!("failed to reload config: {e}"),
+    }
+}
+
+/// Reload the blacklist file on change.
+fn reload_blacklist(snapshot: &Arc<ArcSwap<ConfigSnapshot>>, blacklist: &Arc<ArcSwap<Blacklist>>) {
+    let bl_path = snapshot.load().config.blacklist.clone();
+    if let Some(p) = bl_path.as_deref() {
+        match load_blacklist(p) {
+            Ok(v) => {
+                let entries = v.len();
+                blacklist.store(Arc::new(v));
+                log::info!("blacklist reloaded from {p}: {entries} entries");
+            }
+            Err(e) => log::error!("failed to reload blacklist {p}: {e}"),
+        }
+    }
 }
 #[cfg(test)]
 mod tests {

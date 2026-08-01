@@ -116,10 +116,8 @@ pub(crate) fn path_matches(path: &str, pattern: &str) -> bool {
     if prefix.is_empty() {
         return true;
     }
-    path == prefix
-        || path
-            .strip_prefix(prefix)
-            .is_some_and(|rest| rest.starts_with('/'))
+    path.strip_prefix(prefix)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
 /// Strip a `:port` suffix from a host, keeping IPv6 literals intact

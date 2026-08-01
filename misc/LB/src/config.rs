@@ -168,7 +168,8 @@ impl Default for UpstreamTimeouts {
 pub(crate) struct Config {
     pub(crate) listen_port: Option<u16>,
     pub(crate) tls: Option<TlsConfig>,
-    pub(crate) default_backend: SocketAddr,
+    /// Ordered failover list for unmatched requests; never empty (`from_raw`
+    /// guarantees at least one entry, so `default_backends[0]` is always safe).
     pub(crate) default_backends: Vec<SocketAddr>,
     pub(crate) max_body_size: Option<u64>,
     pub(crate) upstream_tls: Option<UpstreamTlsConfig>,
@@ -278,7 +279,6 @@ impl Config {
         Ok(Config {
             listen_port: raw.listen_port,
             tls: raw.tls,
-            default_backend: default_backends[0],
             default_backends,
             max_body_size: raw.max_body_size,
             upstream_tls: raw.upstream_tls,
@@ -298,7 +298,7 @@ impl Config {
         })
     }
 
-    /// First-match routing. Returns (route_index, &Route); None => use default_backend.
+    /// First-match routing. Returns (route_index, &Route); None => default_backends.
     pub(crate) fn resolve_route(
         &self,
         host: &str,
@@ -317,9 +317,8 @@ impl Config {
                 }
             }
             if let Some(ref r_net) = route.client_ip {
-                match client_ip {
-                    Some(ip) if r_net.contains(&ip) => {}
-                    _ => continue,
+                if !client_ip.is_some_and(|ip| r_net.contains(&ip)) {
+                    continue;
                 }
             }
             return Some((idx, route));
@@ -342,7 +341,7 @@ routes:
     backends: ["10.0.0.2:80", "10.0.0.3:80"]
 "#;
         let cfg = Config::from_str(yaml).unwrap();
-        assert_eq!(cfg.default_backend, "127.0.0.1:8080".parse().unwrap());
+        assert_eq!(cfg.default_backends[0], "127.0.0.1:8080".parse().unwrap());
         assert_eq!(cfg.routes[0].backend, Some("10.0.0.1:80".parse().unwrap()));
         assert!(cfg.routes[0].backends.is_none());
         assert!(cfg.routes[1].backend.is_none());
@@ -447,7 +446,7 @@ routes: []
         let yaml = "default_backends: [\"10.0.0.1:80\", \"10.0.0.2:80\"]\nroutes: []\n";
         let cfg = Config::from_str(yaml).unwrap();
         assert_eq!(cfg.default_backends.len(), 2);
-        assert_eq!(cfg.default_backend, "10.0.0.1:80".parse().unwrap());
+        assert_eq!(cfg.default_backends[0], "10.0.0.1:80".parse().unwrap());
 
         // Both forms at once is rejected; so are neither, or an empty list.
         let both =
