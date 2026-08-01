@@ -298,7 +298,8 @@ impl Config {
         })
     }
 
-    /// First-match routing. Returns (route_index, &Route); None => default_backends.
+    /// First-match routing. Returns `Some((route_index, &Route))` on match;
+    /// `None` falls through to `default_backends`.
     pub(crate) fn resolve_route(
         &self,
         host: &str,

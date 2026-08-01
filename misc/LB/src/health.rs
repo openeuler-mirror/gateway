@@ -12,7 +12,7 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// most this many OS threads instead of spawning one per backend.
 const MAX_PROBE_WORKERS: usize = 8;
 
-/// (prev_consecutive_failures, probe_healthy) -> (new_failures, mark_unhealthy)
+/// (prev_consecutive_failures, probe_healthy) -> (new_failures, mark_unhealthy).
 fn classify_health(prev_failures: u32, probe_healthy: bool, fail_threshold: u32) -> (u32, bool) {
     if probe_healthy {
         (0, false)
@@ -67,11 +67,11 @@ fn probe_once(addr: SocketAddr, check: &HealthCheckConfig) -> bool {
     }
 }
 
-/// Background TCP prober: every PROBE_INTERVAL, probe each known backend in
-/// parallel and publish a fresh `unhealthy` set. It is the SOLE writer of
-/// `unhealthy`, so a plain `.store()` is safe. Rebuilding from the current
-/// `backends` each cycle also self-prunes backends that were removed from the
-/// config.
+/// Background prober: every `health_check.interval_secs`, probe each known
+/// backend in parallel and publish a fresh `unhealthy` set. It is the SOLE
+/// writer of `unhealthy`, so a plain `.store()` is safe. Rebuilding from the
+/// current `backends` each cycle also self-prunes backends that were removed
+/// from the config.
 pub(crate) fn run_health_probe(
     snapshot: Arc<ArcSwap<ConfigSnapshot>>,
     unhealthy: Arc<ArcSwap<HashSet<SocketAddr>>>,
@@ -127,7 +127,6 @@ pub(crate) fn run_health_probe(
     });
 }
 
-/// Per-request routing context. `request_filter` resolves the route once and
 #[cfg(test)]
 mod tests {
     use super::*;

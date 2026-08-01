@@ -67,6 +67,8 @@ pub(crate) struct Gateway {
     pub(crate) block_warn: Mutex<HashMap<IpAddr, Instant>>,
 }
 
+/// Per-request routing context. `request_filter` resolves the route once and
+/// stores the chosen backend here, so `upstream_peer` can reuse it without
 /// re-resolving (and without re-scanning the route table).
 pub struct RoutingCtx {
     backend: Option<SocketAddr>,
@@ -117,8 +119,9 @@ const LB_HEALTH_PATH: &str = "/__lb_healthz";
 /// endpoint, it is answered by the LB itself before blacklist/routing.
 const LB_METRICS_PATH: &str = "/__lb_metrics";
 
-/// Snapshot of a multi-backend route for retry re-selection. Kept in ctx so a
-/// config reload mid-request never tears the route index from its ring.
+/// Snapshot of a multi-backend route (or the default-backend list) for retry
+/// re-selection. Kept in ctx so a config reload mid-request never tears the
+/// route index from its ring (the default list has no ring: `idx` is `None`).
 #[derive(Clone)]
 struct RouteCtx {
     idx: Option<usize>,

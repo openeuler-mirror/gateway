@@ -1,8 +1,8 @@
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::Instant;
 
-/// Lightweight in-process counters exposed as a text endpoint (Prometheus
-/// text-format-ish). Relaxed ordering is fine: totals only need monotonicity.
+/// Lightweight in-process counters exposed as a Prometheus text-format
+/// endpoint. Relaxed ordering is fine: totals only need monotonicity.
 pub(crate) struct Metrics {
     started: Instant,
     pub(crate) requests_total: AtomicU64,

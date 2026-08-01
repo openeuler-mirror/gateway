@@ -41,8 +41,6 @@ pub(crate) fn effective_client_ip(
     }
 }
 
-/// One blacklist entry: either a single IP / CIDR network, or an inclusive
-/// `start..=end` IP range (e.g. `10.123.181.128-10.123.181.255`).
 #[cfg(test)]
 mod tests {
     use super::*;

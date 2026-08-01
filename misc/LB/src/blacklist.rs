@@ -129,7 +129,6 @@ pub(crate) fn load_blacklist_state(path: Option<&str>) -> Blacklist {
     }
 }
 
-/// Build the structured "request dispatched to backend" log line.
 #[cfg(test)]
 mod tests {
     use super::*;

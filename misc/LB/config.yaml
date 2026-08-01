@@ -64,12 +64,13 @@ default_backend: "127.0.0.1:8080"
 #   enabled: true
 #   sample_rate: 1.0
 
-# IP 黑名单文件路径：文件中每行一个 IP 或 CIDR（# 为注释），命中即返回 403。
-# 文件独立于本配置，可单独热加载（编辑后立即生效，无需改动 config.yaml）。
+# IP 黑名单文件路径:文件中每行一个 IP 或 CIDR(# 为注释),命中即返回 403。
+# 文件独立于本配置,可单独热加载(编辑后立即生效,无需改动 config.yaml)。
 blacklist: "/etc/gateway/blacklist.txt"
 
-# LB 自带健康端点(不可配置):GET /__lb_healthz 由 LB 直接返回 200,
-# 不经过黑名单/路由,用于容器 HEALTHCHECK 或编排探活。
+# LB 自带端点(不可配置,在黑名单/路由之前应答):
+#   GET /__lb_healthz  探活,直接返回 200,用于容器 HEALTHCHECK 或编排探活。
+#   GET /__lb_metrics  进程内计数(Prometheus 文本格式:请求/拦截/转发/不健康后端等)。
 
 routes:
   - client_ip: "10.0.0.0/24"
