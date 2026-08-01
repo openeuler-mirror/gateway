@@ -7,9 +7,41 @@ tls:
 
 default_backend: "127.0.0.1:8080"
 
+# 上游超时(秒,均可选,不写用默认值):
+#   connect   = 3s  连接建立超时
+#   total     = 5s  连接总超时(含 TLS 握手)
+#   read      = 30s 读响应超时
+#   idle      = 60s 上游 keep-alive 空闲超时
+# upstream_connect_timeout: 3
+# upstream_total_connect_timeout: 5
+# upstream_read_timeout: 30
+# upstream_idle_timeout: 60
+
+# 后端健康检查(可选):不写默认仅 TCP connect 探测。
+#   配置 path 后,探测改为 HTTP GET 该路径并要求期望状态码。
+# health_check:
+#   path: "/healthz"
+#   expected_status: 200
+
+# 信任的反向代理网段(可选):直连 IP 落在这些网段时,黑名单和 client_ip
+# 路由改用 X-Forwarded-For 中第一个"不可信"跳作为真实客户端 IP(防伪造)。
+# trusted_proxies:
+#   - "10.0.0.0/8"
+#   - "192.168.1.1"
+
+# 逐请求访问日志(可选,默认开启全量):
+#   enabled: false  关闭 dispatch/redirect 日志
+#   sample_rate: 0.1  按请求特征确定性采样(0.0~1.0)
+# access_log:
+#   enabled: true
+#   sample_rate: 1.0
+
 # IP 黑名单文件路径：文件中每行一个 IP 或 CIDR（# 为注释），命中即返回 403。
 # 文件独立于本配置，可单独热加载（编辑后立即生效，无需改动 config.yaml）。
 blacklist: "/etc/gateway/blacklist.txt"
+
+# LB 自带健康端点(不可配置):GET /__lb_healthz 由 LB 直接返回 200,
+# 不经过黑名单/路由,用于容器 HEALTHCHECK 或编排探活。
 
 routes:
   - client_ip: "10.0.0.0/24"

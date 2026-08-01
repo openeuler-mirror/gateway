@@ -112,7 +112,9 @@ do_start() {
     # Detect ports from config
     local http_port https_port
     http_port=$(grep "^listen_port:" "$CONFIG_FILE" | awk '{print $2}' | tr -d '"')
-    https_port=$(grep "port:" "$CONFIG_FILE" | head -2 | tail -1 | awk '{print $2}' | tr -d '"')
+    # Only pick `port:` inside the `tls:` block, so unrelated `port:` fields
+    # (if any appear later in the file) cannot confuse the detection.
+    https_port=$(grep -A3 "^tls:" "$CONFIG_FILE" | grep "port:" | head -1 | awk '{print $2}' | tr -d '"')
 
     [ -n "$http_port" ] && docker_opts+=(-p "${http_port}:${http_port}")
     [ -n "$https_port" ] && docker_opts+=(-p "${https_port}:${https_port}")
