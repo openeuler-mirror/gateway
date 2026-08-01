@@ -600,7 +600,7 @@ Pingora-based standalone load balancer as an optional front-end. It ships as a D
 - Health checks: TCP / HTTP GET probes with configurable interval and failure threshold; connect failures retry on another backend
 - Resilience: idempotent 5xx retries that exclude the failing backend, plus per-route timeout overrides
 - Security: hot-reloaded IP blacklist, trusted-proxy-aware XFF handling, upstream TLS, request body limits, request-smuggling defense-in-depth
-- Observability: `/__lb_metrics` Prometheus counters (status buckets/errors/retries), `/__lb_healthz` liveness, structured access logs with status, latency and errors
+- Observability: `/__lb_metrics` Prometheus counters (status buckets/errors/retries/latency histogram), `/__lb_healthz` liveness, structured access logs with status, latency and errors
 - Hot reload: config and blacklist changes apply automatically (lock-free ArcSwap)
 
 ```bash

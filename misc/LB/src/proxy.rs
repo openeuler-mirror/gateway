@@ -620,6 +620,12 @@ impl ProxyHttp for Gateway {
         e: Option<&pingora_core::Error>,
         ctx: &mut Self::CTX,
     ) {
+        // Latency histogram covers every proxied request, independent of
+        // access-log sampling.
+        let ms = ctx.started.elapsed().as_millis();
+        if ctx.backend.is_some() {
+            self.metrics.observe_duration_ms(ms);
+        }
         let Some(backend) = ctx.log_backend else {
             return;
         };
@@ -646,7 +652,6 @@ impl ProxyHttp for Gateway {
         self.metrics
             .response_bytes_total
             .fetch_add(bytes, Ordering::Relaxed);
-        let ms = ctx.started.elapsed().as_millis();
         let error = e.map(|e| e.to_string());
         log::info!(
             "{}",

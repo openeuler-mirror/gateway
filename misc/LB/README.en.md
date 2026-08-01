@@ -147,7 +147,7 @@ multi-backend routes, the API-key affinity key is taken from `Authorization: Bea
 | Endpoint | Description |
 |---|---|
 | `GET /__lb_healthz` | Liveness, returns 200 directly; bypasses blacklist/routing |
-| `GET /__lb_metrics` | Prometheus text format: total/blocked/redirected/proxied requests, body-rejections, status buckets (2xx/3xx/4xx/5xx), upstream errors, retries, response bytes, unhealthy backends, uptime |
+| `GET /__lb_metrics` | Prometheus text format: total/blocked/redirected/proxied requests, body-rejections, status buckets (2xx/3xx/4xx/5xx), upstream errors, retries, response bytes, latency histogram (5ms–60s), unhealthy backends, uptime |
 
 Both endpoints answer before blacklist/routing but have **no authentication** —
 keep them on internal networks only.

@@ -128,7 +128,7 @@ API Key 亲和取自 `Authorization: Bearer`、`X-API-Key` 或客户端 IP(按�
 | 端点 | 说明 |
 |---|---|
 | `GET /__lb_healthz` | 探活,直接返回 200;不经过黑名单/路由 |
-| `GET /__lb_metrics` | Prometheus 文本格式:请求总数、黑名单拦截、重定向、转发、body 超限拒绝、状态码分桶(2xx/3xx/4xx/5xx)、上游错误数、重试数、响应字节、不健康后端数、uptime |
+| `GET /__lb_metrics` | Prometheus 文本格式:请求总数、黑名单拦截、重定向、转发、body 超限拒绝、状态码分桶(2xx/3xx/4xx/5xx)、上游错误数、重试数、响应字节、请求延迟直方图(5ms~60s)、不健康后端数、uptime |
 
 两个端点都在黑名单与路由判断之前应答,但**没有鉴权**,请勿暴露到公网。
 
