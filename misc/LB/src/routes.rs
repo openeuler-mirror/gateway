@@ -108,6 +108,20 @@ pub(crate) fn host_matches(request_host: &str, pattern: &str) -> bool {
     }
 }
 
+/// Match `path` against a route prefix at a segment boundary: `/api` matches
+/// `/api` and `/api/...` but not `/api2`. A trailing slash in the pattern is
+/// normalized away; `/` (or empty) matches everything.
+pub(crate) fn path_matches(path: &str, pattern: &str) -> bool {
+    let prefix = pattern.trim_end_matches('/');
+    if prefix.is_empty() {
+        return true;
+    }
+    path == prefix
+        || path
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
 /// Strip a `:port` suffix from a host, keeping IPv6 literals intact
 /// (`[::1]:8080` -> `[::1]`, `example.com:8080` -> `example.com`).
 fn strip_port(host: &str) -> &str {
@@ -173,5 +187,22 @@ mod tests {
         assert_eq!(request_host(Some("::1"), None), "::1");
         // Neither present -> empty.
         assert_eq!(request_host(None, None), "");
+    }
+
+    #[test]
+    fn path_matches_respects_segment_boundaries() {
+        // exact and subtree
+        assert!(path_matches("/api", "/api"));
+        assert!(path_matches("/api/v1", "/api"));
+        assert!(path_matches("/api/", "/api"));
+        // no false positives on a longer segment
+        assert!(!path_matches("/api2", "/api"));
+        assert!(!path_matches("/api2/v1", "/api"));
+        // trailing slash in the pattern is normalized
+        assert!(path_matches("/api/v1", "/api/"));
+        assert!(!path_matches("/api2", "/api/"));
+        // root matches everything
+        assert!(path_matches("/anything", "/"));
+        assert!(path_matches("/anything", ""));
     }
 }

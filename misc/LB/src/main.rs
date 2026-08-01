@@ -4,6 +4,7 @@ mod client;
 mod config;
 mod health;
 mod logging;
+mod metrics;
 mod proxy;
 mod routes;
 
@@ -22,6 +23,7 @@ use crate::blacklist::load_blacklist_state;
 use crate::config::Config;
 use crate::health::run_health_probe;
 use crate::logging::init_logging;
+use crate::metrics::Metrics;
 use crate::proxy::{watch_config, ConfigSnapshot, Gateway};
 
 #[derive(Parser, Debug)]
@@ -50,6 +52,13 @@ fn main() {
     let tls_config = config.tls.clone();
 
     let mut server = Server::new(None).unwrap();
+    // Pingora defaults to a single worker thread and 16 retries; both are
+    // tuned from config (threads = CPU count, retries = 3 unless overridden).
+    // The config Arc is not shared with any service yet, so get_mut is safe.
+    let server_conf = Arc::get_mut(&mut server.configuration)
+        .expect("server configuration must not be shared before tuning");
+    server_conf.threads = config.worker_threads;
+    server_conf.max_retries = config.max_retries;
     server.bootstrap();
 
     let blacklist_init = load_blacklist_state(config.blacklist.as_deref());
@@ -67,6 +76,7 @@ fn main() {
         snapshot,
         unhealthy,
         blacklist,
+        metrics: Metrics::default(),
     };
 
     let mut proxy = http_proxy_service(&server.configuration, gateway);

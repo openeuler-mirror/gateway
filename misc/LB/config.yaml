@@ -7,6 +7,16 @@ tls:
 
 default_backend: "127.0.0.1:8080"
 
+# 默认后端也可以给 failover 列表(与 default_backend 二选一,优先第一个,
+# 前面的不健康时按顺序切换;列表内的节点会纳入健康探测):
+# default_backends:
+#   - "10.0.1.10:8080"
+#   - "10.0.1.11:8080"
+
+# 请求体大小上限(字节,可选):不写不限制。Content-Length 超限直接 413,
+# chunked 流式请求超限会中断;按需设置防大 body 内存占用。
+# max_body_size: 10485760
+
 # 上游超时(秒,均可选,不写用默认值):
 #   connect   = 3s  连接建立超时
 #   total     = 5s  连接总超时(含 TLS 握手)
@@ -16,6 +26,13 @@ default_backend: "127.0.0.1:8080"
 # upstream_total_connect_timeout: 5
 # upstream_read_timeout: 30
 # upstream_idle_timeout: 60
+
+# pingora worker 线程数(可选):不写默认 = CPU 核数。进程内所有监听共用。
+# worker_threads: 4
+
+# 单请求最大上游尝试次数(可选,默认 3):连接失败时按路由 failover 重试,
+# 上限不宜过大,否则坏后端会放大尾部延迟。
+# max_retries: 3
 
 # 后端健康检查(可选):不写默认仅 TCP connect 探测。
 #   配置 path 后,探测改为 HTTP GET 该路径并要求期望状态码。

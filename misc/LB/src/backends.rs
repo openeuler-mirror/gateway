@@ -131,12 +131,22 @@ pub(crate) fn build_rings(config: &Config) -> HashMap<usize, Ring> {
 pub(crate) fn collect_all_backends(config: &Config) -> Vec<SocketAddr> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
+    for a in &config.default_backends {
+        if seen.insert(*a) {
+            out.push(*a);
+        }
+    }
     for r in &config.routes {
         if let Some(list) = &r.backends {
             for a in list {
                 if seen.insert(*a) {
                     out.push(*a);
                 }
+            }
+        }
+        if let Some(a) = r.backend {
+            if seen.insert(a) {
+                out.push(a);
             }
         }
     }
@@ -347,7 +357,19 @@ routes:
         assert!(!rings.contains_key(&0), "single-backend route has no ring");
         let all = collect_all_backends(&cfg);
         let set: HashSet<SocketAddr> = all.iter().copied().collect();
-        assert_eq!(set.len(), 3, "dedup across routes: .2/.3/.4");
+        assert_eq!(
+            set.len(),
+            5,
+            "default backend + single route backend + two lists, deduped"
+        );
         assert!(set.contains(&"10.0.0.2:80".parse().unwrap()));
+        assert!(
+            set.contains(&"127.0.0.1:8080".parse().unwrap()),
+            "default backend probed"
+        );
+        assert!(
+            set.contains(&"10.0.0.1:80".parse().unwrap()),
+            "single route backend probed"
+        );
     }
 }

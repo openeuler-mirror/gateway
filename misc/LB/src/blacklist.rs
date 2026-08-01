@@ -1,4 +1,5 @@
 use ipnet::IpNet;
+use std::collections::HashSet;
 use std::fs;
 use std::net::IpAddr;
 
@@ -10,15 +11,47 @@ pub(crate) enum BlacklistEntry {
     Range { start: IpAddr, end: IpAddr },
 }
 
-impl BlacklistEntry {
-    /// True if `ip` is covered by this entry. A range of one address family
-    /// never matches a query of the other (IpAddr ordering puts all IPv4
-    /// before all IPv6, so the comparison naturally yields false).
-    fn matches(&self, ip: IpAddr) -> bool {
-        match self {
-            BlacklistEntry::Net(net) => net.contains(&ip),
-            BlacklistEntry::Range { start, end } => ip >= *start && ip <= *end,
+/// Lookup-optimized blacklist: exact IPs live in an O(1) `HashSet`; CIDR nets
+/// and inclusive ranges stay in small Vecs. Parsing happens only on load /
+/// reload, so per-request checks are cheap even for very large files.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Blacklist {
+    exact: HashSet<IpAddr>,
+    nets: Vec<IpNet>,
+    ranges: Vec<(IpAddr, IpAddr)>,
+}
+
+impl Blacklist {
+    pub(crate) fn from_entries(entries: Vec<BlacklistEntry>) -> Self {
+        let mut bl = Blacklist::default();
+        for e in entries {
+            match e {
+                BlacklistEntry::Net(net) => {
+                    // A /32 or /128 net is a single address: hash it for O(1).
+                    if net.prefix_len() == net.max_prefix_len() {
+                        bl.exact.insert(net.addr());
+                    } else {
+                        bl.nets.push(net);
+                    }
+                }
+                BlacklistEntry::Range { start, end } => bl.ranges.push((start, end)),
+            }
         }
+        bl
+    }
+
+    /// True if `ip` is covered by any blacklist entry. A range of one address
+    /// family never matches a query of the other (IpAddr ordering puts all
+    /// IPv4 before all IPv6, so the comparison naturally yields false).
+    pub(crate) fn contains(&self, ip: IpAddr) -> bool {
+        self.exact.contains(&ip)
+            || self.nets.iter().any(|n| n.contains(&ip))
+            || self.ranges.iter().any(|(s, e)| ip >= *s && ip <= *e)
+    }
+
+    /// Total number of entries (exact + nets + ranges).
+    pub(crate) fn len(&self) -> usize {
+        self.exact.len() + self.nets.len() + self.ranges.len()
     }
 }
 
@@ -54,11 +87,6 @@ fn parse_blacklist_entry(line: &str) -> std::result::Result<BlacklistEntry, Stri
     }
 }
 
-/// True if `ip` is covered by any blacklist entry.
-pub(crate) fn is_blacklisted(ip: IpAddr, entries: &[BlacklistEntry]) -> bool {
-    entries.iter().any(|e| e.matches(ip))
-}
-
 /// Parse blacklist file content: one entry per line. Each line is a single IP,
 /// a CIDR, or an inclusive range `start-end`. `#` introduces comments (full-line
 /// or trailing), blank lines are ignored, and invalid entries are skipped with a
@@ -79,25 +107,25 @@ fn parse_blacklist(content: &str) -> Vec<BlacklistEntry> {
 }
 
 /// Read and parse a blacklist file. Errors only on file-read failure.
-pub(crate) fn load_blacklist(path: &str) -> std::result::Result<Vec<BlacklistEntry>, String> {
+pub(crate) fn load_blacklist(path: &str) -> std::result::Result<Blacklist, String> {
     let content =
         fs::read_to_string(path).map_err(|e| format!("failed to read blacklist {path}: {e}"))?;
-    Ok(parse_blacklist(&content))
+    Ok(Blacklist::from_entries(parse_blacklist(&content)))
 }
 
 /// Load the blacklist for a path that may be `None`. A missing/unreadable file
 /// is logged and treated as an empty list — availability over strictness, so a
 /// transient read error never blocks all traffic.
-pub(crate) fn load_blacklist_state(path: Option<&str>) -> Vec<BlacklistEntry> {
+pub(crate) fn load_blacklist_state(path: Option<&str>) -> Blacklist {
     match path {
         Some(p) => match load_blacklist(p) {
             Ok(v) => v,
             Err(e) => {
                 log::error!("{e}; treating blacklist as empty");
-                Vec::new()
+                Blacklist::default()
             }
         },
-        None => Vec::new(),
+        None => Blacklist::default(),
     }
 }
 
@@ -119,9 +147,10 @@ not-an-ip
 ";
         let nets = parse_blacklist(content);
         assert_eq!(nets.len(), 3, "3 valid entries; invalid line skipped");
+        let bl = Blacklist::from_entries(nets);
         let contains = |ip: &str| {
             let ip: IpAddr = ip.parse().unwrap();
-            nets.iter().any(|n| n.matches(ip))
+            bl.contains(ip)
         };
         assert!(contains("10.0.5.100"));
         assert!(contains("192.168.66.42"));
@@ -142,11 +171,12 @@ not-an-ip
             std::process::id()
         );
         std::fs::write(&path, "# header\n10.0.0.9\n10.0.0.0/24\n").unwrap();
-        let nets = load_blacklist(&path).unwrap();
+        let bl = load_blacklist(&path).unwrap();
         let _ = std::fs::remove_file(&path);
-        assert_eq!(nets.len(), 2);
+        assert_eq!(bl.len(), 2);
         let nine: IpAddr = "10.0.0.9".parse().unwrap();
-        assert!(nets.iter().any(|n| n.matches(nine)));
+        assert!(bl.contains(nine));
+        assert!(bl.contains("10.0.0.55".parse().unwrap()));
     }
 
     #[test]
@@ -156,19 +186,19 @@ not-an-ip
 
     #[test]
     fn is_blacklisted_matches_single_ip_and_cidr() {
-        let nets: Vec<BlacklistEntry> = vec![
+        let bl = Blacklist::from_entries(vec![
             BlacklistEntry::Net(parse_client_ip("10.0.5.100").unwrap()),
             BlacklistEntry::Net(parse_client_ip("192.168.66.0/24").unwrap()),
-        ];
+        ]);
         // exact single-IP hit
-        assert!(is_blacklisted("10.0.5.100".parse().unwrap(), &nets));
+        assert!(bl.contains("10.0.5.100".parse().unwrap()));
         // inside CIDR
-        assert!(is_blacklisted("192.168.66.42".parse().unwrap(), &nets));
+        assert!(bl.contains("192.168.66.42".parse().unwrap()));
         // outside everything
-        assert!(!is_blacklisted("10.0.5.99".parse().unwrap(), &nets));
-        assert!(!is_blacklisted("192.168.99.1".parse().unwrap(), &nets));
+        assert!(!bl.contains("10.0.5.99".parse().unwrap()));
+        assert!(!bl.contains("192.168.99.1".parse().unwrap()));
         // empty list never blocks
-        assert!(!is_blacklisted("10.0.5.100".parse().unwrap(), &[]));
+        assert!(!Blacklist::default().contains("10.0.5.100".parse().unwrap()));
     }
 
     #[test]
@@ -180,9 +210,10 @@ not-an-ip
 ";
         let entries = parse_blacklist(content);
         assert_eq!(entries.len(), 2);
+        let bl = Blacklist::from_entries(entries);
         let in_list = |ip: &str| {
             let ip: IpAddr = ip.parse().unwrap();
-            entries.iter().any(|e| e.matches(ip))
+            bl.contains(ip)
         };
         // first range: both boundaries and inside
         assert!(in_list("10.123.181.128"));

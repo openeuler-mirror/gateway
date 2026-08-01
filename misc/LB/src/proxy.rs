@@ -1,5 +1,6 @@
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
+use bytes::Bytes;
 use pingora_core::upstreams::peer::{HttpPeer, Peer};
 use pingora_core::Result;
 use pingora_proxy::{ProxyHttp, Session};
@@ -7,14 +8,17 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 
 use crate::backends::{build_rings, collect_all_backends, pick_active_active, pick_primary, Ring};
-use crate::blacklist::{is_blacklisted, load_blacklist, load_blacklist_state, BlacklistEntry};
+use crate::blacklist::{load_blacklist, load_blacklist_state, Blacklist};
 use crate::client::effective_client_ip;
 use crate::config::{Config, LbMode, UpstreamTimeouts};
-use crate::logging::dispatch_line;
+use crate::logging::{complete_line, dispatch_line, redirect_line};
+use crate::metrics::Metrics;
 use crate::routes::request_host;
 
 fn extract_api_key(
@@ -56,11 +60,11 @@ pub(crate) struct ConfigSnapshot {
 pub(crate) struct Gateway {
     pub(crate) snapshot: Arc<ArcSwap<ConfigSnapshot>>,
     pub(crate) unhealthy: Arc<ArcSwap<HashSet<SocketAddr>>>,
-    pub(crate) blacklist: Arc<ArcSwap<Vec<BlacklistEntry>>>,
+    pub(crate) blacklist: Arc<ArcSwap<Blacklist>>,
+    pub(crate) metrics: Metrics,
 }
 
 /// re-resolving (and without re-scanning the route table).
-#[derive(Default)]
 pub struct RoutingCtx {
     backend: Option<SocketAddr>,
     /// Backends already attempted for this request (populated by
@@ -72,12 +76,47 @@ pub struct RoutingCtx {
     route: Option<RouteCtx>,
     /// Upstream timeouts captured at request_filter time (stable snapshot).
     timeouts: UpstreamTimeouts,
+    /// Set when the request will be access-logged: request identity for the
+    /// completion line emitted from `logging()`.
+    log_ctx: Option<LogCtx>,
+    /// Bytes of request body seen so far (for `max_body_size` enforcement).
+    body_seen: u64,
+    /// Wall-clock start of the request, for the duration in the completion log.
+    started: Instant,
+}
+
+impl Default for RoutingCtx {
+    fn default() -> Self {
+        RoutingCtx {
+            backend: None,
+            attempted: Vec::new(),
+            client_ip: None,
+            route: None,
+            timeouts: UpstreamTimeouts::default(),
+            log_ctx: None,
+            body_seen: 0,
+            started: Instant::now(),
+        }
+    }
+}
+
+/// Minimal request identity kept until `logging()` so the completion line can
+/// correlate status/duration/bytes back to a dispatched request.
+struct LogCtx {
+    method: String,
+    host: String,
+    path: String,
+    backend: SocketAddr,
 }
 
 /// Built-in LB health endpoint, used by the container HEALTHCHECK (and handy
 /// for any orchestration probe). Handled before blacklist/routing so probes are
 /// never blocked, and never proxied to a backend.
 const LB_HEALTH_PATH: &str = "/__lb_healthz";
+
+/// Built-in metrics endpoint (Prometheus text-ish format). Like the health
+/// endpoint, it is answered by the LB itself before blacklist/routing.
+const LB_METRICS_PATH: &str = "/__lb_metrics";
 
 /// Snapshot of a multi-backend route for retry re-selection. Kept in ctx so a
 /// config reload mid-request never tears the route index from its ring.
@@ -98,6 +137,8 @@ impl ProxyHttp for Gateway {
     }
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
+        self.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
+
         // Gather request fields once; reused for blacklist, routing, and logging.
         let header = session.req_header();
         // `uri.host()` carries `:authority` for HTTP/2 (which has no Host
@@ -116,6 +157,21 @@ impl ProxyHttp for Gateway {
             resp.insert_header("Content-Type", "text/plain")?;
             resp.insert_header("Content-Length", "0")?;
             session.write_response_header(Box::new(resp), true).await?;
+            return Ok(true);
+        }
+
+        // Built-in metrics endpoint, answered before blacklist/routing so
+        // monitoring always works even when a route is misbehaving.
+        if path == LB_METRICS_PATH {
+            let unhealthy_len = self.unhealthy.load().len();
+            let body = self.metrics.render(unhealthy_len);
+            let mut resp = pingora_http::ResponseHeader::build(200, None)?;
+            resp.insert_header("Content-Type", "text/plain; version=0.0.4")?;
+            resp.insert_header("Content-Length", body.len().to_string())?;
+            session.write_response_header(Box::new(resp), false).await?;
+            session
+                .write_response_body(Some(Bytes::from(body)), true)
+                .await?;
             return Ok(true);
         }
 
@@ -144,7 +200,8 @@ impl ProxyHttp for Gateway {
         //    (or the effective client IP behind trusted proxies).
         if let Some(ip) = client_ip {
             let bl = self.blacklist.load();
-            if is_blacklisted(ip, &bl) {
+            if bl.contains(ip) {
+                self.metrics.blocked_total.fetch_add(1, Ordering::Relaxed);
                 log::warn!("blocked request from blacklisted client IP {ip}");
                 session.respond_error(403).await?;
                 return Ok(true);
@@ -159,16 +216,35 @@ impl ProxyHttp for Gateway {
         {
             let snap = self.snapshot.load();
             let unhealthy = self.unhealthy.load();
+
+            // Reject oversized bodies up front when a Content-Length is known;
+            // chunked bodies are capped streaming in `request_body_filter`.
+            if let Some(limit) = snap.config.max_body_size {
+                let cl = header
+                    .headers
+                    .get("content-length")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<u64>().ok());
+                if cl.is_some_and(|n| n > limit) {
+                    self.metrics
+                        .body_rejected_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    session.respond_error(413).await?;
+                    return Ok(true);
+                }
+            }
+
             match snap.config.resolve_route(host, path, client_ip) {
                 Some((idx, route)) => match &route.redirect {
                     Some(location) => {
                         let code = route.redirect_code;
+                        self.metrics.redirects_total.fetch_add(1, Ordering::Relaxed);
                         if snap
                             .config
                             .access_log
                             .should_log(method, host, path, client_ip)
                         {
-                            log::info!("redirect {code} {host}{path} -> {location}");
+                            log::info!("{}", redirect_line(code, host, path, location));
                         }
                         let mut resp = pingora_http::ResponseHeader::build(code, None)?;
                         resp.insert_header("Location", location)?;
@@ -176,6 +252,7 @@ impl ProxyHttp for Gateway {
                         return Ok(true);
                     }
                     None => {
+                        self.metrics.proxied_total.fetch_add(1, Ordering::Relaxed);
                         // Affinity key is only needed for active-active rings.
                         let key = match route.mode {
                             LbMode::ActiveActive => extract_api_key(
@@ -219,6 +296,12 @@ impl ProxyHttp for Gateway {
                             .should_log(method, host, path, client_ip)
                         {
                             log::info!("{}", dispatch_line(method, host, path, client_ip, addr));
+                            ctx.log_ctx = Some(LogCtx {
+                                method: method.to_string(),
+                                host: host.to_string(),
+                                path: path.to_string(),
+                                backend: addr,
+                            });
                         }
                         ctx.backend = Some(addr);
                         ctx.route = route_ctx;
@@ -227,8 +310,17 @@ impl ProxyHttp for Gateway {
                     }
                 },
                 None => {
-                    let addr = snap.config.default_backend;
+                    self.metrics.proxied_total.fetch_add(1, Ordering::Relaxed);
+                    let addr = pick_primary(&snap.config.default_backends, &unhealthy, &[]);
                     ctx.backend = Some(addr);
+                    // Keep a route context so retries fail over across the
+                    // default list instead of hammering the same dead node.
+                    ctx.route = Some(RouteCtx {
+                        idx: usize::MAX,
+                        mode: LbMode::ActiveStandby,
+                        backends: snap.config.default_backends.clone(),
+                        key: String::new(),
+                    });
                     ctx.timeouts = snap.config.timeouts;
                     if snap
                         .config
@@ -236,6 +328,12 @@ impl ProxyHttp for Gateway {
                         .should_log(method, host, path, client_ip)
                     {
                         log::info!("{}", dispatch_line(method, host, path, client_ip, addr));
+                        ctx.log_ctx = Some(LogCtx {
+                            method: method.to_string(),
+                            host: host.to_string(),
+                            path: path.to_string(),
+                            backend: addr,
+                        });
                     }
                     return Ok(false);
                 }
@@ -340,6 +438,55 @@ impl ProxyHttp for Gateway {
         }
         Ok(())
     }
+
+    async fn request_body_filter(
+        &self,
+        _session: &mut Session,
+        body: &mut Option<Bytes>,
+        _end_of_stream: bool,
+        ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        let limit = self.snapshot.load().config.max_body_size;
+        if let Some(limit) = limit {
+            if let Some(b) = body {
+                ctx.body_seen = ctx.body_seen.saturating_add(b.len() as u64);
+            }
+            if ctx.body_seen > limit {
+                self.metrics
+                    .body_rejected_total
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(pingora_core::Error::explain(
+                    pingora_core::ErrorType::ReadError,
+                    format!("request body exceeds max_body_size={limit}"),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    async fn logging(
+        &self,
+        session: &mut Session,
+        _e: Option<&pingora_core::Error>,
+        ctx: &mut Self::CTX,
+    ) {
+        let Some(log_ctx) = &ctx.log_ctx else {
+            return;
+        };
+        let snap = self.snapshot.load();
+        if !snap.config.access_log.should_log(
+            &log_ctx.method,
+            &log_ctx.host,
+            &log_ctx.path,
+            ctx.client_ip,
+        ) {
+            return;
+        }
+        let status = session.response_written().map_or(0, |r| r.status.as_u16());
+        let bytes = session.body_bytes_sent() as u64;
+        let ms = ctx.started.elapsed().as_millis();
+        log::info!("{}", complete_line(log_ctx.backend, status, ms, bytes));
+    }
 }
 
 fn event_targets(
@@ -388,7 +535,7 @@ fn blacklist_dir(blacklist: Option<&str>) -> Option<std::path::PathBuf> {
 pub(crate) fn watch_config(
     path: String,
     snapshot: Arc<ArcSwap<ConfigSnapshot>>,
-    blacklist: Arc<ArcSwap<Vec<BlacklistEntry>>>,
+    blacklist: Arc<ArcSwap<Blacklist>>,
 ) {
     use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, Watcher};
 
@@ -524,8 +671,9 @@ pub(crate) fn watch_config(
                 if let Some(p) = bl_path.as_deref() {
                     match load_blacklist(p) {
                         Ok(v) => {
+                            let entries = v.len();
                             blacklist.store(Arc::new(v));
-                            log::info!("blacklist reloaded from {p}");
+                            log::info!("blacklist reloaded from {p}: {entries} entries");
                         }
                         Err(e) => log::error!("failed to reload blacklist {p}: {e}"),
                     }

@@ -6,13 +6,21 @@ use std::time::Duration;
 
 use crate::backends::hash_str;
 use crate::client::parse_client_ip;
-use crate::routes::{host_matches, Route, RouteRaw};
+use crate::routes::{host_matches, path_matches, Route, RouteRaw};
 
 #[derive(Debug, Deserialize)]
 struct ConfigRaw {
     listen_port: Option<u16>,
     tls: Option<TlsConfig>,
-    default_backend: String,
+    /// Single default backend (shorthand). Mutually exclusive with
+    /// `default_backends`.
+    default_backend: Option<String>,
+    /// Ordered failover list for unmatched requests: traffic prefers the first
+    /// entry and fails over in order when earlier ones are unhealthy.
+    default_backends: Option<Vec<String>>,
+    /// Maximum request body bytes (None = unlimited). Content-Length larger
+    /// than this is rejected with 413; chunked bodies are aborted when exceeded.
+    max_body_size: Option<u64>,
     /// Path to a blacklist file (one IP/CIDR per line). Optional.
     blacklist: Option<String>,
     /// CIDRs of trusted reverse proxies. When the direct peer is inside one of
@@ -28,6 +36,10 @@ struct ConfigRaw {
     health_check: Option<HealthCheckConfig>,
     /// Per-request access log (dispatch/redirect lines) control.
     access_log: Option<AccessLogConfig>,
+    /// Number of pingora worker threads. 0/unset => CPU core count.
+    worker_threads: Option<usize>,
+    /// Max upstream attempts per request (connect-failure failover). 0/unset => 3.
+    max_retries: Option<usize>,
     routes: Vec<RouteRaw>,
 }
 
@@ -125,12 +137,16 @@ pub(crate) struct Config {
     pub(crate) listen_port: Option<u16>,
     pub(crate) tls: Option<TlsConfig>,
     pub(crate) default_backend: SocketAddr,
+    pub(crate) default_backends: Vec<SocketAddr>,
+    pub(crate) max_body_size: Option<u64>,
     /// Path to a blacklist file. The parsed entries live in `Gateway::blacklist`.
     pub(crate) blacklist: Option<String>,
     pub(crate) trusted_proxies: Vec<IpNet>,
     pub(crate) timeouts: UpstreamTimeouts,
     pub(crate) health_check: HealthCheckConfig,
     pub(crate) access_log: AccessLogConfig,
+    pub(crate) worker_threads: usize,
+    pub(crate) max_retries: usize,
     pub(crate) routes: Vec<Route>,
 }
 
@@ -172,7 +188,19 @@ impl Config {
     }
 
     fn from_raw(raw: ConfigRaw) -> std::result::Result<Self, String> {
-        let default_backend = parse_addr(&raw.default_backend)?;
+        let default_backends = match (raw.default_backend, raw.default_backends) {
+            (Some(s), None) => vec![parse_addr(&s)?],
+            (None, Some(list)) if !list.is_empty() => {
+                list.iter()
+                    .map(|s| parse_addr(s))
+                    .collect::<std::result::Result<Vec<_>, _>>()?
+            }
+            (None, Some(_)) => return Err("default_backends must not be empty".into()),
+            (Some(_), Some(_)) => {
+                return Err("set exactly one of `default_backend` / `default_backends`".into())
+            }
+            (None, None) => return Err("missing `default_backend` (or `default_backends`)".into()),
+        };
         let mut routes = Vec::with_capacity(raw.routes.len());
         for (i, r) in raw.routes.into_iter().enumerate() {
             if r.host.is_none() && r.path.is_none() && r.client_ip.is_none() {
@@ -208,10 +236,18 @@ impl Config {
             );
         }
         access_log.sample_rate = access_log.sample_rate.clamp(0.0, 1.0);
+        let worker_threads = raw.worker_threads.filter(|n| *n > 0).unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+        });
+        let max_retries = raw.max_retries.filter(|n| *n > 0).unwrap_or(3);
         Ok(Config {
             listen_port: raw.listen_port,
             tls: raw.tls,
-            default_backend,
+            default_backend: default_backends[0],
+            default_backends,
+            max_body_size: raw.max_body_size,
             blacklist: raw.blacklist,
             trusted_proxies,
             timeouts: UpstreamTimeouts {
@@ -222,6 +258,8 @@ impl Config {
             },
             health_check,
             access_log,
+            worker_threads,
+            max_retries,
             routes,
         })
     }
@@ -240,7 +278,7 @@ impl Config {
                 }
             }
             if let Some(ref r_path) = route.path {
-                if !path.starts_with(r_path) {
+                if !path_matches(path, r_path) {
                     continue;
                 }
             }
@@ -347,6 +385,50 @@ routes: []
             yes && no,
             "0.5 sampling must produce both logged and skipped"
         );
+    }
+
+    #[test]
+    fn config_worker_threads_and_max_retries() {
+        let yaml =
+            "default_backend: \"127.0.0.1:8080\"\nworker_threads: 4\nmax_retries: 7\nroutes: []\n";
+        let cfg = Config::from_str(yaml).unwrap();
+        assert_eq!(cfg.worker_threads, 4);
+        assert_eq!(cfg.max_retries, 7);
+
+        let bare = "default_backend: \"127.0.0.1:8080\"\nroutes: []\n";
+        let cfg2 = Config::from_str(bare).unwrap();
+        assert_eq!(cfg2.max_retries, 3, "default retries = 3");
+        assert!(cfg2.worker_threads >= 1, "default threads = CPU count");
+
+        // 0 (or negative) values fall back to defaults instead of panicking.
+        let zero =
+            "default_backend: \"127.0.0.1:8080\"\nworker_threads: 0\nmax_retries: 0\nroutes: []\n";
+        let cfg3 = Config::from_str(zero).unwrap();
+        assert_eq!(cfg3.max_retries, 3);
+        assert!(cfg3.worker_threads >= 1);
+    }
+
+    #[test]
+    fn config_default_backends_list_and_conflicts() {
+        let yaml = "default_backends: [\"10.0.0.1:80\", \"10.0.0.2:80\"]\nroutes: []\n";
+        let cfg = Config::from_str(yaml).unwrap();
+        assert_eq!(cfg.default_backends.len(), 2);
+        assert_eq!(cfg.default_backend, "10.0.0.1:80".parse().unwrap());
+
+        // Both forms at once is rejected; so are neither, or an empty list.
+        let both =
+            "default_backend: \"10.0.0.1:80\"\ndefault_backends: [\"10.0.0.2:80\"]\nroutes: []\n";
+        assert!(Config::from_str(both).is_err());
+        assert!(Config::from_str("routes: []\n").is_err());
+        assert!(Config::from_str("default_backends: []\nroutes: []\n").is_err());
+    }
+
+    #[test]
+    fn config_max_body_size_optional() {
+        let yaml = "default_backend: \"127.0.0.1:8080\"\nmax_body_size: 1048576\nroutes: []\n";
+        assert_eq!(Config::from_str(yaml).unwrap().max_body_size, Some(1048576));
+        let bare = "default_backend: \"127.0.0.1:8080\"\nroutes: []\n";
+        assert_eq!(Config::from_str(bare).unwrap().max_body_size, None);
     }
 
     #[test]

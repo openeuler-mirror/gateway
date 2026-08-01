@@ -1,6 +1,21 @@
 use log::{Level, LevelFilter, Log, Metadata, Record};
+use std::borrow::Cow;
 use std::net::{IpAddr, SocketAddr};
 use std::os::unix::net::UnixDatagram;
+
+/// Strip control characters from a client-controlled field before it reaches a
+/// log line, preventing syslog / terminal log injection. Protocol parsers
+/// normally reject literal CR/LF, but this is cheap defense-in-depth.
+pub(crate) fn sanitize(s: &str) -> Cow<'_, str> {
+    if !s.chars().any(|c| c.is_control()) {
+        return Cow::Borrowed(s);
+    }
+    Cow::Owned(
+        s.chars()
+            .map(|c| if c.is_control() { '?' } else { c })
+            .collect(),
+    )
+}
 
 pub(crate) fn dispatch_line(
     method: &str,
@@ -12,7 +27,31 @@ pub(crate) fn dispatch_line(
     let client = client
         .map(|ip| ip.to_string())
         .unwrap_or_else(|| "-".into());
-    format!("dispatch method={method} host={host} path={path} client={client} backend={backend}")
+    format!(
+        "dispatch method={} host={} path={} client={} backend={backend}",
+        sanitize(method),
+        sanitize(host),
+        sanitize(path),
+        sanitize(&client)
+    )
+}
+
+/// Build the structured "request redirected by the LB" log line. `location`
+/// comes from config (trusted), but the request-derived fields are sanitized.
+pub(crate) fn redirect_line(code: u16, host: &str, path: &str, location: &str) -> String {
+    format!(
+        "redirect {code} {}{} -> {}",
+        sanitize(host),
+        sanitize(path),
+        sanitize(location)
+    )
+}
+
+/// Build the "request completed" line: response status, elapsed ms and body
+/// bytes sent. Emitted from the `logging()` hook, adjacent to (and correlated
+/// with) the earlier `dispatch` line via the backend address.
+pub(crate) fn complete_line(backend: SocketAddr, status: u16, ms: u128, bytes: u64) -> String {
+    format!("complete backend={backend} status={status} ms={ms} bytes={bytes}")
 }
 /// syslog LOG_USER facility code.
 const FACILITY_USER: u8 = 1;
@@ -130,6 +169,30 @@ mod tests {
         // Missing client IP is rendered as "-".
         let line2 = dispatch_line("GET", "h", "/p", None, backend);
         assert!(line2.contains("client=-"));
+    }
+
+    #[test]
+    fn sanitize_strips_control_chars_keeps_plain_text() {
+        assert_eq!(sanitize("plain-host.example.com"), "plain-host.example.com");
+        // CR, LF and ESC are replaced; printable chars are preserved.
+        assert_eq!(sanitize("bad\r\nhost\x1b[31m"), "bad??host?[31m");
+        assert_eq!(
+            dispatch_line("GET", "a\r\nb", "/x", None, "10.0.0.1:80".parse().unwrap()),
+            "dispatch method=GET host=a??b path=/x client=- backend=10.0.0.1:80"
+        );
+        assert_eq!(
+            redirect_line(302, "a\nb", "/x", "/login"),
+            "redirect 302 a?b/x -> /login"
+        );
+    }
+
+    #[test]
+    fn complete_line_contains_status_duration_bytes() {
+        let line = complete_line("10.0.0.1:80".parse().unwrap(), 200, 12, 4096);
+        assert_eq!(
+            line,
+            "complete backend=10.0.0.1:80 status=200 ms=12 bytes=4096"
+        );
     }
 
     #[test]
