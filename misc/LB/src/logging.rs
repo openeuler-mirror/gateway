@@ -2,6 +2,22 @@ use log::{Level, LevelFilter, Log, Metadata, Record};
 use std::borrow::Cow;
 use std::net::{IpAddr, SocketAddr};
 use std::os::unix::net::UnixDatagram;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Monotonic counter for request IDs; combined with wall-clock nanos below it
+/// is unique enough per process across threads.
+static REQ_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Generate a compact, unique-per-process request ID (hex): `<nanos>-<counter>`.
+pub(crate) fn generate_request_id() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let counter = REQ_ID_COUNTER.fetch_add(1, Relaxed);
+    format!("{nanos:016x}-{counter:08x}")
+}
 
 /// Strip control characters from a client-controlled field before it reaches a
 /// log line, preventing syslog / terminal log injection. Protocol parsers
@@ -193,6 +209,15 @@ mod tests {
             line,
             "complete backend=10.0.0.1:80 status=200 ms=12 bytes=4096"
         );
+    }
+
+    #[test]
+    fn request_ids_are_unique_and_hex() {
+        let a = generate_request_id();
+        let b = generate_request_id();
+        assert_ne!(a, b);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit() || c == '-'));
+        assert!(b.chars().all(|c| c.is_ascii_hexdigit() || c == '-'));
     }
 
     #[test]

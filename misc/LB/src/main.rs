@@ -13,10 +13,10 @@ use clap::Parser;
 use pingora_core::listeners::tls::TlsSettings;
 use pingora_core::server::Server;
 use pingora_proxy::http_proxy_service;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::backends::{build_rings, collect_all_backends};
 use crate::blacklist::load_blacklist_state;
@@ -77,6 +77,7 @@ fn main() {
         unhealthy,
         blacklist,
         metrics: Metrics::default(),
+        block_warn: Mutex::new(HashMap::new()),
     };
 
     let mut proxy = http_proxy_service(&server.configuration, gateway);

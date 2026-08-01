@@ -21,6 +21,8 @@ struct ConfigRaw {
     /// Maximum request body bytes (None = unlimited). Content-Length larger
     /// than this is rejected with 413; chunked bodies are aborted when exceeded.
     max_body_size: Option<u64>,
+    /// Upstream TLS (https backends). Optional; absent => plaintext upstreams.
+    upstream_tls: Option<UpstreamTlsConfig>,
     /// Path to a blacklist file (one IP/CIDR per line). Optional.
     blacklist: Option<String>,
     /// CIDRs of trusted reverse proxies. When the direct peer is inside one of
@@ -50,10 +52,24 @@ pub(crate) struct HealthCheckConfig {
     pub(crate) path: Option<String>,
     #[serde(default = "default_health_status")]
     pub(crate) expected_status: u16,
+    /// Probe cycle in seconds (default 5).
+    #[serde(default = "default_probe_interval")]
+    pub(crate) interval_secs: u64,
+    /// Consecutive failed probes before a backend is marked unhealthy (default 3).
+    #[serde(default = "default_fail_threshold")]
+    pub(crate) fail_threshold: u32,
 }
 
 fn default_health_status() -> u16 {
     200
+}
+
+fn default_probe_interval() -> u64 {
+    5
+}
+
+fn default_fail_threshold() -> u32 {
+    3
 }
 
 impl Default for HealthCheckConfig {
@@ -61,8 +77,24 @@ impl Default for HealthCheckConfig {
         HealthCheckConfig {
             path: None,
             expected_status: default_health_status(),
+            interval_secs: default_probe_interval(),
+            fail_threshold: default_fail_threshold(),
         }
     }
+}
+
+/// TLS settings for upstream (backend) connections. Optional; when absent the
+/// LB talks to backends over plaintext HTTP.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct UpstreamTlsConfig {
+    #[serde(default)]
+    pub(crate) enabled: bool,
+    /// SNI sent to the upstream. Empty => use the backend address's IP string.
+    #[serde(default)]
+    pub(crate) sni: String,
+    /// Verify the upstream certificate chain and hostname (default true).
+    #[serde(default = "default_true")]
+    pub(crate) verify: bool,
 }
 
 /// Per-request access-log control. Sampling is deterministic per request
@@ -139,6 +171,7 @@ pub(crate) struct Config {
     pub(crate) default_backend: SocketAddr,
     pub(crate) default_backends: Vec<SocketAddr>,
     pub(crate) max_body_size: Option<u64>,
+    pub(crate) upstream_tls: Option<UpstreamTlsConfig>,
     /// Path to a blacklist file. The parsed entries live in `Gateway::blacklist`.
     pub(crate) blacklist: Option<String>,
     pub(crate) trusted_proxies: Vec<IpNet>,
@@ -248,6 +281,7 @@ impl Config {
             default_backend: default_backends[0],
             default_backends,
             max_body_size: raw.max_body_size,
+            upstream_tls: raw.upstream_tls,
             blacklist: raw.blacklist,
             trusted_proxies,
             timeouts: UpstreamTimeouts {
@@ -429,6 +463,32 @@ routes: []
         assert_eq!(Config::from_str(yaml).unwrap().max_body_size, Some(1048576));
         let bare = "default_backend: \"127.0.0.1:8080\"\nroutes: []\n";
         assert_eq!(Config::from_str(bare).unwrap().max_body_size, None);
+    }
+
+    #[test]
+    fn config_health_check_interval_and_threshold_defaults() {
+        let yaml = "default_backend: \"127.0.0.1:8080\"\nhealth_check:\n  path: \"/healthz\"\n  interval_secs: 10\n  fail_threshold: 5\nroutes: []\n";
+        let cfg = Config::from_str(yaml).unwrap();
+        assert_eq!(cfg.health_check.interval_secs, 10);
+        assert_eq!(cfg.health_check.fail_threshold, 5);
+
+        let bare = "default_backend: \"127.0.0.1:8080\"\nroutes: []\n";
+        let cfg2 = Config::from_str(bare).unwrap();
+        assert_eq!(cfg2.health_check.interval_secs, 5);
+        assert_eq!(cfg2.health_check.fail_threshold, 3);
+    }
+
+    #[test]
+    fn config_upstream_tls_parses_and_defaults_verify() {
+        let yaml = "default_backend: \"127.0.0.1:8080\"\nupstream_tls:\n  enabled: true\n  sni: \"svc.internal\"\nroutes: []\n";
+        let cfg = Config::from_str(yaml).unwrap();
+        let tls = cfg.upstream_tls.unwrap();
+        assert!(tls.enabled);
+        assert_eq!(tls.sni, "svc.internal");
+        assert!(tls.verify, "verify defaults to true");
+
+        let bare = "default_backend: \"127.0.0.1:8080\"\nroutes: []\n";
+        assert!(Config::from_str(bare).unwrap().upstream_tls.is_none());
     }
 
     #[test]

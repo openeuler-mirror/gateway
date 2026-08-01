@@ -36,9 +36,20 @@ default_backend: "127.0.0.1:8080"
 
 # 后端健康检查(可选):不写默认仅 TCP connect 探测。
 #   配置 path 后,探测改为 HTTP GET 该路径并要求期望状态码。
+#   interval_secs  探测周期(秒,默认 5)
+#   fail_threshold 连续失败多少次标记不健康(默认 3)
 # health_check:
 #   path: "/healthz"
 #   expected_status: 200
+#   interval_secs: 5
+#   fail_threshold: 3
+
+# 上游 TLS(可选):后端走 https 时开启。sni 缺省用后端 IP;
+# verify 默认 true(校验证书与主机名,系统 CA)。
+# upstream_tls:
+#   enabled: true
+#   sni: "svc.internal"
+#   verify: true
 
 # 信任的反向代理网段(可选):直连 IP 落在这些网段时,黑名单和 client_ip
 # 路由改用 X-Forwarded-For 中第一个"不可信"跳作为真实客户端 IP(防伪造)。

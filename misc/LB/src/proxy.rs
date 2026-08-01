@@ -9,7 +9,7 @@ use std::fs;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::time::Instant;
 
@@ -17,7 +17,7 @@ use crate::backends::{build_rings, collect_all_backends, pick_active_active, pic
 use crate::blacklist::{load_blacklist, load_blacklist_state, Blacklist};
 use crate::client::effective_client_ip;
 use crate::config::{Config, LbMode, UpstreamTimeouts};
-use crate::logging::{complete_line, dispatch_line, redirect_line};
+use crate::logging::{complete_line, dispatch_line, generate_request_id, redirect_line};
 use crate::metrics::Metrics;
 use crate::routes::request_host;
 
@@ -62,6 +62,8 @@ pub(crate) struct Gateway {
     pub(crate) unhealthy: Arc<ArcSwap<HashSet<SocketAddr>>>,
     pub(crate) blacklist: Arc<ArcSwap<Blacklist>>,
     pub(crate) metrics: Metrics,
+    /// Throttle map for blacklist-block warnings: <ip, last warn time>.
+    pub(crate) block_warn: Mutex<HashMap<IpAddr, Instant>>,
 }
 
 /// re-resolving (and without re-scanning the route table).
@@ -83,6 +85,9 @@ pub struct RoutingCtx {
     body_seen: u64,
     /// Wall-clock start of the request, for the duration in the completion log.
     started: Instant,
+    /// Original request scheme when known (`:scheme` on HTTP/2 or absolute-form
+    /// HTTP/1), forwarded upstream as X-Forwarded-Proto.
+    forwarded_proto: Option<String>,
 }
 
 impl Default for RoutingCtx {
@@ -96,6 +101,7 @@ impl Default for RoutingCtx {
             log_ctx: None,
             body_seen: 0,
             started: Instant::now(),
+            forwarded_proto: None,
         }
     }
 }
@@ -124,8 +130,16 @@ const LB_METRICS_PATH: &str = "/__lb_metrics";
 struct RouteCtx {
     idx: usize,
     mode: LbMode,
-    backends: Vec<SocketAddr>,
+    backends: Arc<Vec<SocketAddr>>,
     key: String,
+}
+
+/// Fail-closed check for ambiguous request framing (smuggling defense):
+/// Transfer-Encoding combined with Content-Length, or TE on HTTP/1.0 (which
+/// has no chunked framing), is always rejected. Pingora 0.8.1 blocks these
+/// internally too; this is an explicit second layer.
+fn smuggling_ambiguous(version: &http::Version, has_cl: bool, has_te: bool) -> bool {
+    has_te && (has_cl || *version != http::Version::HTTP_11)
 }
 
 #[async_trait]
@@ -175,6 +189,16 @@ impl ProxyHttp for Gateway {
             return Ok(true);
         }
 
+        // Defense-in-depth against request smuggling: ambiguous framing (both
+        // Content-Length and Transfer-Encoding, or TE on HTTP/1.0) is rejected
+        // explicitly. Pingora 0.8.1 already blocks these; this is fail-closed.
+        let has_cl = header.headers.contains_key("content-length");
+        let has_te = header.headers.contains_key("transfer-encoding");
+        if smuggling_ambiguous(&header.version, has_cl, has_te) {
+            session.respond_error(400).await?;
+            return Ok(true);
+        }
+
         // `as_inet()` is None for non-INET (e.g. Unix-socket) clients, so for a
         // UDS listener the IP-based blacklist and client_ip routes silently no-op.
         let peer_ip = session
@@ -195,6 +219,7 @@ impl ProxyHttp for Gateway {
             )
         };
         ctx.client_ip = client_ip;
+        ctx.forwarded_proto = header.uri.scheme().map(|s| s.as_str().to_string());
 
         // 1. Blacklist: block before any routing. Uses the TCP peer address
         //    (or the effective client IP behind trusted proxies).
@@ -202,7 +227,23 @@ impl ProxyHttp for Gateway {
             let bl = self.blacklist.load();
             if bl.contains(ip) {
                 self.metrics.blocked_total.fetch_add(1, Ordering::Relaxed);
-                log::warn!("blocked request from blacklisted client IP {ip}");
+                // Throttle warnings to one per IP per minute so a sustained
+                // attack cannot flood the log.
+                {
+                    let now = Instant::now();
+                    let mut warn_times = self.block_warn.lock().unwrap_or_else(|p| p.into_inner());
+                    let due = warn_times
+                        .get(&ip)
+                        .is_none_or(|last| now.duration_since(*last) >= Duration::from_secs(60));
+                    if due {
+                        log::warn!("blocked request from blacklisted client IP {ip}");
+                        warn_times.insert(ip, now);
+                    }
+                    if warn_times.len() > 4096 {
+                        warn_times
+                            .retain(|_, last| now.duration_since(*last) < Duration::from_secs(60));
+                    }
+                }
                 session.respond_error(403).await?;
                 return Ok(true);
             }
@@ -287,7 +328,7 @@ impl ProxyHttp for Gateway {
                         let route_ctx = route.backends.as_ref().map(|list| RouteCtx {
                             idx,
                             mode: route.mode,
-                            backends: list.clone(),
+                            backends: Arc::new(list.clone()),
                             key,
                         });
                         if snap
@@ -318,7 +359,7 @@ impl ProxyHttp for Gateway {
                     ctx.route = Some(RouteCtx {
                         idx: usize::MAX,
                         mode: LbMode::ActiveStandby,
-                        backends: snap.config.default_backends.clone(),
+                        backends: Arc::new(snap.config.default_backends.clone()),
                         key: String::new(),
                     });
                     ctx.timeouts = snap.config.timeouts;
@@ -374,7 +415,28 @@ impl ProxyHttp for Gateway {
                 .expect("backend must be set before upstream_peer")
         };
 
-        let mut peer = HttpPeer::new(addr, false, String::new());
+        // Upstream TLS: enabled from config (https backends). SNI defaults to
+        // the backend address; certificate/hostname verification is on by
+        // default when TLS is enabled.
+        let upstream_tls = self.snapshot.load().config.upstream_tls.clone();
+        let (use_tls, sni) = match &upstream_tls {
+            Some(t) if t.enabled => (
+                true,
+                if t.sni.is_empty() {
+                    addr.ip().to_string()
+                } else {
+                    t.sni.clone()
+                },
+            ),
+            _ => (false, String::new()),
+        };
+        let mut peer = HttpPeer::new(addr, use_tls, sni);
+        if let Some(t) = upstream_tls {
+            if t.enabled && t.verify {
+                peer.options.verify_cert = true;
+                peer.options.verify_hostname = true;
+            }
+        }
         peer.options.connection_timeout = Some(ctx.timeouts.connect);
         peer.options.total_connection_timeout = Some(ctx.timeouts.total_connect);
         peer.options.read_timeout = Some(ctx.timeouts.read);
@@ -419,6 +481,16 @@ impl ProxyHttp for Gateway {
             .unwrap_or_else(|| "unknown".to_string());
 
         let _ = upstream_request.insert_header("X-Real-IP", &real_ip);
+        // Generate a request ID when the client did not supply one, so tracing
+        // works end-to-end even for direct (non-LB) clients.
+        if upstream_request.headers.get("x-request-id").is_none() {
+            let _ = upstream_request.insert_header("X-Request-Id", generate_request_id());
+        }
+        // Original scheme when known (HTTP/2 `:scheme` or absolute-form HTTP/1);
+        // HTTP/1 origin-form has no scheme, so the header is simply omitted.
+        if let Some(proto) = &ctx.forwarded_proto {
+            let _ = upstream_request.insert_header("X-Forwarded-Proto", proto);
+        }
         // Append to X-Forwarded-For as a single comma-joined header line so
         // downstream parsers that only read one line see the full chain.
         let existing = upstream_request
@@ -695,5 +767,21 @@ mod tests {
         assert_eq!(extract_api_key(Some("Bearer a"), Some("b"), ip), "a");
         assert_eq!(extract_api_key(None, None, ip), "10.0.0.1");
         assert_eq!(extract_api_key(None, None, None), "unknown");
+    }
+
+    #[test]
+    fn smuggling_check_rejects_ambiguous_framing() {
+        use http::Version;
+        // CL + TE together on HTTP/1.1 is ambiguous.
+        assert!(smuggling_ambiguous(&Version::HTTP_11, true, true));
+        // TE on HTTP/1.0 has no valid framing.
+        assert!(smuggling_ambiguous(&Version::HTTP_10, false, true));
+        // Legitimate shapes pass: CL only, TE only (chunked), neither.
+        assert!(!smuggling_ambiguous(&Version::HTTP_11, true, false));
+        assert!(!smuggling_ambiguous(&Version::HTTP_11, false, true));
+        assert!(!smuggling_ambiguous(&Version::HTTP_11, false, false));
+        // HTTP/2 with TE fails closed (spec forbids TE there anyway).
+        assert!(smuggling_ambiguous(&Version::HTTP_2, false, true));
+        assert!(!smuggling_ambiguous(&Version::HTTP_2, false, false));
     }
 }

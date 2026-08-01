@@ -7,16 +7,18 @@ use std::time::Duration;
 use crate::config::HealthCheckConfig;
 use crate::proxy::ConfigSnapshot;
 
-const PROBE_INTERVAL: Duration = Duration::from_secs(5);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
-const FAIL_THRESHOLD: u32 = 3;
+/// Cap on concurrent probe worker threads per cycle; a large pool reuses at
+/// most this many OS threads instead of spawning one per backend.
+const MAX_PROBE_WORKERS: usize = 8;
+
 /// (prev_consecutive_failures, probe_healthy) -> (new_failures, mark_unhealthy)
-fn classify_health(prev_failures: u32, probe_healthy: bool) -> (u32, bool) {
+fn classify_health(prev_failures: u32, probe_healthy: bool, fail_threshold: u32) -> (u32, bool) {
     if probe_healthy {
         (0, false)
     } else {
         let n = prev_failures + 1;
-        (n, n >= FAIL_THRESHOLD)
+        (n, n >= fail_threshold)
     }
 }
 
@@ -81,34 +83,46 @@ pub(crate) fn run_health_probe(
                 let snap = snapshot.load();
                 (snap.backends.clone(), snap.config.health_check.clone())
             };
-            // Probe all backends concurrently so a large (or fully-down) pool
-            // is still checked every PROBE_INTERVAL instead of serially.
-            let results: Vec<(SocketAddr, bool)> = std::thread::scope(|s| {
-                backends
-                    .iter()
-                    .map(|addr| {
-                        let addr = *addr;
+            let interval = Duration::from_secs(check.interval_secs.max(1));
+            let threshold = check.fail_threshold.max(1);
+
+            let results: Vec<(SocketAddr, bool)> = if backends.is_empty() {
+                Vec::new()
+            } else {
+                // Probe backends concurrently, but cap the number of OS threads
+                // so a large pool does not churn threads every cycle.
+                let workers = backends.len().min(MAX_PROBE_WORKERS);
+                std::thread::scope(|s| {
+                    let chunk_size = backends.len().div_ceil(workers);
+                    let mut handles = Vec::with_capacity(workers);
+                    for chunk in backends.chunks(chunk_size) {
                         let check = &check;
-                        s.spawn(move || (addr, probe_once(addr, check)))
-                    })
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .map(|h| h.join().expect("probe thread panicked"))
-                    .collect()
-            });
+                        handles.push(s.spawn(move || {
+                            chunk
+                                .iter()
+                                .map(|&addr| (addr, probe_once(addr, check)))
+                                .collect::<Vec<_>>()
+                        }));
+                    }
+                    handles
+                        .into_iter()
+                        .flat_map(|h| h.join().expect("probe thread panicked"))
+                        .collect()
+                })
+            };
             // Drop counters for backends no longer in the config.
             failures.retain(|addr, _| backends.contains(addr));
             let mut new_unhealthy = HashSet::new();
             for (addr, healthy) in results {
                 let prev = *failures.get(&addr).unwrap_or(&0);
-                let (nf, mark) = classify_health(prev, healthy);
+                let (nf, mark) = classify_health(prev, healthy, threshold);
                 failures.insert(addr, nf);
                 if mark {
                     new_unhealthy.insert(addr);
                 }
             }
             unhealthy.store(Arc::new(new_unhealthy));
-            std::thread::sleep(PROBE_INTERVAL);
+            std::thread::sleep(interval);
         }
     });
 }
@@ -120,10 +134,12 @@ mod tests {
 
     #[test]
     fn classify_health_threshold_and_recovery() {
-        assert_eq!(classify_health(0, true), (0, false));
-        assert_eq!(classify_health(1, false), (2, false));
-        assert_eq!(classify_health(2, false), (3, true));
-        assert_eq!(classify_health(9, true), (0, false));
+        assert_eq!(classify_health(0, true, 3), (0, false));
+        assert_eq!(classify_health(1, false, 3), (2, false));
+        assert_eq!(classify_health(2, false, 3), (3, true));
+        assert_eq!(classify_health(9, true, 3), (0, false));
+        // Custom threshold: a single failure can mark unhealthy immediately.
+        assert_eq!(classify_health(0, false, 1), (1, true));
     }
 
     #[test]
