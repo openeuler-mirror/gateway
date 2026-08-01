@@ -15,6 +15,9 @@ BooMGateway 的可选前端,也可单独部署。以 Docker 镜像提供(Rust �
 - **健康检查**:TCP connect 或 HTTP GET(可配路径与期望状态码);探测周期与失败阈值可配;
   探针最多 8 个 worker 分片,大后端池不抖线程。
 - **失败重试**:连接失败自动换节点(排除已尝试者),重试上限可配(默认 3)。
+- **5xx 重试**(可选):上游返回 5xx 时对幂等方法(GET/HEAD/OPTIONS,可配)重试,
+  自动排除返回 5xx 的后端;非幂等方法绝不重试。
+- **每路由超时覆盖**:单个路由可覆盖全局 connect/read 等超时,未填字段沿用全局值。
 - **安全**:
   - IP 黑名单(文件化、热加载;精确 IP 走 HashSet,大列表也保持 O(1));
   - `trusted_proxies` + X-Forwarded-For 取首个不可信跳,防客户端伪造;
@@ -87,6 +90,7 @@ CONFIG_PATH=/path/to/routes.yaml ./target/release/gateway-lb
 | `upstream_*_timeout` | u64(秒) | connect 3 / total 5 / read 30 / idle 60 | 上游超时 |
 | `worker_threads` | usize | CPU 核数 | Pingora worker 线程数 |
 | `max_retries` | usize | 3 | 单请求最大上游尝试次数(连接失败 failover) |
+| `retry_5xx` | 对象 | 关闭 | `{ enabled, methods, max_tries }`;5xx 时对列出的幂等方法重试 |
 | `health_check` | 对象 | TCP 探测 | `{ path, expected_status, interval_secs, fail_threshold }`;path 设置后改为 HTTP GET |
 | `access_log` | 对象 | 开启全量 | `{ enabled, sample_rate }`;采样按请求特征确定性进行 |
 | `routes` | list | 必填 | 路由表,见下 |
@@ -109,6 +113,8 @@ routes:
   - host: "ha.example.com"
     mode: active-standby               # 主备:优先 backends[0],不健康才切换
     backends: ["10.0.0.20:8080", "10.0.0.21:8080"]
+    timeouts:                          # 每路由超时覆盖(可选,秒)
+      read: 60
   - host: "old.example.com"
     redirect: "https://new.example.com/"
     redirect_code: 301                 # 可选:301/302/303/307/308,默认 302
@@ -122,7 +128,7 @@ API Key 亲和取自 `Authorization: Bearer`、`X-API-Key` 或客户端 IP(按�
 | 端点 | 说明 |
 |---|---|
 | `GET /__lb_healthz` | 探活,直接返回 200;不经过黑名单/路由 |
-| `GET /__lb_metrics` | Prometheus 文本格式:请求总数、黑名单拦截、重定向、转发、body 超限拒绝、不健康后端数、uptime |
+| `GET /__lb_metrics` | Prometheus 文本格式:请求总数、黑名单拦截、重定向、转发、body 超限拒绝、状态码分桶(2xx/3xx/4xx/5xx)、上游错误数、重试数、响应字节、不健康后端数、uptime |
 
 两个端点都在黑名单与路由判断之前应答,但**没有鉴权**,请勿暴露到公网。
 

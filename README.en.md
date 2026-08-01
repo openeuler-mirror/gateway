@@ -598,8 +598,9 @@ Pingora-based standalone load balancer as an optional front-end. It ships as a D
 - Routing by `host` (wildcard `*.example.com`), `path` prefix (segment-boundary aware), and `client_ip` CIDR; first match wins
 - Backend policies: active-active (consistent hash + API-key affinity) and active-standby (ordered failover); default backends support a failover list
 - Health checks: TCP / HTTP GET probes with configurable interval and failure threshold; connect failures retry on another backend
+- Resilience: idempotent 5xx retries that exclude the failing backend, plus per-route timeout overrides
 - Security: hot-reloaded IP blacklist, trusted-proxy-aware XFF handling, upstream TLS, request body limits, request-smuggling defense-in-depth
-- Observability: `/__lb_metrics` Prometheus counters, `/__lb_healthz` liveness, structured access logs with status and latency
+- Observability: `/__lb_metrics` Prometheus counters (status buckets/errors/retries), `/__lb_healthz` liveness, structured access logs with status, latency and errors
 - Hot reload: config and blacklist changes apply automatically (lock-free ArcSwap)
 
 ```bash

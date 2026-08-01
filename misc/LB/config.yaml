@@ -34,6 +34,14 @@ default_backend: "127.0.0.1:8080"
 # 上限不宜过大,否则坏后端会放大尾部延迟。
 # max_retries: 3
 
+# 5xx 重试(可选,默认关闭):上游返回 5xx 时对幂等方法重试,避免 POST 等重复提交。
+#   methods   允许重试的方法(默认 GET/HEAD/OPTIONS)
+#   max_tries 5xx 后的额外尝试次数(默认 1,同时受全局 max_retries 预算限制)
+# retry_5xx:
+#   enabled: true
+#   methods: ["GET", "HEAD", "OPTIONS"]
+#   max_tries: 1
+
 # 后端健康检查(可选):不写默认仅 TCP connect 探测。
 #   配置 path 后,探测改为 HTTP GET 该路径并要求期望状态码。
 #   interval_secs  探测周期(秒,默认 5)
@@ -95,6 +103,9 @@ routes:
       - "10.0.0.10:8080"
       - "10.0.0.11:8080"
       - "10.0.0.12:8080"
+    # 每路由超时覆盖(可选,秒):未填字段沿用全局上游超时。
+    timeouts:
+      read: 60
   # 主备路由：mode: active-standby 时流量优先走 backends[0]，
   # 其不可用（TCP 健康检查判定）才依次切到备机；不写 mode 即默认多活（active-active）。
   - host: "ha.lb.local"

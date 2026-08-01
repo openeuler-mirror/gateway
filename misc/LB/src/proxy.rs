@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use pingora_core::upstreams::peer::{HttpPeer, Peer};
 use pingora_core::Result;
-use pingora_proxy::{ProxyHttp, Session};
+use pingora_proxy::{FailToProxy, ProxyHttp, Session};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::net::{IpAddr, SocketAddr};
@@ -92,6 +92,12 @@ pub struct RoutingCtx {
     /// Original request scheme when known (`:scheme` on HTTP/2 or absolute-form
     /// HTTP/1), forwarded upstream as X-Forwarded-Proto.
     forwarded_proto: Option<String>,
+    /// Remaining 5xx retries for this request (`Some(n)` only when the request
+    /// method is retryable and `retry_5xx` is enabled).
+    retry5xx_left: Option<usize>,
+    /// The backend chosen by the most recent `upstream_peer()` call, so a 5xx
+    /// retry can exclude it from the next pick.
+    last_backend: Option<SocketAddr>,
 }
 
 impl Default for RoutingCtx {
@@ -106,6 +112,8 @@ impl Default for RoutingCtx {
             body_seen: 0,
             started: Instant::now(),
             forwarded_proto: None,
+            retry5xx_left: None,
+            last_backend: None,
         }
     }
 }
@@ -289,6 +297,19 @@ impl ProxyHttp for Gateway {
                 }
             }
 
+            // 5xx retry eligibility: only idempotent methods, bounded by the
+            // configured extra attempts (and the global max_retries budget).
+            if snap.config.retry_5xx.enabled
+                && snap
+                    .config
+                    .retry_5xx
+                    .methods
+                    .iter()
+                    .any(|m| m.eq_ignore_ascii_case(method))
+            {
+                ctx.retry5xx_left = Some(snap.config.retry_5xx.max_tries);
+            }
+
             match snap.config.resolve_route(host, path, client_ip) {
                 Some((idx, route)) => match &route.redirect {
                     Some(location) => {
@@ -356,7 +377,9 @@ impl ProxyHttp for Gateway {
                         );
                         ctx.backend = Some(addr);
                         ctx.route = route_ctx;
-                        ctx.timeouts = snap.config.timeouts;
+                        ctx.timeouts = route
+                            .timeouts
+                            .map_or(snap.config.timeouts, |rt| rt.merge(snap.config.timeouts));
                         return Ok(false);
                     }
                 },
@@ -423,6 +446,7 @@ impl ProxyHttp for Gateway {
             ctx.backend
                 .expect("backend must be set before upstream_peer")
         };
+        ctx.last_backend = Some(addr);
 
         // Upstream TLS: enabled from config (https backends). SNI defaults to
         // the backend address; certificate/hostname verification is on by
@@ -460,6 +484,7 @@ impl ProxyHttp for Gateway {
         ctx: &mut Self::CTX,
         e: Box<pingora_core::Error>,
     ) -> Box<pingora_core::Error> {
+        self.metrics.retries_total.fetch_add(1, Ordering::Relaxed);
         // Record the failed peer so the next `upstream_peer()` call (pingora
         // retries connect errors by default) can pick a different backend.
         if let Some(addr) = peer.address().as_inet() {
@@ -469,6 +494,50 @@ impl ProxyHttp for Gateway {
             }
         }
         e
+    }
+
+    async fn response_filter(
+        &self,
+        _session: &mut Session,
+        upstream_response: &mut pingora_http::ResponseHeader,
+        ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        // Retry a 5xx for idempotent requests while the configured budget
+        // remains. Pingora's retry loop re-runs `upstream_peer()` for errors
+        // flagged retryable; retry buffering (enabled by default) replays the
+        // request body safely.
+        let Some(left) = &mut ctx.retry5xx_left else {
+            return Ok(());
+        };
+        if *left == 0 || !upstream_response.status.is_server_error() {
+            return Ok(());
+        }
+        *left -= 1;
+        self.metrics.retries_total.fetch_add(1, Ordering::Relaxed);
+        // Exclude the backend that served the 5xx from the next pick.
+        if let Some(addr) = ctx.last_backend {
+            if !ctx.attempted.contains(&addr) {
+                ctx.attempted.push(addr);
+            }
+        }
+        let mut e = pingora_core::Error::explain(
+            pingora_core::ErrorType::HTTPStatus(upstream_response.status.as_u16()),
+            format!("upstream returned {}, retrying", upstream_response.status),
+        );
+        e.set_retry(true);
+        Err(e)
+    }
+
+    async fn fail_to_proxy(
+        &self,
+        session: &mut Session,
+        e: &pingora_core::Error,
+        ctx: &mut Self::CTX,
+    ) -> FailToProxy {
+        self.metrics
+            .upstream_errors_total
+            .fetch_add(1, Ordering::Relaxed);
+        ProxyHttp::fail_to_proxy(self, session, e, ctx).await
     }
 
     async fn upstream_request_filter(
@@ -548,7 +617,7 @@ impl ProxyHttp for Gateway {
     async fn logging(
         &self,
         session: &mut Session,
-        _e: Option<&pingora_core::Error>,
+        e: Option<&pingora_core::Error>,
         ctx: &mut Self::CTX,
     ) {
         let Some(backend) = ctx.log_backend else {
@@ -556,8 +625,33 @@ impl ProxyHttp for Gateway {
         };
         let status = session.response_written().map_or(0, |r| r.status.as_u16());
         let bytes = session.body_bytes_sent() as u64;
+        match status {
+            200..=299 => self
+                .metrics
+                .status_2xx_total
+                .fetch_add(1, Ordering::Relaxed),
+            300..=399 => self
+                .metrics
+                .status_3xx_total
+                .fetch_add(1, Ordering::Relaxed),
+            400..=499 => self
+                .metrics
+                .status_4xx_total
+                .fetch_add(1, Ordering::Relaxed),
+            _ => self
+                .metrics
+                .status_5xx_total
+                .fetch_add(1, Ordering::Relaxed),
+        };
+        self.metrics
+            .response_bytes_total
+            .fetch_add(bytes, Ordering::Relaxed);
         let ms = ctx.started.elapsed().as_millis();
-        log::info!("{}", complete_line(backend, status, ms, bytes));
+        let error = e.map(|e| e.to_string());
+        log::info!(
+            "{}",
+            complete_line(backend, status, ms, bytes, error.as_deref())
+        );
     }
 }
 

@@ -21,6 +21,11 @@ natively.
   at most 8 worker threads so large pools do not churn threads.
 - **Failure retry**: connect failures re-select a backend (excluding attempted
   ones), with a configurable attempt cap (default 3).
+- **5xx retry** (optional): retries idempotent methods (GET/HEAD/OPTIONS by
+  default, configurable) on upstream 5xx responses and excludes the failing
+  backend from the next pick; non-idempotent methods are never retried.
+- **Per-route timeouts**: individual routes can override the global
+  connect/read/etc. timeouts; unset fields inherit the global values.
 - **Security**:
   - IP blacklist (file-based, hot-reloaded; exact IPs in a `HashSet` for O(1)
     lookups even with very large lists);
@@ -103,6 +108,7 @@ See [config.yaml](config.yaml) for a fully commented example. Top-level keys:
 | `upstream_*_timeout` | u64 (s) | connect 3 / total 5 / read 30 / idle 60 | Upstream timeouts |
 | `worker_threads` | usize | CPU cores | Pingora worker threads |
 | `max_retries` | usize | 3 | Max upstream attempts per request (connect-failure failover) |
+| `retry_5xx` | object | disabled | `{ enabled, methods, max_tries }`; retries the listed idempotent methods on 5xx |
 | `health_check` | object | TCP probe | `{ path, expected_status, interval_secs, fail_threshold }`; setting `path` switches to HTTP GET |
 | `access_log` | object | enabled, full | `{ enabled, sample_rate }`; deterministic per-request sampling |
 | `routes` | list | required | Route table, see below |
@@ -125,6 +131,8 @@ routes:
   - host: "ha.example.com"
     mode: active-standby               # prefer backends[0], fail over when unhealthy
     backends: ["10.0.0.20:8080", "10.0.0.21:8080"]
+    timeouts:                          # per-route timeout overrides (optional, seconds)
+      read: 60
   - host: "old.example.com"
     redirect: "https://new.example.com/"
     redirect_code: 301                 # optional: 301/302/303/307/308, default 302
@@ -139,7 +147,7 @@ multi-backend routes, the API-key affinity key is taken from `Authorization: Bea
 | Endpoint | Description |
 |---|---|
 | `GET /__lb_healthz` | Liveness, returns 200 directly; bypasses blacklist/routing |
-| `GET /__lb_metrics` | Prometheus text format: total/blocked/redirected/proxied requests, body-rejections, unhealthy backends, uptime |
+| `GET /__lb_metrics` | Prometheus text format: total/blocked/redirected/proxied requests, body-rejections, status buckets (2xx/3xx/4xx/5xx), upstream errors, retries, response bytes, unhealthy backends, uptime |
 
 Both endpoints answer before blacklist/routing but have **no authentication** —
 keep them on internal networks only.

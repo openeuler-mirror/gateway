@@ -10,6 +10,13 @@ pub(crate) struct Metrics {
     pub(crate) redirects_total: AtomicU64,
     pub(crate) proxied_total: AtomicU64,
     pub(crate) body_rejected_total: AtomicU64,
+    pub(crate) status_2xx_total: AtomicU64,
+    pub(crate) status_3xx_total: AtomicU64,
+    pub(crate) status_4xx_total: AtomicU64,
+    pub(crate) status_5xx_total: AtomicU64,
+    pub(crate) upstream_errors_total: AtomicU64,
+    pub(crate) retries_total: AtomicU64,
+    pub(crate) response_bytes_total: AtomicU64,
 }
 
 impl Default for Metrics {
@@ -21,6 +28,13 @@ impl Default for Metrics {
             redirects_total: AtomicU64::new(0),
             proxied_total: AtomicU64::new(0),
             body_rejected_total: AtomicU64::new(0),
+            status_2xx_total: AtomicU64::new(0),
+            status_3xx_total: AtomicU64::new(0),
+            status_4xx_total: AtomicU64::new(0),
+            status_5xx_total: AtomicU64::new(0),
+            upstream_errors_total: AtomicU64::new(0),
+            retries_total: AtomicU64::new(0),
+            response_bytes_total: AtomicU64::new(0),
         }
     }
 }
@@ -35,6 +49,13 @@ impl Metrics {
              gateway_lb_redirects_total {}\n\
              gateway_lb_proxied_total {}\n\
              gateway_lb_body_rejected_total {}\n\
+             gateway_lb_status_2xx_total {}\n\
+             gateway_lb_status_3xx_total {}\n\
+             gateway_lb_status_4xx_total {}\n\
+             gateway_lb_status_5xx_total {}\n\
+             gateway_lb_upstream_errors_total {}\n\
+             gateway_lb_retries_total {}\n\
+             gateway_lb_response_bytes_total {}\n\
              # HELP gateway_lb_unhealthy_backends Backends currently marked unhealthy.\n\
              # TYPE gateway_lb_unhealthy_backends gauge\n\
              gateway_lb_unhealthy_backends {}\n\
@@ -46,6 +67,13 @@ impl Metrics {
             self.redirects_total.load(Relaxed),
             self.proxied_total.load(Relaxed),
             self.body_rejected_total.load(Relaxed),
+            self.status_2xx_total.load(Relaxed),
+            self.status_3xx_total.load(Relaxed),
+            self.status_4xx_total.load(Relaxed),
+            self.status_5xx_total.load(Relaxed),
+            self.upstream_errors_total.load(Relaxed),
+            self.retries_total.load(Relaxed),
+            self.response_bytes_total.load(Relaxed),
             unhealthy_backends,
             self.started.elapsed().as_secs(),
         )
@@ -62,10 +90,18 @@ mod tests {
         m.requests_total.fetch_add(3, Relaxed);
         m.blocked_total.fetch_add(1, Relaxed);
         m.proxied_total.fetch_add(2, Relaxed);
+        m.status_2xx_total.fetch_add(5, Relaxed);
+        m.upstream_errors_total.fetch_add(1, Relaxed);
+        m.retries_total.fetch_add(3, Relaxed);
+        m.response_bytes_total.fetch_add(4096, Relaxed);
         let out = m.render(2);
         assert!(out.contains("gateway_lb_requests_total 3"));
         assert!(out.contains("gateway_lb_blocked_total 1"));
         assert!(out.contains("gateway_lb_proxied_total 2"));
+        assert!(out.contains("gateway_lb_status_2xx_total 5"));
+        assert!(out.contains("gateway_lb_upstream_errors_total 1"));
+        assert!(out.contains("gateway_lb_retries_total 3"));
+        assert!(out.contains("gateway_lb_response_bytes_total 4096"));
         assert!(out.contains("gateway_lb_unhealthy_backends 2"));
     }
 }

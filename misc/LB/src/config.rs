@@ -38,6 +38,9 @@ struct ConfigRaw {
     health_check: Option<HealthCheckConfig>,
     /// Per-request access log (dispatch/redirect lines) control.
     access_log: Option<AccessLogConfig>,
+    /// Retry idempotent requests on 5xx upstream responses. Optional; absent
+    /// means disabled.
+    retry_5xx: Option<Retry5xxConfig>,
     /// Number of pingora worker threads. 0/unset => CPU core count.
     worker_threads: Option<usize>,
     /// Max upstream attempts per request (connect-failure failover). 0/unset => 3.
@@ -107,6 +110,59 @@ pub(crate) struct AccessLogConfig {
     sample_rate: f64,
 }
 
+/// Retry policy for 5xx upstream responses. Only idempotent methods are safe
+/// to replay, so the retryable method set is explicit.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct Retry5xxConfig {
+    #[serde(default)]
+    pub(crate) enabled: bool,
+    /// Methods that may be retried on a 5xx (default GET/HEAD/OPTIONS).
+    #[serde(default)]
+    pub(crate) methods: Vec<String>,
+    /// Extra attempts after the first 5xx (default 1). Also bounded by the
+    /// global `max_retries` budget.
+    #[serde(default = "default_retry5xx_tries")]
+    pub(crate) max_tries: usize,
+}
+
+fn default_retry5xx_tries() -> usize {
+    1
+}
+
+impl Default for Retry5xxConfig {
+    fn default() -> Self {
+        Retry5xxConfig {
+            enabled: false,
+            methods: vec!["GET".into(), "HEAD".into(), "OPTIONS".into()],
+            max_tries: default_retry5xx_tries(),
+        }
+    }
+}
+
+/// Per-route timeout overrides, in seconds. Any field left absent inherits the
+/// global `UpstreamTimeouts` value.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+pub(crate) struct RouteTimeouts {
+    pub(crate) connect: Option<u64>,
+    pub(crate) total_connect: Option<u64>,
+    pub(crate) read: Option<u64>,
+    pub(crate) idle: Option<u64>,
+}
+
+impl RouteTimeouts {
+    /// Merge per-route overrides on top of the global defaults.
+    pub(crate) fn merge(&self, base: UpstreamTimeouts) -> UpstreamTimeouts {
+        UpstreamTimeouts {
+            connect: self.connect.map_or(base.connect, Duration::from_secs),
+            total_connect: self
+                .total_connect
+                .map_or(base.total_connect, Duration::from_secs),
+            read: self.read.map_or(base.read, Duration::from_secs),
+            idle: self.idle.map_or(base.idle, Duration::from_secs),
+        }
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -173,6 +229,7 @@ pub(crate) struct Config {
     pub(crate) default_backends: Vec<SocketAddr>,
     pub(crate) max_body_size: Option<u64>,
     pub(crate) upstream_tls: Option<UpstreamTlsConfig>,
+    pub(crate) retry_5xx: Retry5xxConfig,
     /// Path to a blacklist file. The parsed entries live in `Gateway::blacklist`.
     pub(crate) blacklist: Option<String>,
     pub(crate) trusted_proxies: Vec<IpNet>,
@@ -282,6 +339,7 @@ impl Config {
             default_backends,
             max_body_size: raw.max_body_size,
             upstream_tls: raw.upstream_tls,
+            retry_5xx: raw.retry_5xx.unwrap_or_default(),
             blacklist: raw.blacklist,
             trusted_proxies,
             timeouts: UpstreamTimeouts {
@@ -489,6 +547,43 @@ routes: []
 
         let bare = "default_backend: \"127.0.0.1:8080\"\nroutes: []\n";
         assert!(Config::from_str(bare).unwrap().upstream_tls.is_none());
+    }
+
+    #[test]
+    fn config_retry_5xx_defaults_and_override() {
+        let bare = "default_backend: \"127.0.0.1:8080\"\nroutes: []\n";
+        let cfg = Config::from_str(bare).unwrap();
+        assert!(!cfg.retry_5xx.enabled, "retry_5xx opt-in");
+        let methods: Vec<&str> = cfg.retry_5xx.methods.iter().map(|s| s.as_str()).collect();
+        assert_eq!(methods, vec!["GET", "HEAD", "OPTIONS"]);
+        assert_eq!(cfg.retry_5xx.max_tries, 1);
+
+        let yaml = "default_backend: \"127.0.0.1:8080\"\nretry_5xx:\n  enabled: true\n  methods: [\"GET\", \"PUT\"]\n  max_tries: 2\nroutes: []\n";
+        let cfg = Config::from_str(yaml).unwrap();
+        assert!(cfg.retry_5xx.enabled);
+        let methods: Vec<&str> = cfg.retry_5xx.methods.iter().map(|s| s.as_str()).collect();
+        assert_eq!(methods, vec!["GET", "PUT"]);
+        assert_eq!(cfg.retry_5xx.max_tries, 2);
+    }
+
+    #[test]
+    fn config_route_timeouts_override_global() {
+        let yaml = r#"default_backend: "127.0.0.1:8080"
+routes:
+  - host: "a.com"
+    backend: "10.0.0.1:80"
+    timeouts:
+      connect: 1
+      read: 60
+"#;
+        let cfg = Config::from_str(yaml).unwrap();
+        let rt = cfg.routes[0].timeouts.unwrap();
+        let merged = rt.merge(UpstreamTimeouts::default());
+        assert_eq!(merged.connect, Duration::from_secs(1));
+        assert_eq!(merged.read, Duration::from_secs(60));
+        // Unset fields inherit the global defaults.
+        assert_eq!(merged.total_connect, Duration::from_secs(5));
+        assert_eq!(merged.idle, Duration::from_secs(60));
     }
 
     #[test]

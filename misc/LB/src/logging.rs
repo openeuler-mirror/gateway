@@ -64,10 +64,23 @@ pub(crate) fn redirect_line(code: u16, host: &str, path: &str, location: &str) -
 }
 
 /// Build the "request completed" line: response status, elapsed ms and body
-/// bytes sent. Emitted from the `logging()` hook, adjacent to (and correlated
-/// with) the earlier `dispatch` line via the backend address.
-pub(crate) fn complete_line(backend: SocketAddr, status: u16, ms: u128, bytes: u64) -> String {
-    format!("complete backend={backend} status={status} ms={ms} bytes={bytes}")
+/// bytes sent, plus the upstream error when the proxy failed. Emitted from the
+/// `logging()` hook, adjacent to (and correlated with) the earlier `dispatch`
+/// line via the backend address.
+pub(crate) fn complete_line(
+    backend: SocketAddr,
+    status: u16,
+    ms: u128,
+    bytes: u64,
+    error: Option<&str>,
+) -> String {
+    match error {
+        Some(e) => format!(
+            "complete backend={backend} status={status} ms={ms} bytes={bytes} error={}",
+            sanitize(e)
+        ),
+        None => format!("complete backend={backend} status={status} ms={ms} bytes={bytes}"),
+    }
 }
 /// syslog LOG_USER facility code.
 const FACILITY_USER: u8 = 1;
@@ -204,10 +217,21 @@ mod tests {
 
     #[test]
     fn complete_line_contains_status_duration_bytes() {
-        let line = complete_line("10.0.0.1:80".parse().unwrap(), 200, 12, 4096);
+        let line = complete_line("10.0.0.1:80".parse().unwrap(), 200, 12, 4096, None);
         assert_eq!(
             line,
             "complete backend=10.0.0.1:80 status=200 ms=12 bytes=4096"
+        );
+        let failed = complete_line(
+            "10.0.0.1:80".parse().unwrap(),
+            502,
+            3,
+            0,
+            Some("Connection refused"),
+        );
+        assert_eq!(
+            failed,
+            "complete backend=10.0.0.1:80 status=502 ms=3 bytes=0 error=Connection refused"
         );
     }
 

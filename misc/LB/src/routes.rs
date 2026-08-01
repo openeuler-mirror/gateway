@@ -3,7 +3,7 @@ use serde::Deserialize;
 use std::net::SocketAddr;
 
 use crate::client::parse_client_ip;
-use crate::config::{parse_addr, LbMode};
+use crate::config::{parse_addr, LbMode, RouteTimeouts};
 
 #[derive(Debug)]
 pub(crate) struct Route {
@@ -17,6 +17,8 @@ pub(crate) struct Route {
     /// Redirect status code (3xx). Defaults to 302.
     pub(crate) redirect_code: u16,
     pub(crate) mode: LbMode,
+    /// Per-route timeout overrides (optional).
+    pub(crate) timeouts: Option<RouteTimeouts>,
 }
 
 impl Route {
@@ -82,6 +84,7 @@ impl Route {
             redirect: raw.redirect,
             redirect_code,
             mode: raw.mode,
+            timeouts: raw.timeouts,
         })
     }
 }
@@ -97,6 +100,7 @@ pub(crate) struct RouteRaw {
     pub(crate) redirect_code: Option<u16>,
     #[serde(default)]
     pub(crate) mode: LbMode,
+    pub(crate) timeouts: Option<RouteTimeouts>,
 }
 pub(crate) fn host_matches(request_host: &str, pattern: &str) -> bool {
     let req = request_host.to_lowercase();

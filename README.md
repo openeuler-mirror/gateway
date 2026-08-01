@@ -596,8 +596,9 @@ prompt_log:
 - 路由：`host`（含通配符 `*.example.com`）、`path` 前缀（按段边界）、`client_ip` CIDR，首条匹配生效
 - 后端策略：多活（一致性哈希 + API Key 亲和）与主备（按序 failover），默认后端支持 failover 列表
 - 健康检查：TCP / HTTP GET 探测，周期与失败阈值可配；连接失败自动重试换节点
+- 韧性：5xx 重试（幂等方法限定，自动排除坏后端）+ 每路由超时覆盖
 - 安全：IP 黑名单（热加载）、trusted_proxies + XFF 防伪造、上游 TLS、请求体上限、请求走私纵深防御
-- 可观测：`/__lb_metrics` Prometheus 计数、`/__lb_healthz` 探活、结构化访问日志（状态码/耗时）
+- 可观测：`/__lb_metrics` Prometheus 计数（状态码分桶/错误/重试）、`/__lb_healthz` 探活、结构化访问日志（状态码/耗时/错误）
 - 热加载：配置与黑名单变更自动生效（ArcSwap 无锁切换）
 
 ```bash
