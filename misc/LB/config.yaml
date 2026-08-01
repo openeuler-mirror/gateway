@@ -7,9 +7,78 @@ tls:
 
 default_backend: "127.0.0.1:8080"
 
-# IP 黑名单文件路径：文件中每行一个 IP 或 CIDR（# 为注释），命中即返回 403。
-# 文件独立于本配置，可单独热加载（编辑后立即生效，无需改动 config.yaml）。
+# 默认后端也可以给 failover 列表(与 default_backend 二选一,优先第一个,
+# 前面的不健康时按顺序切换;列表内的节点会纳入健康探测):
+# default_backends:
+#   - "10.0.1.10:8080"
+#   - "10.0.1.11:8080"
+
+# 请求体大小上限(字节,可选):不写不限制。Content-Length 超限直接 413,
+# chunked 流式请求超限会中断;按需设置防大 body 内存占用。
+# max_body_size: 10485760
+
+# 上游超时(秒,均可选,不写用默认值):
+#   connect   = 3s  连接建立超时
+#   total     = 5s  连接总超时(含 TLS 握手)
+#   read      = 30s 读响应超时
+#   idle      = 60s 上游 keep-alive 空闲超时
+# upstream_connect_timeout: 3
+# upstream_total_connect_timeout: 5
+# upstream_read_timeout: 30
+# upstream_idle_timeout: 60
+
+# pingora worker 线程数(可选):不写默认 = CPU 核数。进程内所有监听共用。
+# worker_threads: 4
+
+# 单请求最大上游尝试次数(可选,默认 3):连接失败时按路由 failover 重试,
+# 上限不宜过大,否则坏后端会放大尾部延迟。
+# max_retries: 3
+
+# 5xx 重试(可选,默认关闭):上游返回 5xx 时对幂等方法重试,避免 POST 等重复提交。
+#   methods   允许重试的方法(默认 GET/HEAD/OPTIONS)
+#   max_tries 5xx 后的额外尝试次数(默认 1,同时受全局 max_retries 预算限制)
+# retry_5xx:
+#   enabled: true
+#   methods: ["GET", "HEAD", "OPTIONS"]
+#   max_tries: 1
+
+# 后端健康检查(可选):不写默认仅 TCP connect 探测。
+#   配置 path 后,探测改为 HTTP GET 该路径并要求期望状态码。
+#   interval_secs  探测周期(秒,默认 5)
+#   fail_threshold 连续失败多少次标记不健康(默认 3)
+# health_check:
+#   path: "/healthz"
+#   expected_status: 200
+#   interval_secs: 5
+#   fail_threshold: 3
+
+# 上游 TLS(可选):后端走 https 时开启。sni 缺省用后端 IP;
+# verify 默认 true(校验证书与主机名,系统 CA)。
+# upstream_tls:
+#   enabled: true
+#   sni: "svc.internal"
+#   verify: true
+
+# 信任的反向代理网段(可选):直连 IP 落在这些网段时,黑名单和 client_ip
+# 路由改用 X-Forwarded-For 中第一个"不可信"跳作为真实客户端 IP(防伪造)。
+# trusted_proxies:
+#   - "10.0.0.0/8"
+#   - "192.168.1.1"
+
+# 逐请求访问日志(可选,默认开启全量):
+#   enabled: false  关闭 dispatch/redirect 日志
+#   sample_rate: 0.1  按请求特征确定性采样(0.0~1.0)
+# access_log:
+#   enabled: true
+#   sample_rate: 1.0
+
+# IP 黑名单文件路径:文件中每行一个 IP 或 CIDR(# 为注释),命中即返回 403。
+# 文件独立于本配置,可单独热加载(编辑后立即生效,无需改动 config.yaml)。
 blacklist: "/etc/gateway/blacklist.txt"
+
+# LB 自带端点(不可配置,在黑名单/路由之前应答):
+#   GET /__lb_healthz  探活,直接返回 200,用于容器 HEALTHCHECK 或编排探活。
+#   GET /__lb_metrics  进程内计数(Prometheus 文本格式:请求/拦截/转发/不健康后端等)。
 
 routes:
   - client_ip: "10.0.0.0/24"
@@ -34,6 +103,9 @@ routes:
       - "10.0.0.10:8080"
       - "10.0.0.11:8080"
       - "10.0.0.12:8080"
+    # 每路由超时覆盖(可选,秒):未填字段沿用全局上游超时。
+    timeouts:
+      read: 60
   # 主备路由：mode: active-standby 时流量优先走 backends[0]，
   # 其不可用（TCP 健康检查判定）才依次切到备机；不写 mode 即默认多活（active-active）。
   - host: "ha.lb.local"

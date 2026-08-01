@@ -9,7 +9,7 @@ RUN mkdir -p /usr/local/cargo && \
     printf '[source.crates-io]\nreplace-with = "rsproxy-sparse"\n\n[source.rsproxy-sparse]\nregistry = "sparse+https://rsproxy.cn/index/"\n' > /usr/local/cargo/config.toml
 
 WORKDIR /app
-COPY Cargo.toml ./
+COPY Cargo.toml Cargo.lock ./
 COPY src/ ./src/
 
 # Cache dependencies with a dummy build, then build the real binary
@@ -23,7 +23,7 @@ RUN touch src/main.rs && cargo build --release
 
 FROM openeuler/openeuler:24.03
 
-RUN dnf install -y ca-certificates openssl-libs && \
+RUN dnf install -y ca-certificates openssl-libs curl && \
     dnf clean all
 
 COPY --from=builder /app/target/release/gateway-lb /usr/bin/gateway-lb
@@ -32,7 +32,15 @@ COPY config.yaml /etc/gateway/routes.yaml
 COPY blacklist.txt /etc/gateway/blacklist.txt
 
 ENV CONFIG_PATH=/etc/gateway/routes.yaml
+ENV HOME=/tmp
+
+# Run as an unprivileged user; the process only needs read access to the
+# mounted config/certs and binds ports above 1024.
+USER 65534:65534
 
 EXPOSE 6198 6443
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD curl -fsS http://127.0.0.1:6198/__lb_healthz || curl -kfsS https://127.0.0.1:6443/__lb_healthz
 
 CMD ["gateway-lb"]

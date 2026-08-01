@@ -17,3 +17,5 @@ serde_yaml = "0.9"
 arc-swap = "1"
 notify = { version = "7", default-features = false, features = ["macos_kqueue"] }
 clap = { version = "4", features = ["derive", "env"] }
+bytes = "1"
+http = "1"
