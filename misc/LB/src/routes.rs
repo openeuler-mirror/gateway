@@ -203,4 +203,28 @@ mod tests {
         assert!(path_matches("/anything", "/"));
         assert!(path_matches("/anything", ""));
     }
+
+    #[test]
+    fn host_matches_exact_case_insensitive_and_wildcard() {
+        assert!(host_matches("api.example.com", "api.example.com"));
+        // Case-insensitive on both sides.
+        assert!(host_matches("API.Example.COM", "api.example.com"));
+        // Wildcard matches any subdomain, but not the bare apex.
+        assert!(host_matches("www.example.com", "*.example.com"));
+        assert!(host_matches("a.b.example.com", "*.example.com"));
+        assert!(!host_matches("example.com", "*.example.com"));
+        assert!(!host_matches("other.com", "api.example.com"));
+    }
+
+    #[test]
+    fn strip_port_handles_ipv4_ipv6_and_dns() {
+        assert_eq!(strip_port("example.com:8080"), "example.com");
+        assert_eq!(strip_port("example.com"), "example.com");
+        assert_eq!(strip_port("127.0.0.1:8080"), "127.0.0.1");
+        // Bracketed IPv6 literal with port keeps the brackets.
+        assert_eq!(strip_port("[::1]:8080"), "[::1]");
+        // Bare IPv6 (what `Uri::host()` yields) is left untouched.
+        assert_eq!(strip_port("::1"), "::1");
+        assert_eq!(strip_port("[2001:db8::1]"), "[2001:db8::1]");
+    }
 }

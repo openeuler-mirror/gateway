@@ -389,7 +389,7 @@ routes: []
     }
 
     #[test]
-    fn access_log_sampling_is_deterministic_and_bounded() {
+    fn config_access_log_sampling_is_deterministic_and_bounded() {
         let ip = Some(IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)));
         let full = AccessLogConfig {
             enabled: true,
@@ -657,5 +657,82 @@ routes:
             Config::from_str(blank).is_err(),
             "whitespace-only redirect target rejected"
         );
+    }
+
+    #[test]
+    fn parse_addr_accepts_valid_and_rejects_invalid() {
+        assert_eq!(
+            parse_addr("127.0.0.1:8080").unwrap(),
+            "127.0.0.1:8080".parse().unwrap()
+        );
+        assert_eq!(
+            parse_addr("[::1]:443").unwrap(),
+            "[::1]:443".parse().unwrap()
+        );
+        assert!(parse_addr("not-an-addr").is_err());
+        assert!(parse_addr("127.0.0.1").is_err(), "missing port");
+    }
+
+    #[test]
+    fn resolve_route_first_match_priority_and_fallthrough() {
+        let cfg = Config::from_str(
+            r#"default_backend: "127.0.0.1:8080"
+routes:
+  - host: "a.com"
+    path: "/api"
+    backend: "10.0.0.1:80"
+  - host: "a.com"
+    backend: "10.0.0.2:80"
+  - host: "*.example.com"
+    backend: "10.0.0.3:80"
+  - path: "/legacy/"
+    redirect: "https://new.example.com/"
+"#,
+        )
+        .unwrap();
+
+        // Host+path beats the later host-only route.
+        let (idx, route) = cfg.resolve_route("a.com", "/api/v1", None).unwrap();
+        assert_eq!(idx, 0);
+        assert_eq!(route.backend, Some("10.0.0.1:80".parse().unwrap()));
+        // Non-matching path falls through to the host-only route.
+        let (idx, route) = cfg.resolve_route("a.com", "/other", None).unwrap();
+        assert_eq!(idx, 1);
+        assert_eq!(route.backend, Some("10.0.0.2:80".parse().unwrap()));
+        // Wildcard host matches a subdomain.
+        let (idx, _) = cfg.resolve_route("www.example.com", "/", None).unwrap();
+        assert_eq!(idx, 2);
+        // Redirect route is returned like any other.
+        let (idx, route) = cfg.resolve_route("x.test", "/legacy/a", None).unwrap();
+        assert_eq!(idx, 3);
+        assert!(route.redirect.is_some());
+        // No match at all -> default backends.
+        assert!(cfg.resolve_route("nope.test", "/x", None).is_none());
+    }
+
+    #[test]
+    fn resolve_route_matches_client_ip_and_skips_wrong_ip() {
+        let cfg = Config::from_str(
+            r#"default_backend: "127.0.0.1:8080"
+routes:
+  - client_ip: "10.0.0.0/24"
+    backend: "10.0.1.1:80"
+  - client_ip: "10.0.5.100"
+    backend: "10.0.2.1:80"
+"#,
+        )
+        .unwrap();
+
+        assert!(cfg
+            .resolve_route("", "/", Some("10.0.0.9".parse().unwrap()))
+            .is_some());
+        assert!(cfg
+            .resolve_route("", "/", Some("10.0.5.100".parse().unwrap()))
+            .is_some());
+        assert!(cfg
+            .resolve_route("", "/", Some("192.168.1.1".parse().unwrap()))
+            .is_none());
+        // No client IP can never match a client_ip route.
+        assert!(cfg.resolve_route("", "/", None).is_none());
     }
 }

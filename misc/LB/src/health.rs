@@ -54,10 +54,14 @@ fn probe_http(addr: SocketAddr, path: &str, expected: u16) -> bool {
         }
     }
     let head = std::str::from_utf8(&buf[..got]).unwrap_or("");
+    parse_status(head) == Some(expected)
+}
+
+/// Extract the status code from an HTTP response head (`HTTP/1.1 200 OK`).
+fn parse_status(head: &str) -> Option<u16> {
     head.split_whitespace()
         .nth(1)
         .and_then(|s| s.parse::<u16>().ok())
-        == Some(expected)
 }
 
 fn probe_once(addr: SocketAddr, check: &HealthCheckConfig) -> bool {
@@ -139,6 +143,16 @@ mod tests {
         assert_eq!(classify_health(9, true, 3), (0, false));
         // Custom threshold: a single failure can mark unhealthy immediately.
         assert_eq!(classify_health(0, false, 1), (1, true));
+    }
+
+    #[test]
+    fn parse_status_extracts_code_from_head() {
+        assert_eq!(parse_status("HTTP/1.1 200 OK\r\n"), Some(200));
+        assert_eq!(parse_status("HTTP/1.0 204 No Content\r\n"), Some(204));
+        assert_eq!(parse_status("HTTP/2 503\r\n"), Some(503));
+        assert_eq!(parse_status(""), None);
+        assert_eq!(parse_status("garbage"), None);
+        assert_eq!(parse_status("HTTP/1.1 ABC OK"), None);
     }
 
     #[test]

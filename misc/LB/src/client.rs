@@ -46,6 +46,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parse_client_ip_accepts_single_ip_and_cidr() {
+        let single = parse_client_ip("10.0.0.1").unwrap();
+        assert_eq!(single.prefix_len(), 32, "bare IP becomes a /32");
+        let single_ip: IpAddr = "10.0.0.1".parse().unwrap();
+        assert!(single.contains(&single_ip));
+
+        let cidr = parse_client_ip("10.0.0.0/8").unwrap();
+        let inside: IpAddr = "10.9.9.9".parse().unwrap();
+        let outside: IpAddr = "11.0.0.1".parse().unwrap();
+        assert!(cidr.contains(&inside));
+        assert!(!cidr.contains(&outside));
+
+        assert!(parse_client_ip("not-an-ip").is_err());
+        assert!(parse_client_ip("10.0.0.0/99").is_err());
+    }
+
+    #[test]
     fn effective_client_ip_trusts_xff_only_behind_trusted_proxy() {
         let trusted: Vec<IpNet> = ["10.0.0.0/8"]
             .iter()

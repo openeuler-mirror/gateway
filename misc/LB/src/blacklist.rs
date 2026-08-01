@@ -165,7 +165,7 @@ not-an-ip
     #[test]
     fn load_blacklist_reads_file() {
         let path = format!(
-            "{}/lb_bl_test_{}.txt",
+            "{}/lb_blacklist_test_{}.txt",
             std::env::temp_dir().to_string_lossy(),
             std::process::id()
         );
@@ -184,7 +184,16 @@ not-an-ip
     }
 
     #[test]
-    fn is_blacklisted_matches_single_ip_and_cidr() {
+    fn load_blacklist_state_none_or_missing_is_empty() {
+        assert_eq!(load_blacklist_state(None).len(), 0);
+        assert_eq!(
+            load_blacklist_state(Some("/nonexistent/lb_bl_missing.txt")).len(),
+            0
+        );
+    }
+
+    #[test]
+    fn blacklist_contains_matches_single_ip_and_cidr() {
         let bl = Blacklist::from_entries(vec![
             BlacklistEntry::Net(parse_client_ip("10.0.5.100").unwrap()),
             BlacklistEntry::Net(parse_client_ip("192.168.66.0/24").unwrap()),

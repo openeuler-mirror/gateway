@@ -786,7 +786,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn api_key_extraction_priority() {
+    fn extract_api_key_priority() {
         let ip = Some(IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)));
         assert_eq!(extract_api_key(Some("Bearer abc123"), None, ip), "abc123");
         assert_eq!(extract_api_key(Some("bearer XYZ"), None, ip), "XYZ");
