@@ -591,7 +591,14 @@ prompt_log:
 
 ## 负载均衡（misc/LB）
 
-基于 Pingora 的独立负载均衡器，可作为可选前端。它以 Docker 镜像提供（Rust 多阶段构建，openEuler 运行时）：
+基于 Pingora 的独立负载均衡器，可作为可选前端。它以 Docker 镜像提供（Rust 多阶段构建，openEuler 运行时）。核心能力：
+
+- 路由：`host`（含通配符 `*.example.com`）、`path` 前缀（按段边界）、`client_ip` CIDR，首条匹配生效
+- 后端策略：多活（一致性哈希 + API Key 亲和）与主备（按序 failover），默认后端支持 failover 列表
+- 健康检查：TCP / HTTP GET 探测，周期与失败阈值可配；连接失败自动重试换节点
+- 安全：IP 黑名单（热加载）、trusted_proxies + XFF 防伪造、上游 TLS、请求体上限、请求走私纵深防御
+- 可观测：`/__lb_metrics` Prometheus 计数、`/__lb_healthz` 探活、结构化访问日志（状态码/耗时）
+- 热加载：配置与黑名单变更自动生效（ArcSwap 无锁切换）
 
 ```bash
 ./misc/LB/start.sh start              # 自动构建 + 生成证书
@@ -599,7 +606,7 @@ prompt_log:
 ./misc/LB/start.sh status | stop | restart
 ```
 
-按 `host`（支持通配符 `*.example.com`）、`path` 前缀、`client_ip` CIDR 进行路由。
+详细配置与运维说明见 [misc/LB/README.md](misc/LB/README.md)。
 
 ---
 
