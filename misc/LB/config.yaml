@@ -27,8 +27,8 @@ default_backend: "127.0.0.1:8080"
 # upstream_read_timeout: 30
 # upstream_idle_timeout: 60
 
-# pingora worker 线程数(可选):不写默认 = CPU 核数。进程内所有监听共用。
-# 高核机器(如 192 核)建议按需显式限制(例如 32~64),避免线程数过大;
+# pingora worker 线程数(可选):不写默认 = min(CPU 核数, 8),即高核机器
+# (如 192 核)默认 8 个 worker,避免线程数过大;需要更多可显式设置。
 # 所有 worker 线程栈默认为 8 MiB,可用 RUST_MIN_STACK 环境变量调整。
 # worker_threads: 4
 

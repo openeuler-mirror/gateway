@@ -40,13 +40,11 @@ struct Args {
 
 fn main() {
     // Pingora creates one tokio runtime whose worker count comes from
-    // `worker_threads` (default: CPU cores). Every tokio worker is a std
-    // thread, and Rust's default thread stack is only 2 MiB (RUST_MIN_STACK).
-    // On high-core machines (e.g. 192 CPUs => 192 workers) the combined
-    // proxy + TLS/HTTP-2 async state machine has been observed to overflow
-    // that 2 MiB stack ("thread ... has overflowed its stack"), especially
-    // with the toolchain used by the Docker build. Bump the default to 8 MiB
-    // before any thread is spawned, unless the operator already set it.
+    // `worker_threads` (default: CPU cores, capped at 8). Every tokio worker is
+    // a std thread, and Rust's default thread stack is only 2 MiB
+    // (RUST_MIN_STACK). Bump the default to 8 MiB before any thread is
+    // spawned, unless the operator already set it, so high-core machines
+    // (e.g. 192 CPUs) keep comfortable headroom on each worker stack.
     if std::env::var_os("RUST_MIN_STACK").is_none() {
         std::env::set_var("RUST_MIN_STACK", (8 * 1024 * 1024).to_string());
     }
@@ -74,8 +72,9 @@ fn main() {
 
     let mut server = Server::new(None).unwrap();
     // Pingora defaults to a single worker thread and 16 retries; both are
-    // tuned from config (threads = CPU count, retries = 3 unless overridden).
-    // The config Arc is not shared with any service yet, so get_mut is safe.
+    // tuned from config (threads = CPU count capped at 8, retries = 3 unless
+    // overridden). The config Arc is not shared with any service yet, so
+    // get_mut is safe.
     let server_conf = Arc::get_mut(&mut server.configuration)
         .expect("server configuration must not be shared before tuning");
     server_conf.threads = config.worker_threads;
