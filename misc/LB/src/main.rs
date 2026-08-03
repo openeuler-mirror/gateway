@@ -39,6 +39,16 @@ struct Args {
 }
 
 fn main() {
+    // Pingora creates one tokio runtime whose worker count comes from
+    // `worker_threads` (default: CPU cores, capped at 8). Every tokio worker is
+    // a std thread, and Rust's default thread stack is only 2 MiB
+    // (RUST_MIN_STACK). Bump the default to 8 MiB before any thread is
+    // spawned, unless the operator already set it, so high-core machines
+    // (e.g. 192 CPUs) keep comfortable headroom on each worker stack.
+    if std::env::var_os("RUST_MIN_STACK").is_none() {
+        std::env::set_var("RUST_MIN_STACK", (8 * 1024 * 1024).to_string());
+    }
+
     let args = Args::parse();
     // Resolve to an absolute path so hot-reload watching works no matter how
     // the process was invoked (e.g. `-c config.yaml` from a subdirectory).
@@ -47,14 +57,24 @@ fn main() {
         .unwrap_or_else(|_| args.config);
     init_logging("gateway-lb");
     let config = Config::load(&config_path).expect("failed to load config");
+    log::info!(
+        "starting gateway-lb: worker_threads={} max_retries={} threads_stack_mib={}",
+        config.worker_threads,
+        config.max_retries,
+        std::env::var_os("RUST_MIN_STACK")
+            .and_then(|v| v.to_string_lossy().parse::<u64>().ok())
+            .map(|bytes| bytes / (1024 * 1024))
+            .unwrap_or(2),
+    );
 
     let listen_port = config.listen_port;
     let tls_config = config.tls.clone();
 
     let mut server = Server::new(None).unwrap();
     // Pingora defaults to a single worker thread and 16 retries; both are
-    // tuned from config (threads = CPU count, retries = 3 unless overridden).
-    // The config Arc is not shared with any service yet, so get_mut is safe.
+    // tuned from config (threads = CPU count capped at 8, retries = 3 unless
+    // overridden). The config Arc is not shared with any service yet, so
+    // get_mut is safe.
     let server_conf = Arc::get_mut(&mut server.configuration)
         .expect("server configuration must not be shared before tuning");
     server_conf.threads = config.worker_threads;

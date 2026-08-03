@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use pingora_core::upstreams::peer::{HttpPeer, Peer};
 use pingora_core::Result;
-use pingora_proxy::{FailToProxy, ProxyHttp, Session};
+use pingora_proxy::{ProxyHttp, Session};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::net::{IpAddr, SocketAddr};
@@ -528,18 +528,6 @@ impl ProxyHttp for Gateway {
         Err(e)
     }
 
-    async fn fail_to_proxy(
-        &self,
-        session: &mut Session,
-        e: &pingora_core::Error,
-        ctx: &mut Self::CTX,
-    ) -> FailToProxy {
-        self.metrics
-            .upstream_errors_total
-            .fetch_add(1, Ordering::Relaxed);
-        ProxyHttp::fail_to_proxy(self, session, e, ctx).await
-    }
-
     async fn upstream_request_filter(
         &self,
         session: &mut Session,
@@ -620,6 +608,18 @@ impl ProxyHttp for Gateway {
         e: Option<&pingora_core::Error>,
         ctx: &mut Self::CTX,
     ) {
+        // Count fatal proxy errors here rather than overriding
+        // `fail_to_proxy`: with `#[async_trait]`, calling
+        // `ProxyHttp::fail_to_proxy(self, ...).await` from an override of the
+        // same method dispatches back to the override and recurses forever
+        // ("thread ... has overflowed its stack"). `logging()` is invoked
+        // right after `fail_to_proxy` with the same final error, so moving the
+        // counter here preserves the metric exactly.
+        if e.is_some() {
+            self.metrics
+                .upstream_errors_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
         // Latency histogram covers every proxied request, independent of
         // access-log sampling.
         let ms = ctx.started.elapsed().as_millis();

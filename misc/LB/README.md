@@ -88,7 +88,7 @@ CONFIG_PATH=/path/to/routes.yaml ./target/release/gateway-lb
 | `blacklist` | string | 无 | 黑名单文件路径(每行 IP / CIDR / `a-b` 区间,# 注释) |
 | `trusted_proxies` | list | 空 | 信任的反向代理网段;直连 IP 在其中时才采信 XFF |
 | `upstream_*_timeout` | u64(秒) | connect 3 / total 5 / read 30 / idle 60 | 上游超时 |
-| `worker_threads` | usize | CPU 核数 | Pingora worker 线程数 |
+| `worker_threads` | usize | min(CPU 核数, 8) | Pingora worker 线程数;高核机器默认 8,需更多可显式设置 |
 | `max_retries` | usize | 3 | 单请求最大上游尝试次数(连接失败 failover) |
 | `retry_5xx` | 对象 | 关闭 | `{ enabled, methods, max_tries }`;5xx 时对列出的幂等方法重试 |
 | `health_check` | 对象 | TCP 探测 | `{ path, expected_status, interval_secs, fail_threshold }`;path 设置后改为 HTTP GET |
@@ -151,6 +151,12 @@ API Key 亲和取自 `Authorization: Bearer`、`X-API-Key` 或客户端 IP(按�
 - `max_retries` 不宜过大(默认 3),否则坏后端会放大尾部延迟。
 - 黑名单文件每行一条:IP、CIDR 或 `start-end` 区间(`#` 注释),非法行跳过并告警。
 - 配置或黑名单变更后自动热加载,无需重启;TLS 证书变更需要重启容器。
+- `worker_threads` 不写时默认 = min(CPU 核数, 8):高核机器(如 192 核)默认只
+  起 8 个 worker,避免线程开销过大;需要更多可显式设置。worker 线程栈固定为
+  8 MiB(进程启动时自动设置 `RUST_MIN_STACK`,可用环境变量覆盖)。历史上曾有
+  一个 `fail_to_proxy` 覆盖导致 async 无限自递归的栈溢出 bug(日志出现
+  `thread ... has overflowed its stack`),已改为在 `logging()` 中计数上游错误,
+  避免覆盖该钩子;若再遇到栈溢出,优先检查是否有类似的 trait 方法自委托。
 
 ## 测试
 

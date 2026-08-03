@@ -167,6 +167,17 @@ fn default_true() -> bool {
     true
 }
 
+/// Default `worker_threads` when the config does not set it: the CPU count,
+/// capped at 8. On high-core machines (e.g. 192 CPUs) spawning one tokio
+/// worker per core is pure overhead for an edge proxy — every worker carries
+/// its own stack and runtime — so the default tops out at 8. Deployments that
+/// want more can still set `worker_threads` explicitly.
+const MAX_DEFAULT_WORKER_THREADS: usize = 8;
+
+fn default_worker_threads(cpus: usize) -> usize {
+    cpus.min(MAX_DEFAULT_WORKER_THREADS)
+}
+
 fn default_sample_rate() -> f64 {
     1.0
 }
@@ -329,7 +340,7 @@ impl Config {
         access_log.sample_rate = access_log.sample_rate.clamp(0.0, 1.0);
         let worker_threads = raw.worker_threads.filter(|n| *n > 0).unwrap_or_else(|| {
             std::thread::available_parallelism()
-                .map(|n| n.get())
+                .map(|n| default_worker_threads(n.get()))
                 .unwrap_or(1)
         });
         let max_retries = raw.max_retries.filter(|n| *n > 0).unwrap_or(3);
@@ -490,14 +501,25 @@ routes: []
         let bare = "default_backend: \"127.0.0.1:8080\"\nroutes: []\n";
         let cfg2 = Config::from_str(bare).unwrap();
         assert_eq!(cfg2.max_retries, 3, "default retries = 3");
-        assert!(cfg2.worker_threads >= 1, "default threads = CPU count");
+        assert!(
+            (1..=MAX_DEFAULT_WORKER_THREADS).contains(&cfg2.worker_threads),
+            "default threads = CPU count capped at {MAX_DEFAULT_WORKER_THREADS}"
+        );
 
         // 0 (or negative) values fall back to defaults instead of panicking.
         let zero =
             "default_backend: \"127.0.0.1:8080\"\nworker_threads: 0\nmax_retries: 0\nroutes: []\n";
         let cfg3 = Config::from_str(zero).unwrap();
         assert_eq!(cfg3.max_retries, 3);
-        assert!(cfg3.worker_threads >= 1);
+        assert!((1..=MAX_DEFAULT_WORKER_THREADS).contains(&cfg3.worker_threads));
+    }
+
+    #[test]
+    fn default_worker_threads_caps_high_cpu_counts() {
+        assert_eq!(default_worker_threads(1), 1);
+        assert_eq!(default_worker_threads(8), 8);
+        assert_eq!(default_worker_threads(16), 8);
+        assert_eq!(default_worker_threads(192), 8, "192-core default = 8");
     }
 
     #[test]
