@@ -28,6 +28,8 @@ default_backend: "127.0.0.1:8080"
 # upstream_idle_timeout: 60
 
 # pingora worker 线程数(可选):不写默认 = CPU 核数。进程内所有监听共用。
+# 高核机器(如 192 核)建议按需显式限制(例如 32~64),避免线程数过大;
+# 所有 worker 线程栈默认为 8 MiB,可用 RUST_MIN_STACK 环境变量调整。
 # worker_threads: 4
 
 # 单请求最大上游尝试次数(可选,默认 3):连接失败时按路由 failover 重试,

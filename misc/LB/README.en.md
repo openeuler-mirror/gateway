@@ -106,7 +106,7 @@ See [config.yaml](config.yaml) for a fully commented example. Top-level keys:
 | `blacklist` | string | none | Blacklist file (one IP / CIDR / `a-b` range per line, `#` comments) |
 | `trusted_proxies` | list | empty | Trusted reverse-proxy CIDRs; XFF is only honored when the direct peer is inside one |
 | `upstream_*_timeout` | u64 (s) | connect 3 / total 5 / read 30 / idle 60 | Upstream timeouts |
-| `worker_threads` | usize | CPU cores | Pingora worker threads |
+| `worker_threads` | usize | CPU cores | Pingora worker threads; set 32–64 explicitly on high-core machines |
 | `max_retries` | usize | 3 | Max upstream attempts per request (connect-failure failover) |
 | `retry_5xx` | object | disabled | `{ enabled, methods, max_tries }`; retries the listed idempotent methods on 5xx |
 | `health_check` | object | TCP probe | `{ path, expected_status, interval_secs, fail_threshold }`; setting `path` switches to HTTP GET |
@@ -179,6 +179,14 @@ keep them on internal networks only.
   (`#` comments); invalid lines are skipped with a warning.
 - Config and blacklist changes hot-reload without restart; TLS certificate
   changes require a container restart.
+- On high-core machines (e.g. 192 cores) `worker_threads` defaults to the CPU
+  count; worker threads run on an 8 MiB stack (the process sets `RUST_MIN_STACK`
+  at startup and honors an explicitly-set environment variable), and lowering
+  `worker_threads` reduces thread overhead. A previous `fail_to_proxy` override
+  caused unbounded async self-recursion and stack overflow (log shows
+  `thread ... has overflowed its stack`); it was fixed by counting upstream
+  errors in `logging()` instead of overriding that hook. If stack overflow
+  reappears, first look for similar self-delegating trait-method overrides.
 
 ## Tests
 
