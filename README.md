@@ -369,7 +369,7 @@ BooMGateway/
 | `GET` · `PUT /dashboard/api/admin/plans` · `DELETE /dashboard/api/admin/plans/{name}` | 套餐 CRUD |
 | `POST /dashboard/api/admin/assignments` · `DELETE` · `GET` | 密钥→套餐绑定 |
 | `POST /dashboard/api/admin/team-assignments` · `DELETE /{team_id}` | 团队→套餐绑定 |
-| `POST /dashboard/api/admin/teams` · `PUT` · `DELETE /dashboard/api/admin/teams/{team_id}` | 团队 CRUD（含模型访问控制） |
+`POST /dashboard/api/admin/teams` `PUT` `DELETE /dashboard/api/admin/teams/{team_id}`
 
 **配额**
 | 端点 | 说明 |
