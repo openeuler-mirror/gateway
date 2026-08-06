@@ -1,0 +1,110 @@
+# BooMGateway GitCode CI — Rust workspace build & test
+# GitCode 流水线语法兼容 GitHub Actions，但 runner 使用 euleros
+name: ci
+
+on:
+  push:
+    branches: ["main", "dev"]
+  pull_request:
+    branches: ["main", "dev"]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  build-and-lint:
+    name: Build & Clippy
+    runs-on: euleros-2.10.1
+    steps:
+      - uses: checkout-action@0.0.1
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          source "$HOME/.cargo/env"
+          rustup component add clippy rustfmt
+
+      - name: Cache cargo registry
+        uses: cache@0.0.1
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Check formatting
+        run: |
+          source "$HOME/.cargo/env"
+          cd repo_workspace && cargo fmt --all -- --check
+
+      - name: Clippy
+        run: |
+          source "$HOME/.cargo/env"
+          cd repo_workspace && cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build (release)
+        run: |
+          source "$HOME/.cargo/env"
+          cd repo_workspace && cargo build --workspace --release
+
+  test:
+    name: Test
+    runs-on: euleros-2.10.1
+    needs: build-and-lint
+    steps:
+      - uses: checkout-action@0.0.1
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          source "$HOME/.cargo/env"
+
+      - name: Cache cargo registry
+        uses: cache@0.0.1
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Run tests
+        run: |
+          source "$HOME/.cargo/env"
+          cd repo_workspace && cargo test --workspace --all-features
+
+  build-standalone:
+    name: Standalone crates
+    runs-on: euleros-2.10.1
+    needs: build-and-lint
+    steps:
+      - uses: checkout-action@0.0.1
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          source "$HOME/.cargo/env"
+
+      - name: Build misc/LB
+        run: |
+          source "$HOME/.cargo/env"
+          cd repo_workspace/misc/LB && cargo build --release
+
+      - name: Build hook demo
+        run: |
+          source "$HOME/.cargo/env"
+          cd repo_workspace/hook && cargo build --release
+
+      - name: Build bench-client
+        run: |
+          source "$HOME/.cargo/env"
+          cd repo_workspace/boom-gateway/test/bench-client && cargo build --release
+
+      - name: Build mock-backend
+        run: |
+          source "$HOME/.cargo/env"
+          cd repo_workspace/boom-gateway/test/mock-backend && cargo build --release
