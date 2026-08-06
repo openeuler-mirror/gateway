@@ -305,18 +305,19 @@ BooMGateway/
 
 ## API Endpoints
 
-### Client API (API key)
+### Client API (requires API key)
 
 | Endpoint | Description |
 |----------|-------------|
-| `POST /v1/chat/completions` | OpenAI chat (streaming / non-streaming, including workflow models) |
+| `POST /v1/chat/completions` | OpenAI chat (streaming / non-streaming, workflow models) |
 | `POST /v1/messages` | Anthropic Messages API |
 | `POST /v1/completions` | OpenAI completions |
-| `POST /v1/embeddings` | Returns "not supported" |
+| `POST /v1/embeddings` | Returns "not supported" (route exists, uniformly rejected) |
+| `POST /v1/audio/speech` · `/audio/transcriptions` · `/v1/moderations` | Returns "not supported" (route exists, uniformly rejected) |
 | `GET /v1/models` | Models visible to the key (deployments + aliases) |
 | `GET /v1/models/{id}` | Single model info |
 
-> OpenAI-client aliases (no `/v1` prefix) are also served: `/chat/completions`, `/completions`, `/models`.
+> OpenAI client-compatible aliases (without `/v1` prefix) are also provided: `/chat/completions`, `/completions`, `/models`, `/models/{id}`.
 
 ### Admin API (master key)
 
@@ -351,29 +352,35 @@ BooMGateway/
 |----------|-------------|
 | `GET /dashboard/api/admin/keys` | List keys |
 | `POST /dashboard/api/admin/keys` · `/keys/batch` | Create / batch-create keys |
+| `POST /dashboard/api/admin/keys/import` | Import external keys |
 | `PUT /dashboard/api/admin/keys/{token_hash}` | Update a key |
+| `DELETE /dashboard/api/admin/keys/{token_hash}` | Delete a key |
 | `POST /dashboard/api/admin/keys/{token_hash}/block` · `/unblock` | Block / unblock a key |
 
 **Models & aliases**
 | Endpoint | Description |
 |----------|-------------|
-| `/dashboard/api/admin/models` | Model deployment CRUD |
-| `/dashboard/api/admin/aliases` | Model alias CRUD |
+| `GET` · `POST /dashboard/api/admin/models` | List / create model deployment |
+| `PUT` · `DELETE /dashboard/api/admin/models/{id}` | Update / delete model deployment |
+| `GET` · `POST /dashboard/api/admin/aliases` | List / create model alias |
+| `PUT` · `DELETE /dashboard/api/admin/aliases/{alias_name}` | Update / delete model alias |
 
 **Plans, assignments & teams**
 | Endpoint | Description |
 |----------|-------------|
-| `/dashboard/api/admin/plans` | Plan CRUD |
+| `GET` · `PUT /dashboard/api/admin/plans` · `DELETE /dashboard/api/admin/plans/{name}` | Plan CRUD |
 | `POST /dashboard/api/admin/assignments` · `DELETE` · `GET` | Key→plan assignment |
-| `POST /dashboard/api/admin/team-assignments` · `DELETE` | Team→plan assignment |
-| `/dashboard/api/admin/teams` | Team CRUD with model access control |
+| `POST /dashboard/api/admin/team-assignments` · `DELETE /{team_id}` | Team→plan assignment |
+| `POST /dashboard/api/admin/teams` · `PUT` · `DELETE /dashboard/api/admin/teams/{team_id}` | Team CRUD with model access control |
 
 **Quota**
 | Endpoint | Description |
 |----------|-------------|
 | `GET /dashboard/api/admin/quota/overview` | Team-organized quota overview |
-| `GET /dashboard/api/admin/quota/team/{id}` · `/unassigned` · `/key/{hash}/windows` | Quota detail |
-| `POST /dashboard/api/admin/quota/reset/...` | Reset cumulative / window quota (by key or team) |
+| `GET /dashboard/api/admin/quota/team/{id}` · `/unassigned` · `/key/{key_hash}/windows` | Quota detail |
+| `POST /dashboard/api/admin/quota/reset/key/{key_hash}` · `/team/{id}` | Reset cumulative / window quota (by key or team) |
+| `POST /dashboard/api/admin/quota/reset/key/{key_hash}/cumulative` · `/windows` | Reset per-key cumulative / window quota |
+| `POST /dashboard/api/admin/quota/reset/team/{id}/cumulative` · `/windows` | Reset per-team cumulative / window quota |
 
 **Logs & stats**
 | Endpoint | Description |
@@ -385,6 +392,7 @@ BooMGateway/
 | `GET /dashboard/api/admin/stats/deployments/summary` | Per-deployment 24h summary |
 | `GET /dashboard/api/admin/stats/request_rate` | Per-deployment request rate |
 | `GET /dashboard/api/admin/stats/rebalance-moves` | Load-balance move counts |
+| `GET /dashboard/api/admin/stats/audit-log` | Audit log drop counter (channel full / batch failures) |
 
 **Prompt log**
 | Endpoint | Description |
@@ -397,13 +405,17 @@ BooMGateway/
 | Endpoint | Description |
 |----------|-------------|
 | `POST /dashboard/api/admin/limits/reset/{key_hash}` · `/reset` | Reset rate-limit windows |
+| `GET` · `PUT /dashboard/api/admin/config` | Read / incrementally update full config |
+| `GET /dashboard/api/admin/config/schema` | Config field manifest (declarative UI schema) |
 | `POST /dashboard/api/admin/config/reload` | Hot-reload from dashboard UI |
 
-**Debug** (with the `debug-tools` feature)
+**Debug**
 | Endpoint | Description |
 |----------|-------------|
 | `GET /dashboard/api/admin/debug/status` · `POST /toggle` | Debug recording control |
 | `GET /dashboard/api/admin/debug/errors/{request_id}` | Fetch a recorded error |
+
+> Debug routes are always registered (no feature flag required); the `debug-tools` feature only controls whether the Debug entry is shown in the static page.
 
 ### Health Checks (no auth)
 
