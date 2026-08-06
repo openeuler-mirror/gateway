@@ -28,7 +28,7 @@ use std::time::Instant;
 
 /// Extract client IP from request headers with TCP fallback.
 /// Priority: X-Real-IP > X-Forwarded-For (first IP) > TCP remote addr > "unknown".
-fn extract_client_ip(headers: &axum::http::HeaderMap, remote_addr: Option<std::net::SocketAddr>) -> String {
+pub(crate) fn extract_client_ip(headers: &axum::http::HeaderMap, remote_addr: Option<std::net::SocketAddr>) -> String {
     // Try X-Real-IP first (set by nginx etc.)
     if let Some(val) = headers.get("X-Real-IP").and_then(|v| v.to_str().ok()) {
         let ip = val.trim();
@@ -1335,7 +1335,7 @@ fn check_model_access(
     }
 
     if model_configured {
-        tracing::warn!(
+        tracing::debug!(
             "check_model_access: key={:?}, model={}, result=deny (configured model, not in key_models={:?})",
             identity.key_name, model, identity.models
         );
@@ -1350,7 +1350,7 @@ fn check_model_access(
         return Ok(());
     }
 
-    tracing::warn!(
+    tracing::debug!(
         "check_model_access: key={:?}, model={}, result=deny (no match, no wildcard, key_models={:?})",
         identity.key_name, model, identity.models
     );
