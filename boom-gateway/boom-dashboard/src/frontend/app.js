@@ -1569,18 +1569,35 @@
 
   window._loadUserLogsPage = (p) => loadUserLogs(p);
   async function loadUserData() {
+    // Each panel is fetched independently so a single failing endpoint
+    // (e.g. /user/usage throwing on a stale limiter state) doesn't strand
+    // the other two panels in their initial "Loading..." state.
     try {
-      const [plan, usage, keyInfo] = await Promise.all([
-        api("/user/plan"),
-        api("/user/usage"),
-        api("/user/key-info"),
-      ]);
+      const plan = await api("/user/plan");
       renderPlan(plan);
+    } catch (err) {
+      console.error("Failed to load user plan:", err);
+      const el = document.getElementById("plan-info");
+      if (el) el.innerHTML = '<p class="error">' + esc(String(err)) + '</p>';
+    }
+    try {
+      const usage = await api("/user/usage");
       renderUsage(usage);
+    } catch (err) {
+      console.error("Failed to load user usage:", err);
+      const el = document.getElementById("usage-info");
+      if (el) el.innerHTML = '<p class="error">' + esc(String(err)) + '</p>';
+    }
+    try {
+      const keyInfo = await api("/user/key-info");
       renderTokenInfo(keyInfo);
       renderKeyInfo(keyInfo);
     } catch (err) {
-      console.error("Failed to load user data:", err);
+      console.error("Failed to load key info:", err);
+      const el = document.getElementById("key-info");
+      if (el) el.innerHTML = '<p class="error">' + esc(String(err)) + '</p>';
+      const tEl = document.getElementById("token-info");
+      if (tEl) tEl.innerHTML = '<p class="error">' + esc(String(err)) + '</p>';
     }
   }
 

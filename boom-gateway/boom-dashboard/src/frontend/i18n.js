@@ -1259,7 +1259,7 @@
 
       "plan.limits.concurrency": "并发：{n}",
       "plan.limits.rpm": "RPM：{n}",
-      "plan.limits.window": "{n} 请求 / {duration}",
+      "plan.limits.window": "{dims} / {duration}",
       "plan.window_limit_label": "{duration} 限制",
 
       "models.col.litellm_model": "模型名称",
