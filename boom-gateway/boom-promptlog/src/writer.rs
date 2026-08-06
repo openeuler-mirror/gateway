@@ -251,7 +251,7 @@ async fn compress_file(path: &std::path::Path) -> std::io::Result<()> {
     // Compress in a blocking task to avoid starving the async runtime.
     let gz_path_clone = gz_path.clone();
     let compressed = tokio::task::spawn_blocking(move || {
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
         use std::io::Write;
         encoder.write_all(&data)?;
         encoder.finish()
