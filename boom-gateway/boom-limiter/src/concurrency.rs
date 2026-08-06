@@ -999,6 +999,13 @@ impl PlanStore {
     /// `unassign_key_db`: this writes a row with `plan_name IS NULL` so the
     /// runtime knows the user actively opted out of plan-based limits, and
     /// must NOT fall back to default_plan.
+    ///
+    /// Returns Err if neither UPDATE nor INSERT could persist the NULL row —
+    /// e.g. when `assignment_alter_ddl` failed silently (some GaussDB/openGauss
+    /// versions reject DROP NOT NULL on distributed tables) and the column is
+    /// still NOT NULL. Catching this here surfaces the migration gap to the
+    /// dashboard (400 response) instead of silently writing memory-only state
+    /// that disappears on restart.
     pub async fn assign_key_no_plan_db(
         &self,
         pool: &sqlx::PgPool,
@@ -1012,7 +1019,7 @@ impl PlanStore {
         .await
         .map_err(|e| format!("DB error: {}", e))?;
         if updated.rows_affected() == 0 {
-            if let Err(_) = sqlx::query(
+            if let Err(insert_err) = sqlx::query(
                 r#"INSERT INTO boom_key_plan_assignment (key_hash, plan_name, assigned_at)
                    VALUES ($1, NULL, NOW())"#,
             )
@@ -1020,13 +1027,26 @@ impl PlanStore {
             .execute(pool)
             .await
             {
-                sqlx::query(
+                // INSERT failed (e.g. concurrent race, or plan_name column is
+                // still NOT NULL because assignment_alter_ddl was silently
+                // swallowed). Retry UPDATE — if it still affects 0 rows, the
+                // row never landed in DB; surface the error so the caller
+                // knows memory-only state would be a lie.
+                let retry = sqlx::query(
                     r#"UPDATE boom_key_plan_assignment SET plan_name = NULL WHERE key_hash = $1"#,
                 )
                 .bind(key_hash)
                 .execute(pool)
                 .await
                 .map_err(|e| format!("DB error: {}", e))?;
+                if retry.rows_affected() == 0 {
+                    return Err(format!(
+                        "Failed to persist 'no plan' assignment (INSERT error: {}). \
+                         The boom_key_plan_assignment.plan_name column may still be NOT NULL — \
+                         check that assignment_alter_ddl ran successfully on this DB.",
+                        insert_err
+                    ));
+                }
             }
         }
 
