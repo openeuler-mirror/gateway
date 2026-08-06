@@ -81,6 +81,8 @@ curl -s -X POST http://127.0.0.1:8080/v1/chat/completions \
 ```
 mock-backend [--bind ADDR] [--min-chars N] [--max-chars N]
              [--chunk-interval-ms N] [--max-concurrent N] [--ttft-ms N]
+             [--response-delay-ms N]
+             [--served-model NAME] [--disconnect-on-wrong-model]
 ```
 
 | 参数 | 默认 | 说明 |
@@ -91,6 +93,9 @@ mock-backend [--bind ADDR] [--min-chars N] [--max-chars N]
 | `--chunk-interval-ms` | `2` | 流式每 chunk 间隔（ms）。设 0 让 mock 尽快推 |
 | `--max-concurrent` | `10000` | 自身并发上限。超出时返回 503，模拟后端过载 |
 | `--ttft-ms` | `0` | 首 token 延迟（ms）。非 0 时模拟 reasoning 模型 |
+| `--response-delay-ms` | `0` | 非流式响应延迟（ms）。非 0 时模拟长时间无结果的 panel |
+| `--served-model` | 不限制 | 仅公布并接受指定模型，错误模型返回 404 |
+| `--disconnect-on-wrong-model` | `false` | 错误模型到达时在响应头前断开连接 |
 
 **端点**：
 - `POST /v1/chat/completions` — OpenAI 格式（流式 / 非流式）

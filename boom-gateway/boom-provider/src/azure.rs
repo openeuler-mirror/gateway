@@ -139,7 +139,14 @@ impl Provider for AzureProvider {
             let mut stream = resp.bytes_stream();
             let mut buffer = String::new();
 
-            while let Some(chunk_result) = stream.next().await {
+            loop {
+                let chunk_result = tokio::select! {
+                    _ = tx.closed() => return,
+                    chunk_result = stream.next() => chunk_result,
+                };
+                let Some(chunk_result) = chunk_result else {
+                    return;
+                };
                 match chunk_result {
                     Ok(bytes) => {
                         buffer.push_str(&String::from_utf8_lossy(&bytes));

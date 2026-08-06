@@ -10,6 +10,7 @@ use boom_core::types::{
 };
 use boom_core::GatewayError;
 use futures::{future::join_all, Stream};
+use std::fmt::Write;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -18,8 +19,8 @@ use std::time::Duration;
 const SELF_MOA_AGGREGATOR_PROMPT: &str = include_str!("prompts/self_moa_aggregator.txt");
 const DIRECT_SYNTHESIS_REFERENCE_CONTEXT_PROMPT: &str =
     include_str!("prompts/direct_synthesis_reference_context.txt");
-const REFERENCE_ADVISOR_PROMPT: &str = include_str!("prompts/reference_advisor.txt");
 const DEFAULT_OUTPUT_CONTRACT: &str = include_str!("prompts/output_contract.txt");
+const PANEL_AGGREGATION_THRESHOLD: usize = 2;
 
 #[derive(Debug, Clone)]
 pub struct ModelInstance {
@@ -45,7 +46,7 @@ impl DirectSynthesisWorkflow {
         if id.is_empty() {
             return Err("workflow id must not be empty".to_string());
         }
-        if config.panel.len() < 2 {
+        if config.panel.len() < PANEL_AGGREGATION_THRESHOLD {
             return Err("direct_synthesis requires at least two panel instances".to_string());
         }
         if config
@@ -61,6 +62,17 @@ impl DirectSynthesisWorkflow {
         Ok(Self { id, config })
     }
 
+    fn validate_request(&self, request: &ChatCompletionRequest) -> Result<(), WorkflowFailure> {
+        if request.n.unwrap_or(1) != 1 {
+            return Err(WorkflowFailure {
+                error: GatewayError::UnsupportedMode(
+                    "fusion direct_synthesis supports only n=1".to_string(),
+                ),
+            });
+        }
+        Ok(())
+    }
+
     fn panel_request(
         &self,
         original: &ChatCompletionRequest,
@@ -70,19 +82,10 @@ impl DirectSynthesisWorkflow {
         request.model = instance.model.clone();
         request.temperature = instance.temperature;
         request.stream = Some(false);
-
-        let has_tools = original
-            .tools
-            .as_ref()
-            .map_or(false, |tools| !tools.is_empty());
-        if has_tools {
-            request.messages.push(text_message(
-                MessageRole::User,
-                prompt_text(REFERENCE_ADVISOR_PROMPT).to_string(),
-            ));
+        request.tools = non_empty_tools(original);
+        if request.tools.is_none() {
+            request.tool_choice = None;
         }
-        request.tools = Some(Vec::new());
-        request.tool_choice = None;
         request
     }
 
@@ -93,11 +96,12 @@ impl DirectSynthesisWorkflow {
         stream: bool,
     ) -> ChatCompletionRequest {
         let question = last_user_question(&original.messages);
-        let answers_text = answers_text(panel_results);
-        let has_tools = original
-            .tools
-            .as_ref()
-            .map_or(false, |tools| !tools.is_empty());
+        let has_tools = request_has_tools(original);
+        let answers_text = if has_tools {
+            answers_text_with_tool_calls(panel_results)
+        } else {
+            answers_text(panel_results)
+        };
         let template = if has_tools {
             prompt_text(DIRECT_SYNTHESIS_REFERENCE_CONTEXT_PROMPT)
         } else {
@@ -121,64 +125,130 @@ impl DirectSynthesisWorkflow {
         request
             .messages
             .push(text_message(MessageRole::User, prompt));
-        let tools = original.tools.clone().unwrap_or_default();
-        let tools_empty = tools.is_empty();
-        request.tools = Some(tools);
-        if tools_empty {
+        request.tools = non_empty_tools(original);
+        if request.tools.is_none() {
             request.tool_choice = None;
         }
         request
     }
 
-    async fn prepare(&self, context: WorkflowContext) -> Result<PreparedSynthesis, WorkflowFailure> {
-        let WorkflowContext { request, invoker } = context;
+    async fn run_panel_round(
+        &self,
+        request: &ChatCompletionRequest,
+        invoker: &Arc<dyn ModelInvoker>,
+        attempt: u8,
+    ) -> PanelRound {
         let panel_futures = self
             .config
             .panel
             .iter()
-            .map(|instance| {
+            .enumerate()
+            .map(|(index, instance)| {
+                let model = instance.model.clone();
                 let call = invoker.invoke(
                     &self.id,
                     WorkflowRole::Panel,
-                    self.panel_request(&request, instance),
+                    self.panel_request(request, instance),
                 );
                 async move {
-                    match self.config.panel_timeout {
-                        Some(timeout) => tokio::time::timeout(timeout, call).await.map_err(|_| {
-                            GatewayError::ProviderError(format!(
-                                "direct_synthesis panel call timed out after {} seconds",
+                    let result = match self.config.panel_timeout {
+                        Some(timeout) => match tokio::time::timeout(timeout, call).await {
+                            Ok(result) => result,
+                            Err(_) => Err(GatewayError::ProviderError(format!(
+                                "panel call timed out after {} seconds",
                                 timeout.as_secs()
-                            ))
-                        })?,
+                            ))),
+                        },
                         None => call.await,
+                    };
+                    (index, model, result)
+                }
+            });
+
+        let mut round = PanelRound::default();
+        for (index, model, result) in join_all(panel_futures).await {
+            match result {
+                Ok(invocation) => {
+                    add_usage(&mut round.usage, &invocation.response.usage);
+                    if valid_panel(&invocation.response) {
+                        round.valid.push(PanelSuccess { index, invocation });
+                    } else {
+                        round.failures.push(FusionFailure::invalid_panel(
+                            index,
+                            model,
+                            attempt,
+                            invalid_panel_reason(&invocation.response),
+                        ));
                     }
                 }
-            });
-        let panel_results = join_all(panel_futures).await;
-        let mut valid_panels = Vec::with_capacity(self.config.panel.len());
-        let mut usage = Usage::default();
-
-        for result in panel_results {
-            if let Ok(invocation) = result {
-                add_usage(&mut usage, &invocation.response.usage);
-                if valid_panel(&invocation.response) {
-                    valid_panels.push(invocation);
-                }
+                Err(error) => round.failures.push(FusionFailure::from_error(
+                    WorkflowRole::Panel,
+                    Some(index),
+                    model,
+                    Some(attempt),
+                    &error,
+                )),
             }
         }
+        round
+    }
+
+    async fn prepare(
+        &self,
+        context: WorkflowContext,
+    ) -> Result<PreparedSynthesis, WorkflowFailure> {
+        let WorkflowContext { request, invoker } = context;
+        self.validate_request(&request)?;
+
+        let first_round = self.run_panel_round(&request, &invoker, 1).await;
+        let PanelRound {
+            valid: first_valid,
+            mut failures,
+            mut usage,
+        } = first_round;
+
+        let (mut valid_panels, attempts) = if first_valid.is_empty() {
+            let retry_round = self.run_panel_round(&request, &invoker, 2).await;
+            failures.extend(retry_round.failures);
+            add_usage(&mut usage, &retry_round.usage);
+            (retry_round.valid, 2)
+        } else {
+            (first_valid, 1)
+        };
 
         if valid_panels.is_empty() {
-            return Err(WorkflowFailure {
-                error: GatewayError::ProviderError(
-                    "direct_synthesis produced no panel answers: ALL_PANELS_FAILED".to_string(),
-                ),
-            });
+            return Err(workflow_failure(
+                &self.id,
+                "panel",
+                attempts,
+                "no valid panel answers after retry",
+                &failures,
+            ));
         }
+
+        valid_panels.sort_by_key(|panel| panel.index);
+        let mut valid_panels = valid_panels
+            .into_iter()
+            .map(|panel| panel.invocation)
+            .collect::<Vec<_>>();
+        let panel_outcome = if valid_panels.len() >= PANEL_AGGREGATION_THRESHOLD {
+            PanelOutcome::Aggregate(valid_panels)
+        } else if request_has_tools(&request) {
+            PanelOutcome::Single(valid_panels.pop().expect("one valid panel"))
+        } else {
+            return Err(workflow_failure(
+                &self.id,
+                "panel",
+                attempts,
+                "only 1 valid panel answer; at least 2 are required when the request has no tools",
+                &failures,
+            ));
+        };
 
         Ok(PreparedSynthesis {
             request,
             invoker,
-            valid_panels,
+            panel_outcome,
             usage,
         })
     }
@@ -190,9 +260,18 @@ impl DirectSynthesisWorkflow {
         let PreparedSynthesis {
             request,
             invoker,
-            valid_panels,
+            panel_outcome,
             mut usage,
         } = self.prepare(context).await?;
+        let valid_panels = match panel_outcome {
+            PanelOutcome::Single(invocation) => {
+                let mut response = invocation.response;
+                response.usage = usage;
+                return Ok(WorkflowExecution { response });
+            }
+            PanelOutcome::Aggregate(valid_panels) => valid_panels,
+        };
+
         let aggregator_request = self.aggregator_request(&request, &valid_panels, false);
         let mut response = match invoker
             .invoke(&self.id, WorkflowRole::Aggregator, aggregator_request)
@@ -204,9 +283,47 @@ impl DirectSynthesisWorkflow {
             }
             Err(_) => valid_panels[0].response.clone(),
         };
-
         response.usage = usage;
         Ok(WorkflowExecution { response })
+    }
+
+    async fn execute_stream_inner(
+        &self,
+        context: WorkflowContext,
+    ) -> Result<WorkflowStreamExecution, WorkflowFailure> {
+        let PreparedSynthesis {
+            request,
+            invoker,
+            panel_outcome,
+            usage: panel_usage,
+        } = self.prepare(context).await?;
+        let valid_panels = match panel_outcome {
+            PanelOutcome::Single(invocation) => {
+                return Ok(WorkflowStreamExecution {
+                    stream: response_stream(&invocation.response, &panel_usage),
+                });
+            }
+            PanelOutcome::Aggregate(valid_panels) => valid_panels,
+        };
+
+        let request = self.aggregator_request(&request, &valid_panels, true);
+        match invoker
+            .invoke_stream(&self.id, WorkflowRole::Aggregator, request)
+            .await
+        {
+            Ok(invocation) => Ok(WorkflowStreamExecution {
+                stream: Box::pin(AggregateUsageStream {
+                    inner: invocation.stream,
+                    panel_usage,
+                    aggregator_usage: Usage::default(),
+                    workflow_id: self.id.clone(),
+                    aggregator_model: self.config.aggregator.model.clone(),
+                }),
+            }),
+            Err(_) => Ok(WorkflowStreamExecution {
+                stream: response_stream(&valid_panels[0].response, &panel_usage),
+            }),
+        }
     }
 }
 
@@ -226,7 +343,7 @@ impl Workflow for DirectSynthesisWorkflow {
     async fn execute_stream(
         &self,
         context: WorkflowContext,
-    ) -> Result<crate::WorkflowStreamExecution, WorkflowFailure> {
+    ) -> Result<WorkflowStreamExecution, WorkflowFailure> {
         self.execute_stream_inner(context).await
     }
 }
@@ -234,8 +351,115 @@ impl Workflow for DirectSynthesisWorkflow {
 struct PreparedSynthesis {
     request: ChatCompletionRequest,
     invoker: Arc<dyn ModelInvoker>,
-    valid_panels: Vec<ModelInvocation>,
+    panel_outcome: PanelOutcome,
     usage: Usage,
+}
+
+#[derive(Default)]
+struct PanelRound {
+    valid: Vec<PanelSuccess>,
+    failures: Vec<FusionFailure>,
+    usage: Usage,
+}
+
+struct PanelSuccess {
+    index: usize,
+    invocation: ModelInvocation,
+}
+
+enum PanelOutcome {
+    Aggregate(Vec<ModelInvocation>),
+    Single(ModelInvocation),
+}
+
+#[derive(Debug)]
+struct FusionFailure {
+    role: WorkflowRole,
+    panel_index: Option<usize>,
+    model: String,
+    attempt: Option<u8>,
+    error_type: String,
+    upstream_status: Option<u16>,
+    message: String,
+}
+
+impl FusionFailure {
+    fn invalid_panel(index: usize, model: String, attempt: u8, message: String) -> Self {
+        Self {
+            role: WorkflowRole::Panel,
+            panel_index: Some(index),
+            model,
+            attempt: Some(attempt),
+            error_type: "invalid_response".to_string(),
+            upstream_status: None,
+            message,
+        }
+    }
+
+    fn from_error(
+        role: WorkflowRole,
+        panel_index: Option<usize>,
+        model: String,
+        attempt: Option<u8>,
+        error: &GatewayError,
+    ) -> Self {
+        let upstream_status = match error {
+            GatewayError::UpstreamError { status, .. } => Some(*status),
+            _ => None,
+        };
+        Self {
+            role,
+            panel_index,
+            model,
+            attempt,
+            error_type: error.error_type().to_string(),
+            upstream_status,
+            message: error.to_string(),
+        }
+    }
+}
+
+fn workflow_failure(
+    workflow_id: &str,
+    stage: &str,
+    attempts: u8,
+    summary: &str,
+    failures: &[FusionFailure],
+) -> WorkflowFailure {
+    let mut message = format!(
+        "fusion '{}' direct_synthesis failed at {} stage after {} attempt(s): {}",
+        workflow_id, stage, attempts, summary
+    );
+    if !failures.is_empty() {
+        message.push_str("; failures: ");
+        for (index, failure) in failures.iter().enumerate() {
+            if index > 0 {
+                message.push_str(" | ");
+            }
+            let _ = write!(
+                message,
+                "role={}{} model='{}'{} type={}",
+                failure.role.as_str(),
+                failure
+                    .panel_index
+                    .map(|index| format!("[{index}]"))
+                    .unwrap_or_default(),
+                failure.model,
+                failure
+                    .attempt
+                    .map(|attempt| format!(" attempt={attempt}"))
+                    .unwrap_or_default(),
+                failure.error_type,
+            );
+            if let Some(status) = failure.upstream_status {
+                let _ = write!(message, " upstream_status={status}");
+            }
+            let _ = write!(message, " message={}", failure.message);
+        }
+    }
+    WorkflowFailure {
+        error: GatewayError::ProviderError(message),
+    }
 }
 
 fn prompt_text(value: &'static str) -> &'static str {
@@ -251,6 +475,17 @@ fn text_message(role: MessageRole, content: String) -> Message {
         tool_call_id: None,
         reasoning_content: None,
     }
+}
+
+fn non_empty_tools(request: &ChatCompletionRequest) -> Option<Vec<boom_core::types::Tool>> {
+    request.tools.clone().filter(|tools| !tools.is_empty())
+}
+
+fn request_has_tools(request: &ChatCompletionRequest) -> bool {
+    request
+        .tools
+        .as_ref()
+        .is_some_and(|tools| !tools.is_empty())
 }
 
 fn last_user_question(messages: &[Message]) -> String {
@@ -280,6 +515,33 @@ fn answers_text(panel_results: &[ModelInvocation]) -> String {
         .join("\n\n")
 }
 
+fn answers_text_with_tool_calls(panel_results: &[ModelInvocation]) -> String {
+    panel_results
+        .iter()
+        .take(8)
+        .enumerate()
+        .map(|(index, result)| {
+            let mut parts = Vec::new();
+            if let Some(choice) = result.response.choices.first() {
+                let content = message_text(&choice.message.content);
+                if !content.trim().is_empty() {
+                    parts.push(content.trim().to_string());
+                }
+                if let Some(tool_calls) = &choice.message.tool_calls {
+                    parts.extend(tool_calls.iter().map(|call| {
+                        format!(
+                            "候选 tool_call: {}({})",
+                            call.function.name, call.function.arguments
+                        )
+                    }));
+                }
+            }
+            format!("回答{}：\n{}", index + 1, parts.join("\n"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
 fn valid_panel(response: &ChatCompletionResponse) -> bool {
     let Some(choice) = response.choices.first() else {
         return false;
@@ -288,12 +550,24 @@ fn valid_panel(response: &ChatCompletionResponse) -> bool {
         .message
         .tool_calls
         .as_ref()
-        .map_or(false, |calls| !calls.is_empty())
+        .is_some_and(|calls| !calls.is_empty())
     {
         return true;
     }
-    let content = message_text(&choice.message.content);
-    !content.trim().is_empty()
+    !message_text(&choice.message.content).trim().is_empty()
+}
+
+fn invalid_panel_reason(response: &ChatCompletionResponse) -> String {
+    match response.choices.first() {
+        None => "panel response has no choices".to_string(),
+        Some(choice)
+            if choice.message.tool_calls.as_ref().is_none_or(Vec::is_empty)
+                && message_text(&choice.message.content).trim().is_empty() =>
+        {
+            "panel response has neither content nor tool calls".to_string()
+        }
+        Some(_) => "panel response is invalid".to_string(),
+    }
 }
 
 fn message_text(content: &MessageContent) -> String {
@@ -340,43 +614,12 @@ fn add_optional(target: &mut Option<u32>, value: Option<u32>) {
     }
 }
 
-impl DirectSynthesisWorkflow {
-    async fn execute_stream_inner(
-        &self,
-        context: WorkflowContext,
-    ) -> Result<WorkflowStreamExecution, WorkflowFailure> {
-        let PreparedSynthesis {
-            request,
-            invoker,
-            valid_panels,
-            usage: panel_usage,
-        } = self.prepare(context).await?;
-        let request = self.aggregator_request(&request, &valid_panels, true);
-        match invoker
-            .invoke_stream(&self.id, WorkflowRole::Aggregator, request)
-            .await
-        {
-            Ok(invocation) => {
-                let stream = AggregateUsageStream {
-                    inner: invocation.stream,
-                    panel_usage,
-                    aggregator_usage: Usage::default(),
-                };
-                Ok(WorkflowStreamExecution {
-                    stream: Box::pin(stream),
-                })
-            }
-            Err(_) => Ok(WorkflowStreamExecution {
-                stream: response_stream(&valid_panels[0].response, &panel_usage),
-            }),
-        }
-    }
-}
-
 struct AggregateUsageStream {
     inner: ChatStream,
     panel_usage: Usage,
     aggregator_usage: Usage,
+    workflow_id: String,
+    aggregator_model: String,
 }
 
 impl Stream for AggregateUsageStream {
@@ -391,6 +634,12 @@ impl Stream for AggregateUsageStream {
                     *usage = combined_stream_usage(&this.aggregator_usage, &this.panel_usage);
                 }
                 Poll::Ready(Some(Ok(chunk)))
+            }
+            Poll::Ready(Some(Err(error))) => {
+                Poll::Ready(Some(Err(GatewayError::ProviderError(format!(
+                    "fusion '{}' aggregator model '{}' stream failed: {}",
+                    this.workflow_id, this.aggregator_model, error
+                )))))
             }
             result => result,
         }
@@ -526,62 +775,51 @@ fn response_stream(response: &ChatCompletionResponse, usage: &Usage) -> ChatStre
 mod tests {
     use super::*;
     use crate::ModelStreamInvocation;
-    use boom_core::types::{
-        ChatStreamChunk, Choice, StreamChoice, StreamDelta, StreamUsage, Tool, ToolCall,
-        ToolFunction,
-    };
+    use boom_core::types::{Choice, FunctionCall, Tool, ToolCall, ToolFunction};
     use futures::StreamExt;
-    use serde_json::{json, Map, Value};
-    use sha2::{Digest, Sha256};
+    use serde_json::{json, Value};
     use std::collections::HashMap;
     use std::sync::Mutex;
 
-    struct FakeInvoker {
-        calls: Mutex<Vec<(WorkflowRole, ChatCompletionRequest)>>,
+    #[derive(Clone, Copy)]
+    enum PanelBehavior {
+        Valid,
+        Invalid,
+        Error,
+        ValidOnRetry,
     }
 
-    struct ScenarioInvoker {
+    struct TestInvoker {
         calls: Mutex<Vec<(WorkflowRole, ChatCompletionRequest)>>,
-        fail_all_panels: bool,
-        fail_first_panel: bool,
-        fail_aggregator: bool,
-        delay_first_panel: bool,
+        panels: Vec<PanelBehavior>,
+        aggregator_error: bool,
+        aggregator_stream_error: bool,
+        aggregator_empty: bool,
     }
 
-    #[async_trait]
-    impl ModelInvoker for FakeInvoker {
-        async fn invoke(
-            &self,
-            _workflow_id: &str,
-            role: WorkflowRole,
-            request: ChatCompletionRequest,
-        ) -> Result<ModelInvocation, GatewayError> {
-            self.calls.lock().unwrap().push((role, request.clone()));
-            let index = self.calls.lock().unwrap().len();
-            let (content, tool_calls, finish_reason) = if role == WorkflowRole::Aggregator {
-                (
-                    String::new(),
-                    Some(vec![ToolCall {
-                        id: "call_1".to_string(),
-                        call_type: "function".to_string(),
-                        function: boom_core::types::FunctionCall {
-                            name: "bash".to_string(),
-                            arguments: "{\"command\":\"pwd\"}".to_string(),
-                        },
-                    }]),
-                    Some("tool_calls".to_string()),
-                )
-            } else {
-                (format!("panel {}", index), None, Some("stop".to_string()))
-            };
-            Ok(ModelInvocation {
-                response: response(&request.model, content, tool_calls, finish_reason),
-            })
+    impl TestInvoker {
+        fn new(panels: Vec<PanelBehavior>) -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                panels,
+                aggregator_error: false,
+                aggregator_stream_error: false,
+                aggregator_empty: false,
+            }
+        }
+
+        fn panel_attempt(&self, model: &str) -> usize {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(role, request)| *role == WorkflowRole::Panel && request.model == model)
+                .count()
         }
     }
 
     #[async_trait]
-    impl ModelInvoker for ScenarioInvoker {
+    impl ModelInvoker for TestInvoker {
         async fn invoke(
             &self,
             _workflow_id: &str,
@@ -589,27 +827,47 @@ mod tests {
             request: ChatCompletionRequest,
         ) -> Result<ModelInvocation, GatewayError> {
             self.calls.lock().unwrap().push((role, request.clone()));
-            if role == WorkflowRole::Aggregator && self.fail_aggregator {
-                return Err(GatewayError::ProviderError(
-                    "aggregator unavailable".to_string(),
-                ));
-            }
-            if role == WorkflowRole::Panel {
-                let is_first = request.temperature == Some(0.3);
-                if self.fail_all_panels || (self.fail_first_panel && is_first) {
-                    return Err(GatewayError::ProviderError("panel unavailable".to_string()));
+            if role == WorkflowRole::Aggregator {
+                if self.aggregator_error {
+                    return Err(GatewayError::ProviderError(
+                        "aggregator unavailable".to_string(),
+                    ));
                 }
-                if self.delay_first_panel && is_first {
-                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                }
-                let content = if is_first {
-                    "configured first"
-                } else {
-                    "configured second"
-                };
-                return Ok(invocation(content));
+                return Ok(ModelInvocation {
+                    response: response(
+                        &request.model,
+                        if self.aggregator_empty {
+                            ""
+                        } else {
+                            "aggregated"
+                        },
+                        None,
+                    ),
+                });
             }
-            Ok(invocation("aggregated"))
+
+            let index = request
+                .model
+                .strip_prefix("panel-")
+                .unwrap()
+                .parse::<usize>()
+                .unwrap();
+            let attempt = self.panel_attempt(&request.model);
+            match self.panels[index] {
+                PanelBehavior::Error => Err(GatewayError::UpstreamError {
+                    status: 503,
+                    message: format!("{} unavailable", request.model),
+                }),
+                PanelBehavior::Invalid => Ok(ModelInvocation {
+                    response: response(&request.model, "", None),
+                }),
+                PanelBehavior::ValidOnRetry if attempt == 1 => Err(GatewayError::ProviderError(
+                    "temporary panel failure".to_string(),
+                )),
+                PanelBehavior::Valid | PanelBehavior::ValidOnRetry => Ok(ModelInvocation {
+                    response: response(&request.model, "panel answer", None),
+                }),
+            }
         }
 
         async fn invoke_stream(
@@ -619,54 +877,66 @@ mod tests {
             request: ChatCompletionRequest,
         ) -> Result<ModelStreamInvocation, GatewayError> {
             self.calls.lock().unwrap().push((role, request.clone()));
-            if self.fail_aggregator {
+            if self.aggregator_error {
                 return Err(GatewayError::ProviderError(
                     "aggregator unavailable".to_string(),
                 ));
             }
+            let item = if self.aggregator_stream_error {
+                Err(GatewayError::UpstreamError {
+                    status: 502,
+                    message: "stream broke".to_string(),
+                })
+            } else {
+                Ok(stream_chunk(&request.model, "aggregated"))
+            };
             Ok(ModelStreamInvocation {
-                stream: Box::pin(futures::stream::iter([Ok(ChatStreamChunk {
-                    id: "chatcmpl-stream".to_string(),
-                    object: "chat.completion.chunk".to_string(),
-                    created: 1,
-                    model: request.model.clone(),
-                    choices: vec![StreamChoice {
-                        index: 0,
-                        delta: StreamDelta {
-                            role: Some(MessageRole::Assistant),
-                            content: Some("aggregated".to_string()),
-                            tool_calls: None,
-                            reasoning_content: None,
-                        },
-                        finish_reason: Some("stop".to_string()),
-                    }],
-                    usage: Some(StreamUsage {
-                        prompt_tokens: Some(5),
-                        completion_tokens: Some(2),
-                        total_tokens: Some(7),
-                        prompt_tokens_details: None,
-                    }),
-                    raw_data: None,
-                })])),
+                stream: Box::pin(futures::stream::iter([item])),
             })
         }
     }
 
-    fn request() -> ChatCompletionRequest {
+    fn workflow() -> DirectSynthesisWorkflow {
+        DirectSynthesisWorkflow::new(
+            "fusion-test",
+            DirectSynthesisConfig {
+                panel: vec![
+                    ModelInstance {
+                        model: "panel-0".to_string(),
+                        temperature: Some(0.3),
+                    },
+                    ModelInstance {
+                        model: "panel-1".to_string(),
+                        temperature: Some(0.5),
+                    },
+                ],
+                aggregator: ModelInstance {
+                    model: "aggregator".to_string(),
+                    temperature: Some(0.0),
+                },
+                panel_timeout: None,
+            },
+        )
+        .unwrap()
+    }
+
+    fn request(with_tools: bool) -> ChatCompletionRequest {
         ChatCompletionRequest {
             model: "fusion".to_string(),
             messages: vec![text_message(MessageRole::User, "fix it".to_string())],
             max_tokens: Some(128),
             max_completion_tokens: None,
-            tools: Some(vec![Tool {
-                tool_type: "function".to_string(),
-                function: ToolFunction {
-                    name: "bash".to_string(),
-                    description: None,
-                    parameters: json!({"type": "object"}),
-                },
-            }]),
-            tool_choice: Some(Value::String("required".to_string())),
+            tools: with_tools.then(|| {
+                vec![Tool {
+                    tool_type: "function".to_string(),
+                    function: ToolFunction {
+                        name: "bash".to_string(),
+                        description: None,
+                        parameters: json!({"type": "object"}),
+                    },
+                }]
+            }),
+            tool_choice: with_tools.then(|| Value::String("auto".to_string())),
             response_format: None,
             temperature: Some(0.0),
             top_p: None,
@@ -680,69 +950,19 @@ mod tests {
             top_logprobs: None,
             logit_bias: None,
             user: None,
-            extra: Map::from_iter([(
-                "metadata".to_string(),
-                json!({
-                    "benchmark": "swebench",
-                    "instance_id": "astropy__astropy-13236",
-                }),
-            )]),
+            extra: Default::default(),
             gateway_headers: HashMap::new(),
             kv_cache_report_full: false,
         }
     }
 
-    fn workflow() -> DirectSynthesisWorkflow {
-        DirectSynthesisWorkflow::new(
-            "direct_synthesis",
-            DirectSynthesisConfig {
-                panel: vec![
-                    ModelInstance {
-                        model: "glm-5.2".to_string(),
-                        temperature: Some(0.3),
-                    },
-                    ModelInstance {
-                        model: "glm-5.2".to_string(),
-                        temperature: Some(0.5),
-                    },
-                ],
-                aggregator: ModelInstance {
-                    model: "glm-5.2".to_string(),
-                    temperature: None,
-                },
-                panel_timeout: None,
-            },
-        )
-        .unwrap()
-    }
-
-    fn fixture(value: &str) -> ChatCompletionRequest {
-        serde_json::from_str(value).unwrap()
-    }
-
-    fn invocation(content: &str) -> ModelInvocation {
-        ModelInvocation {
-            response: response(
-                "glm-5.2",
-                content.to_string(),
-                None,
-                Some("stop".to_string()),
-            ),
-        }
-    }
-
-    fn sha256(value: &str) -> String {
-        hex::encode(Sha256::digest(value.as_bytes()))
-    }
-
     fn response(
         model: &str,
-        content: String,
+        content: &str,
         tool_calls: Option<Vec<ToolCall>>,
-        finish_reason: Option<String>,
     ) -> ChatCompletionResponse {
         ChatCompletionResponse {
-            id: format!("chatcmpl-{}", model),
+            id: format!("chatcmpl-{model}"),
             object: "chat.completion".to_string(),
             created: 1,
             model: model.to_string(),
@@ -750,13 +970,13 @@ mod tests {
                 index: 0,
                 message: Message {
                     role: MessageRole::Assistant,
-                    content: MessageContent::Text(content),
+                    content: MessageContent::Text(content.to_string()),
                     name: None,
                     tool_calls,
                     tool_call_id: None,
                     reasoning_content: None,
                 },
-                finish_reason,
+                finish_reason: Some("stop".to_string()),
                 logprobs: None,
             }],
             usage: Usage {
@@ -770,472 +990,247 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn direct_synthesis_preserves_tool_contract_and_order() {
-        let invoker = Arc::new(FakeInvoker {
-            calls: Mutex::new(Vec::new()),
-        });
-        let workflow = workflow();
+    fn stream_chunk(model: &str, content: &str) -> ChatStreamChunk {
+        ChatStreamChunk {
+            id: format!("chatcmpl-{model}"),
+            object: "chat.completion.chunk".to_string(),
+            created: 1,
+            model: model.to_string(),
+            choices: vec![StreamChoice {
+                index: 0,
+                delta: StreamDelta {
+                    role: Some(MessageRole::Assistant),
+                    content: Some(content.to_string()),
+                    tool_calls: None,
+                    reasoning_content: None,
+                },
+                finish_reason: Some("stop".to_string()),
+            }],
+            usage: None,
+            raw_data: None,
+        }
+    }
 
-        let result = workflow
+    #[tokio::test]
+    async fn panels_and_aggregator_receive_non_empty_tools() {
+        let invoker = Arc::new(TestInvoker::new(vec![
+            PanelBehavior::Valid,
+            PanelBehavior::Valid,
+        ]));
+        workflow()
             .execute(WorkflowContext {
-                request: request(),
+                request: request(true),
                 invoker: invoker.clone(),
             })
             .await
             .unwrap();
 
         let calls = invoker.calls.lock().unwrap();
-        let panel_calls: Vec<_> = calls
+        assert_eq!(calls.len(), 3);
+        assert!(calls
             .iter()
-            .filter(|(role, _)| *role == WorkflowRole::Panel)
-            .collect();
-        assert_eq!(panel_calls.len(), 2);
-        assert_eq!(panel_calls[0].1.temperature, Some(0.3));
-        assert_eq!(panel_calls[1].1.temperature, Some(0.5));
-        assert!(panel_calls[0].1.tools.as_ref().is_some_and(Vec::is_empty));
-        assert!(panel_calls[0].1.tool_choice.is_none());
+            .all(|(_, request)| { request.tools.as_ref().is_some_and(|tools| tools.len() == 1) }));
+    }
 
-        let aggregator = calls
+    #[tokio::test]
+    async fn empty_tools_are_omitted_from_child_requests() {
+        let invoker = Arc::new(TestInvoker::new(vec![
+            PanelBehavior::Valid,
+            PanelBehavior::Valid,
+        ]));
+        let mut input = request(false);
+        input.tools = Some(Vec::new());
+        input.tool_choice = Some(Value::String("required".to_string()));
+        workflow()
+            .execute(WorkflowContext {
+                request: input,
+                invoker: invoker.clone(),
+            })
+            .await
+            .unwrap();
+
+        assert!(invoker
+            .calls
+            .lock()
+            .unwrap()
             .iter()
-            .find(|(role, _)| *role == WorkflowRole::Aggregator)
-            .unwrap();
-        assert_eq!(aggregator.1.temperature, Some(0.0));
-        assert_eq!(
-            aggregator.1.tool_choice,
-            Some(Value::String("required".to_string()))
-        );
-        let prompt = message_text(&aggregator.1.messages.last().unwrap().content);
-        assert!(prompt.contains("回答1：\npanel 1\n\n回答2：\npanel 2"));
-        assert!(prompt.contains("当前对话的下一条 assistant response"));
-        assert_eq!(result.response.usage.total_tokens, 9);
-        assert_eq!(
-            result.response.choices[0].finish_reason.as_deref(),
-            Some("tool_calls")
-        );
-    }
-
-    #[test]
-    fn prompt_assets_match_migration_baseline() {
-        assert_eq!(
-            sha256(DEFAULT_OUTPUT_CONTRACT),
-            "d37eada5aeff79e70dce467e1489b2521462e712175b83fce4eddff914b26503"
-        );
-        assert_eq!(
-            sha256(prompt_text(DIRECT_SYNTHESIS_REFERENCE_CONTEXT_PROMPT)),
-            "59fb526ab0826688bad49aebb87a1fe6952900f27948ed4555ba4fe77a0b89a4"
-        );
-        assert_eq!(
-            sha256(prompt_text(DEFAULT_OUTPUT_CONTRACT).trim()),
-            "729d94fa14b730931863ec0d90afa03e2f435fbe5d732d4d39cd10aedb0d0ee4"
-        );
-        assert_eq!(
-            sha256(prompt_text(REFERENCE_ADVISOR_PROMPT)),
-            "fe831153a436a2d73188ed76db19598a23fdedce515dabc364bce32418647586"
-        );
-        assert_eq!(
-            sha256(prompt_text(SELF_MOA_AGGREGATOR_PROMPT)),
-            "513a249e312902e2ce8a22247806cdf28491fb1f2db7e66c78b1172bfa2b93b3"
-        );
-        assert_eq!(
-            prompt_text(REFERENCE_ADVISOR_PROMPT),
-            "You are a reference advisor in a Mixture of Agents (MoA) process. You are NOT the acting agent and you do NOT execute anything: you cannot call tools, run commands, browse, or access files, repositories, or URLs, and you should not try to or apologize for being unable to. A separate aggregator/orchestrator model holds those capabilities and will take the actual actions.\n\nThe conversation above is the current state of a task handled by that acting agent. Your job is to give your most intelligent analysis of that state: understand the goal, reason about the problem, and advise on what to do next. Surface the best approach, concrete next steps and tool-use strategy, likely pitfalls and risks, and anything the acting agent may have missed or gotten wrong. Assume any referenced files, URLs, or systems exist and reason about them from the context given rather than asking for access.\n\nRespond with your advice directly — no preamble, no disclaimers about tools or access. Your response is private guidance handed to the aggregator, not an answer shown to the user.\n\nGive your judgement: what is going on, what should happen next, what risks or mistakes you see, and how the acting agent should proceed."
-        );
-        assert!(prompt_text(DEFAULT_OUTPUT_CONTRACT)
-            .starts_with("你的输出必须是当前对话的下一条 assistant response"));
-    }
-
-    #[test]
-    fn canonical_swe_tool_requests_match_direct_synthesis_contract() {
-        for raw in [
-            include_str!("../tests/fixtures/swe_tool_first_turn_request.json"),
-            include_str!("../tests/fixtures/swe_tool_result_request.json"),
-        ] {
-            let original = fixture(raw);
-            let workflow = workflow();
-            let panel = workflow.panel_request(&original, &workflow.config.panel[0]);
-
-            assert_eq!(
-                serde_json::to_value(&panel.messages[..original.messages.len()]).unwrap(),
-                serde_json::to_value(&original.messages).unwrap()
-            );
-            assert_eq!(
-                message_text(&panel.messages.last().unwrap().content),
-                prompt_text(REFERENCE_ADVISOR_PROMPT)
-            );
-            assert!(panel.tools.as_ref().is_some_and(Vec::is_empty));
-            assert!(panel.tool_choice.is_none());
-            assert_eq!(panel.temperature, Some(0.3));
-            assert_eq!(panel.extra.get("metadata"), original.extra.get("metadata"));
-
-            let aggregator = workflow.aggregator_request(
-                &original,
-                &[invocation("panel A"), invocation("panel B")],
-                false,
-            );
-            assert_eq!(
-                serde_json::to_value(&aggregator.messages[..original.messages.len()]).unwrap(),
-                serde_json::to_value(&original.messages).unwrap()
-            );
-            assert_eq!(
-                serde_json::to_value(&aggregator.tools).unwrap(),
-                serde_json::to_value(&original.tools).unwrap()
-            );
-            assert_eq!(aggregator.tool_choice, original.tool_choice);
-            assert_eq!(
-                aggregator.extra.get("metadata"),
-                original.extra.get("metadata")
-            );
-            let prompt = message_text(&aggregator.messages.last().unwrap().content);
-            assert!(
-                prompt.contains("原始问题：Fix astropy__astropy-13236 and run the relevant tests.")
-            );
-            assert!(prompt.contains("回答1：\npanel A\n\n回答2：\npanel B"));
-            assert!(prompt.ends_with(prompt_text(DEFAULT_OUTPUT_CONTRACT).trim()));
-        }
-    }
-
-    #[test]
-    fn canonical_no_tools_request_keeps_panel_messages_unchanged() {
-        let original = fixture(include_str!("../tests/fixtures/no_tools_request.json"));
-        let workflow = workflow();
-        let panel = workflow.panel_request(&original, &workflow.config.panel[1]);
-        assert_eq!(
-            serde_json::to_value(&panel.messages).unwrap(),
-            serde_json::to_value(&original.messages).unwrap()
-        );
-        assert!(panel.tools.as_ref().is_some_and(Vec::is_empty));
-        assert_eq!(panel.temperature, Some(0.5));
-
-        let aggregator = workflow.aggregator_request(
-            &original,
-            &[invocation("first"), invocation("second")],
-            false,
-        );
-        let prompt = message_text(&aggregator.messages.last().unwrap().content);
-        assert!(prompt.starts_with("你是一个回答合成专家。"));
-        assert!(prompt.contains("回答1：\nfirst\n\n回答2：\nsecond"));
-        assert!(aggregator.tools.as_ref().is_some_and(Vec::is_empty));
-        assert!(aggregator.tool_choice.is_none());
+            .all(|(_, request)| { request.tools.is_none() && request.tool_choice.is_none() }));
     }
 
     #[tokio::test]
-    async fn partial_panel_failure_continues_and_counts_only_successful_usage() {
-        let invoker = Arc::new(ScenarioInvoker {
-            calls: Mutex::new(Vec::new()),
-            fail_all_panels: false,
-            fail_first_panel: true,
-            fail_aggregator: false,
-            delay_first_panel: false,
-        });
+    async fn all_panels_retry_once_and_report_detailed_failures() {
+        let invoker = Arc::new(TestInvoker::new(vec![
+            PanelBehavior::Error,
+            PanelBehavior::Invalid,
+        ]));
         let result = workflow()
             .execute(WorkflowContext {
-                request: request(),
-                invoker,
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(result.response.usage.total_tokens, 6);
-    }
-
-    #[tokio::test]
-    async fn panel_timeout_excludes_only_the_slow_panel() {
-        let invoker = Arc::new(ScenarioInvoker {
-            calls: Mutex::new(Vec::new()),
-            fail_all_panels: false,
-            fail_first_panel: false,
-            fail_aggregator: false,
-            delay_first_panel: true,
-        });
-        let mut workflow = workflow();
-        workflow.config.panel_timeout = Some(Duration::from_millis(1));
-        let result = workflow
-            .execute(WorkflowContext {
-                request: request(),
-                invoker,
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(result.response.usage.total_tokens, 6);
-    }
-
-    #[test]
-    fn panel_content_is_not_rejected_by_error_like_prefixes() {
-        for content in [
-            "ERROR: this is a diagnosis, not a provider error",
-            "API_ERROR: explain how to recover",
-            "ALL_PANELS_FAILED",
-        ] {
-            assert!(valid_panel(&invocation(content).response));
-        }
-    }
-
-    #[tokio::test]
-    async fn aggregator_failure_falls_back_to_first_panel() {
-        let invoker = Arc::new(ScenarioInvoker {
-            calls: Mutex::new(Vec::new()),
-            fail_all_panels: false,
-            fail_first_panel: false,
-            fail_aggregator: true,
-            delay_first_panel: false,
-        });
-        let result = workflow()
-            .execute(WorkflowContext {
-                request: request(),
-                invoker,
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(
-            message_text(&result.response.choices[0].message.content),
-            "configured first"
-        );
-        assert_eq!(result.response.usage.total_tokens, 6);
-    }
-
-    #[tokio::test]
-    async fn all_panel_failures_stop_before_aggregator() {
-        let invoker = Arc::new(ScenarioInvoker {
-            calls: Mutex::new(Vec::new()),
-            fail_all_panels: true,
-            fail_first_panel: false,
-            fail_aggregator: false,
-            delay_first_panel: false,
-        });
-        let result = workflow()
-            .execute(WorkflowContext {
-                request: request(),
+                request: request(false),
                 invoker: invoker.clone(),
             })
             .await;
-        let failure = match result {
-            Ok(_) => panic!("all panel failures must fail the workflow"),
-            Err(failure) => failure,
+        let error = match result {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("all failed panels unexpectedly succeeded"),
         };
 
-        assert!(failure.to_string().contains("ALL_PANELS_FAILED"));
+        assert_eq!(invoker.calls.lock().unwrap().len(), 4);
+        assert!(error.contains("after 2 attempt(s)"));
+        assert!(error.contains("panel[0]"));
+        assert!(error.contains("upstream_status=503"));
+        assert!(error.contains("panel[1]"));
+        assert!(error.contains("invalid_response"));
+    }
+
+    #[tokio::test]
+    async fn one_initial_panel_does_not_retry_and_requires_tools() {
+        let invoker = Arc::new(TestInvoker::new(vec![
+            PanelBehavior::Valid,
+            PanelBehavior::Error,
+        ]));
+        let result = workflow()
+            .execute(WorkflowContext {
+                request: request(false),
+                invoker: invoker.clone(),
+            })
+            .await;
+        let error = match result {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("single panel without tools unexpectedly succeeded"),
+        };
+
+        assert_eq!(invoker.calls.lock().unwrap().len(), 2);
+        assert!(error.contains("only 1 valid panel answer"));
+    }
+
+    #[tokio::test]
+    async fn one_panel_with_tools_returns_without_requiring_a_tool_call() {
+        let invoker = Arc::new(TestInvoker::new(vec![
+            PanelBehavior::Valid,
+            PanelBehavior::Error,
+        ]));
+        let result = workflow()
+            .execute(WorkflowContext {
+                request: request(true),
+                invoker: invoker.clone(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.response.model, "panel-0");
         assert_eq!(invoker.calls.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]
-    async fn panel_answers_follow_config_order_not_completion_order() {
-        let invoker = Arc::new(ScenarioInvoker {
-            calls: Mutex::new(Vec::new()),
-            fail_all_panels: false,
-            fail_first_panel: false,
-            fail_aggregator: false,
-            delay_first_panel: true,
+    async fn aggregator_failure_falls_back_to_first_panel() {
+        let invoker = Arc::new(TestInvoker {
+            aggregator_error: true,
+            ..TestInvoker::new(vec![PanelBehavior::Valid, PanelBehavior::Valid])
         });
-        workflow()
+        let result = workflow()
             .execute(WorkflowContext {
-                request: request(),
-                invoker: invoker.clone(),
-            })
-            .await
-            .unwrap();
-
-        let calls = invoker.calls.lock().unwrap();
-        let aggregator = calls
-            .iter()
-            .find(|(role, _)| *role == WorkflowRole::Aggregator)
-            .unwrap();
-        let prompt = message_text(&aggregator.1.messages.last().unwrap().content);
-        assert!(prompt.contains("回答1：\nconfigured first\n\n回答2：\nconfigured second"));
-    }
-
-    #[tokio::test]
-    async fn streams_only_the_aggregator_and_adds_panel_usage() {
-        let invoker = Arc::new(ScenarioInvoker {
-            calls: Mutex::new(Vec::new()),
-            fail_all_panels: false,
-            fail_first_panel: false,
-            fail_aggregator: false,
-            delay_first_panel: false,
-        });
-        let execution = workflow()
-            .execute_stream(WorkflowContext {
-                request: request(),
-                invoker: invoker.clone(),
-            })
-            .await
-            .unwrap();
-
-        let chunk = execution
-            .stream
-            .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .next()
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            chunk.choices[0].delta.content.as_deref(),
-            Some("aggregated")
-        );
-        assert_eq!(chunk.usage.as_ref().unwrap().total_tokens, Some(13));
-
-        let calls = invoker.calls.lock().unwrap();
-        assert!(calls
-            .iter()
-            .filter(|(role, _)| *role == WorkflowRole::Panel)
-            .all(|(_, request)| request.stream == Some(false)));
-        assert_eq!(
-            calls
-                .iter()
-                .find(|(role, _)| *role == WorkflowRole::Aggregator)
-                .unwrap()
-                .1
-                .stream,
-            Some(true)
-        );
-    }
-
-    #[tokio::test]
-    async fn streaming_usage_accumulates_partial_provider_snapshots() {
-        let chunk = |usage| ChatStreamChunk {
-            id: "chatcmpl-stream".to_string(),
-            object: "chat.completion.chunk".to_string(),
-            created: 1,
-            model: "glm-5.2".to_string(),
-            choices: Vec::new(),
-            usage: Some(usage),
-            raw_data: None,
-        };
-        let inner = futures::stream::iter([
-            Ok(chunk(StreamUsage {
-                prompt_tokens: Some(5),
-                completion_tokens: Some(0),
-                total_tokens: None,
-                prompt_tokens_details: Some(PromptTokensDetails {
-                    cached_tokens: Some(2),
-                }),
-            })),
-            Ok(chunk(StreamUsage {
-                prompt_tokens: None,
-                completion_tokens: Some(2),
-                total_tokens: None,
-                prompt_tokens_details: None,
-            })),
-        ]);
-        let stream = AggregateUsageStream {
-            inner: Box::pin(inner),
-            panel_usage: Usage {
-                prompt_tokens: 4,
-                completion_tokens: 2,
-                total_tokens: 6,
-                prompt_tokens_details: Some(PromptTokensDetails {
-                    cached_tokens: Some(1),
-                }),
-                ..Usage::default()
-            },
-            aggregator_usage: Usage::default(),
-        };
-
-        let chunks = stream.collect::<Vec<_>>().await;
-        let first = chunks[0].as_ref().unwrap().usage.as_ref().unwrap();
-        assert_eq!(first.prompt_tokens, Some(9));
-        assert_eq!(first.completion_tokens, Some(2));
-        assert_eq!(first.total_tokens, Some(11));
-
-        let second = chunks[1].as_ref().unwrap().usage.as_ref().unwrap();
-        assert_eq!(second.prompt_tokens, Some(9));
-        assert_eq!(second.completion_tokens, Some(4));
-        assert_eq!(second.total_tokens, Some(13));
-        assert_eq!(
-            second
-                .prompt_tokens_details
-                .as_ref()
-                .and_then(|details| details.cached_tokens),
-            Some(3)
-        );
-
-    }
-
-    #[tokio::test]
-    async fn streaming_without_provider_usage_does_not_invent_aggregator_usage() {
-        let inner = futures::stream::iter([Ok(ChatStreamChunk {
-            id: "chatcmpl-stream".to_string(),
-            object: "chat.completion.chunk".to_string(),
-            created: 1,
-            model: "glm-5.2".to_string(),
-            choices: Vec::new(),
-            usage: None,
-            raw_data: None,
-        })]);
-        let stream = AggregateUsageStream {
-            inner: Box::pin(inner),
-            panel_usage: Usage {
-                prompt_tokens: 4,
-                completion_tokens: 2,
-                total_tokens: 6,
-                ..Usage::default()
-            },
-            aggregator_usage: Usage::default(),
-        };
-
-        let chunks = stream.collect::<Vec<_>>().await;
-        assert!(chunks[0].as_ref().unwrap().usage.is_none());
-    }
-
-    #[test]
-    fn stream_usage_clamps_only_at_the_i32_protocol_boundary() {
-        let usage = combined_stream_usage(
-            &Usage {
-                prompt_tokens: u32::MAX,
-                completion_tokens: u32::MAX,
-                total_tokens: u32::MAX,
-                ..Usage::default()
-            },
-            &Usage {
-                prompt_tokens: 1,
-                completion_tokens: 1,
-                total_tokens: 1,
-                ..Usage::default()
-            },
-        );
-
-        assert_eq!(usage.prompt_tokens, Some(i32::MAX));
-        assert_eq!(usage.completion_tokens, Some(i32::MAX));
-        assert_eq!(usage.total_tokens, Some(i32::MAX));
-    }
-
-    #[tokio::test]
-    async fn streaming_aggregator_failure_falls_back_to_panel_stream() {
-        let invoker = Arc::new(ScenarioInvoker {
-            calls: Mutex::new(Vec::new()),
-            fail_all_panels: false,
-            fail_first_panel: false,
-            fail_aggregator: true,
-            delay_first_panel: false,
-        });
-        let execution = workflow()
-            .execute_stream(WorkflowContext {
-                request: request(),
+                request: request(false),
                 invoker,
             })
             .await
             .unwrap();
 
-        let chunks = execution.stream.collect::<Vec<_>>().await;
+        assert_eq!(result.response.model, "panel-0");
+    }
+
+    #[tokio::test]
+    async fn successful_aggregator_response_is_not_revalidated() {
+        let invoker = Arc::new(TestInvoker {
+            aggregator_empty: true,
+            ..TestInvoker::new(vec![PanelBehavior::Valid, PanelBehavior::Valid])
+        });
+        let result = workflow()
+            .execute(WorkflowContext {
+                request: request(false),
+                invoker,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.response.model, "aggregator");
         assert_eq!(
-            chunks[0].as_ref().unwrap().choices[0]
-                .delta
-                .content
-                .as_deref(),
-            Some("configured first")
+            message_text(&result.response.choices[0].message.content),
+            ""
         );
-        assert_eq!(
-            chunks[1]
-                .as_ref()
-                .unwrap()
-                .usage
-                .as_ref()
-                .unwrap()
-                .total_tokens,
-            Some(6)
-        );
+    }
+
+    #[tokio::test]
+    async fn established_aggregator_stream_error_is_not_replaced_by_panel() {
+        let invoker = Arc::new(TestInvoker {
+            aggregator_stream_error: true,
+            ..TestInvoker::new(vec![PanelBehavior::Valid, PanelBehavior::Valid])
+        });
+        let execution = workflow()
+            .execute_stream(WorkflowContext {
+                request: request(false),
+                invoker,
+            })
+            .await
+            .unwrap();
+        let error = execution
+            .stream
+            .collect::<Vec<_>>()
+            .await
+            .pop()
+            .unwrap()
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            GatewayError::ProviderError(message)
+                if message.contains("fusion-test")
+                    && message.contains("aggregator")
+                    && message.contains("stream broke")
+        ));
+    }
+
+    #[tokio::test]
+    async fn fusion_rejects_multiple_choices_before_child_calls() {
+        let invoker = Arc::new(TestInvoker::new(vec![
+            PanelBehavior::ValidOnRetry,
+            PanelBehavior::ValidOnRetry,
+        ]));
+        let mut input = request(false);
+        input.n = Some(2);
+        let result = workflow()
+            .execute(WorkflowContext {
+                request: input,
+                invoker: invoker.clone(),
+            })
+            .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("n=2 Fusion request unexpectedly succeeded"),
+        };
+
+        assert!(matches!(error.error, GatewayError::UnsupportedMode(_)));
+        assert!(invoker.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn tool_calls_are_included_in_aggregator_reference_text() {
+        let invocation = ModelInvocation {
+            response: response(
+                "panel-0",
+                "",
+                Some(vec![ToolCall {
+                    id: "call-1".to_string(),
+                    call_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "bash".to_string(),
+                        arguments: "{\"command\":\"pwd\"}".to_string(),
+                    },
+                }]),
+            ),
+        };
+
+        let text = answers_text_with_tool_calls(&[invocation]);
+        assert!(text.contains("bash"));
+        assert!(text.contains("\"command\":\"pwd\""));
     }
 }

@@ -12,7 +12,7 @@ use tokio::time::Instant;
 /// Unlike the old content-extracting approach, this stores each SSE event's raw
 /// JSON in a `chunks` array — no field-level parsing, no content extraction.
 pub struct PromptLogStream<S, F> {
-    inner: S,
+    inner: Option<S>,
     sender: mpsc::UnboundedSender<PromptLogEntry>,
     entry: Option<PromptLogEntry>,
     start: Instant,
@@ -24,6 +24,8 @@ pub struct PromptLogStream<S, F> {
     /// Shared buffer for raw upstream SSE chunks (before format conversion).
     /// Only set when `capture_raw_upstream` is enabled for Anthropic-format endpoints.
     raw_upstream_chunks: Option<Arc<std::sync::Mutex<Vec<String>>>>,
+    /// Adds provider-owned metadata after the wrapped stream has been dropped.
+    entry_enricher: Option<Arc<dyn Fn(&mut PromptLogEntry) + Send + Sync>>,
 }
 
 impl<S: Unpin, F: Unpin> Unpin for PromptLogStream<S, F> {}
@@ -38,7 +40,7 @@ impl<S, F> PromptLogStream<S, F> {
     ) -> Self {
         let start = Instant::now();
         Self {
-            inner,
+            inner: Some(inner),
             sender,
             entry: Some(entry),
             start,
@@ -46,12 +48,24 @@ impl<S, F> PromptLogStream<S, F> {
             chunks: Vec::new(),
             raw_data_fn,
             raw_upstream_chunks,
+            entry_enricher: None,
         }
+    }
+
+    pub fn with_entry_enricher(
+        mut self,
+        enricher: Arc<dyn Fn(&mut PromptLogEntry) + Send + Sync>,
+    ) -> Self {
+        self.entry_enricher = Some(enricher);
+        self
     }
 }
 
 impl<S, F> Drop for PromptLogStream<S, F> {
     fn drop(&mut self) {
+        // Nested provider streams finalize their trace state on drop.
+        self.inner.take();
+
         if let Some(mut entry) = self.entry.take() {
             let duration_ms = self.start.elapsed().as_millis() as u64;
 
@@ -63,6 +77,10 @@ impl<S, F> Drop for PromptLogStream<S, F> {
 
             entry.set_response(response);
             entry.set_status(200, duration_ms);
+
+            if let Some(enricher) = &self.entry_enricher {
+                enricher(&mut entry);
+            }
 
             // Capture raw upstream chunks if available (before format conversion).
             if let Some(ref raw_chunks) = self.raw_upstream_chunks {
@@ -97,7 +115,10 @@ where
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        match this.inner.poll_next_unpin(cx) {
+        let Some(inner) = this.inner.as_mut() else {
+            return Poll::Ready(None);
+        };
+        match inner.poll_next_unpin(cx) {
             Poll::Ready(Some(item)) => {
                 this.event_count += 1;
                 if let Some(raw) = (this.raw_data_fn)(&item) {
@@ -110,5 +131,73 @@ where
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct DropSignalStream {
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Stream for DropSignalStream {
+        type Item = serde_json::Value;
+
+        fn poll_next(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            Poll::Pending
+        }
+    }
+
+    impl Drop for DropSignalStream {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn entry_enricher_runs_after_inner_stream_drop() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let entry = PromptLogEntry::new(
+            "request-1",
+            "key-1",
+            None,
+            None,
+            "test-model",
+            "/v1/chat/completions",
+            true,
+            serde_json::json!({"model": "test-model"}),
+            None,
+            None,
+        );
+        let snapshot_dropped = dropped.clone();
+        let stream = PromptLogStream::new(
+            DropSignalStream {
+                dropped: dropped.clone(),
+            },
+            sender,
+            entry,
+            |_item: &serde_json::Value| None::<String>,
+            None,
+        )
+        .with_entry_enricher(Arc::new(move |entry| {
+            entry.set_raw_upstream_response(serde_json::json!({
+                "inner_dropped": snapshot_dropped.load(Ordering::SeqCst)
+            }));
+        }));
+
+        drop(stream);
+
+        assert!(dropped.load(Ordering::SeqCst));
+        let entry = receiver.try_recv().expect("prompt log entry was not sent");
+        assert_eq!(
+            entry.raw_upstream_response.unwrap()["inner_dropped"],
+            serde_json::Value::Bool(true)
+        );
+        assert_eq!(entry.status_code, Some(200));
+        assert!(entry.error_message.is_none());
     }
 }

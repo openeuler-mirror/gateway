@@ -130,6 +130,12 @@ impl WorkflowSettings {
                                 workflow_id, role, instance.model
                             )));
                         }
+                        validate_openai_compatible_model(
+                            config,
+                            workflow_id,
+                            role,
+                            &instance.model,
+                        )?;
                         if instance.temperature.is_some_and(|value| !value.is_finite()) {
                             return Err(GatewayError::ConfigError(format!(
                                 "workflow '{}' {} temperature must be finite",
@@ -144,9 +150,113 @@ impl WorkflowSettings {
     }
 }
 
+fn validate_openai_compatible_model(
+    config: &Config,
+    workflow_id: &str,
+    role: &str,
+    configured_model: &str,
+) -> Result<(), GatewayError> {
+    let model = config
+        .router_settings
+        .model_group_alias
+        .get(configured_model)
+        .map(|alias| alias.target_model())
+        .unwrap_or(configured_model);
+    let mut deployment_found = false;
+
+    for entry in config
+        .model_list
+        .iter()
+        .filter(|entry| entry.model_name == model)
+    {
+        deployment_found = true;
+        let (provider_type, _) = entry.litellm_params.resolve_provider_and_model();
+        if !is_openai_compatible_provider(&provider_type) {
+            return Err(GatewayError::ConfigError(format!(
+                "workflow '{}' {} model '{}' uses provider '{}' \
+                 (litellm_params.model='{}'); Fusion child models must use an \
+                 OpenAI-compatible provider",
+                workflow_id,
+                role,
+                configured_model,
+                provider_type,
+                entry.litellm_params.model
+            )));
+        }
+    }
+
+    if !deployment_found {
+        return Err(GatewayError::ConfigError(format!(
+            "workflow '{}' {} model '{}' resolves to model '{}', which has no configured deployment",
+            workflow_id, role, configured_model, model
+        )));
+    }
+
+    Ok(())
+}
+
+fn is_openai_compatible_provider(provider_type: &str) -> bool {
+    matches!(
+        provider_type,
+        "openai"
+            | "azure"
+            | "hosted_vllm"
+            | "vllm"
+            | "ollama"
+            | "ollama_chat"
+            | "deepseek"
+            | "groq"
+            | "together_ai"
+            | "fireworks_ai"
+            | "perplexity"
+            | "anyscale"
+            | "deepinfra"
+            | "lm_studio"
+            | "llamafile"
+            | "xinference"
+            | "sambanova"
+            | "cerebras"
+            | "nvidia_nim"
+            | "codestral"
+            | "volcengine"
+            | "dashscope"
+            | "moonshot"
+            | "xai"
+            | "ai21"
+            | "ai21_chat"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use crate::Config;
+
+    fn config_with_providers(panel_provider: &str, aggregator_provider: &str) -> Config {
+        serde_yaml::from_str(&format!(
+            r#"
+model_list:
+  - model_name: panel
+    litellm_params:
+      model: {panel_provider}/panel
+  - model_name: aggregator
+    litellm_params:
+      model: {aggregator_provider}/aggregator
+workflow_settings:
+  models:
+    fusion: direct_synthesis
+  workflows:
+    direct_synthesis:
+      type: direct_synthesis
+      roles:
+        panel:
+          - model: panel
+          - model: panel
+        aggregator:
+          model: aggregator
+"#
+        ))
+        .unwrap()
+    }
 
     #[test]
     fn direct_synthesis_config_is_valid() {
@@ -246,5 +356,88 @@ workflow_settings:
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         let error = config.validate().unwrap_err().to_string();
         assert!(error.contains("panel_timeout_secs"));
+    }
+
+    #[test]
+    fn openai_panel_and_azure_aggregator_are_allowed() {
+        let config = config_with_providers("openai", "azure");
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn anthropic_panel_is_rejected_without_tools() {
+        let config = config_with_providers("anthropic", "openai");
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("panel model 'panel' uses provider 'anthropic'"));
+        assert!(error.contains("OpenAI-compatible provider"));
+    }
+
+    #[test]
+    fn gemini_aggregator_is_rejected() {
+        let config = config_with_providers("openai", "gemini");
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("aggregator model 'aggregator' uses provider 'gemini'"));
+    }
+
+    #[test]
+    fn all_deployments_of_a_fusion_child_model_must_be_compatible() {
+        let yaml = r#"
+model_list:
+  - model_name: panel
+    litellm_params:
+      model: openai/panel
+  - model_name: panel
+    litellm_params:
+      model: anthropic/panel
+  - model_name: aggregator
+    litellm_params:
+      model: openai/aggregator
+workflow_settings:
+  models:
+    fusion: direct_synthesis
+  workflows:
+    direct_synthesis:
+      type: direct_synthesis
+      roles:
+        panel:
+          - model: panel
+          - model: panel
+        aggregator:
+          model: aggregator
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("panel model 'panel' uses provider 'anthropic'"));
+    }
+
+    #[test]
+    fn fusion_child_alias_is_checked_against_its_target_deployments() {
+        let yaml = r#"
+model_list:
+  - model_name: panel-target
+    litellm_params:
+      model: anthropic/panel
+  - model_name: aggregator
+    litellm_params:
+      model: openai/aggregator
+router_settings:
+  model_group_alias:
+    panel-alias: panel-target
+workflow_settings:
+  models:
+    fusion: direct_synthesis
+  workflows:
+    direct_synthesis:
+      type: direct_synthesis
+      roles:
+        panel:
+          - model: panel-alias
+          - model: panel-alias
+        aggregator:
+          model: aggregator
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("panel model 'panel-alias' uses provider 'anthropic'"));
     }
 }

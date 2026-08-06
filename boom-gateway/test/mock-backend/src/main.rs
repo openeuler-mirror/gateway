@@ -57,6 +57,22 @@ struct Args {
     /// Optional first-token delay (ms) — simulates reasoning-model TTFT.
     #[arg(long, default_value_t = 0)]
     ttft_ms: u64,
+
+    /// Optional non-streaming response delay (ms) — simulates a slow panel.
+    #[arg(long, default_value_t = 0)]
+    response_delay_ms: u64,
+
+    /// When set, advertise and accept only this model.
+    #[arg(long)]
+    served_model: Option<String>,
+
+    /// Drop the connection before response headers when the model mismatches.
+    #[arg(long, default_value_t = false)]
+    disconnect_on_wrong_model: bool,
+
+    /// Reject requests that explicitly send an empty tools array.
+    #[arg(long, default_value_t = false)]
+    reject_empty_tools: bool,
 }
 
 struct AppState {
@@ -74,6 +90,8 @@ struct Stats {
     total_completion: AtomicU64,
     total_messages: AtomicU64,
     total_503: AtomicU64,
+    rejected_model: AtomicU64,
+    rejected_empty_tools: AtomicU64,
 }
 
 #[derive(Deserialize, Default)]
@@ -84,6 +102,7 @@ struct AnyBody {
     stream: Option<bool>,
     #[allow(dead_code)]
     max_tokens: Option<u64>,
+    tools: Option<Vec<serde_json::Value>>,
 }
 
 #[tokio::main]
@@ -188,6 +207,42 @@ async fn handle_any(
     let parsed: AnyBody = serde_json::from_value(body).unwrap_or_default();
     let stream = parsed.stream.unwrap_or(false);
     let model = parsed.model.clone().unwrap_or_else(|| "mock-model".into());
+    if st.args.reject_empty_tools && parsed.tools.as_ref().is_some_and(Vec::is_empty) {
+        st.stats
+            .rejected_empty_tools
+            .fetch_add(1, Ordering::Relaxed);
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "tools must not be an empty array; either provide at least one tool or omit the field entirely"
+                }
+            })),
+        )
+            .into_response();
+    }
+    if st
+        .args
+        .served_model
+        .as_deref()
+        .is_some_and(|served| served != model)
+    {
+        st.stats.rejected_model.fetch_add(1, Ordering::Relaxed);
+        if st.args.disconnect_on_wrong_model {
+            panic!("mock-backend received unsupported model '{model}'");
+        }
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": {
+                    "type": "model_not_found",
+                    "message": format!("model '{model}' is not served by this backend")
+                }
+            })),
+        )
+            .into_response();
+    }
     let prompt_chars = estimate_prompt_chars(&parsed);
     let prompt_tokens = (prompt_chars / 4).max(1) as u64;
 
@@ -281,7 +336,9 @@ async fn handle_any(
 
         Sse::new(ReceiverStream::new(rx)).into_response()
     } else {
-        // Non-streaming — return immediately.
+        if st.args.response_delay_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(st.args.response_delay_ms)).await;
+        }
         st.stats.inflight.fetch_sub(1, Ordering::Relaxed);
         drop(permit);
         let body = json!({
@@ -305,14 +362,23 @@ async fn handle_any(
     }
 }
 
-async fn list_models() -> impl IntoResponse {
+async fn list_models(State(st): State<Arc<AppState>>) -> impl IntoResponse {
+    let models = match st.args.served_model.as_deref() {
+        Some(model) => vec![json!({
+            "id": model,
+            "object": "model",
+            "created": 0,
+            "owned_by": "mock"
+        })],
+        None => vec![
+            json!({"id":"mock-gpt-4o","object":"model","created":0,"owned_by":"mock"}),
+            json!({"id":"mock-claude","object":"model","created":0,"owned_by":"mock"}),
+            json!({"id":"mock-deepseek","object":"model","created":0,"owned_by":"mock"}),
+        ],
+    };
     Json(json!({
         "object": "list",
-        "data": [
-            {"id":"mock-gpt-4o","object":"model","created":0,"owned_by":"mock"},
-            {"id":"mock-claude","object":"model","created":0,"owned_by":"mock"},
-            {"id":"mock-deepseek","object":"model","created":0,"owned_by":"mock"}
-        ]
+        "data": models
     }))
 }
 
@@ -329,6 +395,8 @@ async fn get_stats(State(st): State<Arc<AppState>>) -> impl IntoResponse {
         "endpoint_completion": s.total_completion.load(Ordering::Relaxed),
         "endpoint_messages": s.total_messages.load(Ordering::Relaxed),
         "rejected_503": s.total_503.load(Ordering::Relaxed),
+        "rejected_model": s.rejected_model.load(Ordering::Relaxed),
+        "rejected_empty_tools": s.rejected_empty_tools.load(Ordering::Relaxed),
         "max_concurrent": st.args.max_concurrent,
     }))
 }
