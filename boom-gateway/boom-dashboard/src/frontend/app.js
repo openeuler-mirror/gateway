@@ -1817,8 +1817,8 @@
       [t("keyinfo.alias"), info.key_alias || "-"],
       [t("keyinfo.token"), info.token_prefix],
       [t("keyinfo.name"), info.key_name || "-"],
-      [t("keyinfo.spend"), "¥" + (info.spend || 0).toFixed(4)],
-      [t("keyinfo.max_budget"), info.max_budget != null ? "¥" + info.max_budget : t("common.unlimited")],
+      [t("keyinfo.spend"), fmtCost(info.spend)],
+      [t("keyinfo.max_budget"), info.max_budget != null ? fmtCost(info.max_budget) : t("common.unlimited")],
       [t("keyinfo.blocked"), info.blocked ? t("common.yes") : t("common.no")],
       [t("keyinfo.expires"), info.expires || t("common.never")],
       [t("keyinfo.created"), info.created_at || "-"],
@@ -2069,12 +2069,6 @@
       if (v >= 1e6) return (v / 1e6).toFixed(2) + "M";
       if (v >= 1e3) return (v / 1e3).toFixed(2) + "K";
       return String(v);
-    };
-    const fmtCost = (s) => {
-      const v = Number(s) || 0;
-      if (v >= 1) return "¥" + v.toFixed(2);
-      if (v > 0) return "¥" + v.toFixed(4);
-      return "¥0";
     };
     wrap.innerHTML = `<table>
       <tr><th>${t("keys.col.token")}</th><th>${t("keys.col.alias")}</th><th>${t("keys.col.user")}</th><th>${t("keys.col.plan")}</th><th>${t("keys.col.usage")}</th><th>${t("keys.col.spend")}</th><th>${t("keys.col.budget")}</th><th>${t("keys.col.status")}</th><th>${t("keys.col.actions")}</th></tr>
@@ -5264,6 +5258,17 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
     if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + "M";
     if (n >= 1_000) return (n / 1_000).toFixed(1) + "K";
     return String(n);
+  }
+
+  // Cost formatter — accepts Number or String (backend sends spend/total_cost
+  // as Decimal.to_string() to preserve precision; we parse back to Number here
+  // for display. Values >= ¥1 use 2dp; smaller positive values use 4dp so
+  // sub-cent usage still shows meaningful digits.)
+  function fmtCost(s) {
+    const v = Number(s) || 0;
+    if (v >= 1) return "¥" + v.toFixed(2);
+    if (v > 0) return "¥" + v.toFixed(4);
+    return "¥0";
   }
 
   function formatTimestamp(iso) {
