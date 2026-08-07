@@ -4501,7 +4501,7 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
     `, { xwide: true });
     getModelNames().then((names) => {
       const container = document.getElementById("m-team-models-combo");
-      if (container) initModelCombo(container, p.models || [], names);
+      if (container) initModelCombo(container, p.models || [], names, true);
     });
     getTeamPlanNames().then((names) => {
       const sel = document.getElementById("m-team-plan");
@@ -4520,7 +4520,10 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
         const body = {
           team_id: document.getElementById("m-team-id").value.trim(),
           team_alias: document.getElementById("m-team-alias").value.trim() || null,
-          models: modelsVal || ["all-team-models"],
+          // Team full-access submits `[]` (empty array) per litellm semantic.
+          // Legacy rows with ["all-team-models"] still render as full-access
+          // via renderTeamModels/formatTeamModels — no migration needed.
+          models: modelsVal || [],
         };
         const selectedPlan = document.getElementById("m-team-plan").value;
         if (p.team_id) {
@@ -5048,15 +5051,18 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
   // - Individual model checkboxes for fine-grained control
   // - Shows currently selected models in a display area
 
-  function initModelCombo(container, existingModels, allNames) {
+  function initModelCombo(container, existingModels, allNames, isTeam = false) {
     const checked = new Set(existingModels || []);
     const isFullAccess = checked.size === 0 || checked.has("all-team-models");
+    // Key form: "all-team-models" is litellm semantic (inherit team's models).
+    // Team form: full-access is stored as empty array — show generic label.
+    const fullAccessLabel = isTeam ? t("plans.team_full_access") : t("plans.full_access");
 
     // Build HTML
     container.innerHTML = `
-      <div class="mcc-display">${isFullAccess ? t("plans.full_access") : (existingModels || []).map((m) => esc(m)).join(", ") || t("plans.no_models")}</div>
+      <div class="mcc-display">${isFullAccess ? fullAccessLabel : (existingModels || []).map((m) => esc(m)).join(", ") || t("plans.no_models")}</div>
       <div class="mcc-dropdown hidden">
-        <label class="mcc-item mcc-item-all"><input type="checkbox" value="all-team-models" ${isFullAccess ? "checked" : ""}> ${t("plans.full_access")}</label>
+        <label class="mcc-item mcc-item-all"><input type="checkbox" value="all-team-models" ${isFullAccess ? "checked" : ""}> ${fullAccessLabel}</label>
         <div class="mcc-divider"></div>
         ${allNames.map((n) => `<label class="mcc-item"><input type="checkbox" value="${esc(n)}" ${!isFullAccess && checked.has(n) ? "checked" : ""}> ${esc(n)}</label>`).join("")}
       </div>
@@ -5113,7 +5119,7 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
 
     function refreshDisplay() {
       if (allCb.checked) {
-        display.textContent = t("plans.full_access");
+        display.textContent = fullAccessLabel;
       } else {
         const selected = Array.from(modelCbs).filter((c) => c.checked).map((c) => c.value);
         display.textContent = selected.length > 0 ? selected.join(", ") : t("plans.no_models_selected");

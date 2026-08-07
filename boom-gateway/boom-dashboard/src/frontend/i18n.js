@@ -201,6 +201,7 @@
       "plans.col.schedule": "Schedule",
       "plans.empty": "No plans found.",
       "plans.full_access": "all-team-models (Full Access)",
+      "plans.team_full_access": "Full Access (All Models)",
       "plans.no_models": "No models",
       "plans.no_models_selected": "No models selected",
       "plans.using_default": "No plan assigned. Using default limits.",
@@ -640,7 +641,7 @@
       "tip.team.id": "Unique identifier for this team. Cannot be changed after creation.",
       "tip.team.alias": "Display name for this team. Can be non-unique.",
       "tip.team.plan": "Pick a type=team plan, or leave on default to fall back to default_team_plan (YAML-configured).",
-      "tip.team.models": "Select model access for this team. Check 'all-team-models' for full access to all current and future models, or pick specific models.",
+      "tip.team.models": "Select model access for this team. Check 'Full Access' for unrestricted access to all current and future models, or pick specific models. Stored as empty array in DB.",
 
       "keys.col.usage": "Usage (count/tokens/cost)",
       "keys.col.reset": "Reset",
@@ -983,6 +984,7 @@
       "plans.col.schedule": "时段",
       "plans.empty": "未找到套餐。",
       "plans.full_access": "all-team-models（全部访问）",
+      "plans.team_full_access": "全部访问（所有模型）",
       "plans.no_models": "无模型",
       "plans.no_models_selected": "未选择模型",
       "plans.using_default": "未分配套餐，使用默认限制。",
@@ -1422,7 +1424,7 @@
       "tip.team.id": "团队唯一标识,创建后不可修改。",
       "tip.team.alias": "团队显示名,可以不唯一。",
       "tip.team.plan": "选一个 type=team 的套餐;留默认则回退到 default_team_plan(YAML 配置)。",
-      "tip.team.models": "选择团队的模型权限。勾选 'all-team-models' 表示对当前和未来模型都有全权限;或勾选具体模型。",
+      "tip.team.models": "选择团队的模型权限。勾选\"全部访问\"表示对当前和未来模型都有全权限(数据库存空数组);或勾选具体模型。",
 
       "keys.col.usage": "用量(次数/token/计费)",
       "keys.col.reset": "重置",
