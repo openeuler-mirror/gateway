@@ -347,6 +347,78 @@ pub fn log_error(
     );
 }
 
+/// Log an auth-phase error from the extractor, before `AuthIdentity` exists.
+///
+/// Constructs a minimal identity keyed by `hash_token(raw_key)` — enough to
+/// populate `boom_request_log` (whose `key_hash` column is NOT NULL) and to
+/// drive `REJECTION_DEDUP` for `KeyExpired` / `KeyBlocked` / `BudgetExceeded`.
+///
+/// `AuthError` (401) is **not** deduped — every auth failure is logged in
+/// full for security visibility. The `model` column is filled with the
+/// placeholder `"<auth>"` because the request hasn't been routed yet and
+/// the real model is unknown.
+///
+/// `raw_key` is the original key string the client sent (before any
+/// `pre_auth` hook replacement). Hashing it here is consistent with
+/// `DbAuthenticator::hash_token`, so dedup keys line up with the
+/// in-DB `key_hash` column for the same key.
+pub fn log_auth_error(
+    state: &AppState,
+    raw_key: &str,
+    api_path: &str,
+    start: Instant,
+    error: &GatewayError,
+    request_id: Option<String>,
+    client_ip: Option<String>,
+) {
+    let key_hash = boom_auth::DbAuthenticator::hash_token(raw_key);
+    let identity = AuthIdentity {
+        key_hash,
+        key_name: None,
+        key_alias: None,
+        user_id: None,
+        team_id: None,
+        team_alias: None,
+        models: vec![],
+        team_models: vec![],
+        rpm_limit: None,
+        tpm_limit: None,
+        max_budget: None,
+        spend: 0.0,
+        blocked: false,
+        expires_at: None,
+        metadata: serde_json::Value::Null,
+    };
+
+    log_error_with_usage(
+        state,
+        &identity,
+        "<auth>",
+        api_path,
+        false,
+        start,
+        error,
+        request_id,
+        None,
+        None,
+        client_ip,
+        None,
+    );
+
+    // AuthError (401) is not a dedup member, so log_error_with_usage does
+    // not emit a tracing line for it — emit one here so failed auth shows
+    // up in the console log unconditionally.
+    if matches!(error, GatewayError::AuthError(_)) {
+        tracing::warn!(
+            status_code = error.status_code(),
+            error_type = error.error_type(),
+            key_hash = %identity.key_hash,
+            "{:.80}",
+            error.to_string()
+        );
+    }
+}
+
 /// Error logging variant for composite providers that may have completed
 /// successful child calls before the parent request failed.
 pub fn log_error_with_usage(
@@ -363,7 +435,7 @@ pub fn log_error_with_usage(
     client_ip: Option<String>,
     usage: Option<&Usage>,
 ) {
-    if !error.should_log_to_db() {
+    if error.should_dedup_log() {
         let dedup_key = format!("{}:{}:{}", error.error_type(), identity.key_hash, model);
         if REJECTION_DEDUP.get(&dedup_key).is_some() {
             // Deduplicated — skip both DB log and console output.

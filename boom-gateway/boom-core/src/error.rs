@@ -112,6 +112,32 @@ impl GatewayError {
         )
     }
 
+    /// Whether this error should be deduplicated per `(key_hash, model, 60s)`
+    /// before being logged (tracing + DB).
+    ///
+    /// Covers expected rejections (rate-limit / concurrency / budget /
+    /// flow-control) AND not-found / not-allowed / expired / blocked —
+    /// clients hitting the same wall retry repeatedly, so logging every
+    /// attempt produces log spam and DB bloat without adding signal.
+    ///
+    /// `AuthError` (401) is NOT here: failed auth is a security signal we
+    /// want in full. `UpstreamError` / `ProviderError` / `ConfigError` /
+    /// `InternalError` are not here either — they reflect per-request
+    /// upstream behavior, not repeated client rejections.
+    pub fn should_dedup_log(&self) -> bool {
+        matches!(
+            self,
+            Self::RateLimitExceeded { .. }
+                | Self::ConcurrencyExceeded { .. }
+                | Self::BudgetExceeded
+                | Self::FlowControlQueueTimeout { .. }
+                | Self::ModelNotFound(_)
+                | Self::ModelNotAllowed(_)
+                | Self::KeyExpired
+                | Self::KeyBlocked
+        )
+    }
+
     /// Whether this error represents a deterministic deployment failure
     /// (unreachable upstream or authentication failure) that will not self-heal.
     pub fn is_deployment_failure(&self) -> bool {
@@ -140,6 +166,85 @@ impl GatewayError {
             Self::ProviderError(_) => "provider_error",
             Self::FlowControlQueueTimeout { .. } => "flow_control_timeout",
             Self::ConfigError(_) | Self::InternalError(_) => "internal_error",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rl() -> GatewayError {
+        GatewayError::RateLimitExceeded {
+            retry_after_secs: None,
+            message: "rpm".into(),
+            limit_type: "rpm_limit",
+            scope: Some("key"),
+            scope_id: None,
+            plan_name: None,
+        }
+    }
+    fn cc() -> GatewayError {
+        GatewayError::ConcurrencyExceeded { limit: 1, message: "x".into() }
+    }
+    fn fc() -> GatewayError {
+        GatewayError::FlowControlQueueTimeout {
+            deployment_id: "d".into(),
+            waiters: 0,
+            message: "x".into(),
+        }
+    }
+
+    #[test]
+    fn should_dedup_log_membership() {
+        // Dedup members — repeated client rejections.
+        assert!(rl().should_dedup_log());
+        assert!(cc().should_dedup_log());
+        assert!(GatewayError::BudgetExceeded.should_dedup_log());
+        assert!(fc().should_dedup_log());
+        assert!(GatewayError::ModelNotFound("gpt-x".into()).should_dedup_log());
+        assert!(GatewayError::ModelNotAllowed("gpt-x".into()).should_dedup_log());
+        assert!(GatewayError::KeyExpired.should_dedup_log());
+        assert!(GatewayError::KeyBlocked.should_dedup_log());
+
+        // Non-members — keep full per-request logging.
+        assert!(!GatewayError::AuthError("bad key".into()).should_dedup_log());
+        assert!(!GatewayError::ProviderError("upstream".into()).should_dedup_log());
+        assert!(!GatewayError::UpstreamTimeout.should_dedup_log());
+        assert!(!GatewayError::UpstreamError { status: 500, message: "x".into() }.should_dedup_log());
+        assert!(!GatewayError::ConfigError("cfg".into()).should_dedup_log());
+        assert!(!GatewayError::InternalError("boom".into()).should_dedup_log());
+        assert!(!GatewayError::NotSupported("embeddings".into()).should_dedup_log());
+        assert!(!GatewayError::UnsupportedMode("x".into()).should_dedup_log());
+    }
+
+    /// `should_dedup_log` is a strict superset of `!should_log_to_db` —
+    /// everything that was deduped before stays deduped, plus the four
+    /// new client-rejection variants.
+    #[test]
+    fn dedup_log_superset_of_not_log_to_db() {
+        let non_db = [
+            rl(),
+            cc(),
+            GatewayError::BudgetExceeded,
+            fc(),
+        ];
+        for e in non_db {
+            assert!(e.should_dedup_log(), "{:?} should remain deduped", e);
+            assert!(!e.should_log_to_db());
+        }
+        let new_dedup = [
+            GatewayError::ModelNotFound("gpt-x".into()),
+            GatewayError::ModelNotAllowed("gpt-x".into()),
+            GatewayError::KeyExpired,
+            GatewayError::KeyBlocked,
+        ];
+        for e in new_dedup {
+            assert!(e.should_dedup_log(), "{:?} should be deduped", e);
+            // These still "should log to DB" in the sense that the first
+            // occurrence within a window writes to DB — dedup happens
+            // upstream of the DB write.
+            assert!(e.should_log_to_db());
         }
     }
 }

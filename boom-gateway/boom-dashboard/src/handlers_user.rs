@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 use crate::auth::DashboardSession;
 use crate::state::DashboardState;
 use boom_flowcontrol::UserRequestStage;
+use boom_limiter::RateLimitPlan;
 
 // ── GET /dashboard/api/user/plan ───────────────────────────
 
@@ -17,11 +18,29 @@ pub async fn get_plan(
 ) -> Json<Value> {
     let key_hash = &session.claims.key_hash;
 
-    // Resolve plan: explicit assignment → default plan → null.
-    let plan = state
-        .plan_store
-        .resolve_plan(key_hash)
-        .or_else(|| state.plan_store.get_default_plan());
+    // Three-state resolution (mirrors routes.rs check_plan_limits):
+    //   None              → key never configured → fall back to default_plan
+    //   Some(None)        → user explicitly chose "no plan" → NO default fallback,
+    //                       return plan_name=null so the dashboard can show the
+    //                       "explicit no-plan" state instead of the default's name
+    //   Some(Some(name))  → user explicitly assigned plan `name`
+    let plan: Option<RateLimitPlan> = match state.plan_store.get_plan_name_explicit(key_hash) {
+        None => state.plan_store.get_default_plan(),
+        Some(None) => None,
+        Some(Some(plan_name)) => match state.plan_store.get_plan(&plan_name) {
+            Some(p) if p.r#type == boom_core::types::PlanType::Team => {
+                tracing::warn!(
+                    key_hash = %key_hash,
+                    plan = %p.name,
+                    "Key is assigned a type=team plan — falling back to default_plan. \
+                     Team plans cannot be assigned to individual keys."
+                );
+                state.plan_store.get_default_plan()
+            }
+            Some(p) => Some(p),
+            None => state.plan_store.get_default_plan(),
+        },
+    };
 
     match plan {
         Some(p) => {
@@ -53,13 +72,24 @@ pub async fn get_plan(
                 "schedule": p.schedule,
             }))
         }
-        None => Json(json!({
-            "plan_name": null,
-            "concurrency_limit": null,
-            "rpm_limit": null,
-            "window_limits": [],
-            "schedule": [],
-        })),
+        None => {
+            // Distinguish "explicit no-plan" (Some(None)) from "no assignment row"
+            // (None). The former opts out of plan-based limits on purpose and
+            // must NOT be presented to the user as "using default limits" —
+            // the dashboard shows "no plan" instead.
+            let explicit_no_plan = matches!(
+                state.plan_store.get_plan_name_explicit(key_hash),
+                Some(None)
+            );
+            Json(json!({
+                "plan_name": null,
+                "is_explicit_no_plan": explicit_no_plan,
+                "concurrency_limit": null,
+                "rpm_limit": null,
+                "window_limits": [],
+                "schedule": [],
+            }))
+        }
     }
 }
 
@@ -71,11 +101,28 @@ pub async fn get_usage(
 ) -> Json<Value> {
     let key_hash = &session.claims.key_hash;
 
-    // Resolve plan limits for this key.
-    let plan = state
-        .plan_store
-        .resolve_plan(key_hash)
-        .or_else(|| state.plan_store.get_default_plan());
+    // Three-state resolution (mirrors get_plan above and routes.rs
+    // check_plan_limits): "explicit no plan" must NOT fold into default_plan,
+    // otherwise the user dashboard would display default-plan limits as if
+    // they applied to a key that has explicitly opted out of plan-based
+    // limits.
+    let plan: Option<RateLimitPlan> = match state.plan_store.get_plan_name_explicit(key_hash) {
+        None => state.plan_store.get_default_plan(),
+        Some(None) => None,
+        Some(Some(plan_name)) => match state.plan_store.get_plan(&plan_name) {
+            Some(p) if p.r#type == boom_core::types::PlanType::Team => {
+                tracing::warn!(
+                    key_hash = %key_hash,
+                    plan = %p.name,
+                    "Key is assigned a type=team plan — falling back to default_plan. \
+                     Team plans cannot be assigned to individual keys."
+                );
+                state.plan_store.get_default_plan()
+            }
+            Some(p) => Some(p),
+            None => state.plan_store.get_default_plan(),
+        },
+    };
     let (plan_concurrency, plan_window_limits, _) = plan
         .as_ref()
         .map(|p| p.effective_limits())

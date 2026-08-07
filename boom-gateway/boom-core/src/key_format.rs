@@ -8,10 +8,10 @@
 
 /// Validate that a candidate prefix string is acceptable for a new key.
 ///
-/// ASCII alphanumeric (uppercase allowed), 1–8 chars. Used by dashboard
+/// ASCII alphanumeric (uppercase allowed), 1–50 chars. Used by dashboard
 /// key-creation handlers to reject invalid prefixes with a 400.
 pub fn is_valid_prefix(p: &str) -> bool {
-    (1..=8).contains(&p.len()) && p.chars().all(|c| c.is_ascii_alphanumeric())
+    (1..=50).contains(&p.len()) && p.chars().all(|c| c.is_ascii_alphanumeric())
 }
 
 #[cfg(test)]
@@ -25,11 +25,12 @@ mod tests {
         assert!(is_valid_prefix("abc123"));
         assert!(is_valid_prefix("TeamA"));
         assert!(is_valid_prefix(&"a".repeat(8)));
+        assert!(is_valid_prefix(&"a".repeat(50)));
     }
 
     #[test]
     fn is_valid_prefix_rejects_illegal_prefixes() {
-        assert!(!is_valid_prefix(&"a".repeat(9)));
+        assert!(!is_valid_prefix(&"a".repeat(51)));
         assert!(!is_valid_prefix(""));
         assert!(!is_valid_prefix("team_a"));
         assert!(!is_valid_prefix("team.a"));

@@ -70,7 +70,7 @@ fn validate_prefix_and_tag(req: &CreateKeyRequest) -> Option<Response> {
             return Some((
                 axum::http::StatusCode::BAD_REQUEST,
                 format!(
-                    "Invalid key_prefix '{}': must be 1-8 ASCII alphanumeric chars [a-zA-Z0-9]",
+                    "Invalid key_prefix '{}': must be 1-50 ASCII alphanumeric chars [a-zA-Z0-9]",
                     p
                 ),
             )
@@ -2427,12 +2427,10 @@ pub async fn create_team(
         return (axum::http::StatusCode::BAD_REQUEST, "team_id is required").into_response();
     }
 
-    // Normalize: if models contains "all-team-models", treat as full access.
-    let models = if req.models.iter().any(|m| m == "all-team-models") {
-        vec!["all-team-models".to_string()]
-    } else {
-        req.models
-    };
+    // team full-access is now stored as `[]` (empty array) per litellm semantic.
+    // Legacy rows with ["all-team-models"] still render as full-access via
+    // renderTeamModels/formatTeamModels — no migration needed.
+    let models = req.models;
 
     let result = sqlx::query(
         r#"INSERT INTO boom_team_table (team_id, team_alias, models, created_at, updated_at)
@@ -2483,14 +2481,10 @@ pub async fn update_team(
         None => return Json(json!({"error": "Database not available"})).into_response(),
     };
 
-    // Normalize models if provided.
-    let models = req.models.map(|ms| {
-        if ms.iter().any(|m| m == "all-team-models") {
-            vec!["all-team-models".to_string()]
-        } else {
-            ms
-        }
-    });
+    // team full-access is now stored as `[]` (empty array) per litellm semantic.
+    // No normalize needed — frontend submit [] for full access; legacy rows
+    // with ["all-team-models"] render correctly via renderTeamModels.
+    let models = req.models;
 
     let result = sqlx::query(
         r#"UPDATE boom_team_table

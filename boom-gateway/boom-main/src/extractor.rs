@@ -1,10 +1,13 @@
 use crate::hooks::PreAuthOutcome;
-use crate::routes::GatewayErrorReply;
+use crate::request_log::log_auth_error;
+use crate::routes::{extract_client_ip, GatewayErrorReply};
 use crate::state::AppState;
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
 use boom_core::types::AuthIdentity;
 use boom_core::GatewayError;
+use std::time::Instant;
+use uuid::Uuid;
 
 /// Axum extractor that validates API key from the Authorization header.
 pub struct RequiredAuth {
@@ -29,11 +32,29 @@ impl FromRequestParts<AppState> for RequiredAuth {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
+        let start = Instant::now();
+        let api_path = parts.uri.path().to_string();
+        let client_ip = Some(extract_client_ip(&parts.headers, None));
         let raw_key = extract_api_key(parts);
 
-        let raw_key = raw_key.ok_or_else(|| {
-            GatewayErrorReply(GatewayError::AuthError("Missing API key".to_string()), false)
-        })?;
+        let raw_key = match raw_key {
+            Some(k) => k,
+            None => {
+                // No key at all — can't compute a stable hash, so we can't
+                // write to boom_request_log (key_hash is NOT NULL). Surface
+                // via tracing only.
+                tracing::warn!(
+                    status_code = 401,
+                    error_type = "authentication_error",
+                    path = %api_path,
+                    "Missing API key"
+                );
+                return Err(GatewayErrorReply(
+                    GatewayError::AuthError("Missing API key".to_string()),
+                    false,
+                ));
+            }
+        };
 
         let inner = state.inner.load();
 
@@ -47,24 +68,54 @@ impl FromRequestParts<AppState> for RequiredAuth {
             PreAuthOutcome::NoHook | PreAuthOutcome::Continue => raw_key,
             PreAuthOutcome::Replace(new_key) => new_key,
             PreAuthOutcome::Reject(reason) => {
-                return Err(GatewayErrorReply(
-                    GatewayError::AuthError(reason),
-                    false,
-                ));
+                let err = GatewayError::AuthError(reason);
+                log_auth_error(
+                    state,
+                    &raw_key,
+                    &api_path,
+                    start,
+                    &err,
+                    Some(Uuid::new_v4().to_string()),
+                    client_ip.clone(),
+                );
+                return Err(GatewayErrorReply(err, false));
             }
             PreAuthOutcome::Deny => {
-                return Err(GatewayErrorReply(
-                    GatewayError::InternalError("pre_auth hook failure (deny mode)".into()),
-                    false,
-                ));
+                let err = GatewayError::InternalError("pre_auth hook failure (deny mode)".into());
+                log_auth_error(
+                    state,
+                    &raw_key,
+                    &api_path,
+                    start,
+                    &err,
+                    Some(Uuid::new_v4().to_string()),
+                    client_ip.clone(),
+                );
+                return Err(GatewayErrorReply(err, false));
             }
         };
 
-        let identity = inner
-            .auth
-            .authenticate(&effective_key)
-            .await
-            .map_err(|e| GatewayErrorReply(e, false))?;
+        let identity = match inner.auth.authenticate(&effective_key).await {
+            Ok(id) => id,
+            Err(e) => {
+                // KeyExpired / KeyBlocked / BudgetExceeded are deduped per
+                // (key_hash, "<auth>", 60s); AuthError (401) is logged in
+                // full. hash_token(effective_key) gives a stable key_hash
+                // matching the DB's token column when no hook replaced the
+                // key; with a Replace hook, the hash is of the replaced
+                // key, which is what the authenticator actually saw.
+                log_auth_error(
+                    state,
+                    &effective_key,
+                    &api_path,
+                    start,
+                    &e,
+                    Some(Uuid::new_v4().to_string()),
+                    client_ip.clone(),
+                );
+                return Err(GatewayErrorReply(e, false));
+            }
+        };
 
         Ok(Self { identity })
     }

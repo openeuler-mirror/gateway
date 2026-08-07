@@ -1569,25 +1569,50 @@
 
   window._loadUserLogsPage = (p) => loadUserLogs(p);
   async function loadUserData() {
+    // Each panel is fetched independently so a single failing endpoint
+    // (e.g. /user/usage throwing on a stale limiter state) doesn't strand
+    // the other two panels in their initial "Loading..." state.
     try {
-      const [plan, usage, keyInfo] = await Promise.all([
-        api("/user/plan"),
-        api("/user/usage"),
-        api("/user/key-info"),
-      ]);
+      const plan = await api("/user/plan");
       renderPlan(plan);
+    } catch (err) {
+      console.error("Failed to load user plan:", err);
+      const el = document.getElementById("plan-info");
+      if (el) el.innerHTML = '<p class="error">' + esc(String(err)) + '</p>';
+    }
+    try {
+      const usage = await api("/user/usage");
       renderUsage(usage);
+    } catch (err) {
+      console.error("Failed to load user usage:", err);
+      const el = document.getElementById("usage-info");
+      if (el) el.innerHTML = '<p class="error">' + esc(String(err)) + '</p>';
+    }
+    try {
+      const keyInfo = await api("/user/key-info");
       renderTokenInfo(keyInfo);
       renderKeyInfo(keyInfo);
     } catch (err) {
-      console.error("Failed to load user data:", err);
+      console.error("Failed to load key info:", err);
+      const el = document.getElementById("key-info");
+      if (el) el.innerHTML = '<p class="error">' + esc(String(err)) + '</p>';
+      const tEl = document.getElementById("token-info");
+      if (tEl) tEl.innerHTML = '<p class="error">' + esc(String(err)) + '</p>';
     }
   }
 
   function renderPlan(plan) {
     const el = document.getElementById("plan-info");
     if (!plan.plan_name) {
-      el.innerHTML = "<p>" + t("plans.using_default") + "</p>";
+      // Backend distinguishes "no assignment row" (None → falls back to
+      // default_plan at runtime, surfaced above as plan_name=...default's
+      // name) from "explicit no-plan" (Some(None) → opts out of plan-based
+      // limits, no default fallback). Show a distinct label for the latter
+      // so users know they actively chose no plan, not "default applied".
+      const label = plan.is_explicit_no_plan
+        ? t("keys.plan.no_plan")
+        : t("plans.using_default");
+      el.innerHTML = "<p>" + label + "</p>";
       return;
     }
     const limits = [];
@@ -1800,8 +1825,8 @@
       [t("keyinfo.alias"), info.key_alias || "-"],
       [t("keyinfo.token"), info.token_prefix],
       [t("keyinfo.name"), info.key_name || "-"],
-      [t("keyinfo.spend"), "¥" + (info.spend || 0).toFixed(4)],
-      [t("keyinfo.max_budget"), info.max_budget != null ? "¥" + info.max_budget : t("common.unlimited")],
+      [t("keyinfo.spend"), fmtCost(info.spend)],
+      [t("keyinfo.max_budget"), info.max_budget != null ? fmtCost(info.max_budget) : t("common.unlimited")],
       [t("keyinfo.blocked"), info.blocked ? t("common.yes") : t("common.no")],
       [t("keyinfo.expires"), info.expires || t("common.never")],
       [t("keyinfo.created"), info.created_at || "-"],
@@ -2052,12 +2077,6 @@
       if (v >= 1e6) return (v / 1e6).toFixed(2) + "M";
       if (v >= 1e3) return (v / 1e3).toFixed(2) + "K";
       return String(v);
-    };
-    const fmtCost = (s) => {
-      const v = Number(s) || 0;
-      if (v >= 1) return "¥" + v.toFixed(2);
-      if (v > 0) return "¥" + v.toFixed(4);
-      return "¥0";
     };
     wrap.innerHTML = `<table>
       <tr><th>${t("keys.col.token")}</th><th>${t("keys.col.alias")}</th><th>${t("keys.col.user")}</th><th>${t("keys.col.plan")}</th><th>${t("keys.col.usage")}</th><th>${t("keys.col.spend")}</th><th>${t("keys.col.budget")}</th><th>${t("keys.col.status")}</th><th>${t("keys.col.actions")}</th></tr>
@@ -3064,7 +3083,7 @@
         <div class="modal-actions">
           <button class="btn-secondary btn-inline" onclick="hideModal()">${t("action.close")}</button>
         </div>
-      `);
+      `, { xwide: true });
     } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
   }
 
@@ -3548,7 +3567,7 @@
           <div class="form-card-title">${t("key_card.basic")}</div>
           <div class="form-card-grid">
             <div class="form-group"><label>${t("form.key.alias")} ${tip(t("tip.key.alias"))}</label><input id="m-key-alias"></div>
-            <div class="form-group"><label>${t("form.key.prefix")} ${tip(t("tip.key.prefix"))}</label><input id="m-key-prefix" placeholder="e.g. prod, TeamA, v2" pattern="[a-zA-Z0-9]{1,8}" maxlength="8"></div>
+            <div class="form-group"><label>${t("form.key.prefix")} ${tip(t("tip.key.prefix"))}</label><input id="m-key-prefix" placeholder="e.g. prod, TeamA, v2" pattern="[a-zA-Z0-9]{1,50}" maxlength="50"></div>
             <div class="form-group"><label>${t("form.key.tag")} ${tip(t("tip.key.tag"))}</label><input id="m-key-tag" placeholder="e.g. production, customer-acme, exp-2026Q1" maxlength="64"></div>
             <div class="form-group"><label>${t("form.key.user_id")} ${tip(t("tip.key.user_id"))}</label><input id="m-key-user"></div>
           </div>
@@ -3676,7 +3695,7 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
       <div class="modal-actions">
         <button class="btn-primary" onclick="hideModal()">${t("action.close")}</button>
       </div>
-    `);
+    `, { xwide: true });
   }
 
   function showImportKeysModal() {
@@ -3695,7 +3714,7 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
         <button class="btn-secondary btn-inline" onclick="hideModal()">${t("action.cancel")}</button>
         <button class="btn-primary" id="m-import-submit">${t("keys.import.submit")}</button>
       </div>
-    `);
+    `, { xwide: true });
     document.getElementById("m-import-submit").addEventListener("click", async () => {
       const fileInput = document.getElementById("m-import-file");
       const file = fileInput && fileInput.files && fileInput.files[0];
@@ -3778,7 +3797,7 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
       <div class="modal-actions">
         <button class="btn-primary" onclick="hideModal(); window._loadKeysPage();">${t("action.done")}</button>
       </div>
-    `);
+    `, { xwide: true });
     if (dl && dl.content) {
       const btn = document.getElementById("m-import-download");
       if (btn) btn.addEventListener("click", () => {
@@ -4484,7 +4503,7 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
     `, { xwide: true });
     getModelNames().then((names) => {
       const container = document.getElementById("m-team-models-combo");
-      if (container) initModelCombo(container, p.models || [], names);
+      if (container) initModelCombo(container, p.models || [], names, true);
     });
     getTeamPlanNames().then((names) => {
       const sel = document.getElementById("m-team-plan");
@@ -4503,7 +4522,10 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
         const body = {
           team_id: document.getElementById("m-team-id").value.trim(),
           team_alias: document.getElementById("m-team-alias").value.trim() || null,
-          models: modelsVal || ["all-team-models"],
+          // Team full-access submits `[]` (empty array) per litellm semantic.
+          // Legacy rows with ["all-team-models"] still render as full-access
+          // via renderTeamModels/formatTeamModels — no migration needed.
+          models: modelsVal || [],
         };
         const selectedPlan = document.getElementById("m-team-plan").value;
         if (p.team_id) {
@@ -5031,15 +5053,18 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
   // - Individual model checkboxes for fine-grained control
   // - Shows currently selected models in a display area
 
-  function initModelCombo(container, existingModels, allNames) {
+  function initModelCombo(container, existingModels, allNames, isTeam = false) {
     const checked = new Set(existingModels || []);
     const isFullAccess = checked.size === 0 || checked.has("all-team-models");
+    // Key form: "all-team-models" is litellm semantic (inherit team's models).
+    // Team form: full-access is stored as empty array — show generic label.
+    const fullAccessLabel = isTeam ? t("plans.team_full_access") : t("plans.full_access");
 
     // Build HTML
     container.innerHTML = `
-      <div class="mcc-display">${isFullAccess ? t("plans.full_access") : (existingModels || []).map((m) => esc(m)).join(", ") || t("plans.no_models")}</div>
+      <div class="mcc-display">${isFullAccess ? fullAccessLabel : (existingModels || []).map((m) => esc(m)).join(", ") || t("plans.no_models")}</div>
       <div class="mcc-dropdown hidden">
-        <label class="mcc-item mcc-item-all"><input type="checkbox" value="all-team-models" ${isFullAccess ? "checked" : ""}> ${t("plans.full_access")}</label>
+        <label class="mcc-item mcc-item-all"><input type="checkbox" value="all-team-models" ${isFullAccess ? "checked" : ""}> ${fullAccessLabel}</label>
         <div class="mcc-divider"></div>
         ${allNames.map((n) => `<label class="mcc-item"><input type="checkbox" value="${esc(n)}" ${!isFullAccess && checked.has(n) ? "checked" : ""}> ${esc(n)}</label>`).join("")}
       </div>
@@ -5096,7 +5121,7 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
 
     function refreshDisplay() {
       if (allCb.checked) {
-        display.textContent = t("plans.full_access");
+        display.textContent = fullAccessLabel;
       } else {
         const selected = Array.from(modelCbs).filter((c) => c.checked).map((c) => c.value);
         display.textContent = selected.length > 0 ? selected.join(", ") : t("plans.no_models_selected");
@@ -5241,6 +5266,17 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
     if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + "M";
     if (n >= 1_000) return (n / 1_000).toFixed(1) + "K";
     return String(n);
+  }
+
+  // Cost formatter — accepts Number or String (backend sends spend/total_cost
+  // as Decimal.to_string() to preserve precision; we parse back to Number here
+  // for display. Values >= ¥1 use 2dp; smaller positive values use 4dp so
+  // sub-cent usage still shows meaningful digits.)
+  function fmtCost(s) {
+    const v = Number(s) || 0;
+    if (v >= 1) return "¥" + v.toFixed(2);
+    if (v > 0) return "¥" + v.toFixed(4);
+    return "¥0";
   }
 
   function formatTimestamp(iso) {
