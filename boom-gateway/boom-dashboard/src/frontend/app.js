@@ -1604,7 +1604,15 @@
   function renderPlan(plan) {
     const el = document.getElementById("plan-info");
     if (!plan.plan_name) {
-      el.innerHTML = "<p>" + t("plans.using_default") + "</p>";
+      // Backend distinguishes "no assignment row" (None → falls back to
+      // default_plan at runtime, surfaced above as plan_name=...default's
+      // name) from "explicit no-plan" (Some(None) → opts out of plan-based
+      // limits, no default fallback). Show a distinct label for the latter
+      // so users know they actively chose no plan, not "default applied".
+      const label = plan.is_explicit_no_plan
+        ? t("keys.plan.no_plan")
+        : t("plans.using_default");
+      el.innerHTML = "<p>" + label + "</p>";
       return;
     }
     const limits = [];
