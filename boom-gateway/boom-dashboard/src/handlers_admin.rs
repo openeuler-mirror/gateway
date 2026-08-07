@@ -70,7 +70,7 @@ fn validate_prefix_and_tag(req: &CreateKeyRequest) -> Option<Response> {
             return Some((
                 axum::http::StatusCode::BAD_REQUEST,
                 format!(
-                    "Invalid key_prefix '{}': must be 1-8 ASCII alphanumeric chars [a-zA-Z0-9]",
+                    "Invalid key_prefix '{}': must be 1-50 ASCII alphanumeric chars [a-zA-Z0-9]",
                     p
                 ),
             )

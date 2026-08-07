@@ -3081,7 +3081,7 @@
         <div class="modal-actions">
           <button class="btn-secondary btn-inline" onclick="hideModal()">${t("action.close")}</button>
         </div>
-      `);
+      `, { xwide: true });
     } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
   }
 
@@ -3565,7 +3565,7 @@
           <div class="form-card-title">${t("key_card.basic")}</div>
           <div class="form-card-grid">
             <div class="form-group"><label>${t("form.key.alias")} ${tip(t("tip.key.alias"))}</label><input id="m-key-alias"></div>
-            <div class="form-group"><label>${t("form.key.prefix")} ${tip(t("tip.key.prefix"))}</label><input id="m-key-prefix" placeholder="e.g. prod, TeamA, v2" pattern="[a-zA-Z0-9]{1,8}" maxlength="8"></div>
+            <div class="form-group"><label>${t("form.key.prefix")} ${tip(t("tip.key.prefix"))}</label><input id="m-key-prefix" placeholder="e.g. prod, TeamA, v2" pattern="[a-zA-Z0-9]{1,50}" maxlength="50"></div>
             <div class="form-group"><label>${t("form.key.tag")} ${tip(t("tip.key.tag"))}</label><input id="m-key-tag" placeholder="e.g. production, customer-acme, exp-2026Q1" maxlength="64"></div>
             <div class="form-group"><label>${t("form.key.user_id")} ${tip(t("tip.key.user_id"))}</label><input id="m-key-user"></div>
           </div>
@@ -3693,7 +3693,7 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
       <div class="modal-actions">
         <button class="btn-primary" onclick="hideModal()">${t("action.close")}</button>
       </div>
-    `);
+    `, { xwide: true });
   }
 
   function showImportKeysModal() {
@@ -3712,7 +3712,7 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
         <button class="btn-secondary btn-inline" onclick="hideModal()">${t("action.cancel")}</button>
         <button class="btn-primary" id="m-import-submit">${t("keys.import.submit")}</button>
       </div>
-    `);
+    `, { xwide: true });
     document.getElementById("m-import-submit").addEventListener("click", async () => {
       const fileInput = document.getElementById("m-import-file");
       const file = fileInput && fileInput.files && fileInput.files[0];
@@ -3795,7 +3795,7 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
       <div class="modal-actions">
         <button class="btn-primary" onclick="hideModal(); window._loadKeysPage();">${t("action.done")}</button>
       </div>
-    `);
+    `, { xwide: true });
     if (dl && dl.content) {
       const btn = document.getElementById("m-import-download");
       if (btn) btn.addEventListener("click", () => {
