@@ -9,7 +9,6 @@ use clap::Parser;
 use futures_util::StreamExt;
 use hdrhistogram::Histogram;
 use rand::Rng;
-use rand::seq::SliceRandom;
 use serde_json::json;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -83,6 +82,7 @@ struct Args {
 struct Shared {
     client: reqwest::Client,
     keys: Vec<String>,
+    key_counts: Arc<Vec<AtomicU64>>,
     pool_bytes: Vec<u8>,
     args: Args,
 }
@@ -146,9 +146,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let pool_bytes = generate_pool();
 
+    let key_counts = Arc::new(
+        args.keys
+            .iter()
+            .map(|_| AtomicU64::new(0))
+            .collect::<Vec<_>>(),
+    );
     let shared = Arc::new(Shared {
         client,
         keys: args.keys.clone(),
+        key_counts: key_counts.clone(),
         pool_bytes,
         args: args.clone(),
     });
@@ -157,7 +164,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mode = parse_mode(&args.mode)?;
 
     let (tx, rx) = mpsc::unbounded_channel::<Outcome>();
-    let agg_handle = tokio::spawn(aggregate_stats(rx, duration, mode.clone(), args.clone()));
+    let agg_handle = tokio::spawn(aggregate_stats(
+        rx,
+        mode.clone(),
+        args.clone(),
+        key_counts,
+    ));
 
     run_load(shared, tx, duration, mode).await;
 
@@ -196,10 +208,14 @@ fn parse_mode(s: &str) -> Result<Mode, String> {
             if parts.len() != 4 {
                 return Err("ramp=FROM,TO,STEP,DURATION_SECS".into());
             }
+            let step = parts[2].parse().map_err(|_| "step not a number")?;
+            if step == 0 {
+                return Err("ramp step must be greater than zero".into());
+            }
             Ok(Mode::Ramp {
                 from: parts[0].parse().map_err(|_| "from not a number")?,
                 to: parts[1].parse().map_err(|_| "to not a number")?,
-                step: parts[2].parse().map_err(|_| "step not a number")?,
+                step,
                 step_duration: Duration::from_secs(parts[3].parse().map_err(|_| "duration not a number")?),
             })
         }
@@ -220,6 +236,7 @@ async fn run_load(
         Mode::Ramp { from, to, step, step_duration } => {
             let mut qps = from.min(to);
             let target = from.max(to);
+            let mut join = JoinSet::<()>::new();
             loop {
                 if Instant::now() >= deadline {
                     break;
@@ -227,18 +244,12 @@ async fn run_load(
                 let step_deadline = (Instant::now() + step_duration).min(deadline);
                 let step_dur = step_deadline.saturating_duration_since(Instant::now());
                 tracing::info!("ramp step: qps={} for {:?}", qps, step_dur);
-                tokio::select! {
-                    _ = run_qps(shared.clone(), tx.clone(), step_deadline, qps) => {}
-                    _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => break,
+                schedule_qps(shared.clone(), tx.clone(), step_deadline, qps, &mut join).await;
+                if qps < target {
+                    qps = (qps + step).min(target);
                 }
-                if qps >= target {
-                    break;
-                }
-                qps = (qps + step).min(target);
             }
-            // `tx` is moved into the loop on first iteration only if it's the
-            // last clone; here we never move it (always clone). Function-end
-            // drop closes the channel and unblocks the aggregator task.
+            while join.join_next().await.is_some() {}
         }
     }
     // tx is dropped here when run_load returns; aggregator sees channel close.
@@ -250,13 +261,24 @@ async fn run_qps(
     deadline: Instant,
     qps: u64,
 ) {
+    let mut join = JoinSet::<()>::new();
+    schedule_qps(shared, tx, deadline, qps, &mut join).await;
+    while join.join_next().await.is_some() {}
+}
+
+async fn schedule_qps(
+    shared: Arc<Shared>,
+    tx: mpsc::UnboundedSender<Outcome>,
+    deadline: Instant,
+    qps: u64,
+    join: &mut JoinSet<()>,
+) {
     if qps == 0 {
         return;
     }
     let interval = Duration::from_nanos(1_000_000_000u64 / qps);
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut join = JoinSet::<()>::new();
     loop {
         tokio::select! {
             _ = ticker.tick() => {}
@@ -278,7 +300,6 @@ async fn run_qps(
             }
         }
     }
-    while join.join_next().await.is_some() {}
 }
 
 async fn run_concurrent(
@@ -309,7 +330,9 @@ async fn run_concurrent(
 async fn send_one(shared: &Shared) -> Outcome {
     SENT.fetch_add(1, Ordering::Relaxed);
 
-    let key = shared.keys.choose(&mut rand::thread_rng()).unwrap();
+    let key_index = rand::thread_rng().gen_range(0..shared.keys.len());
+    let key = &shared.keys[key_index];
+    shared.key_counts[key_index].fetch_add(1, Ordering::Relaxed);
     let prompt_len = if shared.args.prompt_min == shared.args.prompt_max {
         shared.args.prompt_min
     } else {
@@ -503,6 +526,10 @@ struct Summary {
     success_qps: f64,
     bytes_in: u64,
     bytes_out: u64,
+    keys_configured: usize,
+    keys_used: usize,
+    key_requests_min: u64,
+    key_requests_max: u64,
     ttft: Percentiles,
     e2e: Percentiles,
 }
@@ -537,15 +564,17 @@ impl Percentiles {
 
 async fn aggregate_stats(
     mut rx: mpsc::UnboundedReceiver<Outcome>,
-    duration: Duration,
     mode: Mode,
     args: Args,
+    key_counts: Arc<Vec<AtomicU64>>,
 ) -> Summary {
     let mut ttft_hist = Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).unwrap();
     let mut e2e_hist = Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).unwrap();
 
     let start = Instant::now();
-    let mut last_print = Instant::now();
+    let mut live_ticker = tokio::time::interval(Duration::from_secs(1));
+    live_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    live_ticker.tick().await;
 
     loop {
         tokio::select! {
@@ -553,15 +582,9 @@ async fn aggregate_stats(
                 let Some(outcome) = maybe_outcome else { break; };
                 record_outcome(outcome, &mut ttft_hist, &mut e2e_hist);
             }
-            _ = tokio::time::sleep(Duration::from_millis(500)) => {
-                if last_print.elapsed() >= Duration::from_secs(1) {
-                    print_live(&ttft_hist, &e2e_hist, start);
-                    last_print = Instant::now();
-                }
+            _ = live_ticker.tick() => {
+                print_live(&ttft_hist, &e2e_hist, start);
             }
-        }
-        if start.elapsed() >= duration {
-            break;
         }
     }
 
@@ -572,6 +595,10 @@ async fn aggregate_stats(
 
     let elapsed = start.elapsed().as_secs_f64().max(0.001);
     let ok = OK.load(Ordering::Relaxed);
+    let key_request_counts = key_counts
+        .iter()
+        .map(|count| count.load(Ordering::Relaxed))
+        .collect::<Vec<_>>();
     Summary {
         duration_secs: elapsed,
         mode: format!("{:?}", mode),
@@ -591,6 +618,10 @@ async fn aggregate_stats(
         success_qps: ok as f64 / elapsed,
         bytes_in: BYTES_IN.load(Ordering::Relaxed),
         bytes_out: BYTES_OUT.load(Ordering::Relaxed),
+        keys_configured: key_request_counts.len(),
+        keys_used: key_request_counts.iter().filter(|count| **count > 0).count(),
+        key_requests_min: key_request_counts.iter().copied().min().unwrap_or(0),
+        key_requests_max: key_request_counts.iter().copied().max().unwrap_or(0),
         ttft: Percentiles::from_hist(&ttft_hist),
         e2e: Percentiles::from_hist(&e2e_hist),
     }
