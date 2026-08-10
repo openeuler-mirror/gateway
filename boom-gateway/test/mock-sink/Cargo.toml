@@ -1,0 +1,26 @@
+[package]
+name = "mock-sink"
+version = "0.1.0"
+edition = "2021"
+
+# Empty [workspace] table keeps this package OUT of the parent gateway workspace
+# so `cargo build --workspace` from /Users/icecream/code/atomgit/gateway doesn't
+# compile this test tool. Build explicitly:
+#   cd boom-gateway/test/mock-sink && cargo build --release
+[workspace]
+
+[[bin]]
+name = "mock-sink"
+path = "src/main.rs"
+
+[dependencies]
+axum = { version = "0.8" }
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Must match the gateway's opentelemetry-proto version (see
+# boom-promptlog/Cargo.toml). prost must match opentelemetry-proto's
+# prost requirement — currently 0.14.
+opentelemetry-proto = { version = "0.32", features = ["gen-tonic", "logs"] }
+prost = "0.14"
