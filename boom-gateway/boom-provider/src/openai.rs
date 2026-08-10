@@ -1,4 +1,4 @@
-use boom_core::provider::Provider;
+use boom_core::provider::{Provider, ProviderProtocol};
 use boom_core::types::*;
 use boom_core::GatewayError;
 use async_trait::async_trait;
@@ -170,7 +170,14 @@ impl Provider for OpenAIProvider {
             let mut stream = resp.bytes_stream();
             let mut buffer = String::new();
 
-            while let Some(chunk_result) = stream.next().await {
+            loop {
+                let chunk_result = tokio::select! {
+                    _ = tx.closed() => return,
+                    chunk_result = stream.next() => chunk_result,
+                };
+                let Some(chunk_result) = chunk_result else {
+                    return;
+                };
                 match chunk_result {
                     Ok(bytes) => {
                         buffer.push_str(&String::from_utf8_lossy(&bytes));
@@ -227,6 +234,10 @@ impl Provider for OpenAIProvider {
 
     fn name(&self) -> &str {
         "openai"
+    }
+
+    fn protocol(&self) -> ProviderProtocol {
+        ProviderProtocol::OpenAiCompatible
     }
 
     fn models(&self) -> &[String] {

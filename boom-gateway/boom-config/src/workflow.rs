@@ -247,4 +247,5 @@ workflow_settings:
         let error = config.validate().unwrap_err().to_string();
         assert!(error.contains("panel_timeout_secs"));
     }
+
 }

@@ -5,6 +5,7 @@ use crate::types::{
 use crate::GatewayError;
 use async_trait::async_trait;
 use rust_decimal::Decimal;
+use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -94,6 +95,24 @@ fn add_optional_usage(target: &mut Option<u32>, value: Option<u32>) {
     }
 }
 
+/// Optional per-request trace owned by a provider implementation.
+///
+/// The gateway only snapshots the trace into Prompt Log. Its schema and
+/// mutation logic stay inside the provider that created it.
+pub trait ProviderPromptTrace: Send + Sync {
+    fn finalize(&self) {}
+    fn snapshot(&self) -> Option<serde_json::Value>;
+    fn as_any(&self) -> &dyn Any;
+}
+
+pub type SharedProviderPromptTrace = Arc<dyn ProviderPromptTrace>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderProtocol {
+    OpenAiCompatible,
+    Native,
+}
+
 /// Gateway context attached to a provider call after parent-request
 /// authentication and quota admission have completed.
 pub struct ProviderCallContext {
@@ -102,6 +121,7 @@ pub struct ProviderCallContext {
     pub is_vip: bool,
     pub api_path: String,
     pub billing: ProviderBilling,
+    pub prompt_trace: Option<SharedProviderPromptTrace>,
 }
 
 /// Provider trait — each LLM provider implements this.
@@ -137,8 +157,18 @@ pub trait Provider: Send + Sync + 'static {
         self.chat_stream(request).await
     }
 
+    /// Create provider-owned Prompt Log trace state for one parent request.
+    fn create_prompt_trace(&self) -> Option<SharedProviderPromptTrace> {
+        None
+    }
+
     /// Provider identifier (e.g. "openai", "anthropic").
     fn name(&self) -> &str;
+
+    /// Upstream API protocol implemented by this provider.
+    fn protocol(&self) -> ProviderProtocol {
+        ProviderProtocol::Native
+    }
 
     /// List models supported by this provider deployment.
     fn models(&self) -> &[String];

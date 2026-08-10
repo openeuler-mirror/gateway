@@ -39,6 +39,9 @@ pub struct PromptLogEntry {
     /// Full response body (non-stream) or raw SSE chunks array (stream).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response: Option<serde_json::Value>,
+    /// Internal Fusion Panel/Aggregator calls for the parent request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fusion: Option<serde_json::Value>,
     /// Raw upstream response before any gateway format conversion.
     /// Only populated when `capture_raw_upstream` is enabled and the endpoint
     /// performs format conversion (e.g., `/v1/messages`).
@@ -80,12 +83,17 @@ impl PromptLogEntry {
             headers,
             request: request_body,
             response: None,
+            fusion: None,
             raw_upstream_response: None,
         }
     }
 
     pub fn set_response(&mut self, response: serde_json::Value) {
         self.response = Some(response);
+    }
+
+    pub fn set_fusion(&mut self, fusion: serde_json::Value) {
+        self.fusion = Some(fusion);
     }
 
     pub fn set_raw_upstream_response(&mut self, raw: serde_json::Value) {
