@@ -10,6 +10,9 @@ path = "src/main.rs"
 [features]
 default = []
 debug-tools = ["boom-dashboard/debug-tools"]
+# OTLP push for prompt log entries. Off by default — flip to enable the
+# remote-collector sink in addition to the local JSONL sink.
+otlp = ["boom-promptlog/otlp"]
 
 [dependencies]
 boom-core = { path = "../boom-core" }

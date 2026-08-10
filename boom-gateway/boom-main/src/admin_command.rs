@@ -96,6 +96,13 @@ pub async fn admin_command_handler(mut rx: tokio::sync::mpsc::Receiver<AdminComm
                 });
                 let _ = reply.send(Ok(schema));
             }
+            AdminCommand::UpdatePromptLogConfig { config, reply } => {
+                // Hot-swap the live prompt-log config. The writer's
+                // `Arc<ArcSwap<_>>` makes this observable to the dashboard's
+                // `PromptLogQueryApi` handle on the next read.
+                state.prompt_log_writer.update_config(config);
+                let _ = reply.send(Ok(()));
+            }
         }
     }
     tracing::warn!("Admin command handler stopped (channel closed)");

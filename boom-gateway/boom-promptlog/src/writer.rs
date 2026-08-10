@@ -1,5 +1,7 @@
 use crate::config::PromptLogConfig;
-use crate::entry::PromptLogEntry;
+use crate::entry::{LogPhase, PromptLogEntry};
+#[cfg(feature = "otlp")]
+use crate::otlp::OtelExporter;
 use arc_swap::ArcSwap;
 use flate2::write::GzEncoder;
 use flate2::Compression;
@@ -17,23 +19,59 @@ use tokio::sync::mpsc;
 pub struct PromptLogWriter {
     config: Arc<ArcSwap<PromptLogConfig>>,
     sender: mpsc::UnboundedSender<PromptLogEntry>,
+    #[cfg(feature = "otlp")]
+    otlp: Option<Arc<OtelExporter>>,
 }
 
 impl PromptLogWriter {
-    /// Spawn the background writer task and return (writer_handle, sender).
-    ///
-    /// Boom-main keeps the writer in AppState and passes the sender to route handlers.
-    /// The sender can also be cloned freely.
+    /// Spawn the background writer with no OTLP exporter — local JSONL only.
+    /// Available regardless of feature gate. When the `otlp` feature is on
+    /// but the caller doesn't have a configured exporter, this is the right
+    /// entrypoint: it just passes `None` through to the inner writer.
     pub fn spawn(config: PromptLogConfig) -> Self {
         let config = Arc::new(ArcSwap::from_pointee(config));
         let (sender, receiver) = mpsc::unbounded_channel();
-
         let config_clone = config.clone();
+        #[cfg(feature = "otlp")]
+        let otlp: Option<Arc<OtelExporter>> = None;
+        #[cfg(feature = "otlp")]
+        let otlp_clone = otlp.clone();
         tokio::spawn(async move {
+            #[cfg(feature = "otlp")]
+            background_writer(receiver, config_clone, otlp_clone).await;
+            #[cfg(not(feature = "otlp"))]
             background_writer(receiver, config_clone).await;
         });
+        Self {
+            config,
+            sender,
+            #[cfg(feature = "otlp")]
+            otlp,
+        }
+    }
 
-        Self { config, sender }
+    /// Spawn the background writer with an OTLP exporter. Only available when
+    /// the `otlp` feature is on. Caller also typically calls
+    /// `exporter.spawn_flush_task()` to start periodic flushes.
+    #[cfg(feature = "otlp")]
+    pub fn spawn_with_otlp(config: PromptLogConfig, exporter: Arc<OtelExporter>) -> Self {
+        let config = Arc::new(ArcSwap::from_pointee(config));
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let config_clone = config.clone();
+        let exporter_clone = exporter.clone();
+        tokio::spawn(async move {
+            background_writer(receiver, config_clone, Some(exporter_clone)).await;
+        });
+        Self {
+            config,
+            sender,
+            otlp: Some(exporter),
+        }
+    }
+
+    #[cfg(not(feature = "otlp"))]
+    pub fn spawn_with_otlp(config: PromptLogConfig, _exporter: ()) -> Self {
+        Self::spawn(config)
     }
 
     /// Check if this key/team should be captured.
@@ -63,35 +101,92 @@ impl PromptLogWriter {
     pub fn config(&self) -> PromptLogConfig {
         self.config.load().as_ref().clone()
     }
+
+    /// Read-only config handle, for use by `FilePromptLogQuery`.
+    pub fn config_handle(&self) -> Arc<ArcSwap<PromptLogConfig>> {
+        self.config.clone()
+    }
+
+    /// Trigger final flush of any OTLP batch and wait for it to drain.
+    /// Called once during shutdown — best-effort, never blocks the gateway
+    /// exit longer than the configured timeout.
+    #[cfg(feature = "otlp")]
+    pub async fn shutdown_flush(&self) {
+        if let Some(exporter) = &self.otlp {
+            exporter.flush().await;
+        }
+    }
+
+    #[cfg(not(feature = "otlp"))]
+    pub async fn shutdown_flush(&self) {}
 }
 
-/// State for an open log file.
+/// State for an open log file, keyed by `(team, key_hash, phase)`.
 struct OpenFile {
     file: tokio::fs::File,
     size: u64,
     sequence: u64,
 }
 
-/// Background writer loop.
+/// Background writer loop. Each entry is written to one of two phase files
+/// (`request.jsonl` / `response.jsonl`) under `{dir}/{team}/{key_hash}/`.
+/// When the OTLP feature is on, a copy is also handed to the exporter — the
+/// local file sink is never blocked by the remote backend.
+#[cfg(feature = "otlp")]
 async fn background_writer(
-    mut receiver: mpsc::UnboundedReceiver<PromptLogEntry>,
+    receiver: mpsc::UnboundedReceiver<PromptLogEntry>,
+    config: Arc<ArcSwap<PromptLogConfig>>,
+    otlp: Option<Arc<OtelExporter>>,
+) {
+    background_writer_impl(receiver, config, otlp).await
+}
+
+#[cfg(not(feature = "otlp"))]
+async fn background_writer(
+    receiver: mpsc::UnboundedReceiver<PromptLogEntry>,
     config: Arc<ArcSwap<PromptLogConfig>>,
 ) {
-    // "{team_alias}/{key_hash}" → open file state
+    background_writer_impl(receiver, config, ()).await
+}
+
+/// Background writer body. The third argument is `Some(Arc<OtelExporter>)`
+/// when the otlp feature is on, or `()` when off — the per-call `cfg_attr`
+/// on the parameter makes the signature match either way.
+#[cfg_attr(feature = "otlp", allow(clippy::type_complexity))]
+async fn background_writer_impl(
+    mut receiver: mpsc::UnboundedReceiver<PromptLogEntry>,
+    config: Arc<ArcSwap<PromptLogConfig>>,
+    #[cfg(feature = "otlp")] otlp: Option<Arc<OtelExporter>>,
+    #[cfg(not(feature = "otlp"))] _otlp: (),
+) {
+    // "{team_alias}/{key_hash}/{phase}" → open file state
     let mut open_files: HashMap<String, OpenFile> = HashMap::new();
 
     while let Some(entry) = receiver.recv().await {
         let cfg = config.load();
         let base_dir = PathBuf::from(&cfg.dir);
         let max_bytes = cfg.max_file_size_mb * 1024 * 1024;
+        #[cfg(feature = "otlp")]
+        let max_attribute_bytes = cfg.otlp.max_attribute_bytes;
         drop(cfg); // release config guard
 
-        // Directory layout: {dir}/{team_alias}/{key_hash}/
+        // Fork to OTLP exporter first (under feature gate). Failure here must
+        // never skip the local file write — local JSONL is the source of truth.
+        #[cfg(feature = "otlp")]
+        if let Some(exporter) = &otlp {
+            exporter.enqueue(entry.clone(), max_attribute_bytes).await;
+        }
+
+        // Directory layout: {dir}/{team_alias}/{key_hash}/{phase}.jsonl
         // If no team_alias, use "_no_team" as fallback.
         let team_dir_name = entry.team_alias.as_deref().unwrap_or("_no_team");
+        let phase_name = match entry.phase {
+            LogPhase::Request => "request",
+            LogPhase::Response => "response",
+        };
         let key_dir = base_dir.join(team_dir_name).join(&entry.key_hash);
-        // Map key for open_files: use team_alias/key_hash as composite key.
-        let file_key = format!("{}/{}", team_dir_name, entry.key_hash);
+        // Map key for open_files: use team_alias/key_hash/phase as composite key.
+        let file_key = format!("{}/{}/{}", team_dir_name, entry.key_hash, phase_name);
 
         // Ensure directory exists.
         if let Err(e) = tokio::fs::create_dir_all(&key_dir).await {
@@ -109,18 +204,19 @@ async fn background_writer(
         };
         let line_bytes = json_line.len() as u64;
 
-        // Get or create open file for this team/key.
+        // Get or create open file for this team/key/phase.
         let of = match open_files.entry(file_key.clone()) {
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
             std::collections::hash_map::Entry::Vacant(e) => {
                 // Scan directory for existing files to find max sequence.
-                let (seq, stale) = find_max_sequence_and_stale(&key_dir).await;
-                let path = key_dir.join(format!("log_{:06}.jsonl", seq));
+                let (seq, stale) = find_max_sequence_and_stale(&key_dir, phase_name).await;
+                let path = key_dir.join(format!("{}_{:06}.jsonl", phase_name, seq));
 
                 // Compress stale .jsonl files left over from a crash.
                 if !stale.is_empty() {
-                    let stale_paths: Vec<PathBuf> = stale.iter()
-                        .map(|s| key_dir.join(format!("log_{:06}.jsonl", s)))
+                    let stale_paths: Vec<PathBuf> = stale
+                        .iter()
+                        .map(|s| key_dir.join(format!("{}_{:06}.jsonl", phase_name, s)))
                         .collect();
                     tokio::spawn(async move {
                         for p in stale_paths {
@@ -138,7 +234,6 @@ async fn background_writer(
                     .await
                 {
                     Ok(file) => {
-                        // Get current file size for append mode.
                         let size = match tokio::fs::metadata(&path).await {
                             Ok(m) => m.len(),
                             Err(_) => 0,
@@ -156,18 +251,18 @@ async fn background_writer(
         // Check if writing this line would exceed max file size.
         // If current file is non-empty and would overflow, rotate to a new file.
         if of.size > 0 && of.size + line_bytes > max_bytes {
-            let old_path = key_dir.join(format!("log_{:06}.jsonl", of.sequence));
+            let old_path = key_dir.join(format!("{}_{:06}.jsonl", phase_name, of.sequence));
             let new_seq = of.sequence + 1;
-            let new_path = key_dir.join(format!("log_{:06}.jsonl", new_seq));
+            let new_path = key_dir.join(format!("{}_{:06}.jsonl", phase_name, new_seq));
             match tokio::fs::File::create(&new_path).await {
                 Ok(file) => {
                     tracing::info!(
                         path = %new_path.display(),
                         key_hash = %entry.key_hash,
+                        phase = phase_name,
                         "Rotated prompt log file"
                     );
                     *of = OpenFile { file, size: 0, sequence: new_seq };
-                    // Compress old file in background — fire-and-forget.
                     tokio::spawn(async move {
                         if let Err(e) = compress_file(&old_path).await {
                             tracing::warn!("Failed to compress {:?}: {}", old_path, e);
@@ -194,15 +289,12 @@ async fn background_writer(
     tracing::info!("Prompt log writer channel closed, exiting background task");
 }
 
-/// Scan a directory for existing log files.
+/// Scan a directory for existing log files of the given phase.
 /// Returns (max_sequence_to_use, stale_uncompressed_sequences).
 ///
-/// - max_sequence_to_use: the highest sequence found + 1 (next file to write).
-///   If only `.jsonl` files exist (no `.gz`), the max `.jsonl` seq is the current
-///   file, so we return max+1. If a `.gz` exists with same seq, that `.jsonl` is stale.
-/// - stale_uncompressed_sequences: sequences that have `.jsonl` but no matching `.gz`
-///   and are NOT the newest `.jsonl` file (left over from a crash).
-async fn find_max_sequence_and_stale(dir: &std::path::Path) -> (u64, Vec<u64>) {
+/// Files are named `{phase}_{seq:06}.jsonl` or `{phase}_{seq:06}.jsonl.gz`.
+async fn find_max_sequence_and_stale(dir: &std::path::Path, phase: &str) -> (u64, Vec<u64>) {
+    let prefix = format!("{}_", phase);
     let mut jsonl_seqs: Vec<u64> = Vec::new();
     let mut gz_seqs: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
@@ -214,14 +306,14 @@ async fn find_max_sequence_and_stale(dir: &std::path::Path) -> (u64, Vec<u64>) {
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
         if let Some(seq_str) = name_str
-            .strip_prefix("log_")
+            .strip_prefix(prefix.as_str())
             .and_then(|s| s.strip_suffix(".jsonl"))
         {
             if let Ok(seq) = seq_str.parse::<u64>() {
                 jsonl_seqs.push(seq);
             }
         } else if let Some(seq_str) = name_str
-            .strip_prefix("log_")
+            .strip_prefix(prefix.as_str())
             .and_then(|s| s.strip_suffix(".jsonl.gz"))
         {
             if let Ok(seq) = seq_str.parse::<u64>() {
@@ -233,7 +325,6 @@ async fn find_max_sequence_and_stale(dir: &std::path::Path) -> (u64, Vec<u64>) {
     let overall_max = jsonl_seqs.iter().copied().chain(gz_seqs.iter().copied()).max().unwrap_or(0);
     let next_seq = overall_max + 1;
 
-    // Stale: .jsonl files that are NOT the newest and don't have a .gz counterpart.
     let newest_jsonl = jsonl_seqs.iter().copied().max().unwrap_or(0);
     let stale: Vec<u64> = jsonl_seqs
         .into_iter()
@@ -248,7 +339,6 @@ async fn compress_file(path: &std::path::Path) -> std::io::Result<()> {
     let data = tokio::fs::read(path).await?;
     let gz_path = PathBuf::from(format!("{}.gz", path.display()));
 
-    // Compress in a blocking task to avoid starving the async runtime.
     let gz_path_clone = gz_path.clone();
     let compressed = tokio::task::spawn_blocking(move || {
         let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
@@ -257,7 +347,7 @@ async fn compress_file(path: &std::path::Path) -> std::io::Result<()> {
         encoder.finish()
     })
     .await
-    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))??;
+    .map_err(std::io::Error::other)??;
 
     tokio::fs::write(&gz_path_clone, &compressed).await?;
     tokio::fs::remove_file(path).await?;

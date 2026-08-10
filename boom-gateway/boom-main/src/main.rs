@@ -115,6 +115,11 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!("Database pool closed");
             }
 
+            // 3. Best-effort flush of any pending OTLP batch — wait up to
+            //    the configured timeout, never longer. Local JSONL was
+            //    already flushed synchronously inside the writer task.
+            state.prompt_log_writer.shutdown_flush().await;
+
             tracing::info!("Shutdown complete");
         }
     }
@@ -192,7 +197,7 @@ fn build_router(state: AppState) -> Router {
         admin_tx,
         master_key,
         state.debug_store.clone(),
-        state.prompt_log_writer.clone(),
+        state.prompt_log_query.clone(),
         state.rebalance_move_tracker.clone(),
         state.request_rate.clone(),
         state.agent_stats.clone(),

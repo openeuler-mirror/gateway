@@ -66,6 +66,10 @@ pub struct AppState {
     pub debug_store: Arc<DebugErrorStore>,
     /// Prompt log writer — captures full request/response for audit.
     pub prompt_log_writer: PromptLogWriter,
+    /// Read-only prompt-log query API (entry lookup + config snapshot),
+    /// shared with the dashboard. Wraps the same `Arc<ArcSwap<_>>` config
+    /// the writer mutates, so hot-reloads are visible without re-binding.
+    pub prompt_log_query: Arc<dyn boom_promptlog::PromptLogQueryApi>,
     /// Per-deployment rebalance move tracker (in/out counts, survives reloads).
     pub rebalance_move_tracker: Arc<RebalanceMoveTracker>,
     /// Per-deployment request rate tracker (survives reloads).
@@ -259,7 +263,27 @@ impl AppState {
         let prompt_log_config = config.prompt_log.as_ref()
             .and_then(|v| serde_json::from_value::<boom_promptlog::PromptLogConfig>(v.clone()).ok())
             .unwrap_or_default();
+
+        // Wire the OTLP exporter when both the feature and config are on.
+        // The exporter owns an HTTP client and a bounded in-memory queue;
+        // the background flush task lives for the whole process lifetime
+        // and is best-effort flushed at shutdown via `prompt_log_writer.shutdown_flush()`.
+        #[cfg(feature = "otlp")]
+        let prompt_log_writer = if prompt_log_config.otlp.enabled {
+            let exporter = boom_promptlog::OtelExporter::new(&prompt_log_config.otlp);
+            exporter.spawn_flush_task();
+            PromptLogWriter::spawn_with_otlp(prompt_log_config, exporter)
+        } else {
+            PromptLogWriter::spawn(prompt_log_config)
+        };
+        #[cfg(not(feature = "otlp"))]
         let prompt_log_writer = PromptLogWriter::spawn(prompt_log_config);
+
+        // Read-only query handle: shares the writer's `Arc<ArcSwap<config>>`,
+        // so dashboard sees hot-reloads without touching the writer directly.
+        let prompt_log_query: Arc<dyn boom_promptlog::PromptLogQueryApi> = Arc::new(
+            boom_promptlog::FilePromptLogQuery::new(prompt_log_writer.config_handle()),
+        );
 
         let inner = Self::build_inner(config, &db_pool, chrono::Utc::now(), 0)?;
 
@@ -291,6 +315,7 @@ impl AppState {
             flow_controller: flow_controller.clone(),
             debug_store,
             prompt_log_writer,
+            prompt_log_query,
             rebalance_move_tracker,
             request_rate,
             agent_stats,
