@@ -1,12 +1,12 @@
-# mock-sink — OTLP 接收端测试工具
+# mock-otlp-collector — OTLP 接收端测试工具
 
 模拟 OTLP/HTTP 后端，解码 `ExportLogsServiceRequest` protobuf 并打印每条 `LogRecord`。用于本地验证网关（或离线 replay 工具）的 OTLP 上报内容，**不需要**真的起一个 otel-collector 容器。
 
 ```
- ┌────────────┐   POST /v1/logs        ┌──────────┐
- │  gateway   │ ──────────────────▶   │ mock-sink│
- │  或 replay │   application/x-protobuf │          │
- └────────────┘                        └──────────┘
+ ┌────────────┐   POST /v1/logs        ┌─────────────────────┐
+ │  gateway   │ ──────────────────▶   │ mock-otlp-collector │
+ │  或 replay │   application/x-protobuf │                     │
+ └────────────┘                        └─────────────────────┘
 ```
 
 ## 编译
@@ -14,17 +14,17 @@
 独立 Cargo 项目（不在 gateway workspace 内，避免拖累日常 `cargo build --workspace`）：
 
 ```bash
-cd boom-gateway/test/mock-sink && cargo build --release
+cd boom-gateway/test/mock-otlp-collector && cargo build --release
 ```
 
-产物在 `boom-gateway/test/mock-sink/target/release/mock-sink`。
+产物在 `boom-gateway/test/mock-otlp-collector/target/release/mock-otlp-collector`。
 
 ## 启动
 
 最简单：
 
 ```bash
-./boom-gateway/test/mock-sink/target/release/mock-sink
+./boom-gateway/test/mock-otlp-collector/target/release/mock-otlp-collector
 ```
 
 默认监听 `0.0.0.0:4318`（OTLP/HTTP 标准端口），简要打印模式。
@@ -32,7 +32,7 @@ cd boom-gateway/test/mock-sink && cargo build --release
 切完整打印：
 
 ```bash
-./boom-gateway/test/mock-sink/target/release/mock-sink --full
+./boom-gateway/test/mock-otlp-collector/target/release/mock-otlp-collector --full
 ```
 
 可选参数：
@@ -81,8 +81,8 @@ cd boom-gateway/test/mock-sink && cargo build --release
 ## 端到端示例
 
 ```bash
-# 终端 1：起 mock-sink
-./boom-gateway/test/mock-sink/target/release/mock-sink
+# 终端 1：起 mock-otlp-collector
+./boom-gateway/test/mock-otlp-collector/target/release/mock-otlp-collector
 
 # 终端 2（gateway workspace 根目录）：跑离线 replay 工具推一批日志
 cd boom-gateway

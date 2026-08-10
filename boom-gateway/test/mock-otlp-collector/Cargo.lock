@@ -590,7 +590,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "mock-sink"
+name = "mock-otlp-collector"
 version = "0.1.0"
 dependencies = [
  "axum",

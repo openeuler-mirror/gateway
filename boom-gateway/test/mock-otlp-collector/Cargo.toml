@@ -1,16 +1,16 @@
 [package]
-name = "mock-sink"
+name = "mock-otlp-collector"
 version = "0.1.0"
 edition = "2021"
 
 # Empty [workspace] table keeps this package OUT of the parent gateway workspace
 # so `cargo build --workspace` from /Users/icecream/code/atomgit/gateway doesn't
 # compile this test tool. Build explicitly:
-#   cd boom-gateway/test/mock-sink && cargo build --release
+#   cd boom-gateway/test/mock-otlp-collector && cargo build --release
 [workspace]
 
 [[bin]]
-name = "mock-sink"
+name = "mock-otlp-collector"
 path = "src/main.rs"
 
 [dependencies]

@@ -13,7 +13,7 @@
 //! The crate is intentionally a separate Cargo project (see `[workspace]`
 //! in Cargo.toml) — `cargo build --workspace` from the gateway root does
 //! NOT compile this tool. Build it explicitly:
-//!   cd boom-gateway/test/mock-sink && cargo build --release
+//!   cd boom-gateway/test/mock-otlp-collector && cargo build --release
 
 use std::net::SocketAddr;
 
@@ -29,7 +29,7 @@ use prost::Message;
 
 #[derive(Parser, Debug, Clone)]
 #[command(
-    name = "mock-sink",
+    name = "mock-otlp-collector",
     about = "Mock OTLP/HTTP receiver — decodes and pretty-prints LogRecord stream"
 )]
 struct Args {
@@ -88,7 +88,7 @@ async fn main() {
     tracing::info!(
         addr = %addr,
         full_mode = args.full,
-        "OTLP mock sink listening — POST /v1/logs"
+        "mock-otlp-collector listening — POST /v1/logs"
     );
     axum::serve(listener, app).await.unwrap();
 }
