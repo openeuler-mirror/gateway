@@ -558,15 +558,10 @@ fn valid_panel(response: &ChatCompletionResponse) -> bool {
 }
 
 fn invalid_panel_reason(response: &ChatCompletionResponse) -> String {
-    match response.choices.first() {
-        None => "panel response has no choices".to_string(),
-        Some(choice)
-            if choice.message.tool_calls.as_ref().is_none_or(Vec::is_empty)
-                && message_text(&choice.message.content).trim().is_empty() =>
-        {
-            "panel response has neither content nor tool calls".to_string()
-        }
-        Some(_) => "panel response is invalid".to_string(),
+    if response.choices.is_empty() {
+        "panel response has no choices".to_string()
+    } else {
+        "panel response has neither content nor tool calls".to_string()
     }
 }
 

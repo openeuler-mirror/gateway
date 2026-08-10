@@ -66,10 +66,6 @@ struct Args {
     #[arg(long)]
     served_model: Option<String>,
 
-    /// Drop the connection before response headers when the model mismatches.
-    #[arg(long, default_value_t = false)]
-    disconnect_on_wrong_model: bool,
-
     /// Reject requests that explicitly send an empty tools array.
     #[arg(long, default_value_t = false)]
     reject_empty_tools: bool,
@@ -229,9 +225,6 @@ async fn handle_any(
         .is_some_and(|served| served != model)
     {
         st.stats.rejected_model.fetch_add(1, Ordering::Relaxed);
-        if st.args.disconnect_on_wrong_model {
-            panic!("mock-backend received unsupported model '{model}'");
-        }
         return (
             StatusCode::NOT_FOUND,
             Json(json!({

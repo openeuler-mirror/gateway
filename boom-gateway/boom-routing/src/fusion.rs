@@ -8,7 +8,7 @@ use boom_config::{WorkflowDefinitionConfig, WorkflowSettings};
 use boom_core::kv_event::{KvIndexBackend, StorageTier};
 use boom_core::provider::{
     Provider, ProviderBilling, ProviderCallContext, ProviderCost, ProviderPromptTrace,
-    SharedProviderPromptTrace,
+    ProviderProtocol, SharedProviderPromptTrace,
 };
 use boom_core::types::{
     ChatCompletionRequest, ChatCompletionResponse, ChatStream, ChatStreamChunk, MessageContent,
@@ -81,6 +81,7 @@ pub fn register_fusion_providers(
     runtime: FusionRuntime,
 ) -> Result<(), GatewayError> {
     let registry = build_registry(settings)?;
+    validate_fusion_child_providers(settings, deployment_store, alias_store)?;
     for model in settings.models.keys() {
         if deployment_store.contains(model) {
             return Err(GatewayError::ConfigError(format!(
@@ -108,6 +109,51 @@ pub fn register_fusion_providers(
             runtime.clone(),
         ));
         deployment_store.set_exclusive_deployment(model.clone(), provider)?;
+    }
+    Ok(())
+}
+
+fn validate_fusion_child_providers(
+    settings: &WorkflowSettings,
+    deployment_store: &DeploymentStore,
+    alias_store: &AliasStore,
+) -> Result<(), GatewayError> {
+    for (workflow_id, definition) in &settings.workflows {
+        let WorkflowDefinitionConfig::DirectSynthesis { roles, .. } = definition;
+        for (role, instance) in roles
+            .panel
+            .iter()
+            .map(|instance| ("panel", instance))
+            .chain(std::iter::once(("aggregator", &roles.aggregator)))
+        {
+            let resolved_model = alias_store
+                .resolve(&instance.model)
+                .unwrap_or_else(|| instance.model.clone());
+            let providers = deployment_store
+                .get_providers(&resolved_model)
+                .filter(|providers| !providers.is_empty())
+                .ok_or_else(|| {
+                    GatewayError::ConfigError(format!(
+                        "workflow '{}' {} model '{}' resolves to model '{}', which has no active deployment",
+                        workflow_id, role, instance.model, resolved_model
+                    ))
+                })?;
+            for provider in providers {
+                if provider.protocol() != ProviderProtocol::OpenAiCompatible {
+                    return Err(GatewayError::ConfigError(format!(
+                        "workflow '{}' {} model '{}' resolves to provider '{}'{}; Fusion child models must use an OpenAI-compatible provider",
+                        workflow_id,
+                        role,
+                        instance.model,
+                        provider.name(),
+                        provider
+                            .deployment_id()
+                            .map(|id| format!(" (deployment_id='{id}')"))
+                            .unwrap_or_default()
+                    )));
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -163,6 +209,7 @@ struct FusionProvider {
 struct FusionPromptTrace {
     calls: Mutex<Vec<serde_json::Value>>,
     started: Mutex<Vec<Instant>>,
+    streams: Mutex<HashMap<usize, Arc<Mutex<FusionStreamTraceState>>>>,
 }
 
 impl FusionPromptTrace {
@@ -190,17 +237,33 @@ impl FusionPromptTrace {
         else {
             return;
         };
-        let Some(update) = update.as_object() else {
+        let serde_json::Value::Object(update) = update else {
             return;
         };
         for (key, value) in update {
-            call.insert(key.clone(), value.clone());
+            call.insert(key, value);
         }
+    }
+
+    fn register_stream(&self, index: usize) -> Arc<Mutex<FusionStreamTraceState>> {
+        let state = Arc::new(Mutex::new(FusionStreamTraceState::default()));
+        if let Ok(mut streams) = self.streams.lock() {
+            streams.insert(index, state.clone());
+        }
+        state
+    }
+
+    fn stream_response(&self, index: usize) -> Option<serde_json::Value> {
+        let state = self.streams.lock().ok()?.get(&index).cloned()?;
+        state.lock().ok().map(|state| state.response())
     }
 }
 
 impl ProviderPromptTrace for FusionPromptTrace {
     fn finalize(&self) {
+        // A route-level Prompt Log can be dropped before the background task
+        // consuming a provider stream. Merge its latest compact state before
+        // closing calls that never reached a terminal state.
         let Ok(mut calls) = self.calls.lock() else {
             return;
         };
@@ -217,6 +280,9 @@ impl ProviderPromptTrace for FusionPromptTrace {
                 .unwrap_or_default();
             if matches!(status, "succeeded" | "failed" | "cancelled") {
                 continue;
+            }
+            if let Some(response) = self.stream_response(index) {
+                call.insert("response".to_string(), response);
             }
             call.insert("status".to_string(), serde_json::json!("cancelled"));
             if let Some(started) = started.get(index) {
@@ -239,6 +305,22 @@ impl ProviderPromptTrace for FusionPromptTrace {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+}
+
+#[derive(Default)]
+struct FusionStreamTraceState {
+    event_count: u64,
+    last_chunk: Option<serde_json::Value>,
+}
+
+impl FusionStreamTraceState {
+    fn response(&self) -> serde_json::Value {
+        serde_json::json!({
+            "stream": true,
+            "event_count": self.event_count,
+            "last_chunk": self.last_chunk,
+        })
     }
 }
 
@@ -478,7 +560,6 @@ impl RoutingModelInvoker {
         role: WorkflowRole,
         requested_model: &str,
         stream: bool,
-        request: &ChatCompletionRequest,
     ) -> Option<usize> {
         fusion_prompt_trace(self.context.prompt_trace.as_ref()?)?.start_call(
             serde_json::json!({
@@ -486,7 +567,6 @@ impl RoutingModelInvoker {
                 "role": role.as_str(),
                 "model": requested_model,
                 "stream": stream,
-                "request": serde_json::to_value(request).unwrap_or(serde_json::Value::Null),
             }),
         )
     }
@@ -567,8 +647,7 @@ impl ModelInvoker for RoutingModelInvoker {
         request: ChatCompletionRequest,
     ) -> Result<ModelInvocation, GatewayError> {
         let requested_model = request.model.clone();
-        let prompt_call =
-            self.start_prompt_call(workflow_id, role, &requested_model, false, &request);
+        let prompt_call = self.start_prompt_call(workflow_id, role, &requested_model, false);
         let started = Instant::now();
         let prepared = match self.prepare_call(request).await {
             Ok(prepared) => prepared,
@@ -630,8 +709,7 @@ impl ModelInvoker for RoutingModelInvoker {
         request: ChatCompletionRequest,
     ) -> Result<ModelStreamInvocation, GatewayError> {
         let requested_model = request.model.clone();
-        let prompt_call =
-            self.start_prompt_call(workflow_id, role, &requested_model, true, &request);
+        let prompt_call = self.start_prompt_call(workflow_id, role, &requested_model, true);
         let started = Instant::now();
         let prepared = match self.prepare_call(request).await {
             Ok(prepared) => prepared,
@@ -707,8 +785,7 @@ struct FusionStreamPromptLog {
     prompt_trace: SharedProviderPromptTrace,
     call_index: usize,
     started: Instant,
-    event_count: u64,
-    last_chunk: Option<serde_json::Value>,
+    state: Arc<Mutex<FusionStreamTraceState>>,
     finished: bool,
 }
 
@@ -718,31 +795,23 @@ impl FusionStreamPromptLog {
         call_index: usize,
         started: Instant,
     ) -> Self {
+        let state = fusion_prompt_trace(&prompt_trace)
+            .map(|trace| trace.register_stream(call_index))
+            .unwrap_or_default();
         Self {
             prompt_trace,
             call_index,
             started,
-            event_count: 0,
-            last_chunk: None,
+            state,
             finished: false,
         }
     }
 
     fn push(&mut self, chunk: &ChatStreamChunk) {
         if let Ok(chunk) = serde_json::to_value(chunk) {
-            self.event_count = self.event_count.saturating_add(1);
-            self.last_chunk = Some(chunk.clone());
-            if let Some(prompt_trace) = fusion_prompt_trace(&self.prompt_trace) {
-                prompt_trace.update_call(
-                    self.call_index,
-                    serde_json::json!({
-                        "response": {
-                            "stream": true,
-                            "event_count": self.event_count,
-                            "last_chunk": chunk,
-                        },
-                    }),
-                );
+            if let Ok(mut state) = self.state.lock() {
+                state.event_count = state.event_count.saturating_add(1);
+                state.last_chunk = Some(chunk);
             }
         }
     }
@@ -751,14 +820,16 @@ impl FusionStreamPromptLog {
         if self.finished {
             return;
         }
+        let response = self
+            .state
+            .lock()
+            .ok()
+            .map(|state| state.response())
+            .unwrap_or_else(|| serde_json::json!({"stream": true}));
         let mut update = serde_json::json!({
             "status": status,
             "duration_ms": elapsed_ms(self.started),
-            "response": {
-                "stream": true,
-                "event_count": self.event_count,
-                "last_chunk": self.last_chunk,
-            },
+            "response": response,
         });
         if let Some(error) = error {
             update["error"] = fusion_call_error(error);
@@ -779,7 +850,6 @@ struct GuardedFusionStream {
     reported_cost: ProviderCost,
     billing: ProviderBilling,
     prompt_log: Option<FusionStreamPromptLog>,
-    finished: bool,
 }
 
 impl GuardedFusionStream {
@@ -800,7 +870,6 @@ impl GuardedFusionStream {
             reported_cost: ProviderCost::default(),
             billing,
             prompt_log,
-            finished: false,
         }
     }
 }
@@ -832,13 +901,11 @@ impl Stream for GuardedFusionStream {
                 }
             }
             Poll::Ready(Some(Err(error))) => {
-                this.finished = true;
                 if let Some(prompt_log) = &mut this.prompt_log {
                     prompt_log.finish("failed", Some(error));
                 }
             }
             Poll::Ready(None) => {
-                this.finished = true;
                 if let Some(prompt_log) = &mut this.prompt_log {
                     prompt_log.finish("succeeded", None);
                 }
@@ -855,6 +922,8 @@ impl Stream for GuardedFusionStream {
 
 impl Drop for GuardedFusionStream {
     fn drop(&mut self) {
+        // finish() is idempotent, so completed and failed streams keep their
+        // terminal status while an abandoned stream becomes cancelled.
         if let Some(prompt_log) = &mut self.prompt_log {
             prompt_log.finish("cancelled", None);
         }
@@ -1014,7 +1083,8 @@ pub fn build_gateway_headers(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_gateway_headers, register_fusion_providers, request_prefix_bytes, FusionRuntime,
+        build_gateway_headers, register_fusion_providers, request_prefix_bytes,
+        FusionPromptTrace, FusionRuntime, FusionStreamPromptLog,
     };
     use crate::{
         AliasStore, DeploymentStore, InFlightTracker, ModelCostRate, RequestRateTracker, Router,
@@ -1023,7 +1093,10 @@ mod tests {
     use arc_swap::ArcSwap;
     use async_trait::async_trait;
     use boom_config::Config;
-    use boom_core::provider::{Provider, ProviderBilling, ProviderCallContext};
+    use boom_core::provider::{
+        Provider, ProviderBilling, ProviderCallContext, ProviderPromptTrace, ProviderProtocol,
+        SharedProviderPromptTrace,
+    };
     use boom_core::types::{
         ChatCompletionRequest, ChatCompletionResponse, ChatStream, ChatStreamChunk, Choice, Message,
         MessageContent, MessageRole, StreamChoice, StreamDelta, StreamUsage, Usage,
@@ -1065,6 +1138,7 @@ mod tests {
         fail_models: Arc<Mutex<HashSet<String>>>,
         invalid_models: Arc<Mutex<HashSet<String>>>,
         models: Vec<String>,
+        protocol: ProviderProtocol,
     }
 
     #[async_trait]
@@ -1148,6 +1222,10 @@ mod tests {
             "fake"
         }
 
+        fn protocol(&self) -> ProviderProtocol {
+            self.protocol
+        }
+
         fn models(&self) -> &[String] {
             &self.models
         }
@@ -1194,6 +1272,158 @@ mod tests {
         expected.extend_from_slice(&serde_json::to_vec(&request.messages).unwrap());
 
         assert_eq!(request_prefix_bytes(&request), expected);
+    }
+
+    #[test]
+    fn finalize_only_cancels_unfinished_prompt_calls() {
+        let trace = FusionPromptTrace::default();
+        let succeeded = trace.start_call(json!({"status": "started"})).unwrap();
+        let failed = trace.start_call(json!({"status": "started"})).unwrap();
+        let unfinished = trace.start_call(json!({"status": "started"})).unwrap();
+        trace.update_call(succeeded, json!({"status": "succeeded"}));
+        trace.update_call(failed, json!({"status": "failed"}));
+
+        trace.finalize();
+
+        let snapshot = trace.snapshot().unwrap();
+        let calls = snapshot["calls"].as_array().unwrap();
+        assert_eq!(calls[succeeded]["status"], "succeeded");
+        assert_eq!(calls[failed]["status"], "failed");
+        assert_eq!(calls[unfinished]["status"], "cancelled");
+    }
+
+    #[test]
+    fn stream_prompt_log_updates_shared_trace_only_when_finished() {
+        let trace = Arc::new(FusionPromptTrace::default());
+        let call_index = trace
+            .start_call(json!({"role": "aggregator", "stream": true}))
+            .unwrap();
+        let shared_trace: SharedProviderPromptTrace = trace.clone();
+        let mut prompt_log =
+            FusionStreamPromptLog::new(shared_trace, call_index, std::time::Instant::now());
+
+        for index in 0..2048 {
+            prompt_log.push(&ChatStreamChunk {
+                id: "chatcmpl-buffered-trace".to_string(),
+                object: "chat.completion.chunk".to_string(),
+                created: 1,
+                model: "aggregator".to_string(),
+                choices: vec![StreamChoice {
+                    index: 0,
+                    delta: StreamDelta {
+                        role: None,
+                        content: Some(index.to_string()),
+                        tool_calls: None,
+                        reasoning_content: None,
+                    },
+                    finish_reason: None,
+                }],
+                usage: None,
+                raw_data: None,
+            });
+        }
+
+        let before_finish = trace.snapshot().unwrap();
+        assert!(before_finish["calls"][call_index].get("response").is_none());
+
+        prompt_log.finish("succeeded", None);
+        trace.finalize();
+
+        let after_finish = trace.snapshot().unwrap();
+        let call = &after_finish["calls"][call_index];
+        assert_eq!(call["status"], "succeeded");
+        assert_eq!(call["response"]["event_count"], 2048);
+        assert_eq!(
+            call["response"]["last_chunk"]["choices"][0]["delta"]["content"],
+            "2047"
+        );
+    }
+
+    #[test]
+    fn fusion_registration_checks_alias_target_and_every_deployment_protocol() {
+        let config: Config = serde_yaml::from_str(
+            r#"
+model_list:
+  - model_name: panel-target
+    litellm_params:
+      model: openai/panel
+  - model_name: aggregator
+    litellm_params:
+      model: openai/aggregator
+router_settings:
+  model_group_alias:
+    panel-alias: panel-target
+workflow_settings:
+  models:
+    fusion: direct_synthesis
+  workflows:
+    direct_synthesis:
+      type: direct_synthesis
+      roles:
+        panel:
+          - model: panel-alias
+          - model: panel-alias
+        aggregator:
+          model: aggregator
+"#,
+        )
+        .unwrap();
+        config.validate().unwrap();
+
+        let deployment_store = Arc::new(DeploymentStore::new());
+        let compatible: Arc<dyn Provider> = Arc::new(FakeProvider {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            fail_models: Arc::new(Mutex::new(HashSet::new())),
+            invalid_models: Arc::new(Mutex::new(HashSet::new())),
+            models: vec!["panel-target".to_string(), "aggregator".to_string()],
+            protocol: ProviderProtocol::OpenAiCompatible,
+        });
+        let incompatible: Arc<dyn Provider> = Arc::new(FakeProvider {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            fail_models: Arc::new(Mutex::new(HashSet::new())),
+            invalid_models: Arc::new(Mutex::new(HashSet::new())),
+            models: vec!["panel-target".to_string()],
+            protocol: ProviderProtocol::Native,
+        });
+        deployment_store.add_deployment("panel-target", compatible.clone());
+        deployment_store.add_deployment("panel-target", incompatible);
+        deployment_store.add_deployment("aggregator", compatible);
+
+        let alias_store = Arc::new(AliasStore::new());
+        alias_store.set_alias(
+            "panel-alias".to_string(),
+            "panel-target".to_string(),
+            false,
+        );
+        let router = Arc::new(Router::new(
+            deployment_store.clone(),
+            alias_store.clone(),
+            Arc::new(RecordingPolicy {
+                key_hashes: Arc::new(Mutex::new(Vec::new())),
+            }),
+        ));
+        let runtime = FusionRuntime::new(
+            Arc::downgrade(&router),
+            deployment_store.clone(),
+            Arc::new(FlowController::new()),
+            Arc::new(InFlightTracker::new()),
+            Arc::new(RequestRateTracker::new()),
+            Arc::new(ArcSwap::from_pointee(None)),
+            true,
+            1200,
+        );
+
+        let error = register_fusion_providers(
+            &config.workflow_settings,
+            &deployment_store,
+            &alias_store,
+            runtime,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("panel model 'panel-alias'"));
+        assert!(error.contains("provider 'fake'"));
+        assert!(error.contains("OpenAI-compatible provider"));
     }
 
     #[tokio::test]
@@ -1243,6 +1473,7 @@ workflow_settings:
                 "panel-b".to_string(),
                 "aggregator".to_string(),
             ],
+            protocol: ProviderProtocol::OpenAiCompatible,
         });
         for model in ["panel-a", "panel-b", "aggregator"] {
             deployment_store.add_deployment(model, fake.clone());
@@ -1497,6 +1728,7 @@ workflow_settings:
         assert_eq!(recursive_calls[0]["status"], "failed");
         assert_eq!(recursive_calls[0]["role"], "panel");
         assert!(recursive_calls[0].get("provider").is_none());
+        assert!(recursive_calls[0].get("request").is_none());
         assert!(recursive_calls[0]["error"]["message"]
             .as_str()
             .is_some_and(|message| message.contains("resolves to virtual provider")));

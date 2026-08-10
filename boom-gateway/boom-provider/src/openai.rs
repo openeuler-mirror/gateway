@@ -1,4 +1,4 @@
-use boom_core::provider::Provider;
+use boom_core::provider::{Provider, ProviderProtocol};
 use boom_core::types::*;
 use boom_core::GatewayError;
 use async_trait::async_trait;
@@ -234,6 +234,10 @@ impl Provider for OpenAIProvider {
 
     fn name(&self) -> &str {
         "openai"
+    }
+
+    fn protocol(&self) -> ProviderProtocol {
+        ProviderProtocol::OpenAiCompatible
     }
 
     fn models(&self) -> &[String] {

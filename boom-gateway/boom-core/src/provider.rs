@@ -107,6 +107,12 @@ pub trait ProviderPromptTrace: Send + Sync {
 
 pub type SharedProviderPromptTrace = Arc<dyn ProviderPromptTrace>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderProtocol {
+    OpenAiCompatible,
+    Native,
+}
+
 /// Gateway context attached to a provider call after parent-request
 /// authentication and quota admission have completed.
 pub struct ProviderCallContext {
@@ -158,6 +164,11 @@ pub trait Provider: Send + Sync + 'static {
 
     /// Provider identifier (e.g. "openai", "anthropic").
     fn name(&self) -> &str;
+
+    /// Upstream API protocol implemented by this provider.
+    fn protocol(&self) -> ProviderProtocol {
+        ProviderProtocol::Native
+    }
 
     /// List models supported by this provider deployment.
     fn models(&self) -> &[String];

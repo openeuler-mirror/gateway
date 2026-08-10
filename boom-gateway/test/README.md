@@ -82,8 +82,7 @@ curl -s -X POST http://127.0.0.1:8080/v1/chat/completions \
 mock-backend [--bind ADDR] [--min-chars N] [--max-chars N]
              [--chunk-interval-ms N] [--max-concurrent N] [--ttft-ms N]
              [--response-delay-ms N]
-             [--served-model NAME] [--disconnect-on-wrong-model]
-             [--reject-empty-tools]
+             [--served-model NAME] [--reject-empty-tools]
 ```
 
 | 参数 | 默认 | 说明 |
@@ -96,7 +95,6 @@ mock-backend [--bind ADDR] [--min-chars N] [--max-chars N]
 | `--ttft-ms` | `0` | 首 token 延迟（ms）。非 0 时模拟 reasoning 模型 |
 | `--response-delay-ms` | `0` | 非流式响应延迟（ms）。非 0 时模拟长时间无结果的 panel |
 | `--served-model` | 不限制 | 仅公布并接受指定模型，错误模型返回 404 |
-| `--disconnect-on-wrong-model` | `false` | 错误模型到达时在响应头前断开连接 |
 | `--reject-empty-tools` | `false` | 请求显式携带 `tools: []` 时返回 400 |
 
 **端点**：
@@ -163,7 +161,8 @@ bench 报告和 Backend 503，不能只看客户端 HTTP 结果。
 Fusion Prompt Log 的功能、成功和故障场景由
 `boom-main/tests/fusion_panel_tools_e2e.rs` 中的 14 个真实 Gateway E2E 覆盖。
 
-环境变量可覆盖单项参数以调试脚本，但默认值始终是本 README 的原始参数。例如：
+环境变量可覆盖单项参数以调试脚本，但默认值始终是本 README 的原始参数。服务启动时
+默认最多重试 5 次，可用 `FUSION_LOAD_START_RETRIES` 调整。例如：
 
 ```bash
 FUSION_LOAD_PROFILE=release \

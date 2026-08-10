@@ -1030,6 +1030,8 @@ async fn aggregator_midstream_error_is_emitted_and_not_replaced_by_a_panel() {
         .into_iter()
         .find(|event| event["error"]["type"] == "provider_error")
         .expect("stream did not contain a provider_error event");
+    assert!(error["error"].is_object());
+    assert_eq!(error["error"]["code"], 502);
     let message = error["error"]["message"].as_str().unwrap();
     assert!(message.contains("direct_synthesis"));
     assert!(message.contains("aggregator"));

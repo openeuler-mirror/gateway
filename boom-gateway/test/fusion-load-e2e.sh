@@ -29,6 +29,7 @@ RAMP_DURATION=${FUSION_LOAD_RAMP_DURATION:-15m}
 
 REQUEST_TIMEOUT_SECS=${FUSION_LOAD_REQUEST_TIMEOUT_SECS:-120}
 GATEWAY_RUST_LOG=${FUSION_LOAD_GATEWAY_RUST_LOG:-warn}
+START_RETRIES=${FUSION_LOAD_START_RETRIES:-5}
 
 MASTER_KEY="fusion-load-master-key"
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
@@ -123,21 +124,26 @@ start_process() {
     printf -v "${name}" '%s' "${pid}"
 }
 
+stop_process() {
+    local pid=$1
+    kill "${pid}" >/dev/null 2>&1 || true
+    wait "${pid}" >/dev/null 2>&1 || true
+}
+
 wait_for_http() {
-    local name=$1
-    local url=$2
-    local pid=$3
+    local url=$1
+    local pid=$2
     local attempt
     for attempt in $(seq 1 300); do
         if ! kill -0 "${pid}" >/dev/null 2>&1; then
-            fail "${name} exited before becoming ready; see ${OUTPUT_DIR}/logs"
+            return 1
         fi
         if curl -fsS --max-time 1 "${url}" >/dev/null 2>&1; then
-            return
+            return 0
         fi
         sleep 0.1
     done
-    fail "${name} did not become ready: ${url}"
+    return 1
 }
 
 wait_for_backend_idle() {
@@ -168,7 +174,8 @@ validate_settings() {
         "${PROMPT_QPS}" \
         "${SHORT_PROMPT_CHARS}" \
         "${LONG_PROMPT_CHARS}" \
-        "${REQUEST_TIMEOUT_SECS}"; do
+        "${REQUEST_TIMEOUT_SECS}" \
+        "${START_RETRIES}"; do
         is_positive_integer "${number}" || fail "expected a positive integer, got: ${number}"
     done
 
@@ -258,20 +265,58 @@ start_postgres() {
 
 start_mock() {
     local pid_name=$1
-    local log_name=$2
-    local port=$3
+    local port_name=$2
+    local log_name=$3
     shift 3
-    start_process "${pid_name}" "${OUTPUT_DIR}/logs/${log_name}.log" \
-        env RUST_LOG=warn "${MOCK_BIN}" \
-        --bind "127.0.0.1:${port}" \
-        --min-chars 100 \
-        --max-chars 400 \
-        --chunk-interval-ms 2 \
-        --max-concurrent 10000 \
-        --reject-empty-tools \
-        "$@"
-    local pid=${!pid_name}
-    wait_for_http "${log_name}" "http://127.0.0.1:${port}/health" "${pid}"
+    local attempt port pid log_path
+    log_path="${OUTPUT_DIR}/logs/${log_name}.log"
+
+    for attempt in $(seq 1 "${START_RETRIES}"); do
+        port=$(pick_port)
+        printf -v "${port_name}" '%s' "${port}"
+        start_process "${pid_name}" "${log_path}" \
+            env RUST_LOG=warn "${MOCK_BIN}" \
+            --bind "127.0.0.1:${port}" \
+            --min-chars 100 \
+            --max-chars 400 \
+            --chunk-interval-ms 2 \
+            --max-concurrent 10000 \
+            --reject-empty-tools \
+            "$@"
+        pid=${!pid_name}
+        if wait_for_http "http://127.0.0.1:${port}/health" "${pid}"; then
+            return
+        fi
+        stop_process "${pid}"
+        mv "${log_path}" "${OUTPUT_DIR}/logs/${log_name}-start-${attempt}.log"
+        log "${log_name} failed to start on port ${port}; retrying"
+    done
+
+    fail "${log_name} failed to start after ${START_RETRIES} attempts; see ${OUTPUT_DIR}/logs"
+}
+
+start_gateway() {
+    local attempt pid log_path="${OUTPUT_DIR}/logs/gateway.log"
+
+    for attempt in $(seq 1 "${START_RETRIES}"); do
+        GATEWAY_PORT=$(pick_port)
+        GATEWAY_URL="http://127.0.0.1:${GATEWAY_PORT}"
+        start_process GATEWAY_PID "${log_path}" \
+            env FUSION_LOAD_DB_URL="${DATABASE_URL}" RUST_LOG="${GATEWAY_RUST_LOG}" \
+            "${GATEWAY_BIN}" \
+            --config "${WORK_DIR}/config.yaml" \
+            --host 127.0.0.1 \
+            --port "${GATEWAY_PORT}"
+        pid=${GATEWAY_PID}
+        if wait_for_http "${GATEWAY_URL}/health" "${pid}"; then
+            return
+        fi
+        stop_process "${pid}"
+        mv "${log_path}" "${OUTPUT_DIR}/logs/gateway-start-${attempt}.log"
+        log "gateway failed to start on port ${GATEWAY_PORT}; retrying"
+    done
+
+    fail "gateway failed to start after ${START_RETRIES} attempts; see ${OUTPUT_DIR}/logs"
 }
 
 write_gateway_config() {
@@ -656,35 +701,22 @@ BENCH_BIN="${SCRIPT_DIR}/bench-client/target/${PROFILE_DIR}/bench-client"
 [[ -x "${MOCK_BIN}" ]] || fail "mock binary not found: ${MOCK_BIN}"
 [[ -x "${BENCH_BIN}" ]] || fail "bench binary not found: ${BENCH_BIN}"
 
-PANEL_A_PORT=$(pick_port)
-PANEL_B_PORT=$(pick_port)
-AGGREGATOR_PORT=$(pick_port)
-PROTOCOL_PORT=$(pick_port)
-GATEWAY_PORT=$(pick_port)
+start_mock PANEL_A_PID PANEL_A_PORT panel-a \
+    --served-model panel-a-upstream
+start_mock PANEL_B_PID PANEL_B_PORT panel-b \
+    --served-model panel-b-upstream
+start_mock AGGREGATOR_PID AGGREGATOR_PORT aggregator \
+    --served-model aggregator-upstream
+start_mock PROTOCOL_PID PROTOCOL_PORT protocol
 
 PANEL_A_URL="http://127.0.0.1:${PANEL_A_PORT}"
 PANEL_B_URL="http://127.0.0.1:${PANEL_B_PORT}"
 AGGREGATOR_URL="http://127.0.0.1:${AGGREGATOR_PORT}"
 PROTOCOL_URL="http://127.0.0.1:${PROTOCOL_PORT}"
-GATEWAY_URL="http://127.0.0.1:${GATEWAY_PORT}"
-
-start_mock PANEL_A_PID panel-a "${PANEL_A_PORT}" \
-    --served-model panel-a-upstream
-start_mock PANEL_B_PID panel-b "${PANEL_B_PORT}" \
-    --served-model panel-b-upstream
-start_mock AGGREGATOR_PID aggregator "${AGGREGATOR_PORT}" \
-    --served-model aggregator-upstream
-start_mock PROTOCOL_PID protocol "${PROTOCOL_PORT}"
 
 start_postgres
 write_gateway_config
-start_process GATEWAY_PID "${OUTPUT_DIR}/logs/gateway.log" \
-    env FUSION_LOAD_DB_URL="${DATABASE_URL}" RUST_LOG="${GATEWAY_RUST_LOG}" \
-    "${GATEWAY_BIN}" \
-    --config "${WORK_DIR}/config.yaml" \
-    --host 127.0.0.1 \
-    --port "${GATEWAY_PORT}"
-wait_for_http gateway "${GATEWAY_URL}/health" "${GATEWAY_PID}"
+start_gateway
 
 create_virtual_keys
 
