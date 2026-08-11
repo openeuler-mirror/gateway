@@ -3453,6 +3453,63 @@ pub async fn get_prompt_log_status(
     }))
 }
 
+/// POST `/admin/prompt-log/otlp-ping` — probe a remote OTLP collector.
+/// Body: `{ "endpoint": "...", "headers": {...}, "timeout_secs": 10 }`.
+/// Sends an empty `ExportLogsServiceRequest` and returns `{ok, latency_ms}`
+/// on success or `{ok:false, error}` on failure. Used by the connectivity
+/// indicator above the endpoint input on the prompt-log card.
+#[derive(Debug, Deserialize)]
+pub struct PingOtlpEndpointRequest {
+    pub endpoint: String,
+    #[serde(default)]
+    pub headers: std::collections::HashMap<String, String>,
+    #[serde(default = "default_ping_timeout_secs")]
+    pub timeout_secs: u64,
+}
+fn default_ping_timeout_secs() -> u64 { 5 }
+
+pub async fn ping_otlp_endpoint(
+    _session: AdminSession,
+    Extension(state): Extension<Arc<DashboardState>>,
+    Json(req): Json<PingOtlpEndpointRequest>,
+) -> Response {
+    if req.endpoint.trim().is_empty() {
+        return Json(json!({"ok": false, "error": "endpoint not configured"}))
+            .into_response();
+    }
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    if state
+        .admin_tx
+        .send(crate::state::AdminCommand::PingOtlpEndpoint {
+            endpoint: req.endpoint.clone(),
+            headers: req.headers.clone(),
+            timeout_secs: req.timeout_secs,
+            reply: reply_tx,
+        })
+        .await
+        .is_err()
+    {
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "Admin command handler unavailable",
+        )
+            .into_response();
+    }
+    match reply_rx.await {
+        Ok(Ok(latency_ms)) => Json(json!({
+            "ok": true,
+            "latency_ms": latency_ms,
+        }))
+        .into_response(),
+        Ok(Err(e)) => Json(json!({"ok": false, "error": e})).into_response(),
+        Err(_) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "Admin command handler dropped reply",
+        )
+            .into_response(),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct PromptLogToggleRequest {
     pub enabled: bool,

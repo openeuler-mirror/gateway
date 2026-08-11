@@ -1162,16 +1162,43 @@ div[id$="-table-wrap"]:not(.bare) > table > thead:first-child > tr:first-child >
   padding-top: 12px;
   border-top: 1px dashed var(--border);
 }
-/* Inline field tip — small greyed-out explanation rendered below the input.
-   Used by the OTLP block where every field needs a parameter-level
-   explanation without forcing the user to expand a separate hint block. */
-.form-field-tip {
+/* Connectivity indicator above the OTLP endpoint input. Polls
+ * /admin/prompt-log/otlp-ping every 5s and flips between three states:
+ * unknown (grey, no endpoint configured / not yet polled), ok (green, the
+ * collector responded within the configured HTTP timeout), fail (red,
+ * connection refused / timed out / non-2xx). Latency in ms sits next to
+ * the dot so the operator can spot a flaky backend at a glance.
+ */
+.otlp-ping-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   font-size: 11px;
   color: var(--text2);
-  margin: 4px 0 0;
-  line-height: 1.4;
-  opacity: 0.85;
+  margin: 2px 0 6px;
+  min-height: 16px;
 }
+.otlp-ping-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--text3); /* unknown */
+  box-shadow: 0 0 0 0 rgba(0,0,0,0);
+  transition: background 200ms ease;
+}
+.otlp-ping-row[data-state="ok"] .otlp-ping-dot {
+  background: var(--success, #10b981);
+}
+.otlp-ping-row[data-state="fail"] .otlp-ping-dot {
+  background: var(--danger, #ef4444);
+}
+.otlp-ping-row[data-state="pending"] .otlp-ping-dot {
+  background: var(--text3);
+  animation: otlp-ping-pulse 1s ease-in-out infinite;
+}
+@keyframes otlp-ping-pulse {
+  0%, 100% { opacity: 0.4; }
+  50% { opacity: 1; }
+}
+.otlp-ping-text { line-height: 1; }
 .form-card-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;

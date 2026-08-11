@@ -252,6 +252,10 @@ pub fn build_router<S: Clone + Send + Sync + 'static>(state: DashboardState) -> 
             "/dashboard/api/admin/prompt-log/entry/{request_id}",
             get(handlers_admin::get_prompt_log_entry),
         )
+        .route(
+            "/dashboard/api/admin/prompt-log/otlp-ping",
+            post(handlers_admin::ping_otlp_endpoint),
+        )
         // Admin — Hot-reload config.
         .route(
             "/dashboard/api/admin/config/reload",

@@ -77,6 +77,17 @@ pub enum AdminCommand {
         config: PromptLogConfig,
         reply: oneshot::Sender<Result<(), String>>,
     },
+    /// Probe a remote OTLP/HTTP collector. The dashboard passes the live
+    /// endpoint/headers/timeout (read from the prompt-log card form — not the
+    /// committed YAML, so the operator can type a new endpoint and test it
+    /// before saving). Reply carries the round-trip latency in ms on success
+    /// or a one-line error string on failure.
+    PingOtlpEndpoint {
+        endpoint: String,
+        headers: std::collections::HashMap<String, String>,
+        timeout_secs: u64,
+        reply: oneshot::Sender<Result<u64, String>>,
+    },
 }
 
 pub type AdminTx = mpsc::Sender<AdminCommand>;

@@ -2563,32 +2563,32 @@
   }
 
   function fieldTipHTML(opts) {
-    return opts.tip ? `<p class="form-field-tip">${esc(opts.tip)}</p>` : "";
+    return opts.tip ? ` ${tip(opts.tip)}` : "";
   }
   function fieldText(id, label, value, opts = {}) {
     const v = value === null || value === undefined ? "" : String(value);
     const placeholder = opts.placeholder ? ` placeholder="${esc(opts.placeholder)}"` : "";
     const type = opts.type || "text";
-    return `<div class="form-group${opts.full ? " field-full" : ""}"><label for="${id}">${esc(label)}</label><input id="${id}" type="${type}" value="${esc(v)}"${placeholder}>${fieldTipHTML(opts)}</div>`;
+    return `<div class="form-group${opts.full ? " field-full" : ""}"><label for="${id}">${esc(label)}${fieldTipHTML(opts)}</label><input id="${id}" type="${type}" value="${esc(v)}"${placeholder}></div>`;
   }
   function fieldNum(id, label, value, opts = {}) {
     const v = value === null || value === undefined ? "" : String(value);
-    return `<div class="form-group${opts.full ? " field-full" : ""}"><label for="${id}">${esc(label)}</label><input id="${id}" type="number" value="${esc(v)}" ${opts.min !== undefined ? `min="${opts.min}"` : ""} ${opts.step ? `step="${opts.step}"` : ""}>${fieldTipHTML(opts)}</div>`;
+    return `<div class="form-group${opts.full ? " field-full" : ""}"><label for="${id}">${esc(label)}${fieldTipHTML(opts)}</label><input id="${id}" type="number" value="${esc(v)}" ${opts.min !== undefined ? `min="${opts.min}"` : ""} ${opts.step ? `step="${opts.step}"` : ""}></div>`;
   }
   function fieldCheckbox(id, label, checked, opts = {}) {
-    return `<div class="form-group field-checkbox"><input id="${id}" type="checkbox" ${checked ? "checked" : ""}><label for="${id}">${esc(label)}</label>${fieldTipHTML(opts)}</div>`;
+    return `<div class="form-group field-checkbox"><input id="${id}" type="checkbox" ${checked ? "checked" : ""}><label for="${id}">${esc(label)}${fieldTipHTML(opts)}</label></div>`;
   }
-  function fieldSelect(id, label, options, selected) {
-    const opts = options.map((o) => {
+  function fieldSelect(id, label, options, selected, opts = {}) {
+    const opts2 = options.map((o) => {
       const val = typeof o === "string" ? o : o.value;
       const txt = typeof o === "string" ? o : o.label;
       return `<option value="${esc(val)}" ${val === selected ? "selected" : ""}>${esc(txt)}</option>`;
     }).join("");
-    return `<div class="form-group"><label for="${id}">${esc(label)}</label><select id="${id}">${opts}</select></div>`;
+    return `<div class="form-group"><label for="${id}">${esc(label)}${fieldTipHTML(opts)}</label><select id="${id}">${opts2}</select></div>`;
   }
   function fieldTextarea(id, label, value, opts = {}) {
     const v = value === null || value === undefined ? "" : typeof value === "string" ? value : JSON.stringify(value, null, 2);
-    return `<div class="form-group field-full"><label for="${id}">${esc(label)}</label><textarea id="${id}" rows="${opts.rows || 3}" style="font-family:var(--mono);font-size:12px">${esc(v)}</textarea>${fieldTipHTML(opts)}</div>`;
+    return `<div class="form-group field-full"><label for="${id}">${esc(label)}${fieldTipHTML(opts)}</label><textarea id="${id}" rows="${opts.rows || 3}" style="font-family:var(--mono);font-size:12px">${esc(v)}</textarea></div>`;
   }
 
   function renderCardServer(s) {
@@ -2696,7 +2696,14 @@
       <div class="form-card-subtitle">${t("config.section.prompt_log_otlp")}</div>
       <div class="form-card-grid">
         ${fieldCheckbox("cfg-pl-otlp-enabled", t("config.field.otlp_enabled"), o.enabled, { tip: t("config.tip.prompt_log_otlp") })}
-        ${fieldText("cfg-pl-otlp-endpoint", t("config.field.otlp_endpoint"), o.endpoint, { full: true, placeholder: "http://otel-collector:4318", tip: t("config.tip.otlp_endpoint") })}
+        <div class="form-group field-full">
+          <label>${t("config.field.otlp_endpoint")} ${tip(t("config.tip.otlp_endpoint"))}</label>
+          <div id="cfg-pl-otlp-ping" class="otlp-ping-row" data-state="unknown">
+            <span class="otlp-ping-dot"></span>
+            <span class="otlp-ping-text">${t("config.tip.otlp_ping_unknown")}</span>
+          </div>
+          <input id="cfg-pl-otlp-endpoint" type="text" value="${esc(o.endpoint || "")}" placeholder="http://otel-collector:4318">
+        </div>
         ${fieldText("cfg-pl-otlp-service-name", t("config.field.otlp_service_name"), o.service_name, { placeholder: "boom-gateway", tip: t("config.tip.otlp_service_name") })}
         ${fieldText("cfg-pl-otlp-service-version", t("config.field.otlp_service_version"), o.service_version || "", { placeholder: t("config.tip.otlp_service_version_default"), tip: t("config.tip.otlp_service_version_default") })}
         ${fieldNum("cfg-pl-otlp-timeout-secs", t("config.field.otlp_timeout_secs"), o.timeout_secs, { min: 1, tip: t("config.tip.otlp_timeout_secs") })}
@@ -2796,6 +2803,64 @@
     });
     const reloadBtn = document.getElementById("btn-reload-config-page");
     if (reloadBtn) reloadBtn.addEventListener("click", reloadConfigHandler);
+    startOtlpPingLoop();
+  }
+
+  // ── OTLP endpoint connectivity indicator ────────────────
+  // Polls POST /admin/prompt-log/otlp-ping every 5s while the config page
+  // is open. The badge sits above the endpoint input and shows green/red +
+  // latency. Re-tests immediately when the operator edits the endpoint
+  // input (debounced on blur) so the badge reflects what they typed without
+  // waiting up to 5s for the next tick. Cancels itself when the config page
+  // wrapper is gone (SPA navigation away).
+  let _otlpPingTimer = null;
+  function startOtlpPingLoop() {
+    if (_otlpPingTimer) clearInterval(_otlpPingTimer);
+    _otlpPingTimer = setInterval(otlpPingTick, 5000);
+    // First poll immediately rather than waiting 5s for the initial read.
+    otlpPingTick();
+    const input = document.getElementById("cfg-pl-otlp-endpoint");
+    if (input) {
+      input.addEventListener("blur", otlpPingTick);
+      // Re-baseline the loop in case the card re-rendered under our feet.
+      const pingRow = document.getElementById("cfg-pl-otlp-ping");
+      if (pingRow) otlpPingSetState(pingRow, "pending");
+    }
+  }
+  async function otlpPingTick() {
+    const pingRow = document.getElementById("cfg-pl-otlp-ping");
+    if (!pingRow) {
+      // Config page navigated away — cancel the loop. setInterval id is the
+      // only handle so we don't leak a 5s timer ticking into a dead DOM.
+      if (_otlpPingTimer) { clearInterval(_otlpPingTimer); _otlpPingTimer = null; }
+      return;
+    }
+    const endpoint = (document.getElementById("cfg-pl-otlp-endpoint")?.value || "").trim();
+    if (!endpoint) {
+      otlpPingSetState(pingRow, "unknown", t("config.tip.otlp_ping_no_endpoint"));
+      return;
+    }
+    otlpPingSetState(pingRow, "pending", t("config.tip.otlp_ping_pending"));
+    try {
+      const started = performance.now();
+      const r = await api("/admin/prompt-log/otlp-ping", {
+        method: "POST",
+        body: JSON.stringify({ endpoint }),
+      });
+      const ms = Math.round(performance.now() - started);
+      if (r && r.ok) {
+        otlpPingSetState(pingRow, "ok", `${t("config.tip.otlp_ping_ok")} · ${ms} ms`);
+      } else {
+        otlpPingSetState(pingRow, "fail", `${t("config.tip.otlp_ping_fail")} · ${r && r.error ? r.error : ""}`.trim().replace(/[·\s]+$/, ""));
+      }
+    } catch (err) {
+      otlpPingSetState(pingRow, "fail", `${t("config.tip.otlp_ping_fail")} · ${err.message}`);
+    }
+  }
+  function otlpPingSetState(row, state, text) {
+    row.setAttribute("data-state", state);
+    const txt = row.querySelector(".otlp-ping-text");
+    if (txt && text !== undefined) txt.textContent = text;
   }
 
   async function reloadConfigHandler() {

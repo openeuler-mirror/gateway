@@ -15,6 +15,6 @@ pub use stream::{ChunkDelta, PromptLogStream};
 pub use writer::PromptLogWriter;
 
 #[cfg(feature = "otlp")]
-pub use otlp::OtelExporter;
+pub use otlp::{ping_endpoint, OtelExporter};
 #[cfg(feature = "otlp")]
 pub use replay::OtelReplayer;

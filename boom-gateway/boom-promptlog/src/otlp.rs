@@ -517,6 +517,43 @@ impl OtelExporter {
     }
 }
 
+/// Probe a remote OTLP/HTTP collector by sending an empty
+/// `ExportLogsServiceRequest`. A real collector returns 200 OK for an empty
+/// batch (no LogRecords), which lets us distinguish "the collector is up and
+/// speaking OTLP" from "network unreachable". Returns the round-trip latency
+/// in milliseconds on success, or a one-line error string on failure.
+///
+/// Single attempt — no retry. Used by the dashboard connectivity indicator,
+/// which already re-polls every 5s and would just compound backoff if this
+/// function retried internally.
+pub async fn ping_endpoint(config: &OtlpConfig) -> Result<u64, String> {
+    if config.endpoint.trim().is_empty() {
+        return Err("endpoint not configured".to_string());
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(config.timeout_secs.max(1)))
+        .build()
+        .map_err(|e| format!("build client: {e}"))?;
+    let req = build_export_request(Vec::new());
+    let body = req.encode_to_vec();
+    let url = format!("{}/v1/logs", config.endpoint.trim_end_matches('/'));
+    let mut req_builder = client
+        .post(&url)
+        .header("Content-Type", "application/x-protobuf")
+        .body(body);
+    for (k, v) in &config.headers {
+        req_builder = req_builder.header(k, v);
+    }
+    let started = std::time::Instant::now();
+    match req_builder.send().await {
+        Ok(resp) if resp.status().is_success() => {
+            Ok(started.elapsed().as_millis() as u64)
+        }
+        Ok(resp) => Err(format!("HTTP {}", resp.status())),
+        Err(e) => Err(format!("{e}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
