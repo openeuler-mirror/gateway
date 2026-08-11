@@ -93,6 +93,16 @@ async fn async_main(args: Args, config: boom_config::Config) -> anyhow::Result<(
     // Spawn deployment health monitor (auto offline/recovery, DB deployments only).
     health_monitor::spawn_deployment_health_monitor(state.clone(), shutdown_tx.subscribe());
 
+    // Spawn the system pressure sampler (1 Hz — CPU, RSS, tokio worker queue
+    // depth, blocking pool queue, inflight). See `spawn_stressmon_sampler`.
+    spawn_stressmon_sampler(
+        state.stressmon.clone(),
+        state.inflight.clone(),
+        shutdown_tx.subscribe(),
+    );
+
+    // Build router.
+
     // Build router.
     let app = build_router(state.clone());
 
@@ -216,6 +226,7 @@ fn build_router(state: AppState) -> Router {
         state.agent_stats.clone(),
         key_alias_lookup,
         state.log_writer.clone().map(|w| w as Arc<dyn boom_core::LogDroppedCounter>),
+        state.stressmon.clone(),
     );
     let dashboard_router = boom_dashboard::build_router(dashboard_state);
 
@@ -328,6 +339,151 @@ fn spawn_request_summary(
         }
     });
     tracing::info!("Request summary logger spawned (every 60s)");
+}
+
+/// Background task: every 1s, sample system pressure (CPU, RSS, tokio
+/// worker queue depth, blocking pool queue, inflight) and push to the
+/// `StressmonCollector`.
+///
+/// Sampling lives here (not inside boom-stressmon) so boom-stressmon stays
+/// a leaf crate with no dep on boom-routing's `InFlightTracker`
+/// (CLAUDE.md §1 — boom-core is the only leaf dep). The collector itself
+/// is just a ring buffer.
+fn spawn_stressmon_sampler(
+    collector: std::sync::Arc<boom_stressmon::StressmonCollector>,
+    inflight: std::sync::Arc<boom_routing::InFlightTracker>,
+    mut shutdown: tokio::sync::broadcast::Receiver<()>,
+) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    let sample = sample_pressure_once(&inflight);
+                    collector.record_sample(sample);
+                }
+                _ = shutdown.recv() => {
+                    tracing::debug!("Stressmon sampler shutting down");
+                    return;
+                }
+            }
+        }
+    });
+    tracing::info!("System pressure sampler spawned (1 Hz)");
+}
+
+/// Take one pressure sample. CPU% is computed from utime+stime deltas
+/// against the previous call — so the function keeps its own state via a
+/// `static Mutex<Option<(prev_jiffies, prev_instant)>>`. Returns zeros on
+/// platforms without `/proc` (e.g., macOS dev) — Linux prod is the target.
+fn sample_pressure_once(
+    inflight: &std::sync::Arc<boom_routing::InFlightTracker>,
+) -> boom_core::StressmonSample {
+    use std::sync::Mutex;
+    static PREV: Mutex<Option<(u64, std::time::Instant)>> = Mutex::new(None);
+
+    let now_ts = chrono::Utc::now().timestamp();
+    let now_instant = std::time::Instant::now();
+
+    // Tokio runtime metrics — `Handle::current().metrics()` is the per-thread
+    // cached handle; cheap.
+    let metrics = tokio::runtime::Handle::current().metrics();
+    let num_workers = metrics.num_workers().max(1);
+    // Sum of per-worker local queues + the global injection queue — gives a
+    // single "tasks waiting to be polled" number. Spikes here = workers
+    // can't keep up.
+    let mut worker_queue_depth = metrics.global_queue_depth();
+    for i in 0..num_workers {
+        worker_queue_depth += metrics.worker_local_queue_depth(i);
+    }
+    // Tasks queued on the blocking pool (gzip compression, DB migrations,
+    // etc) — a proxy for "spawn_blocking is being over-used".
+    let blocking_tasks_queued = metrics.blocking_queue_depth();
+
+    // Inflight: sum across all models with active requests.
+    let inflight_count = inflight
+        .get_stats()
+        .iter()
+        .map(|s| s.inflight_requests)
+        .sum::<u64>();
+
+    // CPU jiffies (utime + stime) + VmRSS via /proc on Linux. On other
+    // platforms these are best-effort 0s — the dashboard still gets useful
+    // worker-queue / blocking-queue / inflight signal.
+    let (cpu_jiffies, rss_bytes) = read_proc_cpu_rss();
+
+    // Delta the CPU jiffies against the previous sample to get instantaneous %.
+    let cpu_pct = {
+        let mut prev_guard = PREV.lock().unwrap();
+        let cpu_pct = match prev_guard.as_ref() {
+            Some((prev_jiffies, prev_instant)) => {
+                let dt_jiffies = cpu_jiffies.saturating_sub(*prev_jiffies);
+                let dt_secs = now_instant
+                    .saturating_duration_since(*prev_instant)
+                    .as_secs_f64()
+                    .max(0.001);
+                // Each jiffy is 1/CLK_TCK seconds; on Linux that's 100 Hz
+                // (sysconf(_SC_CLK_TCK) = 100 essentially everywhere).
+                let cpu_secs = dt_jiffies as f64 / 100.0;
+                (cpu_secs / dt_secs * 100.0) as f32
+            }
+            None => 0.0,
+        };
+        *prev_guard = Some((cpu_jiffies, now_instant));
+        cpu_pct
+    };
+
+    boom_core::StressmonSample {
+        ts: now_ts,
+        cpu_pct,
+        rss_bytes,
+        worker_queue_depth,
+        blocking_tasks_queued,
+        inflight: inflight_count,
+    }
+}
+
+/// Read cumulative CPU jiffies (utime + stime) and current RSS from
+/// `/proc/self/stat` + `/proc/self/status`. Returns (0, 0) on non-Linux.
+#[cfg(target_os = "linux")]
+fn read_proc_cpu_rss() -> (u64, u64) {
+    let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+    // Field 14 (utime) and 15 (stime) — fields are 1-indexed in proc(5).
+    // The 2nd field (comm) can contain spaces and parens; parse from the
+    // right by finding the last ')' to skip comm entirely.
+    let after_comm = match stat.rfind(')') {
+        Some(i) => &stat[i + 2..],
+        None => return (0, 0),
+    };
+    let fields: Vec<&str> = after_comm.split_whitespace().collect();
+    // after_comm starts at field 3 (state), so:
+    //   fields[0]  = state
+    //   ...
+    //   fields[10] = utime (field 14 - 3 = index 11 - 1 = 10? Let's be careful.)
+    // Fields 14 and 15 → indices 11 and 12 in `after_comm` (since after_comm
+    // begins at field 3, the offset is field_num - 3 = 11 for utime).
+    let utime: u64 = fields.get(11).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let stime: u64 = fields.get(12).and_then(|s| s.parse().ok()).unwrap_or(0);
+
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let rss_bytes = status
+        .lines()
+        .find_map(|line| {
+            let trimmed = line.trim();
+            let rest = trimmed.strip_prefix("VmRSS:")?;
+            // "VmRSS:      1234 kB" — value is in kB.
+            let kb: u64 = rest.trim().split_whitespace().next()?.parse().ok()?;
+            Some(kb * 1024)
+        })
+        .unwrap_or(0);
+
+    (utime + stime, rss_bytes)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_proc_cpu_rss() -> (u64, u64) {
+    (0, 0)
 }
 
 /// Background task: every 1s, trigger dispatch on all flow control slots.

@@ -6,6 +6,7 @@ pub mod key_format;
 pub mod kv_event;
 pub mod normalize;
 pub mod provider;
+pub mod stressmon;
 pub mod types;
 
 pub use debug_store::{DebugErrorEntry, DebugErrorStore};
@@ -13,6 +14,7 @@ pub use error::GatewayError;
 pub use key_format::is_valid_prefix;
 pub use kv_event::KvIndexBackend;
 pub use provider::{Authenticator, DeploymentQueueInfo, KeyAliasLookup, Provider};
+pub use stressmon::{StressmonApi, StressmonSample, StressmonSnapshot};
 
 /// Diagnostic counter for audit-log drops (channel full or batch INSERT
 /// failures). Implemented by boom-main's LogWriter; consumed by the dashboard

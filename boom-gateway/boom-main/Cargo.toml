@@ -29,6 +29,7 @@ boom-flowcontrol = { path = "../boom-flowcontrol" }
 boom-promptlog = { path = "../boom-promptlog" }
 boom-kvindex = { path = "../boom-kvindex" }
 boom-hooks-sdk = { path = "../boom-hooks-sdk" }
+boom-stressmon = { path = "../boom-stressmon" }
 axum = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }

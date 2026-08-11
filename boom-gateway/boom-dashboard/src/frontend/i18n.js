@@ -123,6 +123,13 @@
       "chat.confirm_clear_history": "Clear all conversation history for this API key? This cannot be undone.",
       "chat.history_cleared": "Conversation history cleared",
 
+      "stress.title": "System Pressure",
+      "stress.cpu": "CPU%",
+      "stress.queue": "Worker queue",
+      "stress.blocking": "Blocking queue",
+      "stress.inflight": "In-flight",
+      "stress.rss": "RSS",
+
       "stats.inflight.title": "In-Flight Requests",
       "stats.inflight.col.deployment": "Deployment",
       "stats.inflight.col.fc_queue": "FC QUEUE",
@@ -933,6 +940,13 @@
       "chat.clear_history": "清空历史",
       "chat.confirm_clear_history": "确认清空当前 API key 的所有对话历史?此操作不可撤销。",
       "chat.history_cleared": "对话历史已清空",
+
+      "stress.title": "系统压力",
+      "stress.cpu": "CPU%",
+      "stress.queue": "Worker 队列",
+      "stress.blocking": "Blocking 队列",
+      "stress.inflight": "在途",
+      "stress.rss": "RSS",
 
       "stats.inflight.title": "在途请求",
       "stats.inflight.col.deployment": "部署",

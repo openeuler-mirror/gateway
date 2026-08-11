@@ -223,6 +223,20 @@
                 <button class="btn-small" id="btn-refresh-inflight" data-i18n="action.refresh">Refresh</button>
               </div>
             </div>
+            <div class="stress-panel" id="stress-panel" style="margin-bottom:1.5rem">
+              <div class="stress-panel__head">
+                <span class="stress-panel__title" data-i18n="stress.title">System Pressure</span>
+                <span class="stress-panel__legend" id="stress-legend"></span>
+                <span class="stress-panel__range">
+                  <button class="btn-tiny" data-stress-range="5m">5m</button>
+                  <button class="btn-tiny" data-stress-range="15m">15m</button>
+                  <button class="btn-tiny" data-stress-range="30m">30m</button>
+                  <button class="btn-tiny" data-stress-range="60m">60m</button>
+                </span>
+              </div>
+              <canvas id="stress-canvas" width="1000" height="140"></canvas>
+              <div class="stress-panel__numbers" id="stress-numbers"></div>
+            </div>
             <div id="inflight-table-wrap"><p class="loading" data-i18n="common.loading">Loading...</p></div>
 
             <div class="request-rate-panel" style="margin-top:2rem">
