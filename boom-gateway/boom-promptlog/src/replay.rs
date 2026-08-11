@@ -46,7 +46,6 @@ impl OtelReplayer {
             .await
             .map_err(|e| ReplayError::Read(path.to_path_buf(), e.to_string()))?;
         let mut count = 0;
-        let max_attribute_bytes = self.exporter_max_attribute_bytes();
         for (i, line) in data.lines().enumerate() {
             let line = line.trim();
             if line.is_empty() {
@@ -54,7 +53,7 @@ impl OtelReplayer {
             }
             match serde_json::from_str::<PromptLogEntry>(line) {
                 Ok(entry) => {
-                    self.exporter.enqueue(entry, max_attribute_bytes).await;
+                    self.exporter.enqueue(entry).await;
                     count += 1;
                 }
                 Err(e) => {
@@ -119,10 +118,6 @@ impl OtelReplayer {
     /// Force a flush of whatever's queued. Call at the end of a replay run.
     pub async fn flush(&self) {
         self.exporter.flush().await;
-    }
-
-    fn exporter_max_attribute_bytes(&self) -> usize {
-        self.exporter.max_attribute_bytes()
     }
 }
 

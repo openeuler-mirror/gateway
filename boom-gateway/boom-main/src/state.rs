@@ -547,10 +547,20 @@ impl AppState {
         // Clean up assignments pointing to plans that no longer exist.
         self.plan_store.cleanup_assignments();
 
-        // 5. Update prompt log config (hot-reload).
+        // 5. Update prompt log config (hot-reload) + hot-swap OTLP exporter
+        //    when its sub-config changes. update_config covers the runtime
+        //    fields read per-entry by the background writer (dir, max_size,
+        //    enabled toggle, excluded_*, record_headers). replace_otlp
+        //    rebuilds the exporter when endpoint/headers/batch/timeout/etc.
+        //    differ — those are frozen in OtelExporter at construction time
+        //    and only take effect via rebuild.
         if let Some(ref v) = new_config.prompt_log {
             if let Ok(pc) = serde_json::from_value::<boom_promptlog::PromptLogConfig>(v.clone()) {
-                self.prompt_log_writer.update_config(pc);
+                let old_otlp = self.prompt_log_writer.config().otlp;
+                self.prompt_log_writer.update_config(pc.clone());
+                if old_otlp != pc.otlp {
+                    self.prompt_log_writer.replace_otlp(&pc.otlp).await;
+                }
             }
         } else {
             self.prompt_log_writer.update_config(boom_promptlog::PromptLogConfig::default());

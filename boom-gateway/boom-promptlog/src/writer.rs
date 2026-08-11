@@ -1,4 +1,4 @@
-use crate::config::PromptLogConfig;
+use crate::config::{OtlpConfig, PromptLogConfig};
 use crate::entry::{LogPhase, PromptLogEntry};
 #[cfg(feature = "otlp")]
 use crate::otlp::OtelExporter;
@@ -15,12 +15,19 @@ use tokio::sync::mpsc;
 ///
 /// Clone-safe handle that checks `should_capture()` against the live config.
 /// The actual file I/O happens in a background tokio task.
+///
+/// The OTLP exporter is held in an `Arc<ArcSwap<Option<Arc<OtelExporter>>>>`
+/// so it can be hot-swapped at runtime via `replace_otlp()` — the background
+/// writer reads `otlp.load()` on every entry, so the new exporter takes
+/// effect immediately for new entries after a reload.
 #[derive(Clone)]
 pub struct PromptLogWriter {
     config: Arc<ArcSwap<PromptLogConfig>>,
     sender: mpsc::UnboundedSender<PromptLogEntry>,
     #[cfg(feature = "otlp")]
-    otlp: Option<Arc<OtelExporter>>,
+    otlp: Arc<ArcSwap<Option<Arc<OtelExporter>>>>,
+    #[cfg(feature = "otlp")]
+    flush_handle: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl PromptLogWriter {
@@ -33,9 +40,13 @@ impl PromptLogWriter {
         let (sender, receiver) = mpsc::unbounded_channel();
         let config_clone = config.clone();
         #[cfg(feature = "otlp")]
-        let otlp: Option<Arc<OtelExporter>> = None;
+        let otlp: Arc<ArcSwap<Option<Arc<OtelExporter>>>> =
+            Arc::new(ArcSwap::from_pointee(None));
         #[cfg(feature = "otlp")]
         let otlp_clone = otlp.clone();
+        #[cfg(feature = "otlp")]
+        let flush_handle: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>> =
+            Arc::new(std::sync::Mutex::new(None));
         tokio::spawn(async move {
             #[cfg(feature = "otlp")]
             background_writer(receiver, config_clone, otlp_clone).await;
@@ -47,25 +58,37 @@ impl PromptLogWriter {
             sender,
             #[cfg(feature = "otlp")]
             otlp,
+            #[cfg(feature = "otlp")]
+            flush_handle,
         }
     }
 
     /// Spawn the background writer with an OTLP exporter. Only available when
     /// the `otlp` feature is on. Caller also typically calls
-    /// `exporter.spawn_flush_task()` to start periodic flushes.
+    /// `exporter.spawn_flush_task_to_handle()` to start periodic flushes
+    /// (writes the JoinHandle into the writer's `flush_handle` slot so
+    /// `replace_otlp` can abort it on reload).
     #[cfg(feature = "otlp")]
     pub fn spawn_with_otlp(config: PromptLogConfig, exporter: Arc<OtelExporter>) -> Self {
         let config = Arc::new(ArcSwap::from_pointee(config));
         let (sender, receiver) = mpsc::unbounded_channel();
         let config_clone = config.clone();
-        let exporter_clone = exporter.clone();
+        let flush_handle: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let flush_handle_for_task = flush_handle.clone();
+        // Spawn the flush task into the writer's handle slot.
+        exporter.spawn_flush_task_to_handle(flush_handle_for_task.clone());
+        let otlp: Arc<ArcSwap<Option<Arc<OtelExporter>>>> =
+            Arc::new(ArcSwap::from_pointee(Some(exporter.clone())));
+        let otlp_clone = otlp.clone();
         tokio::spawn(async move {
-            background_writer(receiver, config_clone, Some(exporter_clone)).await;
+            background_writer(receiver, config_clone, otlp_clone).await;
         });
         Self {
             config,
             sender,
-            otlp: Some(exporter),
+            otlp,
+            flush_handle,
         }
     }
 
@@ -92,9 +115,53 @@ impl PromptLogWriter {
         }
     }
 
-    /// Update config at runtime (hot-reload).
+    /// Update config at runtime (hot-reload). Updates the runtime config
+    /// seen by the background writer — affects local sink (dir, max_size,
+    /// capture flag, excluded_*, record_headers) and the `otlp.enabled`
+    /// toggle. Does NOT touch the running exporter (endpoint / batch_size /
+    /// timeout / etc.); use `replace_otlp` for those.
     pub fn update_config(&self, new_config: PromptLogConfig) {
         self.config.store(Arc::new(new_config));
+    }
+
+    /// Hot-swap the OTLP exporter. Aborts the old flush task, runs a
+    /// best-effort final flush on the old exporter to drain its queue,
+    /// constructs a new exporter from `new_otlp`, stores it, and spawns a
+    /// fresh flush task. Called from boom-main reload path when the `otlp`
+    /// sub-config differs from the running exporter's config.
+    ///
+    /// The best-effort flush is bounded by `new_otlp.timeout_secs + 2` so
+    /// a slow/unreachable old endpoint can't stall the reload. Entries that
+    /// arrive during the swap may briefly hit the old exporter (race window
+    /// between abort and store) — those entries stay in the old queue and
+    /// are dropped on overflow. Local JSONL is unaffected.
+    #[cfg(feature = "otlp")]
+    pub async fn replace_otlp(&self, new_otlp: &OtlpConfig) {
+        // 1. Abort the old flush task. The task may be mid-.await (HTTP
+        //    in-flight); abort() cancels cooperatively at the next .await.
+        if let Some(h) = self.flush_handle.lock().unwrap().take() {
+            h.abort();
+        }
+        // 2. Best-effort final flush on the old exporter to drain its
+        //    in-memory batch. Bounded so a dead endpoint doesn't stall
+        //    reload. Reuse the *new* timeout as the bound — it's a hint,
+        //    not a contract.
+        if let Some(old) = self.otlp.load().as_ref() {
+            let bound = std::time::Duration::from_secs(new_otlp.timeout_secs.max(1) + 2);
+            let _ = tokio::time::timeout(bound, old.flush()).await;
+        }
+        // 3. Construct the new exporter + spawn its flush task into the
+        //    shared handle slot. The ArcSwap store is atomic — the
+        //    background writer sees the new exporter on its next entry.
+        let new = OtelExporter::new(new_otlp);
+        new.spawn_flush_task_to_handle(self.flush_handle.clone());
+        self.otlp.store(Arc::new(Some(new)));
+        tracing::info!(
+            endpoint = %new_otlp.endpoint,
+            batch_size = new_otlp.batch_size,
+            flush_interval_secs = new_otlp.flush_interval_secs,
+            "OTLP exporter hot-swapped via reload"
+        );
     }
 
     /// Read a snapshot of the current config.
@@ -109,11 +176,15 @@ impl PromptLogWriter {
 
     /// Trigger final flush of any OTLP batch and wait for it to drain.
     /// Called once during shutdown — best-effort, never blocks the gateway
-    /// exit longer than the configured timeout.
+    /// exit longer than the configured timeout. Reads the current exporter
+    /// via the ArcSwap so a `replace_otlp` mid-shutdown is honored.
     #[cfg(feature = "otlp")]
     pub async fn shutdown_flush(&self) {
-        if let Some(exporter) = &self.otlp {
+        if let Some(exporter) = self.otlp.load().as_ref() {
             exporter.flush().await;
+        }
+        if let Some(h) = self.flush_handle.lock().unwrap().take() {
+            h.abort();
         }
     }
 
@@ -136,7 +207,7 @@ struct OpenFile {
 async fn background_writer(
     receiver: mpsc::UnboundedReceiver<PromptLogEntry>,
     config: Arc<ArcSwap<PromptLogConfig>>,
-    otlp: Option<Arc<OtelExporter>>,
+    otlp: Arc<ArcSwap<Option<Arc<OtelExporter>>>>,
 ) {
     background_writer_impl(receiver, config, otlp).await
 }
@@ -149,14 +220,15 @@ async fn background_writer(
     background_writer_impl(receiver, config, ()).await
 }
 
-/// Background writer body. The third argument is `Some(Arc<OtelExporter>)`
-/// when the otlp feature is on, or `()` when off — the per-call `cfg_attr`
-/// on the parameter makes the signature match either way.
+/// Background writer body. The third argument is `Arc<ArcSwap<Option<Arc<OtelExporter>>>>`
+/// when the otlp feature is on, or `()` when off. Reading `otlp.load()` on
+/// every entry lets `replace_otlp` hot-swap the exporter mid-run — new
+/// entries are enqueued to whatever exporter is current.
 #[cfg_attr(feature = "otlp", allow(clippy::type_complexity))]
 async fn background_writer_impl(
     mut receiver: mpsc::UnboundedReceiver<PromptLogEntry>,
     config: Arc<ArcSwap<PromptLogConfig>>,
-    #[cfg(feature = "otlp")] otlp: Option<Arc<OtelExporter>>,
+    #[cfg(feature = "otlp")] otlp: Arc<ArcSwap<Option<Arc<OtelExporter>>>>,
     #[cfg(not(feature = "otlp"))] _otlp: (),
 ) {
     // "{team_alias}/{key_hash}/{phase}" → open file state
@@ -167,19 +239,25 @@ async fn background_writer_impl(
         let base_dir = PathBuf::from(&cfg.dir);
         let max_bytes = cfg.max_file_size_mb * 1024 * 1024;
         #[cfg(feature = "otlp")]
-        let (otlp_enabled, max_attribute_bytes) = (cfg.otlp.enabled, cfg.otlp.max_attribute_bytes);
+        let otlp_enabled = cfg.otlp.enabled;
         drop(cfg); // release config guard
 
         // Fork to OTLP exporter first (under feature gate). Failure here must
         // never skip the local file write — local JSONL is the source of truth.
         // Respect the live `otlp.enabled` toggle: the exporter may have been
-        // constructed at startup (when enabled was true) but later disabled via
-        // dashboard — skip enqueuing in that case so the in-memory queue drains
-        // instead of accumulating entries nobody will pick up.
+        // disabled via dashboard — skip enqueuing in that case so the in-memory
+        // queue drains instead of accumulating entries nobody will pick up.
+        //
+        // `otlp.load()` is read every entry, so a `replace_otlp` mid-run is
+        // picked up immediately — new entries go to the new exporter. The
+        // `max_attribute_bytes` is no longer passed here (the previous
+        // parameter was silently ignored); the exporter uses its own frozen
+        // value, which is the current config value because replace_otlp
+        // rebuilds the exporter from the new config.
         #[cfg(feature = "otlp")]
         if otlp_enabled {
-            if let Some(exporter) = &otlp {
-                exporter.enqueue(entry.clone(), max_attribute_bytes).await;
+            if let Some(exporter) = otlp.load().as_ref() {
+                exporter.enqueue(entry.clone()).await;
             }
         }
 

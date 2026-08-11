@@ -22,7 +22,7 @@ use serde::Deserialize;
 ///     headers: {}
 ///     max_queue_size: 10000
 /// ```
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct PromptLogConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -56,7 +56,7 @@ pub struct PromptLogConfig {
 /// runs purely on local JSONL files; flipping it on spawns a background
 /// exporter that batches entries and POSTs them as `ExportLogsServiceRequest`
 /// protobuf to `{endpoint}/v1/logs`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct OtlpConfig {
     #[serde(default)]
     pub enabled: bool,

@@ -403,6 +403,10 @@ impl OtelExporter {
     /// Spawn the periodic flush task. Returns a JoinHandle the caller can
     /// await at shutdown. Drops of the handle do NOT abort the task — the
     /// task runs until the runtime is dropped or the process exits.
+    ///
+    /// For hot-reload paths prefer `spawn_flush_task_to_handle`, which writes
+    /// the JoinHandle into an externally-managed `Mutex<Option<JoinHandle>>`
+    /// so the caller can `abort()` it before constructing a replacement.
     pub fn spawn_flush_task(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let me = self.clone();
         let start = Instant::now();
@@ -415,13 +419,41 @@ impl OtelExporter {
         })
     }
 
+    /// Same as `spawn_flush_task` but writes the JoinHandle into the caller-
+    /// supplied `flush_handle` slot instead of returning it. Used by
+    /// `PromptLogWriter::replace_otlp` so the reload path can abort the
+    /// previous flush task before spawning a fresh one against the rebuilt
+    /// exporter — same pattern as `AppState::kv_prune_handle`.
+    pub fn spawn_flush_task_to_handle(
+        self: &Arc<Self>,
+        handle: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    ) {
+        let me = self.clone();
+        let start = Instant::now();
+        let mut ticker = interval_at(start, me.flush_interval);
+        let h = tokio::spawn(async move {
+            loop {
+                ticker.tick().await;
+                me.flush().await;
+            }
+        });
+        *handle.lock().unwrap() = Some(h);
+    }
+
     /// Push an entry into the in-memory queue. Bounded; if full, drop oldest.
     /// When the batch hits `batch_size`, flush eagerly so a steady load
     /// doesn't wait for the periodic tick.
     ///
     /// Async because the batch is held in a `tokio::sync::Mutex` and we can't
     /// `blocking_lock` from inside an async runtime.
-    pub async fn enqueue(self: &Arc<Self>, entry: PromptLogEntry, _max_attribute_bytes: usize) {
+    ///
+    /// `max_attribute_bytes` is read from `self` at flush time, not here —
+    /// the parameter was removed because the previous two-arg version silently
+    /// ignored it (param was named `_max_attribute_bytes`), giving the false
+    /// impression that hot-reloading `otlp.max_attribute_bytes` would take
+    /// effect. With exporter hot-swap, `self.max_attribute_bytes` is always
+    /// the current value.
+    pub async fn enqueue(self: &Arc<Self>, entry: PromptLogEntry) {
         let should_flush = {
             let mut batch = self.batch.lock().await;
             if batch.len() >= self.max_queue_size {
