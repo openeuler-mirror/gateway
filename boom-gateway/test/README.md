@@ -81,6 +81,8 @@ curl -s -X POST http://127.0.0.1:8080/v1/chat/completions \
 ```
 mock-backend [--bind ADDR] [--min-chars N] [--max-chars N]
              [--chunk-interval-ms N] [--max-concurrent N] [--ttft-ms N]
+             [--response-delay-ms N]
+             [--served-model NAME] [--reject-empty-tools]
 ```
 
 | 参数 | 默认 | 说明 |
@@ -91,6 +93,9 @@ mock-backend [--bind ADDR] [--min-chars N] [--max-chars N]
 | `--chunk-interval-ms` | `2` | 流式每 chunk 间隔（ms）。设 0 让 mock 尽快推 |
 | `--max-concurrent` | `10000` | 自身并发上限。超出时返回 503，模拟后端过载 |
 | `--ttft-ms` | `0` | 首 token 延迟（ms）。非 0 时模拟 reasoning 模型 |
+| `--response-delay-ms` | `0` | 非流式响应延迟（ms）。非 0 时模拟长时间无结果的 panel |
+| `--served-model` | 不限制 | 仅公布并接受指定模型，错误模型返回 404 |
+| `--reject-empty-tools` | `false` | 请求显式携带 `tools: []` 时返回 400 |
 
 **端点**：
 - `POST /v1/chat/completions` — OpenAI 格式（流式 / 非流式）
@@ -103,6 +108,82 @@ mock-backend [--bind ADDR] [--min-chars N] [--max-chars N]
 **SSE 格式**：vLLM 标准 —— `delta` chunk 一个个发，最后一个 chunk 带 `usage` 字段（`prompt_tokens` / `completion_tokens` / `total_tokens`），结尾 `data: [DONE]\n\n`。**usage 必须在最后一个 chunk**，这是网关 `LoggedStream` 提取计费用的。
 
 > **关于 end-of-stream 检测**：mock 直发 `data: [DONE]\n\n`；但网关成功路径**不**转发 `[DONE]`（OpenAI 流以 `"finish_reason":"stop"` 终止，Anthropic 流以 `"type":"message_stop"` 终止），只有错误路径才发 `[DONE]`。bench-client 同时认这三种信号，所以 mock 直连和经网关两种链路都能正确判完。
+
+## Fusion 压测 E2E
+
+`fusion-load-e2e.sh` 自动构建并启动 4 个独立 mock-backend、真实
+boom-gateway、临时 PostgreSQL 和 bench-client，严格按本章参数自动运行
+5 类场景、共 7 次压测：
+
+| README 场景 | 自动运行 |
+|---|---|
+| A 基线吞吐 | Fusion，OpenAI 单 key，1000 QPS，120 秒，流式 |
+| B 协议转换 | OpenAI 与 Anthropic 各 500 QPS、60 秒、流式 |
+| C DB 认证 | Dashboard API 创建 100 把 virtual key，2000 并发，120 秒，非流式 Fusion |
+| D 长 Prompt | Fusion，1K 与 100K prompt 各 200 QPS、60 秒、流式 |
+| E Ramp | Fusion，`ramp=100,5000,500,30`，15 分钟，流式 |
+
+FusionProvider 设计上只支持 `/v1/chat/completions`，因此场景 B 使用同一套
+Gateway 和协议转换 mock-backend 直接请求 `mock-gpt-4o` / `mock-claude`，只测 Gateway 的
+`/v1/messages` 协议转换开销，不将其伪装成 Fusion Anthropic 覆盖。
+
+场景 A-D 是功能与稳定性基线，要求：
+
+- bench-client 所有请求成功，无 4xx/5xx/超时/连接/解析/流错误；
+- 三个 Fusion Backend 和协议转换 Backend 的收包增量严格符合当前场景拓扑；
+- Backend 无错误模型、空 tools 或并发过载拒绝，结束后 inflight 为零；
+- 多 Key 场景创建的每一把 virtual key 都至少实际完成一个请求。
+
+场景 E 用于寻找吞吐拐点，不把高压阶段出现的 429、5xx、超时或 Backend 503
+直接判为脚本失败。它要求请求结果完整记账、执行完整 30 个时间段、到达 5000 QPS
+后保持到 15 分钟结束，并把每个 Backend 的收包数和 503 增量写入
+`stats/E-ramp-delta.json`。Fusion 在 Aggregator 建立流之前失败时会降级返回第一个
+有效 Panel，因此客户端成功数可能高于 Aggregator 成功数；判断拐点时必须同时查看
+bench 报告和 Backend 503，不能只看客户端 HTTP 结果。
+
+```bash
+./boom-gateway/test/fusion-load-e2e.sh
+```
+
+脚本默认使用 release 构建。Mock 输出、chunk 间隔和并发上限也使用本 README
+的原始值：100~400 字符、每 chunk 2ms、最大并发 10000。默认完整运行时间
+至少约 23 分钟，另加 release 构建、Gateway 启动和请求收尾时间。
+
+多 Key 场景需要 PostgreSQL。默认通过 Docker 启动并自动清理
+`postgres:16-alpine`；也可以用 `FUSION_LOAD_DATABASE_URL` 指向专用的、
+可丢弃的测试数据库。Gateway 会在该数据库执行迁移并写入测试数据，不应指向生产库。
+
+每次运行的 JSON 报告、bench 实时输出、Gateway/Mock 日志和 Backend stats/增量
+默认保留在 `/tmp/boom-fusion-readme-<UTC时间>-<PID>`。可用
+`FUSION_LOAD_OUTPUT_DIR` 指定其他目录。
+
+标准性能压测不启用 Prompt Log，避免每个请求的详细日志 I/O 改写吞吐结果。
+Fusion Prompt Log 的功能、成功和故障场景由
+`boom-main/tests/fusion_panel_tools_e2e.rs` 中的 14 个真实 Gateway E2E 覆盖。
+
+环境变量可覆盖单项参数以调试脚本，但默认值始终是本 README 的原始参数。服务启动时
+默认最多重试 5 次，可用 `FUSION_LOAD_START_RETRIES` 调整。例如：
+
+```bash
+FUSION_LOAD_PROFILE=release \
+FUSION_LOAD_BASELINE_QPS=1000 \
+FUSION_LOAD_BASELINE_DURATION=120s \
+FUSION_LOAD_PROTOCOL_QPS=500 \
+FUSION_LOAD_PROTOCOL_DURATION=60s \
+FUSION_LOAD_KEY_COUNT=100 \
+FUSION_LOAD_MULTI_KEY_CONCURRENCY=2000 \
+FUSION_LOAD_MULTI_KEY_DURATION=120s \
+FUSION_LOAD_PROMPT_QPS=200 \
+FUSION_LOAD_PROMPT_DURATION=60s \
+FUSION_LOAD_SHORT_PROMPT_CHARS=1000 \
+FUSION_LOAD_LONG_PROMPT_CHARS=100000 \
+FUSION_LOAD_RAMP_MODE=ramp=100,5000,500,30 \
+FUSION_LOAD_RAMP_DURATION=15m \
+./boom-gateway/test/fusion-load-e2e.sh
+```
+
+已构建对应 profile 的二进制时可设置 `FUSION_LOAD_SKIP_BUILD=1`。该压测
+E2E 不进入默认 `cargo test`，必须显式运行。
 
 ## bench-client CLI
 

@@ -8,7 +8,9 @@ use axum::Json;
 use boom_core::anthropic::{
     anthropic_request_to_openai, openai_response_to_anthropic, AnthropicStreamTranscoder,
 };
-use boom_core::provider::{ProviderBilling, ProviderCallContext, ProviderCost};
+use boom_core::provider::{
+    ProviderBilling, ProviderCallContext, ProviderCost, SharedProviderPromptTrace,
+};
 use boom_core::types::*;
 use boom_core::GatewayError;
 use boom_ctxaware::AgentStatsTracker;
@@ -25,6 +27,77 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Instant;
+
+#[allow(clippy::too_many_arguments)]
+fn write_prompt_log_error(
+    state: &AppState,
+    should_capture: bool,
+    request_body: Option<&serde_json::Value>,
+    trace_id: Option<String>,
+    request_id: &str,
+    identity: &AuthIdentity,
+    model: &str,
+    api_path: &str,
+    is_stream: bool,
+    client_ip: &str,
+    headers: Option<&std::collections::HashMap<String, String>>,
+    error: &GatewayError,
+    prompt_trace: Option<&SharedProviderPromptTrace>,
+    start: Instant,
+) {
+    if !should_capture {
+        return;
+    }
+    let Some(request_body) = request_body else {
+        return;
+    };
+
+    let request_entry = PromptLogEntry::new_request(
+        request_id,
+        trace_id,
+        &identity.key_hash,
+        identity.key_alias.as_deref(),
+        identity.team_alias.as_deref(),
+        model,
+        api_path,
+        is_stream,
+        request_body.clone(),
+        Some(client_ip),
+        headers.cloned(),
+    );
+    state.prompt_log_writer.send(request_entry.clone());
+
+    let mut response_entry = PromptLogEntry::new_response_from(&request_entry);
+    response_entry.set_response(openai_error_body(error));
+    if let Some(trace) = prompt_trace {
+        trace.finalize();
+        if let Some(fusion) = trace.snapshot() {
+            response_entry.set_fusion(fusion);
+        }
+    }
+    response_entry.set_status(error.status_code() as i32, start.elapsed().as_millis() as u64);
+    let error_code = match error {
+        GatewayError::ModelNotFound(_) | GatewayError::ModelNotAllowed(_) => {
+            boom_promptlog::error_code::MODEL_NOT_ALLOWED
+        }
+        GatewayError::AuthError(_) | GatewayError::KeyExpired | GatewayError::KeyBlocked => {
+            boom_promptlog::error_code::AUTH_FAILED
+        }
+        GatewayError::RateLimitExceeded { .. } | GatewayError::ConcurrencyExceeded { .. } => {
+            boom_promptlog::error_code::RATE_LIMITED
+        }
+        GatewayError::UpstreamTimeout => boom_promptlog::error_code::TIMEOUT,
+        GatewayError::UpstreamError { .. } | GatewayError::ProviderError(_) => {
+            boom_promptlog::error_code::UPSTREAM_ERROR
+        }
+        GatewayError::ConfigError(_) | GatewayError::InternalError(_) => {
+            boom_promptlog::error_code::INTERNAL_ERROR
+        }
+        _ => boom_promptlog::error_code::UPSTREAM_ERROR,
+    };
+    response_entry.set_error(error_code, error.to_string());
+    state.prompt_log_writer.send(response_entry);
+}
 
 /// Extract client IP from request headers with TCP fallback.
 /// Priority: X-Real-IP > X-Forwarded-For (first IP) > TCP remote addr > "unknown".
@@ -610,12 +683,14 @@ async fn chat_completions_inner(
         provider.client_type_header(),
     );
     let provider_billing = ProviderBilling::default();
+    let provider_prompt_trace = prompt_log_should.then(|| provider.create_prompt_trace()).flatten();
     let provider_context = ProviderCallContext {
         key_hash: identity.key_hash.clone(),
         key_alias: identity.key_alias.clone(),
         is_vip,
         api_path: api_path.to_string(),
         billing: provider_billing.clone(),
+        prompt_trace: provider_prompt_trace.clone(),
     };
 
     // Capture request body for debug recording if debug mode is enabled.
@@ -633,6 +708,22 @@ async fn chat_completions_inner(
                 let partial_usage = provider_billing.actual_usage();
                 settle_partial_provider_accounting(&mut plan_charge, &provider_billing);
                 log_error_with_usage(&state, &identity, &model, api_path, true, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()), partial_usage.as_ref());
+                write_prompt_log_error(
+                    &state,
+                    prompt_log_should,
+                    prompt_log_req_body.as_ref(),
+                    prompt_log_trace_id.clone(),
+                    &request_id,
+                    &identity,
+                    &model,
+                    api_path,
+                    true,
+                    &client_ip,
+                    prompt_log_headers.as_ref(),
+                    &e,
+                    provider_prompt_trace.as_ref(),
+                    start,
+                );
                 crate::health_monitor::record_request_failure(&state, &deployment_id, &e);
                 return Err(GatewayErrorReply(e, true));
             }
@@ -713,8 +804,27 @@ async fn chat_completions_inner(
                 // any upstream bytes arrive. The stream wrapper's Drop will
                 // emit the matching Response-phase entry via `new_response_from`.
                 let _ = sender.send(prompt_entry.clone());
-                let prompt_logged = PromptLogStream::new(logged, sender, prompt_entry, sse_raw_data_extractor(), None);
-                let response = Sse::new(sse_item_to_event(prompt_logged)).keep_alive(KeepAlive::default());
+                let mut prompt_logged = PromptLogStream::new(
+                    logged,
+                    sender,
+                    prompt_entry,
+                    sse_raw_data_extractor(),
+                    None,
+                );
+                // Provider-owned trace snapshot (fusion/KV-index/etc.) is
+                // injected into the Response-phase entry built on Drop —
+                // runs AFTER the inner stream's Drop so trace finalization
+                // side effects are visible to the snapshot.
+                if let Some(trace) = provider_prompt_trace.clone() {
+                    prompt_logged = prompt_logged.with_entry_enricher(Arc::new(move |entry| {
+                        trace.finalize();
+                        if let Some(fusion) = trace.snapshot() {
+                            entry.set_fusion(fusion);
+                        }
+                    }));
+                }
+                let response =
+                    Sse::new(sse_item_to_event(prompt_logged)).keep_alive(KeepAlive::default());
                 return Ok(response.into_response());
             }
         }
@@ -732,6 +842,22 @@ async fn chat_completions_inner(
                 let partial_usage = provider_billing.actual_usage();
                 settle_partial_provider_accounting(&mut plan_charge, &provider_billing);
                 log_error_with_usage(&state, &identity, &model, api_path, false, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()), partial_usage.as_ref());
+                write_prompt_log_error(
+                    &state,
+                    prompt_log_should,
+                    prompt_log_req_body.as_ref(),
+                    prompt_log_trace_id.clone(),
+                    &request_id,
+                    &identity,
+                    &model,
+                    api_path,
+                    false,
+                    &client_ip,
+                    prompt_log_headers.as_ref(),
+                    &e,
+                    provider_prompt_trace.as_ref(),
+                    start,
+                );
                 crate::health_monitor::record_request_failure(&state, &deployment_id, &e);
                 return Err(GatewayErrorReply(e, false));
             }
@@ -832,6 +958,12 @@ async fn chat_completions_inner(
                 response_entry.set_response(
                     serde_json::to_value(&resp).unwrap_or(serde_json::Value::Null),
                 );
+                if let Some(trace) = provider_prompt_trace.as_ref() {
+                    trace.finalize();
+                    if let Some(fusion) = trace.snapshot() {
+                        response_entry.set_fusion(fusion);
+                    }
+                }
                 response_entry.set_status(200, duration_ms as u64);
                 let _ = sender.send(response_entry);
             }
@@ -1170,6 +1302,16 @@ fn require_master(identity: &AuthIdentity) -> Result<(), GatewayErrorReply> {
 /// so streaming clients receive a clear error instead of hanging.
 pub struct GatewayErrorReply(pub GatewayError, pub bool /* is_stream */);
 
+fn openai_error_body(error: &GatewayError) -> serde_json::Value {
+    serde_json::json!({
+        "error": {
+            "message": error.to_string(),
+            "type": error.error_type(),
+            "code": error.status_code(),
+        }
+    })
+}
+
 impl IntoResponse for GatewayErrorReply {
     fn into_response(self) -> axum::response::Response {
         let status = axum::http::StatusCode::from_u16(self.0.status_code())
@@ -1178,13 +1320,7 @@ impl IntoResponse for GatewayErrorReply {
         if self.1 {
             // Streaming mode: return SSE-formatted error so the client
             // (which expects text/event-stream) can parse it correctly.
-            let body = serde_json::json!({
-                "error": {
-                    "message": self.0.to_string(),
-                    "type": self.0.error_type(),
-                    "code": self.0.status_code(),
-                }
-            });
+            let body = openai_error_body(&self.0);
             let data = serde_json::to_string(&body).unwrap_or_default();
             let sse_body = format!("data: {data}\n\ndata: [DONE]\n\n");
 
@@ -1211,13 +1347,7 @@ impl IntoResponse for GatewayErrorReply {
             response
         } else {
             // Non-streaming: standard JSON error.
-            let body = serde_json::json!({
-                "error": {
-                    "message": self.0.to_string(),
-                    "type": self.0.error_type(),
-                    "code": self.0.status_code(),
-                }
-            });
+            let body = openai_error_body(&self.0);
 
             let mut response = (status, Json(body)).into_response();
             if let GatewayError::RateLimitExceeded {
@@ -2318,7 +2448,14 @@ fn sse_stream_from_chat_stream(
     tokio::spawn(async move {
         let mut tool_arg_buf: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
         let mut stream = std::pin::pin!(stream);
-        while let Some(result) = stream.next().await {
+        loop {
+            let result = tokio::select! {
+                _ = tx.closed() => return,
+                result = stream.next() => result,
+            };
+            let Some(result) = result else {
+                return;
+            };
             match result {
                 Ok(mut chunk) => {
                     if let Some(ref u) = chunk.usage {
@@ -2413,10 +2550,10 @@ fn sse_stream_from_chat_stream(
                 }
                 Err(e) => {
                     tracing::error!("SSE stream error (OpenAI): {}", e);
-                    let error_data =
-                        serde_json::to_string(&serde_json::json!({"error": "Upstream error"}))
-                            .unwrap_or_default();
+                    let error_data = serde_json::to_string(&openai_error_body(&e))
+                        .unwrap_or_default();
                     let _ = tx.send(SseItem { event: Event::default().data(&error_data), json_data: error_data }).await;
+                    return;
                 }
             }
         }
@@ -3140,9 +3277,7 @@ pub async fn kv_index_status(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        build_gateway_headers, is_vip_key, preferred_stream_usage, UsageTrackerState,
-    };
+    use super::{build_gateway_headers, is_vip_key, preferred_stream_usage, UsageTrackerState};
     use boom_core::types::{PromptTokensDetails, Usage};
     use serde_json::json;
 
@@ -3277,4 +3412,5 @@ mod tests {
             (Some(7), Some(3), Some(2))
         );
     }
+
 }

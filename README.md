@@ -310,11 +310,12 @@ BooMGateway/
 | `POST /v1/chat/completions` | OpenAI 对话（流式 / 非流式，支持 workflow 模型） |
 | `POST /v1/messages` | Anthropic Messages API |
 | `POST /v1/completions` | OpenAI completions |
-| `POST /v1/embeddings` | 返回"不支持" |
+| `POST /v1/embeddings` | 返回"不支持"（路由存在，统一拒绝） |
+| `POST /v1/audio/speech` · `/audio/transcriptions` · `/v1/moderations` | 返回"不支持"（路由存在，统一拒绝） |
 | `GET /v1/models` | 当前密钥可见的模型（deployment + 别名） |
 | `GET /v1/models/{id}` | 单个模型信息 |
 
-> 同时提供 OpenAI 客户端兼容别名（不带 `/v1` 前缀）：`/chat/completions`、`/completions`、`/models`。
+> 同时提供 OpenAI 客户端兼容别名（不带 `/v1` 前缀）：`/chat/completions`、`/completions`、`/models`、`/models/{id}`。
 
 ### 管理 API（需 master key）
 
@@ -349,29 +350,35 @@ BooMGateway/
 |----------|-------------|
 | `GET /dashboard/api/admin/keys` | 列出密钥 |
 | `POST /dashboard/api/admin/keys` · `/keys/batch` | 创建 / 批量创建密钥 |
+| `POST /dashboard/api/admin/keys/import` | 导入外部密钥 |
 | `PUT /dashboard/api/admin/keys/{token_hash}` | 更新密钥 |
+| `DELETE /dashboard/api/admin/keys/{token_hash}` | 删除密钥 |
 | `POST /dashboard/api/admin/keys/{token_hash}/block` · `/unblock` | 封禁 / 解封密钥 |
 
 **模型与别名**
 | 端点 | 说明 |
 |----------|-------------|
-| `/dashboard/api/admin/models` | 模型 deployment CRUD |
-| `/dashboard/api/admin/aliases` | 模型别名 CRUD |
+| `GET` · `POST /dashboard/api/admin/models` | 列出 / 创建模型 deployment |
+| `PUT` · `DELETE /dashboard/api/admin/models/{id}` | 更新 / 删除模型 deployment |
+| `GET` · `POST /dashboard/api/admin/aliases` | 列出 / 创建模型别名 |
+| `PUT` · `DELETE /dashboard/api/admin/aliases/{alias_name}` | 更新 / 删除模型别名 |
 
 **套餐、绑定与团队**
 | 端点 | 说明 |
 |----------|-------------|
-| `/dashboard/api/admin/plans` | 套餐 CRUD |
+| `GET` · `PUT /dashboard/api/admin/plans` · `DELETE /dashboard/api/admin/plans/{name}` | 套餐 CRUD |
 | `POST /dashboard/api/admin/assignments` · `DELETE` · `GET` | 密钥→套餐绑定 |
-| `POST /dashboard/api/admin/team-assignments` · `DELETE` | 团队→套餐绑定 |
-| `/dashboard/api/admin/teams` | 团队 CRUD（含模型访问控制） |
+| `POST /dashboard/api/admin/team-assignments` · `DELETE /{team_id}` | 团队→套餐绑定 |
+`POST /dashboard/api/admin/teams` `PUT` `DELETE /dashboard/api/admin/teams/{team_id}`
 
 **配额**
 | 端点 | 说明 |
 |----------|-------------|
 | `GET /dashboard/api/admin/quota/overview` | 按团队的配额总览 |
-| `GET /dashboard/api/admin/quota/team/{id}` · `/unassigned` · `/key/{hash}/windows` | 配额明细 |
-| `POST /dashboard/api/admin/quota/reset/...` | 重置累计 / 窗口配额（按密钥或团队） |
+| `GET /dashboard/api/admin/quota/team/{id}` · `/unassigned` · `/key/{key_hash}/windows` | 配额明细 |
+| `POST /dashboard/api/admin/quota/reset/key/{key_hash}` · `/team/{id}` | 重置累计 / 窗口配额（按密钥或团队） |
+| `POST /dashboard/api/admin/quota/reset/key/{key_hash}/cumulative` · `/windows` | 重置单密钥累计 / 窗口配额 |
+| `POST /dashboard/api/admin/quota/reset/team/{id}/cumulative` · `/windows` | 重置单团队累计 / 窗口配额 |
 
 **日志与统计**
 | 端点 | 说明 |
@@ -383,6 +390,7 @@ BooMGateway/
 | `GET /dashboard/api/admin/stats/deployments/summary` | 各 deployment 24 小时汇总 |
 | `GET /dashboard/api/admin/stats/request_rate` | 各 deployment 请求速率 |
 | `GET /dashboard/api/admin/stats/rebalance-moves` | 负载均衡迁移次数 |
+| `GET /dashboard/api/admin/stats/audit-log` | 审计日志丢弃计数（channel full / 批量失败） |
 
 **Prompt 日志**
 | 端点 | 说明 |
@@ -395,13 +403,17 @@ BooMGateway/
 | 端点 | 说明 |
 |----------|-------------|
 | `POST /dashboard/api/admin/limits/reset/{key_hash}` · `/reset` | 重置速率限制窗口 |
+| `GET` · `PUT /dashboard/api/admin/config` | 读取 / 增量更新完整配置 |
+| `GET /dashboard/api/admin/config/schema` | 配置字段 manifest（声明式 UI schema） |
 | `POST /dashboard/api/admin/config/reload` | 从面板 UI 热加载 |
 
-**调试**（需开启 `debug-tools` feature）
+**调试**
 | 端点 | 说明 |
 |----------|-------------|
 | `GET /dashboard/api/admin/debug/status` · `POST /toggle` | 调试录制开关 |
 | `GET /dashboard/api/admin/debug/errors/{request_id}` | 读取录制的错误 |
+
+> 调试路由始终注册（无需 feature flag）；`debug-tools` feature 仅用于是否在静态页面中展示 Debug 入口。
 
 ### 健康检查（无需认证）
 
@@ -591,7 +603,15 @@ prompt_log:
 
 ## 负载均衡（misc/LB）
 
-基于 Pingora 的独立负载均衡器，可作为可选前端。它以 Docker 镜像提供（Rust 多阶段构建，openEuler 运行时）：
+基于 Pingora 的独立负载均衡器，可作为可选前端。它以 Docker 镜像提供（Rust 多阶段构建，openEuler 运行时）。核心能力：
+
+- 路由：`host`（含通配符 `*.example.com`）、`path` 前缀（按段边界）、`client_ip` CIDR，首条匹配生效
+- 后端策略：多活（一致性哈希 + API Key 亲和）与主备（按序 failover），默认后端支持 failover 列表
+- 健康检查：TCP / HTTP GET 探测，周期与失败阈值可配；连接失败自动重试换节点
+- 韧性：5xx 重试（幂等方法限定，自动排除坏后端）+ 每路由超时覆盖
+- 安全：IP 黑名单（热加载）、trusted_proxies + XFF 防伪造、上游 TLS、请求体上限、请求走私纵深防御
+- 可观测：`/__lb_metrics` Prometheus 计数（状态码分桶/错误/重试/延迟直方图）、`/__lb_healthz` 探活、结构化访问日志（状态码/耗时/错误）
+- 热加载：配置与黑名单变更自动生效（ArcSwap 无锁切换）
 
 ```bash
 ./misc/LB/start.sh start              # 自动构建 + 生成证书
@@ -599,7 +619,7 @@ prompt_log:
 ./misc/LB/start.sh status | stop | restart
 ```
 
-按 `host`（支持通配符 `*.example.com`）、`path` 前缀、`client_ip` CIDR 进行路由。
+详细配置与运维说明见 [misc/LB/README.md](misc/LB/README.md)。
 
 ---
 

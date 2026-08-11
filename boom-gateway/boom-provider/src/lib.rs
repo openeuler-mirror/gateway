@@ -207,3 +207,41 @@ pub(crate) fn now_timestamp() -> u64 {
         .unwrap_or_default()
         .as_secs()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::create_provider;
+    use boom_core::provider::ProviderProtocol;
+    use std::collections::HashMap;
+
+    #[test]
+    fn provider_protocol_comes_from_the_created_provider() {
+        let create = |model: &str| {
+            create_provider(
+                model,
+                Some("test-key".to_string()),
+                Some("http://127.0.0.1:1/v1".to_string()),
+                1,
+                &HashMap::new(),
+                None,
+                false,
+            )
+            .unwrap()
+        };
+
+        for model in [
+            "openai/test-model",
+            "hosted_vllm/test-model",
+            "azure/test-deployment",
+        ] {
+            assert_eq!(create(model).protocol(), ProviderProtocol::OpenAiCompatible);
+        }
+        for model in [
+            "anthropic/test-model",
+            "gemini/test-model",
+            "bedrock/test-model",
+        ] {
+            assert_eq!(create(model).protocol(), ProviderProtocol::Native);
+        }
+    }
+}

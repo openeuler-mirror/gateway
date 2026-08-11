@@ -41,7 +41,7 @@ pub struct ChunkDelta {
 /// If the client disconnects mid-stream, Drop is still invoked — we keep what
 /// we have, mark the entry with `CLIENT_DISCONNECTED`, and write a 499 status.
 pub struct PromptLogStream<S, F> {
-    inner: S,
+    inner: Option<S>,
     sender: mpsc::UnboundedSender<PromptLogEntry>,
     /// The Request-phase entry, kept here so `new_response_from` can clone its
     /// shared identity fields when we emit the Response-phase entry on Drop.
@@ -62,6 +62,8 @@ pub struct PromptLogStream<S, F> {
     /// Shared buffer for raw upstream SSE chunks (before format conversion).
     /// Only set when `capture_raw_upstream` is enabled for Anthropic-format endpoints.
     raw_upstream_chunks: Option<Arc<std::sync::Mutex<Vec<String>>>>,
+    /// Adds provider-owned metadata after the wrapped stream has been dropped.
+    entry_enricher: Option<Arc<dyn Fn(&mut PromptLogEntry) + Send + Sync>>,
 }
 
 impl<S: Unpin, F: Unpin> Unpin for PromptLogStream<S, F> {}
@@ -76,7 +78,7 @@ impl<S, F> PromptLogStream<S, F> {
     ) -> Self {
         let start = Instant::now();
         Self {
-            inner,
+            inner: Some(inner),
             sender,
             request_entry: Some(request_entry),
             start,
@@ -86,12 +88,24 @@ impl<S, F> PromptLogStream<S, F> {
             end_state: None,
             delta_fn,
             raw_upstream_chunks,
+            entry_enricher: None,
         }
+    }
+
+    pub fn with_entry_enricher(
+        mut self,
+        enricher: Arc<dyn Fn(&mut PromptLogEntry) + Send + Sync>,
+    ) -> Self {
+        self.entry_enricher = Some(enricher);
+        self
     }
 }
 
 impl<S, F> Drop for PromptLogStream<S, F> {
     fn drop(&mut self) {
+        // Nested provider streams finalize their trace state on drop.
+        self.inner.take();
+
         let Some(req_entry) = self.request_entry.take() else {
             return;
         };
@@ -136,6 +150,13 @@ impl<S, F> Drop for PromptLogStream<S, F> {
             entry.error_code = Some(code);
         }
 
+        // Let the producer inject extra fields (e.g. fusion trace snapshot)
+        // before the entry ships. Runs AFTER inner stream drop so the trace
+        // can observe finalization side effects.
+        if let Some(enricher) = &self.entry_enricher {
+            enricher(&mut entry);
+        }
+
         // Capture raw upstream chunks if available (before format conversion).
         if let Some(ref raw_chunks) = self.raw_upstream_chunks {
             if let Ok(guard) = raw_chunks.lock() {
@@ -171,7 +192,10 @@ where
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        match this.inner.poll_next_unpin(cx) {
+        let Some(inner) = this.inner.as_mut() else {
+            return Poll::Ready(None);
+        };
+        match inner.poll_next_unpin(cx) {
             Poll::Ready(Some(item)) => {
                 if let Some(delta) = (this.delta_fn)(&item) {
                     if let Some(content) = delta.content {
@@ -210,6 +234,7 @@ mod tests {
     use crate::entry::LogPhase;
     use futures::stream;
     use futures::StreamExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     fn make_request_entry(id: &str) -> PromptLogEntry {
         PromptLogEntry::new_request(
@@ -315,5 +340,76 @@ mod tests {
         // Content not accumulated because we never polled.
         let resp = entry.response.expect("response set");
         assert_eq!(resp["choices"][0]["message"]["content"], "");
+    }
+
+    /// Stream that never produces an item but signals on Drop. Used to verify
+    /// the inner stream's Drop runs BEFORE the entry_enricher callback — the
+    /// fusion trace snapshot must observe finalization side effects.
+    struct DropSignalStream {
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Stream for DropSignalStream {
+        type Item = serde_json::Value;
+
+        fn poll_next(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            Poll::Pending
+        }
+    }
+
+    impl Drop for DropSignalStream {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn entry_enricher_runs_after_inner_stream_drop() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let entry = PromptLogEntry::new_request(
+            "request-1",
+            None,
+            "key-1",
+            None,
+            None,
+            "test-model",
+            "/v1/chat/completions",
+            true,
+            serde_json::json!({"model": "test-model"}),
+            None,
+            None,
+        );
+        let snapshot_dropped = dropped.clone();
+        let stream = PromptLogStream::new(
+            DropSignalStream {
+                dropped: dropped.clone(),
+            },
+            sender,
+            entry,
+            |_item: &serde_json::Value| None::<ChunkDelta>,
+            None,
+        )
+        .with_entry_enricher(Arc::new(move |entry| {
+            entry.set_raw_upstream_response(serde_json::json!({
+                "inner_dropped": snapshot_dropped.load(Ordering::SeqCst)
+            }));
+        }));
+
+        drop(stream);
+
+        // Inner stream's Drop ran first — enricher observed the side effect.
+        assert!(dropped.load(Ordering::SeqCst));
+        let entry = receiver.try_recv().expect("prompt log entry was not sent");
+        assert_eq!(
+            entry.raw_upstream_response.unwrap()["inner_dropped"],
+            serde_json::Value::Bool(true)
+        );
+        // The wrapper was dropped without ever being polled, so it's recorded
+        // as a truncation (CLIENT_DISCONNECTED), not a clean 200. This is the
+        // otlp-refactor behavior: no terminal chunk seen ⇒ 499.
+        assert_eq!(entry.status_code, Some(499));
+        assert_eq!(entry.error_code.as_deref(), Some(error_code::CLIENT_DISCONNECTED));
+        assert!(entry.error_message.is_none());
     }
 }
