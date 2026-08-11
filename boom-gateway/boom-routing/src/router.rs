@@ -108,7 +108,7 @@ impl Router {
     /// Returns the resolved model name for routing (provider selection,
     /// inflight, logging). If the classifier is disabled or the model
     /// doesn't match the virtual name, falls back to `resolve_model_name`.
-    pub fn resolve_request_model(
+    pub async fn resolve_request_model(
         &self,
         model: &str,
         messages: &[Message],
@@ -116,7 +116,7 @@ impl Router {
     ) -> String {
         let classifier = self.classifier.load();
         if let Some(ref hr) = classifier.inner {
-            if let Some(target) = hr.classify(model, messages, tools) {
+            if let Some(target) = hr.classify(model, messages, tools).await {
                 return target;
             }
         }

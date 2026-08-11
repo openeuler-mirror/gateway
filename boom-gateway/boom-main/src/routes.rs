@@ -491,7 +491,7 @@ async fn chat_completions_inner(
     // 1b. Content-aware model resolution (hybrid router).
     let resolved_model = state.router.resolve_request_model(
         &req.model, &req.messages, &req.tools,
-    );
+    ).await;
 
     // 2. Plan-based or default rate limiting.
     let rate_limit_cfg = &inner.config.rate_limit;
@@ -2492,7 +2492,7 @@ pub async fn messages(
     // 1b. Content-aware model resolution (hybrid router).
     let resolved_model = state.router.resolve_request_model(
         &openai_req.model, &openai_req.messages, &openai_req.tools,
-    );
+    ).await;
 
     // 2. Plan-based or default rate limiting.
     let rate_limit_cfg = &inner.config.rate_limit;
