@@ -4,10 +4,12 @@ version.workspace = true
 edition.workspace = true
 
 [features]
-default = []
-# When enabled, the writer forks each entry into an OTLP/HTTP exporter in
-# addition to the local JSONL sink. boom-main enables this by default; the
-# dashboard does not — it only needs the read-only query API.
+# OTLP push is on by default. The exporter only activates when
+# `prompt_log.otlp.enabled` is set in YAML, so the cost of carrying the
+# codegen is the few extra crates linked in — no runtime behavior unless
+# configured. Disable with `--no-default-features` for an embedded build
+# that doesn't need OTLP at all.
+default = ["otlp"]
 otlp = [
     "dep:opentelemetry",
     "dep:opentelemetry-otlp",

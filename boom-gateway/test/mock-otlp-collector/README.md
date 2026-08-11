@@ -86,7 +86,7 @@ cd boom-gateway/test/mock-otlp-collector && cargo build --release
 
 # 终端 2（gateway workspace 根目录）：跑离线 replay 工具推一批日志
 cd boom-gateway
-cargo run --example replay -p boom-promptlog --features otlp -- \
+cargo run --example replay -p boom-promptlog -- \
   --dir /data/prompt_logs \
   --otlp-endpoint http://127.0.0.1:4318
 ```

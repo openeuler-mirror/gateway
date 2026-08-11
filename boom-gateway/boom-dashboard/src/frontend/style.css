@@ -1149,6 +1149,29 @@ div[id$="-table-wrap"]:not(.bare) > table > thead:first-child > tr:first-child >
   padding-bottom: 8px;
   border-bottom: 1px solid var(--border);
 }
+/* Section divider inside a multi-section card (e.g. OTLP block inside the
+   Prompt Log card). Lighter than the card title — it groups a sub-form
+   without competing with the parent title. */
+.form-card-subtitle {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text2);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin: 18px 0 8px;
+  padding-top: 12px;
+  border-top: 1px dashed var(--border);
+}
+/* Inline field tip — small greyed-out explanation rendered below the input.
+   Used by the OTLP block where every field needs a parameter-level
+   explanation without forcing the user to expand a separate hint block. */
+.form-field-tip {
+  font-size: 11px;
+  color: var(--text2);
+  margin: 4px 0 0;
+  line-height: 1.4;
+  opacity: 0.85;
+}
 .form-card-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;

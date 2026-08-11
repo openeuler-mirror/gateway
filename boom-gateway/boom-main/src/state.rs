@@ -264,17 +264,16 @@ impl AppState {
             .and_then(|v| serde_json::from_value::<boom_promptlog::PromptLogConfig>(v.clone()).ok())
             .unwrap_or_default();
 
-        // Wire the OTLP exporter when both the feature and config are on.
-        // The exporter owns an HTTP client and a bounded in-memory queue;
-        // the background flush task lives for the whole process lifetime
-        // and is best-effort flushed at shutdown via `prompt_log_writer.shutdown_flush()`.
+        // Wire the OTLP exporter when the feature is on. The exporter is
+        // always constructed at startup (cheap: just an HTTP client + queue),
+        // and the runtime `otlp.enabled` toggle in YAML is consulted on every
+        // entry in the background writer — so flipping the dashboard switch
+        // off→on (or on→off) takes effect immediately without a restart.
         #[cfg(feature = "otlp")]
-        let prompt_log_writer = if prompt_log_config.otlp.enabled {
+        let prompt_log_writer = {
             let exporter = boom_promptlog::OtelExporter::new(&prompt_log_config.otlp);
             exporter.spawn_flush_task();
             PromptLogWriter::spawn_with_otlp(prompt_log_config, exporter)
-        } else {
-            PromptLogWriter::spawn(prompt_log_config)
         };
         #[cfg(not(feature = "otlp"))]
         let prompt_log_writer = PromptLogWriter::spawn(prompt_log_config);

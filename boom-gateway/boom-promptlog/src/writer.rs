@@ -167,14 +167,20 @@ async fn background_writer_impl(
         let base_dir = PathBuf::from(&cfg.dir);
         let max_bytes = cfg.max_file_size_mb * 1024 * 1024;
         #[cfg(feature = "otlp")]
-        let max_attribute_bytes = cfg.otlp.max_attribute_bytes;
+        let (otlp_enabled, max_attribute_bytes) = (cfg.otlp.enabled, cfg.otlp.max_attribute_bytes);
         drop(cfg); // release config guard
 
         // Fork to OTLP exporter first (under feature gate). Failure here must
         // never skip the local file write — local JSONL is the source of truth.
+        // Respect the live `otlp.enabled` toggle: the exporter may have been
+        // constructed at startup (when enabled was true) but later disabled via
+        // dashboard — skip enqueuing in that case so the in-memory queue drains
+        // instead of accumulating entries nobody will pick up.
         #[cfg(feature = "otlp")]
-        if let Some(exporter) = &otlp {
-            exporter.enqueue(entry.clone(), max_attribute_bytes).await;
+        if otlp_enabled {
+            if let Some(exporter) = &otlp {
+                exporter.enqueue(entry.clone(), max_attribute_bytes).await;
+            }
         }
 
         // Directory layout: {dir}/{team_alias}/{key_hash}/{phase}.jsonl

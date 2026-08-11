@@ -2562,18 +2562,21 @@
     `;
   }
 
+  function fieldTipHTML(opts) {
+    return opts.tip ? `<p class="form-field-tip">${esc(opts.tip)}</p>` : "";
+  }
   function fieldText(id, label, value, opts = {}) {
     const v = value === null || value === undefined ? "" : String(value);
     const placeholder = opts.placeholder ? ` placeholder="${esc(opts.placeholder)}"` : "";
     const type = opts.type || "text";
-    return `<div class="form-group${opts.full ? " field-full" : ""}"><label for="${id}">${esc(label)}</label><input id="${id}" type="${type}" value="${esc(v)}"${placeholder}></div>`;
+    return `<div class="form-group${opts.full ? " field-full" : ""}"><label for="${id}">${esc(label)}</label><input id="${id}" type="${type}" value="${esc(v)}"${placeholder}>${fieldTipHTML(opts)}</div>`;
   }
   function fieldNum(id, label, value, opts = {}) {
     const v = value === null || value === undefined ? "" : String(value);
-    return `<div class="form-group${opts.full ? " field-full" : ""}"><label for="${id}">${esc(label)}</label><input id="${id}" type="number" value="${esc(v)}" ${opts.min !== undefined ? `min="${opts.min}"` : ""} ${opts.step ? `step="${opts.step}"` : ""}></div>`;
+    return `<div class="form-group${opts.full ? " field-full" : ""}"><label for="${id}">${esc(label)}</label><input id="${id}" type="number" value="${esc(v)}" ${opts.min !== undefined ? `min="${opts.min}"` : ""} ${opts.step ? `step="${opts.step}"` : ""}>${fieldTipHTML(opts)}</div>`;
   }
-  function fieldCheckbox(id, label, checked) {
-    return `<div class="form-group field-checkbox"><input id="${id}" type="checkbox" ${checked ? "checked" : ""}><label for="${id}">${esc(label)}</label></div>`;
+  function fieldCheckbox(id, label, checked, opts = {}) {
+    return `<div class="form-group field-checkbox"><input id="${id}" type="checkbox" ${checked ? "checked" : ""}><label for="${id}">${esc(label)}</label>${fieldTipHTML(opts)}</div>`;
   }
   function fieldSelect(id, label, options, selected) {
     const opts = options.map((o) => {
@@ -2585,7 +2588,7 @@
   }
   function fieldTextarea(id, label, value, opts = {}) {
     const v = value === null || value === undefined ? "" : typeof value === "string" ? value : JSON.stringify(value, null, 2);
-    return `<div class="form-group field-full"><label for="${id}">${esc(label)}</label><textarea id="${id}" rows="${opts.rows || 3}" style="font-family:var(--mono);font-size:12px">${esc(v)}</textarea></div>`;
+    return `<div class="form-group field-full"><label for="${id}">${esc(label)}</label><textarea id="${id}" rows="${opts.rows || 3}" style="font-family:var(--mono);font-size:12px">${esc(v)}</textarea>${fieldTipHTML(opts)}</div>`;
   }
 
   function renderCardServer(s) {
@@ -2677,6 +2680,7 @@
   }
 
   function renderCardPromptLog(p) {
+    const o = (p && p.otlp) || {};
     return `<div class="form-card" data-section="prompt_log">
       <div class="form-card-title">${t("config.section.prompt_log")}</div>
       <div class="form-card-grid">
@@ -2688,6 +2692,21 @@
         ${fieldFullList("cfg-pl-excluded-teams", t("config.field.excluded_teams"), p.excluded_teams || [])}
         ${fieldFullList("cfg-pl-record-headers", t("config.field.record_headers"), p.record_headers || [])}
       </div>
+
+      <div class="form-card-subtitle">${t("config.section.prompt_log_otlp")}</div>
+      <div class="form-card-grid">
+        ${fieldCheckbox("cfg-pl-otlp-enabled", t("config.field.otlp_enabled"), o.enabled, { tip: t("config.tip.prompt_log_otlp") })}
+        ${fieldText("cfg-pl-otlp-endpoint", t("config.field.otlp_endpoint"), o.endpoint, { full: true, placeholder: "http://otel-collector:4318", tip: t("config.tip.otlp_endpoint") })}
+        ${fieldText("cfg-pl-otlp-service-name", t("config.field.otlp_service_name"), o.service_name, { placeholder: "boom-gateway", tip: t("config.tip.otlp_service_name") })}
+        ${fieldText("cfg-pl-otlp-service-version", t("config.field.otlp_service_version"), o.service_version || "", { placeholder: t("config.tip.otlp_service_version_default"), tip: t("config.tip.otlp_service_version_default") })}
+        ${fieldNum("cfg-pl-otlp-timeout-secs", t("config.field.otlp_timeout_secs"), o.timeout_secs, { min: 1, tip: t("config.tip.otlp_timeout_secs") })}
+        ${fieldNum("cfg-pl-otlp-batch-size", t("config.field.otlp_batch_size"), o.batch_size, { min: 1, tip: t("config.tip.otlp_batch_size") })}
+        ${fieldNum("cfg-pl-otlp-flush-interval-secs", t("config.field.otlp_flush_interval_secs"), o.flush_interval_secs, { min: 1, tip: t("config.tip.otlp_flush_interval_secs") })}
+        ${fieldNum("cfg-pl-otlp-max-attribute-bytes", t("config.field.otlp_max_attribute_bytes"), o.max_attribute_bytes, { min: 256, step: 256, tip: t("config.tip.otlp_max_attribute_bytes") })}
+        ${fieldNum("cfg-pl-otlp-max-queue-size", t("config.field.otlp_max_queue_size"), o.max_queue_size, { min: 100, step: 100, tip: t("config.tip.otlp_max_queue_size") })}
+        ${fieldTextarea("cfg-pl-otlp-headers", t("config.field.otlp_headers"), o.headers || {}, { rows: 3, tip: t("config.tip.otlp_headers") })}
+      </div>
+
       <div class="form-card-actions">
         <button class="btn-primary btn-small" data-save="prompt_log">${t("action.save")}</button>
       </div>
@@ -2851,6 +2870,18 @@
           excluded_keys: parseListInput($("cfg-pl-excluded-keys")),
           excluded_teams: parseListInput($("cfg-pl-excluded-teams")),
           record_headers: parseListInput($("cfg-pl-record-headers")),
+          otlp: {
+            enabled: $("cfg-pl-otlp-enabled").checked,
+            endpoint: $("cfg-pl-otlp-endpoint").value || "",
+            service_name: $("cfg-pl-otlp-service-name").value || "boom-gateway",
+            service_version: $("cfg-pl-otlp-service-version").value || null,
+            timeout_secs: numOr($("cfg-pl-otlp-timeout-secs"), 10),
+            batch_size: numOr($("cfg-pl-otlp-batch-size"), 512),
+            flush_interval_secs: numOr($("cfg-pl-otlp-flush-interval-secs"), 5),
+            max_attribute_bytes: numOr($("cfg-pl-otlp-max-attribute-bytes"), 4096),
+            headers: parseJsonInput($("cfg-pl-otlp-headers"), {}),
+            max_queue_size: numOr($("cfg-pl-otlp-max-queue-size"), 10000),
+          },
         });
       } else if (kind === "router") {
         const aliases = parseJsonInput($("cfg-rs-aliases"), {});
