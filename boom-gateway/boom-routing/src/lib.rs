@@ -4,6 +4,7 @@ pub mod fusion;
 pub mod hybrid_router;
 pub mod inflight;
 pub mod migrations;
+pub mod ml_service_client;
 pub mod policy;
 pub mod rebalance;
 pub mod request_rate;
@@ -18,6 +19,7 @@ pub use fusion::{register_fusion_providers, FusionRuntime};
 pub use hybrid_router::{
     ClassifyRequest, ClassificationStrategy, HybridRouter, StrategyRegistry, TierClassifier,
 };
+pub use ml_service_client::MlServiceClient;
 pub use inflight::{DeploymentInFlightStat, InFlightGuard, InFlightStat, InFlightTracker};
 pub use policy::load_helpers;
 pub use policy::SchedulePolicy;

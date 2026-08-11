@@ -16,11 +16,12 @@ pub struct ClassifyRequest<'a> {
 /// Extensible classification strategy interface.
 /// Implement this trait and register via `StrategyRegistry` to add
 /// new content-based routing strategies — no other code changes needed.
+#[async_trait::async_trait]
 pub trait ClassificationStrategy: Send + Sync {
     /// Strategy name (matches the `strategy` config field).
     fn name(&self) -> &str;
     /// Classify the request and return a tier name.
-    fn classify(&self, req: &ClassifyRequest) -> String;
+    async fn classify(&self, req: &ClassifyRequest<'_>) -> String;
 }
 
 /// Registry of named classification strategies.
@@ -61,12 +62,13 @@ impl Default for StrategyRegistry {
 /// tool usage, and conversation depth, then maps to a tier.
 pub struct TierClassifier;
 
+#[async_trait::async_trait]
 impl ClassificationStrategy for TierClassifier {
     fn name(&self) -> &str {
         "tier_classifier"
     }
 
-    fn classify(&self, req: &ClassifyRequest) -> String {
+    async fn classify(&self, req: &ClassifyRequest<'_>) -> String {
         let mut score: f64 = 0.0;
 
         let mut user_text = String::new();
@@ -211,7 +213,7 @@ impl HybridRouter {
     /// Attempt to classify a request.
     /// Returns `Some(target_model)` if the model matches the virtual name.
     /// Returns `None` otherwise (pass-through to normal routing).
-    pub fn classify(
+    pub async fn classify(
         &self,
         model: &str,
         messages: &[Message],
@@ -227,7 +229,7 @@ impl HybridRouter {
             default_tier: &self.default_tier,
         };
 
-        let tier = self.strategy.classify(&req);
+        let tier = self.strategy.classify(&req).await;
 
         let target = self.tiers.get(&tier).cloned().unwrap_or_else(|| {
             tracing::warn!(
@@ -289,31 +291,31 @@ mod tests {
         )
     }
 
-    #[test]
-    fn non_matching_model_returns_none() {
+    #[tokio::test]
+    async fn non_matching_model_returns_none() {
         let router = make_router();
         let msgs = make_messages(vec![("user", "hello")]);
-        assert!(router.classify("gpt-4o", &msgs, &None).is_none());
+        assert!(router.classify("gpt-4o", &msgs, &None).await.is_none());
     }
 
-    #[test]
-    fn short_greeting_routes_to_small() {
+    #[tokio::test]
+    async fn short_greeting_routes_to_small() {
         let router = make_router();
         let msgs = make_messages(vec![("user", "hi")]);
-        let result = router.classify("auto", &msgs, &None);
+        let result = router.classify("auto", &msgs, &None).await;
         assert_eq!(result, Some("small-cup".to_string()));
     }
 
-    #[test]
-    fn code_request_routes_to_large() {
+    #[tokio::test]
+    async fn code_request_routes_to_large() {
         let router = make_router();
         let msgs = make_messages(vec![("user", "debug this code:\n```python\nprint(1)\n```")]);
-        let result = router.classify("auto", &msgs, &None);
+        let result = router.classify("auto", &msgs, &None).await;
         assert_eq!(result, Some("large-cup".to_string()));
     }
 
-    #[test]
-    fn tool_request_routes_to_medium_or_higher() {
+    #[tokio::test]
+    async fn tool_request_routes_to_medium_or_higher() {
         let router = make_router();
         let msgs = make_messages(vec![("user", "what is the weather?")]);
         let tools = vec![Tool {
@@ -324,12 +326,12 @@ mod tests {
                 parameters: serde_json::json!({}),
             },
         }];
-        let result = router.classify("auto", &msgs, &Some(tools));
+        let result = router.classify("auto", &msgs, &Some(tools)).await;
         assert!(result == Some("medium-cup".to_string()) || result == Some("large-cup".to_string()));
     }
 
-    #[test]
-    fn registry_register_and_lookup() {
+    #[tokio::test]
+    async fn registry_register_and_lookup() {
         let mut registry = StrategyRegistry::new();
         registry.register(Arc::new(TierClassifier));
         assert!(registry.get("tier_classifier").is_some());

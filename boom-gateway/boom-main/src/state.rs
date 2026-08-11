@@ -7,7 +7,7 @@ use boom_kvindex::{TokenPrefixIndex};
 use boom_core::kv_event::KvIndexBackend;
 use boom_limiter::{PlanStore, RateLimitPlan, ScheduleSlot, SlidingWindowLimiter};
 use boom_flowcontrol::{FlowControlConfig, FlowController};
-use boom_routing::{register_fusion_providers, AliasStore, DeploymentStore, FusionRuntime, HybridRouter, InFlightTracker, KeyAffinityPolicy, RebalanceMoveTracker, RequestRateTracker, Router, RoundRobinPolicy, SchedulePolicy, StrategyRegistry, TierClassifier};
+use boom_routing::{register_fusion_providers, AliasStore, DeploymentStore, FusionRuntime, HybridRouter, InFlightTracker, KeyAffinityPolicy, MlServiceClient, RebalanceMoveTracker, RequestRateTracker, Router, RoundRobinPolicy, SchedulePolicy, StrategyRegistry, TierClassifier};
 use boom_ctxaware::AgentStatsTracker;
 use boom_promptlog::PromptLogWriter;
 use boom_provider;
@@ -1387,6 +1387,20 @@ fn build_hybrid_router(config: &Config) -> Option<Arc<HybridRouter>> {
 
     let mut registry = StrategyRegistry::new();
     registry.register(Arc::new(TierClassifier));
+    if let Some(ml) = &hr_config.ml_service {
+        tracing::info!(
+            url = %ml.url,
+            timeout_ms = ml.timeout_ms,
+            "Registering ML service classification strategy"
+        );
+        let valid_tiers: std::collections::HashSet<String> =
+            hr_config.tiers.keys().cloned().collect();
+        registry.register(Arc::new(MlServiceClient::new(
+            &ml.url,
+            ml.timeout_ms,
+            valid_tiers,
+        )));
+    }
 
     let strategy = match registry.get(&hr_config.strategy) {
         Some(s) => s.clone(),

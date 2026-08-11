@@ -429,7 +429,8 @@ impl RoutingModelInvoker {
         let input_chars = request_input_chars(&request) as u64;
         let router = self.runtime.router()?;
         let resolved_model =
-            router.resolve_request_model(&requested_model, &request.messages, &request.tools);
+            router.resolve_request_model(&requested_model, &request.messages, &request.tools)
+                .await;
         let kv_index = (**self.runtime.kv_index.load()).clone();
         let prefix_bytes = if kv_index.is_some() {
             request_prefix_bytes(&request)

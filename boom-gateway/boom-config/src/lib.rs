@@ -759,6 +759,9 @@ pub struct HybridRouterConfig {
     /// Tier name → tier definition.
     #[serde(default)]
     pub tiers: HashMap<String, HybridRouterTier>,
+    /// Settings for the `ml_service` strategy. Required when `strategy = "ml_service"`.
+    #[serde(default)]
+    pub ml_service: Option<MlServiceConfig>,
 }
 
 /// A single tier in the hybrid router configuration.
@@ -766,6 +769,26 @@ pub struct HybridRouterConfig {
 pub struct HybridRouterTier {
     /// Target model_name in model_list to route to for this tier.
     pub target_model: String,
+}
+
+/// Configuration for the `ml_service` classification strategy.
+///
+/// The gateway POSTs `{messages, tools, default_tier}` to `{url}/classify`
+/// and expects `{"tier": "..."}` back. On any failure (timeout, HTTP error,
+/// malformed JSON, unknown tier), the strategy falls back to `TierClassifier`.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct MlServiceConfig {
+    /// Base URL of the ML service, e.g. `http://127.0.0.1:2345`.
+    /// The gateway appends `/classify`.
+    pub url: String,
+    /// Request timeout in milliseconds. Covers connect + write + read.
+    /// Default 100ms — ML service must be fast and local.
+    #[serde(default = "default_ml_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+fn default_ml_timeout_ms() -> u64 {
+    100
 }
 
 fn default_hybrid_strategy() -> String {
@@ -1488,5 +1511,31 @@ plan_settings:
         assert!(!std::path::Path::exists(path.with_extension("yaml.tmp").as_ref()));
 
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod hybrid_router_config_tests {
+    use super::*;
+
+    #[test]
+    fn ml_service_section_parses() {
+        let yaml = r#"
+model_name: auto
+strategy: ml_service
+default_tier: medium
+tiers:
+  small:  { target_model: small-cup }
+  medium: { target_model: medium-cup }
+  large:  { target_model: large-cup }
+ml_service:
+  url: http://127.0.0.1:2345
+  timeout_ms: 50
+"#;
+        let cfg: HybridRouterConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.strategy, "ml_service");
+        let ml = cfg.ml_service.expect("ml_service should be set");
+        assert_eq!(ml.url, "http://127.0.0.1:2345");
+        assert_eq!(ml.timeout_ms, 50);
     }
 }
