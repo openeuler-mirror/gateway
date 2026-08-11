@@ -69,6 +69,7 @@
       "action.create": "Create",
       "action.update": "Update",
       "action.reset": "Reset",
+      "action.test": "Test",
 
       "range.custom": "Custom",
       "range.last_n_minutes": "Last {n} minutes",
@@ -411,6 +412,7 @@
       "common.error_retry": "Operation failed, please retry.",
       "common.error_prefix": "Error: {message}",
       "common.warning_prefix": "Warning: {message}",
+      "common.dirty_confirm": "There are unsaved changes on this card. Leave without saving?",
       "common.failed_to_load": "Failed to load {what}: {message}",
       "common.failed_to_load_short": "Failed to load {what}",
       "common.page_of": "Page {page} of {total} ({count} {unit})",
@@ -878,6 +880,7 @@
       "action.create": "创建",
       "action.update": "更新",
       "action.reset": "重置",
+      "action.test": "测试",
 
       "range.custom": "自定义",
       "range.last_n_minutes": "最近 {n} 分钟",
@@ -1219,6 +1222,7 @@
 
       "common.error_retry": "操作失败，请重试。",
       "common.error_prefix": "错误：{message}",
+      "common.dirty_confirm": "当前卡片有未保存的修改,确认离开?",
       "common.warning_prefix": "警告：{message}",
       "common.failed_to_load": "加载{what}失败：{message}",
       "common.failed_to_load_short": "加载{what}失败",

@@ -1199,6 +1199,20 @@ div[id$="-table-wrap"]:not(.bare) > table > thead:first-child > tr:first-child >
   50% { opacity: 1; }
 }
 .otlp-ping-text { line-height: 1; }
+/* Endpoint input + Test button on one row. Test button is .btn-small so it
+   matches the height of the text input; gap keeps them visually separated. */
+.otlp-endpoint-row {
+  display: flex;
+  gap: 8px;
+  align-items: stretch;
+}
+.otlp-endpoint-row input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.otlp-endpoint-row .btn-small {
+  flex: 0 0 auto;
+}
 .form-card-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -1363,31 +1377,102 @@ div[id$="-table-wrap"]:not(.bare) > table > thead:first-child > tr:first-child >
 }
 .form-card-collapsible[open] summary { margin-bottom: 14px; }
 
-/* ── Config page (uses form-card primitives) ──────────────────── */
+/* ── Config page (sidebar + main-panel layout) ──────────────── */
+/* Two-column layout: sticky left sidebar lists every config card grouped
+   by Runtime / Traffic / Routing; right panel shows the one currently
+   selected card. Active section is persisted in sessionStorage by the JS
+   (wireConfigSidebar). On narrow viewports (<960px) the sidebar hides and
+   a <select> dropdown (.config-side-select) takes over so mobile users
+   can still switch cards. */
 .config-page {
-  display: flex;
-  flex-direction: column;
-  gap: 24px;
+  display: grid;
+  grid-template-columns: 220px 1fr;
+  gap: 20px;
+  align-items: start;
 }
-.config-group {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
+.config-side-select {
+  display: none;
+  width: 100%;
+  padding: 8px 10px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  font-size: 13px;
+  margin-bottom: 12px;
 }
-.config-group-title {
-  font-size: 11px;
-  font-weight: 600;
+.config-side {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px 8px;
+  position: sticky;
+  top: 16px;
+  max-height: calc(100vh - 32px);
+  overflow-y: auto;
+}
+.config-side-group + .config-side-group { margin-top: 16px; }
+.config-side-group-title {
+  font-size: 10px;
+  font-weight: 700;
   text-transform: uppercase;
   letter-spacing: .8px;
-  color: var(--text3, #9ca3af);
-  padding: 0 4px;
+  color: var(--text3);
+  padding: 4px 12px 8px;
 }
-.config-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
-  gap: 16px;
-  align-items: stretch;
+.config-side-link {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 12px;
+  border-radius: var(--radius-sm);
+  color: var(--text2);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  border: 1px solid transparent;
+  transition: background var(--transition), color var(--transition), border-color var(--transition);
+  text-decoration: none;
 }
+.config-side-link:hover {
+  background: var(--surface2);
+  color: var(--text);
+}
+.config-side-link.is-active {
+  background: var(--primary-bg);
+  color: var(--primary);
+  border-color: var(--primary);
+  font-weight: 600;
+}
+.config-side-link svg {
+  width: 14px;
+  height: 14px;
+  opacity: .7;
+  flex-shrink: 0;
+}
+.config-side-link.is-active svg { opacity: 1; }
+.config-main {
+  min-width: 0; /* prevent 1fr children (form-card-grid) from blowing out */
+}
+.config-main-section[hidden] { display: none; }
+/* Width-constrained cards in the main panel go full-width — they no longer
+   share a grid with neighbours. */
+.config-main .form-card { width: 100%; }
+.config-main .form-card .modal-table-wrap {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+@media (max-width: 960px) {
+  .config-page {
+    grid-template-columns: 1fr;
+  }
+  .config-side { display: none; }
+  .config-side-select { display: block; }
+}
+
+/* Legacy config-notice — kept for the comment-loss warning above the
+   config page; the new layout doesn't use .config-group/.config-grid
+   anymore. */
 .config-notice {
   margin: 8px 0 16px;
   padding: 8px 12px;
@@ -1396,13 +1481,6 @@ div[id$="-table-wrap"]:not(.bare) > table > thead:first-child > tr:first-child >
   border-radius: 4px;
   font-size: 12px;
   color: var(--text2, #6b7280);
-}
-.config-grid .form-card { width: 100%; }
-/* Cost-template table wraps inside its card; horizontal scroll only kicks
-   in on very narrow viewports. */
-.config-grid .form-card .modal-table-wrap {
-  overflow-x: auto;
-  -webkit-overflow-scrolling: touch;
 }
 .modal-table { width: 100%; border-collapse: collapse; font-size: 13px; }
 .modal-table th, .modal-table td {

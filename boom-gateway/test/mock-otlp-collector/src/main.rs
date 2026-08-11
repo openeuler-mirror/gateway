@@ -122,6 +122,15 @@ async fn handle_logs(
         .map(|sl| sl.log_records.len())
         .sum();
 
+    // Dashboard connectivity probe sends an empty ExportLogsServiceRequest
+    // (0 records) to check the collector is reachable. Silently 200'ing it
+    // keeps the console clean — without this, every 5s ping printed a
+    // "[time req#N] batch=0 records" line. Use RUST_LOG=debug to see them.
+    if total == 0 {
+        tracing::debug!(req_seq, "empty probe (dashboard connectivity check)");
+        return (StatusCode::OK, b"");
+    }
+
     if state.full {
         print_full(req_seq, &req);
     } else {

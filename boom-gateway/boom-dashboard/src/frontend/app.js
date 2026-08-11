@@ -2531,35 +2531,76 @@
     }
   }
 
+  // ── Config page: sidebar + main-panel layout ─────────────────
+  // The three groups (Runtime / Traffic / Routing) and their 9 cards map
+  // to a 2-column layout: a sticky left sidebar listing every card as a
+  // nav link, and a right main panel that shows exactly one card at a
+  // time. Clicking a link is pure DOM toggle (no HTTP); the active section
+  // is persisted in sessionStorage so a refresh keeps you on the same card.
+  // On narrow viewports (<960px) the sidebar hides and a <select> takes
+  // over so mobile users can still switch cards.
   function renderConfigPage(cfg) {
+    const items = [
+      { group: "runtime", section: "runtime-server",       label: t("config.section.server"),                icon: "server",       html: renderCardServer(cfg.server || {}) },
+      { group: "runtime", section: "runtime-general",      label: t("config.section.general_settings"),     icon: "general",       html: renderCardGeneral(cfg.general_settings || {}) },
+      { group: "runtime", section: "runtime-health",       label: t("config.section.deployment_health_check"), icon: "health",     html: renderCardHealthCheck(cfg.deployment_health_check || {}) },
+      { group: "runtime", section: "runtime-prompt-log",   label: t("config.section.prompt_log"),            icon: "prompt-log",   html: renderCardPromptLog(cfg.prompt_log || {}) },
+      { group: "traffic", section: "traffic-rate-limit",   label: t("config.section.rate_limit"),            icon: "rate-limit",    html: renderCardRateLimit(cfg.rate_limit || {}) },
+      { group: "traffic", section: "traffic-plans",       label: t("config.section.plan_settings"),          icon: "plans",         html: renderCardPlanSettings(cfg.plan_settings || {}, cfg) },
+      { group: "routing", section: "routing-router",      label: t("config.section.router_settings"),       icon: "router",        html: renderCardRouter(cfg.router_settings || {}) },
+      { group: "routing", section: "routing-cost",        label: t("config.section.cost_templates"),        icon: "cost",          html: renderCardCostTemplates(cfg.cost_templates || []) },
+      { group: "routing", section: "routing-model-list",  label: t("config.section.model_list"),            icon: "model-list",    html: renderCardModelList(cfg.model_list || []) },
+    ];
+    const groupLabels = {
+      runtime: t("config.group.runtime"),
+      traffic: t("config.group.traffic"),
+      routing: t("config.group.routing"),
+    };
+    const groups = ["runtime", "traffic", "routing"];
+    const sidebarGroups = groups.map((g) => {
+      const links = items.filter((i) => i.group === g).map((i) => `
+        <a class="config-side-link" data-config-section="${i.section}" href="#${i.section}">
+          ${configSideIcon(i.icon)}
+          <span>${esc(i.label)}</span>
+        </a>`).join("");
+      return `<div class="config-side-group">
+        <div class="config-side-group-title">${esc(groupLabels[g])}</div>
+        ${links}
+      </div>`;
+    }).join("");
+    const selectOpts = groups.map((g) => {
+      const opts = items.filter((i) => i.group === g)
+        .map((i) => `<option value="${i.section}">${esc(i.label)}</option>`).join("");
+      return `<optgroup label="${esc(groupLabels[g])}">${opts}</optgroup>`;
+    }).join("");
+    const panels = items.map((i) => `
+      <div class="config-main-section" data-config-section="${i.section}" hidden>
+        ${i.html}
+      </div>`).join("");
     return `
       <div class="config-page">
-        <div class="config-group">
-          <div class="config-group-title">${t("config.group.runtime")}</div>
-          <div class="config-grid">
-            ${renderCardServer(cfg.server || {})}
-            ${renderCardGeneral(cfg.general_settings || {})}
-            ${renderCardHealthCheck(cfg.deployment_health_check || {})}
-            ${renderCardPromptLog(cfg.prompt_log || {})}
-          </div>
-        </div>
-        <div class="config-group">
-          <div class="config-group-title">${t("config.group.traffic")}</div>
-          <div class="config-grid">
-            ${renderCardRateLimit(cfg.rate_limit || {})}
-            ${renderCardPlanSettings(cfg.plan_settings || {}, cfg)}
-          </div>
-        </div>
-        <div class="config-group">
-          <div class="config-group-title">${t("config.group.routing")}</div>
-          <div class="config-grid">
-            ${renderCardRouter(cfg.router_settings || {})}
-            ${renderCardCostTemplates(cfg.cost_templates || [])}
-            ${renderCardModelList(cfg.model_list || [])}
-          </div>
-        </div>
+        <select id="cfg-side-select" class="config-side-select" aria-label="${esc(t("config.group.runtime"))}">${selectOpts}</select>
+        <aside class="config-side">${sidebarGroups}</aside>
+        <main class="config-main">${panels}</main>
       </div>
     `;
+  }
+
+  // Inline SVG icons for the config sidebar. 14x14, currentColor stroke,
+  // matches the visual weight of the existing top-level sidebar icons.
+  function configSideIcon(name) {
+    const paths = {
+      "server": '<rect x="2" y="3" width="12" height="4" rx="1"/><rect x="2" y="9" width="12" height="4" rx="1"/><path d="M4 5h.01M4 11h.01"/>',
+      "general": '<circle cx="8" cy="8" r="6.5"/><path d="M8 5v3M8 11h.01"/>',
+      "health": '<path d="M1.5 8h3l1.5-4 3 8 1.5-4h3.5"/>',
+      "prompt-log": '<rect x="2" y="2" width="12" height="12" rx="1.5"/><path d="M5 5h6M5 8h6M5 11h3"/>',
+      "rate-limit": '<circle cx="8" cy="8" r="6.5"/><path d="M8 4.5V8l2.5 1.5"/>',
+      "plans": '<rect x="2" y="2" width="12" height="12" rx="1.5"/><path d="M5 5h6M5 8h4M5 11h2"/>',
+      "router": '<circle cx="4" cy="4" r="2"/><circle cx="12" cy="8" r="2"/><circle cx="4" cy="12" r="2"/><path d="M6 4h2M8 8h2M6 12h2"/>',
+      "cost": '<path d="M3 2h7l3 3v9H3z"/><path d="M5 7h6M5 10h4"/>',
+      "model-list": '<path d="M2 4l6-3 6 3-6 3z M2 8l6 3 6-3 M2 12l6 3 6-3"/>',
+    };
+    return `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">${paths[name] || ""}</svg>`;
   }
 
   function fieldTipHTML(opts) {
@@ -2702,7 +2743,10 @@
             <span class="otlp-ping-dot"></span>
             <span class="otlp-ping-text">${t("config.tip.otlp_ping_unknown")}</span>
           </div>
-          <input id="cfg-pl-otlp-endpoint" type="text" value="${esc(o.endpoint || "")}" placeholder="http://otel-collector:4318">
+          <div class="otlp-endpoint-row">
+            <input id="cfg-pl-otlp-endpoint" type="text" value="${esc(o.endpoint || "")}" placeholder="http://otel-collector:4318">
+            <button type="button" id="cfg-pl-otlp-test" class="btn-small btn-secondary">${t("action.test")}</button>
+          </div>
         </div>
         ${fieldText("cfg-pl-otlp-service-name", t("config.field.otlp_service_name"), o.service_name, { placeholder: "boom-gateway", tip: t("config.tip.otlp_service_name") })}
         ${fieldText("cfg-pl-otlp-service-version", t("config.field.otlp_service_version"), o.service_version || "", { placeholder: t("config.tip.otlp_service_version_default"), tip: t("config.tip.otlp_service_version_default") })}
@@ -2803,43 +2847,103 @@
     });
     const reloadBtn = document.getElementById("btn-reload-config-page");
     if (reloadBtn) reloadBtn.addEventListener("click", reloadConfigHandler);
-    startOtlpPingLoop();
+    wireConfigSidebar();
+    wireDirtyTracking();
+    const testBtn = document.getElementById("cfg-pl-otlp-test");
+    if (testBtn) testBtn.addEventListener("click", otlpPingOnce);
   }
 
-  // ── OTLP endpoint connectivity indicator ────────────────
-  // Polls POST /admin/prompt-log/otlp-ping every 5s while the config page
-  // is open. The badge sits above the endpoint input and shows green/red +
-  // latency. Re-tests immediately when the operator edits the endpoint
-  // input (debounced on blur) so the badge reflects what they typed without
-  // waiting up to 5s for the next tick. Cancels itself when the config page
-  // wrapper is gone (SPA navigation away).
-  let _otlpPingTimer = null;
-  function startOtlpPingLoop() {
-    if (_otlpPingTimer) clearInterval(_otlpPingTimer);
-    _otlpPingTimer = setInterval(otlpPingTick, 5000);
-    // First poll immediately rather than waiting 5s for the initial read.
-    otlpPingTick();
-    const input = document.getElementById("cfg-pl-otlp-endpoint");
-    if (input) {
-      input.addEventListener("blur", otlpPingTick);
-      // Re-baseline the loop in case the card re-rendered under our feet.
-      const pingRow = document.getElementById("cfg-pl-otlp-ping");
-      if (pingRow) otlpPingSetState(pingRow, "pending");
+  // ── Config page sidebar (Runtime/Traffic/Routing sub-items) ────
+  // The sidebar persists the active section in sessionStorage so a page
+  // refresh keeps you on the same card. Switching cards is pure DOM toggle
+  // (no HTTP), but if the current card has unsaved edits we confirm first.
+  const CONFIG_SECTION_KEY = "boom-config-active-section";
+  const CONFIG_SECTION_DEFAULT = "runtime-server";
+  function wireConfigSidebar() {
+    const root = document.querySelector(".config-page");
+    if (!root) return;
+    const saved = sessionStorage.getItem(CONFIG_SECTION_KEY) || CONFIG_SECTION_DEFAULT;
+    selectConfigSection(saved, /*scrollIntoView=*/true);
+    root.querySelectorAll(".config-side-link").forEach((link) => {
+      link.addEventListener("click", (e) => {
+        e.preventDefault();
+        const target = link.getAttribute("data-config-section");
+        if (!target || target === currentConfigSection()) return;
+        if (!leaveCurrentSectionIfDirty()) return;
+        selectConfigSection(target, /*scrollIntoView=*/false);
+      });
+    });
+    // Narrow-viewport fallback: a <select> mirrors the sidebar so users on
+    // mobile or sub-960px viewports can still switch cards.
+    const select = document.getElementById("cfg-side-select");
+    if (select) {
+      select.value = saved;
+      select.addEventListener("change", () => {
+        if (!leaveCurrentSectionIfDirty()) {
+          // Revert the select back to current — user cancelled the switch.
+          select.value = currentConfigSection();
+          return;
+        }
+        selectConfigSection(select.value, /*scrollIntoView=*/false);
+      });
     }
   }
-  async function otlpPingTick() {
-    const pingRow = document.getElementById("cfg-pl-otlp-ping");
-    if (!pingRow) {
-      // Config page navigated away — cancel the loop. setInterval id is the
-      // only handle so we don't leak a 5s timer ticking into a dead DOM.
-      if (_otlpPingTimer) { clearInterval(_otlpPingTimer); _otlpPingTimer = null; }
-      return;
+  function currentConfigSection() {
+    const active = document.querySelector(".config-side-link.is-active");
+    return active ? active.getAttribute("data-config-section") : CONFIG_SECTION_DEFAULT;
+  }
+  function selectConfigSection(sectionId, scrollIntoView) {
+    const links = document.querySelectorAll(".config-side-link");
+    const panels = document.querySelectorAll(".config-main-section");
+    links.forEach((l) => l.classList.toggle("is-active", l.getAttribute("data-config-section") === sectionId));
+    panels.forEach((p) => {
+      const match = p.getAttribute("data-config-section") === sectionId;
+      p.toggleAttribute("hidden", !match);
+    });
+    sessionStorage.setItem(CONFIG_SECTION_KEY, sectionId);
+    const sel = document.getElementById("cfg-side-select");
+    if (sel && sel.value !== sectionId) sel.value = sectionId;
+    if (scrollIntoView) {
+      const link = document.querySelector(`.config-side-link[data-config-section="${sectionId}"]`);
+      if (link) link.scrollIntoView({ block: "nearest", behavior: "auto" });
     }
+  }
+  function wireDirtyTracking() {
+    document.querySelectorAll(".config-main-section input, .config-main-section textarea, .config-main-section select").forEach((el) => {
+      el.addEventListener("input", () => { el.dataset.dirty = "true"; });
+      el.addEventListener("change", () => { el.dataset.dirty = "true"; });
+    });
+  }
+  function leaveCurrentSectionIfDirty() {
+    const current = document.querySelector(".config-main-section:not([hidden])");
+    if (!current) return true;
+    const dirty = current.querySelector('[data-dirty="true"]');
+    if (!dirty) return true;
+    return confirm(t("common.dirty_confirm"));
+  }
+  // (Note: after a successful save, saveConfigSection() calls loadConfigPage()
+  // which re-renders the whole config page — DOM is replaced, so dirty flags
+  // are gone. No explicit clearDirtyFlags needed.)
+
+  // ── OTLP endpoint connectivity indicator ────────────────
+  // Manual Test button: no auto-polling. The operator clicks Test, we send
+  // one POST /admin/prompt-log/otlp-ping with the current endpoint value,
+  // and the badge flips green/red + latency. Initial state is "unknown"
+  // (grey) until the first Test click. The button is disabled while a probe
+  // is in flight to prevent concurrent pings.
+  async function otlpPingOnce() {
+    const btn = document.getElementById("cfg-pl-otlp-test");
+    const pingRow = document.getElementById("cfg-pl-otlp-ping");
+    if (!pingRow || !btn) return;
+    if (btn.disabled) return; // in-flight guard
     const endpoint = (document.getElementById("cfg-pl-otlp-endpoint")?.value || "").trim();
     if (!endpoint) {
       otlpPingSetState(pingRow, "unknown", t("config.tip.otlp_ping_no_endpoint"));
       return;
     }
+    const prevLabel = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = t("config.tip.otlp_ping_pending");
     otlpPingSetState(pingRow, "pending", t("config.tip.otlp_ping_pending"));
     try {
       const started = performance.now();
@@ -2855,6 +2959,9 @@
       }
     } catch (err) {
       otlpPingSetState(pingRow, "fail", `${t("config.tip.otlp_ping_fail")} · ${err.message}`);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = prevLabel;
     }
   }
   function otlpPingSetState(row, state, text) {
