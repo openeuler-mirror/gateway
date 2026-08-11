@@ -572,6 +572,22 @@ async fn wait_for_prompt_logs(config: &TempConfig, expected: usize) -> Vec<Value
     wait_for_prompt_logs_with_timeout(config, expected, Duration::from_secs(5)).await
 }
 
+async fn wait_for_prompt_log_requests(config: &TempConfig, expected: usize) -> Vec<Value> {
+    let started = tokio::time::Instant::now();
+    loop {
+        let entries = read_prompt_log_requests(config);
+        if entries.len() >= expected {
+            return entries;
+        }
+        if started.elapsed() >= Duration::from_secs(5) {
+            panic!(
+                "prompt log did not contain {expected} request entries within 5000 ms"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 async fn wait_for_prompt_logs_with_timeout(
     config: &TempConfig,
     expected: usize,
@@ -593,22 +609,54 @@ async fn wait_for_prompt_logs_with_timeout(
     }
 }
 
+/// Read the Response-phase prompt log entries from disk. After the otlp
+/// refactor, prompt logs are split into two phase files per request:
+/// `request_*.jsonl` (carrying the request body, written at ingress) and
+/// `response_*.jsonl` (carrying the assembled response body, status, duration,
+/// fusion trace — written on completion). Fusion trace data lives only in the
+/// Response phase, so the bulk of the assertions in this file read from there.
 fn read_prompt_logs(config: &TempConfig) -> Vec<Value> {
-    let path = config
-        .prompt_log_dir
-        .join("_no_team")
-        .join("master")
-        .join("log_000001.jsonl");
-    fs::read_to_string(path)
-        .ok()
-        .into_iter()
-        .flat_map(|content| {
-            content
-                .lines()
-                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-                .collect::<Vec<_>>()
-        })
-        .collect()
+    read_phase(config, "response")
+}
+
+/// Read the Request-phase prompt log entries from disk. Used by tests that
+/// need to inspect the inbound request body (e.g. `messages` content).
+fn read_prompt_log_requests(config: &TempConfig) -> Vec<Value> {
+    read_phase(config, "request")
+}
+
+fn read_phase(config: &TempConfig, phase: &str) -> Vec<Value> {
+    let key_dir = config.prompt_log_dir.join("_no_team").join("master");
+    let mut out: Vec<Value> = Vec::new();
+    let entries = match fs::read_dir(&key_dir) {
+        Ok(e) => e,
+        Err(_) => return out,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = match path.file_name().and_then(|s| s.to_str()) {
+            Some(s) => s,
+            None => continue,
+        };
+        // Match `{phase}_{seq:06}.jsonl` (active) or `{phase}_{seq:06}.jsonl.gz`
+        // (rotated). We don't decompress .gz — the active .jsonl is what the
+        // tests are reading within their timeout window.
+        let prefix = format!("{phase}_");
+        if !name.starts_with(&prefix) || !(name.ends_with(".jsonl") || name.ends_with(".jsonl.gz")) {
+            continue;
+        }
+        if name.ends_with(".gz") {
+            continue;
+        }
+        if let Ok(content) = fs::read_to_string(&path) {
+            for line in content.lines() {
+                if let Ok(v) = serde_json::from_str::<Value>(line) {
+                    out.push(v);
+                }
+            }
+        }
+    }
+    out
 }
 
 fn fusion_request(message: &str, stream: bool, tools: Option<Vec<Value>>) -> Value {
@@ -642,8 +690,20 @@ fn sse_json_events(body: &str) -> Vec<Value> {
         .collect()
 }
 
+/// Pull `fusion.calls` out of a prompt log entry. Accepts either:
+/// - A bare Response-phase entry (`{phase, response, fusion, ...}`) — fusion
+///   lives at top level.
+/// - The dashboard API's `{request, response}` envelope — fusion lives under
+///   `response.fusion` (the response entry is nested).
+/// Discriminator: the envelope has a top-level `request` object; a bare
+/// response entry's `request` is null/absent.
 fn fusion_calls(prompt_log: &Value) -> &[Value] {
-    prompt_log["fusion"]["calls"]
+    let fusion = if prompt_log["request"].is_object() {
+        &prompt_log["response"]["fusion"]
+    } else {
+        &prompt_log["fusion"]
+    };
+    fusion["calls"]
         .as_array()
         .expect("prompt log fusion.calls must be an array")
 }
@@ -762,7 +822,9 @@ async fn tools_reach_every_child_and_prompt_log_is_queryable_by_request_id() {
         .unwrap();
     assert_eq!(api_response.status(), StatusCode::OK);
     let api_log: Value = api_response.json().await.unwrap();
-    assert_eq!(api_log["request_id"], request_id);
+    // Dashboard API returns `{request, response}` envelope when both phases
+    // are present. Both share the same `request_id`.
+    assert_eq!(api_log["response"]["request_id"], request_id);
     assert_eq!(fusion_calls(&api_log).len(), 3);
 }
 
@@ -1130,7 +1192,13 @@ async fn client_disconnect_cancels_the_real_upstream_and_marks_trace_cancelled()
 
     wait_for_disconnect(&aggregator).await;
     let logs = wait_for_prompt_logs_with_timeout(&gateway.config, 1, Duration::from_secs(8)).await;
-    assert_eq!(logs[0]["status_code"], 200);
+    // Client disconnected mid-stream — the gateway writes a 499 status +
+    // `CLIENT_DISCONNECTED` error_code (the otlp-refactor semantic: a stream
+    // that ended without `finish_reason` is a truncation, regardless of
+    // whether the gateway already flushed 200 OK headers). The fusion trace
+    // separately records the aggregator call as `cancelled`.
+    assert_eq!(logs[0]["status_code"], 499);
+    assert_eq!(logs[0]["error_code"], "CLIENT_DISCONNECTED");
     let call = role_call(fusion_calls(&logs[0]), "aggregator");
     assert_eq!(call["status"], "cancelled");
     assert_eq!(call["response"]["event_count"], 1);
@@ -1308,11 +1376,20 @@ async fn concurrent_requests_keep_prompt_traces_isolated() {
         .iter()
         .all(|response| response.status() == StatusCode::OK));
 
-    let logs = wait_for_prompt_logs(&gateway.config, markers.len()).await;
-    assert_eq!(logs.len(), markers.len());
-    for log in logs {
-        let marker = log["request"]["messages"][0]["content"].as_str().unwrap();
-        let trace = serde_json::to_string(&log["fusion"]).unwrap();
+    let response_logs = wait_for_prompt_logs(&gateway.config, markers.len()).await;
+    assert_eq!(response_logs.len(), markers.len());
+    // Request-phase entries carry the inbound request body (where the marker
+    // lives); response-phase entries carry the fusion trace. Join by
+    // `request_id` (the shared key between the two phases).
+    let request_logs = wait_for_prompt_log_requests(&gateway.config, markers.len()).await;
+    for resp in response_logs {
+        let request_id = resp["request_id"].as_str().unwrap();
+        let req = request_logs
+            .iter()
+            .find(|r| r["request_id"].as_str() == Some(request_id))
+            .expect("response entry had no matching request entry");
+        let marker = req["request"]["messages"][0]["content"].as_str().unwrap();
+        let trace = serde_json::to_string(&resp["fusion"]).unwrap();
         assert!(trace.contains(marker));
         for other in markers.iter().filter(|other| **other != marker) {
             assert!(!trace.contains(other));

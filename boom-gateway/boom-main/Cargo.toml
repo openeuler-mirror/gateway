@@ -10,6 +10,10 @@ path = "src/main.rs"
 [features]
 default = []
 debug-tools = ["boom-dashboard/debug-tools"]
+# OTLP push for prompt log entries. Inherited from boom-promptlog's default
+# feature set — the exporter only activates at runtime when
+# `prompt_log.otlp.enabled` is true in YAML.
+otlp = ["boom-promptlog/otlp"]
 
 [dependencies]
 boom-core = { path = "../boom-core" }

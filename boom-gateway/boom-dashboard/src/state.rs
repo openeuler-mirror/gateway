@@ -2,7 +2,8 @@ use boom_core::provider::KeyAliasLookup;
 use boom_core::DebugErrorStore;
 use boom_flowcontrol::FlowController;
 use boom_limiter::{PlanStore, SlidingWindowLimiter};
-use boom_promptlog::PromptLogWriter;
+use boom_promptlog::PromptLogConfig;
+use boom_promptlog::PromptLogQueryApi;
 use boom_routing::{AliasStore, DeploymentStore, InFlightTracker, RebalanceMoveTracker, RequestRateTracker};
 use boom_ctxaware::AgentStatsTracker;
 use dashmap::DashMap;
@@ -68,6 +69,25 @@ pub enum AdminCommand {
         value: Value,
         reply: oneshot::Sender<Result<String, String>>,
     },
+    /// Hot-swap the prompt-log config at runtime (toggle on/off, change
+    /// exclusion lists, flip the otlp sub-config). Boom-main owns the
+    /// `PromptLogWriter`; dashboard must not touch the writer handle directly
+    /// (see CLAUDE.md §5 AdminCommand pattern).
+    UpdatePromptLogConfig {
+        config: PromptLogConfig,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    /// Probe a remote OTLP/HTTP collector. The dashboard passes the live
+    /// endpoint/headers/timeout (read from the prompt-log card form — not the
+    /// committed YAML, so the operator can type a new endpoint and test it
+    /// before saving). Reply carries the round-trip latency in ms on success
+    /// or a one-line error string on failure.
+    PingOtlpEndpoint {
+        endpoint: String,
+        headers: std::collections::HashMap<String, String>,
+        timeout_secs: u64,
+        reply: oneshot::Sender<Result<u64, String>>,
+    },
 }
 
 pub type AdminTx = mpsc::Sender<AdminCommand>;
@@ -103,8 +123,9 @@ pub struct DashboardState {
     pub login_attempts: Arc<DashMap<String, LoginAttempt>>,
     /// Debug error store — shared with boom-main for recording upstream errors.
     pub debug_store: Arc<DebugErrorStore>,
-    /// Prompt log writer — shared with boom-main for runtime config control.
-    pub prompt_log_writer: PromptLogWriter,
+    /// Read-only prompt-log query API — entry lookup + config snapshot.
+    /// Boom-main owns the writer; writes go through `AdminCommand::UpdatePromptLogConfig`.
+    pub prompt_log_query: Arc<dyn PromptLogQueryApi>,
     /// Per-deployment rebalance move tracker (in/out) for dashboard debug page.
     pub rebalance_move_tracker: Arc<RebalanceMoveTracker>,
     /// Per-deployment request rate tracker for dashboard stats.
@@ -130,7 +151,7 @@ impl DashboardState {
         admin_tx: AdminTx,
         master_key: Option<String>,
         debug_store: Arc<DebugErrorStore>,
-        prompt_log_writer: PromptLogWriter,
+        prompt_log_query: Arc<dyn PromptLogQueryApi>,
         rebalance_move_tracker: Arc<RebalanceMoveTracker>,
         request_rate: Arc<RequestRateTracker>,
         agent_stats: Arc<AgentStatsTracker>,
@@ -155,7 +176,7 @@ impl DashboardState {
             master_key,
             login_attempts: Arc::new(DashMap::new()),
             debug_store,
-            prompt_log_writer,
+            prompt_log_query,
             rebalance_move_tracker,
             request_rate,
             agent_stats,

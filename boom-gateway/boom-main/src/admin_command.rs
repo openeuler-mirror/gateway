@@ -96,6 +96,31 @@ pub async fn admin_command_handler(mut rx: tokio::sync::mpsc::Receiver<AdminComm
                 });
                 let _ = reply.send(Ok(schema));
             }
+            AdminCommand::UpdatePromptLogConfig { config, reply } => {
+                // Hot-swap the live prompt-log config. The writer's
+                // `Arc<ArcSwap<_>>` makes this observable to the dashboard's
+                // `PromptLogQueryApi` handle on the next read.
+                state.prompt_log_writer.update_config(config);
+                let _ = reply.send(Ok(()));
+            }
+            AdminCommand::PingOtlpEndpoint { endpoint, headers, timeout_secs, reply } => {
+                // Single attempt — no retry. The dashboard polls every 5s and
+                // would compound backoff if we retried internally.
+                let probe_config = boom_promptlog::OtlpConfig {
+                    enabled: true,
+                    endpoint,
+                    service_name: "boom-gateway".to_string(),
+                    service_version: None,
+                    timeout_secs,
+                    batch_size: 512,
+                    flush_interval_secs: 5,
+                    max_attribute_bytes: 4096,
+                    headers,
+                    max_queue_size: 10000,
+                };
+                let result = boom_promptlog::ping_endpoint(&probe_config).await;
+                let _ = reply.send(result);
+            }
         }
     }
     tracing::warn!("Admin command handler stopped (channel closed)");

@@ -37,8 +37,7 @@ struct Args {
     reboot: bool,
 }
 
-#[tokio::main(worker_threads = 32)]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     let _tracing_guard = init_tracing();
@@ -49,9 +48,23 @@ async fn main() -> anyhow::Result<()> {
         graceful_restart(args.port)?;
     }
 
-    // Load config.
+    // Load config sync, before the runtime is built — `server.workers` is the
+    // single source of truth for the tokio worker thread count. Previously
+    // this was hardcoded to 32 via the `#[tokio::main(worker_threads = 32)]`
+    // attribute and the config field was a zombie.
     let config = boom_config::load_config(&args.config)?;
+    let worker_count = config.server.workers.max(1);
 
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_count)
+        .enable_all()
+        .build()
+        .map_err(|e| anyhow::anyhow!("failed to build tokio runtime: {}", e))?;
+
+    runtime.block_on(async_main(args, config))
+}
+
+async fn async_main(args: Args, config: boom_config::Config) -> anyhow::Result<()> {
     // CLI overrides.
     let host = args.host.unwrap_or(config.server.host.clone());
     let port = args.port.unwrap_or(config.server.port);
@@ -114,6 +127,11 @@ async fn main() -> anyhow::Result<()> {
                 pool.close().await;
                 tracing::info!("Database pool closed");
             }
+
+            // 3. Best-effort flush of any pending OTLP batch — wait up to
+            //    the configured timeout, never longer. Local JSONL was
+            //    already flushed synchronously inside the writer task.
+            state.prompt_log_writer.shutdown_flush().await;
 
             tracing::info!("Shutdown complete");
         }
@@ -192,7 +210,7 @@ fn build_router(state: AppState) -> Router {
         admin_tx,
         master_key,
         state.debug_store.clone(),
-        state.prompt_log_writer.clone(),
+        state.prompt_log_query.clone(),
         state.rebalance_move_tracker.clone(),
         state.request_rate.clone(),
         state.agent_stats.clone(),

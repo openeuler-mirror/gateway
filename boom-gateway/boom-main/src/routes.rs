@@ -33,6 +33,7 @@ fn write_prompt_log_error(
     state: &AppState,
     should_capture: bool,
     request_body: Option<&serde_json::Value>,
+    trace_id: Option<String>,
     request_id: &str,
     identity: &AuthIdentity,
     model: &str,
@@ -51,8 +52,9 @@ fn write_prompt_log_error(
         return;
     };
 
-    let mut entry = PromptLogEntry::new(
+    let request_entry = PromptLogEntry::new_request(
         request_id,
+        trace_id,
         &identity.key_hash,
         identity.key_alias.as_deref(),
         identity.team_alias.as_deref(),
@@ -63,16 +65,38 @@ fn write_prompt_log_error(
         Some(client_ip),
         headers.cloned(),
     );
-    entry.set_response(openai_error_body(error));
+    state.prompt_log_writer.send(request_entry.clone());
+
+    let mut response_entry = PromptLogEntry::new_response_from(&request_entry);
+    response_entry.set_response(openai_error_body(error));
     if let Some(trace) = prompt_trace {
         trace.finalize();
         if let Some(fusion) = trace.snapshot() {
-            entry.set_fusion(fusion);
+            response_entry.set_fusion(fusion);
         }
     }
-    entry.set_status(error.status_code() as i32, start.elapsed().as_millis() as u64);
-    entry.set_error(error.to_string());
-    state.prompt_log_writer.send(entry);
+    response_entry.set_status(error.status_code() as i32, start.elapsed().as_millis() as u64);
+    let error_code = match error {
+        GatewayError::ModelNotFound(_) | GatewayError::ModelNotAllowed(_) => {
+            boom_promptlog::error_code::MODEL_NOT_ALLOWED
+        }
+        GatewayError::AuthError(_) | GatewayError::KeyExpired | GatewayError::KeyBlocked => {
+            boom_promptlog::error_code::AUTH_FAILED
+        }
+        GatewayError::RateLimitExceeded { .. } | GatewayError::ConcurrencyExceeded { .. } => {
+            boom_promptlog::error_code::RATE_LIMITED
+        }
+        GatewayError::UpstreamTimeout => boom_promptlog::error_code::TIMEOUT,
+        GatewayError::UpstreamError { .. } | GatewayError::ProviderError(_) => {
+            boom_promptlog::error_code::UPSTREAM_ERROR
+        }
+        GatewayError::ConfigError(_) | GatewayError::InternalError(_) => {
+            boom_promptlog::error_code::INTERNAL_ERROR
+        }
+        _ => boom_promptlog::error_code::UPSTREAM_ERROR,
+    };
+    response_entry.set_error(error_code, error.to_string());
+    state.prompt_log_writer.send(response_entry);
 }
 
 /// Extract client IP from request headers with TCP fallback.
@@ -529,6 +553,18 @@ async fn chat_completions_inner(
     } else {
         None
     };
+    // Extract trace_id from W3C traceparent header (if present). When absent
+    // the prompt log exporter mints a synthetic one from the request_id, so
+    // we don't need to fall back here. Carried separately so it can be
+    // stamped into BOTH the Request-phase and Response-phase entries.
+    let prompt_log_trace_id: Option<String> = if prompt_log_should {
+        headers
+            .get("traceparent")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+    } else {
+        None
+    };
 
     // 1. Model access check (deployment-aware, alias-aware).
     check_model_access(identity, &req.model, &state.router, &inner.config.general_settings.public_models)
@@ -676,6 +712,7 @@ async fn chat_completions_inner(
                     &state,
                     prompt_log_should,
                     prompt_log_req_body.as_ref(),
+                    prompt_log_trace_id.clone(),
                     &request_id,
                     &identity,
                     &model,
@@ -749,8 +786,9 @@ async fn chat_completions_inner(
         // Wrap with prompt log stream if enabled, then wrap in Sse.
         if let Some(sender) = prompt_log_sender {
             if let Some(req_body) = prompt_log_req_body {
-                let prompt_entry = PromptLogEntry::new(
+                let prompt_entry = PromptLogEntry::new_request(
                     prompt_log_rid.as_deref().unwrap_or_default(),
+                    prompt_log_trace_id.clone(),
                     &identity.key_hash,
                     identity.key_alias.as_deref(),
                     identity.team_alias.as_deref(),
@@ -761,6 +799,11 @@ async fn chat_completions_inner(
                     Some(&client_ip),
                     prompt_log_headers.clone(),
                 );
+                // Ship the Request-phase entry immediately so the prompt log
+                // reflects this request even if the client disconnects before
+                // any upstream bytes arrive. The stream wrapper's Drop will
+                // emit the matching Response-phase entry via `new_response_from`.
+                let _ = sender.send(prompt_entry.clone());
                 let mut prompt_logged = PromptLogStream::new(
                     logged,
                     sender,
@@ -768,6 +811,10 @@ async fn chat_completions_inner(
                     sse_raw_data_extractor(),
                     None,
                 );
+                // Provider-owned trace snapshot (fusion/KV-index/etc.) is
+                // injected into the Response-phase entry built on Drop —
+                // runs AFTER the inner stream's Drop so trace finalization
+                // side effects are visible to the snapshot.
                 if let Some(trace) = provider_prompt_trace.clone() {
                     prompt_logged = prompt_logged.with_entry_enricher(Arc::new(move |entry| {
                         trace.finalize();
@@ -799,6 +846,7 @@ async fn chat_completions_inner(
                     &state,
                     prompt_log_should,
                     prompt_log_req_body.as_ref(),
+                    prompt_log_trace_id.clone(),
                     &request_id,
                     &identity,
                     &model,
@@ -887,11 +935,14 @@ async fn chat_completions_inner(
             choice.message.normalize_reasoning_for_openai();
         }
 
-        // Prompt log: capture non-streaming response.
+        // Prompt log: emit Request-phase immediately, then Response-phase
+        // with the assembled response body and status. (For non-streaming,
+        // both phases fire nearly back-to-back; that's fine.)
         if let Some(sender) = prompt_log_sender {
             if let Some(req_body) = prompt_log_req_body {
-                let mut prompt_entry = PromptLogEntry::new(
+                let request_entry = PromptLogEntry::new_request(
                     prompt_log_rid.as_deref().unwrap_or_default(),
+                    prompt_log_trace_id.clone(),
                     &identity.key_hash,
                     identity.key_alias.as_deref(),
                     identity.team_alias.as_deref(),
@@ -902,15 +953,19 @@ async fn chat_completions_inner(
                     Some(client_ip.as_str()),
                     prompt_log_headers.clone(),
                 );
-                prompt_entry.set_response(serde_json::to_value(&resp).unwrap_or(serde_json::Value::Null));
+                let _ = sender.send(request_entry.clone());
+                let mut response_entry = PromptLogEntry::new_response_from(&request_entry);
+                response_entry.set_response(
+                    serde_json::to_value(&resp).unwrap_or(serde_json::Value::Null),
+                );
                 if let Some(trace) = provider_prompt_trace.as_ref() {
                     trace.finalize();
                     if let Some(fusion) = trace.snapshot() {
-                        prompt_entry.set_fusion(fusion);
+                        response_entry.set_fusion(fusion);
                     }
                 }
-                prompt_entry.set_status(200, duration_ms as u64);
-                let _ = sender.send(prompt_entry);
+                response_entry.set_status(200, duration_ms as u64);
+                let _ = sender.send(response_entry);
             }
         }
 
@@ -2588,6 +2643,15 @@ pub async fn messages(
     } else {
         None
     };
+    // Extract W3C traceparent — same shape/caveats as the chat_completions path.
+    let prompt_log_trace_id: Option<String> = if prompt_log_should {
+        headers
+            .get("traceparent")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+    } else {
+        None
+    };
 
     // 1. Model access check (deployment-aware, alias-aware).
     check_model_access(identity, &openai_req.model, &state.router, &inner.config.general_settings.public_models)
@@ -2782,8 +2846,9 @@ pub async fn messages(
         // Wrap with prompt log stream if enabled, then wrap in Sse.
         if let Some(sender) = prompt_log_sender {
             if let Some(req_body) = prompt_log_req_body {
-                let prompt_entry = PromptLogEntry::new(
+                let prompt_entry = PromptLogEntry::new_request(
                     prompt_log_rid.as_deref().unwrap_or_default(),
+                    prompt_log_trace_id.clone(),
                     &identity.key_hash,
                     identity.key_alias.as_deref(),
                     identity.team_alias.as_deref(),
@@ -2794,6 +2859,9 @@ pub async fn messages(
                     Some(&client_ip.as_str()),
                     prompt_log_headers.clone(),
                 );
+                // Request-phase fires immediately. Stream wrapper's Drop
+                // emits the Response-phase entry with assembled content.
+                let _ = sender.send(prompt_entry.clone());
                 let prompt_logged = PromptLogStream::new(logged, sender, prompt_entry, sse_raw_data_extractor(), raw_upstream_buf);
                 let response = Sse::new(sse_item_to_event(prompt_logged)).keep_alive(KeepAlive::default());
                 return Ok(response.into_response());
@@ -2882,11 +2950,15 @@ pub async fn messages(
 
         let anthropic_resp = openai_response_to_anthropic(&response);
 
-        // Prompt log: capture non-streaming Anthropic response.
+        // Prompt log: emit Request-phase immediately, then Response-phase with
+        // the converted Anthropic response. Raw upstream bytes (when enabled)
+        // travel only on the Response-phase entry — the Request-phase entry's
+        // raw_upstream_response is None.
         if let Some(sender) = prompt_log_sender {
             if let Some(req_body) = prompt_log_req_body {
-                let mut prompt_entry = PromptLogEntry::new(
+                let request_entry = PromptLogEntry::new_request(
                     prompt_log_rid.as_deref().unwrap_or_default(),
+                    prompt_log_trace_id.clone(),
                     &identity.key_hash,
                     identity.key_alias.as_deref(),
                     identity.team_alias.as_deref(),
@@ -2897,18 +2969,21 @@ pub async fn messages(
                     Some(client_ip.as_str()),
                     prompt_log_headers.clone(),
                 );
-                // Capture raw upstream response (exact bytes from provider, if enabled).
+                let _ = sender.send(request_entry.clone());
+                let mut response_entry = PromptLogEntry::new_response_from(&request_entry);
                 if prompt_log_capture_raw {
                     if let Some(ref raw) = response.raw_response {
-                        prompt_entry.set_raw_upstream_response(
+                        response_entry.set_raw_upstream_response(
                             serde_json::from_str::<serde_json::Value>(raw)
-                                .unwrap_or(serde_json::Value::String(raw.clone()))
+                                .unwrap_or(serde_json::Value::String(raw.clone())),
                         );
                     }
                 }
-                prompt_entry.set_response(serde_json::to_value(&anthropic_resp).unwrap_or(serde_json::Value::Null));
-                prompt_entry.set_status(200, duration_ms as u64);
-                let _ = sender.send(prompt_entry);
+                response_entry.set_response(
+                    serde_json::to_value(&anthropic_resp).unwrap_or(serde_json::Value::Null),
+                );
+                response_entry.set_status(200, duration_ms as u64);
+                let _ = sender.send(response_entry);
             }
         }
 
@@ -3101,9 +3176,36 @@ where
 }
 
 /// Returns a closure that extracts raw JSON data from an SSE stream item.
-fn sse_raw_data_extractor() -> impl FnMut(&Result<SseItem, Infallible>) -> Option<String> + Unpin {
-    |item: &Result<SseItem, Infallible>| match item {
-        Ok(sse_item) => Some(sse_item.json_data.clone()),
+fn sse_raw_data_extractor() -> impl FnMut(&Result<SseItem, Infallible>) -> Option<boom_promptlog::ChunkDelta> + Unpin {
+    use boom_promptlog::ChunkDelta;
+    // OpenAI SSE chunks have shape `{"choices": [{"delta": {"content": "..."}, "finish_reason": ...}], "usage": {...}}`.
+    // We parse the raw SSE `data:` payload and pull out content / finish_reason / usage.
+    // For non-OpenAI chunks (or malformed JSON), return None — the wrapper just
+    // won't accumulate from that chunk, no harm done.
+    move |item: &Result<SseItem, Infallible>| match item {
+        Ok(sse_item) => {
+            let raw = sse_item.json_data.as_str();
+            if raw.is_empty() || raw == "[DONE]" {
+                return None;
+            }
+            let v: serde_json::Value = match serde_json::from_str(raw) {
+                Ok(v) => v,
+                Err(_) => return None,
+            };
+            let choices = v.get("choices").and_then(|c| c.as_array());
+            let first_choice = choices.and_then(|c| c.first());
+            let delta = first_choice.and_then(|c| c.get("delta"));
+            let content = delta
+                .and_then(|d| d.get("content"))
+                .and_then(|c| c.as_str())
+                .map(|s| s.to_string());
+            let finish_reason = first_choice
+                .and_then(|c| c.get("finish_reason"))
+                .and_then(|f| f.as_str())
+                .map(|s| s.to_string());
+            let usage = v.get("usage").cloned();
+            Some(ChunkDelta { content, finish_reason, usage })
+        }
         Err(_) => None,
     }
 }

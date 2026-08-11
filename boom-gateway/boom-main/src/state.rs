@@ -66,6 +66,10 @@ pub struct AppState {
     pub debug_store: Arc<DebugErrorStore>,
     /// Prompt log writer — captures full request/response for audit.
     pub prompt_log_writer: PromptLogWriter,
+    /// Read-only prompt-log query API (entry lookup + config snapshot),
+    /// shared with the dashboard. Wraps the same `Arc<ArcSwap<_>>` config
+    /// the writer mutates, so hot-reloads are visible without re-binding.
+    pub prompt_log_query: Arc<dyn boom_promptlog::PromptLogQueryApi>,
     /// Per-deployment rebalance move tracker (in/out counts, survives reloads).
     pub rebalance_move_tracker: Arc<RebalanceMoveTracker>,
     /// Per-deployment request rate tracker (survives reloads).
@@ -259,7 +263,26 @@ impl AppState {
         let prompt_log_config = config.prompt_log.as_ref()
             .and_then(|v| serde_json::from_value::<boom_promptlog::PromptLogConfig>(v.clone()).ok())
             .unwrap_or_default();
+
+        // Wire the OTLP exporter when the feature is on. The exporter is
+        // always constructed at startup (cheap: just an HTTP client + queue),
+        // and the runtime `otlp.enabled` toggle in YAML is consulted on every
+        // entry in the background writer — so flipping the dashboard switch
+        // off→on (or on→off) takes effect immediately without a restart.
+        #[cfg(feature = "otlp")]
+        let prompt_log_writer = {
+            let exporter = boom_promptlog::OtelExporter::new(&prompt_log_config.otlp);
+            exporter.spawn_flush_task();
+            PromptLogWriter::spawn_with_otlp(prompt_log_config, exporter)
+        };
+        #[cfg(not(feature = "otlp"))]
         let prompt_log_writer = PromptLogWriter::spawn(prompt_log_config);
+
+        // Read-only query handle: shares the writer's `Arc<ArcSwap<config>>`,
+        // so dashboard sees hot-reloads without touching the writer directly.
+        let prompt_log_query: Arc<dyn boom_promptlog::PromptLogQueryApi> = Arc::new(
+            boom_promptlog::FilePromptLogQuery::new(prompt_log_writer.config_handle()),
+        );
 
         let inner = Self::build_inner(config, &db_pool, chrono::Utc::now(), 0)?;
 
@@ -291,6 +314,7 @@ impl AppState {
             flow_controller: flow_controller.clone(),
             debug_store,
             prompt_log_writer,
+            prompt_log_query,
             rebalance_move_tracker,
             request_rate,
             agent_stats,
@@ -523,10 +547,20 @@ impl AppState {
         // Clean up assignments pointing to plans that no longer exist.
         self.plan_store.cleanup_assignments();
 
-        // 5. Update prompt log config (hot-reload).
+        // 5. Update prompt log config (hot-reload) + hot-swap OTLP exporter
+        //    when its sub-config changes. update_config covers the runtime
+        //    fields read per-entry by the background writer (dir, max_size,
+        //    enabled toggle, excluded_*, record_headers). replace_otlp
+        //    rebuilds the exporter when endpoint/headers/batch/timeout/etc.
+        //    differ — those are frozen in OtelExporter at construction time
+        //    and only take effect via rebuild.
         if let Some(ref v) = new_config.prompt_log {
             if let Ok(pc) = serde_json::from_value::<boom_promptlog::PromptLogConfig>(v.clone()) {
-                self.prompt_log_writer.update_config(pc);
+                let old_otlp = self.prompt_log_writer.config().otlp;
+                self.prompt_log_writer.update_config(pc.clone());
+                if old_otlp != pc.otlp {
+                    self.prompt_log_writer.replace_otlp(&pc.otlp).await;
+                }
             }
         } else {
             self.prompt_log_writer.update_config(boom_promptlog::PromptLogConfig::default());

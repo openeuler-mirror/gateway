@@ -3255,9 +3255,20 @@ pub async fn toggle_debug(
 ) -> Json<Value> {
     state.debug_store.set_enabled(req.enabled);
     // Also toggle raw upstream response capture alongside debug mode.
-    let prompt_cfg = state.prompt_log_writer.config();
-    let new_cfg = prompt_cfg.with_enabled(true).with_capture_raw_upstream(req.enabled);
-    state.prompt_log_writer.update_config(new_cfg);
+    let new_cfg = state
+        .prompt_log_query
+        .full_config()
+        .with_enabled(true)
+        .with_capture_raw_upstream(req.enabled);
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let _ = state
+        .admin_tx
+        .send(crate::state::AdminCommand::UpdatePromptLogConfig {
+            config: new_cfg,
+            reply: reply_tx,
+        })
+        .await;
+    let _ = reply_rx.await;
     tracing::info!(enabled = req.enabled, "Debug toggled (debug errors + raw upstream capture)");
     Json(json!({
         "ok": true,
@@ -3434,12 +3445,69 @@ pub async fn get_prompt_log_status(
     _session: AdminSession,
     Extension(state): Extension<Arc<DashboardState>>,
 ) -> Json<Value> {
-    let cfg = state.prompt_log_writer.config();
+    let cfg = state.prompt_log_query.config_snapshot();
     Json(json!({
         "enabled": cfg.enabled,
         "excluded_keys": cfg.excluded_keys,
         "excluded_teams": cfg.excluded_teams,
     }))
+}
+
+/// POST `/admin/prompt-log/otlp-ping` — probe a remote OTLP collector.
+/// Body: `{ "endpoint": "...", "headers": {...}, "timeout_secs": 10 }`.
+/// Sends an empty `ExportLogsServiceRequest` and returns `{ok, latency_ms}`
+/// on success or `{ok:false, error}` on failure. Used by the connectivity
+/// indicator above the endpoint input on the prompt-log card.
+#[derive(Debug, Deserialize)]
+pub struct PingOtlpEndpointRequest {
+    pub endpoint: String,
+    #[serde(default)]
+    pub headers: std::collections::HashMap<String, String>,
+    #[serde(default = "default_ping_timeout_secs")]
+    pub timeout_secs: u64,
+}
+fn default_ping_timeout_secs() -> u64 { 5 }
+
+pub async fn ping_otlp_endpoint(
+    _session: AdminSession,
+    Extension(state): Extension<Arc<DashboardState>>,
+    Json(req): Json<PingOtlpEndpointRequest>,
+) -> Response {
+    if req.endpoint.trim().is_empty() {
+        return Json(json!({"ok": false, "error": "endpoint not configured"}))
+            .into_response();
+    }
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    if state
+        .admin_tx
+        .send(crate::state::AdminCommand::PingOtlpEndpoint {
+            endpoint: req.endpoint.clone(),
+            headers: req.headers.clone(),
+            timeout_secs: req.timeout_secs,
+            reply: reply_tx,
+        })
+        .await
+        .is_err()
+    {
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "Admin command handler unavailable",
+        )
+            .into_response();
+    }
+    match reply_rx.await {
+        Ok(Ok(latency_ms)) => Json(json!({
+            "ok": true,
+            "latency_ms": latency_ms,
+        }))
+        .into_response(),
+        Ok(Err(e)) => Json(json!({"ok": false, "error": e})).into_response(),
+        Err(_) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "Admin command handler dropped reply",
+        )
+            .into_response(),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -3452,9 +3520,16 @@ pub async fn toggle_prompt_log(
     Extension(state): Extension<Arc<DashboardState>>,
     Json(req): Json<PromptLogToggleRequest>,
 ) -> Json<Value> {
-    let cfg = state.prompt_log_writer.config();
-    let new_cfg = cfg.with_enabled(req.enabled);
-    state.prompt_log_writer.update_config(new_cfg);
+    let new_cfg = state.prompt_log_query.full_config().with_enabled(req.enabled);
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let _ = state
+        .admin_tx
+        .send(crate::state::AdminCommand::UpdatePromptLogConfig {
+            config: new_cfg,
+            reply: reply_tx,
+        })
+        .await;
+    let _ = reply_rx.await;
     tracing::info!(enabled = req.enabled, "Prompt log toggled via dashboard");
     Json(json!({
         "ok": true,
@@ -3474,9 +3549,19 @@ pub async fn toggle_team_prompt_log(
     Extension(state): Extension<Arc<DashboardState>>,
     Json(req): Json<PromptLogTeamRequest>,
 ) -> Json<Value> {
-    let cfg = state.prompt_log_writer.config();
-    let new_cfg = cfg.with_team_excluded(&req.team_id, req.excluded);
-    state.prompt_log_writer.update_config(new_cfg);
+    let new_cfg = state
+        .prompt_log_query
+        .full_config()
+        .with_team_excluded(&req.team_id, req.excluded);
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let _ = state
+        .admin_tx
+        .send(crate::state::AdminCommand::UpdatePromptLogConfig {
+            config: new_cfg,
+            reply: reply_tx,
+        })
+        .await;
+    let _ = reply_rx.await;
     tracing::info!(team_id = %req.team_id, excluded = req.excluded, "Prompt log team exclusion toggled");
     Json(json!({
         "ok": true,
@@ -3497,9 +3582,19 @@ pub async fn toggle_key_prompt_log(
     Extension(state): Extension<Arc<DashboardState>>,
     Json(req): Json<PromptLogKeyRequest>,
 ) -> Json<Value> {
-    let cfg = state.prompt_log_writer.config();
-    let new_cfg = cfg.with_key_excluded(&req.key_hash, req.excluded);
-    state.prompt_log_writer.update_config(new_cfg);
+    let new_cfg = state
+        .prompt_log_query
+        .full_config()
+        .with_key_excluded(&req.key_hash, req.excluded);
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let _ = state
+        .admin_tx
+        .send(crate::state::AdminCommand::UpdatePromptLogConfig {
+            config: new_cfg,
+            reply: reply_tx,
+        })
+        .await;
+    let _ = reply_rx.await;
     tracing::info!(key_hash = %req.key_hash, excluded = req.excluded, "Prompt log key exclusion toggled");
     Json(json!({
         "ok": true,
@@ -3520,66 +3615,45 @@ pub struct PromptLogEntryQuery {
 
 /// GET /admin/prompt-log/entry/{request_id}?key_hash=xxx&team_alias=xxx
 ///
-/// Scans JSONL files under {dir}/{team_alias}/{key_hash}/ to find the entry
-/// matching the given request_id. Returns the full JSON entry on match.
+/// Looks up the request and response entries for the given request_id via
+/// `PromptLogQueryApi` (which encapsulates the JSONL storage layout). Returns
+/// a JSON object with both phases if available. Old single-phase entries
+/// (pre-refactor) won't match the new `phase` field and fall through to the
+/// 404 path — dashboard surfaces a "log not found" message in that case.
 pub async fn get_prompt_log_entry(
     _session: AdminSession,
     Extension(state): Extension<Arc<DashboardState>>,
     Path(request_id): Path<String>,
     Query(query): Query<PromptLogEntryQuery>,
 ) -> impl IntoResponse {
-    let cfg = state.prompt_log_writer.config();
+    let team_alias = query.team_alias.as_deref();
+    let req_entry = state.prompt_log_query.find_entry(
+        &request_id,
+        &query.key_hash,
+        team_alias,
+        boom_promptlog::LogPhase::Request,
+    );
+    let resp_entry = state.prompt_log_query.find_entry(
+        &request_id,
+        &query.key_hash,
+        team_alias,
+        boom_promptlog::LogPhase::Response,
+    );
 
-    // Build the directory path: {dir}/{team_alias}/{key_hash}/
-    let team_dir = query.team_alias.as_deref().unwrap_or("_no_team");
-    let key_dir = std::path::PathBuf::from(&cfg.dir)
-        .join(team_dir)
-        .join(&query.key_hash);
-
-    // Scan JSONL files in directory, newest first.
-    let mut entries = match tokio::fs::read_dir(&key_dir).await {
-        Ok(rd) => rd,
-        Err(_) => {
-            return (
-                axum::http::StatusCode::NOT_FOUND,
-                Json(json!({"error": "Log directory not found"})),
-            )
-                .into_response();
-        }
-    };
-
-    let mut files: Vec<String> = Vec::new();
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with("log_") && name.ends_with(".jsonl") {
-            files.push(name);
-        }
+    match (req_entry, resp_entry) {
+        (None, None) => (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(json!({"error": "Request not found in prompt logs"})),
+        )
+            .into_response(),
+        (Some(req), None) => Json(serde_json::to_value(req).unwrap_or_default()).into_response(),
+        (None, Some(resp)) => Json(serde_json::to_value(resp).unwrap_or_default()).into_response(),
+        (Some(req), Some(resp)) => Json(json!({
+            "request": serde_json::to_value(req).unwrap_or_default(),
+            "response": serde_json::to_value(resp).unwrap_or_default(),
+        }))
+        .into_response(),
     }
-    // Sort descending (newest files first) for faster lookup on recent requests.
-    files.sort_by(|a, b| b.cmp(a));
-
-    for fname in files {
-        let path = key_dir.join(&fname);
-        let Ok(content) = tokio::fs::read_to_string(&path).await else {
-            continue;
-        };
-        for line in content.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
-                if val.get("request_id").and_then(|v| v.as_str()) == Some(&request_id) {
-                    return Json(val).into_response();
-                }
-            }
-        }
-    }
-
-    (
-        axum::http::StatusCode::NOT_FOUND,
-        Json(json!({"error": "Request not found in prompt logs"})),
-    )
-        .into_response()
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -3754,8 +3828,8 @@ pub async fn quota_overview(
 
     // prompt-log excluded teams — read once, lookup in loop.
     let excluded_teams: Vec<String> = state
-        .prompt_log_writer
-        .config()
+        .prompt_log_query
+        .config_snapshot()
         .excluded_teams
         .clone();
 

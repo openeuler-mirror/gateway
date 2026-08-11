@@ -3,6 +3,22 @@ name = "boom-promptlog"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# OTLP push is on by default. The exporter only activates when
+# `prompt_log.otlp.enabled` is set in YAML, so the cost of carrying the
+# codegen is the few extra crates linked in — no runtime behavior unless
+# configured. Disable with `--no-default-features` for an embedded build
+# that doesn't need OTLP at all.
+default = ["otlp"]
+otlp = [
+    "dep:opentelemetry",
+    "dep:opentelemetry-otlp",
+    "dep:opentelemetry-proto",
+    "dep:reqwest",
+    "dep:prost",
+    "dep:tempfile",
+]
+
 [dependencies]
 tokio = { workspace = true }
 serde = { workspace = true }
@@ -12,3 +28,23 @@ arc-swap = { workspace = true }
 tracing = { workspace = true }
 futures = { workspace = true }
 flate2 = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }
+
+# OTLP-exporter deps — only pulled in when the `otlp` feature is on.
+# All three opentelemetry-* crates are released in lockstep; pin them to the
+# same major.minor to keep their proto-generated types compatible.
+opentelemetry = { version = "0.32", optional = true, default-features = false }
+opentelemetry-otlp = { version = "0.32", optional = true, default-features = false, features = ["http-proto", "reqwest-client"] }
+opentelemetry-proto = { version = "0.32", optional = true, default-features = false, features = ["gen-tonic", "logs"] }
+reqwest = { workspace = true, optional = true }
+prost = { version = "0.14", optional = true }
+# Used by replay.rs (gz decompression to a temp file). Only needed with otlp.
+tempfile = { version = "3", optional = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+clap = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true }
