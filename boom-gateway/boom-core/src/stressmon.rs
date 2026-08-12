@@ -38,6 +38,10 @@ pub struct StressmonSample {
 pub struct StressmonSnapshot {
     pub num_workers: usize,
     pub samples: Vec<StressmonSample>,
+    /// Cumulative count of samples where normalized CPU exceeded 80% —
+    /// `cpu_pct > 0.8 * num_workers * 100`. Lifetime of the process,
+    /// survives range switches (it's a counter, not a windowed value).
+    pub cpu_over_80_count: u64,
 }
 
 #[async_trait]

@@ -2753,6 +2753,7 @@ input[list] {
 
 /* ── System Pressure Page ─────────────────────────────────────────── */
 .stress-info-bar {
+  position: relative;
   display: flex;
   flex-wrap: wrap;
   gap: 18px;
@@ -2771,6 +2772,52 @@ input[list] {
 }
 .stress-info-item b {
   color: var(--text2);
+  font-weight: 600;
+}
+.stress-info-help {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  color: var(--text3);
+  font-size: 11px;
+  font-weight: 700;
+  cursor: help;
+  user-select: none;
+  margin-left: auto;
+}
+.stress-info-help:hover, .stress-info-help:focus {
+  border-color: var(--accent);
+  color: var(--accent);
+  outline: none;
+}
+.stress-info-tooltip {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 12px;
+  z-index: 50;
+  padding: 12px 14px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.18);
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text2);
+  max-width: 520px;
+}
+.stress-info-tooltip[hidden] { display: none; }
+.stress-info-tooltip__row {
+  margin-bottom: 6px;
+}
+.stress-info-tooltip__row:last-child {
+  margin-bottom: 0;
+}
+.stress-info-tooltip__row b {
+  color: var(--text1);
   font-weight: 600;
 }
 .stress-grid {

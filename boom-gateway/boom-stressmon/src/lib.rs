@@ -12,6 +12,7 @@
 
 use boom_core::{StressmonApi, StressmonSample, StressmonSnapshot};
 use async_trait::async_trait;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// 60 minutes × 1 Hz. Fixed cap → bounded memory (~140 KB worst case).
@@ -76,6 +77,9 @@ impl RingBuffer {
 pub struct StressmonCollector {
     samples: Mutex<RingBuffer>,
     num_workers: usize,
+    /// Lifetime counter of samples whose normalized CPU exceeds 80%.
+    /// Compared here (not in the sampler) so the rule stays with the data.
+    cpu_over_80_count: AtomicU64,
 }
 
 impl StressmonCollector {
@@ -83,11 +87,19 @@ impl StressmonCollector {
         Arc::new(Self {
             samples: Mutex::new(RingBuffer::new()),
             num_workers,
+            cpu_over_80_count: AtomicU64::new(0),
         })
     }
 
     /// Push one sample. Called from boom-main's sampler task at 1 Hz.
+    /// Also bumps the lifetime CPU-over-80% counter if this sample crosses
+    /// the threshold — `cpu_pct > 0.8 * num_workers * 100` is equivalent to
+    /// "normalized CPU% > 80%".
     pub fn record_sample(&self, sample: StressmonSample) {
+        let threshold = (self.num_workers as f32) * 80.0;
+        if sample.cpu_pct > threshold {
+            self.cpu_over_80_count.fetch_add(1, Ordering::Relaxed);
+        }
         if let Ok(mut buf) = self.samples.lock() {
             buf.push(sample);
         }
@@ -112,6 +124,7 @@ impl StressmonApi for StressmonCollector {
         StressmonSnapshot {
             num_workers: self.num_workers,
             samples,
+            cpu_over_80_count: self.cpu_over_80_count.load(Ordering::Relaxed),
         }
     }
 }

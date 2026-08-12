@@ -352,8 +352,6 @@
               <h2 data-i18n="stress.title">System Pressure</h2>
               <div class="range-controls" data-target="stress">
                 <button class="btn-range active" data-range="5m">5m</button>
-                <button class="btn-range" data-range="15m">15m</button>
-                <button class="btn-range" data-range="30m">30m</button>
                 <button class="btn-range" data-range="60m">60m</button>
               </div>
             </div>
@@ -362,6 +360,9 @@
               <span class="stress-info-item"><b data-i18n="stress.info.worker_queue">Worker local queue</b> <span data-i18n="stress.info.worker_queue_value">256 (tokio default)</span></span>
               <span class="stress-info-item"><b data-i18n="stress.info.blocking_pool">Blocking thread pool</b> <span data-i18n="stress.info.blocking_pool_value">512 (tokio default)</span></span>
               <span class="stress-info-item"><b data-i18n="stress.info.sample_rate">Sample rate</b> 1 Hz</span>
+              <span class="stress-info-item"><b data-i18n="stress.info.cpu_over_80">CPU &gt; 80% count</b> <span id="stress-info-cpu-over-80">0</span></span>
+              <span class="stress-info-help" tabindex="0" data-i18n-title="stress.info.help_title" title="?">?</span>
+              <div class="stress-info-tooltip" id="stress-info-tooltip" hidden></div>
             </div>
             <p class="modal-hint" data-i18n="stress.hint">In-memory 1Hz ring buffer (last 60 min). CPU is normalized against worker count.</p>
             <div class="stress-grid">

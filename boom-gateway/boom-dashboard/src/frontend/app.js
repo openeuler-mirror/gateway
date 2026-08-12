@@ -12,6 +12,7 @@
     document.documentElement.dataset.theme = t;
     localStorage.setItem("boom-theme", t);
     updateThemeIcons();
+    document.dispatchEvent(new CustomEvent("themechange"));
   }
   function toggleTheme() { setTheme(getTheme() === "dark" ? "light" : "dark"); }
   function updateThemeIcons() {
@@ -443,6 +444,8 @@
     // capacity the charts are normalized against.
     const workersEl = document.getElementById("stress-info-workers");
     if (workersEl) workersEl.textContent = String(numWorkers);
+    const cpuOver80El = document.getElementById("stress-info-cpu-over-80");
+    if (cpuOver80El) cpuOver80El.textContent = String(snap.cpu_over_80_count || 0);
 
     // CPU: normalized to 0..100 against worker count. >80% draws a red
     // warning band behind the line.
@@ -510,8 +513,8 @@
       samples,
       accessor: (s) => s.inflight,
       yMax: "auto",
-      color: "rgba(99,102,241,0.9)",
-      fill: "rgba(99,102,241,0.15)",
+      color: "#6366f1",
+      fill: "rgba(99,102,241,0.18)",
       emptyHint: "—",
       formatValue: (v) => String(v),
       formatY: (v) => String(Math.round(v)),
@@ -547,6 +550,31 @@
     return { max, step };
   }
 
+  // Read a CSS custom property from :root. Canvas APIs don't accept CSS
+  // variables directly, so we resolve them in JS — this is what makes the
+  // chart adapt to light/dark themes.
+  let _cssVarCache = null;
+  let _cssVarTheme = null;
+  function cssVar(name) {
+    const theme = document.documentElement.dataset.theme || "light";
+    if (_cssVarCache && _cssVarTheme === theme) return _cssVarCache[name] || "";
+    _cssVarTheme = theme;
+    const styles = getComputedStyle(document.documentElement);
+    _cssVarCache = {
+      "--text1": styles.getPropertyValue("--text1").trim(),
+      "--text2": styles.getPropertyValue("--text2").trim(),
+      "--text3": styles.getPropertyValue("--text3").trim(),
+      "--border": styles.getPropertyValue("--border").trim(),
+      "--surface2": styles.getPropertyValue("--surface2").trim(),
+    };
+    return _cssVarCache[name] || "";
+  }
+  // Invalidate cache on theme toggle and immediately redraw current charts.
+  document.addEventListener("themechange", () => {
+    _cssVarCache = null;
+    if (sectionFromHash(location.hash) === "admin-stress") loadStress();
+  });
+
   // Generic single-metric canvas renderer.
   // - yMax: number (fixed scale) | "auto" (round peak up to a nice value)
   // - tickStep: number | undefined — Y-axis grid step. If omitted for fixed
@@ -578,7 +606,7 @@
     if (valueEl) valueEl.textContent = opts.emptyHint || "—";
     if (samples.length === 0) {
       ctx.clearRect(0, 0, cssW, cssH);
-      ctx.fillStyle = "var(--text3, #888)";
+      ctx.fillStyle = cssVar("--text3") || "#888";
       ctx.font = "12px sans-serif";
       ctx.textAlign = "left";
       ctx.fillText(opts.emptyHint || "—", 12, 24);
@@ -618,18 +646,21 @@
     const xFor = (i) => padLeft + (plotW * i) / Math.max(1, values.length - 1);
 
     // Y-axis: horizontal grid lines + tick labels (0, step, 2*step, ..., yMax).
+    // Colors resolve via cssVar so they follow the active theme.
+    const tickColor = cssVar("--text2") || "#555";
+    const gridColor = cssVar("--border") || "rgba(127,127,127,0.25)";
     ctx.font = "11px sans-serif";
     ctx.textAlign = "right";
     for (let v = 0; v <= yMax + 1e-6; v += tickStep) {
       const y = yFor(v);
-      ctx.strokeStyle = "rgba(127, 127, 127, 0.18)";
+      ctx.strokeStyle = gridColor;
       ctx.setLineDash([]);
       ctx.lineWidth = 1;
       ctx.beginPath();
       ctx.moveTo(padLeft, y);
       ctx.lineTo(padLeft + plotW, y);
       ctx.stroke();
-      ctx.fillStyle = "var(--text3, #888)";
+      ctx.fillStyle = tickColor;
       ctx.fillText(
         typeof opts.formatY === "function" ? opts.formatY(v) : String(Math.round(v)),
         padLeft - 6,
@@ -3595,6 +3626,37 @@
   // ── Admin: Modals ─────────────────────────────────────
   function setupAdminButtons() {
     document.getElementById("btn-new-plan").addEventListener("click", showNewPlanModal);
+    // Stress info-bar "?" tooltip — hover/focus reveals a glossary.
+    const helpBtn = document.querySelector(".stress-info-help");
+    const tooltip = document.getElementById("stress-info-tooltip");
+    if (helpBtn && tooltip) {
+      const render = () => {
+        tooltip.innerHTML = [
+          ["stress.info.workers", "stress.info.help.workers"],
+          ["stress.info.worker_queue", "stress.info.help.worker_queue"],
+          ["stress.info.blocking_pool", "stress.info.help.blocking_pool"],
+          ["stress.info.cpu_over_80", "stress.info.help.cpu_over_80"],
+          ["stress.info.sample_rate", "stress.info.help.sample_rate"],
+        ]
+          .map(
+            ([k, hk]) =>
+              `<div class="stress-info-tooltip__row"><b>${t(k)}:</b> ${t(hk)}</div>`,
+          )
+          .join("");
+      };
+      const show = () => {
+        render();
+        tooltip.hidden = false;
+      };
+      const hide = () => { tooltip.hidden = true; };
+      helpBtn.addEventListener("mouseenter", show);
+      helpBtn.addEventListener("mouseleave", hide);
+      helpBtn.addEventListener("focus", show);
+      helpBtn.addEventListener("blur", hide);
+      document.addEventListener("languagechange", () => {
+        if (!tooltip.hidden) render();
+      });
+    }
     const btnResetAll = document.getElementById("btn-reset-all-limits");
     if (btnResetAll) btnResetAll.addEventListener("click", async () => {
       if (!confirm(t("confirm.reset_all"))) return;
