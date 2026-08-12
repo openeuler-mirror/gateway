@@ -8,11 +8,17 @@ name = "boom-gateway"
 path = "src/main.rs"
 
 [features]
-default = []
+# OTLP is default-on so `cargo build --release` produces a binary that
+# actually pushes prompt logs to a remote collector when the YAML flips
+# `prompt_log.otlp.enabled=true`. Without this, `#[cfg(feature = "otlp")]`
+# in state.rs strips the `OtelExporter::new` call entirely — the exporter
+# is never constructed, and `background_writer` sees `otlp.load() == None`
+# forever, silently dropping every entry on the floor. 482086f promised
+# default-on but only edited the comment, not the `default` array.
+default = ["otlp"]
 debug-tools = ["boom-dashboard/debug-tools"]
-# OTLP push for prompt log entries. Inherited from boom-promptlog's default
-# feature set — the exporter only activates at runtime when
-# `prompt_log.otlp.enabled` is true in YAML.
+# OTLP push for prompt log entries. The exporter only activates at runtime
+# when `prompt_log.otlp.enabled` is true in YAML.
 otlp = ["boom-promptlog/otlp"]
 
 [dependencies]
