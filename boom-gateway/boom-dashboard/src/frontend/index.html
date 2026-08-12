@@ -353,7 +353,6 @@
               <span class="section-header__hint" data-i18n="stress.window_hint">Last 60 min · 1 Hz sampling</span>
             </div>
             <div class="stress-info-bar" id="stress-info-bar">
-              <span class="stress-info-item"><b data-i18n="stress.info.workers">Workers</b> <span id="stress-info-workers">—</span></span>
               <span class="stress-info-item"><b data-i18n="stress.info.worker_queue">Worker local queue</b> <span data-i18n="stress.info.worker_queue_value">256 (tokio default)</span></span>
               <span class="stress-info-item"><b data-i18n="stress.info.blocking_pool">Blocking thread pool</b> <span data-i18n="stress.info.blocking_pool_value">512 (tokio default)</span></span>
               <span class="stress-info-item"><b data-i18n="stress.info.sample_rate">Sample rate</b> 1 Hz</span>
@@ -361,7 +360,7 @@
               <span class="stress-info-help" tabindex="0" data-i18n-title="stress.info.help_title" title="?">?</span>
               <div class="stress-info-tooltip" id="stress-info-tooltip" hidden></div>
             </div>
-            <p class="modal-hint" data-i18n="stress.hint">In-memory 1Hz ring buffer (last 60 min). CPU is normalized against worker count.</p>
+            <p class="modal-hint" data-i18n="stress.hint">In-memory 1Hz ring buffer (last 60 min). CPU is process-level and may exceed worker count × 100.</p>
             <div class="stress-grid">
               <div class="stress-card">
                 <div class="stress-card__head">

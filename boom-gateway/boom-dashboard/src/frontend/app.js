@@ -441,23 +441,23 @@
     const latest = samples.length > 0 ? samples[samples.length - 1] : null;
     if (latest) stressLastSampleTs = latest.ts;
 
-    // Reflect runtime config at the top so the operator can see the
-    // capacity the charts are normalized against.
-    const workersEl = document.getElementById("stress-info-workers");
-    if (workersEl) workersEl.textContent = String(numWorkers);
     const cpuOver80El = document.getElementById("stress-info-cpu-over-80");
     if (cpuOver80El) cpuOver80El.textContent = String(snap.cpu_over_80_count || 0);
 
-    // CPU = mean tokio worker_busyness (already 0..=100 in the sample).
-    // >80% draws a red warning band behind the line.
+    // CPU = process-level (utime+stime), not normalized. May go far past
+    // num_workers × 100 because tokio's blocking pool runs threads outside
+    // the worker pool (prompt-log gzip, DB work, file I/O). Y axis auto-
+    // scales; the red warning band starts at `numWorkers × 80%` (the
+    // equivalent of the worker pool running at 80% saturation).
+    const cpuWarn = numWorkers * 80;
     drawMetricCanvas({
       canvasId: "stress-cpu-canvas",
       valueId: "stress-cpu-value",
       samples,
-      accessor: (s) => s.worker_busy_pct,
-      yMax: 100,
-      tickStep: 10,
-      warnThreshold: 80,
+      accessor: (s) => s.cpu_pct,
+      yMax: "auto",
+      yMinFloor: 100,
+      warnThreshold: cpuWarn,
       color: "#10b981",
       emptyHint: "Collecting… (first sample takes 1s)",
       formatValue: (v) => v.toFixed(1) + "%",
@@ -3629,7 +3629,6 @@
     if (helpBtn && tooltip) {
       const render = () => {
         tooltip.innerHTML = [
-          ["stress.info.workers", "stress.info.help.workers"],
           ["stress.info.worker_queue", "stress.info.help.worker_queue"],
           ["stress.info.blocking_pool", "stress.info.help.blocking_pool"],
           ["stress.info.cpu_over_80", "stress.info.help.cpu_over_80"],

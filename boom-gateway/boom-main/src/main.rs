@@ -373,13 +373,13 @@ fn spawn_stressmon_sampler(
     tracing::info!("System pressure sampler spawned (1 Hz)");
 }
 
-/// Take one pressure sample. Worker busyness is derived from
-/// `RuntimeMetrics::worker_total_busy_duration(i)` — tokio reports
-/// cumulative busy nanoseconds per worker, so we diff against the previous
-/// sample to get "fraction of wall time worker i was busy" in 0..=100,
-/// then average.
-/// Unlike a process-level CPU%, this excludes the blocking pool: a fully
-/// loaded 8-worker runtime peaks at exactly 100, never more.
+/// Take one pressure sample. CPU is process-level: sum of utime+stime
+/// from `/proc/self/stat`, diffed against the previous sample and divided
+/// by elapsed wall time ×100. **Not normalized against worker count** —
+/// tokio's blocking pool (prompt-log gzip, DB migrations, file I/O) runs
+/// outside the worker pool and contributes CPU, so a loaded 8-worker
+/// runtime can legitimately report 1300% on a 16-core box. The Y axis
+/// auto-scales to whatever the peak is.
 fn sample_pressure_once(
     inflight: &std::sync::Arc<boom_routing::InFlightTracker>,
 ) -> boom_core::StressmonSample {
@@ -391,37 +391,29 @@ fn sample_pressure_once(
     let metrics = tokio::runtime::Handle::current().metrics();
     let num_workers = metrics.num_workers().max(1);
 
-    // Per-worker (prev_busy_duration, prev_instant). Mutex<Vec> resized to
-    // num_workers on first call; num_workers is fixed for the runtime's
-    // lifetime so this is stable.
-    static PREV_BUSY: Mutex<Vec<Option<(std::time::Duration, std::time::Instant)>>> =
-        Mutex::new(Vec::new());
-    let mut prev_guard = PREV_BUSY.lock().unwrap();
-    if prev_guard.len() < num_workers {
-        prev_guard.resize(num_workers, None);
-    }
-    let mut busy_pct_sum = 0.0f32;
-    for i in 0..num_workers {
-        let cur = metrics.worker_total_busy_duration(i);
-        let pct = match prev_guard[i] {
-            Some((prev, prev_instant)) => {
-                let dt_busy_ns = cur.saturating_sub(prev).as_nanos() as u64;
-                let dt_wall_ns = now_instant
-                    .saturating_duration_since(prev_instant)
-                    .as_nanos() as u64;
-                if dt_wall_ns == 0 {
-                    0.0
-                } else {
-                    ((dt_busy_ns as f64 / dt_wall_ns as f64) * 100.0).min(100.0) as f32
-                }
+    // Process CPU since the previous sample. (cpu_jiffies_prev, instant_prev).
+    // First sample has no baseline → emit 0.
+    static PREV: Mutex<Option<(u64, std::time::Instant)>> = Mutex::new(None);
+    let mut prev_guard = PREV.lock().unwrap();
+    let (cpu_jiffies, rss_bytes) = read_proc_cpu_rss();
+    let cpu_pct = match *prev_guard {
+        Some((prev_jiffies, prev_instant)) => {
+            let dt_jiffies = cpu_jiffies.saturating_sub(prev_jiffies);
+            let dt_secs = now_instant
+                .saturating_duration_since(prev_instant)
+                .as_secs_f64();
+            // /proc reports jiffies at 100 Hz regardless of CONFIG_HZ on x86/ARM
+            // Linux. So % = dt_jiffies / (dt_secs * 100) * 100 == dt_jiffies/dt_secs.
+            if dt_secs > 0.0 {
+                (dt_jiffies as f64 / dt_secs) as f32
+            } else {
+                0.0
             }
-            None => 0.0,
-        };
-        prev_guard[i] = Some((cur, now_instant));
-        busy_pct_sum += pct;
-    }
+        }
+        None => 0.0,
+    };
+    *prev_guard = Some((cpu_jiffies, now_instant));
     drop(prev_guard);
-    let worker_busy_pct = busy_pct_sum / (num_workers as f32);
 
     // Sum of per-worker local queues + the global injection queue — gives a
     // single "tasks waiting to be polled" number. Spikes here = workers
@@ -441,12 +433,9 @@ fn sample_pressure_once(
         .map(|s| s.inflight_requests)
         .sum::<u64>();
 
-    // VmRSS via /proc on Linux; 0 on other platforms (macOS dev).
-    let rss_bytes = read_proc_rss();
-
     boom_core::StressmonSample {
         ts: now_ts,
-        worker_busy_pct,
+        cpu_pct,
         rss_bytes,
         worker_queue_depth,
         blocking_tasks_queued,
@@ -454,9 +443,41 @@ fn sample_pressure_once(
     }
 }
 
-/// Read current RSS from `/proc/self/status`. Returns 0 on non-Linux.
+/// Read (cpu_jiffies, rss_bytes) from `/proc`. Returns (0, 0) on non-Linux.
+/// `cpu_jiffies` = utime + stime from `/proc/self/stat` field 14 + field 15
+/// (the 14th and 15th whitespace-separated tokens, 1-indexed in `man proc`).
 #[cfg(target_os = "linux")]
-fn read_proc_rss() -> u64 {
+fn read_proc_cpu_rss() -> (u64, u64) {
+    let stat = match std::fs::read_to_string("/proc/self/stat") {
+        Ok(s) => s,
+        Err(_) => return (0, read_proc_rss_only()),
+    };
+    // Field 14 = utime, field 15 = stime, both in clock ticks (100 Hz on
+    // standard Linux x86/ARM). The `comm` field (field 2) is wrapped in
+    // parens and may contain spaces, so we start parsing after the *last*
+    // ')' to be safe.
+    let after_comm = match stat.rfind(')') {
+        Some(i) => &stat[i + 1..],
+        None => return (0, read_proc_rss_only()),
+    };
+    let mut it = after_comm.split_whitespace();
+    // After `comm` (field 2), skip state (field 3) through cmajflt (field 13)
+    // = 11 tokens, then field 14 = utime, field 15 = stime. Both in clock
+    // ticks (100 Hz on standard Linux x86/ARM).
+    for _ in 0..11 {
+        it.next();
+    }
+    match (it.next(), it.next()) {
+        (Some(utime), Some(stime)) => match (utime.parse::<u64>(), stime.parse::<u64>()) {
+            (Ok(u), Ok(s)) => (u.saturating_add(s), read_proc_rss_only()),
+            _ => (0, read_proc_rss_only()),
+        },
+        _ => (0, read_proc_rss_only()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn read_proc_rss_only() -> u64 {
     let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
     status
         .lines()
@@ -471,8 +492,8 @@ fn read_proc_rss() -> u64 {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn read_proc_rss() -> u64 {
-    0
+fn read_proc_cpu_rss() -> (u64, u64) {
+    (0, 0)
 }
 
 /// Background task: every 1s, trigger dispatch on all flow control slots.

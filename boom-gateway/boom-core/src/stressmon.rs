@@ -17,11 +17,15 @@ use serde::Serialize;
 pub struct StressmonSample {
     /// Unix seconds. Frontend formats in the viewer's local timezone.
     pub ts: i64,
-    /// Average tokio worker busyness in 0..=100 — mean of
-    /// `RuntimeMetrics::worker_busyness(i)` across all workers. Unlike a
-    /// process-level CPU%, this excludes the blocking pool, so a fully
-    /// loaded 8-worker runtime peaks at exactly 100, never more.
-    pub worker_busy_pct: f32,
+    /// Process-level CPU utilization as a percentage. Sum of utime + stime
+    /// from `/proc/self/stat`, diffed against the previous sample and scaled
+    /// by wall-clock — same definition as `top`'s `100 * cpu_ticks / hertz /
+    /// elapsed`. **Not normalized against worker count**: an 8-worker
+    /// runtime under heavy load can report far more than 800% because tokio's
+    /// blocking pool (prompt-log gzip, DB migrations, file I/O) runs threads
+    /// outside the worker pool. The Y axis is left auto-scaled so a 16-core
+    /// process can display as 1300%.
+    pub cpu_pct: f32,
     /// Resident set size in bytes (`/proc/self/status` VmRSS).
     pub rss_bytes: u64,
     /// Sum of `worker_queue_depth(i)` across all tokio workers. Non-zero +
@@ -35,14 +39,16 @@ pub struct StressmonSample {
 }
 
 /// Response to `timeseries()` — samples plus the cached worker count so the
-/// frontend can scale the CPU axis (`cpu_pct / num_workers / 100`).
+/// frontend can derive the "worker pool 80% saturated" warning threshold
+/// (`num_workers × 80` in absolute process-CPU% units).
 #[derive(Debug, Serialize)]
 pub struct StressmonSnapshot {
     pub num_workers: usize,
     pub samples: Vec<StressmonSample>,
-    /// Cumulative count of samples where normalized CPU exceeded 80% —
-    /// `cpu_pct > 0.8 * num_workers * 100`. Lifetime of the process,
-    /// survives range switches (it's a counter, not a windowed value).
+    /// Cumulative count of samples where process CPU exceeded
+    /// `num_workers × 80%` (the equivalent of the worker pool running at
+    /// 80% saturation). Lifetime of the process, survives range switches
+    /// (it's a counter, not a windowed value).
     pub cpu_over_80_count: u64,
 }
 

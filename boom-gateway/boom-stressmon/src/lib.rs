@@ -92,11 +92,15 @@ impl StressmonCollector {
     }
 
     /// Push one sample. Called from boom-main's sampler task at 1 Hz.
-    /// Also bumps the lifetime CPU-over-80% counter if this sample crosses
-    /// the threshold — `worker_busy_pct > 80.0` directly (the field is
-    /// already normalized to 0..=100 against worker count).
+    /// Also bumps the lifetime CPU-over-80% counter when this sample
+    /// crosses the worker-pool-80% threshold. `cpu_pct` is process-level
+    /// (not normalized), so "80% of the worker pool saturated" maps to the
+    /// absolute value `num_workers × 80`. Above that, the worker pool is
+    /// likely the bottleneck even though the process may also be spending
+    /// CPU in the blocking pool.
     pub fn record_sample(&self, sample: StressmonSample) {
-        if sample.worker_busy_pct > 80.0 {
+        let threshold = (self.num_workers as f32) * 80.0;
+        if sample.cpu_pct > threshold {
             self.cpu_over_80_count.fetch_add(1, Ordering::Relaxed);
         }
         if let Ok(mut buf) = self.samples.lock() {
@@ -135,7 +139,7 @@ mod tests {
     fn sample(ts: i64) -> StressmonSample {
         StressmonSample {
             ts,
-            worker_busy_pct: 0.0,
+            cpu_pct: 0.0,
             rss_bytes: 0,
             worker_queue_depth: 0,
             blocking_tasks_queued: 0,
