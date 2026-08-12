@@ -441,12 +441,16 @@
 
     // CPU: normalized to 0..100 against worker count. >80% draws a red
     // warning band behind the line.
+    // Backend's cpu_pct is already a percentage scaled by worker count
+    // (e.g. 1600 = 16 cores fully busy on a 32-worker runtime = 50% of
+    // capacity), so dividing by num_workers gives the 0..100 capacity ratio.
     drawMetricCanvas({
       canvasId: "stress-cpu-canvas",
       valueId: "stress-cpu-value",
       samples,
-      accessor: (s) => (s.cpu_pct / numWorkers) * 100,
+      accessor: (s) => s.cpu_pct / numWorkers,
       yMax: 100,
+      tickStep: 10,
       warnThreshold: 80,
       color: "#10b981",
       emptyHint: "Collecting… (first sample takes 1s)",
@@ -520,8 +524,29 @@
     return (b / 1024).toFixed(0) + " KiB";
   }
 
+  // Round max up to a "nice" value and pick a tick step that yields ~5 divisions.
+  // Returns { max, step }. Used to draw a clean Y axis instead of relying on
+  // raw peak × 1.15 which produces ugly labels like "268".
+  function niceMaxAndStep(rawMax, targetTicks) {
+    if (!isFinite(rawMax) || rawMax <= 0) return { max: 5, step: 1 };
+    const rawStep = rawMax / targetTicks;
+    const magnitude = Math.pow(10, Math.floor(Math.log10(rawStep)));
+    const normalized = rawStep / magnitude;
+    let step;
+    if (normalized < 1.5) step = 1;
+    else if (normalized < 3) step = 2;
+    else if (normalized < 7) step = 5;
+    else step = 10;
+    step *= magnitude;
+    const max = Math.ceil(rawMax / step) * step;
+    return { max, step };
+  }
+
   // Generic single-metric canvas renderer.
-  // - yMax: number (fixed scale) | "auto" (scale to peak × 1.15)
+  // - yMax: number (fixed scale) | "auto" (round peak up to a nice value)
+  // - tickStep: number | undefined — Y-axis grid step. If omitted for fixed
+  //   yMax, defaults to yMax/10 (10 divisions). For "auto" yMax, derived from
+  //   niceMaxAndStep.
   // - warnThreshold: number | null — draws red warning band above this Y value
   // - fill: rgba string | null — soft fill under the line
   function drawMetricCanvas(opts) {
@@ -547,19 +572,23 @@
     if (valueEl) valueEl.textContent = opts.formatValue(opts.accessor(latest));
 
     const values = samples.map(opts.accessor);
-    const peak = Math.max(1, ...values);
-    let yMax;
+    const peak = Math.max(0.0001, ...values);
+
+    let yMax, tickStep;
     if (typeof opts.yMax === "number") {
       yMax = opts.yMax;
+      tickStep = opts.tickStep || yMax / 10;
     } else {
       const floor = opts.yMinFloor || 0;
-      yMax = Math.max(floor, peak) * 1.15;
+      const r = niceMaxAndStep(Math.max(floor, peak), 5);
+      yMax = r.max;
+      tickStep = r.step;
     }
 
-    const padLeft = 44;
-    const padRight = 10;
-    const padTop = 10;
-    const padBot = 18;
+    const padLeft = 50;
+    const padRight = 14;
+    const padTop = 12;
+    const padBot = 22;
     const plotW = w - padLeft - padRight;
     const plotH = h - padTop - padBot;
 
@@ -570,6 +599,26 @@
       return padTop + plotH - (clamped / yMax) * plotH;
     };
     const xFor = (i) => padLeft + (plotW * i) / Math.max(1, values.length - 1);
+
+    // Y-axis: horizontal grid lines + tick labels (0, step, 2*step, ..., yMax).
+    ctx.font = "10px sans-serif";
+    ctx.textAlign = "right";
+    for (let v = 0; v <= yMax + 1e-6; v += tickStep) {
+      const y = yFor(v);
+      ctx.strokeStyle = "rgba(127, 127, 127, 0.18)";
+      ctx.setLineDash([]);
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(padLeft, y);
+      ctx.lineTo(padLeft + plotW, y);
+      ctx.stroke();
+      ctx.fillStyle = "var(--text3, #888)";
+      ctx.fillText(
+        typeof opts.formatY === "function" ? opts.formatY(v) : String(Math.round(v)),
+        padLeft - 6,
+        y + 3,
+      );
+    }
 
     // Warning band (CPU > 80% etc) — fill above threshold with translucent red.
     if (opts.warnThreshold != null && opts.warnThreshold < yMax) {
@@ -589,7 +638,7 @@
       ctx.font = "10px sans-serif";
       ctx.textAlign = "left";
       ctx.fillText(
-        (typeof opts.formatY === "function" ? opts.formatY(opts.warnThreshold) : opts.warnThreshold),
+        typeof opts.formatY === "function" ? opts.formatY(opts.warnThreshold) : opts.warnThreshold,
         padLeft + 4,
         warnY - 3,
       );
@@ -622,15 +671,6 @@
     ctx.strokeStyle = opts.color;
     ctx.lineWidth = 1.6;
     ctx.stroke();
-
-    // Y-axis labels — top (max) and bottom (0).
-    ctx.fillStyle = "var(--text3, #888)";
-    ctx.font = "10px sans-serif";
-    ctx.textAlign = "right";
-    const topLabel = typeof opts.formatY === "function" ? opts.formatY(yMax) : String(Math.round(yMax));
-    const botLabel = typeof opts.formatY === "function" ? opts.formatY(0) : "0";
-    ctx.fillText(topLabel, padLeft - 4, padTop + 8);
-    ctx.fillText(botLabel, padLeft - 4, padTop + plotH);
   }
 
   // 24h per-deployment aggregates — populated on page load and Refresh button
