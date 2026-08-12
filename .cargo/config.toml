@@ -1,0 +1,12 @@
+[build]
+# Enable tokio's `cfg(tokio_unstable)` gate so the metrics API
+# (`Handle::current().metrics().worker_local_queue_depth(i)`,
+#  `blocking_queue_depth()`, etc.) is available. The flag is a rustc cfg
+# value, not a Cargo feature — it gates the source via `#[cfg(tokio_unstable)]`
+# in tokio's own code (see tokio-1.50.0/src/macros/cfg.rs). The name
+# "tokio_unstable" is misleading — the metrics API has been stable in
+# semantics for years; the gate is just a conservative switch.
+#
+# Applied workspace-wide. No per-crate effect unless that crate actually
+# calls the gated methods, so non-tokio-metrics crates ignore it.
+rustflags = ["--cfg", "tokio_unstable"]

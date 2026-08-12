@@ -95,6 +95,14 @@ pub struct AppState {
     /// Handler calls kvc_orchestrator.route() — all kvc business logic is here,
     /// not in routes.rs. Returns None when kvc is disabled.
     pub kvc_orchestrator: crate::kvc::KvcOrchestrator,
+    /// Real-time pressure metrics collector (1 Hz sample ring buffer).
+    /// Survives reloads — sampler task is spawned once at startup and not
+    /// respawned (it doesn't depend on any per-config resource). Concrete
+    /// type (not `Arc<dyn>`) so the sampler in main.rs can call
+    /// `record_sample` (the trait is read-only for the dashboard). Erased
+    /// to `Arc<dyn StressmonApi>` at the point where DashboardState is
+    /// built — dashboard stays leaf-of-boom-core that way.
+    pub stressmon: Arc<boom_stressmon::StressmonCollector>,
 }
 
 /// The state that gets swapped on config reload.
@@ -296,6 +304,16 @@ impl AppState {
             router.clone(),
         );
 
+        // Stressmon collector — worker count is read off the live tokio
+        // runtime (we're already inside `runtime.block_on`), then cached on
+        // the collector so the dashboard snapshot doesn't need the runtime
+        // handle. The 1 Hz sampler task is spawned from main.rs::async_main.
+        let num_workers = tokio::runtime::Handle::current()
+            .metrics()
+            .num_workers()
+            .max(1);
+        let stressmon = boom_stressmon::StressmonCollector::new(num_workers);
+
         let state = Self {
             config_path,
             inner: Arc::new(ArcSwap::from_pointee(inner)),
@@ -321,6 +339,7 @@ impl AppState {
             kv_index,
             kv_prune_handle: Arc::new(std::sync::Mutex::new(None)),
             kvc_orchestrator,
+            stressmon,
         };
         state.register_fusion_models(&state.inner.load().config)?;
         Ok(state)

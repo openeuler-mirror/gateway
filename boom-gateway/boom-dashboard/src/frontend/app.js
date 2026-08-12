@@ -12,6 +12,7 @@
     document.documentElement.dataset.theme = t;
     localStorage.setItem("boom-theme", t);
     updateThemeIcons();
+    document.dispatchEvent(new CustomEvent("themechange"));
   }
   function toggleTheme() { setTheme(getTheme() === "dark" ? "light" : "dark"); }
   function updateThemeIcons() {
@@ -366,6 +367,11 @@
     } else {
       stopInflightPoll();
     }
+    if (section === "admin-stress") {
+      startStressPoll();
+    } else {
+      stopStressPoll();
+    }
     if (section === "admin-models") loadModels();
     else if (section === "admin-plans") loadPlans();
     else if (section === "admin-keys") { setupKeysSearch(); loadKeys(); }
@@ -384,6 +390,7 @@
     if (hash.includes("/admin/logs")) return "admin-logs";
     if (hash.includes("/admin/debug")) return "admin-debug";
     if (hash.includes("/admin/config")) return "admin-config";
+    if (hash.includes("/admin/stress")) return "admin-stress";
     return "admin-models";
   }
 
@@ -396,6 +403,376 @@
 
   // ── In-Flight ─────────────────────────────────────────
   let inflightTimer = null;
+
+  // ── System Pressure ───────────────────────────────────
+  // 1.5s poll + canvas redraw. Stops when leaving admin-stress section.
+  // Window is fixed at 60 min (the ring buffer's full capacity) so each
+  // 1Hz sample lands in its own second on the X axis.
+  let stressTimer = null;
+  let stressLastSampleTs = 0;
+
+  function startStressPoll() {
+    stopStressPoll();
+    // Immediate fetch so the chart appears without waiting the first tick.
+    loadStress();
+    stressTimer = setInterval(loadStress, 1500);
+  }
+
+  function stopStressPoll() {
+    if (stressTimer) {
+      clearInterval(stressTimer);
+      stressTimer = null;
+    }
+  }
+
+  async function loadStress() {
+    try {
+      const res = await api("/admin/stress/timeseries?range=60m");
+      renderStress(res);
+    } catch (e) {
+      // Silently skip — dashboard is read-only, errors shouldn't spam the
+      // console every 1.5s. Network errors usually mean logout.
+    }
+  }
+
+  function renderStress(snap) {
+    const samples = snap.samples || [];
+    const numWorkers = snap.num_workers || 1;
+    const latest = samples.length > 0 ? samples[samples.length - 1] : null;
+    if (latest) stressLastSampleTs = latest.ts;
+
+    const cpuOver80El = document.getElementById("stress-info-cpu-over-80");
+    if (cpuOver80El) cpuOver80El.textContent = String(snap.cpu_over_80_count || 0);
+
+    // CPU = process-level (utime+stime), not normalized. May go far past
+    // num_workers × 100 because tokio's blocking pool runs threads outside
+    // the worker pool (prompt-log gzip, DB work, file I/O). Y axis auto-
+    // scales; the info-bar "CPU > 80% count" still tracks how often the
+    // worker pool itself hit 80% saturation (num_workers × 80 in absolute
+    // terms), but no line is drawn — process CPU spends most of its time
+    // outside that range under load, so the band just visually polluted
+    // the chart without communicating anything actionable.
+    drawMetricCanvas({
+      canvasId: "stress-cpu-canvas",
+      valueId: "stress-cpu-value",
+      samples,
+      accessor: (s) => s.cpu_pct,
+      yMax: "auto",
+      yMinFloor: 100,
+      color: "#10b981",
+      emptyHint: "Collecting… (first sample takes 1s)",
+      formatValue: (v) => v.toFixed(1) + "%",
+      formatY: (v) => v.toFixed(0) + "%",
+    });
+
+    // RSS: bytes → MiB / GiB.
+    drawMetricCanvas({
+      canvasId: "stress-rss-canvas",
+      valueId: "stress-rss-value",
+      samples,
+      accessor: (s) => s.rss_bytes,
+      yMax: "auto",
+      yMinFloor: 100 * 1024 * 1024,
+      color: "#a855f7",
+      emptyHint: "—",
+      formatValue: formatBytes,
+      formatY: (v) => formatBytes(v, true),
+    });
+
+    // Worker queue depth.
+    drawMetricCanvas({
+      canvasId: "stress-worker-queue-canvas",
+      valueId: "stress-worker-queue-value",
+      samples,
+      accessor: (s) => s.worker_queue_depth,
+      yMax: "auto",
+      color: "#f59e0b",
+      emptyHint: "—",
+      formatValue: (v) => String(v),
+      formatY: (v) => String(Math.round(v)),
+    });
+
+    // Blocking pool queue.
+    drawMetricCanvas({
+      canvasId: "stress-blocking-queue-canvas",
+      valueId: "stress-blocking-queue-value",
+      samples,
+      accessor: (s) => s.blocking_tasks_queued,
+      yMax: "auto",
+      color: "#ef4444",
+      emptyHint: "—",
+      formatValue: (v) => String(v),
+      formatY: (v) => String(Math.round(v)),
+    });
+
+    // Inflight requests — soft fill underneath the line.
+    drawMetricCanvas({
+      canvasId: "stress-inflight-canvas",
+      valueId: "stress-inflight-value",
+      samples,
+      accessor: (s) => s.inflight,
+      yMax: "auto",
+      color: "#6366f1",
+      fill: "rgba(99,102,241,0.18)",
+      emptyHint: "—",
+      formatValue: (v) => String(v),
+      formatY: (v) => String(Math.round(v)),
+    });
+  }
+
+  // Bytes → "1.23 GiB" / "456 MiB". compact=true → short form for Y axis.
+  function formatBytes(b, compact) {
+    if (b >= 1024 * 1024 * 1024) {
+      return (b / 1024 / 1024 / 1024).toFixed(compact ? 1 : 2) + " GiB";
+    }
+    if (b >= 1024 * 1024) {
+      return (b / 1024 / 1024).toFixed(compact ? 0 : 0) + " MiB";
+    }
+    return (b / 1024).toFixed(0) + " KiB";
+  }
+
+  // Round max up to a "nice" value and pick a tick step that yields ~5 divisions.
+  // Returns { max, step }. Used to draw a clean Y axis instead of relying on
+  // raw peak × 1.15 which produces ugly labels like "268".
+  function niceMaxAndStep(rawMax, targetTicks) {
+    if (!isFinite(rawMax) || rawMax <= 0) return { max: 5, step: 1 };
+    const rawStep = rawMax / targetTicks;
+    const magnitude = Math.pow(10, Math.floor(Math.log10(rawStep)));
+    const normalized = rawStep / magnitude;
+    let step;
+    if (normalized < 1.5) step = 1;
+    else if (normalized < 3) step = 2;
+    else if (normalized < 7) step = 5;
+    else step = 10;
+    step *= magnitude;
+    const max = Math.ceil(rawMax / step) * step;
+    return { max, step };
+  }
+
+  // Pick a "nice" time step (in seconds) for the X axis so labels land on
+  // recognizable boundaries (whole minutes / 5 min / 15 min / etc). Returns
+  // the smallest candidate ≥ range/targetTicks, falling back to 1h.
+  function niceTimeStep(rangeSec, targetTicks) {
+    const raw = rangeSec / Math.max(1, targetTicks);
+    const candidates = [10, 30, 60, 120, 300, 600, 900, 1800, 3600];
+    for (const c of candidates) {
+      if (c >= raw) return c;
+    }
+    return 3600;
+  }
+
+  // Format a Unix-seconds timestamp as local-time HH:MM. Used for X-axis
+  // labels — the dashboard is operator-facing, so wall-clock time is what
+  // the operator wants to see (UTC labels would force mental arithmetic).
+  function formatTs(ts) {
+    const d = new Date(ts * 1000);
+    const hh = String(d.getHours()).padStart(2, "0");
+    const mm = String(d.getMinutes()).padStart(2, "0");
+    return hh + ":" + mm;
+  }
+
+  // Read a CSS custom property from :root. Canvas APIs don't accept CSS
+  // variables directly, so we resolve them in JS — this is what makes the
+  // chart adapt to light/dark themes.
+  let _cssVarCache = null;
+  let _cssVarTheme = null;
+  function cssVar(name) {
+    const theme = document.documentElement.dataset.theme || "light";
+    if (_cssVarCache && _cssVarTheme === theme) return _cssVarCache[name] || "";
+    _cssVarTheme = theme;
+    const styles = getComputedStyle(document.documentElement);
+    _cssVarCache = {
+      "--text1": styles.getPropertyValue("--text1").trim(),
+      "--text2": styles.getPropertyValue("--text2").trim(),
+      "--text3": styles.getPropertyValue("--text3").trim(),
+      "--border": styles.getPropertyValue("--border").trim(),
+      "--surface2": styles.getPropertyValue("--surface2").trim(),
+    };
+    return _cssVarCache[name] || "";
+  }
+  // Invalidate cache on theme toggle and immediately redraw current charts.
+  document.addEventListener("themechange", () => {
+    _cssVarCache = null;
+    if (sectionFromHash(location.hash) === "admin-stress") loadStress();
+  });
+
+  // Generic single-metric canvas renderer.
+  // - yMax: number (fixed scale) | "auto" (round peak up to a nice value)
+  // - tickStep: number | undefined — Y-axis grid step. If omitted for fixed
+  //   yMax, defaults to yMax/10 (10 divisions). For "auto" yMax, derived from
+  //   niceMaxAndStep.
+  // - warnThreshold: number | null — draws red warning band above this Y value
+  // - fill: rgba string | null — soft fill under the line
+  function drawMetricCanvas(opts) {
+    const canvas = document.getElementById(opts.canvasId);
+    if (!canvas) return;
+    const valueEl = document.getElementById(opts.valueId);
+    const samples = opts.samples;
+
+    // Match canvas backing resolution to the CSS pixel box × devicePixelRatio.
+    // Without this, the 1200×220 backing gets stretched by the browser when
+    // the rendered width is larger — text glyphs smear horizontally.
+    const cssW = canvas.clientWidth || canvas.width;
+    const cssH = canvas.clientHeight || canvas.height;
+    const dpr = window.devicePixelRatio || 1;
+    const targetW = Math.max(1, Math.round(cssW * dpr));
+    const targetH = Math.max(1, Math.round(cssH * dpr));
+    if (canvas.width !== targetW || canvas.height !== targetH) {
+      canvas.width = targetW;
+      canvas.height = targetH;
+    }
+    const ctx = canvas.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    if (valueEl) valueEl.textContent = opts.emptyHint || "—";
+    if (samples.length === 0) {
+      ctx.clearRect(0, 0, cssW, cssH);
+      ctx.fillStyle = cssVar("--text3") || "#888";
+      ctx.font = "12px sans-serif";
+      ctx.textAlign = "left";
+      ctx.fillText(opts.emptyHint || "—", 12, 24);
+      return;
+    }
+
+    const latest = samples[samples.length - 1];
+    if (valueEl) valueEl.textContent = opts.formatValue(opts.accessor(latest));
+
+    const values = samples.map(opts.accessor);
+    const peak = Math.max(0.0001, ...values);
+
+    let yMax, tickStep;
+    if (typeof opts.yMax === "number") {
+      yMax = opts.yMax;
+      tickStep = opts.tickStep || yMax / 10;
+    } else {
+      const floor = opts.yMinFloor || 0;
+      const r = niceMaxAndStep(Math.max(floor, peak), 5);
+      yMax = r.max;
+      tickStep = r.step;
+    }
+
+    const padLeft = 52;
+    const padRight = 14;
+    const padTop = 12;
+    const padBot = 34;
+    const plotW = cssW - padLeft - padRight;
+    const plotH = cssH - padTop - padBot;
+
+    ctx.clearRect(0, 0, cssW, cssH);
+
+    const yFor = (v) => {
+      const clamped = Math.min(Math.max(v, 0), yMax);
+      return padTop + plotH - (clamped / yMax) * plotH;
+    };
+
+    // X-axis maps by sample.ts (real time), not array index. Without this,
+    // any time the sampler misses a tick (heavy load → tokio interval Skip
+    // behavior drops a few cycles) the chart pretends the gap doesn't
+    // exist — points stay equidistant on screen even though wall-clock
+    // spacing is uneven, which makes recent data look artificially sparse
+    // next to dense early-history data. Using ts preserves the true rhythm.
+    const tMin = samples[0].ts;
+    const tMax = samples[samples.length - 1].ts;
+    const tRange = Math.max(1, tMax - tMin);
+    const xForTs = (t) => padLeft + (plotW * (t - tMin)) / tRange;
+    const xFor = (i) => xForTs(samples[i].ts);
+
+    // Y-axis: horizontal grid lines + tick labels (0, step, 2*step, ..., yMax).
+    // Colors resolve via cssVar so they follow the active theme.
+    const tickColor = cssVar("--text2") || "#555";
+    const gridColor = cssVar("--border") || "rgba(127,127,127,0.25)";
+    ctx.font = "11px sans-serif";
+    ctx.textAlign = "right";
+    for (let v = 0; v <= yMax + 1e-6; v += tickStep) {
+      const y = yFor(v);
+      ctx.strokeStyle = gridColor;
+      ctx.setLineDash([]);
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(padLeft, y);
+      ctx.lineTo(padLeft + plotW, y);
+      ctx.stroke();
+      ctx.fillStyle = tickColor;
+      ctx.fillText(
+        typeof opts.formatY === "function" ? opts.formatY(v) : String(Math.round(v)),
+        padLeft - 6,
+        y + 3,
+      );
+    }
+
+    // X-axis: vertical grid lines + HH:MM labels at a nice time step.
+    // Step is chosen so ~4-7 ticks land across the visible range. Aligned
+    // to step boundaries (e.g. every 5 min) so labels read as clock faces
+    // rather than arbitrary offsets.
+    const tStep = niceTimeStep(tRange, 5);
+    const firstTick = Math.ceil(tMin / tStep) * tStep;
+    ctx.textAlign = "center";
+    for (let t = firstTick; t <= tMax; t += tStep) {
+      const x = xForTs(t);
+      if (x < padLeft - 0.5 || x > padLeft + plotW + 0.5) continue;
+      ctx.strokeStyle = gridColor;
+      ctx.setLineDash([]);
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(x, padTop);
+      ctx.lineTo(x, padTop + plotH);
+      ctx.stroke();
+      ctx.fillStyle = tickColor;
+      ctx.fillText(formatTs(t), x, padTop + plotH + 14);
+    }
+
+    // Warning band (CPU > 80% etc) — fill above threshold with translucent red.
+    if (opts.warnThreshold != null && opts.warnThreshold < yMax) {
+      const warnY = yFor(opts.warnThreshold);
+      ctx.fillStyle = "rgba(239, 68, 68, 0.18)";
+      ctx.fillRect(padLeft, padTop, plotW, warnY - padTop);
+      // Dashed threshold line + label.
+      ctx.strokeStyle = "rgba(239, 68, 68, 0.7)";
+      ctx.setLineDash([4, 3]);
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(padLeft, warnY);
+      ctx.lineTo(padLeft + plotW, warnY);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = "rgba(239, 68, 68, 0.9)";
+      ctx.font = "11px sans-serif";
+      ctx.textAlign = "left";
+      ctx.fillText(
+        typeof opts.formatY === "function" ? opts.formatY(opts.warnThreshold) : opts.warnThreshold,
+        padLeft + 4,
+        warnY - 3,
+      );
+    }
+
+    // Soft fill under the line (optional).
+    if (opts.fill) {
+      ctx.beginPath();
+      values.forEach((v, i) => {
+        const x = xFor(i);
+        const y = yFor(v);
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
+      ctx.lineTo(xFor(values.length - 1), padTop + plotH);
+      ctx.lineTo(xFor(0), padTop + plotH);
+      ctx.closePath();
+      ctx.fillStyle = opts.fill;
+      ctx.fill();
+    }
+
+    // Main line.
+    ctx.beginPath();
+    values.forEach((v, i) => {
+      const x = xFor(i);
+      const y = yFor(v);
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    });
+    ctx.strokeStyle = opts.color;
+    ctx.lineWidth = 1.6;
+    ctx.stroke();
+  }
 
   // 24h per-deployment aggregates — populated on page load and Refresh button
   // only; the 3s setInterval auto-poll does NOT touch this. renderInflightTable
@@ -561,6 +938,7 @@
     const custom = controls.querySelector(".range-custom");
     const note = controls.querySelector(".range-note");
     if (range === "custom") {
+      if (!custom) return; // target doesn't support custom range (e.g. stress)
       custom.classList.remove("hidden");
       // Pre-fill inputs with last-1h window if empty (local time, matching datetime-local format).
       const fromInput = controls.querySelector(".range-from");
@@ -573,13 +951,14 @@
       }
       return;
     }
-    custom.classList.add("hidden");
+    if (custom) custom.classList.add("hidden");
     if (note) note.classList.add("hidden");
     controls.querySelectorAll(".btn-range").forEach((b) => {
       b.classList.toggle("active", b.dataset.range === range);
     });
     rangeState[target] = { range, from: null, to: null };
-    if (target === "agent") loadAgentStats(); else loadRequestRateStats();
+    if (target === "agent") loadAgentStats();
+    else loadRequestRateStats();
   }
 
   function onRangeApply(controls, target) {
@@ -3299,6 +3678,36 @@
   // ── Admin: Modals ─────────────────────────────────────
   function setupAdminButtons() {
     document.getElementById("btn-new-plan").addEventListener("click", showNewPlanModal);
+    // Stress info-bar "?" tooltip — hover/focus reveals a glossary.
+    const helpBtn = document.querySelector(".stress-info-help");
+    const tooltip = document.getElementById("stress-info-tooltip");
+    if (helpBtn && tooltip) {
+      const render = () => {
+        tooltip.innerHTML = [
+          ["stress.info.worker_queue", "stress.info.help.worker_queue"],
+          ["stress.info.blocking_pool", "stress.info.help.blocking_pool"],
+          ["stress.info.cpu_over_80", "stress.info.help.cpu_over_80"],
+          ["stress.info.sample_rate", "stress.info.help.sample_rate"],
+        ]
+          .map(
+            ([k, hk]) =>
+              `<div class="stress-info-tooltip__row"><b>${t(k)}:</b> ${t(hk)}</div>`,
+          )
+          .join("");
+      };
+      const show = () => {
+        render();
+        tooltip.hidden = false;
+      };
+      const hide = () => { tooltip.hidden = true; };
+      helpBtn.addEventListener("mouseenter", show);
+      helpBtn.addEventListener("mouseleave", hide);
+      helpBtn.addEventListener("focus", show);
+      helpBtn.addEventListener("blur", hide);
+      document.addEventListener("languagechange", () => {
+        if (!tooltip.hidden) render();
+      });
+    }
     const btnResetAll = document.getElementById("btn-reset-all-limits");
     if (btnResetAll) btnResetAll.addEventListener("click", async () => {
       if (!confirm(t("confirm.reset_all"))) return;

@@ -137,6 +137,10 @@ pub struct DashboardState {
     /// Audit-log drop counter (channel full or batch INSERT failures).
     /// None when DB not configured (no LogWriter). Surfaced on the debug page.
     pub log_dropped: Option<Arc<dyn boom_core::LogDroppedCounter>>,
+    /// Real-time pressure metrics (CPU, RSS, tokio worker queue depth,
+    /// blocking pool queue, inflight). Polled every 1.5s by the admin
+    /// stats page's top sparkline chart.
+    pub stressmon: Arc<dyn boom_core::StressmonApi>,
 }
 
 impl DashboardState {
@@ -157,6 +161,7 @@ impl DashboardState {
         agent_stats: Arc<AgentStatsTracker>,
         auth: Arc<dyn KeyAliasLookup>,
         log_dropped: Option<Arc<dyn boom_core::LogDroppedCounter>>,
+        stressmon: Arc<dyn boom_core::StressmonApi>,
     ) -> Self {
         // Derive JWT secret from master_key, or use a random fallback.
         let jwt_secret = master_key
@@ -182,6 +187,7 @@ impl DashboardState {
             agent_stats,
             auth,
             log_dropped,
+            stressmon,
         }
     }
 }

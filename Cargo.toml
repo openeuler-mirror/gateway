@@ -16,6 +16,7 @@ members = [
     "boom-gateway/boom-kvindex",
     "boom-gateway/boom-fusion",
     "boom-gateway/boom-hooks-sdk",
+    "boom-gateway/boom-stressmon",
     "boom-gateway/example-hooks",
 ]
 

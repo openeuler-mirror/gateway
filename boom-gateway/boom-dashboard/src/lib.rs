@@ -135,6 +135,11 @@ pub fn build_router<S: Clone + Send + Sync + 'static>(state: DashboardState) -> 
             "/dashboard/api/admin/stats/inflight",
             get(handlers_admin::get_inflight_stats),
         )
+        // Admin — System Pressure timeseries (1Hz ring buffer, last N minutes).
+        .route(
+            "/dashboard/api/admin/stress/timeseries",
+            get(handlers_admin::get_stress_timeseries),
+        )
         // Admin — Deployment 24h Summary (on-demand, off auto-refresh).
         .route(
             "/dashboard/api/admin/stats/deployments/summary",

@@ -4708,6 +4708,39 @@ pub async fn quota_reset_team_windows(
     }
 }
 
+// ── System Pressure ────────────────────────────────────────────────────
+//
+// Reads from boom-stressmon's ring buffer (1Hz × 60min). The chart on the
+// admin stats page polls this every 1.5s — see `loadStressPanel` in app.js.
+
+#[derive(Debug, Deserialize)]
+pub struct StressRangeQuery {
+    /// `5m` / `15m` / `30m` / `60m` (default 5m). Bounded to the ring
+    /// buffer's 60-min capacity by the impl.
+    #[serde(default = "default_stress_range")]
+    pub range: String,
+}
+
+fn default_stress_range() -> String {
+    "5m".to_string()
+}
+
+pub async fn get_stress_timeseries(
+    _session: AdminSession,
+    Extension(state): Extension<Arc<DashboardState>>,
+    Query(q): Query<StressRangeQuery>,
+) -> Response {
+    let window_secs: i64 = match q.range.as_str() {
+        "5m" => 300,
+        "15m" => 900,
+        "30m" => 1800,
+        "60m" => 3600,
+        _ => 300,
+    };
+    let snap = state.stressmon.timeseries(window_secs).await;
+    Json(snap).into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{normalize_pagination, CreateKeyRequest};
