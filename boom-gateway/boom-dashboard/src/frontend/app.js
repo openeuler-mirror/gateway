@@ -439,6 +439,11 @@
     const latest = samples.length > 0 ? samples[samples.length - 1] : null;
     if (latest) stressLastSampleTs = latest.ts;
 
+    // Reflect runtime config at the top so the operator can see the
+    // capacity the charts are normalized against.
+    const workersEl = document.getElementById("stress-info-workers");
+    if (workersEl) workersEl.textContent = String(numWorkers);
+
     // CPU: normalized to 0..100 against worker count. >80% draws a red
     // warning band behind the line.
     // Backend's cpu_pct is already a percentage scaled by worker count
@@ -552,15 +557,27 @@
   function drawMetricCanvas(opts) {
     const canvas = document.getElementById(opts.canvasId);
     if (!canvas) return;
-    const ctx = canvas.getContext("2d");
     const valueEl = document.getElementById(opts.valueId);
     const samples = opts.samples;
-    const w = canvas.width;
-    const h = canvas.height;
+
+    // Match canvas backing resolution to the CSS pixel box × devicePixelRatio.
+    // Without this, the 1200×220 backing gets stretched by the browser when
+    // the rendered width is larger — text glyphs smear horizontally.
+    const cssW = canvas.clientWidth || canvas.width;
+    const cssH = canvas.clientHeight || canvas.height;
+    const dpr = window.devicePixelRatio || 1;
+    const targetW = Math.max(1, Math.round(cssW * dpr));
+    const targetH = Math.max(1, Math.round(cssH * dpr));
+    if (canvas.width !== targetW || canvas.height !== targetH) {
+      canvas.width = targetW;
+      canvas.height = targetH;
+    }
+    const ctx = canvas.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
     if (valueEl) valueEl.textContent = opts.emptyHint || "—";
     if (samples.length === 0) {
-      ctx.clearRect(0, 0, w, h);
+      ctx.clearRect(0, 0, cssW, cssH);
       ctx.fillStyle = "var(--text3, #888)";
       ctx.font = "12px sans-serif";
       ctx.textAlign = "left";
@@ -585,14 +602,14 @@
       tickStep = r.step;
     }
 
-    const padLeft = 50;
+    const padLeft = 52;
     const padRight = 14;
     const padTop = 12;
     const padBot = 22;
-    const plotW = w - padLeft - padRight;
-    const plotH = h - padTop - padBot;
+    const plotW = cssW - padLeft - padRight;
+    const plotH = cssH - padTop - padBot;
 
-    ctx.clearRect(0, 0, w, h);
+    ctx.clearRect(0, 0, cssW, cssH);
 
     const yFor = (v) => {
       const clamped = Math.min(Math.max(v, 0), yMax);
@@ -601,7 +618,7 @@
     const xFor = (i) => padLeft + (plotW * i) / Math.max(1, values.length - 1);
 
     // Y-axis: horizontal grid lines + tick labels (0, step, 2*step, ..., yMax).
-    ctx.font = "10px sans-serif";
+    ctx.font = "11px sans-serif";
     ctx.textAlign = "right";
     for (let v = 0; v <= yMax + 1e-6; v += tickStep) {
       const y = yFor(v);
@@ -635,7 +652,7 @@
       ctx.stroke();
       ctx.setLineDash([]);
       ctx.fillStyle = "rgba(239, 68, 68, 0.9)";
-      ctx.font = "10px sans-serif";
+      ctx.font = "11px sans-serif";
       ctx.textAlign = "left";
       ctx.fillText(
         typeof opts.formatY === "function" ? opts.formatY(opts.warnThreshold) : opts.warnThreshold,
@@ -837,6 +854,7 @@
     const custom = controls.querySelector(".range-custom");
     const note = controls.querySelector(".range-note");
     if (range === "custom") {
+      if (!custom) return; // target doesn't support custom range (e.g. stress)
       custom.classList.remove("hidden");
       // Pre-fill inputs with last-1h window if empty (local time, matching datetime-local format).
       const fromInput = controls.querySelector(".range-from");
@@ -849,13 +867,15 @@
       }
       return;
     }
-    custom.classList.add("hidden");
+    if (custom) custom.classList.add("hidden");
     if (note) note.classList.add("hidden");
     controls.querySelectorAll(".btn-range").forEach((b) => {
       b.classList.toggle("active", b.dataset.range === range);
     });
     rangeState[target] = { range, from: null, to: null };
-    if (target === "agent") loadAgentStats(); else loadRequestRateStats();
+    if (target === "agent") loadAgentStats();
+    else if (target === "stress") { stressRange = range; loadStress(); }
+    else loadRequestRateStats();
   }
 
   function onRangeApply(controls, target) {
@@ -3575,16 +3595,6 @@
   // ── Admin: Modals ─────────────────────────────────────
   function setupAdminButtons() {
     document.getElementById("btn-new-plan").addEventListener("click", showNewPlanModal);
-    // Stress page range buttons (5m / 15m / 30m / 60m).
-    document.querySelectorAll('.range-controls[data-target="stress"] [data-range]').forEach((btn) => {
-      btn.addEventListener("click", () => {
-        stressRange = btn.dataset.range;
-        document
-          .querySelectorAll('.range-controls[data-target="stress"] [data-range]')
-          .forEach((b) => b.classList.toggle("active", b === btn));
-        loadStress();
-      });
-    });
     const btnResetAll = document.getElementById("btn-reset-all-limits");
     if (btnResetAll) btnResetAll.addEventListener("click", async () => {
       if (!confirm(t("confirm.reset_all"))) return;

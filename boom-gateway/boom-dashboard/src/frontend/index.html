@@ -357,6 +357,12 @@
                 <button class="btn-range" data-range="60m">60m</button>
               </div>
             </div>
+            <div class="stress-info-bar" id="stress-info-bar">
+              <span class="stress-info-item"><b data-i18n="stress.info.workers">Workers</b> <span id="stress-info-workers">—</span></span>
+              <span class="stress-info-item"><b data-i18n="stress.info.worker_queue">Worker local queue</b> <span data-i18n="stress.info.worker_queue_value">256 (tokio default)</span></span>
+              <span class="stress-info-item"><b data-i18n="stress.info.blocking_pool">Blocking thread pool</b> <span data-i18n="stress.info.blocking_pool_value">512 (tokio default)</span></span>
+              <span class="stress-info-item"><b data-i18n="stress.info.sample_rate">Sample rate</b> 1 Hz</span>
+            </div>
             <p class="modal-hint" data-i18n="stress.hint">In-memory 1Hz ring buffer (last 60 min). CPU is normalized against worker count.</p>
             <div class="stress-grid">
               <div class="stress-card">

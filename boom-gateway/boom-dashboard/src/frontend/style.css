@@ -2752,6 +2752,27 @@ input[list] {
 
 
 /* ── System Pressure Page ─────────────────────────────────────────── */
+.stress-info-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 18px;
+  padding: 10px 14px;
+  margin-top: 8px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 12px;
+  color: var(--text3);
+}
+.stress-info-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.stress-info-item b {
+  color: var(--text2);
+  font-weight: 600;
+}
 .stress-grid {
   display: grid;
   grid-template-columns: 1fr;
