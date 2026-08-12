@@ -548,6 +548,28 @@
     return { max, step };
   }
 
+  // Pick a "nice" time step (in seconds) for the X axis so labels land on
+  // recognizable boundaries (whole minutes / 5 min / 15 min / etc). Returns
+  // the smallest candidate ≥ range/targetTicks, falling back to 1h.
+  function niceTimeStep(rangeSec, targetTicks) {
+    const raw = rangeSec / Math.max(1, targetTicks);
+    const candidates = [10, 30, 60, 120, 300, 600, 900, 1800, 3600];
+    for (const c of candidates) {
+      if (c >= raw) return c;
+    }
+    return 3600;
+  }
+
+  // Format a Unix-seconds timestamp as local-time HH:MM. Used for X-axis
+  // labels — the dashboard is operator-facing, so wall-clock time is what
+  // the operator wants to see (UTC labels would force mental arithmetic).
+  function formatTs(ts) {
+    const d = new Date(ts * 1000);
+    const hh = String(d.getHours()).padStart(2, "0");
+    const mm = String(d.getMinutes()).padStart(2, "0");
+    return hh + ":" + mm;
+  }
+
   // Read a CSS custom property from :root. Canvas APIs don't accept CSS
   // variables directly, so we resolve them in JS — this is what makes the
   // chart adapt to light/dark themes.
@@ -631,7 +653,7 @@
     const padLeft = 52;
     const padRight = 14;
     const padTop = 12;
-    const padBot = 22;
+    const padBot = 34;
     const plotW = cssW - padLeft - padRight;
     const plotH = cssH - padTop - padBot;
 
@@ -641,7 +663,18 @@
       const clamped = Math.min(Math.max(v, 0), yMax);
       return padTop + plotH - (clamped / yMax) * plotH;
     };
-    const xFor = (i) => padLeft + (plotW * i) / Math.max(1, values.length - 1);
+
+    // X-axis maps by sample.ts (real time), not array index. Without this,
+    // any time the sampler misses a tick (heavy load → tokio interval Skip
+    // behavior drops a few cycles) the chart pretends the gap doesn't
+    // exist — points stay equidistant on screen even though wall-clock
+    // spacing is uneven, which makes recent data look artificially sparse
+    // next to dense early-history data. Using ts preserves the true rhythm.
+    const tMin = samples[0].ts;
+    const tMax = samples[samples.length - 1].ts;
+    const tRange = Math.max(1, tMax - tMin);
+    const xForTs = (t) => padLeft + (plotW * (t - tMin)) / tRange;
+    const xFor = (i) => xForTs(samples[i].ts);
 
     // Y-axis: horizontal grid lines + tick labels (0, step, 2*step, ..., yMax).
     // Colors resolve via cssVar so they follow the active theme.
@@ -664,6 +697,27 @@
         padLeft - 6,
         y + 3,
       );
+    }
+
+    // X-axis: vertical grid lines + HH:MM labels at a nice time step.
+    // Step is chosen so ~4-7 ticks land across the visible range. Aligned
+    // to step boundaries (e.g. every 5 min) so labels read as clock faces
+    // rather than arbitrary offsets.
+    const tStep = niceTimeStep(tRange, 5);
+    const firstTick = Math.ceil(tMin / tStep) * tStep;
+    ctx.textAlign = "center";
+    for (let t = firstTick; t <= tMax; t += tStep) {
+      const x = xForTs(t);
+      if (x < padLeft - 0.5 || x > padLeft + plotW + 0.5) continue;
+      ctx.strokeStyle = gridColor;
+      ctx.setLineDash([]);
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(x, padTop);
+      ctx.lineTo(x, padTop + plotH);
+      ctx.stroke();
+      ctx.fillStyle = tickColor;
+      ctx.fillText(formatTs(t), x, padTop + plotH + 14);
     }
 
     // Warning band (CPU > 80% etc) — fill above threshold with translucent red.
