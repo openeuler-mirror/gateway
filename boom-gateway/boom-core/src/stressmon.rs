@@ -17,9 +17,11 @@ use serde::Serialize;
 pub struct StressmonSample {
     /// Unix seconds. Frontend formats in the viewer's local timezone.
     pub ts: i64,
-    /// Process-level CPU% (utime+stime delta over wall clock). Range
-    /// `0..=num_workers * 100` — a fully loaded 4-worker process peaks at 400.
-    pub cpu_pct: f32,
+    /// Average tokio worker busyness in 0..=100 — mean of
+    /// `RuntimeMetrics::worker_busyness(i)` across all workers. Unlike a
+    /// process-level CPU%, this excludes the blocking pool, so a fully
+    /// loaded 8-worker runtime peaks at exactly 100, never more.
+    pub worker_busy_pct: f32,
     /// Resident set size in bytes (`/proc/self/status` VmRSS).
     pub rss_bytes: u64,
     /// Sum of `worker_queue_depth(i)` across all tokio workers. Non-zero +

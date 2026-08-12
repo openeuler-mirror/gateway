@@ -405,9 +405,10 @@
   let inflightTimer = null;
 
   // ── System Pressure ───────────────────────────────────
-  // 1.5s poll + canvas redraw. Stops when leaving admin-stats section.
+  // 1.5s poll + canvas redraw. Stops when leaving admin-stress section.
+  // Window is fixed at 60 min (the ring buffer's full capacity) so each
+  // 1Hz sample lands in its own second on the X axis.
   let stressTimer = null;
-  let stressRange = "5m";
   let stressLastSampleTs = 0;
 
   function startStressPoll() {
@@ -426,7 +427,7 @@
 
   async function loadStress() {
     try {
-      const res = await api(`/admin/stress/timeseries?range=${encodeURIComponent(stressRange)}`);
+      const res = await api("/admin/stress/timeseries?range=60m");
       renderStress(res);
     } catch (e) {
       // Silently skip — dashboard is read-only, errors shouldn't spam the
@@ -447,16 +448,13 @@
     const cpuOver80El = document.getElementById("stress-info-cpu-over-80");
     if (cpuOver80El) cpuOver80El.textContent = String(snap.cpu_over_80_count || 0);
 
-    // CPU: normalized to 0..100 against worker count. >80% draws a red
-    // warning band behind the line.
-    // Backend's cpu_pct is already a percentage scaled by worker count
-    // (e.g. 1600 = 16 cores fully busy on a 32-worker runtime = 50% of
-    // capacity), so dividing by num_workers gives the 0..100 capacity ratio.
+    // CPU = mean tokio worker_busyness (already 0..=100 in the sample).
+    // >80% draws a red warning band behind the line.
     drawMetricCanvas({
       canvasId: "stress-cpu-canvas",
       valueId: "stress-cpu-value",
       samples,
-      accessor: (s) => s.cpu_pct / numWorkers,
+      accessor: (s) => s.worker_busy_pct,
       yMax: 100,
       tickStep: 10,
       warnThreshold: 80,
@@ -905,7 +903,6 @@
     });
     rangeState[target] = { range, from: null, to: null };
     if (target === "agent") loadAgentStats();
-    else if (target === "stress") { stressRange = range; loadStress(); }
     else loadRequestRateStats();
   }
 

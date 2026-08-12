@@ -93,11 +93,10 @@ impl StressmonCollector {
 
     /// Push one sample. Called from boom-main's sampler task at 1 Hz.
     /// Also bumps the lifetime CPU-over-80% counter if this sample crosses
-    /// the threshold — `cpu_pct > 0.8 * num_workers * 100` is equivalent to
-    /// "normalized CPU% > 80%".
+    /// the threshold — `worker_busy_pct > 80.0` directly (the field is
+    /// already normalized to 0..=100 against worker count).
     pub fn record_sample(&self, sample: StressmonSample) {
-        let threshold = (self.num_workers as f32) * 80.0;
-        if sample.cpu_pct > threshold {
+        if sample.worker_busy_pct > 80.0 {
             self.cpu_over_80_count.fetch_add(1, Ordering::Relaxed);
         }
         if let Ok(mut buf) = self.samples.lock() {
@@ -136,7 +135,7 @@ mod tests {
     fn sample(ts: i64) -> StressmonSample {
         StressmonSample {
             ts,
-            cpu_pct: 0.0,
+            worker_busy_pct: 0.0,
             rss_bytes: 0,
             worker_queue_depth: 0,
             blocking_tasks_queued: 0,

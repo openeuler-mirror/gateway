@@ -373,23 +373,56 @@ fn spawn_stressmon_sampler(
     tracing::info!("System pressure sampler spawned (1 Hz)");
 }
 
-/// Take one pressure sample. CPU% is computed from utime+stime deltas
-/// against the previous call — so the function keeps its own state via a
-/// `static Mutex<Option<(prev_jiffies, prev_instant)>>`. Returns zeros on
-/// platforms without `/proc` (e.g., macOS dev) — Linux prod is the target.
+/// Take one pressure sample. Worker busyness is derived from
+/// `RuntimeMetrics::worker_total_busy_duration(i)` — tokio reports
+/// cumulative busy nanoseconds per worker, so we diff against the previous
+/// sample to get "fraction of wall time worker i was busy" in 0..=100,
+/// then average.
+/// Unlike a process-level CPU%, this excludes the blocking pool: a fully
+/// loaded 8-worker runtime peaks at exactly 100, never more.
 fn sample_pressure_once(
     inflight: &std::sync::Arc<boom_routing::InFlightTracker>,
 ) -> boom_core::StressmonSample {
     use std::sync::Mutex;
-    static PREV: Mutex<Option<(u64, std::time::Instant)>> = Mutex::new(None);
 
     let now_ts = chrono::Utc::now().timestamp();
     let now_instant = std::time::Instant::now();
 
-    // Tokio runtime metrics — `Handle::current().metrics()` is the per-thread
-    // cached handle; cheap.
     let metrics = tokio::runtime::Handle::current().metrics();
     let num_workers = metrics.num_workers().max(1);
+
+    // Per-worker (prev_busy_duration, prev_instant). Mutex<Vec> resized to
+    // num_workers on first call; num_workers is fixed for the runtime's
+    // lifetime so this is stable.
+    static PREV_BUSY: Mutex<Vec<Option<(std::time::Duration, std::time::Instant)>>> =
+        Mutex::new(Vec::new());
+    let mut prev_guard = PREV_BUSY.lock().unwrap();
+    if prev_guard.len() < num_workers {
+        prev_guard.resize(num_workers, None);
+    }
+    let mut busy_pct_sum = 0.0f32;
+    for i in 0..num_workers {
+        let cur = metrics.worker_total_busy_duration(i);
+        let pct = match prev_guard[i] {
+            Some((prev, prev_instant)) => {
+                let dt_busy_ns = cur.saturating_sub(prev).as_nanos() as u64;
+                let dt_wall_ns = now_instant
+                    .saturating_duration_since(prev_instant)
+                    .as_nanos() as u64;
+                if dt_wall_ns == 0 {
+                    0.0
+                } else {
+                    ((dt_busy_ns as f64 / dt_wall_ns as f64) * 100.0).min(100.0) as f32
+                }
+            }
+            None => 0.0,
+        };
+        prev_guard[i] = Some((cur, now_instant));
+        busy_pct_sum += pct;
+    }
+    drop(prev_guard);
+    let worker_busy_pct = busy_pct_sum / (num_workers as f32);
+
     // Sum of per-worker local queues + the global injection queue — gives a
     // single "tasks waiting to be polled" number. Spikes here = workers
     // can't keep up.
@@ -408,35 +441,12 @@ fn sample_pressure_once(
         .map(|s| s.inflight_requests)
         .sum::<u64>();
 
-    // CPU jiffies (utime + stime) + VmRSS via /proc on Linux. On other
-    // platforms these are best-effort 0s — the dashboard still gets useful
-    // worker-queue / blocking-queue / inflight signal.
-    let (cpu_jiffies, rss_bytes) = read_proc_cpu_rss();
-
-    // Delta the CPU jiffies against the previous sample to get instantaneous %.
-    let cpu_pct = {
-        let mut prev_guard = PREV.lock().unwrap();
-        let cpu_pct = match prev_guard.as_ref() {
-            Some((prev_jiffies, prev_instant)) => {
-                let dt_jiffies = cpu_jiffies.saturating_sub(*prev_jiffies);
-                let dt_secs = now_instant
-                    .saturating_duration_since(*prev_instant)
-                    .as_secs_f64()
-                    .max(0.001);
-                // Each jiffy is 1/CLK_TCK seconds; on Linux that's 100 Hz
-                // (sysconf(_SC_CLK_TCK) = 100 essentially everywhere).
-                let cpu_secs = dt_jiffies as f64 / 100.0;
-                (cpu_secs / dt_secs * 100.0) as f32
-            }
-            None => 0.0,
-        };
-        *prev_guard = Some((cpu_jiffies, now_instant));
-        cpu_pct
-    };
+    // VmRSS via /proc on Linux; 0 on other platforms (macOS dev).
+    let rss_bytes = read_proc_rss();
 
     boom_core::StressmonSample {
         ts: now_ts,
-        cpu_pct,
+        worker_busy_pct,
         rss_bytes,
         worker_queue_depth,
         blocking_tasks_queued,
@@ -444,30 +454,11 @@ fn sample_pressure_once(
     }
 }
 
-/// Read cumulative CPU jiffies (utime + stime) and current RSS from
-/// `/proc/self/stat` + `/proc/self/status`. Returns (0, 0) on non-Linux.
+/// Read current RSS from `/proc/self/status`. Returns 0 on non-Linux.
 #[cfg(target_os = "linux")]
-fn read_proc_cpu_rss() -> (u64, u64) {
-    let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
-    // Field 14 (utime) and 15 (stime) — fields are 1-indexed in proc(5).
-    // The 2nd field (comm) can contain spaces and parens; parse from the
-    // right by finding the last ')' to skip comm entirely.
-    let after_comm = match stat.rfind(')') {
-        Some(i) => &stat[i + 2..],
-        None => return (0, 0),
-    };
-    let fields: Vec<&str> = after_comm.split_whitespace().collect();
-    // after_comm starts at field 3 (state), so:
-    //   fields[0]  = state
-    //   ...
-    //   fields[10] = utime (field 14 - 3 = index 11 - 1 = 10? Let's be careful.)
-    // Fields 14 and 15 → indices 11 and 12 in `after_comm` (since after_comm
-    // begins at field 3, the offset is field_num - 3 = 11 for utime).
-    let utime: u64 = fields.get(11).and_then(|s| s.parse().ok()).unwrap_or(0);
-    let stime: u64 = fields.get(12).and_then(|s| s.parse().ok()).unwrap_or(0);
-
+fn read_proc_rss() -> u64 {
     let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
-    let rss_bytes = status
+    status
         .lines()
         .find_map(|line| {
             let trimmed = line.trim();
@@ -476,14 +467,12 @@ fn read_proc_cpu_rss() -> (u64, u64) {
             let kb: u64 = rest.trim().split_whitespace().next()?.parse().ok()?;
             Some(kb * 1024)
         })
-        .unwrap_or(0);
-
-    (utime + stime, rss_bytes)
+        .unwrap_or(0)
 }
 
 #[cfg(not(target_os = "linux"))]
-fn read_proc_cpu_rss() -> (u64, u64) {
-    (0, 0)
+fn read_proc_rss() -> u64 {
+    0
 }
 
 /// Background task: every 1s, trigger dispatch on all flow control slots.
