@@ -363,9 +363,12 @@
     if (section === "admin-stats") {
       loadStats();
       startInflightPoll();
-      startStressPoll();
     } else {
       stopInflightPoll();
+    }
+    if (section === "admin-stress") {
+      startStressPoll();
+    } else {
       stopStressPoll();
     }
     if (section === "admin-models") loadModels();
@@ -386,6 +389,7 @@
     if (hash.includes("/admin/logs")) return "admin-logs";
     if (hash.includes("/admin/debug")) return "admin-debug";
     if (hash.includes("/admin/config")) return "admin-config";
+    if (hash.includes("/admin/stress")) return "admin-stress";
     return "admin-models";
   }
 
@@ -430,125 +434,203 @@
   }
 
   function renderStress(snap) {
-    const canvas = document.getElementById("stress-canvas");
+    const samples = snap.samples || [];
+    const numWorkers = snap.num_workers || 1;
+    const latest = samples.length > 0 ? samples[samples.length - 1] : null;
+    if (latest) stressLastSampleTs = latest.ts;
+
+    // CPU: normalized to 0..100 against worker count. >80% draws a red
+    // warning band behind the line.
+    drawMetricCanvas({
+      canvasId: "stress-cpu-canvas",
+      valueId: "stress-cpu-value",
+      samples,
+      accessor: (s) => (s.cpu_pct / numWorkers) * 100,
+      yMax: 100,
+      warnThreshold: 80,
+      color: "#10b981",
+      emptyHint: "Collecting… (first sample takes 1s)",
+      formatValue: (v) => v.toFixed(1) + "%",
+      formatY: (v) => v.toFixed(0) + "%",
+    });
+
+    // RSS: bytes → MiB / GiB.
+    drawMetricCanvas({
+      canvasId: "stress-rss-canvas",
+      valueId: "stress-rss-value",
+      samples,
+      accessor: (s) => s.rss_bytes,
+      yMax: "auto",
+      yMinFloor: 100 * 1024 * 1024,
+      color: "#a855f7",
+      emptyHint: "—",
+      formatValue: formatBytes,
+      formatY: (v) => formatBytes(v, true),
+    });
+
+    // Worker queue depth.
+    drawMetricCanvas({
+      canvasId: "stress-worker-queue-canvas",
+      valueId: "stress-worker-queue-value",
+      samples,
+      accessor: (s) => s.worker_queue_depth,
+      yMax: "auto",
+      color: "#f59e0b",
+      emptyHint: "—",
+      formatValue: (v) => String(v),
+      formatY: (v) => String(Math.round(v)),
+    });
+
+    // Blocking pool queue.
+    drawMetricCanvas({
+      canvasId: "stress-blocking-queue-canvas",
+      valueId: "stress-blocking-queue-value",
+      samples,
+      accessor: (s) => s.blocking_tasks_queued,
+      yMax: "auto",
+      color: "#ef4444",
+      emptyHint: "—",
+      formatValue: (v) => String(v),
+      formatY: (v) => String(Math.round(v)),
+    });
+
+    // Inflight requests — soft fill underneath the line.
+    drawMetricCanvas({
+      canvasId: "stress-inflight-canvas",
+      valueId: "stress-inflight-value",
+      samples,
+      accessor: (s) => s.inflight,
+      yMax: "auto",
+      color: "rgba(99,102,241,0.9)",
+      fill: "rgba(99,102,241,0.15)",
+      emptyHint: "—",
+      formatValue: (v) => String(v),
+      formatY: (v) => String(Math.round(v)),
+    });
+  }
+
+  // Bytes → "1.23 GiB" / "456 MiB". compact=true → short form for Y axis.
+  function formatBytes(b, compact) {
+    if (b >= 1024 * 1024 * 1024) {
+      return (b / 1024 / 1024 / 1024).toFixed(compact ? 1 : 2) + " GiB";
+    }
+    if (b >= 1024 * 1024) {
+      return (b / 1024 / 1024).toFixed(compact ? 0 : 0) + " MiB";
+    }
+    return (b / 1024).toFixed(0) + " KiB";
+  }
+
+  // Generic single-metric canvas renderer.
+  // - yMax: number (fixed scale) | "auto" (scale to peak × 1.15)
+  // - warnThreshold: number | null — draws red warning band above this Y value
+  // - fill: rgba string | null — soft fill under the line
+  function drawMetricCanvas(opts) {
+    const canvas = document.getElementById(opts.canvasId);
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
-    const samples = snap.samples || [];
-    if (samples.length === 0) {
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-      ctx.fillStyle = "var(--text3, #888)";
-      ctx.font = "12px sans-serif";
-      ctx.fillText("Collecting… (first sample takes 1s)", 12, 24);
-      document.getElementById("stress-numbers").textContent = "";
-      return;
-    }
-    const latest = samples[samples.length - 1];
-    stressLastSampleTs = latest.ts;
-
-    // Auto-scale axes — CPU is fixed 0..N*100, others adapt to peak.
-    const cpuMax = Math.max(snap.num_workers * 100, 100);
-    const queueMax = Math.max(8, ...samples.map((s) => s.worker_queue_depth)) * 1.15;
-    const blockingMax = Math.max(8, ...samples.map((s) => s.blocking_tasks_queued)) * 1.15;
-    const inflightMax = Math.max(4, ...samples.map((s) => s.inflight)) * 1.15;
-    // RSS scale based on peak within window, but never below 100 MiB so a
-    // flat 50 MiB chart isn't all the way at the top.
-    const rssMax = Math.max(100 * 1024 * 1024, ...samples.map((s) => s.rss_bytes)) * 1.15;
-
+    const valueEl = document.getElementById(opts.valueId);
+    const samples = opts.samples;
     const w = canvas.width;
     const h = canvas.height;
-    ctx.clearRect(0, 0, w, h);
 
-    const padLeft = 36;
-    const padRight = 8;
-    const padTop = 8;
-    const padBot = 16;
+    if (valueEl) valueEl.textContent = opts.emptyHint || "—";
+    if (samples.length === 0) {
+      ctx.clearRect(0, 0, w, h);
+      ctx.fillStyle = "var(--text3, #888)";
+      ctx.font = "12px sans-serif";
+      ctx.textAlign = "left";
+      ctx.fillText(opts.emptyHint || "—", 12, 24);
+      return;
+    }
+
+    const latest = samples[samples.length - 1];
+    if (valueEl) valueEl.textContent = opts.formatValue(opts.accessor(latest));
+
+    const values = samples.map(opts.accessor);
+    const peak = Math.max(1, ...values);
+    let yMax;
+    if (typeof opts.yMax === "number") {
+      yMax = opts.yMax;
+    } else {
+      const floor = opts.yMinFloor || 0;
+      yMax = Math.max(floor, peak) * 1.15;
+    }
+
+    const padLeft = 44;
+    const padRight = 10;
+    const padTop = 10;
+    const padBot = 18;
     const plotW = w - padLeft - padRight;
     const plotH = h - padTop - padBot;
 
-    const xFor = (i) => padLeft + (plotW * i) / Math.max(1, samples.length - 1);
+    ctx.clearRect(0, 0, w, h);
 
-    const drawSeries = (values, scale, color, fill) => {
+    const yFor = (v) => {
+      const clamped = Math.min(Math.max(v, 0), yMax);
+      return padTop + plotH - (clamped / yMax) * plotH;
+    };
+    const xFor = (i) => padLeft + (plotW * i) / Math.max(1, values.length - 1);
+
+    // Warning band (CPU > 80% etc) — fill above threshold with translucent red.
+    if (opts.warnThreshold != null && opts.warnThreshold < yMax) {
+      const warnY = yFor(opts.warnThreshold);
+      ctx.fillStyle = "rgba(239, 68, 68, 0.18)";
+      ctx.fillRect(padLeft, padTop, plotW, warnY - padTop);
+      // Dashed threshold line + label.
+      ctx.strokeStyle = "rgba(239, 68, 68, 0.7)";
+      ctx.setLineDash([4, 3]);
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(padLeft, warnY);
+      ctx.lineTo(padLeft + plotW, warnY);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = "rgba(239, 68, 68, 0.9)";
+      ctx.font = "10px sans-serif";
+      ctx.textAlign = "left";
+      ctx.fillText(
+        (typeof opts.formatY === "function" ? opts.formatY(opts.warnThreshold) : opts.warnThreshold),
+        padLeft + 4,
+        warnY - 3,
+      );
+    }
+
+    // Soft fill under the line (optional).
+    if (opts.fill) {
       ctx.beginPath();
       values.forEach((v, i) => {
         const x = xFor(i);
-        const y = padTop + plotH - (Math.min(v, scale) / scale) * plotH;
+        const y = yFor(v);
         if (i === 0) ctx.moveTo(x, y);
         else ctx.lineTo(x, y);
       });
-      if (fill) {
-        ctx.lineTo(xFor(samples.length - 1), padTop + plotH);
-        ctx.lineTo(xFor(0), padTop + plotH);
-        ctx.closePath();
-        ctx.fillStyle = fill;
-        ctx.fill();
-      } else {
-        ctx.strokeStyle = color;
-        ctx.lineWidth = 1.5;
-        ctx.stroke();
-      }
-    };
+      ctx.lineTo(xFor(values.length - 1), padTop + plotH);
+      ctx.lineTo(xFor(0), padTop + plotH);
+      ctx.closePath();
+      ctx.fillStyle = opts.fill;
+      ctx.fill();
+    }
 
-    // Inflight — soft fill underneath everything else.
-    drawSeries(
-      samples.map((s) => s.inflight),
-      inflightMax,
-      null,
-      "rgba(99, 102, 241, 0.10)",
-    );
-    // RSS — line.
-    drawSeries(samples.map((s) => s.rss_bytes), rssMax, "#a855f7", null);
-    // Worker queue — line.
-    drawSeries(samples.map((s) => s.worker_queue_depth), queueMax, "#f59e0b", null);
-    // Blocking queue — line.
-    drawSeries(
-      samples.map((s) => s.blocking_tasks_queued),
-      blockingMax,
-      "#ef4444",
-      null,
-    );
-    // CPU — overlay on top.
-    drawSeries(samples.map((s) => s.cpu_pct), cpuMax, "#10b981", null);
+    // Main line.
+    ctx.beginPath();
+    values.forEach((v, i) => {
+      const x = xFor(i);
+      const y = yFor(v);
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    });
+    ctx.strokeStyle = opts.color;
+    ctx.lineWidth = 1.6;
+    ctx.stroke();
 
-    // Axis label — CPU% on left.
+    // Y-axis labels — top (max) and bottom (0).
     ctx.fillStyle = "var(--text3, #888)";
     ctx.font = "10px sans-serif";
     ctx.textAlign = "right";
-    ctx.fillText(cpuMax.toFixed(0) + "%", padLeft - 4, padTop + 8);
-    ctx.fillText("0", padLeft - 4, padTop + plotH);
-
-    // Legend.
-    const legend = document.getElementById("stress-legend");
-    if (legend) {
-      legend.innerHTML = [
-        ["#10b981", "CPU%"],
-        ["#f59e0b", "Worker queue"],
-        ["#ef4444", "Blocking queue"],
-        ["#a855f7", "RSS"],
-        ["rgba(99, 102, 241, 0.5)", "Inflight"],
-      ]
-        .map(
-          ([c, label]) =>
-            `<span class="stress-legend-item"><span class="stress-legend-swatch" style="background:${c}"></span>${label}</span>`,
-        )
-        .join("");
-    }
-
-    // Numbers strip — latest values as text.
-    const numbers = document.getElementById("stress-numbers");
-    if (numbers) {
-      const rssStr =
-        latest.rss_bytes >= 1024 * 1024 * 1024
-          ? (latest.rss_bytes / 1024 / 1024 / 1024).toFixed(2) + " GiB"
-          : (latest.rss_bytes / 1024 / 1024).toFixed(0) + " MiB";
-      numbers.innerHTML = [
-        `<span>CPU <b>${latest.cpu_pct.toFixed(1)}%</b></span>`,
-        `<span>W-queue <b>${latest.worker_queue_depth}</b></span>`,
-        `<span>B-queue <b>${latest.blocking_tasks_queued}</b></span>`,
-        `<span>Inflight <b>${latest.inflight}</b></span>`,
-        `<span>RSS <b>${rssStr}</b></span>`,
-        `<span>Workers <b>${snap.num_workers}</b></span>`,
-      ].join("");
-    }
+    const topLabel = typeof opts.formatY === "function" ? opts.formatY(yMax) : String(Math.round(yMax));
+    const botLabel = typeof opts.formatY === "function" ? opts.formatY(0) : "0";
+    ctx.fillText(topLabel, padLeft - 4, padTop + 8);
+    ctx.fillText(botLabel, padLeft - 4, padTop + plotH);
   }
 
   // 24h per-deployment aggregates — populated on page load and Refresh button
@@ -3453,22 +3535,16 @@
   // ── Admin: Modals ─────────────────────────────────────
   function setupAdminButtons() {
     document.getElementById("btn-new-plan").addEventListener("click", showNewPlanModal);
-    // Stress panel range buttons.
-    document.querySelectorAll("#stress-panel [data-stress-range]").forEach((btn) => {
+    // Stress page range buttons (5m / 15m / 30m / 60m).
+    document.querySelectorAll('.range-controls[data-target="stress"] [data-range]').forEach((btn) => {
       btn.addEventListener("click", () => {
-        stressRange = btn.dataset.stressRange;
-        // Reflect active button visually.
+        stressRange = btn.dataset.range;
         document
-          .querySelectorAll("#stress-panel [data-stress-range]")
+          .querySelectorAll('.range-controls[data-target="stress"] [data-range]')
           .forEach((b) => b.classList.toggle("active", b === btn));
         loadStress();
       });
     });
-    // Default range active.
-    const defaultStressBtn = document.querySelector(
-      `#stress-panel [data-stress-range="${stressRange}"]`,
-    );
-    if (defaultStressBtn) defaultStressBtn.classList.add("active");
     const btnResetAll = document.getElementById("btn-reset-all-limits");
     if (btnResetAll) btnResetAll.addEventListener("click", async () => {
       if (!confirm(t("confirm.reset_all"))) return;

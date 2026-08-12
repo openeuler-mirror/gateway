@@ -42,6 +42,7 @@
       "nav.logs": "Logs",
       "nav.debug": "Debug",
       "nav.config": "Config",
+      "nav.stress": "System Pressure",
 
       "common.loading": "Loading...",
       "common.no_data": "No data yet.",
@@ -124,11 +125,12 @@
       "chat.history_cleared": "Conversation history cleared",
 
       "stress.title": "System Pressure",
-      "stress.cpu": "CPU%",
-      "stress.queue": "Worker queue",
-      "stress.blocking": "Blocking queue",
+      "stress.cpu": "CPU",
+      "stress.queue": "Worker Queue",
+      "stress.blocking": "Blocking Queue",
       "stress.inflight": "In-flight",
       "stress.rss": "RSS",
+      "stress.hint": "In-memory 1Hz ring buffer (last 60 min). CPU is normalized against worker count.",
 
       "stats.inflight.title": "In-Flight Requests",
       "stats.inflight.col.deployment": "Deployment",
@@ -860,6 +862,7 @@
       "nav.logs": "日志",
       "nav.debug": "调试",
       "nav.config": "配置",
+      "nav.stress": "系统压力",
 
       "common.loading": "加载中...",
       "common.no_data": "暂无数据。",
@@ -942,11 +945,12 @@
       "chat.history_cleared": "对话历史已清空",
 
       "stress.title": "系统压力",
-      "stress.cpu": "CPU%",
+      "stress.cpu": "CPU",
       "stress.queue": "Worker 队列",
       "stress.blocking": "Blocking 队列",
       "stress.inflight": "在途",
       "stress.rss": "RSS",
+      "stress.hint": "内存 1Hz 环形缓冲(最近 60 分钟)。CPU 按工作线程数归一化。",
 
       "stats.inflight.title": "在途请求",
       "stats.inflight.col.deployment": "部署",
