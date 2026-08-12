@@ -447,9 +447,11 @@
     // CPU = process-level (utime+stime), not normalized. May go far past
     // num_workers × 100 because tokio's blocking pool runs threads outside
     // the worker pool (prompt-log gzip, DB work, file I/O). Y axis auto-
-    // scales; the red warning band starts at `numWorkers × 80%` (the
-    // equivalent of the worker pool running at 80% saturation).
-    const cpuWarn = numWorkers * 80;
+    // scales; the info-bar "CPU > 80% count" still tracks how often the
+    // worker pool itself hit 80% saturation (num_workers × 80 in absolute
+    // terms), but no line is drawn — process CPU spends most of its time
+    // outside that range under load, so the band just visually polluted
+    // the chart without communicating anything actionable.
     drawMetricCanvas({
       canvasId: "stress-cpu-canvas",
       valueId: "stress-cpu-value",
@@ -457,7 +459,6 @@
       accessor: (s) => s.cpu_pct,
       yMax: "auto",
       yMinFloor: 100,
-      warnThreshold: cpuWarn,
       color: "#10b981",
       emptyHint: "Collecting… (first sample takes 1s)",
       formatValue: (v) => v.toFixed(1) + "%",
