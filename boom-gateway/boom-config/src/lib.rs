@@ -564,9 +564,9 @@ pub struct RouterSettings {
     /// working for existing configs.)
     #[serde(default = "default_rebalance_threshold", alias = "key_affinity_rebalance_threshold")]
     pub rebalance_threshold: u8,
-    /// Content-based hybrid router (optional dynamic model alias).
+    /// Content-based auto router (optional dynamic model alias).
     #[serde(default)]
-    pub hybrid_router: Option<HybridRouterConfig>,
+    pub auto_router: Option<AutoRouterConfig>,
     /// KV-cache aware routing settings.
     #[serde(default)]
     pub kvc_aware: KvcAwareSettings,
@@ -743,30 +743,30 @@ fn default_max_blocks() -> usize {
     500_000
 }
 
-/// Configuration for the content-based hybrid router.
+/// Configuration for the content-based auto router.
 ///
 /// When enabled, requesting the virtual `model_name` triggers content
 /// analysis which maps to a real model from `model_list`.
 #[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct HybridRouterConfig {
+pub struct AutoRouterConfig {
     /// Virtual model name that triggers classification (e.g. "auto").
     pub model_name: String,
     /// Classification strategy name. Default: "tier_classifier".
-    #[serde(default = "default_hybrid_strategy")]
+    #[serde(default = "default_auto_strategy")]
     pub strategy: String,
     /// Default tier when classification is uncertain.
     pub default_tier: String,
     /// Tier name → tier definition.
     #[serde(default)]
-    pub tiers: HashMap<String, HybridRouterTier>,
+    pub tiers: HashMap<String, AutoRouterTier>,
     /// Settings for the `ml_service` strategy. Required when `strategy = "ml_service"`.
     #[serde(default)]
     pub ml_service: Option<MlServiceConfig>,
 }
 
-/// A single tier in the hybrid router configuration.
+/// A single tier in the auto router configuration.
 #[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct HybridRouterTier {
+pub struct AutoRouterTier {
     /// Target model_name in model_list to route to for this tier.
     pub target_model: String,
 }
@@ -791,7 +791,7 @@ fn default_ml_timeout_ms() -> u64 {
     100
 }
 
-fn default_hybrid_strategy() -> String {
+fn default_auto_strategy() -> String {
     "tier_classifier".to_string()
 }
 
@@ -1515,7 +1515,7 @@ plan_settings:
 }
 
 #[cfg(test)]
-mod hybrid_router_config_tests {
+mod auto_router_config_tests {
     use super::*;
 
     #[test]
@@ -1532,7 +1532,7 @@ ml_service:
   url: http://127.0.0.1:2345
   timeout_ms: 50
 "#;
-        let cfg: HybridRouterConfig = serde_yaml::from_str(yaml).unwrap();
+        let cfg: AutoRouterConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(cfg.strategy, "ml_service");
         let ml = cfg.ml_service.expect("ml_service should be set");
         assert_eq!(ml.url, "http://127.0.0.1:2345");

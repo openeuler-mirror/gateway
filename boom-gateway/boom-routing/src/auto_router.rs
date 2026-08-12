@@ -177,20 +177,20 @@ impl ClassificationStrategy for TierClassifier {
 }
 
 // ═══════════════════════════════════════════════════════════
-// HybridRouter — the dynamic alias resolver
+// AutoRouter — the dynamic alias resolver
 // ═══════════════════════════════════════════════════════════
 
 /// Content-based model router. Acts as a "dynamic alias":
 /// matches a virtual model name → classifies request content →
 /// returns a real model name for the normal routing pipeline.
-pub struct HybridRouter {
+pub struct AutoRouter {
     model_name: String,
     strategy: Arc<dyn ClassificationStrategy>,
     default_tier: String,
     tiers: HashMap<String, String>,
 }
 
-impl HybridRouter {
+impl AutoRouter {
     pub fn new(
         model_name: String,
         strategy: Arc<dyn ClassificationStrategy>,
@@ -247,7 +247,7 @@ impl HybridRouter {
             model = %model,
             tier = %tier,
             target_model = %target,
-            "Hybrid router classified request"
+            "Auto router classified request"
         );
 
         Some(target)
@@ -278,12 +278,12 @@ mod tests {
             .collect()
     }
 
-    fn make_router() -> HybridRouter {
+    fn make_router() -> AutoRouter {
         let mut tiers = HashMap::new();
         tiers.insert("small".to_string(), "small-cup".to_string());
         tiers.insert("medium".to_string(), "medium-cup".to_string());
         tiers.insert("large".to_string(), "large-cup".to_string());
-        HybridRouter::new(
+        AutoRouter::new(
             "auto".to_string(),
             Arc::new(TierClassifier),
             "medium".to_string(),

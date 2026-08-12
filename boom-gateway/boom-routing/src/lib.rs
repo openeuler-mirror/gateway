@@ -1,10 +1,11 @@
 pub mod alias_store;
 pub mod deployment_store;
 pub mod fusion;
-pub mod hybrid_router;
+pub mod auto_router;
 pub mod inflight;
 pub mod migrations;
 pub mod ml_service_client;
+pub mod ml_service_stats;
 pub mod policy;
 pub mod rebalance;
 pub mod request_rate;
@@ -16,10 +17,11 @@ pub use deployment_store::{
     ModelCostRate,
 };
 pub use fusion::{register_fusion_providers, FusionRuntime};
-pub use hybrid_router::{
-    ClassifyRequest, ClassificationStrategy, HybridRouter, StrategyRegistry, TierClassifier,
+pub use auto_router::{
+    ClassifyRequest, ClassificationStrategy, AutoRouter, StrategyRegistry, TierClassifier,
 };
 pub use ml_service_client::MlServiceClient;
+pub use ml_service_stats::MlServiceStats;
 pub use inflight::{DeploymentInFlightStat, InFlightGuard, InFlightStat, InFlightTracker};
 pub use policy::load_helpers;
 pub use policy::SchedulePolicy;
