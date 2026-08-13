@@ -116,6 +116,12 @@ static ERR_PRS: AtomicU64 = AtomicU64::new(0);
 static ERR_STR: AtomicU64 = AtomicU64::new(0);
 static BYTES_IN: AtomicU64 = AtomicU64::new(0);
 static BYTES_OUT: AtomicU64 = AtomicU64::new(0);
+/// Outcome 在 send 给 aggregator 时失败（receiver 已关闭）。理论上不应
+/// 该出现——spawned task 持有 tx clone，task 完成才 drop tx，aggregator
+/// 不会在 task 完成前退出。如果这个计数 > 0，说明 aggregator 提前退出
+/// 了（race 或 panic），需要进一步排查。把它从"静默丢失"改成"显式
+/// 计数"是定位此类 bug 的 forcing function。
+static DROPPED: AtomicU64 = AtomicU64::new(0);
 
 // ── Main ────────────────────────────────────────────────────────────────
 
@@ -291,7 +297,9 @@ async fn schedule_qps(
         let tx = tx.clone();
         join.spawn(async move {
             let outcome = send_one(&shared).await;
-            let _ = tx.send(outcome);
+            if tx.send(outcome).is_err() {
+                DROPPED.fetch_add(1, Ordering::Relaxed);
+            }
         });
         // Reap finished tasks to avoid unbounded JoinSet growth.
         while join.len() > 4096 {
@@ -318,7 +326,9 @@ async fn run_concurrent(
                     break;
                 }
                 let outcome = send_one(&shared).await;
-                let _ = tx.send(outcome);
+                if tx.send(outcome).is_err() {
+                    DROPPED.fetch_add(1, Ordering::Relaxed);
+                }
             }
         });
     }
@@ -405,10 +415,26 @@ async fn consume_stream(resp: reqwest::Response, start: Instant) -> Outcome {
     //       gateway.
     // Both signals are scanned across a rolling window because SSE chunks can
     // split either pattern across HTTP frame boundaries.
-    let mut tail: Vec<u8> = Vec::with_capacity(32);
+    //
+    // Hot path: the previous version allocated a `Vec<u8>` per chunk to build
+    // the scan window — at 1000 QPS × ~100 chunks/stream that's ~100k
+    // allocations/sec, libc malloc fragmentation pushes RSS up and CPU into
+    // the allocator. This version keeps the rolling tail in a fixed stack
+    // array (no heap allocation on the per-chunk scan path).
     const NEEDLE_DONE: &[u8] = b"data: [DONE]";
     const NEEDLE_FINISH: &[u8] = b"\"finish_reason\":\"";
     const NEEDLE_MSG_STOP: &[u8] = b"\"type\":\"message_stop\"";
+    let max_needle = NEEDLE_DONE
+        .len()
+        .max(NEEDLE_FINISH.len())
+        .max(NEEDLE_MSG_STOP.len());
+    // Tail holds the last (max_needle - 1) bytes of the previous frame, so a
+    // needle straddling the frame boundary still gets caught. max_needle=19
+    // → cap 32 leaves headroom.
+    const TAIL_CAP: usize = 32;
+    debug_assert!(max_needle - 1 <= TAIL_CAP, "TAIL_CAP must hold max_needle-1");
+    let mut tail_buf: [u8; TAIL_CAP] = [0u8; TAIL_CAP];
+    let mut tail_len: usize = 0;
 
     while let Some(frame) = stream.next().await {
         match frame {
@@ -421,25 +447,44 @@ async fn consume_stream(resp: reqwest::Response, start: Instant) -> Outcome {
                 total_bytes_in += n;
                 BYTES_IN.fetch_add(n, Ordering::Relaxed);
                 if !saw_done {
-                    let max_needle = NEEDLE_DONE
-                        .len()
-                        .max(NEEDLE_FINISH.len())
-                        .max(NEEDLE_MSG_STOP.len());
-                    let window_start = tail.len().saturating_sub(max_needle - 1);
-                    let scan_window: Vec<u8> = tail[window_start..]
-                        .iter()
-                        .chain(bytes.as_ref().iter())
-                        .copied()
-                        .collect();
-                    if memmem(&scan_window, NEEDLE_DONE).is_some()
-                        || has_terminal_finish_reason(&scan_window, NEEDLE_FINISH)
-                        || memmem(&scan_window, NEEDLE_MSG_STOP).is_some()
+                    let bytes_ref: &[u8] = bytes.as_ref();
+                    // Build the boundary window: tail's tail + bytes' head.
+                    // Length ≤ 2 * (max_needle-1) ≤ 64 — fits in a stack array.
+                    let mut boundary: [u8; 64] = [0u8; 64];
+                    let b_tail = tail_len.min(max_needle - 1);
+                    let b_head = bytes_ref.len().min(max_needle - 1);
+                    boundary[..b_tail].copy_from_slice(&tail_buf[tail_len - b_tail..tail_len]);
+                    boundary[b_tail..b_tail + b_head].copy_from_slice(&bytes_ref[..b_head]);
+                    let boundary_view = &boundary[..b_tail + b_head];
+                    // Scan three slices per needle (tail alone, bytes alone,
+                    // boundary). Most hits land in `bytes` (largest slice),
+                    // so the short-circuit `||` keeps cost low.
+                    if memmem(&tail_buf[..tail_len], NEEDLE_DONE).is_some()
+                        || memmem(bytes_ref, NEEDLE_DONE).is_some()
+                        || memmem(boundary_view, NEEDLE_DONE).is_some()
+                        || has_terminal_finish_reason(&tail_buf[..tail_len], NEEDLE_FINISH)
+                        || has_terminal_finish_reason(bytes_ref, NEEDLE_FINISH)
+                        || has_terminal_finish_reason(boundary_view, NEEDLE_FINISH)
+                        || memmem(&tail_buf[..tail_len], NEEDLE_MSG_STOP).is_some()
+                        || memmem(bytes_ref, NEEDLE_MSG_STOP).is_some()
+                        || memmem(boundary_view, NEEDLE_MSG_STOP).is_some()
                     {
                         saw_done = true;
                     }
-                    tail.clear();
-                    let take = bytes.len().min(32);
-                    tail.extend_from_slice(&bytes.as_ref()[bytes.len() - take..]);
+                    // Update tail: the new tail is the last (max_needle-1)
+                    // bytes of (old_tail + bytes). Build the concatenation
+                    // in a stack array (max size = 2*(max_needle-1) ≤ 64),
+                    // then copy the relevant suffix into tail_buf.
+                    let mut concat: [u8; 64] = [0u8; 64];
+                    let c_tail = tail_len.min(max_needle - 1);
+                    let c_bytes = bytes_ref.len().min((max_needle - 1).saturating_sub(c_tail));
+                    concat[..c_tail].copy_from_slice(&tail_buf[tail_len - c_tail..tail_len]);
+                    concat[c_tail..c_tail + c_bytes]
+                        .copy_from_slice(&bytes_ref[bytes_ref.len() - c_bytes..]);
+                    let total = c_tail + c_bytes;
+                    let take_new = total.min(max_needle - 1);
+                    tail_buf[..take_new].copy_from_slice(&concat[total - take_new..total]);
+                    tail_len = take_new;
                 }
             }
             Err(e) => {
@@ -522,6 +567,10 @@ struct Summary {
     err_connect: u64,
     err_parse: u64,
     err_stream: u64,
+    /// Spawned task 完成了 send_one，但把 outcome send 给 aggregator 时
+    /// 失败（receiver 已关闭）。0 是期望值；> 0 说明 aggregator 提前
+    /// 退出，sent - ok - sum(err_*) - dropped 即 task 被 abort 没 send 成的。
+    dropped: u64,
     actual_qps: f64,
     success_qps: f64,
     bytes_in: u64,
@@ -614,6 +663,7 @@ async fn aggregate_stats(
         err_connect: ERR_CNT.load(Ordering::Relaxed),
         err_parse: ERR_PRS.load(Ordering::Relaxed),
         err_stream: ERR_STR.load(Ordering::Relaxed),
+        dropped: DROPPED.load(Ordering::Relaxed),
         actual_qps: SENT.load(Ordering::Relaxed) as f64 / elapsed,
         success_qps: ok as f64 / elapsed,
         bytes_in: BYTES_IN.load(Ordering::Relaxed),
@@ -650,6 +700,14 @@ fn record_outcome(outcome: Outcome, ttft: &mut Histogram<u64>, e2e: &mut Histogr
 }
 
 fn print_live(ttft: &Histogram<u64>, e2e: &Histogram<u64>, start: Instant) {
+    // Use `tracing::info!` rather than `println!` so the aggregator task is
+    // never blocked on stdout I/O. A slow terminal (tmux scrollback, remote
+    // ssh with high latency) can stall `println!` for tens of ms; since the
+    // aggregator is single-task and serial, that delay cascades into the
+    // unbounded mpsc channel backpressure, indirectly throttling spawned
+    // tasks' `tx.send` completion — visible as artificially low actual_qps
+    // under high load. tracing writes to stderr asynchronously and never
+    // blocks the caller. Enable with `RUST_LOG=bench_client=info`.
     let sent = SENT.load(Ordering::Relaxed);
     let ok = OK.load(Ordering::Relaxed);
     let err429 = ERR_429.load(Ordering::Relaxed);
@@ -661,13 +719,15 @@ fn print_live(ttft: &Histogram<u64>, e2e: &Histogram<u64>, start: Instant) {
     let ttft_p99 = if ttft.len() > 0 { ttft.value_at_quantile(0.99) } else { 0 };
     let e2e_p50 = if e2e.len() > 0 { e2e.value_at_quantile(0.5) } else { 0 };
     let e2e_p99 = if e2e.len() > 0 { e2e.value_at_quantile(0.99) } else { 0 };
-    println!(
-        "[t+{:>5.1}s] sent={} ok={} 429={} 5xx={} tmo={} cnt={} | ttft p50={}ms p99={}ms | e2e p50={}ms p99={}ms | ok_qps={:.0}",
-        elapsed,
+    tracing::info!(
+        elapsed_s = format!("{:.1}", elapsed),
         sent, ok, err429, err5xx, errtmo, errcnt,
-        ttft_p50 / 1000, ttft_p99 / 1000,
-        e2e_p50 / 1000, e2e_p99 / 1000,
-        ok as f64 / elapsed.max(0.001),
+        ttft_p50_ms = ttft_p50 / 1000,
+        ttft_p99_ms = ttft_p99 / 1000,
+        e2e_p50_ms = e2e_p50 / 1000,
+        e2e_p99_ms = e2e_p99 / 1000,
+        ok_qps = format!("{:.0}", ok as f64 / elapsed.max(0.001)),
+        "live stats"
     );
 }
 
