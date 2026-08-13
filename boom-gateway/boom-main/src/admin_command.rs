@@ -121,6 +121,19 @@ pub async fn admin_command_handler(mut rx: tokio::sync::mpsc::Receiver<AdminComm
                 let result = boom_promptlog::ping_endpoint(&probe_config).await;
                 let _ = reply.send(result);
             }
+            AdminCommand::GetOtlpStatus { reply } => {
+                // Read-only snapshot of the live exporter's state machine.
+                // The writer's `otlp_status` takes an owned Arc out of the
+                // ArcSwap guard before awaiting, so we don't hold the guard
+                // across the await.
+                let snap = state.prompt_log_writer.otlp_status().await;
+                let _ = reply.send(snap);
+            }
+            AdminCommand::ProbeOtlp { reply } => {
+                // Manual probe — drives Offline → Online on success.
+                let result = state.prompt_log_writer.probe_otlp().await;
+                let _ = reply.send(result);
+            }
         }
     }
     tracing::warn!("Admin command handler stopped (channel closed)");

@@ -1,7 +1,7 @@
 use crate::config::{OtlpConfig, PromptLogConfig};
 use crate::entry::{LogPhase, PromptLogEntry};
 #[cfg(feature = "otlp")]
-use crate::otlp::OtelExporter;
+use crate::otlp::{ExporterStatusSnapshot, OtelExporter, ProbeResult};
 use arc_swap::ArcSwap;
 use flate2::write::GzEncoder;
 use flate2::Compression;
@@ -162,6 +162,53 @@ impl PromptLogWriter {
             flush_interval_secs = new_otlp.flush_interval_secs,
             "OTLP exporter hot-swapped via reload"
         );
+    }
+
+    /// Read-only snapshot of the live OTLP exporter's state machine. Returns
+    /// `None` when OTLP is not configured (no exporter in the ArcSwap) — the
+    /// dashboard treats `None` as "disabled" (gray indicator).
+    ///
+    /// Takes an owned `Arc<OtelExporter>` out of the ArcSwap guard before
+    /// returning, so callers can `.await` freely without holding the guard.
+    #[cfg(feature = "otlp")]
+    pub async fn otlp_status(&self) -> Option<ExporterStatusSnapshot> {
+        let g = self.otlp.load();
+        let Some(exporter) = g.as_ref() else {
+            return None;
+        };
+        // Clone out of the ArcSwap guard before awaiting so we don't hold the
+        // guard across the (potentially long) await.
+        Some(exporter.clone().status_snapshot())
+    }
+
+    #[cfg(not(feature = "otlp"))]
+    pub async fn otlp_status(&self) -> Option<()> {
+        None
+    }
+
+    /// Manual probe of the live OTLP exporter. Drives the state machine: on
+    /// success, transitions Offline → Online; on failure, records a probe
+    /// failure (but does NOT drive Online → Offline — only repeated flush
+    /// failures do that).
+    ///
+    /// Used by the dashboard's manual "Probe now" action when the operator
+    /// wants to attempt recovery before the next periodic tick. The periodic
+    /// tick calls `run_probe_cycle` internally; this is the user-triggered
+    /// counterpart that returns a `ProbeResult` for UI feedback.
+    #[cfg(feature = "otlp")]
+    pub async fn probe_otlp(&self) -> Option<ProbeResult> {
+        let g = self.otlp.load();
+        let Some(exporter) = g.as_ref() else {
+            return None;
+        };
+        // Clone out of the ArcSwap guard before awaiting so we don't hold
+        // the guard across the network probe.
+        Some(exporter.clone().probe().await)
+    }
+
+    #[cfg(not(feature = "otlp"))]
+    pub async fn probe_otlp(&self) -> Option<()> {
+        None
     }
 
     /// Read a snapshot of the current config.
