@@ -61,12 +61,16 @@ impl AzureProvider {
 impl Provider for AzureProvider {
     async fn chat(&self, mut req: ChatCompletionRequest) -> Result<ChatCompletionResponse, GatewayError> {
         req.model = self.deployment.clone();
+        let gateway_headers = std::mem::take(&mut req.gateway_headers);
         let body = serde_json::to_value(&req)
             .map_err(|e| GatewayError::InternalError(format!("Serialize error: {}", e)))?;
 
         let mut builder = self.client.post(self.azure_url());
         if let Some(ref key) = self.api_key {
             builder = builder.header("api-key", key);
+        }
+        for (name, value) in &gateway_headers {
+            builder = builder.header(name, value);
         }
         // Non-streaming: upstream sends no data until the entire response is ready.
         // Uses the reqwest Client timeout from deployment config (`create_provider`), not a separate 600s cap.
@@ -99,6 +103,7 @@ impl Provider for AzureProvider {
 
     async fn chat_stream(&self, mut req: ChatCompletionRequest) -> Result<ChatStream, GatewayError> {
         req.model = self.deployment.clone();
+        let gateway_headers = std::mem::take(&mut req.gateway_headers);
         let mut body = serde_json::to_value(&req)
             .map_err(|e| GatewayError::InternalError(format!("Serialize error: {}", e)))?;
 
@@ -113,6 +118,9 @@ impl Provider for AzureProvider {
         let mut builder = self.client.post(self.azure_url());
         if let Some(ref key) = self.api_key {
             builder = builder.header("api-key", key);
+        }
+        for (name, value) in &gateway_headers {
+            builder = builder.header(name, value);
         }
 
         let resp = builder

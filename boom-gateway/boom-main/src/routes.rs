@@ -675,8 +675,13 @@ async fn chat_completions_inner(
         None
     };
 
-    // Attach gateway-internal headers (e.g. X-Gateway-Priority) when enabled.
-    req.gateway_headers = build_gateway_headers(
+    // Attach gateway-internal headers (e.g. X-Gateway-Priority) plus the
+    // client-whitelisted headers. The compose function injects client
+    // whitelist first, gateway-controlled values second (overriding any
+    // same-named client entry — clients cannot spoof VIP priority).
+    req.gateway_headers = compose_gateway_headers(
+        headers,
+        &inner.config.router_settings.forward_client_headers,
         is_vip,
         inner.config.router_settings.enable_priority_header,
         api_path,
@@ -1775,6 +1780,88 @@ fn build_gateway_headers(
     headers
 }
 
+/// Filter client `HeaderMap` through a whitelist of header names. Returns
+/// a lowercased-keyed map of permitted, non-blocked client headers — the
+/// first half of the `req.gateway_headers` side-channel.
+///
+/// Empty whitelist = forward nothing (default-deny, matching historical
+/// behavior where the gateway rewrites every upstream header itself).
+///
+/// Hard-blocked names/prefixes — dropped even when listed in the whitelist:
+/// - `x-gateway-*`, `x-boom-*` — gateway-controlled, must not be spoofable
+/// - `authorization`, `x-api-key`, `api-key` — provider re-injects from
+///   deployment config (the whole point of the gateway)
+/// - `cookie`, `set-cookie` — RFC 6265代理剥离, prevents session leakage
+/// - `surrogate-key` — gateway routes KV-cache by `key_hash`, never client
+///
+/// Header name matching is case-insensitive (RFC 7230 §3.2): whitelist
+/// entries and incoming names are both lowercased before comparison.
+fn forward_client_headers(
+    client_headers: &axum::http::HeaderMap,
+    whitelist: &[String],
+) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    if whitelist.is_empty() {
+        return out;
+    }
+    let wl: std::collections::HashSet<&str> = whitelist.iter().map(|s| s.as_str()).collect();
+    for (name, value) in client_headers.iter() {
+        let lower = name.as_str().to_lowercase();
+        if lower.starts_with("x-gateway-")
+            || lower.starts_with("x-boom-")
+            || lower == "authorization"
+            || lower == "x-api-key"
+            || lower == "api-key"
+            || lower == "cookie"
+            || lower == "set-cookie"
+            || lower == "surrogate-key"
+        {
+            continue;
+        }
+        if !wl.contains(lower.as_str()) {
+            continue;
+        }
+        if let Ok(v) = value.to_str() {
+            out.insert(lower, v.to_string());
+        }
+    }
+    out
+}
+
+/// Compose the full upstream-header side-channel: client whitelist pass
+/// first, gateway-injected values second (overriding any same-named
+/// client entry). Centralizing the merge keeps the override order
+/// consistent across the OpenAI and Anthropic paths.
+///
+/// Both passes normalize keys to lowercase before inserting into the map —
+/// HTTP header names are case-insensitive (RFC 7230 §3.2), and using a
+/// single canonical case means the gateway-injected value reliably
+/// overrides any client-supplied value of the same name (e.g. a client
+/// cannot spoof `x-gateway-priority` because the gateway inserts the
+/// same lowercase key after the client pass).
+fn compose_gateway_headers(
+    client_headers: &axum::http::HeaderMap,
+    whitelist: &[String],
+    is_vip: bool,
+    enable_priority_header: bool,
+    api_path: &str,
+    client_type_enabled: bool,
+) -> std::collections::HashMap<String, String> {
+    let mut headers = forward_client_headers(client_headers, whitelist);
+    for (k, v) in build_gateway_headers(
+        is_vip,
+        enable_priority_header,
+        api_path,
+        client_type_enabled,
+    ) {
+        // Lowercase the key so gateway-injected entries override any
+        // same-named client entry already in the map (which was inserted
+        // under its lowercased name).
+        headers.insert(k.to_lowercase(), v);
+    }
+    headers
+}
+
 /// Build a RateLimitExceeded error with full scope info.
 fn rate_limit_exceeded(
     retry_after_secs: Option<u64>,
@@ -2758,8 +2845,13 @@ pub async fn messages(
         None
     };
 
-    // Attach gateway-internal headers (e.g. X-Gateway-Priority) when enabled.
-    openai_req.gateway_headers = build_gateway_headers(
+    // Attach gateway-internal headers (e.g. X-Gateway-Priority) plus the
+    // client-whitelisted headers. compose injects client whitelist first,
+    // gateway-controlled values second (overriding any same-named client
+    // entry — clients cannot spoof VIP priority). `/v1/messages` path.
+    openai_req.gateway_headers = compose_gateway_headers(
+        &headers,
+        &inner.config.router_settings.forward_client_headers,
         is_vip,
         inner.config.router_settings.enable_priority_header,
         "/v1/messages",
@@ -3277,7 +3369,11 @@ pub async fn kv_index_status(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_gateway_headers, is_vip_key, preferred_stream_usage, UsageTrackerState};
+    use super::{
+        build_gateway_headers, compose_gateway_headers, forward_client_headers,
+        is_vip_key, preferred_stream_usage, UsageTrackerState,
+    };
+    use axum::http::{HeaderMap, HeaderName, HeaderValue};
     use boom_core::types::{PromptTokensDetails, Usage};
     use serde_json::json;
 
@@ -3369,6 +3465,122 @@ mod tests {
     fn client_type_header_omitted_when_disabled() {
         let headers = build_gateway_headers(false, false, "/v1/messages", false);
         assert!(!headers.contains_key("X-BooM-Client-Type"));
+    }
+
+    /// Helper: build a HeaderMap from `(name, value)` pairs.
+    fn header_map(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (n, v) in pairs {
+            h.insert(
+                HeaderName::from_bytes(n.as_bytes()).unwrap(),
+                HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        h
+    }
+
+    #[test]
+    fn forward_client_headers_empty_whitelist_forwards_nothing() {
+        let client = header_map(&[("user-agent", "my-app/1.0"), ("x-custom", "abc")]);
+        let out = forward_client_headers(&client, &[]);
+        assert!(out.is_empty(), "empty whitelist must forward nothing");
+    }
+
+    #[test]
+    fn forward_client_headers_whitelisted_name_is_forwarded() {
+        let client = header_map(&[("user-agent", "my-app/1.0"), ("x-custom", "abc")]);
+        let wl = vec!["user-agent".to_string()];
+        let out = forward_client_headers(&client, &wl);
+        assert_eq!(out.get("user-agent").map(String::as_str), Some("my-app/1.0"));
+        assert!(!out.contains_key("x-custom"), "non-whitelisted header dropped");
+    }
+
+    #[test]
+    fn forward_client_headers_case_insensitive_match() {
+        // Client sends `User-Agent` (mixed case); whitelist lists `user-agent`.
+        let client = header_map(&[("User-Agent", "my-app/1.0")]);
+        let wl = vec!["user-agent".to_string()];
+        let out = forward_client_headers(&client, &wl);
+        assert_eq!(
+            out.get("user-agent").map(String::as_str),
+            Some("my-app/1.0"),
+            "header name matching must be case-insensitive"
+        );
+    }
+
+    #[test]
+    fn forward_client_headers_blocks_gateway_controlled_prefix() {
+        // Even when listed in the whitelist, x-gateway-* must be hard-dropped
+        // so clients cannot spoof VIP priority.
+        let client = header_map(&[("x-gateway-priority", "100")]);
+        let wl = vec!["x-gateway-priority".to_string()];
+        let out = forward_client_headers(&client, &wl);
+        assert!(out.is_empty(), "x-gateway-* must be hard-blocked even if whitelisted");
+    }
+
+    #[test]
+    fn forward_client_headers_blocks_boom_prefix() {
+        let client = header_map(&[("x-boom-client-type", "spoofed")]);
+        let wl = vec!["x-boom-client-type".to_string()];
+        let out = forward_client_headers(&client, &wl);
+        assert!(out.is_empty(), "x-boom-* must be hard-blocked even if whitelisted");
+    }
+
+    #[test]
+    fn forward_client_headers_blocks_auth_and_session_names() {
+        let client = header_map(&[
+            ("authorization", "Bearer sk-client"),
+            ("x-api-key", "sk-client"),
+            ("api-key", "sk-client"),
+            ("cookie", "session=abc"),
+            ("set-cookie", "session=abc"),
+            ("surrogate-key", "evil"),
+        ]);
+        // Whitelist lists ALL of them — the function must still drop every one.
+        let wl = vec![
+            "authorization".to_string(),
+            "x-api-key".to_string(),
+            "api-key".to_string(),
+            "cookie".to_string(),
+            "set-cookie".to_string(),
+            "surrogate-key".to_string(),
+        ];
+        let out = forward_client_headers(&client, &wl);
+        assert!(out.is_empty(), "auth/session/surrogate names must be hard-blocked");
+    }
+
+    #[test]
+    fn compose_gateway_headers_injects_gateway_value_overriding_client() {
+        // Client whitelists `x-gateway-priority` (will be hard-blocked in the
+        // client pass) and `user-agent` (forwarded). The gateway then
+        // injects its own `x-gateway-priority: 0`, which must be present
+        // and override any (blocked) client attempt.
+        let client = header_map(&[
+            ("user-agent", "my-app/1.0"),
+            ("x-gateway-priority", "100"), // client attempts to spoof VIP
+        ]);
+        let wl = vec![
+            "user-agent".to_string(),
+            "x-gateway-priority".to_string(),
+        ];
+        let out = compose_gateway_headers(
+            &client,
+            &wl,
+            /* is_vip */ false,
+            /* enable_priority_header */ true,
+            "/v1/chat/completions",
+            /* client_type_enabled */ false,
+        );
+        // Client UA forwarded (lowercase key).
+        assert_eq!(out.get("user-agent").map(String::as_str), Some("my-app/1.0"));
+        // Gateway value overrides — keys are lowercased so the gateway
+        // entry lives under the same key the client pass would have used.
+        assert_eq!(
+            out.get("x-gateway-priority").map(String::as_str),
+            Some("0"),
+            "gateway-injected value must win over client spoof attempt"
+        );
+        assert_eq!(out.len(), 2, "only UA and priority should be in the map");
     }
 
     #[test]

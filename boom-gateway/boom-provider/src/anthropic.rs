@@ -519,8 +519,9 @@ impl AnthropicProvider {
 
 #[async_trait]
 impl Provider for AnthropicProvider {
-    async fn chat(&self, req: ChatCompletionRequest) -> Result<ChatCompletionResponse, GatewayError> {
+    async fn chat(&self, mut req: ChatCompletionRequest) -> Result<ChatCompletionResponse, GatewayError> {
         let requested_model = req.model.clone();
+        let gateway_headers = std::mem::take(&mut req.gateway_headers);
         let body = self.to_anthropic_request(&req);
         let url = format!("{}/messages", self.base_url.trim_end_matches('/'));
         let betas = self.beta_headers(&req);
@@ -534,6 +535,9 @@ impl Provider for AnthropicProvider {
             .header("content-type", "application/json");
         if !betas.is_empty() {
             builder = builder.header("anthropic-beta", betas.join(","));
+        }
+        for (name, value) in &gateway_headers {
+            builder = builder.header(name, value);
         }
         // Non-streaming: upstream sends no data until the entire response is ready.
         // Uses the reqwest Client timeout from deployment config (`create_provider`), not a separate 600s cap.
@@ -567,8 +571,9 @@ impl Provider for AnthropicProvider {
         Ok(self.from_anthropic_response(body, &requested_model))
     }
 
-    async fn chat_stream(&self, req: ChatCompletionRequest) -> Result<ChatStream, GatewayError> {
+    async fn chat_stream(&self, mut req: ChatCompletionRequest) -> Result<ChatStream, GatewayError> {
         let requested_model = req.model.clone();
+        let gateway_headers = std::mem::take(&mut req.gateway_headers);
         let mut body = self.to_anthropic_request(&req);
         body["stream"] = serde_json::json!(true);
         let betas = self.beta_headers(&req);
@@ -584,6 +589,9 @@ impl Provider for AnthropicProvider {
             .header("content-type", "application/json");
         if !betas.is_empty() {
             builder = builder.header("anthropic-beta", betas.join(","));
+        }
+        for (name, value) in &gateway_headers {
+            builder = builder.header(name, value);
         }
 
         let resp = builder
@@ -933,5 +941,150 @@ impl Provider for AnthropicProvider {
 
     fn client_type_header(&self) -> bool {
         self.client_type_header
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Build a minimal OpenAI-format request carrying gateway-internal headers.
+    /// Anthropic provider's `chat`/`chat_stream` start from this format and
+    /// internally convert to Anthropic Messages API via `to_anthropic_request`.
+    fn request_with_gateway_headers(headers: &[(&str, &str)]) -> ChatCompletionRequest {
+        let mut gateway_headers = HashMap::new();
+        for (k, v) in headers {
+            gateway_headers.insert(k.to_string(), v.to_string());
+        }
+        ChatCompletionRequest {
+            model: "claude-test".to_string(),
+            messages: vec![Message {
+                role: MessageRole::User,
+                content: MessageContent::Text("hello".to_string()),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            }],
+            temperature: None,
+            top_p: None,
+            n: None,
+            stream: None,
+            stop: None,
+            max_tokens: None,
+            max_completion_tokens: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            user: None,
+            tools: None,
+            tool_choice: None,
+            response_format: None,
+            seed: None,
+            logprobs: None,
+            top_logprobs: None,
+            logit_bias: None,
+            extra: Default::default(),
+            gateway_headers,
+            kv_cache_report_full: false,
+        }
+    }
+
+    fn fake_anthropic_response() -> serde_json::Value {
+        serde_json::json!({
+            "id": "msg_test",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "hi"}],
+            "model": "claude-test",
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 5, "output_tokens": 1}
+        })
+    }
+
+    fn provider_for(uri: String, api_key: Option<String>) -> AnthropicProvider {
+        AnthropicProvider::new(
+            Client::new(),
+            api_key,
+            Some(uri),
+            "claude-test",
+            None,
+            false,
+        )
+    }
+
+    /// Regression: before this fix, Anthropic provider's `chat` did NOT
+    /// read `req.gateway_headers` — the whitelist pass would land in the
+    /// `HashMap` but never reach the upstream reqwest request. This test
+    /// pins the fix: an `X-Gateway-Priority` entry must arrive at upstream.
+    #[tokio::test]
+    async fn chat_injects_gateway_header() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/messages"))
+            .and(header("x-gateway-priority", "100"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(fake_anthropic_response()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = provider_for(server.uri(), None);
+        let req = request_with_gateway_headers(&[("x-gateway-priority", "100")]);
+        assert!(provider.chat(req).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn chat_stream_injects_gateway_header() {
+        let sse_body = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_test\",\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/messages"))
+            .and(header("x-gateway-priority", "100"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(sse_body)
+                    .insert_header("content-type", "text/event-stream"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = provider_for(server.uri(), None);
+        let req = request_with_gateway_headers(&[("x-gateway-priority", "100")]);
+        let stream = provider.chat_stream(req).await.expect("stream must start");
+        // Drain the stream so the mock sees a complete request lifecycle.
+        use futures::StreamExt;
+        tokio::pin!(stream);
+        while stream.next().await.is_some() {}
+    }
+
+    /// When `gateway_headers` is empty, no extra headers should be sent
+    /// (auth + anthropic-version + content-type + anthropic-beta only).
+    #[tokio::test]
+    async fn chat_without_gateway_headers_sends_no_priority_header() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/messages"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(fake_anthropic_response()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = provider_for(server.uri(), None);
+        let req = request_with_gateway_headers(&[]);
+        assert!(provider.chat(req).await.is_ok());
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            !requests[0].headers.contains_key("x-gateway-priority"),
+            "no x-gateway-priority header should be sent when gateway_headers is empty"
+        );
     }
 }

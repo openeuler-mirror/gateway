@@ -601,6 +601,27 @@ pub struct RouterSettings {
     /// protocol).
     #[serde(default)]
     pub strip_claude_code_attribution: bool,
+    /// Whitelist of client header names to forward to upstream providers.
+    ///
+    /// HTTP header names are case-insensitive — entries are normalized to
+    /// lowercase at load time and matched case-insensitively against the
+    /// incoming `HeaderMap`. An empty list (default) forwards nothing,
+    /// matching historical behavior: the gateway rewrites all upstream
+    /// headers itself.
+    ///
+    /// Gateway-controlled names (`x-gateway-*`, `x-boom-*`) and
+    /// auth/session names (`authorization`, `x-api-key`, `api-key`,
+    /// `cookie`, `set-cookie`, `surrogate-key`) are forcibly dropped from
+    /// client input even when listed here — operators cannot accidentally
+    /// let clients spoof VIP priority or leak session state. Gateway-
+    /// injected values for the same name always win (inserted after the
+    /// client whitelist pass, overriding any collision).
+    ///
+    /// Only the value-matching, non-blocked subset of client headers
+    /// reaches the upstream `reqwest` request — see
+    /// `boom_main::routes::forward_client_headers`.
+    #[serde(default)]
+    pub forward_client_headers: Vec<String>,
 }
 
 impl RouterSettings {
