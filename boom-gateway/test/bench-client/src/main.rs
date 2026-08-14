@@ -591,6 +591,7 @@ struct Percentiles {
     p99_us: u64,
     p999_us: u64,
     max_us: u64,
+    mean_us: f64,
     count: u64,
 }
 
@@ -606,6 +607,7 @@ impl Percentiles {
             p99_us: h.value_at_quantile(0.99),
             p999_us: h.value_at_quantile(0.999),
             max_us: h.max(),
+            mean_us: h.mean(),
             count: h.len(),
         }
     }
@@ -717,14 +719,18 @@ fn print_live(ttft: &Histogram<u64>, e2e: &Histogram<u64>, start: Instant) {
     let elapsed = start.elapsed().as_secs_f64();
     let ttft_p50 = if ttft.len() > 0 { ttft.value_at_quantile(0.5) } else { 0 };
     let ttft_p99 = if ttft.len() > 0 { ttft.value_at_quantile(0.99) } else { 0 };
+    let ttft_mean = if ttft.len() > 0 { ttft.mean() } else { 0.0 };
     let e2e_p50 = if e2e.len() > 0 { e2e.value_at_quantile(0.5) } else { 0 };
     let e2e_p99 = if e2e.len() > 0 { e2e.value_at_quantile(0.99) } else { 0 };
+    let e2e_mean = if e2e.len() > 0 { e2e.mean() } else { 0.0 };
     tracing::info!(
         elapsed_s = format!("{:.1}", elapsed),
         sent, ok, err429, err5xx, errtmo, errcnt,
         ttft_p50_ms = ttft_p50 / 1000,
+        ttft_mean_ms = format!("{:.1}", ttft_mean / 1000.0),
         ttft_p99_ms = ttft_p99 / 1000,
         e2e_p50_ms = e2e_p50 / 1000,
+        e2e_mean_ms = format!("{:.1}", e2e_mean / 1000.0),
         e2e_p99_ms = e2e_p99 / 1000,
         ok_qps = format!("{:.0}", ok as f64 / elapsed.max(0.001)),
         "live stats"
