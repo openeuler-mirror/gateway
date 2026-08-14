@@ -178,11 +178,24 @@ pub struct ChatCompletionRequest {
     /// upstream providers that may not understand them.
     #[serde(default, flatten, skip_serializing)]
     pub extra: serde_json::Map<String, serde_json::Value>,
-    /// Gateway-internal HTTP headers to inject into the upstream request
-    /// (e.g. `X-Gateway-Priority` for the downstream scheduler). Skipped by serde
-    /// in both directions: never parsed from the client body (prevents
-    /// spoofing) and never serialized into the upstream JSON body. Purely an
-    /// in-memory side channel from the route layer to the provider layer.
+    /// Gateway-internal HTTP headers to inject into the upstream request —
+    /// a side channel from the route layer to the provider layer that never
+    /// touches serde (never parsed from client body, preventing spoofing;
+    /// never serialized into the upstream JSON body).
+    ///
+    /// Carries two categories, merged by the route layer:
+    /// 1. **Client-whitelisted headers** — entries from the client's
+    ///    `HeaderMap` whose lowercased name appears in
+    ///    `router_settings.forward_client_headers` (after hard-blocking
+    ///    `x-gateway-*`, `x-boom-*`, `authorization`, `x-api-key`,
+    ///    `api-key`, `cookie`, `set-cookie`, `surrogate-key`).
+    /// 2. **Gateway-injected headers** — `X-Gateway-Priority`,
+    ///    `X-BooM-Client-Type`, etc., built by `build_gateway_headers`.
+    ///
+    /// Gateway-injected entries are inserted **after** the client whitelist
+    /// pass, so they override any same-named client value (operators cannot
+    /// let a client spoof VIP priority by listing `x-gateway-priority` in
+    /// the whitelist — that name is hard-blocked anyway).
     #[serde(skip)]
     pub gateway_headers: HashMap<String, String>,
     /// Internal flag: when true, the gateway asks the upstream inference engine

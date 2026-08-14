@@ -302,8 +302,9 @@ impl GeminiProvider {
 
 #[async_trait]
 impl Provider for GeminiProvider {
-    async fn chat(&self, req: ChatCompletionRequest) -> Result<ChatCompletionResponse, GatewayError> {
+    async fn chat(&self, mut req: ChatCompletionRequest) -> Result<ChatCompletionResponse, GatewayError> {
         let requested_model = req.model.clone();
+        let gateway_headers = std::mem::take(&mut req.gateway_headers);
         let body = self.to_gemini_request(&req);
         let url = format!(
             "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent",
@@ -313,6 +314,9 @@ impl Provider for GeminiProvider {
         let mut builder = self.client.post(&url);
         if let Some(ref key) = self.api_key {
             builder = builder.query(&[("key", key)]);
+        }
+        for (name, value) in &gateway_headers {
+            builder = builder.header(name, value);
         }
         // Non-streaming: upstream sends no data until the entire response is ready.
         // Uses the reqwest Client timeout from deployment config (`create_provider`), not a separate 600s cap.
@@ -346,8 +350,9 @@ impl Provider for GeminiProvider {
         Ok(self.from_gemini_response(body, &requested_model))
     }
 
-    async fn chat_stream(&self, req: ChatCompletionRequest) -> Result<ChatStream, GatewayError> {
+    async fn chat_stream(&self, mut req: ChatCompletionRequest) -> Result<ChatStream, GatewayError> {
         let requested_model = req.model.clone();
+        let gateway_headers = std::mem::take(&mut req.gateway_headers);
         let body = self.to_gemini_request(&req);
         let url = format!(
             "https://generativelanguage.googleapis.com/v1beta/models/{}:streamGenerateContent?alt=sse",
@@ -357,6 +362,9 @@ impl Provider for GeminiProvider {
         let mut builder = self.client.post(&url);
         if let Some(ref key) = self.api_key {
             builder = builder.query(&[("key", key)]);
+        }
+        for (name, value) in &gateway_headers {
+            builder = builder.header(name, value);
         }
 
         let resp = builder

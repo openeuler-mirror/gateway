@@ -3510,6 +3510,100 @@ pub async fn ping_otlp_endpoint(
     }
 }
 
+/// GET `/admin/prompt-log/otlp-status` — read the live OTLP exporter's state
+/// machine snapshot. Returns `{ok:true, status: "online"|"offline", ...}` when
+/// an exporter is configured, or `{ok:true, status:"disabled"}` when OTLP is
+/// not configured (None from the writer). The dashboard polls this every 5s
+/// to drive the connectivity indicator.
+pub async fn otlp_status(
+    _session: AdminSession,
+    Extension(state): Extension<Arc<DashboardState>>,
+) -> Response {
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    if state
+        .admin_tx
+        .send(crate::state::AdminCommand::GetOtlpStatus { reply: reply_tx })
+        .await
+        .is_err()
+    {
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "Admin command handler unavailable",
+        )
+            .into_response();
+    }
+    match reply_rx.await {
+        Ok(Some(snap)) => Json(json!({
+            "ok": true,
+            "status": snap.status,
+            "endpoint": snap.endpoint,
+            "last_failure_ts": snap.last_failure_ts,
+            "last_recovery_ts": snap.last_recovery_ts,
+            "consecutive_probe_failures": snap.consecutive_probe_failures,
+            "total_offline_episodes": snap.total_offline_episodes,
+            "total_dropped_during_offline": snap.total_dropped_during_offline,
+            "dropped_count": snap.dropped_count,
+        }))
+        .into_response(),
+        Ok(None) => Json(json!({
+            "ok": true,
+            "status": "disabled",
+            "endpoint": "",
+        }))
+        .into_response(),
+        Err(_) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "Admin command handler dropped reply",
+        )
+            .into_response(),
+    }
+}
+
+/// POST `/admin/prompt-log/otlp-probe` — manually trigger a probe on the
+/// live exporter. On success transitions Offline → Online and returns
+/// `{ok:true, latency_ms}`; on failure returns `{ok:false, error}` (does
+/// NOT drive Online → Offline — only repeated flush failures do that).
+/// Used by the dashboard's "Probe now" button when the operator wants to
+/// attempt recovery before the next periodic tick.
+pub async fn probe_otlp(
+    _session: AdminSession,
+    Extension(state): Extension<Arc<DashboardState>>,
+) -> Response {
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    if state
+        .admin_tx
+        .send(crate::state::AdminCommand::ProbeOtlp { reply: reply_tx })
+        .await
+        .is_err()
+    {
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "Admin command handler unavailable",
+        )
+            .into_response();
+    }
+    match reply_rx.await {
+        Ok(Some(boom_promptlog::ProbeResult::Ok { latency_ms })) => Json(json!({
+            "ok": true,
+            "latency_ms": latency_ms,
+        }))
+        .into_response(),
+        Ok(Some(boom_promptlog::ProbeResult::Fail { error })) => {
+            Json(json!({"ok": false, "error": error})).into_response()
+        }
+        Ok(None) => Json(json!({
+            "ok": false,
+            "error": "OTLP not configured",
+        }))
+        .into_response(),
+        Err(_) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "Admin command handler dropped reply",
+        )
+            .into_response(),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct PromptLogToggleRequest {
     pub enabled: bool,

@@ -88,6 +88,24 @@ pub enum AdminCommand {
         timeout_secs: u64,
         reply: oneshot::Sender<Result<u64, String>>,
     },
+    /// Read the live OTLP exporter's state machine snapshot — Online/Offline
+    /// status, endpoint, last_failure_ts, last_recovery_ts, episode counters,
+    /// dropped counts. The dashboard polls this every 5s to drive the
+    /// connectivity indicator (green=online, red=offline, gray=disabled).
+    /// Returns `None` when OTLP is not configured (no exporter in the
+    /// ArcSwap); the dashboard treats `None` as "disabled".
+    GetOtlpStatus {
+        reply: oneshot::Sender<Option<boom_promptlog::ExporterStatusSnapshot>>,
+    },
+    /// Manually trigger a probe on the live exporter. On success transitions
+    /// Offline → Online; on failure records a probe failure (but does NOT
+    /// drive Online → Offline — only repeated flush failures do that). Used
+    /// by the dashboard's "Probe now" action when the operator wants to
+    /// attempt recovery before the next periodic tick. Returns `None` when
+    /// OTLP is not configured.
+    ProbeOtlp {
+        reply: oneshot::Sender<Option<boom_promptlog::ProbeResult>>,
+    },
 }
 
 pub type AdminTx = mpsc::Sender<AdminCommand>;

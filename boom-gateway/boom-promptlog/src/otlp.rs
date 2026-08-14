@@ -1,17 +1,49 @@
 //! OTLP/HTTP exporter for prompt log entries.
 //!
 //! The exporter has one job: take `PromptLogEntry`s, batch them up, and POST
-//! them as `ExportLogsServiceRequest` protobuf to `{endpoint}/v1/logs`. Two
-//! design rules:
+//! them as `ExportLogsServiceRequest` protobuf to `{endpoint}/v1/logs`. The
+//! design rests on three principles:
 //!
 //! 1. **`convert_entry_to_log_records` is a pure function** — no client, no
 //!    state. The offline replayer (see `replay.rs`) reuses it so the runtime
 //!    and replay paths produce byte-identical LogRecords from the same entry.
 //!    "What you stored locally is what gets pushed" is the contract.
-//! 2. **Never block the gateway.** The exporter owns a bounded Vec; overflow
-//!    drops oldest with a `tracing::warn!`. HTTP failures retry a couple
-//!    times with exponential backoff and then drop the batch with a warn.
-//!    Local JSONL is the source of truth; OTLP is best-effort.
+//! 2. **Local JSONL is the source of truth; OTLP is best-effort.** The writer
+//!    writes JSONL first and forks a copy to the exporter. Any failure on the
+//!    OTLP side never blocks or stalls the local sink.
+//! 3. **Result-oriented state machine.** When the OTLP backend is
+//!    unreachable, the exporter enters `Offline` and skips all further pushes
+//!    — no point burning CPU/network on a known-dead endpoint. Recovery is
+//!    detected by a periodic lightweight probe (an empty
+//!    `ExportLogsServiceRequest`). The "能推则推，不能推则丢弃" contract: we
+//!    do not buffer offline entries for later replay; the JSONL file is the
+//!    durable record.
+//!
+//! # State machine
+//!
+//! ```text
+//!                ┌─────────────┐
+//!     startup → │   Online    │
+//!                │ push → batch│←────────────┐
+//!                │ tick → flush│             │
+//!                └──────┬──────┘             │
+//!                       │                    │
+//!                       │ flush 3× retry     │
+//!                       │ all failed         │
+//!                       ▼                    │
+//!                ┌─────────────┐             │
+//!                │   Offline   │── tick (5s) ─┘
+//!                │ skip push   │   probe ok
+//!                │ tick→probe  │
+//!                └─────────────┘
+//!                       │
+//!                       │ probe fail (stay Offline)
+//!                       ▼
+//!                  (stay Offline)
+//! ```
+//!
+//! Transitions are atomic (AtomicU8 for status, AtomicU64 for counters) so
+//! the hot path (`enqueue`) reads status without locking.
 
 use crate::config::OtlpConfig;
 #[cfg(test)]
@@ -27,10 +59,17 @@ use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use prost::Message as ProstMessage;
 use sha2::{Digest, Sha256};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 use tokio::time::{interval_at, Instant};
+
+/// Status byte for `OtelExporter::status`. Using integer constants (rather
+/// than an enum) so reads on the hot path are lock-free via `AtomicU8`.
+const STATUS_ONLINE: u8 = 0;
+const STATUS_OFFLINE: u8 = 1;
 
 /// Severity numbers (OTel spec): INFO=9, WARN=13, ERROR=17. The producer maps
 /// HTTP status → severity; missing status defaults to INFO.
@@ -40,7 +79,7 @@ fn severity_for(status: Option<i32>, phase: LogPhase) -> i32 {
         LogPhase::Response => match status {
             Some(s) if (200..300).contains(&s) => 9,  // INFO
             Some(s) if (400..500).contains(&s) => 13, // WARN
-            Some(_) => 17,                              // ERROR (5xx)
+            Some(_) => 17, // ERROR (5xx)
             None => 9, // unknown status — assume OK
         },
     }
@@ -230,8 +269,8 @@ pub fn convert_entry_to_log_records(
     if let Some(ip) = &entry.client_ip {
         attrs.push(otlp_kv_string("client.address", ip));
     }
-    if let Some(d) = entry.duration_ms {
-        attrs.push(otlp_kv_int("duration_ms", d as i64));
+    if let Some(d) = &entry.duration_ms {
+        attrs.push(otlp_kv_int("duration_ms", *d as i64));
     }
 
     // Custom prompt_log.* fields.
@@ -331,28 +370,110 @@ pub fn build_export_request(resource_logs: Vec<ResourceLogs>) -> ExportLogsServi
     ExportLogsServiceRequest { resource_logs }
 }
 
-/// Batched OTLP exporter. Owns the HTTP client and the in-memory queue.
-/// Always wrapped in `Arc` — the writer holds `Arc<Self>` so the background
-/// task and the enqueue path can both reach the same shared batch.
+/// Read-only snapshot of the OTLP exporter's runtime state.
+///
+/// Returned by [`OtelExporter::status_snapshot`]. The dashboard surfaces this
+/// through `GET /admin/prompt-log/otlp-status` so the connectivity indicator
+/// reflects the live state machine (Online/Offline) rather than a one-shot
+/// manual ping. Timestamps are unix epoch seconds; `None` means "never".
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ExporterStatusSnapshot {
+    /// `"online"` or `"offline"`. Push is skipped while offline.
+    pub status: String,
+    /// The endpoint URL the exporter is currently committed to (from YAML
+    /// via `replace_otlp`). Differs from the live config endpoint only
+    /// briefly during a reload race window.
+    pub endpoint: String,
+    pub last_failure_ts: Option<u64>,
+    pub last_recovery_ts: Option<u64>,
+    /// Probe failures since the last successful probe. Only accumulates while
+    /// Offline — Online flush successes reset this implicitly (the value is
+    /// only meaningful when status == offline).
+    pub consecutive_probe_failures: u64,
+    /// Lifetime counter of how many times the exporter entered Offline.
+    pub total_offline_episodes: u64,
+    /// Entries dropped at enqueue time because the exporter was Offline.
+    /// Does NOT include entries dropped due to batch overflow while Online —
+    /// those are in `dropped_count`.
+    pub total_dropped_during_offline: u64,
+    /// Total entries ever dropped (offline skip + batch overflow + flush
+    /// failure drops). Monotonic across reloads within a process lifetime.
+    pub dropped_count: u64,
+}
+
+/// Result of a manual probe via [`OtelExporter::probe`].
+#[derive(Debug, Clone)]
+pub enum ProbeResult {
+    /// Probe succeeded. If the exporter was Offline it has been transitioned
+    /// back to Online.
+    Ok { latency_ms: u64 },
+    /// Probe failed. If the exporter was Online it remains Online (the
+    /// manual probe does NOT cause a transition to Offline — only repeated
+    /// flush failures do that). If it was already Offline, the failure is
+    /// recorded in `consecutive_probe_failures`.
+    Fail { error: String },
+}
+
+/// Batched OTLP exporter with a result-oriented state machine.
+///
+/// Owns the HTTP client, an in-memory batch, and the Online/Offline status.
+/// Always wrapped in `Arc` — the writer holds `Arc<ArcSwap<Option<Arc<Self>>>>`
+/// so the whole exporter can be hot-swapped at runtime via `replace_otlp`
+/// (called by boom-main when the OTLP sub-config changes).
+///
+/// # Memory bounds
+///
+/// - `batch` is bounded by `max_queue_size` (default 10000). Overflow drops
+///   oldest (O(1) via VecDeque pop_front).
+/// - In-flight `flush` tasks are bounded to **1** via a `Semaphore(1)`. While
+///   one flush is in retry backoff, additional batch-full triggers do NOT
+///   spawn more flush tasks — they accumulate in `batch` and are picked up
+///   by the next periodic tick or by the next successful flush.
+/// - While Offline, `enqueue` returns immediately without touching `batch`
+///   or spawning any task — zero memory growth.
+///
+/// # State transitions
+///
+/// - **Online → Offline**: a flush's three retry attempts all fail (network
+///   error, HTTP non-2xx, or timeout — result-oriented, all treated the same).
+/// - **Offline → Online**: a periodic probe (or manual `probe()`) returns
+///   HTTP 2xx.
 pub struct OtelExporter {
     client: reqwest::Client,
     endpoint: String,
     extra_headers: Vec<(String, String)>,
     resource: Resource,
-    batch: Arc<Mutex<Vec<PromptLogEntry>>>,
+    batch: Arc<Mutex<VecDeque<PromptLogEntry>>>,
     batch_size: usize,
     flush_interval: Duration,
     max_attribute_bytes: usize,
     max_queue_size: usize,
-    /// How many entries we've dropped since startup due to queue overflow.
-    /// Saturation here means OTLP backend is slow.
-    dropped_count: Arc<std::sync::atomic::AtomicU64>,
+    /// Total entries ever dropped (offline skip + batch overflow + flush
+    /// failure). Surfaced to dashboard via `status_snapshot`.
+    dropped_count: Arc<AtomicU64>,
+    /// Status byte (STATUS_ONLINE / STATUS_OFFLINE). Atomic so `enqueue`'s
+    /// hot-path read is lock-free.
+    status: AtomicU8,
+    /// Probe failures since the last successful probe. Only meaningful while
+    /// Offline — Online flush successes reset this implicitly.
+    consecutive_probe_failures: AtomicU64,
+    /// Unix epoch secs of the last failure (flush or probe). 0 = never.
+    last_failure_ts: AtomicU64,
+    /// Unix epoch secs of the last recovery (Offline → Online transition). 0 = never.
+    last_recovery_ts: AtomicU64,
+    /// Lifetime counter of Offline episodes.
+    total_offline_episodes: AtomicU64,
+    /// Entries dropped at enqueue time because the exporter was Offline.
+    total_dropped_during_offline: AtomicU64,
+    /// Serializes in-flight flush tasks to at most 1. Acquired before spawn,
+    /// held until the flush returns.
+    flush_permit: Arc<Semaphore>,
 }
 
 impl OtelExporter {
     /// Construct an exporter from config. Caller is responsible for spawning
     /// the flush task via `spawn_flush_task` and triggering a final flush
-    /// via `flush()` at shutdown.
+    /// via `flush()` at shutdown. The exporter starts in Online status.
     pub fn new(config: &OtlpConfig) -> Arc<Self> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(config.timeout_secs.max(1)))
@@ -369,12 +490,19 @@ impl OtelExporter {
             endpoint: config.endpoint.clone(),
             extra_headers,
             resource,
-            batch: Arc::new(Mutex::new(Vec::with_capacity(config.batch_size))),
+            batch: Arc::new(Mutex::new(VecDeque::with_capacity(config.batch_size))),
             batch_size: config.batch_size,
             flush_interval: Duration::from_secs(config.flush_interval_secs.max(1)),
             max_attribute_bytes: config.max_attribute_bytes,
             max_queue_size: config.max_queue_size,
-            dropped_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            dropped_count: Arc::new(AtomicU64::new(0)),
+            status: AtomicU8::new(STATUS_ONLINE),
+            consecutive_probe_failures: AtomicU64::new(0),
+            last_failure_ts: AtomicU64::new(0),
+            last_recovery_ts: AtomicU64::new(0),
+            total_offline_episodes: AtomicU64::new(0),
+            total_dropped_during_offline: AtomicU64::new(0),
+            flush_permit: Arc::new(Semaphore::new(1)),
         })
     }
 
@@ -387,7 +515,7 @@ impl OtelExporter {
     }
 
     /// Get a clone of the dropped-counter handle (for metrics surfacing).
-    pub fn dropped_count_handle(&self) -> Arc<std::sync::atomic::AtomicU64> {
+    pub fn dropped_count_handle(&self) -> Arc<AtomicU64> {
         self.dropped_count.clone()
     }
 
@@ -399,6 +527,286 @@ impl OtelExporter {
     pub fn max_attribute_bytes(&self) -> usize {
         self.max_attribute_bytes
     }
+
+    /// Read-only snapshot of the exporter's runtime state. Cheap (atomic
+    /// loads only), safe to call from any thread.
+    pub fn status_snapshot(&self) -> ExporterStatusSnapshot {
+        ExporterStatusSnapshot {
+            status: if self.is_offline() {
+                "offline".to_string()
+            } else {
+                "online".to_string()
+            },
+            endpoint: self.endpoint.clone(),
+            last_failure_ts: read_atomic_opt(&self.last_failure_ts),
+            last_recovery_ts: read_atomic_opt(&self.last_recovery_ts),
+            consecutive_probe_failures: self.consecutive_probe_failures.load(Ordering::Relaxed),
+            total_offline_episodes: self.total_offline_episodes.load(Ordering::Relaxed),
+            total_dropped_during_offline: self.total_dropped_during_offline.load(Ordering::Relaxed),
+            dropped_count: self.dropped_count.load(Ordering::Relaxed),
+        }
+    }
+
+    /// `true` when the exporter is in Offline status (push skipped).
+    #[inline]
+    pub fn is_offline(&self) -> bool {
+        self.status.load(Ordering::Relaxed) == STATUS_OFFLINE
+    }
+
+    /// Push an entry into the in-memory queue. Behavior depends on state:
+    ///
+    /// - **Online**: push to `batch`. If batch is full, drop the oldest
+    ///   (FIFO, O(1)). If `batch.len() >= batch_size`, try to acquire the
+    ///   flush permit; if acquired, spawn a flush task; if not, the entries
+    ///   wait for the next periodic tick.
+    /// - **Offline**: drop immediately + bump `dropped_count` and
+    ///   `total_dropped_during_offline`. Zero memory growth.
+    ///
+    /// Never blocks on the network. The Mutex is held only for the brief
+    /// batch push; the HTTP round-trip happens in a spawned task (or the
+    /// periodic tick) holding the flush permit, not the batch lock.
+    pub async fn enqueue(self: &Arc<Self>, entry: PromptLogEntry) {
+        // Hot path: lock-free status read. Offline → immediate drop, no batch
+        // touch, no spawn. This is the contract that bounds memory under
+        // backend outage.
+        if self.is_offline() {
+            self.dropped_count.fetch_add(1, Ordering::Relaxed);
+            self.total_dropped_during_offline
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+
+        let should_flush = {
+            let mut batch = self.batch.lock().await;
+            if batch.len() >= self.max_queue_size {
+                let dropped = batch.pop_front().expect("batch non-empty when len>=cap");
+                self.dropped_count.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    request_id = %dropped.request_id,
+                    queue_size = self.max_queue_size,
+                    "OTLP batch full, dropping oldest entry"
+                );
+            }
+            batch.push_back(entry);
+            batch.len() >= self.batch_size
+        };
+
+        if should_flush {
+            // Try to acquire the flush permit. If acquired, spawn a flush
+            // task that holds the permit until it returns. If not acquired,
+            // a flush is already in flight — the entries accumulated above
+            // will be picked up by the next periodic tick or by the in-flight
+            // flush's next iteration. This bounds in-flight flush tasks to 1.
+            if let Ok(permit) = self.flush_permit.clone().try_acquire_owned() {
+                let me = self.clone();
+                tokio::spawn(async move {
+                    me.flush().await;
+                    drop(permit);
+                });
+            }
+        }
+    }
+
+    /// Force a flush of the current batch right now, regardless of size.
+    /// Used by the periodic task and by shutdown. Also used by `probe()` to
+    /// drain pending entries after a successful probe (so they don't sit in
+    /// the batch until the next tick).
+    pub async fn flush(&self) {
+        let drained: VecDeque<PromptLogEntry> = {
+            let mut batch = self.batch.lock().await;
+            if batch.is_empty() {
+                return;
+            }
+            std::mem::take(&mut *batch)
+        };
+
+        match self.send_with_retry(&drained).await {
+            Ok(()) => { /* stay Online */ }
+            Err(()) => {
+                // Result-oriented: any failure (network, HTTP non-2xx,
+                // timeout) drives the exporter Offline. The drained batch's
+                // entries are counted as dropped — they're still in JSONL,
+                // so not truly lost, but the OTLP copy is gone.
+                self.transition_to_offline(drained.len() as u64);
+            }
+        }
+    }
+
+    /// Build the HTTP request body for a batch and send it, retrying up to 3
+    /// times with exponential backoff (100ms, 200ms, 400ms). Returns `Err(())`
+    /// if all attempts fail — caller drives the state-machine transition.
+    async fn send_with_retry(&self, drained: &VecDeque<PromptLogEntry>) -> Result<(), ()> {
+        let resource_logs: Vec<ResourceLogs> = drained
+            .iter()
+            .map(|e| convert_entry_to_log_records(e, &self.resource, self.max_attribute_bytes))
+            .collect();
+        let req = build_export_request(resource_logs);
+        let body = req.encode_to_vec();
+        let url = format!("{}/v1/logs", self.endpoint.trim_end_matches('/'));
+
+        let mut attempt = 0u32;
+        loop {
+            let result = self
+                .client
+                .post(&url)
+                .header("Content-Type", "application/x-protobuf")
+                .body(body.clone())
+                .send()
+                .await;
+            match result {
+                Ok(resp) if resp.status().is_success() => return Ok(()),
+                Ok(resp) => {
+                    let status = resp.status();
+                    tracing::warn!(
+                        attempt = attempt + 1,
+                        status = %status,
+                        "OTLP collector returned non-success status"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        attempt = attempt + 1,
+                        error = %e,
+                        "OTLP push failed"
+                    );
+                }
+            }
+            attempt += 1;
+            if attempt >= 3 {
+                return Err(());
+            }
+            tokio::time::sleep(Duration::from_millis(100u64 * (1 << attempt))).await;
+        }
+    }
+
+    /// Manual probe. Sends an empty `ExportLogsServiceRequest` to the
+    /// endpoint using the exporter's own HTTP client (so the probe goes
+    /// through the same connection pool / headers / timeout as a real push).
+    ///
+    /// - Success → if was Offline, transition to Online. Returns `Ok { latency_ms }`.
+    /// - Failure → if was Offline, bump `consecutive_probe_failures`. If was
+    ///   Online, leave it Online (manual probe failure does NOT drive the
+    ///   exporter Offline — only repeated flush failures do that).
+    ///
+    /// This is the API the dashboard's "Test" button calls through
+    /// `PromptLogWriter::probe_otlp`. The periodic tick uses the internal
+    /// `run_probe_cycle` instead, which logs differently.
+    pub async fn probe(self: &Arc<Self>) -> ProbeResult {
+        match self.probe_internal().await {
+            Ok(latency_ms) => {
+                self.transition_to_online();
+                ProbeResult::Ok { latency_ms }
+            }
+            Err(e) => {
+                self.record_probe_failure();
+                ProbeResult::Fail { error: e }
+            }
+        }
+    }
+
+    /// Internal: send an empty ExportLogsServiceRequest, return latency on
+    /// success or a one-line error on failure. Does NOT touch the state
+    /// machine — the caller decides what to do with the result.
+    async fn probe_internal(&self) -> Result<u64, String> {
+        let req = build_export_request(Vec::new());
+        let body = req.encode_to_vec();
+        let url = format!("{}/v1/logs", self.endpoint.trim_end_matches('/'));
+        let mut req_builder = self
+            .client
+            .post(&url)
+            .header("Content-Type", "application/x-protobuf")
+            .body(body);
+        for (k, v) in &self.extra_headers {
+            req_builder = req_builder.header(k, v);
+        }
+        let started = std::time::Instant::now();
+        match req_builder.send().await {
+            Ok(resp) if resp.status().is_success() => {
+                Ok(started.elapsed().as_millis() as u64)
+            }
+            Ok(resp) => Err(format!("HTTP {}", resp.status())),
+            Err(e) => Err(format!("{e}")),
+        }
+    }
+
+    /// Periodic probe cycle: probe, and on success transition to Online and
+    /// drain any entries that accumulated in `batch` while Offline (none
+    /// should exist since Offline enqueue drops, but a race between
+    /// transition_to_offline and an in-flight enqueue could leave a few). On
+    /// failure, record and stay Offline.
+    async fn run_probe_cycle(&self) {
+        match self.probe_internal().await {
+            Ok(latency_ms) => {
+                self.transition_to_online();
+                tracing::info!(
+                    latency_ms,
+                    "OTLP probe succeeded — back online, resuming push"
+                );
+                // Drain anything that raced into the batch during the
+                // Offline→Online transition window. Best-effort: a concurrent
+                // enqueue might still be in flight; those will be picked up
+                // by the next periodic tick.
+                self.flush().await;
+            }
+            Err(e) => {
+                self.record_probe_failure();
+                tracing::debug!(error = %e, "OTLP probe still failing");
+            }
+        }
+    }
+
+    // ── State machine transitions ─────────────────────────────────────────
+
+    /// Transition to Offline. Called when a flush's three retry attempts
+    /// all failed. Records timestamps and counters, logs a warn.
+    fn transition_to_offline(&self, dropped_in_batch: u64) {
+        let prev = self.status.swap(STATUS_OFFLINE, Ordering::Relaxed);
+        let now = now_epoch_secs();
+        self.last_failure_ts.store(now, Ordering::Relaxed);
+        // Only bump episodes when actually transitioning (not when already
+        // Offline and another flush somehow ran — defensive).
+        if prev == STATUS_ONLINE {
+            self.total_offline_episodes.fetch_add(1, Ordering::Relaxed);
+        }
+        if dropped_in_batch > 0 {
+            self.dropped_count
+                .fetch_add(dropped_in_batch, Ordering::Relaxed);
+        }
+        tracing::warn!(
+            endpoint = %self.endpoint,
+            entries_dropped = dropped_in_batch,
+            episodes = self.total_offline_episodes.load(Ordering::Relaxed),
+            "OTLP offline — entering skip-push mode (push will resume after a probe succeeds)"
+        );
+    }
+
+    /// Transition to Online. Called when a probe succeeds. Only logs when
+    /// the previous status was Offline (no log spam if already Online).
+    fn transition_to_online(&self) {
+        let prev = self.status.swap(STATUS_ONLINE, Ordering::Relaxed);
+        if prev == STATUS_OFFLINE {
+            let now = now_epoch_secs();
+            self.last_recovery_ts.store(now, Ordering::Relaxed);
+            self.consecutive_probe_failures.store(0, Ordering::Relaxed);
+            tracing::info!(
+                endpoint = %self.endpoint,
+                "OTLP recovered — resuming push"
+            );
+        }
+    }
+
+    /// Record a probe failure (probe couldn't reach the backend). Bumps
+    /// `consecutive_probe_failures` and `last_failure_ts`. Status is left
+    /// unchanged — if we were Offline we stay Offline; if we were Online
+    /// (e.g. manual probe failed while flushes are still succeeding) we
+    /// don't punish the exporter for a single flaky probe.
+    fn record_probe_failure(&self) {
+        self.consecutive_probe_failures
+            .fetch_add(1, Ordering::Relaxed);
+        self.last_failure_ts.store(now_epoch_secs(), Ordering::Relaxed);
+    }
+
+    // ── Periodic task ─────────────────────────────────────────────────────
 
     /// Spawn the periodic flush task. Returns a JoinHandle the caller can
     /// await at shutdown. Drops of the handle do NOT abort the task — the
@@ -414,7 +822,11 @@ impl OtelExporter {
         tokio::spawn(async move {
             loop {
                 ticker.tick().await;
-                me.flush().await;
+                if me.is_offline() {
+                    me.run_probe_cycle().await;
+                } else {
+                    me.flush().await;
+                }
             }
         })
     }
@@ -434,119 +846,34 @@ impl OtelExporter {
         let h = tokio::spawn(async move {
             loop {
                 ticker.tick().await;
-                me.flush().await;
+                if me.is_offline() {
+                    me.run_probe_cycle().await;
+                } else {
+                    me.flush().await;
+                }
             }
         });
         *handle.lock().unwrap() = Some(h);
     }
+}
 
-    /// Push an entry into the in-memory queue. Bounded; if full, drop oldest.
-    /// When the batch hits `batch_size`, flush eagerly so a steady load
-    /// doesn't wait for the periodic tick.
-    ///
-    /// Async because the batch is held in a `tokio::sync::Mutex` and we can't
-    /// `blocking_lock` from inside an async runtime.
-    ///
-    /// `max_attribute_bytes` is read from `self` at flush time, not here —
-    /// the parameter was removed because the previous two-arg version silently
-    /// ignored it (param was named `_max_attribute_bytes`), giving the false
-    /// impression that hot-reloading `otlp.max_attribute_bytes` would take
-    /// effect. With exporter hot-swap, `self.max_attribute_bytes` is always
-    /// the current value.
-    pub async fn enqueue(self: &Arc<Self>, entry: PromptLogEntry) {
-        let should_flush = {
-            let mut batch = self.batch.lock().await;
-            if batch.len() >= self.max_queue_size {
-                let dropped = batch.remove(0);
-                self.dropped_count
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                tracing::warn!(
-                    request_id = %dropped.request_id,
-                    phase = ?dropped.phase,
-                    queue_size = self.max_queue_size,
-                    "OTLP exporter queue full, dropping oldest entry"
-                );
-            }
-            batch.push(entry);
-            batch.len() >= self.batch_size
-        };
-        if should_flush {
-            let me = self.clone();
-            tokio::spawn(async move {
-                me.flush().await;
-            });
-        }
+/// Read an `AtomicU64` as `Option<u64>` — `0` means "never set" → `None`.
+fn read_atomic_opt(a: &AtomicU64) -> Option<u64> {
+    let v = a.load(Ordering::Relaxed);
+    if v == 0 {
+        None
+    } else {
+        Some(v)
     }
+}
 
-    /// Force a flush of the current batch right now, regardless of size.
-    /// Used at shutdown and by the periodic task.
-    pub async fn flush(&self) {
-        let drained: Vec<PromptLogEntry> = {
-            let mut batch = self.batch.lock().await;
-            if batch.is_empty() {
-                return;
-            }
-            std::mem::take(&mut *batch)
-        };
-
-        let resource_logs: Vec<ResourceLogs> = drained
-            .iter()
-            .map(|e| convert_entry_to_log_records(e, &self.resource, self.max_attribute_bytes))
-            .collect();
-
-        let req = build_export_request(resource_logs);
-        let body = req.encode_to_vec();
-
-        let url = format!("{}/v1/logs", self.endpoint.trim_end_matches('/'));
-        let mut req_builder = self
-            .client
-            .post(&url)
-            .header("Content-Type", "application/x-protobuf")
-            .body(body);
-        for (k, v) in &self.extra_headers {
-            req_builder = req_builder.header(k, v);
-        }
-
-        // Retry up to 3 times with exponential backoff.
-        let mut attempt = 0u32;
-        loop {
-            let result = req_builder
-                .try_clone()
-                .expect("clone req")
-                .send()
-                .await;
-            match result {
-                Ok(resp) if resp.status().is_success() => return,
-                Ok(resp) => {
-                    let status = resp.status();
-                    tracing::warn!(
-                        attempt = attempt + 1,
-                        status = %status,
-                        "OTLP collector returned non-success status"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        attempt = attempt + 1,
-                        error = %e,
-                        "OTLP push failed"
-                    );
-                }
-            }
-            attempt += 1;
-            if attempt >= 3 {
-                tracing::warn!(
-                    attempts = attempt,
-                    entries = drained.len(),
-                    "OTLP push failed 3× — dropping batch"
-                );
-                self.dropped_count
-                    .fetch_add(drained.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(100u64 * (1 << attempt))).await;
-        }
-    }
+/// Current unix epoch in seconds. Used for `last_failure_ts` /
+/// `last_recovery_ts` in the status snapshot.
+fn now_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Probe a remote OTLP/HTTP collector by sending an empty
@@ -555,9 +882,15 @@ impl OtelExporter {
 /// speaking OTLP" from "network unreachable". Returns the round-trip latency
 /// in milliseconds on success, or a one-line error string on failure.
 ///
-/// Single attempt — no retry. Used by the dashboard connectivity indicator,
-/// which already re-polls every 5s and would just compound backoff if this
-/// function retried internally.
+/// This is the **standalone** probe — it constructs its own reqwest::Client
+/// each call. It's used by the dashboard's "Test" button to validate an
+/// endpoint the operator just typed into the form (not yet saved to YAML).
+/// For probing the live exporter's committed endpoint, use
+/// `PromptLogWriter::probe_otlp` instead — that goes through the exporter's
+/// own client and drives the state machine.
+///
+/// Single attempt — no retry. The dashboard polls every 5s and would just
+/// compound backoff if this retried internally.
 pub async fn ping_endpoint(config: &OtlpConfig) -> Result<u64, String> {
     if config.endpoint.trim().is_empty() {
         return Err("endpoint not configured".to_string());
@@ -748,5 +1081,211 @@ mod tests {
         let rl4 = convert_entry_to_log_records(&entry4, &resource, 4096);
         let rec4 = &rl4.scope_logs[0].log_records[0];
         assert_ne!(rec2.trace_id, rec4.trace_id);
+    }
+
+    // ── State machine unit tests ──────────────────────────────────────────
+
+    #[test]
+    fn new_exporter_starts_online() {
+        let cfg = OtlpConfig::default();
+        let exp = OtelExporter::new_owned(&cfg);
+        assert!(!exp.is_offline());
+        let snap = exp.status_snapshot();
+        assert_eq!(snap.status, "online");
+        assert_eq!(snap.total_offline_episodes, 0);
+        assert_eq!(snap.total_dropped_during_offline, 0);
+        assert_eq!(snap.dropped_count, 0);
+        assert_eq!(snap.last_failure_ts, None);
+        assert_eq!(snap.last_recovery_ts, None);
+    }
+
+    #[test]
+    fn transition_to_offline_then_back_records_timestamps_and_episodes() {
+        let cfg = OtlpConfig::default();
+        let exp = OtelExporter::new_owned(&cfg);
+
+        // Online → Offline: 3 entries dropped in the failed flush.
+        exp.transition_to_offline(3);
+        assert!(exp.is_offline());
+        let snap = exp.status_snapshot();
+        assert_eq!(snap.status, "offline");
+        assert_eq!(snap.total_offline_episodes, 1);
+        assert_eq!(snap.dropped_count, 3);
+        assert!(snap.last_failure_ts.is_some());
+        assert!(snap.last_recovery_ts.is_none()); // not recovered yet
+
+        // Offline → Online.
+        exp.transition_to_online();
+        assert!(!exp.is_offline());
+        let snap = exp.status_snapshot();
+        assert_eq!(snap.status, "online");
+        assert_eq!(snap.total_offline_episodes, 1); // monotonic
+        assert!(snap.last_recovery_ts.is_some());
+
+        // Online → Offline again: episode count increments.
+        exp.transition_to_offline(0);
+        let snap = exp.status_snapshot();
+        assert_eq!(snap.total_offline_episodes, 2);
+    }
+
+    #[test]
+    fn transition_to_online_when_already_online_is_noop() {
+        let cfg = OtlpConfig::default();
+        let exp = OtelExporter::new_owned(&cfg);
+
+        // Already Online — calling transition_to_online should NOT set
+        // last_recovery_ts (no episode to recover from).
+        exp.transition_to_online();
+        let snap = exp.status_snapshot();
+        assert_eq!(snap.status, "online");
+        assert_eq!(snap.last_recovery_ts, None);
+        assert_eq!(snap.total_offline_episodes, 0);
+    }
+
+    #[test]
+    fn record_probe_failure_bumps_consecutive_counter_and_last_failure() {
+        let cfg = OtlpConfig::default();
+        let exp = OtelExporter::new_owned(&cfg);
+        // Manually push Offline so record_probe_failure is the right path.
+        exp.transition_to_offline(0);
+
+        exp.record_probe_failure();
+        exp.record_probe_failure();
+        exp.record_probe_failure();
+
+        let snap = exp.status_snapshot();
+        assert_eq!(snap.consecutive_probe_failures, 3);
+        assert!(snap.last_failure_ts.is_some());
+        assert!(exp.is_offline());
+
+        // transition_to_online resets consecutive_probe_failures.
+        exp.transition_to_online();
+        let snap = exp.status_snapshot();
+        assert_eq!(snap.consecutive_probe_failures, 0);
+    }
+
+    #[tokio::test]
+    async fn enqueue_while_offline_drops_immediately_and_grows_no_batch() {
+        let cfg = OtlpConfig::default();
+        let exp = OtelExporter::new(&cfg);
+
+        // Force Offline.
+        exp.transition_to_offline(0);
+        assert!(exp.is_offline());
+
+        // Push 5 entries — all should be dropped at enqueue, batch stays empty.
+        for i in 0..5 {
+            let entry = make_request_entry(&format!("off-{i}"), None);
+            exp.enqueue(entry).await;
+        }
+
+        let batch_len = exp.batch.lock().await.len();
+        assert_eq!(batch_len, 0, "batch must stay empty while Offline");
+
+        let snap = exp.status_snapshot();
+        assert_eq!(snap.total_dropped_during_offline, 5);
+        assert_eq!(snap.dropped_count, 5);
+    }
+
+    #[tokio::test]
+    async fn enqueue_while_online_pushes_to_batch() {
+        let cfg = OtlpConfig::default();
+        let exp = OtelExporter::new(&cfg);
+
+        // Online by default.
+        for i in 0..3 {
+            let entry = make_request_entry(&format!("on-{i}"), None);
+            exp.enqueue(entry).await;
+        }
+
+        let batch_len = exp.batch.lock().await.len();
+        assert_eq!(batch_len, 3);
+        let snap = exp.status_snapshot();
+        assert_eq!(snap.total_dropped_during_offline, 0);
+        assert_eq!(snap.dropped_count, 0);
+    }
+
+    #[tokio::test]
+    async fn enqueue_overflow_drops_oldest_from_batch() {
+        // max_queue_size=2 → push 3, oldest dropped.
+        let cfg = OtlpConfig {
+            enabled: true,
+            endpoint: "http://x".to_string(),
+            max_queue_size: 2,
+            batch_size: 10, // large so we don't trigger flush spawn
+            ..OtlpConfig::default()
+        };
+        let exp = OtelExporter::new(&cfg);
+
+        // First two fill the batch.
+        exp.enqueue(make_request_entry("a", None)).await;
+        exp.enqueue(make_request_entry("b", None)).await;
+        // Third overflows — "a" should be dropped.
+        exp.enqueue(make_request_entry("c", None)).await;
+
+        let batch = exp.batch.lock().await;
+        assert_eq!(batch.len(), 2);
+        // The first-in ("a") is gone; "b" and "c" remain.
+        let ids: Vec<&str> = batch.iter().map(|e| e.request_id.as_str()).collect();
+        assert_eq!(ids, vec!["b", "c"]);
+        drop(batch);
+
+        let snap = exp.status_snapshot();
+        assert_eq!(snap.dropped_count, 1);
+    }
+
+    #[tokio::test]
+    async fn flush_empty_batch_is_noop() {
+        // Empty batch → flush returns immediately, no state change.
+        let cfg = OtlpConfig::default();
+        let exp = OtelExporter::new(&cfg);
+        exp.flush().await;
+        assert!(!exp.is_offline());
+        let snap = exp.status_snapshot();
+        assert_eq!(snap.dropped_count, 0);
+    }
+
+    #[test]
+    fn record_probe_failure_while_online_does_not_flip_status() {
+        // Per spec: a probe failure while Online must NOT drive the exporter
+        // Offline — only repeated flush failures do that. Otherwise a flaky
+        // single probe could push the exporter Offline and cause drops.
+        let cfg = OtlpConfig::default();
+        let exp = OtelExporter::new_owned(&cfg);
+        assert!(!exp.is_offline());
+        exp.record_probe_failure();
+        exp.record_probe_failure();
+        assert!(!exp.is_offline(), "probe failure must not flip Online");
+        let snap = exp.status_snapshot();
+        assert_eq!(snap.consecutive_probe_failures, 2);
+        assert!(snap.last_failure_ts.is_some());
+    }
+
+    #[test]
+    fn status_snapshot_endpoint_matches_config() {
+        // Sanity: the snapshot's endpoint reflects the exporter's committed
+        // config — the dashboard's polling indicator shows this so the
+        // operator can see which URL is currently being pushed to.
+        let cfg = OtlpConfig {
+            enabled: true,
+            endpoint: "http://collector.local:4318".to_string(),
+            ..OtlpConfig::default()
+        };
+        let exp = OtelExporter::new_owned(&cfg);
+        let snap = exp.status_snapshot();
+        assert_eq!(snap.endpoint, "http://collector.local:4318");
+    }
+
+    #[test]
+    fn transition_to_offline_idempotent_does_not_double_count_episodes() {
+        // Calling transition_to_offline twice in a row must only bump the
+        // episode counter once — the transition_to_offline body uses
+        // `prev == STATUS_ONLINE` to gate the bump.
+        let cfg = OtlpConfig::default();
+        let exp = OtelExporter::new_owned(&cfg);
+        exp.transition_to_offline(0);
+        exp.transition_to_offline(0);
+        let snap = exp.status_snapshot();
+        assert_eq!(snap.total_offline_episodes, 1);
     }
 }

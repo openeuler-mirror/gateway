@@ -372,6 +372,11 @@
     } else {
       stopStressPoll();
     }
+    if (section === "admin-config") {
+      startOtlpStatusPoll();
+    } else {
+      stopOtlpStatusPoll();
+    }
     if (section === "admin-models") loadModels();
     else if (section === "admin-plans") loadPlans();
     else if (section === "admin-keys") { setupKeysSearch(); loadKeys(); }
@@ -3155,6 +3160,7 @@
         ${fieldNum("cfg-rs-flow-timeout", t("config.field.flow_control_queue_timeout_secs"), r.flow_control_queue_timeout_secs || 1200, { min: 1, step: 1 })}
         ${fieldCheckbox("cfg-rs-priority-hdr", t("config.field.enable_priority_header"), r.enable_priority_header)}
         ${fieldCheckbox("cfg-rs-strip-cc", t("config.field.strip_claude_code_attribution"), r.strip_claude_code_attribution)}
+        ${fieldFullList("cfg-rs-forward-hdrs", t("config.field.forward_client_headers"), r.forward_client_headers || [])}
         ${fieldTextarea("cfg-rs-aliases", t("config.field.model_group_alias"), r.model_group_alias || {}, { rows: 3 })}
       </div>
       <details class="form-card-collapsible is-disabled">
@@ -3349,6 +3355,57 @@
     if (txt && text !== undefined) txt.textContent = text;
   }
 
+  // ── OTLP exporter live status poll (5s) ───────────────────
+  // While the Test button does a one-shot probe of the form-input endpoint
+  // (validates what the operator just typed, before saving), the status poll
+  // reads the live exporter's state machine — what the gateway is actually
+  // pushing to right now. The indicator reflects:
+  //   green  = Online (push is active)
+  //   red    = Offline (push skipped, dropping at enqueue; probe every 5s
+  //                     attempts recovery)
+  //   gray   = Disabled (OTLP not configured / feature off)
+  // The poll starts when the config page is shown and stops on leave, so we
+  // don't burn CPU on tabs the operator isn't looking at.
+  let otlpStatusTimer = null;
+  function startOtlpStatusPoll() {
+    stopOtlpStatusPoll();
+    otlpStatusPoll(); // immediate fetch so the indicator is fresh on enter
+    otlpStatusTimer = setInterval(otlpStatusPoll, 5000);
+  }
+  function stopOtlpStatusPoll() {
+    if (otlpStatusTimer) {
+      clearInterval(otlpStatusTimer);
+      otlpStatusTimer = null;
+    }
+  }
+  async function otlpStatusPoll() {
+    const pingRow = document.getElementById("cfg-pl-otlp-ping");
+    if (!pingRow) return; // config page not rendered yet
+    // Don't clobber a manual Test-in-progress state — the operator just
+    // clicked Test and is waiting on its result; the next tick (5s later)
+    // will refresh from the live exporter.
+    if (pingRow.getAttribute("data-state") === "pending") return;
+    try {
+      const r = await api("/admin/prompt-log/otlp-status", { method: "GET" });
+      if (!r || !r.ok) {
+        otlpPingSetState(pingRow, "fail", t("config.tip.otlp_ping_fail"));
+        return;
+      }
+      if (r.status === "online") {
+        otlpPingSetState(pingRow, "ok", t("config.tip.otlp_status_online"));
+      } else if (r.status === "offline") {
+        const ep = r.endpoint ? ` · ${r.endpoint}` : "";
+        otlpPingSetState(pingRow, "fail", `${t("config.tip.otlp_status_offline")}${ep}`);
+      } else {
+        // "disabled" — OTLP not configured or feature off.
+        otlpPingSetState(pingRow, "unknown", t("config.tip.otlp_status_disabled"));
+      }
+    } catch (err) {
+      // Network error talking to the gateway itself — leave the indicator
+      // alone; the next tick will retry. Logging would spam on a dead tab.
+    }
+  }
+
   async function reloadConfigHandler() {
     try {
       await api("/admin/config/reload", { method: "POST" });
@@ -3443,6 +3500,7 @@
           flow_control_queue_timeout_secs: numOr($("cfg-rs-flow-timeout"), 1200),
           enable_priority_header: $("cfg-rs-priority-hdr").checked,
           strip_claude_code_attribution: $("cfg-rs-strip-cc").checked,
+          forward_client_headers: parseListInput($("cfg-rs-forward-hdrs")),
           model_group_alias: aliases,
         };
         await saveConfigSection("router_settings", routerValue);

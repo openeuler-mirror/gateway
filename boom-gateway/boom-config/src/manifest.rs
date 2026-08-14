@@ -120,6 +120,8 @@ pub fn router_settings_fields() -> &'static [FieldMeta] {
                     label_key: "config.field.flow_control_queue_timeout_secs", tip_key: "tip.config.flow_control_queue_timeout_secs" },
         FieldMeta { field: "strip_claude_code_attribution", section: "router", input_type: "bool",
                     label_key: "config.field.strip_claude_code_attribution", tip_key: "tip.config.strip_claude_code_attribution" },
+        FieldMeta { field: "forward_client_headers", section: "router", input_type: "list",
+                    label_key: "config.field.forward_client_headers", tip_key: "tip.config.forward_client_headers" },
     ]
 }
 
@@ -231,6 +233,7 @@ mod tests {
             "enable_priority_header",
             "flow_control_queue_timeout_secs",
             "strip_claude_code_attribution",
+            "forward_client_headers",
         ];
 
         for f in &required_fields {
