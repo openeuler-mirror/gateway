@@ -69,6 +69,13 @@ struct Args {
     /// Reject requests that explicitly send an empty tools array.
     #[arg(long, default_value_t = false)]
     reject_empty_tools: bool,
+
+    /// Dump every incoming request's headers to the tracing log. Useful for
+    /// verifying gateway header forwarding (whitelist pass-through, gateway-
+    /// injected headers, hard-blocked names) end-to-end. Off by default to
+    /// keep benchmark logs clean.
+    #[arg(long, default_value_t = false, env = "MOCK_DUMP_HEADERS")]
+    dump_headers: bool,
 }
 
 struct AppState {
@@ -181,11 +188,27 @@ async fn messages(
 
 async fn handle_any(
     st: &AppState,
-    _headers: &HeaderMap,
+    headers: &HeaderMap,
     body: serde_json::Value,
     object_kind: &str,
 ) -> Response {
     st.stats.total_received.fetch_add(1, Ordering::Relaxed);
+
+    if st.args.dump_headers {
+        let pairs: Vec<String> = headers
+            .iter()
+            .map(|(name, value)| {
+                let v = value.to_str().unwrap_or("<non-ascii>");
+                format!("  {}: {}", name.as_str(), v)
+            })
+            .collect();
+        tracing::info!(
+            endpoint = object_kind,
+            header_count = headers.len(),
+            "incoming request headers:\n{}",
+            pairs.join("\n")
+        );
+    }
 
     // Acquire concurrency permit; reject with 503 when over limit.
     let permit = match st.semaphore.clone().try_acquire_owned() {
