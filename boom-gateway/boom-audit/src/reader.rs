@@ -43,6 +43,7 @@ pub struct LogRow {
     pub output_tokens: Option<i32>,
     pub duration_ms: Option<i32>,
     pub created_at: Option<DateTime<Utc>>,
+    pub queue_wait_ms: Option<i32>,
 }
 
 /// Paginated result for listing logs.
@@ -107,7 +108,8 @@ pub async fn list_logs(pool: &PgPool, query: ListLogsQuery) -> Result<LogsPage, 
     let sql = format!(
         r#"SELECT request_id, key_hash, key_name, team_id, model, api_path,
                   is_stream, status_code, error_type, error_message,
-                  input_tokens, output_tokens, duration_ms, created_at
+                  input_tokens, output_tokens, duration_ms, created_at,
+                  queue_wait_ms
            FROM boom_request_log
            {where_sql}
            ORDER BY created_at DESC
@@ -166,6 +168,7 @@ pub fn logs_page_to_json(page: LogsPage) -> Value {
                 "output_tokens": r.output_tokens,
                 "duration_ms": r.duration_ms,
                 "created_at": r.created_at.map(|d| d.to_rfc3339()),
+                "queue_wait_ms": r.queue_wait_ms,
             })
         })
         .collect();

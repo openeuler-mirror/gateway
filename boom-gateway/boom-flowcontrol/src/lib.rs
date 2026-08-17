@@ -48,6 +48,11 @@ pub enum FlowControlError {
     Timeout {
         deployment_id: String,
         waiters: usize,
+        /// Wall-clock time this request spent in the queue before timing
+        /// out. Surfaced to audit logs as `queue_wait_ms` so operators can
+        /// distinguish "timed out after a long wait" from "timed out
+        /// immediately under burst load".
+        waited: Duration,
     },
     /// No slot configured for this deployment (pass-through).
     NoSlot,
@@ -426,6 +431,11 @@ impl FlowController {
 
         let (grant_tx, grant_rx) = tokio::sync::oneshot::channel();
         let request_id: u64;
+        // Recorded before entering the slot lock so it's visible across
+        // all return paths (success / race-dispatched / timeout) — the
+        // audit log needs the true wait even when the grant fires via a
+        // timeout race path.
+        let enqueued_at = Instant::now();
 
         {
             let mut inner = slot.inner.lock().unwrap();
@@ -447,7 +457,7 @@ impl FlowController {
                 context_chars,
                 key_alias,
                 model,
-                enqueued_at: Instant::now(),
+                enqueued_at,
                 dispatched_at: None,
                 dispatched: false,
                 grant: Some(grant_tx),
@@ -487,6 +497,25 @@ impl FlowController {
         match tokio::time::timeout(timeout, grant_rx).await {
             Ok(Ok(())) => {
                 cleanup.consumed = true;
+                // Read dispatched_at back from the queue — `dispatch()` set
+                // it just before firing the grant. We snapshot under the slot
+                // lock so the value is consistent with the queue mutation
+                // that released us.
+                let dispatched_at = self
+                    .slots
+                    .get(deployment_id)
+                    .and_then(|slot| {
+                        let inner = slot.inner.lock().unwrap();
+                        let queue = if is_vip {
+                            &inner.vip_queue
+                        } else {
+                            &inner.normal_queue
+                        };
+                        queue
+                            .iter()
+                            .find(|r| r.id == request_id)
+                            .and_then(|r| r.dispatched_at)
+                    });
                 Ok(FlowControlGuard {
                     slots: self.slots.clone(),
                     deployment_id: deployment_id.to_string(),
@@ -494,6 +523,8 @@ impl FlowController {
                     is_vip,
                     key_hash,
                     key_index: self.key_index.clone(),
+                    enqueued_at,
+                    dispatched_at,
                 })
             }
             Ok(Err(_)) => {
@@ -501,8 +532,10 @@ impl FlowController {
                 Err(FlowControlError::NoSlot)
             }
             Err(_) => {
-                // Timeout — check if already dispatched.
-                let already_dispatched = {
+                // Timeout — check if already dispatched (race: dispatch fired
+                // as the timeout expired). Snapshot dispatched_at in the same
+                // critical section so we have a consistent view.
+                let (already_dispatched, snapshot_dispatched_at) = {
                     let slot = self.slots.get(deployment_id);
                     match slot {
                         Some(slot) => {
@@ -515,16 +548,16 @@ impl FlowController {
                             match queue.iter().position(|r| r.id == request_id) {
                                 Some(idx) => {
                                     if queue[idx].dispatched {
-                                        true
+                                        (true, queue[idx].dispatched_at)
                                     } else {
                                         queue.remove(idx);
-                                        false
+                                        (false, None)
                                     }
                                 }
-                                None => true,
+                                None => (true, None),
                             }
                         }
-                        None => false,
+                        None => (false, None),
                     }
                 };
 
@@ -537,15 +570,24 @@ impl FlowController {
                         is_vip,
                         key_hash,
                         key_index: self.key_index.clone(),
+                        enqueued_at,
+                        dispatched_at: snapshot_dispatched_at,
                     })
                 } else {
                     cleanup.consumed = true;
                     if let Some(ref kh) = key_hash {
                         remove_key_ref(&self.key_index, kh, deployment_id, request_id);
                     }
+                    // For a timed-out request that never dispatched,
+                    // `waited` is the time from enqueue to timeout. The
+                    // caller's deadline equals `timeout`, but `enqueued_at`
+                    // is when the request actually entered the queue (after
+                    // lock acquisition), so the gap is the true wait.
+                    let waited = enqueued_at.elapsed();
                     Err(FlowControlError::Timeout {
                         deployment_id: deployment_id.to_string(),
                         waiters: self.total_waiters_for(deployment_id),
+                        waited,
                     })
                 }
             }
@@ -796,6 +838,33 @@ pub struct FlowControlGuard {
     is_vip: bool,
     key_hash: Option<String>,
     key_index: Arc<DashMap<String, Vec<KeyRequestRef>>>,
+    /// When this request entered the flow control queue. Recorded so the
+    /// caller can read [`wait_duration`] before moving the guard into a
+    /// stream wrapper.
+    enqueued_at: Instant,
+    /// When this request was dispatched to upstream. Recorded by `acquire`
+    /// before the grant fires. `None` only if dispatch happened via a
+    /// path that bypassed the standard recording (e.g. timeout race where
+    /// the request was dispatched just as the timeout fired).
+    dispatched_at: Option<Instant>,
+}
+
+impl FlowControlGuard {
+    /// Wall-clock time this request spent waiting in the flow control
+    /// queue before being dispatched. Callers should read this **before**
+    /// moving the guard into a stream wrapper (the guard gets consumed
+    /// there).
+    ///
+    /// Returns `Duration::ZERO` for the rare race where `dispatched_at`
+    /// was not recorded (e.g. timeout-then-dispatch race). The 0 is
+    /// semantically honest: in that race the request was dispatched at
+    /// roughly the same instant it was enqueued.
+    pub fn wait_duration(&self) -> Duration {
+        match self.dispatched_at {
+            Some(d) => d.saturating_duration_since(self.enqueued_at),
+            None => Duration::ZERO,
+        }
+    }
 }
 
 impl Drop for FlowControlGuard {

@@ -1913,7 +1913,7 @@
       return;
     }
     wrap.innerHTML = `<table>
-      <tr><th>${t("logs.col.time")}</th><th>${t("logs.col.ip")}</th><th>${t("logs.col.model")}</th><th>${t("logs.col.path")}</th><th>${t("logs.col.status")}</th><th>${t("logs.col.stream")}</th><th>${t("logs.col.in_out")}</th><th>${t("logs.col.prefix_hit_rate")}</th><th>${t("logs.col.duration")}</th><th>${t("logs.col.error")}</th></tr>
+      <tr><th>${t("logs.col.time")}</th><th>${t("logs.col.ip")}</th><th>${t("logs.col.model")}</th><th>${t("logs.col.path")}</th><th>${t("logs.col.status")}</th><th>${t("logs.col.stream")}</th><th>${t("logs.col.in_out")}</th><th>${t("logs.col.prefix_hit_rate")}</th><th>${t("logs.col.duration")}</th><th>${t("logs.col.queue_wait")}</th><th>${t("logs.col.error")}</th></tr>
       ${logs.map((l) => {
         // Prefix hit rate = cached_tokens / input_tokens * 100, truncated to
         // 1 decimal and capped at 99.9 (no rounding to 100%). "-" if missing.
@@ -1934,6 +1934,7 @@
         <td class="mono">${inOutCell}</td>
         <td class="mono">${kvCell}</td>
         <td>${l.duration_ms != null ? l.duration_ms + "ms" : "-"}</td>
+        <td>${l.queue_wait_ms != null ? l.queue_wait_ms + "ms" : "-"}</td>
         <td>${l.error_message ? '<span style="color:var(--danger)" title="' + esc(l.error_message) + '">' + esc((l.error_type || "").substring(0, 20)) + '</span>' : "-"}</td>
       </tr>`}).join("")}
     </table>`;
@@ -5350,7 +5351,7 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
     } catch (err) {
       if (myToken !== logsLoadToken) return;
       const tbody = document.getElementById("logs-tbody");
-      if (tbody) tbody.innerHTML = `<tr><td colspan="14" class="no-results">${t("logs.failed", { message: esc(err.message) })}</td></tr>`;
+      if (tbody) tbody.innerHTML = `<tr><td colspan="15" class="no-results">${t("logs.failed", { message: esc(err.message) })}</td></tr>`;
       const pg = document.getElementById("logs-pagination");
       if (pg) pg.innerHTML = "";
     }
@@ -5360,7 +5361,7 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
     const tbody = document.getElementById("logs-tbody");
     if (!tbody) return;
     if (logs.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="15" class="no-results">' + t("common.no_matching", { what: t("logs.title").toLowerCase() }) + '</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="16" class="no-results">' + t("common.no_matching", { what: t("logs.title").toLowerCase() }) + '</td></tr>';
       return;
     }
     tbody.innerHTML = logs.map((l) => {
@@ -5414,6 +5415,7 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
         <td class="mono">${kvCell}</td>
         <td>${l.duration_ms != null ? l.duration_ms + "ms" : "-"}</td>
         <td>${l.ttft_ms != null ? l.ttft_ms + "ms" : "-"}</td>
+        <td>${l.queue_wait_ms != null ? l.queue_wait_ms + "ms" : "-"}</td>
         <td>${errorCell}</td>
         <td>${detailCell}</td>
       </tr>`;

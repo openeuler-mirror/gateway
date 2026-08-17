@@ -2171,6 +2171,7 @@ struct LogRow {
     trie_blocks: Option<i64>,
     trie_max_blocks: Option<i64>,
     request_tokens: Option<i64>,
+    queue_wait_ms: Option<i32>,
 }
 
 pub async fn list_logs(
@@ -2267,7 +2268,8 @@ pub async fn list_logs(
                   rl.input_tokens, rl.output_tokens, rl.duration_ms, rl.ttft_ms, rl.created_at,
                   rl.deployment_id, rl.client_ip, rl.cached_tokens,
                   rl.schedule_policy, rl.kv_hit_blocks, rl.kv_input_blocks,
-                  rl.trie_blocks, rl.trie_max_blocks, rl.request_tokens
+                  rl.trie_blocks, rl.trie_max_blocks, rl.request_tokens,
+                  rl.queue_wait_ms
            FROM boom_request_log rl
            LEFT JOIN boom_team_table bt ON rl.team_id = bt.team_id
            {where_sql}
@@ -2382,6 +2384,7 @@ pub async fn list_logs(
                 "trie_blocks": r.trie_blocks,
                 "trie_max_blocks": r.trie_max_blocks,
                 "request_tokens": r.request_tokens,
+                "queue_wait_ms": r.queue_wait_ms,
             })
         })
         .collect();

@@ -1,5 +1,5 @@
 use crate::extractor::RequiredAuth;
-use crate::request_log::{log_error, log_error_with_usage, log_request, RequestLog};
+use crate::request_log::{log_error, log_error_with_queue_wait, log_error_with_usage, log_request, RequestLog};
 use crate::state::AppState;
 use axum::extract::{ConnectInfo, Path, State};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -128,6 +128,15 @@ pub(crate) fn extract_client_ip(headers: &axum::http::HeaderMap, remote_addr: Op
 /// Acquire flow control guard for a deployment.
 /// Returns Ok(Some(guard)) if acquired, Ok(None) if no slot (pass-through),
 /// or Err with appropriate error reply.
+///
+/// `out_queue_wait_ms` receives the queue wait duration on every path:
+/// `Some(ms)` for the Timeout error branch (the only path where the
+/// request actually queued and waited), `None` for pass-through and
+/// ContextExceeded (request never entered the queue). The caller
+/// inspects this to populate `RequestLog.queue_wait_ms` on the success
+/// path — `Err(Timeout)` returns before `out_queue_wait_ms` is read, but
+/// the value is written here so the audit log on the timeout error path
+/// captures the actual wait instead of dropping it.
 async fn acquire_fc_guard<E>(
     state: &AppState,
     deployment_id: &str,
@@ -148,13 +157,18 @@ async fn acquire_fc_guard<E>(
 ) -> Result<Option<boom_flowcontrol::FlowControlGuard>, E> {
     match state.flow_controller.acquire(deployment_id, context_chars, timeout, is_vip, key_alias, fc_key_hash, fc_model).await {
         Ok(g) => Ok(Some(g)),
-        Err(FlowControlError::Timeout { waiters, .. }) => {
+        Err(FlowControlError::Timeout { waiters, waited, .. }) => {
+            let queue_wait_ms = Some(waited.as_millis().min(i32::MAX as u128) as i32);
             let e = GatewayError::FlowControlQueueTimeout {
                 deployment_id: deployment_id.to_string(),
                 waiters,
                 message: format!("Deployment '{}' flow control queue timeout — too many concurrent requests", deployment_id),
             };
-            log_error(state, identity, model, api_path, is_stream, start, &e, Some(request_id.to_string()), Some(deployment_id.to_string()), None, client_ip);
+            log_error_with_queue_wait(
+                state, identity, model, api_path, is_stream, start, &e,
+                Some(request_id.to_string()), Some(deployment_id.to_string()),
+                None, client_ip, queue_wait_ms,
+            );
             Err(err_wrap(e, is_stream))
         }
         Err(FlowControlError::NoSlot) => Ok(None),
@@ -674,6 +688,12 @@ async fn chat_completions_inner(
     } else {
         None
     };
+    // Snapshot queue wait by reference before the guard moves into a
+    // stream wrapper (or gets dropped at handler return on the non-stream
+    // path). `None` = deployment had no flow control slot (pass-through).
+    let queue_wait_ms: Option<i32> = fc_guard.as_ref().map(|g| {
+        g.wait_duration().as_millis().min(i32::MAX as u128) as i32
+    });
 
     // Attach gateway-internal headers (e.g. X-Gateway-Priority) plus the
     // client-whitelisted headers. The compose function injects client
@@ -712,7 +732,7 @@ async fn chat_completions_inner(
             Err(e) => {
                 let partial_usage = provider_billing.actual_usage();
                 settle_partial_provider_accounting(&mut plan_charge, &provider_billing);
-                log_error_with_usage(&state, &identity, &model, api_path, true, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()), partial_usage.as_ref());
+                log_error_with_usage(&state, &identity, &model, api_path, true, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()), partial_usage.as_ref(), None);
                 write_prompt_log_error(
                     &state,
                     prompt_log_should,
@@ -784,6 +804,7 @@ async fn chat_completions_inner(
             trie_blocks,
             trie_max_blocks,
             request_tokens: request_bytes,
+            queue_wait_ms,
         }, start, usage, Some(state.agent_stats.clone()))
         .with_plan_charge(plan_charge)
         .with_provider_billing(provider_billing);
@@ -846,7 +867,7 @@ async fn chat_completions_inner(
             Err(e) => {
                 let partial_usage = provider_billing.actual_usage();
                 settle_partial_provider_accounting(&mut plan_charge, &provider_billing);
-                log_error_with_usage(&state, &identity, &model, api_path, false, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()), partial_usage.as_ref());
+                log_error_with_usage(&state, &identity, &model, api_path, false, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()), partial_usage.as_ref(), None);
                 write_prompt_log_error(
                     &state,
                     prompt_log_should,
@@ -928,6 +949,7 @@ async fn chat_completions_inner(
                 trie_blocks,
                 trie_max_blocks,
                 request_tokens: request_bytes,
+                queue_wait_ms,
             },
         );
         state.agent_stats.record_tokens(api_path, input_tokens as u64, output_tokens as u64);
@@ -2844,6 +2866,11 @@ pub async fn messages(
     } else {
         None
     };
+    // Snapshot queue wait before the guard moves into a stream wrapper
+    // (or drops at handler return on the non-stream path).
+    let queue_wait_ms: Option<i32> = fc_guard.as_ref().map(|g| {
+        g.wait_duration().as_millis().min(i32::MAX as u128) as i32
+    });
 
     // Attach gateway-internal headers (e.g. X-Gateway-Priority) plus the
     // client-whitelisted headers. compose injects client whitelist first,
@@ -2932,6 +2959,7 @@ pub async fn messages(
             trie_blocks,
             trie_max_blocks,
             request_tokens: request_bytes,
+            queue_wait_ms,
         }, start, usage, Some(state.agent_stats.clone()))
         .with_plan_charge(plan_charge);
 
@@ -3036,6 +3064,7 @@ pub async fn messages(
                 trie_blocks,
                 trie_max_blocks,
                 request_tokens: request_bytes,
+                queue_wait_ms,
             },
         );
         state.agent_stats.record_tokens("/v1/messages", input_tokens as u64, output_tokens as u64);

@@ -96,6 +96,13 @@ pub async fn run_request_log_migration(conn: &mut sqlx::PgConnection) -> Result<
     execute_alter(conn, r#"ALTER TABLE boom_request_log ADD COLUMN IF NOT EXISTS trie_blocks BIGINT"#).await;
     execute_alter(conn, r#"ALTER TABLE boom_request_log ADD COLUMN IF NOT EXISTS trie_max_blocks BIGINT"#).await;
     execute_alter(conn, r#"ALTER TABLE boom_request_log ADD COLUMN IF NOT EXISTS request_tokens BIGINT"#).await;
+    // queue_wait_ms: time the request spent waiting in the gateway's
+    // per-deployment flow control queue before being dispatched to
+    // upstream. Pairs with ttft_ms / duration_ms to decompose total
+    // latency into queue + upstream + gateway overhead. NULL when the
+    // deployment has no flow control slot (pass-through) or on the
+    // error paths that fire before acquire() returns.
+    execute_alter(conn, r#"ALTER TABLE boom_request_log ADD COLUMN IF NOT EXISTS queue_wait_ms INTEGER"#).await;
     Ok(())
 }
 
