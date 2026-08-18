@@ -417,6 +417,7 @@ struct UserLogRow {
     created_at: Option<chrono::DateTime<chrono::Utc>>,
     client_ip: Option<String>,
     cached_tokens: Option<i64>,
+    queue_wait_ms: Option<i32>,
 }
 
 pub async fn get_user_logs(
@@ -436,7 +437,7 @@ pub async fn get_user_logs(
         r#"SELECT model, api_path, is_stream, status_code,
                   input_tokens, output_tokens, duration_ms,
                   error_type, error_message, created_at, client_ip,
-                  cached_tokens
+                  cached_tokens, queue_wait_ms
            FROM boom_request_log
            WHERE key_hash = $1
            ORDER BY created_at DESC
@@ -479,6 +480,7 @@ pub async fn get_user_logs(
                 "created_at": r.created_at.map(|d| d.to_rfc3339()),
                 "client_ip": r.client_ip,
                 "cached_tokens": r.cached_tokens,
+                "queue_wait_ms": r.queue_wait_ms,
             })
         })
         .collect();

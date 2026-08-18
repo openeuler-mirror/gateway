@@ -37,6 +37,56 @@ A production-grade LLM API gateway built in Rust. Unified request entry point fo
 
 ---
 
+## Benchmarks
+
+Test environment: **kunpeng920** (ARM64). Stress-tested with `mock-backend` (zero inference latency, returns 100–400 chars of random content) and `bench-client` under `boom-gateway/test/`. Workload: **~50K input context + 100–500 output tokens**, **with prompt-log disk writes and OTLP export enabled**. **All latency values are in ms**, reported as p50 / p90 / p99 / p999 / mean.
+
+### Non-Streaming
+
+> Unit: ms
+
+| Target RPS | p50 | p90 | p99 | p999 | mean |
+|---------|-----|-----|-----|------|------|
+| 50    | 10.3 | 14.6 | 17.4 | 20.0 | 11.1 |
+| 100   | 9.1  | 10.5 | 21.7 | 100.0 | 9.8 |
+| 500   | 9.4  | 10.8 | 13.3 | 33.2 | 9.5 |
+| 1000  | 9.6  | 11.0 | 22.8 | 34.6 | 9.8 |
+| 2000  | 9.7  | 11.0 | 26.7 | 36.5 | 10.0 |
+
+### Streaming TTFT (time to first token)
+
+> Unit: ms
+
+| Target RPS | p50 | p90 | p99 | p999 | mean |
+|---------|-----|-----|-----|------|------|
+| 50    | 54.1 | 58.0 | 62.4 | 80.9 | 43.4 |
+| 100   | 54.0 | 56.7 | 57.9 | 58.7 | 46.2 |
+| 500   | 54.4 | 57.5 | 60.5 | 697.0 | 52.2 |
+| 1000  | 65.3 | 99.0 | 169.0 | 5607.0 | 80.2 |
+| 2000  | 87.3 | 281.0 | 1047.0 | 6295.0 | 155.0 |
+
+### Streaming E2E (incl. mock-backend simulating 500 tps token emission, ~200–1000ms per request)
+
+> Unit: ms
+
+| Target RPS | p50 | p90 | p99 | p999 | mean |
+|---------|-----|-----|-----|------|------|
+| 50    | 539 | 811 | 875 | 909 | 537 |
+| 100   | 536 | 794 | 878 | 920 | 532 |
+| 500   | 567 | 872 | 966 | 1235 | 571 |
+| 1000  | 2373 | 6512 | 7794 | 8130 | 2996 |
+| 2000  | 1564 | 7254 | 8839 | 9232 | 2822 |
+
+**Reading the numbers**:
+
+- **Non-streaming**: p50 stays at 9–10ms across all RPS levels; p999 at 1000/2000 RPS is only 34.6 / 36.5ms — the gateway itself is not the bottleneck; the long tail is mostly mock-backend scheduling jitter.
+- **Streaming TTFT**: p50 holds at ~54ms up to 500 RPS; queueing shows up starting at 1000 RPS (p999 jumps to 5.6s, indicating the connection pool or SSE push path is near its saturation knee).
+- **Streaming E2E**: under 500 RPS, p50 is ~540ms (close to the theoretical floor set by mock token emission); beyond 1000 RPS, p50/p999 rise sharply, consistent with the TTFT knee — i.e. streaming saturation is determined at the first-token stage; the subsequent token-emission stage adds no further amplification.
+
+> Source: `boom-gateway/test/` toolchain. Reproduction steps in [boom-gateway/test/README.md](boom-gateway/test/README.md).
+
+---
+
 ## Quick Start
 
 ### Prerequisites

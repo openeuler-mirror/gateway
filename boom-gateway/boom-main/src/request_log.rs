@@ -60,6 +60,10 @@ pub struct RequestLog {
     pub trie_blocks: Option<i64>,
     pub trie_max_blocks: Option<i64>,
     pub request_tokens: Option<i64>,
+    /// Wall-clock time spent waiting in the gateway's flow control queue
+    /// (ms). NULL on pass-through deployments (no slot configured) and
+    /// on error paths that fire before acquire() returns.
+    pub queue_wait_ms: Option<i32>,
 }
 
 /// Background audit-log writer.
@@ -269,7 +273,7 @@ async fn batch_insert(pool: &PgPool, batch: &[RequestLog]) -> Result<u64, sqlx::
           is_stream, status_code, error_type, error_message, \
           input_tokens, output_tokens, duration_ms, deployment_id, client_ip, ttft_ms, \
           cached_tokens, schedule_policy, kv_hit_blocks, kv_input_blocks, \
-          trie_blocks, trie_max_blocks, request_tokens) "
+          trie_blocks, trie_max_blocks, request_tokens, queue_wait_ms) "
     );
     qb.push_values(batch.iter(), |mut b, log| {
         b.push_bind(log.request_id.clone())
@@ -296,7 +300,8 @@ async fn batch_insert(pool: &PgPool, batch: &[RequestLog]) -> Result<u64, sqlx::
             .push_bind(log.kv_input_blocks)
             .push_bind(log.trie_blocks)
             .push_bind(log.trie_max_blocks)
-            .push_bind(log.request_tokens);
+            .push_bind(log.request_tokens)
+            .push_bind(log.queue_wait_ms);
     });
 
     let result = qb.build().execute(pool).await?;
@@ -344,6 +349,44 @@ pub fn log_error(
         request_body,
         client_ip,
         None,
+        None,
+    );
+}
+
+/// Same as `log_error` but with an explicit `queue_wait_ms` value.
+///
+/// Used by the flow-control timeout path: the request actually queued
+/// before timing out, so its audit log must record the wait. Other error
+/// paths default to `None` via `log_error` (the request never entered
+/// the queue, or the queue wait is unknown at the error site).
+pub fn log_error_with_queue_wait(
+    state: &AppState,
+    identity: &AuthIdentity,
+    model: &str,
+    api_path: &str,
+    is_stream: bool,
+    start: Instant,
+    error: &GatewayError,
+    request_id: Option<String>,
+    deployment_id: Option<String>,
+    request_body: Option<String>,
+    client_ip: Option<String>,
+    queue_wait_ms: Option<i32>,
+) {
+    log_error_with_usage(
+        state,
+        identity,
+        model,
+        api_path,
+        is_stream,
+        start,
+        error,
+        request_id,
+        deployment_id,
+        request_body,
+        client_ip,
+        None,
+        queue_wait_ms,
     );
 }
 
@@ -403,6 +446,7 @@ pub fn log_auth_error(
         None,
         client_ip,
         None,
+        None,
     );
 
     // AuthError (401) is not a dedup member, so log_error_with_usage does
@@ -421,6 +465,10 @@ pub fn log_auth_error(
 
 /// Error logging variant for composite providers that may have completed
 /// successful child calls before the parent request failed.
+///
+/// `queue_wait_ms` carries the flow-control queue wait when this is the
+/// flow-control timeout path; pass `None` for all other error sites
+/// (request never queued, or queue wait unknown).
 pub fn log_error_with_usage(
     state: &AppState,
     identity: &AuthIdentity,
@@ -434,6 +482,7 @@ pub fn log_error_with_usage(
     request_body: Option<String>,
     client_ip: Option<String>,
     usage: Option<&Usage>,
+    queue_wait_ms: Option<i32>,
 ) {
     if error.should_dedup_log() {
         let dedup_key = format!("{}:{}:{}", error.error_type(), identity.key_hash, model);
@@ -488,6 +537,7 @@ pub fn log_error_with_usage(
             trie_blocks: None,
             trie_max_blocks: None,
             request_tokens: None,
+            queue_wait_ms,
         },
     );
 
