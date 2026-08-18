@@ -164,7 +164,7 @@ router_settings:
   #   # 128K 上下文建议 block_size: 2048。
 
   # 内容路由：根据请求内容自动选择模型（可选）
-  # hybrid_router:
+  # auto_router:
   #   model_name: "auto"                  # 虚拟模型名，客户端请求此名触发分类
   #   strategy: "tier_classifier"         # 分类策略（默认 tier_classifier）
   #   default_tier: "medium"              # 分类不确定时使用的默认 tier

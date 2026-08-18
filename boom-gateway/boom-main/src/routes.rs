@@ -587,7 +587,7 @@ async fn chat_completions_inner(
             GatewayErrorReply(e, false)
         })?;
 
-    // 1b. Content-aware model resolution (hybrid router).
+    // 1b. Content-aware model resolution (auto router).
     let resolved_model = state.router.resolve_request_model(
         &req.model, &req.messages, &req.tools,
     ).await;
@@ -1505,12 +1505,12 @@ fn check_model_access(
     // Not in key_models — check if it's a configured model or a wildcard case
     let has_wildcard = identity.models.iter().any(|m| m == "*");
     let model_configured = router.is_model_configured(model);
-    let is_virtual = router.is_hybrid_virtual_model(model);
+    let is_virtual = router.is_auto_virtual_model(model);
 
-    // Virtual model (hybrid router) — always allow, it resolves to a real model later.
+    // Virtual model (auto router) — always allow, it resolves to a real model later.
     if is_virtual {
         tracing::debug!(
-            "check_model_access: key={:?}, model={}, result=allow (hybrid virtual model)",
+            "check_model_access: key={:?}, model={}, result=allow (auto virtual model)",
             identity.key_name, model
         );
         return Ok(());
@@ -2769,7 +2769,7 @@ pub async fn messages(
             AnthropicErrorReply(e, is_stream)
         })?;
 
-    // 1b. Content-aware model resolution (hybrid router).
+    // 1b. Content-aware model resolution (auto router).
     let resolved_model = state.router.resolve_request_model(
         &openai_req.model, &openai_req.messages, &openai_req.tools,
     ).await;

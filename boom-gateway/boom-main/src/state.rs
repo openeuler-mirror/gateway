@@ -7,7 +7,7 @@ use boom_kvindex::{TokenPrefixIndex};
 use boom_core::kv_event::KvIndexBackend;
 use boom_limiter::{PlanStore, RateLimitPlan, ScheduleSlot, SlidingWindowLimiter};
 use boom_flowcontrol::{FlowControlConfig, FlowController};
-use boom_routing::{register_fusion_providers, AliasStore, DeploymentStore, FusionRuntime, HybridRouter, InFlightTracker, KeyAffinityPolicy, MlServiceClient, RebalanceMoveTracker, RequestRateTracker, Router, RoundRobinPolicy, SchedulePolicy, StrategyRegistry, TierClassifier};
+use boom_routing::{register_fusion_providers, AliasStore, DeploymentStore, FusionRuntime, AutoRouter, InFlightTracker, KeyAffinityPolicy, MlServiceClient, RebalanceMoveTracker, RequestRateTracker, Router, RoundRobinPolicy, SchedulePolicy, StrategyRegistry, TierClassifier};
 use boom_ctxaware::AgentStatsTracker;
 use boom_promptlog::PromptLogWriter;
 use boom_provider;
@@ -224,15 +224,15 @@ impl AppState {
         // Create scheduling policy from config (may reference inflight, rebalance_move_tracker, kv_index).
         let policy = create_policy(&config, &inflight, &flow_controller, &rebalance_move_tracker, &kv_index_val);
 
-        // Build hybrid router classifier (optional, content-based model routing).
-        let hybrid_classifier = build_hybrid_router(&config);
+        // Build auto router classifier (optional, content-based model routing).
+        let auto_classifier = build_auto_router(&config);
 
         // Router wraps stores + policy + classifier for routing decisions.
         let router = Arc::new(Router::with_classifier(
             deployment_store.clone(),
             alias_store.clone(),
             policy,
-            hybrid_classifier,
+            auto_classifier,
         ));
 
         // 5. Build from YAML first, then layer DB-only records on top.
@@ -528,8 +528,8 @@ impl AppState {
         );
         self.router.set_policy(new_policy);
 
-        // Rebuild hybrid router classifier.
-        self.router.set_classifier(build_hybrid_router(&new_config));
+        // Rebuild auto router classifier.
+        self.router.set_classifier(build_auto_router(&new_config));
 
         if let Some(ref pool) = db_pool {
             // Sync YAML config to DB (upsert source='yaml', handle conflicts).
@@ -1400,25 +1400,63 @@ fn load_plans_from_config(plan_store: &Arc<PlanStore>, config: &Config) {
 // Helpers
 // ═══════════════════════════════════════════════════════════
 
-/// Build a HybridRouter from config, if hybrid_router section is present.
-fn build_hybrid_router(config: &Config) -> Option<Arc<HybridRouter>> {
-    let hr_config = config.router_settings.hybrid_router.as_ref()?;
+/// Build an AutoRouter from config, if auto_router section is present.
+fn build_auto_router(config: &Config) -> Option<Arc<AutoRouter>> {
+    let hr_config = config.router_settings.auto_router.as_ref()?;
+
+    // ── Strategy / section consistency checks ──────────────────────
+    let wants_ml = hr_config.strategy == "ml_service";
+    let has_ml = hr_config.ml_service.is_some();
+    if wants_ml && !has_ml {
+        tracing::error!(
+            strategy = %hr_config.strategy,
+            "auto_router.strategy=ml_service requires the ml_service sub-section \
+             (url, timeout_ms). Add it or switch strategy to tier_classifier. \
+             Disabling auto router."
+        );
+        return None;
+    }
+    if has_ml && !wants_ml {
+        tracing::warn!(
+            strategy = %hr_config.strategy,
+            "ml_service section is configured but auto_router.strategy is not \
+             'ml_service' — the ml_service section will be ignored"
+        );
+    }
 
     let mut registry = StrategyRegistry::new();
     registry.register(Arc::new(TierClassifier));
     if let Some(ml) = &hr_config.ml_service {
-        tracing::info!(
-            url = %ml.url,
-            timeout_ms = ml.timeout_ms,
-            "Registering ML service classification strategy"
-        );
-        let valid_tiers: std::collections::HashSet<String> =
-            hr_config.tiers.keys().cloned().collect();
-        registry.register(Arc::new(MlServiceClient::new(
-            &ml.url,
-            ml.timeout_ms,
-            valid_tiers,
-        )));
+        // `timeout_ms == 0` is rejected up-front in MlServiceClient::try_new
+        // (reqwest treats 0 as no-timeout). Surface the same condition here
+        // as an error so the operator sees the actionable message before
+        // registration is even attempted.
+        if ml.timeout_ms == 0 {
+            tracing::error!(
+                url = %ml.url,
+                timeout_ms = ml.timeout_ms,
+                "ml_service.timeout_ms must be > 0 (reqwest treats 0 as 'no timeout', \
+                 which would let a hung ML service block every classifier call \
+                 indefinitely). Skipping ml_service strategy registration."
+            );
+        } else {
+            tracing::info!(
+                url = %ml.url,
+                timeout_ms = ml.timeout_ms,
+                "Registering ML service classification strategy"
+            );
+            let valid_tiers: std::collections::HashSet<String> =
+                hr_config.tiers.keys().cloned().collect();
+            match MlServiceClient::try_new(&ml.url, ml.timeout_ms, valid_tiers) {
+                Ok(client) => registry.register(Arc::new(client)),
+                Err(e) => tracing::error!(
+                    url = %ml.url,
+                    error = %e,
+                    "Failed to build ML service client; ml_service strategy \
+                     unavailable (other strategies remain registered)"
+                ),
+            }
+        }
     }
 
     let strategy = match registry.get(&hr_config.strategy) {
@@ -1426,7 +1464,7 @@ fn build_hybrid_router(config: &Config) -> Option<Arc<HybridRouter>> {
         None => {
             tracing::error!(
                 strategy = %hr_config.strategy,
-                "Unknown hybrid_router strategy, disabling hybrid router"
+                "Unknown auto_router strategy, disabling auto router"
             );
             return None;
         }
@@ -1443,10 +1481,10 @@ fn build_hybrid_router(config: &Config) -> Option<Arc<HybridRouter>> {
         strategy = %hr_config.strategy,
         default_tier = %hr_config.default_tier,
         tiers = ?tiers,
-        "Hybrid router enabled"
+        "Auto router enabled"
     );
 
-    Some(Arc::new(HybridRouter::new(
+    Some(Arc::new(AutoRouter::new(
         hr_config.model_name.clone(),
         strategy,
         hr_config.default_tier.clone(),

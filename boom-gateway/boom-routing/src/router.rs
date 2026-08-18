@@ -3,7 +3,7 @@ use boom_core::provider::Provider;
 use boom_core::types::{Message, Tool};
 use std::sync::Arc;
 
-use crate::hybrid_router::HybridRouter;
+use crate::auto_router::AutoRouter;
 use crate::policy::{SchedulePolicy, Selection};
 use crate::{AliasStore, DeploymentStore};
 
@@ -21,13 +21,13 @@ impl std::ops::Deref for PolicyHolder {
 
 /// Type-erased classifier wrapper for ArcSwap compatibility.
 struct ClassifierHolder {
-    inner: Option<Arc<HybridRouter>>,
+    inner: Option<Arc<AutoRouter>>,
 }
 
 /// Unified routing decision engine.
 ///
 /// Owns references to DeploymentStore, AliasStore, a SchedulePolicy,
-/// and an optional HybridRouter classifier, providing a single entry
+/// and an optional AutoRouter classifier, providing a single entry
 /// point for all routing logic.
 pub struct Router {
     deployment_store: Arc<DeploymentStore>,
@@ -50,12 +50,12 @@ impl Router {
         }
     }
 
-    /// Create a Router with an optional hybrid router classifier.
+    /// Create a Router with an optional auto router classifier.
     pub fn with_classifier(
         deployment_store: Arc<DeploymentStore>,
         alias_store: Arc<AliasStore>,
         policy: Arc<dyn SchedulePolicy>,
-        classifier: Option<Arc<HybridRouter>>,
+        classifier: Option<Arc<AutoRouter>>,
     ) -> Self {
         Self {
             deployment_store,
@@ -77,8 +77,8 @@ impl Router {
         self.policy.load().inner.name().to_string()
     }
 
-    /// Hot-swap the hybrid router classifier (e.g. on config reload).
-    pub fn set_classifier(&self, classifier: Option<Arc<HybridRouter>>) {
+    /// Hot-swap the auto router classifier (e.g. on config reload).
+    pub fn set_classifier(&self, classifier: Option<Arc<AutoRouter>>) {
         self.classifier
             .store(Arc::new(ClassifierHolder { inner: classifier }));
     }
@@ -102,7 +102,7 @@ impl Router {
         model.to_string()
     }
 
-    /// Content-aware model resolution: hybrid router classification
+    /// Content-aware model resolution: auto router classification
     /// followed by normal alias resolution.
     ///
     /// Returns the resolved model name for routing (provider selection,
@@ -123,8 +123,8 @@ impl Router {
         self.resolve_model_name(model)
     }
 
-    /// Check if a model name is the hybrid router's virtual model.
-    pub fn is_hybrid_virtual_model(&self, model: &str) -> bool {
+    /// Check if a model name is the auto router's virtual model.
+    pub fn is_auto_virtual_model(&self, model: &str) -> bool {
         self.classifier
             .load()
             .inner
@@ -214,7 +214,7 @@ impl Router {
             }
         }
 
-        // Include hybrid router virtual model name if enabled.
+        // Include auto router virtual model name if enabled.
         if let Some(ref hr) = self.classifier.load().inner {
             let name = hr.model_name().to_string();
             if !names.contains(&name) {
