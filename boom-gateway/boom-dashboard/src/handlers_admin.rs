@@ -4948,6 +4948,30 @@ impl IqrBox {
         }
     }
 
+    /// Severity score = how many IQR-widths the value sits past the fence.
+    /// Same conditions as `flag`: None when the box has no samples, when
+    /// IQR is degenerate, or when the value sits inside the band. Used to
+    /// rank outliers so the table can surface the worst offenders first.
+    fn severity(&self, value: Option<f64>) -> Option<f64> {
+        let (Some(_), Some(_), Some(iqr), Some(lower), Some(upper)) =
+            (self.p25, self.p75, self.iqr, self.lower, self.upper)
+        else {
+            return None;
+        };
+        if iqr == 0.0 {
+            return None;
+        }
+        let v = value?;
+        let lower_clamped = lower.max(0.0);
+        if v > upper {
+            Some((v - upper) / iqr)
+        } else if v < lower_clamped {
+            Some((lower_clamped - v) / iqr)
+        } else {
+            None
+        }
+    }
+
     fn empty() -> Self {
         IqrBox {
             p25: None,
@@ -5140,42 +5164,64 @@ pub async fn get_anomalies(
     let mut outliers: Vec<Value> = Vec::new();
     for g in &groups {
         let mut metrics = serde_json::Map::new();
+        let mut severity_sum = 0.0f64;
+        let mut metric_count = 0u32;
+
         if let Some(dir) = duration_box.flag(g.duration_avg) {
+            let sev = duration_box.severity(g.duration_avg).unwrap_or(0.0);
+            severity_sum += sev;
+            metric_count += 1;
             metrics.insert(
                 "duration_ms".to_string(),
-                json!({"value": g.duration_avg, "direction": dir}),
+                json!({"value": g.duration_avg, "direction": dir, "severity": sev}),
             );
         }
         if let Some(dir) = ttft_box.flag(g.ttft_avg) {
+            let sev = ttft_box.severity(g.ttft_avg).unwrap_or(0.0);
+            severity_sum += sev;
+            metric_count += 1;
             metrics.insert(
                 "ttft_ms".to_string(),
-                json!({"value": g.ttft_avg, "direction": dir}),
+                json!({"value": g.ttft_avg, "direction": dir, "severity": sev}),
             );
         }
         if let Some(dir) = queue_box.flag(g.queue_avg) {
+            let sev = queue_box.severity(g.queue_avg).unwrap_or(0.0);
+            severity_sum += sev;
+            metric_count += 1;
             metrics.insert(
                 "queue_wait_ms".to_string(),
-                json!({"value": g.queue_avg, "direction": dir}),
+                json!({"value": g.queue_avg, "direction": dir, "severity": sev}),
             );
         }
         if let Some(dir) = input_box.flag(g.input_avg) {
+            let sev = input_box.severity(g.input_avg).unwrap_or(0.0);
+            severity_sum += sev;
+            metric_count += 1;
             metrics.insert(
                 "input_tokens".to_string(),
-                json!({"value": g.input_avg, "direction": dir}),
+                json!({"value": g.input_avg, "direction": dir, "severity": sev}),
             );
         }
         if let Some(dir) = hit_rate_box.flag(g.hit_rate_avg) {
+            let sev = hit_rate_box.severity(g.hit_rate_avg).unwrap_or(0.0);
+            severity_sum += sev;
+            metric_count += 1;
             metrics.insert(
                 "hit_rate".to_string(),
-                json!({"value": g.hit_rate_avg, "direction": dir}),
+                json!({"value": g.hit_rate_avg, "direction": dir, "severity": sev}),
             );
         }
-        // Error rate: absolute threshold, not IQR.
+        // Error rate: absolute threshold, not IQR. Severity here is measured
+        // in threshold multiples (how many × of the 3× baseline above it).
         let err_val = g.err_rate.unwrap_or(0.0);
         if err_val > err_threshold && err_val > 0.0 {
+            let sev = (err_val - err_threshold) / err_threshold;
+            severity_sum += sev;
+            metric_count += 1;
             metrics.insert(
                 "err_rate".to_string(),
-                json!({"value": err_val, "direction": "high"}),
+                json!({"value": err_val, "direction": "high", "severity": sev}),
             );
         }
 
@@ -5184,9 +5230,18 @@ pub async fn get_anomalies(
                 "group_key": g.group_key,
                 "req_count": g.req_count,
                 "metrics": metrics,
+                "severity": severity_sum,
+                "metric_count": metric_count,
             }));
         }
     }
+
+    // Sort by total severity descending — worst offenders first.
+    outliers.sort_by(|a, b| {
+        let sa = a.get("severity").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let sb = b.get("severity").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     Json(json!({
         "range": q.range,

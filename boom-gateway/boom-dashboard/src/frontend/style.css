@@ -834,6 +834,17 @@ p.error { color: var(--danger); font-style: italic; margin: 0; }
   border-color: var(--warning, #b8860b);
   background: rgba(184, 134, 11, .08);
 }
+.anomaly-table .metric-sev {
+  display: inline-block;
+  margin-left: 4px;
+  font-size: 10px;
+  font-weight: 600;
+  opacity: .85;
+}
+.anomaly-table .sev-cell {
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
 
 /* ── Cards ──────────────────────────────────────────────── */
 .card {

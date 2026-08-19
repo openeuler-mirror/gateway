@@ -1335,19 +1335,25 @@
     if (outliers.length === 0) {
       outliersHtml = '<p class="muted">' + t("debug.anomalies.empty") + '</p>';
     } else {
+      // Backend already sorts by total severity desc — worst offenders on top.
       const rows = outliers.map((o) => {
         const chips = Object.entries(o.metrics || {}).map(([k, m]) => {
           const d = m.direction === "high" ? "high" : "low";
           const lbl = metricLabel[k] || k;
           const digits = metricDigits[k] !== undefined ? metricDigits[k] : 2;
+          const sev = (typeof m.severity === "number" && m.severity > 0)
+            ? ' <span class="metric-sev">×' + m.severity.toFixed(1) + ' IQR</span>'
+            : "";
           return '<span class="metric-chip ' + d + '">' +
-                   esc(lbl) + " " + fmt(m.value, digits) +
+                   esc(lbl) + " " + fmt(m.value, digits) + sev +
                  '</span>';
         }).join("");
+        const totalSev = (typeof o.severity === "number") ? o.severity : 0;
         return '<tr>' +
           '<td>' + esc(o.group_key || "") + '</td>' +
           '<td>' + Number(o.req_count || 0).toLocaleString() + '</td>' +
           '<td>' + chips + '</td>' +
+          '<td class="sev-cell">' + totalSev.toFixed(2) + '</td>' +
         '</tr>';
       }).join("");
       outliersHtml =
@@ -1356,6 +1362,7 @@
             '<th>' + dimLabel + '</th>' +
             '<th>' + t("debug.anomalies.col.req_count") + '</th>' +
             '<th>' + t("debug.anomalies.col.metric") + '</th>' +
+            '<th>' + t("debug.anomalies.col.severity") + '</th>' +
           '</tr></thead>' +
           '<tbody>' + rows + '</tbody>' +
         '</table>';
