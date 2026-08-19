@@ -5053,25 +5053,25 @@ pub async fn get_anomalies(
         // so the CASE-wrapped hit-rate ratio skips rows without input_tokens.
         let center = sqlx::query_as::<_, CenterRow>(
             r#"SELECT
-                 percentile_cont(0.25) WITHIN GROUP (ORDER BY duration_ms)   AS duration_p25,
-                 percentile_cont(0.75) WITHIN GROUP (ORDER BY duration_ms)   AS duration_p75,
-                 percentile_cont(0.25) WITHIN GROUP (ORDER BY ttft_ms)       AS ttft_p25,
-                 percentile_cont(0.75) WITHIN GROUP (ORDER BY ttft_ms)       AS ttft_p75,
-                 percentile_cont(0.25) WITHIN GROUP (ORDER BY queue_wait_ms) AS queue_p25,
-                 percentile_cont(0.75) WITHIN GROUP (ORDER BY queue_wait_ms) AS queue_p75,
-                 percentile_cont(0.25) WITHIN GROUP (ORDER BY input_tokens) AS input_p25,
-                 percentile_cont(0.75) WITHIN GROUP (ORDER BY input_tokens) AS input_p75,
+                 percentile_cont(0.25) WITHIN GROUP (ORDER BY duration_ms)::float8   AS duration_p25,
+                 percentile_cont(0.75) WITHIN GROUP (ORDER BY duration_ms)::float8   AS duration_p75,
+                 percentile_cont(0.25) WITHIN GROUP (ORDER BY ttft_ms)::float8       AS ttft_p25,
+                 percentile_cont(0.75) WITHIN GROUP (ORDER BY ttft_ms)::float8       AS ttft_p75,
+                 percentile_cont(0.25) WITHIN GROUP (ORDER BY queue_wait_ms)::float8 AS queue_p25,
+                 percentile_cont(0.75) WITHIN GROUP (ORDER BY queue_wait_ms)::float8 AS queue_p75,
+                 percentile_cont(0.25) WITHIN GROUP (ORDER BY input_tokens)::float8 AS input_p25,
+                 percentile_cont(0.75) WITHIN GROUP (ORDER BY input_tokens)::float8 AS input_p75,
                  percentile_cont(0.25) WITHIN GROUP (
                    ORDER BY CASE WHEN input_tokens > 0
-                                 THEN COALESCE(cached_tokens, 0)::float / input_tokens
+                                 THEN COALESCE(cached_tokens, 0)::float8 / input_tokens
                                  ELSE NULL END
-                 ) AS hit_rate_p25,
+                 )::float8 AS hit_rate_p25,
                  percentile_cont(0.75) WITHIN GROUP (
                    ORDER BY CASE WHEN input_tokens > 0
-                                 THEN COALESCE(cached_tokens, 0)::float / input_tokens
+                                 THEN COALESCE(cached_tokens, 0)::float8 / input_tokens
                                  ELSE NULL END
-                 ) AS hit_rate_p75,
-                 avg(CASE WHEN status_code != 200 THEN 1.0::float8 ELSE 0.0::float8 END) AS err_rate_avg
+                 )::float8 AS hit_rate_p75,
+                 avg(CASE WHEN status_code != 200 THEN 1.0::float8 ELSE 0.0::float8 END)::float8 AS err_rate_avg
                FROM boom_request_log
                WHERE created_at >= $1 AND created_at < $2"#,
         )
@@ -5087,14 +5087,14 @@ pub async fn get_anomalies(
             r#"SELECT
                  {dim_col} AS group_key,
                  COUNT(*)::bigint AS req_count,
-                 avg(duration_ms) AS duration_avg,
-                 avg(ttft_ms)     AS ttft_avg,
-                 avg(queue_wait_ms) AS queue_avg,
-                 avg(input_tokens) AS input_avg,
+                 avg(duration_ms)::float8 AS duration_avg,
+                 avg(ttft_ms)::float8     AS ttft_avg,
+                 avg(queue_wait_ms)::float8 AS queue_avg,
+                 avg(input_tokens)::float8 AS input_avg,
                  avg(CASE WHEN input_tokens > 0
-                          THEN COALESCE(cached_tokens, 0)::float / input_tokens
-                          ELSE NULL END) AS hit_rate_avg,
-                 avg(CASE WHEN status_code != 200 THEN 1.0::float8 ELSE 0.0::float8 END) AS err_rate
+                          THEN COALESCE(cached_tokens, 0)::float8 / input_tokens
+                          ELSE NULL END)::float8 AS hit_rate_avg,
+                 avg(CASE WHEN status_code != 200 THEN 1.0::float8 ELSE 0.0::float8 END)::float8 AS err_rate
                FROM boom_request_log
                WHERE created_at >= $1 AND created_at < $2
                  AND {dim_col} IS NOT NULL
