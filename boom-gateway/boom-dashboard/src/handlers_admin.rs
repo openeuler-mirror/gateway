@@ -5071,7 +5071,7 @@ pub async fn get_anomalies(
                                  THEN COALESCE(cached_tokens, 0)::float / input_tokens
                                  ELSE NULL END
                  ) AS hit_rate_p75,
-                 avg(CASE WHEN status_code != 200 THEN 1.0 ELSE 0.0 END) AS err_rate_avg
+                 avg(CASE WHEN status_code != 200 THEN 1.0::float8 ELSE 0.0::float8 END) AS err_rate_avg
                FROM boom_request_log
                WHERE created_at >= $1 AND created_at < $2"#,
         )
@@ -5094,7 +5094,7 @@ pub async fn get_anomalies(
                  avg(CASE WHEN input_tokens > 0
                           THEN COALESCE(cached_tokens, 0)::float / input_tokens
                           ELSE NULL END) AS hit_rate_avg,
-                 avg(CASE WHEN status_code != 200 THEN 1.0 ELSE 0.0 END) AS err_rate
+                 avg(CASE WHEN status_code != 200 THEN 1.0::float8 ELSE 0.0::float8 END) AS err_rate
                FROM boom_request_log
                WHERE created_at >= $1 AND created_at < $2
                  AND {dim_col} IS NOT NULL
