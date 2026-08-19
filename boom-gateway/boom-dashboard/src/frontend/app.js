@@ -1349,8 +1349,14 @@
                  '</span>';
         }).join("");
         const totalSev = (typeof o.severity === "number") ? o.severity : 0;
+        const rawKey = o.group_key || "";
+        const alias = o.alias && o.alias !== rawKey ? o.alias : "";
+        const groupCell = alias
+          ? '<span class="group-alias">' + esc(alias) + '</span>' +
+            '<span class="group-raw" title="' + esc(rawKey) + '">' + esc(rawKey) + '</span>'
+          : esc(rawKey);
         return '<tr>' +
-          '<td>' + esc(o.group_key || "") + '</td>' +
+          '<td>' + groupCell + '</td>' +
           '<td>' + Number(o.req_count || 0).toLocaleString() + '</td>' +
           '<td>' + chips + '</td>' +
           '<td class="sev-cell">' + totalSev.toFixed(2) + '</td>' +

@@ -4885,6 +4885,25 @@ impl AnomalyDim {
         }
     }
 
+    /// Optional LEFT JOIN + alias column to surface a human-readable name
+    /// for the grouped id. Returns (join_clause, alias_column_select).
+    /// `join_clause` uses `rlog` as the alias for boom_request_log.
+    /// None for model/deployment_id — those columns already store the
+    /// human-facing name directly (no extra mapping layer).
+    fn alias_join(&self) -> Option<(&'static str, &'static str)> {
+        match self {
+            AnomalyDim::KeyHash => Some((
+                r##"LEFT JOIN "boom_verification_token" bvt ON bvt.token = rlog.key_hash"##,
+                "bvt.key_alias",
+            )),
+            AnomalyDim::TeamId => Some((
+                r##"LEFT JOIN "boom_team_table" bt ON bt.team_id = rlog.team_id"##,
+                "bt.team_alias",
+            )),
+            AnomalyDim::Model | AnomalyDim::DeploymentId => None,
+        }
+    }
+
     fn parse(s: &str) -> Option<Self> {
         match s {
             "key_hash" => Some(AnomalyDim::KeyHash),
@@ -5019,6 +5038,7 @@ struct CenterRow {
 #[derive(Debug, sqlx::FromRow)]
 struct GroupRow {
     group_key: Option<String>,
+    alias: Option<String>,
     req_count: i64,
     duration_avg: Option<f64>,
     ttft_avg: Option<f64>,
@@ -5107,22 +5127,44 @@ pub async fn get_anomalies(
         // SQL 2: per-group averages. `dim_col` is whitelisted via AnomalyDim.
         // HAVING COUNT(*) >= 10 filters out low-volume groups so a one-shot
         // slow request can't produce a misleading outlier.
+        //
+        // LEFT JOIN optional alias table (boom_verification_token / boom_team_table)
+        // so the frontend can display a human-readable name instead of the
+        // raw hash / team_id. COALESCE falls back to the raw value when the
+        // alias is unset. For model/deployment_id dims there is no extra
+        // mapping layer — the column already stores the human-facing name,
+        // so no JOIN is emitted and alias = group_key.
+        let alias_join = dim.alias_join();
+        let (join_clause, alias_select, group_by_extra) = match alias_join {
+            Some((jc, ac)) => (
+                jc,
+                format!("COALESCE({ac}, rlog.{dim_col}) AS alias"),
+                format!(", {ac}"),
+            ),
+            None => (
+                "",
+                "rlog.{dim_col} AS alias".to_string(),
+                String::new(),
+            ),
+        };
         let groups_sql = format!(
             r#"SELECT
-                 {dim_col} AS group_key,
+                 rlog.{dim_col} AS group_key,
+                 {alias_select},
                  COUNT(*)::bigint AS req_count,
-                 avg(duration_ms)::float8 AS duration_avg,
-                 avg(ttft_ms)::float8     AS ttft_avg,
-                 avg(queue_wait_ms)::float8 AS queue_avg,
-                 avg(input_tokens)::float8 AS input_avg,
-                 avg(CASE WHEN input_tokens > 0
-                          THEN COALESCE(cached_tokens, 0)::float8 / input_tokens
+                 avg(rlog.duration_ms)::float8 AS duration_avg,
+                 avg(rlog.ttft_ms)::float8     AS ttft_avg,
+                 avg(rlog.queue_wait_ms)::float8 AS queue_avg,
+                 avg(rlog.input_tokens)::float8 AS input_avg,
+                 avg(CASE WHEN rlog.input_tokens > 0
+                          THEN COALESCE(rlog.cached_tokens, 0)::float8 / rlog.input_tokens
                           ELSE NULL END)::float8 AS hit_rate_avg,
-                 avg(CASE WHEN status_code != 200 THEN 1.0::float8 ELSE 0.0::float8 END)::float8 AS err_rate
-               FROM boom_request_log
-               WHERE created_at >= $1 AND created_at < $2
-                 AND {dim_col} IS NOT NULL
-               GROUP BY {dim_col}
+                 avg(CASE WHEN rlog.status_code != 200 THEN 1.0::float8 ELSE 0.0::float8 END)::float8 AS err_rate
+               FROM boom_request_log rlog
+               {join_clause}
+               WHERE rlog.created_at >= $1 AND rlog.created_at < $2
+                 AND rlog.{dim_col} IS NOT NULL
+               GROUP BY rlog.{dim_col}{group_by_extra}
                HAVING COUNT(*) >= 10"#
         );
         let groups = sqlx::query_as::<_, GroupRow>(&groups_sql)
@@ -5228,6 +5270,7 @@ pub async fn get_anomalies(
         if !metrics.is_empty() {
             outliers.push(json!({
                 "group_key": g.group_key,
+                "alias": g.alias,
                 "req_count": g.req_count,
                 "metrics": metrics,
                 "severity": severity_sum,
