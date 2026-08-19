@@ -382,7 +382,7 @@
     else if (section === "admin-keys") { setupKeysSearch(); loadKeys(); }
     else if (section === "admin-quota") loadQuota();
     else if (section === "admin-logs") { setupLogsFilters(); loadLogs(); }
-    else if (section === "admin-debug") { loadAgentStats(); loadRebalanceMoves(); loadKvcDfx(); loadAuditLogStats(); }
+    else if (section === "admin-debug") { setupDebugSubtabs(); setupAnomalyControls(); loadAgentStats(); loadRebalanceMoves(); loadKvcDfx(); loadAuditLogStats(); }
     else if (section === "admin-config") loadConfigPage();
   }
 
@@ -1205,6 +1205,172 @@
         '<p class="als-hint">' + t("debug.audit_log.hint") + '</p>' +
       '</div>';
   }
+
+  // ── Debug sub-tabs (Overview / Anomalies) ─────────────────
+  let debugSubtabsSetup = false;
+  let anomalyDim = "key_hash";
+  let anomalyRange = "1d";
+  let anomalyControlsSetup = false;
+
+  function setupDebugSubtabs() {
+    if (debugSubtabsSetup) return;
+    debugSubtabsSetup = true;
+    const tabs = document.querySelectorAll(".debug-subtab");
+    tabs.forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const target = btn.dataset.subtab;
+        tabs.forEach((b) => b.classList.toggle("active", b === btn));
+        document.querySelectorAll(".debug-pane").forEach((p) => {
+          p.classList.toggle("active", p.dataset.pane === target);
+        });
+      });
+    });
+  }
+
+  function setupAnomalyControls() {
+    if (anomalyControlsSetup) return;
+    anomalyControlsSetup = true;
+    const dimSel = document.getElementById("anomaly-dim");
+    if (dimSel) {
+      dimSel.addEventListener("change", () => {
+        anomalyDim = dimSel.value;
+      });
+    }
+    document.querySelectorAll("[data-anomaly-range]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        anomalyRange = btn.dataset.anomalyRange;
+        document.querySelectorAll("[data-anomaly-range]").forEach((b) =>
+          b.classList.toggle("active", b === btn)
+        );
+      });
+    });
+    const refreshBtn = document.getElementById("btn-anomaly-refresh");
+    if (refreshBtn) {
+      refreshBtn.addEventListener("click", loadAnomalies);
+    }
+  }
+
+  async function loadAnomalies() {
+    const wrap = document.getElementById("anomaly-results-wrap");
+    if (!wrap) return;
+    wrap.innerHTML = '<p class="loading">' + t("common.loading") + '</p>';
+    const url = `/admin/debug/anomalies?range=${encodeURIComponent(anomalyRange)}&dim=${encodeURIComponent(anomalyDim)}`;
+    try {
+      const data = await api(url);
+      renderAnomalies(data, wrap);
+    } catch (err) {
+      const hint = (err.message || "").includes("timeout") ? t("debug.anomalies.timeout_hint") : "";
+      wrap.innerHTML = '<p class="error-msg">' + t("common.error_prefix", { message: esc(err.message || "") }) + (hint ? '<br>' + hint : "") + '</p>';
+    }
+  }
+
+  function renderAnomalies(data, wrap) {
+    if (data.error) {
+      const hint = data.timeout_hint ? t("debug.anomalies.timeout_hint") : "";
+      wrap.innerHTML = '<p class="error-msg">' + esc(data.error) + (hint ? '<br>' + hint : "") + '</p>';
+      return;
+    }
+
+    const centers = data.centers || {};
+    const dimLabel = {
+      key_hash: t("debug.anomalies.dim.key"),
+      model: t("debug.anomalies.dim.model"),
+      deployment_id: t("debug.anomalies.dim.deployment"),
+      team_id: t("debug.anomalies.dim.team"),
+    }[data.dim] || data.dim;
+
+    const fmt = (v, digits = 2) => (v === null || v === undefined) ? "—" : Number(v).toFixed(digits);
+
+    const cards = [
+      { key: "duration_ms", label: t("debug.anomalies.metric.duration"), c: centers.duration_ms },
+      { key: "ttft_ms", label: t("debug.anomalies.metric.ttft"), c: centers.ttft_ms },
+      { key: "queue_wait_ms", label: t("debug.anomalies.metric.queue"), c: centers.queue_wait_ms },
+      { key: "input_tokens", label: t("debug.anomalies.metric.input_tokens"), c: centers.input_tokens },
+      { key: "hit_rate", label: t("debug.anomalies.metric.hit_rate"), c: centers.hit_rate },
+    ];
+
+    const cardsHtml = cards.map((m) => {
+      if (!m.c) return "";
+      if (m.key === "hit_rate") {
+        return '' +
+          '<div class="anomaly-metric-card">' +
+            '<h4>' + esc(m.label) + '</h4>' +
+            '<div class="row"><span class="label">P25</span><span class="value">' + fmt(m.c.p25, 3) + '</span></div>' +
+            '<div class="row"><span class="label">P75</span><span class="value">' + fmt(m.c.p75, 3) + '</span></div>' +
+            '<div class="row"><span class="label">IQR</span><span class="value">' + fmt(m.c.iqr, 3) + '</span></div>' +
+            '<div class="fences">[' + fmt(m.c.lower, 3) + ", " + fmt(m.c.upper, 3) + ']</div>' +
+          '</div>';
+      }
+      return '' +
+        '<div class="anomaly-metric-card">' +
+          '<h4>' + esc(m.label) + '</h4>' +
+          '<div class="row"><span class="label">P25</span><span class="value">' + fmt(m.c.p25, 0) + '</span></div>' +
+          '<div class="row"><span class="label">P75</span><span class="value">' + fmt(m.c.p75, 0) + '</span></div>' +
+          '<div class="row"><span class="label">IQR</span><span class="value">' + fmt(m.c.iqr, 0) + '</span></div>' +
+          '<div class="fences">[' + fmt(m.c.lower, 0) + ", " + fmt(m.c.upper, 0) + ']</div>' +
+        '</div>';
+    }).join("");
+
+    // Err rate card (avg + threshold).
+    const errCard = centers.err_rate
+      ? '<div class="anomaly-metric-card">' +
+          '<h4>' + t("debug.anomalies.metric.err_rate") + '</h4>' +
+          '<div class="row"><span class="label">avg</span><span class="value">' + fmt(centers.err_rate.avg, 4) + '</span></div>' +
+          '<div class="row"><span class="label">threshold</span><span class="value">' + fmt(centers.err_rate.threshold, 4) + '</span></div>' +
+        '</div>'
+      : "";
+
+    const outliers = data.outliers || [];
+    const metricLabel = {
+      duration_ms: t("debug.anomalies.metric.duration"),
+      ttft_ms: t("debug.anomalies.metric.ttft"),
+      queue_wait_ms: t("debug.anomalies.metric.queue"),
+      input_tokens: t("debug.anomalies.metric.input_tokens"),
+      hit_rate: t("debug.anomalies.metric.hit_rate"),
+      err_rate: t("debug.anomalies.metric.err_rate"),
+    };
+    const metricDigits = { duration_ms: 1, ttft_ms: 1, queue_wait_ms: 1, input_tokens: 0, hit_rate: 3, err_rate: 4 };
+
+    let outliersHtml;
+    if (outliers.length === 0) {
+      outliersHtml = '<p class="muted">' + t("debug.anomalies.empty") + '</p>';
+    } else {
+      const rows = outliers.map((o) => {
+        const chips = Object.entries(o.metrics || {}).map(([k, m]) => {
+          const d = m.direction === "high" ? "high" : "low";
+          const lbl = metricLabel[k] || k;
+          const digits = metricDigits[k] !== undefined ? metricDigits[k] : 2;
+          return '<span class="metric-chip ' + d + '">' +
+                   esc(lbl) + " " + fmt(m.value, digits) +
+                 '</span>';
+        }).join("");
+        return '<tr>' +
+          '<td>' + esc(o.group_key || "") + '</td>' +
+          '<td>' + Number(o.req_count || 0).toLocaleString() + '</td>' +
+          '<td>' + chips + '</td>' +
+        '</tr>';
+      }).join("");
+      outliersHtml =
+        '<table class="anomaly-table">' +
+          '<thead><tr>' +
+            '<th>' + dimLabel + '</th>' +
+            '<th>' + t("debug.anomalies.col.req_count") + '</th>' +
+            '<th>' + t("debug.anomalies.col.metric") + '</th>' +
+          '</tr></thead>' +
+          '<tbody>' + rows + '</tbody>' +
+        '</table>';
+    }
+
+    const summary = (data.total_groups != null && data.total_outliers != null)
+      ? '<p class="muted">' + data.total_outliers + ' / ' + data.total_groups + ' ' + dimLabel + ' flagged</p>'
+      : "";
+
+    wrap.innerHTML =
+      '<div class="anomaly-metric-cards">' + cardsHtml + errCard + '</div>' +
+      summary +
+      outliersHtml;
+  }
+
 
   // ── Agent Statistics (anthropic share stacked bar) ───────
   async function loadAgentStats() {

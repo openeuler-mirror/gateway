@@ -165,6 +165,11 @@ pub fn build_router<S: Clone + Send + Sync + 'static>(state: DashboardState) -> 
             "/dashboard/api/admin/stats/agents",
             get(handlers_admin::get_agent_stats),
         )
+        // Admin — Anomaly Detection (IQR-based outlier scan per dim; manual refresh).
+        .route(
+            "/dashboard/api/admin/debug/anomalies",
+            get(handlers_admin::get_anomalies),
+        )
         // Admin — Rate Limit Window Reset.
         .route(
             "/dashboard/api/admin/limits/reset/{key_hash}",
