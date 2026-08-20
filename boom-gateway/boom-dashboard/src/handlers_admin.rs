@@ -4838,6 +4838,480 @@ pub async fn get_stress_timeseries(
     Json(snap).into_response()
 }
 
+// ═══════════════════════════════════════════════════════════
+// Anomaly detection — IQR-based outlier scan per dimension
+// ═══════════════════════════════════════════════════════════
+
+/// Query params for `GET /admin/debug/anomalies`.
+///
+/// `range` accepts `1d` / `3d` / `7d` (days, anchored to "now"). `dim` accepts
+/// one of four column names; values are whitelisted before SQL interpolation
+/// (never bind user input directly into a SQL identifier).
+#[derive(Debug, Deserialize)]
+pub struct AnomalyQuery {
+    #[serde(default = "default_anomaly_range")]
+    pub range: String,
+    #[serde(default = "default_anomaly_dim")]
+    pub dim: String,
+}
+
+fn default_anomaly_range() -> String {
+    "1d".to_string()
+}
+fn default_anomaly_dim() -> String {
+    "key_hash".to_string()
+}
+
+/// Whitelisted dimension column. The string is used directly as a SQL
+/// identifier after matching against this enum, so any caller-supplied
+/// value MUST pass through `parse_dim` before interpolation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnomalyDim {
+    KeyHash,
+    Model,
+    DeploymentId,
+    TeamId,
+}
+
+impl AnomalyDim {
+    /// The column name to GROUP BY. Lives in `boom_request_log` directly —
+    /// no JOIN needed for any of the four dimensions.
+    fn column(&self) -> &'static str {
+        match self {
+            AnomalyDim::KeyHash => "key_hash",
+            AnomalyDim::Model => "model",
+            AnomalyDim::DeploymentId => "deployment_id",
+            AnomalyDim::TeamId => "team_id",
+        }
+    }
+
+    /// Optional LEFT JOIN + alias column to surface a human-readable name
+    /// for the grouped id. Returns (join_clause, alias_column_select).
+    /// `join_clause` uses `rlog` as the alias for boom_request_log.
+    /// None for model/deployment_id — those columns already store the
+    /// human-facing name directly (no extra mapping layer).
+    fn alias_join(&self) -> Option<(&'static str, &'static str)> {
+        match self {
+            AnomalyDim::KeyHash => Some((
+                r##"LEFT JOIN "boom_verification_token" bvt ON bvt.token = rlog.key_hash"##,
+                "bvt.key_alias",
+            )),
+            AnomalyDim::TeamId => Some((
+                r##"LEFT JOIN "boom_team_table" bt ON bt.team_id = rlog.team_id"##,
+                "bt.team_alias",
+            )),
+            AnomalyDim::Model | AnomalyDim::DeploymentId => None,
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "key_hash" => Some(AnomalyDim::KeyHash),
+            "model" => Some(AnomalyDim::Model),
+            "deployment_id" => Some(AnomalyDim::DeploymentId),
+            "team_id" => Some(AnomalyDim::TeamId),
+            _ => None,
+        }
+    }
+}
+
+/// Convert `range=1d|3d|7d` to seconds. Defaults to 1 day on any
+/// unrecognised input (the frontend only sends those three).
+fn anomaly_range_secs(s: &str) -> i64 {
+    match s {
+        "1d" => 86_400,
+        "3d" => 3 * 86_400,
+        "7d" => 7 * 86_400,
+        _ => 86_400,
+    }
+}
+
+/// One IQR box: P25, P75, IQR, and the lower/upper fences used to flag
+/// outliers. Lower fence can be negative for non-negative metrics (e.g.
+/// hit_rate); the comparison in `flag` clamps to 0 on the low side.
+#[derive(Debug, Clone, serde::Serialize)]
+struct IqrBox {
+    p25: Option<f64>,
+    p75: Option<f64>,
+    iqr: Option<f64>,
+    lower: Option<f64>,
+    upper: Option<f64>,
+}
+
+impl IqrBox {
+    /// `Some("high"|"low")` if `value` falls outside the fences; `None`
+    /// if it sits inside the IQR band. Returns `None` when the box itself
+    /// has no samples (P25/P75 NULL).
+    fn flag(&self, value: Option<f64>) -> Option<&'static str> {
+        let (Some(_), Some(_), Some(iqr), Some(lower), Some(upper)) =
+            (self.p25, self.p75, self.iqr, self.lower, self.upper)
+        else {
+            return None;
+        };
+        // IQR==0 means the middle 50% are identical (e.g. all queue_wait=0).
+        // Flag only strict outsiders, otherwise every group tied with the
+        // median would be reported as anomaly.
+        if iqr == 0.0 {
+            return None;
+        }
+        let v = match value {
+            Some(v) => v,
+            None => return None,
+        };
+        if v > upper {
+            Some("high")
+        } else if v < lower.max(0.0) {
+            Some("low")
+        } else {
+            None
+        }
+    }
+
+    /// Severity score = how many IQR-widths the value sits past the fence.
+    /// Same conditions as `flag`: None when the box has no samples, when
+    /// IQR is degenerate, or when the value sits inside the band. Used to
+    /// rank outliers so the table can surface the worst offenders first.
+    fn severity(&self, value: Option<f64>) -> Option<f64> {
+        let (Some(_), Some(_), Some(iqr), Some(lower), Some(upper)) =
+            (self.p25, self.p75, self.iqr, self.lower, self.upper)
+        else {
+            return None;
+        };
+        if iqr == 0.0 {
+            return None;
+        }
+        let v = value?;
+        let lower_clamped = lower.max(0.0);
+        if v > upper {
+            Some((v - upper) / iqr)
+        } else if v < lower_clamped {
+            Some((lower_clamped - v) / iqr)
+        } else {
+            None
+        }
+    }
+
+    fn empty() -> Self {
+        IqrBox {
+            p25: None,
+            p75: None,
+            iqr: None,
+            lower: None,
+            upper: None,
+        }
+    }
+
+    fn build(p25: Option<f64>, p75: Option<f64>) -> Self {
+        match (p25, p75) {
+            (Some(a), Some(b)) => {
+                let iqr = b - a;
+                let lower = a - 1.5 * iqr;
+                let upper = b + 1.5 * iqr;
+                IqrBox {
+                    p25: Some(a),
+                    p75: Some(b),
+                    iqr: Some(iqr),
+                    lower: Some(lower),
+                    upper: Some(upper),
+                }
+            }
+            _ => IqrBox::empty(),
+        }
+    }
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct CenterRow {
+    duration_p25: Option<f64>,
+    duration_p75: Option<f64>,
+    ttft_p25: Option<f64>,
+    ttft_p75: Option<f64>,
+    queue_p25: Option<f64>,
+    queue_p75: Option<f64>,
+    input_p25: Option<f64>,
+    input_p75: Option<f64>,
+    hit_rate_p25: Option<f64>,
+    hit_rate_p75: Option<f64>,
+    err_rate_avg: Option<f64>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct GroupRow {
+    group_key: Option<String>,
+    alias: Option<String>,
+    req_count: i64,
+    duration_avg: Option<f64>,
+    ttft_avg: Option<f64>,
+    queue_avg: Option<f64>,
+    input_avg: Option<f64>,
+    hit_rate_avg: Option<f64>,
+    err_rate: Option<f64>,
+}
+
+/// `GET /dashboard/api/admin/debug/anomalies?range=1d&dim=key_hash`
+///
+/// IQR-based outlier scan. Two SQL passes inside one transaction:
+///   1. Compute population P25/P75 (and err-rate avg) for six metrics.
+///   2. GROUP BY `dim`, compute per-group averages; require ≥10 requests
+///      per group so a one-off request can't single-handedly flag a key.
+///
+/// Rust compares each group's averages against the population IQR fences
+/// and returns the subset that fall outside. Error rate uses an absolute
+/// threshold (3× population avg) since binary 0/1 values don't have a
+/// meaningful IQR.
+///
+/// NOT auto-refreshed by the frontend — the caller must hit Refresh.
+/// `statement_timeout=10s` bounds worst-case cost on big tables.
+pub async fn get_anomalies(
+    _session: AdminSession,
+    Extension(state): Extension<Arc<DashboardState>>,
+    Query(q): Query<AnomalyQuery>,
+) -> Response {
+    let dim = match AnomalyDim::parse(&q.dim) {
+        Some(d) => d,
+        None => {
+            return Json(json!({
+                "error": format!("invalid dim '{}'; expected one of: key_hash, model, deployment_id, team_id", q.dim),
+            }))
+            .into_response();
+        }
+    };
+    let range_secs = anomaly_range_secs(&q.range);
+    let now = chrono::Utc::now();
+    let from = now - chrono::Duration::seconds(range_secs);
+    let to = now;
+
+    let pool = match &state.db_pool {
+        Some(p) => p,
+        None => {
+            return Json(json!({"error": "Database not available"})).into_response();
+        }
+    };
+
+    let dim_col = dim.column();
+
+    let res: Result<(CenterRow, Vec<GroupRow>), sqlx::Error> = async {
+        let mut tx = begin_with_timeout(pool).await?;
+
+        // SQL 1: population IQR. percentile_cont ignores NULL inputs,
+        // so the CASE-wrapped hit-rate ratio skips rows without input_tokens.
+        let center = sqlx::query_as::<_, CenterRow>(
+            r#"SELECT
+                 percentile_cont(0.25) WITHIN GROUP (ORDER BY duration_ms)::float8   AS duration_p25,
+                 percentile_cont(0.75) WITHIN GROUP (ORDER BY duration_ms)::float8   AS duration_p75,
+                 percentile_cont(0.25) WITHIN GROUP (ORDER BY ttft_ms)::float8       AS ttft_p25,
+                 percentile_cont(0.75) WITHIN GROUP (ORDER BY ttft_ms)::float8       AS ttft_p75,
+                 percentile_cont(0.25) WITHIN GROUP (ORDER BY queue_wait_ms)::float8 AS queue_p25,
+                 percentile_cont(0.75) WITHIN GROUP (ORDER BY queue_wait_ms)::float8 AS queue_p75,
+                 percentile_cont(0.25) WITHIN GROUP (ORDER BY input_tokens)::float8 AS input_p25,
+                 percentile_cont(0.75) WITHIN GROUP (ORDER BY input_tokens)::float8 AS input_p75,
+                 percentile_cont(0.25) WITHIN GROUP (
+                   ORDER BY CASE WHEN cached_tokens IS NOT NULL AND input_tokens > 0
+                                 THEN cached_tokens::float8 / input_tokens
+                                 ELSE NULL END
+                 )::float8 AS hit_rate_p25,
+                 percentile_cont(0.75) WITHIN GROUP (
+                   ORDER BY CASE WHEN cached_tokens IS NOT NULL AND input_tokens > 0
+                                 THEN cached_tokens::float8 / input_tokens
+                                 ELSE NULL END
+                 )::float8 AS hit_rate_p75,
+                 avg(CASE WHEN status_code != 200 THEN 1.0::float8 ELSE 0.0::float8 END)::float8 AS err_rate_avg
+               FROM boom_request_log
+               WHERE created_at >= $1 AND created_at < $2"#,
+        )
+        .bind(from)
+        .bind(to)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        // SQL 2: per-group averages. `dim_col` is whitelisted via AnomalyDim.
+        // HAVING COUNT(*) >= 10 filters out low-volume groups so a one-shot
+        // slow request can't produce a misleading outlier.
+        //
+        // LEFT JOIN optional alias table (boom_verification_token / boom_team_table)
+        // so the frontend can display a human-readable name instead of the
+        // raw hash / team_id. COALESCE falls back to the raw value when the
+        // alias is unset. For model/deployment_id dims there is no extra
+        // mapping layer — the column already stores the human-facing name,
+        // so no JOIN is emitted and alias = group_key.
+        let alias_join = dim.alias_join();
+        let (join_clause, alias_select, group_by_extra) = match alias_join {
+            Some((jc, ac)) => (
+                jc,
+                format!("COALESCE({ac}, rlog.{dim_col}) AS alias"),
+                format!(", {ac}"),
+            ),
+            None => (
+                "",
+                "rlog.{dim_col} AS alias".to_string(),
+                String::new(),
+            ),
+        };
+        let groups_sql = format!(
+            r#"SELECT
+                 rlog.{dim_col} AS group_key,
+                 {alias_select},
+                 COUNT(*)::bigint AS req_count,
+                 avg(rlog.duration_ms)::float8 AS duration_avg,
+                 avg(rlog.ttft_ms)::float8     AS ttft_avg,
+                 avg(rlog.queue_wait_ms)::float8 AS queue_avg,
+                 avg(rlog.input_tokens)::float8 AS input_avg,
+                 avg(CASE WHEN rlog.cached_tokens IS NOT NULL AND rlog.input_tokens > 0
+                          THEN rlog.cached_tokens::float8 / rlog.input_tokens
+                          ELSE NULL END)::float8 AS hit_rate_avg,
+                 avg(CASE WHEN rlog.status_code != 200 THEN 1.0::float8 ELSE 0.0::float8 END)::float8 AS err_rate
+               FROM boom_request_log rlog
+               {join_clause}
+               WHERE rlog.created_at >= $1 AND rlog.created_at < $2
+                 AND rlog.{dim_col} IS NOT NULL
+               GROUP BY rlog.{dim_col}{group_by_extra}
+               HAVING COUNT(*) >= 10"#
+        );
+        let groups = sqlx::query_as::<_, GroupRow>(&groups_sql)
+            .bind(from)
+            .bind(to)
+            .fetch_all(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+        Ok::<_, sqlx::Error>((center, groups))
+    }
+    .await;
+
+    let (center, groups) = match res {
+        Ok(v) => v,
+        Err(e) => {
+            let msg = e.to_string();
+            let timeout_hint = msg.contains("statement timeout") || msg.contains("canceling statement");
+            tracing::error!("Failed to query anomalies: {}", msg);
+            return Json(json!({
+                "error": msg,
+                "timeout_hint": timeout_hint,
+            }))
+            .into_response();
+        }
+    };
+
+    let duration_box = IqrBox::build(center.duration_p25, center.duration_p75);
+    let ttft_box = IqrBox::build(center.ttft_p25, center.ttft_p75);
+    let queue_box = IqrBox::build(center.queue_p25, center.queue_p75);
+    let input_box = IqrBox::build(center.input_p25, center.input_p75);
+    let hit_rate_box = IqrBox::build(center.hit_rate_p25, center.hit_rate_p75);
+    // Error rate is binary per request; use 3× population average as the
+    // absolute threshold. Floor at 1% so a near-zero population rate (e.g.
+    // 0.001) doesn't flag every group with a single 5xx.
+    let err_avg = center.err_rate_avg.unwrap_or(0.0);
+    let err_threshold = (err_avg * 3.0).max(0.01);
+
+    let mut outliers: Vec<Value> = Vec::new();
+    for g in &groups {
+        let mut metrics = serde_json::Map::new();
+        let mut severity_sum = 0.0f64;
+        let mut metric_count = 0u32;
+
+        if let Some(dir) = duration_box.flag(g.duration_avg) {
+            let sev = duration_box.severity(g.duration_avg).unwrap_or(0.0);
+            severity_sum += sev;
+            metric_count += 1;
+            metrics.insert(
+                "duration_ms".to_string(),
+                json!({"value": g.duration_avg, "direction": dir, "severity": sev}),
+            );
+        }
+        if let Some(dir) = ttft_box.flag(g.ttft_avg) {
+            let sev = ttft_box.severity(g.ttft_avg).unwrap_or(0.0);
+            severity_sum += sev;
+            metric_count += 1;
+            metrics.insert(
+                "ttft_ms".to_string(),
+                json!({"value": g.ttft_avg, "direction": dir, "severity": sev}),
+            );
+        }
+        if let Some(dir) = queue_box.flag(g.queue_avg) {
+            let sev = queue_box.severity(g.queue_avg).unwrap_or(0.0);
+            severity_sum += sev;
+            metric_count += 1;
+            metrics.insert(
+                "queue_wait_ms".to_string(),
+                json!({"value": g.queue_avg, "direction": dir, "severity": sev}),
+            );
+        }
+        if let Some(dir) = input_box.flag(g.input_avg) {
+            let sev = input_box.severity(g.input_avg).unwrap_or(0.0);
+            severity_sum += sev;
+            metric_count += 1;
+            metrics.insert(
+                "input_tokens".to_string(),
+                json!({"value": g.input_avg, "direction": dir, "severity": sev}),
+            );
+        }
+        if let Some(dir) = hit_rate_box.flag(g.hit_rate_avg) {
+            let sev = hit_rate_box.severity(g.hit_rate_avg).unwrap_or(0.0);
+            severity_sum += sev;
+            metric_count += 1;
+            metrics.insert(
+                "hit_rate".to_string(),
+                json!({"value": g.hit_rate_avg, "direction": dir, "severity": sev}),
+            );
+        }
+        // Error rate: absolute threshold, not IQR. Severity here is measured
+        // in threshold multiples (how many × of the 3× baseline above it).
+        let err_val = g.err_rate.unwrap_or(0.0);
+        if err_val > err_threshold && err_val > 0.0 {
+            let sev = (err_val - err_threshold) / err_threshold;
+            severity_sum += sev;
+            metric_count += 1;
+            metrics.insert(
+                "err_rate".to_string(),
+                json!({"value": err_val, "direction": "high", "severity": sev}),
+            );
+        }
+
+        if !metrics.is_empty() {
+            outliers.push(json!({
+                "group_key": g.group_key,
+                "alias": g.alias,
+                "req_count": g.req_count,
+                "metrics": metrics,
+                "severity": severity_sum,
+                "metric_count": metric_count,
+            }));
+        }
+    }
+
+    // Sort by total severity descending — worst offenders first.
+    outliers.sort_by(|a, b| {
+        let sa = a.get("severity").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let sb = b.get("severity").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    Json(json!({
+        "range": q.range,
+        "dim": dim_col,
+        "window": {
+            "from": from.to_rfc3339(),
+            "to": to.to_rfc3339(),
+            "range_secs": range_secs,
+        },
+        "centers": {
+            "duration_ms":   duration_box,
+            "ttft_ms":       ttft_box,
+            "queue_wait_ms": queue_box,
+            "input_tokens":  input_box,
+            "hit_rate":      hit_rate_box,
+            "err_rate": {
+                "avg": err_avg,
+                "threshold": err_threshold,
+            },
+        },
+        "outliers": outliers,
+        "total_groups": groups.len(),
+        "total_outliers": outliers.len(),
+    }))
+    .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{normalize_pagination, CreateKeyRequest};

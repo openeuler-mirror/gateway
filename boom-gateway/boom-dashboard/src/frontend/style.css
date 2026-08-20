@@ -720,6 +720,212 @@ p.error { color: var(--danger); font-style: italic; margin: 0; }
   border-radius: 4px;
 }
 
+/* ── Debug sub-tabs (Overview / Anomalies) ──────────────── */
+.debug-subtabs {
+  display: flex;
+  gap: 4px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 18px;
+}
+.debug-subtab {
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  padding: 8px 14px;
+  font-size: 13px;
+  color: var(--text3);
+  cursor: pointer;
+}
+.debug-subtab:hover { color: var(--text); }
+.debug-subtab.active {
+  color: var(--primary);
+  border-bottom-color: var(--primary);
+  font-weight: 600;
+}
+.debug-pane { display: none; }
+.debug-pane.active { display: block; }
+
+/* ── Anomaly explainer (collapsible) ─────────────────────── */
+.anomaly-explainer {
+  margin: 0.5rem 0 1rem;
+  padding: 0.5rem 0.75rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 13px;
+}
+.anomaly-explainer > summary {
+  cursor: pointer;
+  font-weight: 600;
+  color: var(--primary);
+  user-select: none;
+}
+.anomaly-explainer-body { margin-top: 0.5rem; }
+.anomaly-explainer-body p {
+  margin: 0.4rem 0;
+  line-height: 1.5;
+  color: var(--text-muted, #6b7280);
+}
+.anomaly-explainer-body p:first-child { margin-top: 0; }
+.anomaly-explainer-body p:last-child { margin-bottom: 0; }
+
+/* ── Anomaly pane controls ───────────────────────────────── */
+.anomaly-controls {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.anomaly-controls select {
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 13px;
+  cursor: pointer;
+}
+.anomaly-controls select:hover { border-color: var(--primary); }
+
+/* ── Anomaly results: metric cards + outlier table ───────── */
+.anomaly-metric-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 12px;
+  margin-bottom: 22px;
+}
+.anomaly-metric-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 12px;
+}
+.anomaly-metric-card h4 {
+  margin: 0 0 6px 0;
+  font-size: 12px;
+  color: var(--text3);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+}
+.anomaly-metric-card .row {
+  display: flex;
+  justify-content: space-between;
+  font-size: 12px;
+  color: var(--text2);
+  line-height: 1.6;
+}
+.anomaly-metric-card .row .label { color: var(--text3); }
+.anomaly-metric-card .row .value { font-variant-numeric: tabular-nums; }
+.anomaly-metric-card .fences {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--border);
+  font-size: 11px;
+  color: var(--text3);
+  font-variant-numeric: tabular-nums;
+}
+
+.anomaly-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.anomaly-table th {
+  text-align: left;
+  padding: 8px 10px;
+  border-bottom: 2px solid var(--border);
+  color: var(--text3);
+  font-size: 12px;
+  font-weight: 600;
+}
+.anomaly-table td {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  font-variant-numeric: tabular-nums;
+}
+.anomaly-table .metric-chip {
+  display: inline-block;
+  padding: 2px 8px;
+  margin: 1px 4px 1px 0;
+  border-radius: 4px;
+  font-size: 12px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+}
+.anomaly-table .metric-chip.high {
+  color: var(--danger, #c0392b);
+  border-color: var(--danger, #c0392b);
+  background: rgba(192, 57, 43, .08);
+}
+.anomaly-table .metric-chip.low {
+  color: var(--warning, #b8860b);
+  border-color: var(--warning, #b8860b);
+  background: rgba(184, 134, 11, .08);
+}
+.anomaly-table .metric-sev {
+  display: inline-block;
+  margin-left: 4px;
+  font-size: 10px;
+  font-weight: 600;
+  opacity: .85;
+}
+.anomaly-table .sev-cell {
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+.anomaly-table .group-alias {
+  display: block;
+  font-weight: 600;
+}
+.anomaly-table .group-raw {
+  display: block;
+  font-size: 11px;
+  font-family: ui-monospace, SFMono-Regular, monospace;
+  color: var(--text-muted, #6b7280);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 320px;
+}
+
+/* ── Anomaly scatter plot ──────────────────────────────── */
+.anomaly-scatter {
+  margin: 0.5rem 0 1rem;
+  padding: 0.75rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+.anomaly-scatter h4 {
+  margin: 0 0 0.5rem;
+  font-size: 14px;
+}
+.anomaly-scatter-svg {
+  display: block;
+  width: 100%;
+  height: auto;
+  max-height: 360px;
+}
+.anomaly-scatter-svg circle:hover {
+  fill-opacity: 1;
+  r: 7;
+}
+.anomaly-scatter-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 0.5rem;
+  font-size: 11px;
+  color: var(--text-muted, #6b7280);
+  align-items: center;
+}
+.anomaly-scatter-legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.anomaly-scatter-quadrant {
+  margin-left: auto;
+  font-style: italic;
+  max-width: 60%;
+}
+
 /* ── Cards ──────────────────────────────────────────────── */
 .card {
   background: var(--surface); border: 1px solid var(--border);

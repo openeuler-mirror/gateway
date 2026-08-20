@@ -901,19 +901,21 @@ async fn chat_completions_inner(
         // Settle quota: real token counts from vLLM go to key + team cumulative
         // and 1-min TPM windows. Cost is computed from the model's cost_rate;
         // cached_tokens get the discounted rate when configured.
-        let cached_tokens_i64 = response
+        let provider_cached = response
             .usage
             .prompt_tokens_details
             .as_ref()
-            .and_then(|d| d.cached_tokens)
-            .unwrap_or(0);
+            .and_then(|d| d.cached_tokens);
         plan_charge.settle(
             input_tokens as u64,
-            cached_tokens_i64.max(0) as u64,
+            provider_cached.unwrap_or(0).max(0) as u64,
             output_tokens as u64,
             provider_billing.actual_cost(),
         );
-        let cached_tokens = Some(cached_tokens_i64 as i64);
+        // Preserve Option: None = upstream didn't return cached_tokens (no KV
+        // hit data), Some(0) = upstream explicitly reported 0 cached. The
+        // anomaly detector and 24h hit-rate queries rely on this distinction.
+        let cached_tokens = provider_cached.map(|c| c as i64);
 
         // Provider returned a response — count as a successfully handled request.
         state.agent_stats.record(api_path);
@@ -2982,7 +2984,7 @@ pub async fn messages(
                 // Request-phase fires immediately. Stream wrapper's Drop
                 // emits the Response-phase entry with assembled content.
                 let _ = sender.send(prompt_entry.clone());
-                let prompt_logged = PromptLogStream::new(logged, sender, prompt_entry, sse_raw_data_extractor(), raw_upstream_buf);
+                let prompt_logged = PromptLogStream::new(logged, sender, prompt_entry, sse_anthropic_extractor(), raw_upstream_buf);
                 let response = Sse::new(sse_item_to_event(prompt_logged)).keep_alive(KeepAlive::default());
                 return Ok(response.into_response());
             }
@@ -3016,19 +3018,21 @@ pub async fn messages(
         // Settle quota: real token counts from vLLM go to key + team cumulative
         // and 1-min TPM windows. Cost is computed from the model's cost_rate;
         // cached_tokens get the discounted rate when configured.
-        let cached_tokens_i64 = response
+        let provider_cached = response
             .usage
             .prompt_tokens_details
             .as_ref()
-            .and_then(|d| d.cached_tokens)
-            .unwrap_or(0);
+            .and_then(|d| d.cached_tokens);
         plan_charge.settle(
             input_tokens as u64,
-            cached_tokens_i64.max(0) as u64,
+            provider_cached.unwrap_or(0).max(0) as u64,
             output_tokens as u64,
             None,
         );
-        let cached_tokens = Some(cached_tokens_i64 as i64);
+        // Preserve Option: None = upstream didn't return cached_tokens (no KV
+        // hit data), Some(0) = upstream explicitly reported 0 cached. The
+        // anomaly detector and 24h hit-rate queries rely on this distinction.
+        let cached_tokens = provider_cached.map(|c| c as i64);
 
         // Provider returned a response — count as a successfully handled request.
         state.agent_stats.record("/v1/messages");
@@ -3326,6 +3330,125 @@ fn sse_raw_data_extractor() -> impl FnMut(&Result<SseItem, Infallible>) -> Optio
                 .map(|s| s.to_string());
             let usage = v.get("usage").cloned();
             Some(ChunkDelta { content, finish_reason, usage })
+        }
+        Err(_) => None,
+    }
+}
+
+/// Returns a closure that extracts content / stop_reason / usage from
+/// Anthropic-format SSE chunks. Used on the `/v1/messages` path where the
+/// stream has been transcoded to Anthropic shape by `AnthropicStreamTranscoder`.
+///
+/// Anthropic chunk types we care about:
+/// - `content_block_delta` with `delta.type=="text_delta"` → `delta.text`
+/// - `content_block_delta` with `delta.type=="thinking_delta"` → `delta.thinking`
+///   (recorded as a `--- thinking ---` block; user opted to keep it in the
+///   accumulated content so model reasoning is recoverable from prompt log)
+/// - `message_delta` → `delta.stop_reason` + `usage`
+/// - `message_start` → `message.usage.input_tokens` (for prompt-tokens capture
+///   when the upstream doesn't include them in the final message_delta)
+///
+/// Other chunk types (content_block_start/stop, message_stop, ping) return
+/// None — the wrapper just skips them.
+fn sse_anthropic_extractor() -> impl FnMut(&Result<SseItem, Infallible>) -> Option<boom_promptlog::ChunkDelta> + Unpin {
+    use boom_promptlog::ChunkDelta;
+    // Toggle so the prompt log shows model thinking as a distinct block
+    // instead of blending it into the user-facing text.
+    static THINKING_OPEN: &str = "\n--- thinking ---\n";
+    static THINKING_CLOSE: &str = "\n--- response ---\n";
+    let mut in_thinking = false;
+    move |item: &Result<SseItem, Infallible>| match item {
+        Ok(sse_item) => {
+            let raw = sse_item.json_data.as_str();
+            if raw.is_empty() || raw == "[DONE]" {
+                return None;
+            }
+            let v: serde_json::Value = match serde_json::from_str(raw) {
+                Ok(v) => v,
+                Err(_) => return None,
+            };
+            let chunk_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            match chunk_type {
+                "content_block_delta" => {
+                    let delta = v.get("delta");
+                    let delta_type = delta
+                        .and_then(|d| d.get("type"))
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("");
+                    let (text, marker_open, marker_close) = match delta_type {
+                        "text_delta" => (
+                            delta.and_then(|d| d.get("text")).and_then(|t| t.as_str()),
+                            None,
+                            if std::mem::replace(&mut in_thinking, false) { Some(THINKING_CLOSE) } else { None },
+                        ),
+                        "thinking_delta" => (
+                            delta.and_then(|d| d.get("thinking")).and_then(|t| t.as_str()),
+                            if !std::mem::replace(&mut in_thinking, true) { Some(THINKING_OPEN) } else { None },
+                            None,
+                        ),
+                        _ => return None,
+                    };
+                    let content = match (marker_open, text, marker_close) {
+                        (Some(open), Some(t), Some(close)) => format!("{}{}{}", open, t, close),
+                        (Some(open), Some(t), None) => format!("{}{}", open, t),
+                        (None, Some(t), Some(close)) => format!("{}{}", t, close),
+                        (None, Some(t), None) => t.to_string(),
+                        _ => return None,
+                    };
+                    Some(ChunkDelta {
+                        content: Some(content),
+                        finish_reason: None,
+                        usage: None,
+                    })
+                }
+                "message_delta" => {
+                    let stop_reason = v
+                        .get("delta")
+                        .and_then(|d| d.get("stop_reason"))
+                        .and_then(|s| s.as_str())
+                        .map(|s| s.to_string());
+                    let usage = v.get("usage").cloned();
+                    // Close an in-flight thinking block before the message ends
+                    // so the log doesn't leave an unterminated marker.
+                    let trailing_close = if std::mem::replace(&mut in_thinking, false) {
+                        Some(THINKING_CLOSE.to_string())
+                    } else {
+                        None
+                    };
+                    match (trailing_close, stop_reason.as_ref(), usage.as_ref()) {
+                        (Some(c), _, _) => Some(ChunkDelta {
+                            content: Some(c),
+                            finish_reason: stop_reason,
+                            usage,
+                        }),
+                        (_, Some(_), _) | (_, _, Some(_)) => Some(ChunkDelta {
+                            content: None,
+                            finish_reason: stop_reason,
+                            usage,
+                        }),
+                        _ => None,
+                    }
+                }
+                "message_start" => {
+                    // message_start carries input_tokens; surface as usage so the
+                    // wrapper picks it up. The terminal message_delta may overwrite
+                    // it with the final count, which is fine.
+                    let usage = v
+                        .get("message")
+                        .and_then(|m| m.get("usage"))
+                        .cloned();
+                    if usage.is_some() {
+                        Some(ChunkDelta {
+                            content: None,
+                            finish_reason: None,
+                            usage,
+                        })
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
         }
         Err(_) => None,
     }

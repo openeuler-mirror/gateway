@@ -256,41 +256,82 @@
               Debug-only — content may change or be removed between versions.
             </div>
 
-            <div class="section-header" style="margin-top:1.5rem">
-              <h2 data-i18n="debug.rebalance_moves.title">Rebalance Moves (per deployment)</h2>
-              <span style="font-size:.85em;color:var(--text3)" data-i18n="debug.rebalance_moves.subtitle">Process lifetime cumulative</span>
+            <!-- Sub-tab navigation -->
+            <div class="debug-subtabs">
+              <button class="debug-subtab active" data-subtab="overview" data-i18n="debug.subtab.overview">Overview</button>
+              <button class="debug-subtab" data-subtab="anomalies" data-i18n="debug.subtab.anomalies">Anomalies</button>
             </div>
-            <div id="rebalance-moves-wrap"><p class="loading" data-i18n="common.loading">Loading...</p></div>
 
-            <div class="section-header" style="margin-top:1.5rem">
-              <h2 data-i18n="debug.audit_log.title">Audit Log Writer</h2>
-              <span style="font-size:.85em;color:var(--text3)" data-i18n="debug.audit_log.subtitle">Drop counter — process lifetime cumulative</span>
+            <!-- Overview pane: original debug content -->
+            <div class="debug-pane active" data-pane="overview">
+              <div class="section-header" style="margin-top:1.5rem">
+                <h2 data-i18n="debug.rebalance_moves.title">Rebalance Moves (per deployment)</h2>
+                <span style="font-size:.85em;color:var(--text3)" data-i18n="debug.rebalance_moves.subtitle">Process lifetime cumulative</span>
+              </div>
+              <div id="rebalance-moves-wrap"><p class="loading" data-i18n="common.loading">Loading...</p></div>
+
+              <div class="section-header" style="margin-top:1.5rem">
+                <h2 data-i18n="debug.audit_log.title">Audit Log Writer</h2>
+                <span style="font-size:.85em;color:var(--text3)" data-i18n="debug.audit_log.subtitle">Drop counter — process lifetime cumulative</span>
+              </div>
+              <div id="audit-log-stats-wrap"><p class="loading" data-i18n="common.loading">Loading...</p></div>
+
+              <div class="section-header">
+                <h2 data-i18n="stats.agent.title">Agent Statistics</h2>
+                <div class="range-controls" data-target="agent">
+                  <button class="btn-range active" data-range="1h">1h</button>
+                  <button class="btn-range" data-range="4h">4h</button>
+                  <button class="btn-range" data-range="8h">8h</button>
+                  <button class="btn-range" data-range="24h">24h</button>
+                  <button class="btn-range" data-range="custom" data-i18n="range.custom">Custom</button>
+                  <span class="range-custom hidden">
+                    <input type="datetime-local" class="range-from">
+                    <input type="datetime-local" class="range-to">
+                    <button class="btn-tiny range-apply" data-i18n="action.apply">Apply</button>
+                  </span>
+                  <span class="range-note hidden"></span>
+                </div>
+              </div>
+              <div id="agent-stats-wrap"><p class="loading" data-i18n="common.loading">Loading...</p></div>
+
+              <div class="section-header" style="margin-top:2rem">
+                <h2>KVC DFX (per-request, latest 50)</h2>
+                <button class="btn-small" id="btn-reset-kvc-filters" data-i18n="logs.reset_filters">Reset Filters</button>
+              </div>
+              <div id="kvc-dfx-wrap"><p class="muted">Compile with --features boom-dashboard/debug-tools to enable.</p></div>
             </div>
-            <div id="audit-log-stats-wrap"><p class="loading" data-i18n="common.loading">Loading...</p></div>
 
-            <div class="section-header">
-              <h2 data-i18n="stats.agent.title">Agent Statistics</h2>
-              <div class="range-controls" data-target="agent">
-                <button class="btn-range active" data-range="1h">1h</button>
-                <button class="btn-range" data-range="4h">4h</button>
-                <button class="btn-range" data-range="8h">8h</button>
-                <button class="btn-range" data-range="24h">24h</button>
-                <button class="btn-range" data-range="custom" data-i18n="range.custom">Custom</button>
-                <span class="range-custom hidden">
-                  <input type="datetime-local" class="range-from">
-                  <input type="datetime-local" class="range-to">
-                  <button class="btn-tiny range-apply" data-i18n="action.apply">Apply</button>
-                </span>
-                <span class="range-note hidden"></span>
+            <!-- Anomalies pane: IQR-based outlier scan, manual refresh -->
+            <div class="debug-pane" data-pane="anomalies">
+              <div class="section-header">
+                <h2 data-i18n="debug.anomalies.title">Anomaly Detection</h2>
+                <div class="anomaly-controls">
+                  <select id="anomaly-dim">
+                    <option value="key_hash" data-i18n="debug.anomalies.dim.key">By Key</option>
+                    <option value="model" data-i18n="debug.anomalies.dim.model">By Model</option>
+                    <option value="deployment_id" data-i18n="debug.anomalies.dim.deployment">By Deployment</option>
+                    <option value="team_id" data-i18n="debug.anomalies.dim.team">By Team</option>
+                  </select>
+                  <button class="btn-range active" data-anomaly-range="1d">1d</button>
+                  <button class="btn-range" data-anomaly-range="3d">3d</button>
+                  <button class="btn-range" data-anomaly-range="7d">7d</button>
+                  <button class="btn-small" id="btn-anomaly-refresh" data-i18n="action.refresh">Refresh</button>
+                </div>
+              </div>
+              <div id="anomaly-results-wrap">
+                <details class="anomaly-explainer">
+                  <summary data-i18n="debug.anomalies.explainer.summary">How is this calculated?</summary>
+                  <div class="anomaly-explainer-body">
+                    <p data-i18n="debug.anomalies.explainer.iqr">IQR (Interquartile Range) = P75 − P25 — the spread of the middle 50% of requests. Fence = [P25 − 1.5×IQR, P75 + 1.5×IQR]; groups whose average falls outside are flagged.</p>
+                    <p data-i18n="debug.anomalies.explainer.severity">×N IQR on a chip means the group's average is N IQR-widths past the fence. ×1 = just past the fence; ×3 = severe outlier.</p>
+                    <p data-i18n="debug.anomalies.explainer.err_rate">Error rate is binary (0/1) so IQR doesn't apply; we use 3× overall average as threshold (floor 1%).</p>
+                    <p data-i18n="debug.anomalies.explainer.skip">Metrics with IQR=0 (e.g. queue_wait_ms when most requests are 0) are skipped to avoid flagging tied-with-median groups.</p>
+                    <p data-i18n="debug.anomalies.explainer.scatter">Scatter plot: X = request count (log), Y = total severity (log). Top-right = high-traffic + severe = real anomaly; top-left = low-traffic noise.</p>
+                  </div>
+                </details>
+                <p class="muted" data-i18n="debug.anomalies.hint">Click Refresh to load. Default: last 1 day.</p>
               </div>
             </div>
-            <div id="agent-stats-wrap"><p class="loading" data-i18n="common.loading">Loading...</p></div>
-
-            <div class="section-header" style="margin-top:2rem">
-              <h2>KVC DFX (per-request, latest 50)</h2>
-              <button class="btn-small" id="btn-reset-kvc-filters" data-i18n="logs.reset_filters">Reset Filters</button>
-            </div>
-            <div id="kvc-dfx-wrap"><p class="muted">Compile with --features boom-dashboard/debug-tools to enable.</p></div>
           </section>
 
           <!-- Models Section -->

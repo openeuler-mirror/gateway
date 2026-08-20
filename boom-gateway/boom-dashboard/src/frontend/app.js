@@ -382,7 +382,7 @@
     else if (section === "admin-keys") { setupKeysSearch(); loadKeys(); }
     else if (section === "admin-quota") loadQuota();
     else if (section === "admin-logs") { setupLogsFilters(); loadLogs(); }
-    else if (section === "admin-debug") { loadAgentStats(); loadRebalanceMoves(); loadKvcDfx(); loadAuditLogStats(); }
+    else if (section === "admin-debug") { setupDebugSubtabs(); setupAnomalyControls(); loadAgentStats(); loadRebalanceMoves(); loadKvcDfx(); loadAuditLogStats(); }
     else if (section === "admin-config") loadConfigPage();
   }
 
@@ -1205,6 +1205,289 @@
         '<p class="als-hint">' + t("debug.audit_log.hint") + '</p>' +
       '</div>';
   }
+
+  // ── Debug sub-tabs (Overview / Anomalies) ─────────────────
+  let debugSubtabsSetup = false;
+  let anomalyDim = "key_hash";
+  let anomalyRange = "1d";
+  let anomalyControlsSetup = false;
+
+  function setupDebugSubtabs() {
+    if (debugSubtabsSetup) return;
+    debugSubtabsSetup = true;
+    const tabs = document.querySelectorAll(".debug-subtab");
+    tabs.forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const target = btn.dataset.subtab;
+        tabs.forEach((b) => b.classList.toggle("active", b === btn));
+        document.querySelectorAll(".debug-pane").forEach((p) => {
+          p.classList.toggle("active", p.dataset.pane === target);
+        });
+      });
+    });
+  }
+
+  function setupAnomalyControls() {
+    if (anomalyControlsSetup) return;
+    anomalyControlsSetup = true;
+    const dimSel = document.getElementById("anomaly-dim");
+    if (dimSel) {
+      dimSel.addEventListener("change", () => {
+        anomalyDim = dimSel.value;
+      });
+    }
+    document.querySelectorAll("[data-anomaly-range]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        anomalyRange = btn.dataset.anomalyRange;
+        document.querySelectorAll("[data-anomaly-range]").forEach((b) =>
+          b.classList.toggle("active", b === btn)
+        );
+      });
+    });
+    const refreshBtn = document.getElementById("btn-anomaly-refresh");
+    if (refreshBtn) {
+      refreshBtn.addEventListener("click", loadAnomalies);
+    }
+  }
+
+  async function loadAnomalies() {
+    const wrap = document.getElementById("anomaly-results-wrap");
+    if (!wrap) return;
+    wrap.innerHTML = '<p class="loading">' + t("common.loading") + '</p>';
+    const url = `/admin/debug/anomalies?range=${encodeURIComponent(anomalyRange)}&dim=${encodeURIComponent(anomalyDim)}`;
+    try {
+      const data = await api(url);
+      renderAnomalies(data, wrap);
+    } catch (err) {
+      const hint = (err.message || "").includes("timeout") ? t("debug.anomalies.timeout_hint") : "";
+      wrap.innerHTML = '<p class="error-msg">' + t("common.error_prefix", { message: esc(err.message || "") }) + (hint ? '<br>' + hint : "") + '</p>';
+    }
+  }
+
+  function renderAnomalies(data, wrap) {
+    if (data.error) {
+      const hint = data.timeout_hint ? t("debug.anomalies.timeout_hint") : "";
+      wrap.innerHTML = '<p class="error-msg">' + esc(data.error) + (hint ? '<br>' + hint : "") + '</p>';
+      return;
+    }
+
+    const centers = data.centers || {};
+    const dimLabel = {
+      key_hash: t("debug.anomalies.dim.key"),
+      model: t("debug.anomalies.dim.model"),
+      deployment_id: t("debug.anomalies.dim.deployment"),
+      team_id: t("debug.anomalies.dim.team"),
+    }[data.dim] || data.dim;
+
+    const fmt = (v, digits = 2) => (v === null || v === undefined) ? "—" : Number(v).toFixed(digits);
+
+    const cards = [
+      { key: "duration_ms", label: t("debug.anomalies.metric.duration"), c: centers.duration_ms },
+      { key: "ttft_ms", label: t("debug.anomalies.metric.ttft"), c: centers.ttft_ms },
+      { key: "queue_wait_ms", label: t("debug.anomalies.metric.queue"), c: centers.queue_wait_ms },
+      { key: "input_tokens", label: t("debug.anomalies.metric.input_tokens"), c: centers.input_tokens },
+      { key: "hit_rate", label: t("debug.anomalies.metric.hit_rate"), c: centers.hit_rate },
+    ];
+
+    const cardsHtml = cards.map((m) => {
+      if (!m.c) return "";
+      if (m.key === "hit_rate") {
+        return '' +
+          '<div class="anomaly-metric-card">' +
+            '<h4>' + esc(m.label) + '</h4>' +
+            '<div class="row"><span class="label">P25</span><span class="value">' + fmt(m.c.p25, 3) + '</span></div>' +
+            '<div class="row"><span class="label">P75</span><span class="value">' + fmt(m.c.p75, 3) + '</span></div>' +
+            '<div class="row"><span class="label">IQR</span><span class="value">' + fmt(m.c.iqr, 3) + '</span></div>' +
+            '<div class="fences">[' + fmt(m.c.lower, 3) + ", " + fmt(m.c.upper, 3) + ']</div>' +
+          '</div>';
+      }
+      return '' +
+        '<div class="anomaly-metric-card">' +
+          '<h4>' + esc(m.label) + '</h4>' +
+          '<div class="row"><span class="label">P25</span><span class="value">' + fmt(m.c.p25, 0) + '</span></div>' +
+          '<div class="row"><span class="label">P75</span><span class="value">' + fmt(m.c.p75, 0) + '</span></div>' +
+          '<div class="row"><span class="label">IQR</span><span class="value">' + fmt(m.c.iqr, 0) + '</span></div>' +
+          '<div class="fences">[' + fmt(m.c.lower, 0) + ", " + fmt(m.c.upper, 0) + ']</div>' +
+        '</div>';
+    }).join("");
+
+    // Err rate card (avg + threshold).
+    const errCard = centers.err_rate
+      ? '<div class="anomaly-metric-card">' +
+          '<h4>' + t("debug.anomalies.metric.err_rate") + '</h4>' +
+          '<div class="row"><span class="label">avg</span><span class="value">' + fmt(centers.err_rate.avg, 4) + '</span></div>' +
+          '<div class="row"><span class="label">threshold</span><span class="value">' + fmt(centers.err_rate.threshold, 4) + '</span></div>' +
+        '</div>'
+      : "";
+
+    const outliers = data.outliers || [];
+    const metricLabel = {
+      duration_ms: t("debug.anomalies.metric.duration"),
+      ttft_ms: t("debug.anomalies.metric.ttft"),
+      queue_wait_ms: t("debug.anomalies.metric.queue"),
+      input_tokens: t("debug.anomalies.metric.input_tokens"),
+      hit_rate: t("debug.anomalies.metric.hit_rate"),
+      err_rate: t("debug.anomalies.metric.err_rate"),
+    };
+    const metricDigits = { duration_ms: 1, ttft_ms: 1, queue_wait_ms: 1, input_tokens: 0, hit_rate: 3, err_rate: 4 };
+
+    let outliersHtml;
+    if (outliers.length === 0) {
+      outliersHtml = '<p class="muted">' + t("debug.anomalies.empty") + '</p>';
+    } else {
+      // Backend already sorts by total severity desc — worst offenders on top.
+      const rows = outliers.map((o) => {
+        const chips = Object.entries(o.metrics || {}).map(([k, m]) => {
+          const d = m.direction === "high" ? "high" : "low";
+          const lbl = metricLabel[k] || k;
+          const digits = metricDigits[k] !== undefined ? metricDigits[k] : 2;
+          const sev = (typeof m.severity === "number" && m.severity > 0)
+            ? ' <span class="metric-sev">×' + m.severity.toFixed(1) + ' IQR</span>'
+            : "";
+          return '<span class="metric-chip ' + d + '">' +
+                   esc(lbl) + " " + fmt(m.value, digits) + sev +
+                 '</span>';
+        }).join("");
+        const totalSev = (typeof o.severity === "number") ? o.severity : 0;
+        const rawKey = o.group_key || "";
+        const alias = o.alias && o.alias !== rawKey ? o.alias : "";
+        const groupCell = alias
+          ? '<span class="group-alias">' + esc(alias) + '</span>' +
+            '<span class="group-raw" title="' + esc(rawKey) + '">' + esc(rawKey) + '</span>'
+          : esc(rawKey);
+        return '<tr>' +
+          '<td>' + groupCell + '</td>' +
+          '<td>' + Number(o.req_count || 0).toLocaleString() + '</td>' +
+          '<td>' + chips + '</td>' +
+          '<td class="sev-cell">' + totalSev.toFixed(2) + '</td>' +
+        '</tr>';
+      }).join("");
+      outliersHtml =
+        '<table class="anomaly-table">' +
+          '<thead><tr>' +
+            '<th>' + dimLabel + '</th>' +
+            '<th>' + t("debug.anomalies.col.req_count") + '</th>' +
+            '<th>' + t("debug.anomalies.col.metric") + '</th>' +
+            '<th>' + t("debug.anomalies.col.severity") + '</th>' +
+          '</tr></thead>' +
+          '<tbody>' + rows + '</tbody>' +
+        '</table>';
+    }
+
+    const summary = (data.total_groups != null && data.total_outliers != null)
+      ? '<p class="muted">' + data.total_outliers + ' / ' + data.total_groups + ' ' + dimLabel + ' flagged</p>'
+      : "";
+
+    const scatterHtml = renderAnomalyScatter(outliers, dimLabel);
+
+    wrap.innerHTML =
+      '<div class="anomaly-metric-cards">' + cardsHtml + errCard + '</div>' +
+      summary +
+      scatterHtml +
+      outliersHtml;
+  }
+
+  // Render SVG scatter: X = req_count (log10), Y = severity (log10).
+  // Top-right = high-traffic + severe = real anomaly. Points colored by
+  // metric_count (green=1, yellow=2-3, red=4+). Hover shows alias + raw.
+  function renderAnomalyScatter(outliers, dimLabel) {
+    if (!outliers || outliers.length === 0) {
+      return '<p class="muted">' + t("debug.anomalies.scatter.empty") + '</p>';
+    }
+    const W = 800, H = 320;
+    const padL = 60, padR = 20, padT = 20, padB = 50;
+    const plotW = W - padL - padR;
+    const plotH = H - padT - padB;
+
+    // Pull req_count + severity per outlier. X uses log10 (req_count ranges
+    // 10 to 10000+); Y stays linear — severity typically sits in 0.1-5 range
+    // and log10 would compress the倍数 gap between barely-flagged (×0.5 IQR)
+    // and severe (×3 IQR) into <1 unit, hiding the very thing we want to show.
+    const pts = outliers.map((o) => ({
+      x: Math.log10(Math.max(1, Number(o.req_count) || 1)),
+      y: Math.max(0, Number(o.severity) || 0),
+      alias: (o.alias && o.alias !== o.group_key) ? o.alias : (o.group_key || ""),
+      raw: o.group_key || "",
+      req_count: Number(o.req_count) || 0,
+      severity: Number(o.severity) || 0,
+      metric_count: Number(o.metric_count) || 1,
+    }));
+
+    // X range — log10(req_count). Floor at log10(1)=0 so points never go off-axis.
+    const xMax = Math.max(1, ...pts.map((p) => p.x));
+    const xMin = 0;
+    // Y range — linear severity. Floor at 0 so 0-severity groups sit on X axis.
+    // Top = max severity with a little headroom (×1.1) so top point isn't clipped.
+    const yMaxRaw = Math.max(0, ...pts.map((p) => p.y));
+    const yMax = yMaxRaw * 1.1 || 1;
+    const yMin = 0;
+    const sx = (x) => padL + ((x - xMin) / (xMax - xMin || 1)) * plotW;
+    const sy = (y) => padT + plotH - ((y - yMin) / (yMax - yMin || 1)) * plotH;
+
+    // Quadrant divider at midpoint — left=low traffic, top=high severity.
+    const midX = padL + plotW / 2;
+    const midY = padT + plotH / 2;
+    // Top-right quadrant highlight = real anomaly zone.
+    const quadrantRect =
+      '<rect x="' + midX + '" y="' + padT + '" width="' + (padL + plotW - midX) + '" height="' + (midY - padT) + '" ' +
+        'fill="rgba(192,57,43,0.06)" stroke="rgba(192,57,43,0.18)" stroke-dasharray="4 4"/>';
+
+    // Axes with tick labels. Y ticks at 0, yMax/2, yMax; X ticks at
+    // 10^k for k in [0, ceil(log10(max req))] — labels show raw req_count.
+    const yTicks = [0, yMax / 2, yMax].map((v) => {
+      const yp = sy(v);
+      return '<line x1="' + padL + '" y1="' + yp + '" x2="' + (padL + plotW) + '" y2="' + yp + '" stroke="var(--border, #eee)" stroke-dasharray="2 2"/>' +
+             '<text x="' + (padL - 6) + '" y="' + (yp + 3) + '" text-anchor="end" font-size="10" fill="var(--text-muted, #6b7280)">' + v.toFixed(1) + '</text>';
+    }).join("");
+    const xTickMax = Math.ceil(xMax);
+    const xTicksArr = [];
+    for (let k = 0; k <= xTickMax; k++) {
+      const xv = k;
+      const xp = sx(xv);
+      const label = (Math.pow(10, k)).toLocaleString();
+      xTicksArr.push('<line x1="' + xp + '" y1="' + (padT + plotH) + '" x2="' + xp + '" y2="' + (padT + plotH + 4) + '" stroke="var(--border, #ccc)"/>' +
+                     '<text x="' + xp + '" y="' + (padT + plotH + 16) + '" text-anchor="middle" font-size="10" fill="var(--text-muted, #6b7280)">' + label + '</text>');
+    }
+    const xTicks = xTicksArr.join("");
+    const axisX =
+      '<line x1="' + padL + '" y1="' + (padT + plotH) + '" x2="' + (padL + plotW) + '" y2="' + (padT + plotH) + '" stroke="var(--border, #ccc)"/>' +
+      xTicks +
+      '<text x="' + (padL + plotW / 2) + '" y="' + (H - 8) + '" text-anchor="middle" font-size="11" fill="var(--text-muted, #6b7280)">' + esc(t("debug.anomalies.scatter.x_label")) + '</text>';
+    const axisY =
+      '<line x1="' + padL + '" y1="' + padT + '" x2="' + padL + '" y2="' + (padT + plotH) + '" stroke="var(--border, #ccc)"/>' +
+      yTicks +
+      '<text x="14" y="' + (padT + plotH / 2) + '" text-anchor="middle" font-size="11" fill="var(--text-muted, #6b7280)" transform="rotate(-90 14 ' + (padT + plotH / 2) + ')">' + esc(t("debug.anomalies.scatter.y_label")) + '</text>';
+
+    // Points — color by metric_count
+    const colorFor = (mc) => mc >= 4 ? "#c0392b" : mc >= 2 ? "#b8860b" : "#3b82f6";
+    const points = pts.map((p) => {
+      const cx = sx(p.x).toFixed(2);
+      const cy = sy(p.y).toFixed(2);
+      const color = colorFor(p.metric_count);
+      const tip = esc(p.alias + " | req=" + p.req_count.toLocaleString() + " | sev=" + p.severity.toFixed(2) + " | " + p.metric_count + " metrics");
+      const label = '<title>' + tip + '</title>';
+      const labelText = p.alias.length > 14 ? p.alias.slice(0, 13) + "…" : p.alias;
+      const labelSvg = '<text x="' + (parseFloat(cx) + 8) + '" y="' + (parseFloat(cy) + 4) + '" font-size="10" fill="var(--text-muted, #6b7280)">' + esc(labelText) + '</text>';
+      return '<circle cx="' + cx + '" cy="' + cy + '" r="5" fill="' + color + '" fill-opacity="0.7" stroke="' + color + '">' + label + '</circle>' + labelSvg;
+    }).join("");
+
+    return '<div class="anomaly-scatter">' +
+      '<h4>' + esc(t("debug.anomalies.scatter.title")) + '</h4>' +
+      '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="xMidYMid meet" class="anomaly-scatter-svg">' +
+        quadrantRect +
+        axisX +
+        axisY +
+        points +
+      '</svg>' +
+      '<div class="anomaly-scatter-legend">' +
+        '<span><svg width="10" height="10"><circle cx="5" cy="5" r="4" fill="#3b82f6"/></svg> 1 metric</span>' +
+        '<span><svg width="10" height="10"><circle cx="5" cy="5" r="4" fill="#b8860b"/></svg> 2-3 metrics</span>' +
+        '<span><svg width="10" height="10"><circle cx="5" cy="5" r="4" fill="#c0392b"/></svg> 4+ metrics</span>' +
+        '<span class="anomaly-scatter-quadrant">' + esc(t("debug.anomalies.explainer.scatter")) + '</span>' +
+      '</div>' +
+    '</div>';
+  }
+
 
   // ── Agent Statistics (anthropic share stacked bar) ───────
   async function loadAgentStats() {
