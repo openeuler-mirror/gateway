@@ -901,19 +901,21 @@ async fn chat_completions_inner(
         // Settle quota: real token counts from vLLM go to key + team cumulative
         // and 1-min TPM windows. Cost is computed from the model's cost_rate;
         // cached_tokens get the discounted rate when configured.
-        let cached_tokens_i64 = response
+        let provider_cached = response
             .usage
             .prompt_tokens_details
             .as_ref()
-            .and_then(|d| d.cached_tokens)
-            .unwrap_or(0);
+            .and_then(|d| d.cached_tokens);
         plan_charge.settle(
             input_tokens as u64,
-            cached_tokens_i64.max(0) as u64,
+            provider_cached.unwrap_or(0).max(0) as u64,
             output_tokens as u64,
             provider_billing.actual_cost(),
         );
-        let cached_tokens = Some(cached_tokens_i64 as i64);
+        // Preserve Option: None = upstream didn't return cached_tokens (no KV
+        // hit data), Some(0) = upstream explicitly reported 0 cached. The
+        // anomaly detector and 24h hit-rate queries rely on this distinction.
+        let cached_tokens = provider_cached.map(|c| c as i64);
 
         // Provider returned a response — count as a successfully handled request.
         state.agent_stats.record(api_path);
@@ -3016,19 +3018,21 @@ pub async fn messages(
         // Settle quota: real token counts from vLLM go to key + team cumulative
         // and 1-min TPM windows. Cost is computed from the model's cost_rate;
         // cached_tokens get the discounted rate when configured.
-        let cached_tokens_i64 = response
+        let provider_cached = response
             .usage
             .prompt_tokens_details
             .as_ref()
-            .and_then(|d| d.cached_tokens)
-            .unwrap_or(0);
+            .and_then(|d| d.cached_tokens);
         plan_charge.settle(
             input_tokens as u64,
-            cached_tokens_i64.max(0) as u64,
+            provider_cached.unwrap_or(0).max(0) as u64,
             output_tokens as u64,
             None,
         );
-        let cached_tokens = Some(cached_tokens_i64 as i64);
+        // Preserve Option: None = upstream didn't return cached_tokens (no KV
+        // hit data), Some(0) = upstream explicitly reported 0 cached. The
+        // anomaly detector and 24h hit-rate queries rely on this distinction.
+        let cached_tokens = provider_cached.map(|c| c as i64);
 
         // Provider returned a response — count as a successfully handled request.
         state.agent_stats.record("/v1/messages");
