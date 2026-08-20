@@ -1399,11 +1399,13 @@
     const plotW = W - padL - padR;
     const plotH = H - padT - padB;
 
-    // Pull req_count + severity per outlier. Floor severity at 0.01 so log10
-    // doesn't blow up at 0 (severity can be ~0 for groups barely past fence).
+    // Pull req_count + severity per outlier. X uses log10 (req_count ranges
+    // 10 to 10000+); Y stays linear — severity typically sits in 0.1-5 range
+    // and log10 would compress the倍数 gap between barely-flagged (×0.5 IQR)
+    // and severe (×3 IQR) into <1 unit, hiding the very thing we want to show.
     const pts = outliers.map((o) => ({
       x: Math.log10(Math.max(1, Number(o.req_count) || 1)),
-      y: Math.log10(Math.max(0.01, Number(o.severity) || 0.01)),
+      y: Math.max(0, Number(o.severity) || 0),
       alias: (o.alias && o.alias !== o.group_key) ? o.alias : (o.group_key || ""),
       raw: o.group_key || "",
       req_count: Number(o.req_count) || 0,
@@ -1414,8 +1416,10 @@
     // X range — log10(req_count). Floor at log10(1)=0 so points never go off-axis.
     const xMax = Math.max(1, ...pts.map((p) => p.x));
     const xMin = 0;
-    // Y range — log10(severity). Top = max severity.
-    const yMax = Math.max(0, ...pts.map((p) => p.y));
+    // Y range — linear severity. Floor at 0 so 0-severity groups sit on X axis.
+    // Top = max severity with a little headroom (×1.1) so top point isn't clipped.
+    const yMaxRaw = Math.max(0, ...pts.map((p) => p.y));
+    const yMax = yMaxRaw * 1.1 || 1;
     const yMin = 0;
     const sx = (x) => padL + ((x - xMin) / (xMax - xMin || 1)) * plotW;
     const sy = (y) => padT + plotH - ((y - yMin) / (yMax - yMin || 1)) * plotH;
@@ -1428,12 +1432,30 @@
       '<rect x="' + midX + '" y="' + padT + '" width="' + (padL + plotW - midX) + '" height="' + (midY - padT) + '" ' +
         'fill="rgba(192,57,43,0.06)" stroke="rgba(192,57,43,0.18)" stroke-dasharray="4 4"/>';
 
-    // Axes
+    // Axes with tick labels. Y ticks at 0, yMax/2, yMax; X ticks at
+    // 10^k for k in [0, ceil(log10(max req))] — labels show raw req_count.
+    const yTicks = [0, yMax / 2, yMax].map((v) => {
+      const yp = sy(v);
+      return '<line x1="' + padL + '" y1="' + yp + '" x2="' + (padL + plotW) + '" y2="' + yp + '" stroke="var(--border, #eee)" stroke-dasharray="2 2"/>' +
+             '<text x="' + (padL - 6) + '" y="' + (yp + 3) + '" text-anchor="end" font-size="10" fill="var(--text-muted, #6b7280)">' + v.toFixed(1) + '</text>';
+    }).join("");
+    const xTickMax = Math.ceil(xMax);
+    const xTicksArr = [];
+    for (let k = 0; k <= xTickMax; k++) {
+      const xv = k;
+      const xp = sx(xv);
+      const label = (Math.pow(10, k)).toLocaleString();
+      xTicksArr.push('<line x1="' + xp + '" y1="' + (padT + plotH) + '" x2="' + xp + '" y2="' + (padT + plotH + 4) + '" stroke="var(--border, #ccc)"/>' +
+                     '<text x="' + xp + '" y="' + (padT + plotH + 16) + '" text-anchor="middle" font-size="10" fill="var(--text-muted, #6b7280)">' + label + '</text>');
+    }
+    const xTicks = xTicksArr.join("");
     const axisX =
       '<line x1="' + padL + '" y1="' + (padT + plotH) + '" x2="' + (padL + plotW) + '" y2="' + (padT + plotH) + '" stroke="var(--border, #ccc)"/>' +
+      xTicks +
       '<text x="' + (padL + plotW / 2) + '" y="' + (H - 8) + '" text-anchor="middle" font-size="11" fill="var(--text-muted, #6b7280)">' + esc(t("debug.anomalies.scatter.x_label")) + '</text>';
     const axisY =
       '<line x1="' + padL + '" y1="' + padT + '" x2="' + padL + '" y2="' + (padT + plotH) + '" stroke="var(--border, #ccc)"/>' +
+      yTicks +
       '<text x="14" y="' + (padT + plotH / 2) + '" text-anchor="middle" font-size="11" fill="var(--text-muted, #6b7280)" transform="rotate(-90 14 ' + (padT + plotH / 2) + ')">' + esc(t("debug.anomalies.scatter.y_label")) + '</text>';
 
     // Points — color by metric_count
