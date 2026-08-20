@@ -745,6 +745,30 @@ p.error { color: var(--danger); font-style: italic; margin: 0; }
 .debug-pane { display: none; }
 .debug-pane.active { display: block; }
 
+/* ── Anomaly explainer (collapsible) ─────────────────────── */
+.anomaly-explainer {
+  margin: 0.5rem 0 1rem;
+  padding: 0.5rem 0.75rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 13px;
+}
+.anomaly-explainer > summary {
+  cursor: pointer;
+  font-weight: 600;
+  color: var(--primary);
+  user-select: none;
+}
+.anomaly-explainer-body { margin-top: 0.5rem; }
+.anomaly-explainer-body p {
+  margin: 0.4rem 0;
+  line-height: 1.5;
+  color: var(--text-muted, #6b7280);
+}
+.anomaly-explainer-body p:first-child { margin-top: 0; }
+.anomaly-explainer-body p:last-child { margin-bottom: 0; }
+
 /* ── Anomaly pane controls ───────────────────────────────── */
 .anomaly-controls {
   display: flex;
@@ -858,6 +882,48 @@ p.error { color: var(--danger); font-style: italic; margin: 0; }
   overflow: hidden;
   text-overflow: ellipsis;
   max-width: 320px;
+}
+
+/* ── Anomaly scatter plot ──────────────────────────────── */
+.anomaly-scatter {
+  margin: 0.5rem 0 1rem;
+  padding: 0.75rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+.anomaly-scatter h4 {
+  margin: 0 0 0.5rem;
+  font-size: 14px;
+}
+.anomaly-scatter-svg {
+  display: block;
+  width: 100%;
+  height: auto;
+  max-height: 360px;
+}
+.anomaly-scatter-svg circle:hover {
+  fill-opacity: 1;
+  r: 7;
+}
+.anomaly-scatter-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 0.5rem;
+  font-size: 11px;
+  color: var(--text-muted, #6b7280);
+  align-items: center;
+}
+.anomaly-scatter-legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.anomaly-scatter-quadrant {
+  margin-left: auto;
+  font-style: italic;
+  max-width: 60%;
 }
 
 /* ── Cards ──────────────────────────────────────────────── */

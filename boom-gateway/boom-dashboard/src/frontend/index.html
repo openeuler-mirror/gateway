@@ -319,6 +319,16 @@
                 </div>
               </div>
               <div id="anomaly-results-wrap">
+                <details class="anomaly-explainer">
+                  <summary data-i18n="debug.anomalies.explainer.summary">How is this calculated?</summary>
+                  <div class="anomaly-explainer-body">
+                    <p data-i18n="debug.anomalies.explainer.iqr">IQR (Interquartile Range) = P75 − P25 — the spread of the middle 50% of requests. Fence = [P25 − 1.5×IQR, P75 + 1.5×IQR]; groups whose average falls outside are flagged.</p>
+                    <p data-i18n="debug.anomalies.explainer.severity">×N IQR on a chip means the group's average is N IQR-widths past the fence. ×1 = just past the fence; ×3 = severe outlier.</p>
+                    <p data-i18n="debug.anomalies.explainer.err_rate">Error rate is binary (0/1) so IQR doesn't apply; we use 3× overall average as threshold (floor 1%).</p>
+                    <p data-i18n="debug.anomalies.explainer.skip">Metrics with IQR=0 (e.g. queue_wait_ms when most requests are 0) are skipped to avoid flagging tied-with-median groups.</p>
+                    <p data-i18n="debug.anomalies.explainer.scatter">Scatter plot: X = request count (log), Y = total severity (log). Top-right = high-traffic + severe = real anomaly; top-left = low-traffic noise.</p>
+                  </div>
+                </details>
                 <p class="muted" data-i18n="debug.anomalies.hint">Click Refresh to load. Default: last 1 day.</p>
               </div>
             </div>

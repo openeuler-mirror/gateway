@@ -1378,10 +1378,92 @@
       ? '<p class="muted">' + data.total_outliers + ' / ' + data.total_groups + ' ' + dimLabel + ' flagged</p>'
       : "";
 
+    const scatterHtml = renderAnomalyScatter(outliers, dimLabel);
+
     wrap.innerHTML =
       '<div class="anomaly-metric-cards">' + cardsHtml + errCard + '</div>' +
       summary +
+      scatterHtml +
       outliersHtml;
+  }
+
+  // Render SVG scatter: X = req_count (log10), Y = severity (log10).
+  // Top-right = high-traffic + severe = real anomaly. Points colored by
+  // metric_count (green=1, yellow=2-3, red=4+). Hover shows alias + raw.
+  function renderAnomalyScatter(outliers, dimLabel) {
+    if (!outliers || outliers.length === 0) {
+      return '<p class="muted">' + t("debug.anomalies.scatter.empty") + '</p>';
+    }
+    const W = 800, H = 320;
+    const padL = 60, padR = 20, padT = 20, padB = 50;
+    const plotW = W - padL - padR;
+    const plotH = H - padT - padB;
+
+    // Pull req_count + severity per outlier. Floor severity at 0.01 so log10
+    // doesn't blow up at 0 (severity can be ~0 for groups barely past fence).
+    const pts = outliers.map((o) => ({
+      x: Math.log10(Math.max(1, Number(o.req_count) || 1)),
+      y: Math.log10(Math.max(0.01, Number(o.severity) || 0.01)),
+      alias: (o.alias && o.alias !== o.group_key) ? o.alias : (o.group_key || ""),
+      raw: o.group_key || "",
+      req_count: Number(o.req_count) || 0,
+      severity: Number(o.severity) || 0,
+      metric_count: Number(o.metric_count) || 1,
+    }));
+
+    // X range — log10(req_count). Floor at log10(1)=0 so points never go off-axis.
+    const xMax = Math.max(1, ...pts.map((p) => p.x));
+    const xMin = 0;
+    // Y range — log10(severity). Top = max severity.
+    const yMax = Math.max(0, ...pts.map((p) => p.y));
+    const yMin = 0;
+    const sx = (x) => padL + ((x - xMin) / (xMax - xMin || 1)) * plotW;
+    const sy = (y) => padT + plotH - ((y - yMin) / (yMax - yMin || 1)) * plotH;
+
+    // Quadrant divider at midpoint — left=low traffic, top=high severity.
+    const midX = padL + plotW / 2;
+    const midY = padT + plotH / 2;
+    // Top-right quadrant highlight = real anomaly zone.
+    const quadrantRect =
+      '<rect x="' + midX + '" y="' + padT + '" width="' + (padL + plotW - midX) + '" height="' + (midY - padT) + '" ' +
+        'fill="rgba(192,57,43,0.06)" stroke="rgba(192,57,43,0.18)" stroke-dasharray="4 4"/>';
+
+    // Axes
+    const axisX =
+      '<line x1="' + padL + '" y1="' + (padT + plotH) + '" x2="' + (padL + plotW) + '" y2="' + (padT + plotH) + '" stroke="var(--border, #ccc)"/>' +
+      '<text x="' + (padL + plotW / 2) + '" y="' + (H - 8) + '" text-anchor="middle" font-size="11" fill="var(--text-muted, #6b7280)">' + esc(t("debug.anomalies.scatter.x_label")) + '</text>';
+    const axisY =
+      '<line x1="' + padL + '" y1="' + padT + '" x2="' + padL + '" y2="' + (padT + plotH) + '" stroke="var(--border, #ccc)"/>' +
+      '<text x="14" y="' + (padT + plotH / 2) + '" text-anchor="middle" font-size="11" fill="var(--text-muted, #6b7280)" transform="rotate(-90 14 ' + (padT + plotH / 2) + ')">' + esc(t("debug.anomalies.scatter.y_label")) + '</text>';
+
+    // Points — color by metric_count
+    const colorFor = (mc) => mc >= 4 ? "#c0392b" : mc >= 2 ? "#b8860b" : "#3b82f6";
+    const points = pts.map((p) => {
+      const cx = sx(p.x).toFixed(2);
+      const cy = sy(p.y).toFixed(2);
+      const color = colorFor(p.metric_count);
+      const tip = esc(p.alias + " | req=" + p.req_count.toLocaleString() + " | sev=" + p.severity.toFixed(2) + " | " + p.metric_count + " metrics");
+      const label = '<title>' + tip + '</title>';
+      const labelText = p.alias.length > 14 ? p.alias.slice(0, 13) + "…" : p.alias;
+      const labelSvg = '<text x="' + (parseFloat(cx) + 8) + '" y="' + (parseFloat(cy) + 4) + '" font-size="10" fill="var(--text-muted, #6b7280)">' + esc(labelText) + '</text>';
+      return '<circle cx="' + cx + '" cy="' + cy + '" r="5" fill="' + color + '" fill-opacity="0.7" stroke="' + color + '">' + label + '</circle>' + labelSvg;
+    }).join("");
+
+    return '<div class="anomaly-scatter">' +
+      '<h4>' + esc(t("debug.anomalies.scatter.title")) + '</h4>' +
+      '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="xMidYMid meet" class="anomaly-scatter-svg">' +
+        quadrantRect +
+        axisX +
+        axisY +
+        points +
+      '</svg>' +
+      '<div class="anomaly-scatter-legend">' +
+        '<span><svg width="10" height="10"><circle cx="5" cy="5" r="4" fill="#3b82f6"/></svg> 1 metric</span>' +
+        '<span><svg width="10" height="10"><circle cx="5" cy="5" r="4" fill="#b8860b"/></svg> 2-3 metrics</span>' +
+        '<span><svg width="10" height="10"><circle cx="5" cy="5" r="4" fill="#c0392b"/></svg> 4+ metrics</span>' +
+        '<span class="anomaly-scatter-quadrant">' + esc(t("debug.anomalies.explainer.scatter")) + '</span>' +
+      '</div>' +
+    '</div>';
   }
 
 

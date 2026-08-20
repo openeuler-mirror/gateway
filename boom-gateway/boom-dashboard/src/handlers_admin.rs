@@ -5106,13 +5106,13 @@ pub async fn get_anomalies(
                  percentile_cont(0.25) WITHIN GROUP (ORDER BY input_tokens)::float8 AS input_p25,
                  percentile_cont(0.75) WITHIN GROUP (ORDER BY input_tokens)::float8 AS input_p75,
                  percentile_cont(0.25) WITHIN GROUP (
-                   ORDER BY CASE WHEN input_tokens > 0
-                                 THEN COALESCE(cached_tokens, 0)::float8 / input_tokens
+                   ORDER BY CASE WHEN cached_tokens IS NOT NULL AND input_tokens > 0
+                                 THEN cached_tokens::float8 / input_tokens
                                  ELSE NULL END
                  )::float8 AS hit_rate_p25,
                  percentile_cont(0.75) WITHIN GROUP (
-                   ORDER BY CASE WHEN input_tokens > 0
-                                 THEN COALESCE(cached_tokens, 0)::float8 / input_tokens
+                   ORDER BY CASE WHEN cached_tokens IS NOT NULL AND input_tokens > 0
+                                 THEN cached_tokens::float8 / input_tokens
                                  ELSE NULL END
                  )::float8 AS hit_rate_p75,
                  avg(CASE WHEN status_code != 200 THEN 1.0::float8 ELSE 0.0::float8 END)::float8 AS err_rate_avg
@@ -5156,8 +5156,8 @@ pub async fn get_anomalies(
                  avg(rlog.ttft_ms)::float8     AS ttft_avg,
                  avg(rlog.queue_wait_ms)::float8 AS queue_avg,
                  avg(rlog.input_tokens)::float8 AS input_avg,
-                 avg(CASE WHEN rlog.input_tokens > 0
-                          THEN COALESCE(rlog.cached_tokens, 0)::float8 / rlog.input_tokens
+                 avg(CASE WHEN rlog.cached_tokens IS NOT NULL AND rlog.input_tokens > 0
+                          THEN rlog.cached_tokens::float8 / rlog.input_tokens
                           ELSE NULL END)::float8 AS hit_rate_avg,
                  avg(CASE WHEN rlog.status_code != 200 THEN 1.0::float8 ELSE 0.0::float8 END)::float8 AS err_rate
                FROM boom_request_log rlog
