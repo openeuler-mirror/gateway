@@ -482,17 +482,20 @@ impl ProxyHttp for Gateway {
         _session: &mut Session,
         peer: &HttpPeer,
         ctx: &mut Self::CTX,
-        e: Box<pingora_core::Error>,
+        mut e: Box<pingora_core::Error>,
     ) -> Box<pingora_core::Error> {
         self.metrics.retries_total.fetch_add(1, Ordering::Relaxed);
-        // Record the failed peer so the next `upstream_peer()` call (pingora
-        // retries connect errors by default) can pick a different backend.
+        // Mark the connect error retry-able so pingora's retry loop re-invokes
+        // `upstream_peer()` (bounded by the global `max_retries` budget).
+        // Nothing has been sent to the upstream at this stage, so retrying is
+        // always safe, even for non-idempotent requests.
         if let Some(addr) = peer.address().as_inet() {
             let addr = *addr;
             if !ctx.attempted.contains(&addr) {
                 ctx.attempted.push(addr);
             }
         }
+        e.set_retry(true);
         e
     }
 
