@@ -60,3 +60,6 @@ moka = { workspace = true, features = ["sync"] }
 dashmap = { workspace = true }
 rust_decimal = { workspace = true }
 libloading = { workspace = true }
+
+[lints]
+workspace = true
