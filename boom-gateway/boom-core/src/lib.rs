@@ -25,8 +25,8 @@ pub trait LogDroppedCounter: Send + Sync + 'static {
     fn dropped_count(&self) -> u64;
 }
 
-/// Hand-maintained release version. Semantic version (`1.0.3`) — bumped
+/// Hand-maintained release version. Semantic version (`1.0.4`) — bumped
 /// manually per release. Do NOT derive from build time, that defeats the
 /// purpose (different checkouts would diverge). Frontend prepends "v" for
 /// display, so keep this bare (no "v" prefix).
-pub const BOOM_VERSION: &str = "1.0.3";
+pub const BOOM_VERSION: &str = "1.0.4";
