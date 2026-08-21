@@ -99,3 +99,12 @@ rust_decimal_macros = { version = "1" }
 
 # Dynamic library loading (hook framework)
 libloading = "0.8"
+
+[workspace.lints.rust]
+# `tokio_unstable` is set via `--cfg tokio_unstable` rustflag (see
+# `.cargo/config.toml`). It gates `worker_local_queue_depth` /
+# `blocking_queue_depth` on tokio's `RuntimeMetrics`. We use `#[cfg]`
+# around the call sites so builds without the flag still compile (the
+# metrics degrade to global-queue-only depth). Tell check-cfg this
+# condition is legit so Rust 1.80+ doesn't warn "unexpected cfg".
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }

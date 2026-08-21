@@ -389,6 +389,7 @@ fn sample_pressure_once(
     let now_instant = std::time::Instant::now();
 
     let metrics = tokio::runtime::Handle::current().metrics();
+    #[allow(unused_variables)]
     let num_workers = metrics.num_workers().max(1);
 
     // Process CPU since the previous sample. (cpu_jiffies_prev, instant_prev).
@@ -416,15 +417,31 @@ fn sample_pressure_once(
     drop(prev_guard);
 
     // Sum of per-worker local queues + the global injection queue — gives a
-    // single "tasks waiting to be polled" number. Spikes here = workers
+    // a single "tasks waiting to be polled" number. Spikes here = workers
     // can't keep up.
+    //
+    // `global_queue_depth()` is a stable tokio API and always available.
+    // `worker_local_queue_depth(i)` and `blocking_queue_depth()` are gated
+    // behind `#[cfg(tokio_unstable)]` in tokio's source — they only compile
+    // when the `--cfg tokio_unstable` rustflag is passed (see
+    // `.cargo/config.toml`). When the flag is missing (e.g. a build env that
+    // didn't pick up the project config), we skip those calls and degrade
+    // to global-queue-only depth, so the build doesn't fail with
+    // "no method named 'worker_local_queue_depth' found".
     let mut worker_queue_depth = metrics.global_queue_depth();
-    for i in 0..num_workers {
-        worker_queue_depth += metrics.worker_local_queue_depth(i);
+    #[cfg(tokio_unstable)]
+    {
+        for i in 0..num_workers {
+            worker_queue_depth += metrics.worker_local_queue_depth(i);
+        }
     }
     // Tasks queued on the blocking pool (gzip compression, DB migrations,
-    // etc) — a proxy for "spawn_blocking is being over-used".
+    // etc) — a proxy for "spawn_blocking is being over-used". Same
+    // `tokio_unstable` gate as above.
+    #[cfg(tokio_unstable)]
     let blocking_tasks_queued = metrics.blocking_queue_depth();
+    #[cfg(not(tokio_unstable))]
+    let blocking_tasks_queued = 0;
 
     // Inflight: sum across all models with active requests.
     let inflight_count = inflight
