@@ -173,10 +173,18 @@ pub struct ChatCompletionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
     /// Catch-all: accepts all fields during deserialization so requests are
-    /// never rejected for unknown keys, but **skips serialization** so that
-    /// non-standard fields (service_tier, store, etc.) are NOT forwarded to
-    /// upstream providers that may not understand them.
-    #[serde(default, flatten, skip_serializing)]
+    /// never rejected for unknown keys, and forwards them as-is to OpenAI-
+    /// compatible upstreams. The OpenAI protocol field set is open (new fields
+    /// like `service_tier`, `store`, `reasoning_effort`, `prompt_cache_key`
+    /// arrive faster than the gateway can whitelist them), so for the OpenAI→
+    /// OpenAI path we pass through everything clients send. Cross-protocol
+    /// paths (OpenAI→Anthropic) build their own body and only carry selected
+    /// fields — this struct's `extra` doesn't leak there.
+    ///
+    /// Gateway-internal side channels (`gateway_headers`, `kv_cache_report_full`)
+    /// are kept on separate `#[serde(skip)]` fields and never leak into the
+    /// upstream body.
+    #[serde(default, flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
     /// Gateway-internal HTTP headers to inject into the upstream request —
     /// a side channel from the route layer to the provider layer that never
