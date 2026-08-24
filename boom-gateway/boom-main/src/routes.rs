@@ -2551,6 +2551,18 @@ fn log_request_summary(
     );
 }
 
+/// The OpenAI SSE terminator. The upstream `data: [DONE]` sentinel is
+/// consumed by the provider parser (it can't be represented as a
+/// `ChatStreamChunk`), so the gateway re-emits it here to stay spec-compliant
+/// with strict OpenAI clients that wait for `[DONE]` before treating the
+/// stream as complete.
+fn done_sse_item() -> SseItem {
+    SseItem {
+        event: Event::default().data("[DONE]"),
+        json_data: "[DONE]".to_string(),
+    }
+}
+
 fn sse_stream_from_chat_stream(
     stream: ChatStream,
     usage: UsageTracker,
@@ -2565,6 +2577,7 @@ fn sse_stream_from_chat_stream(
                 result = stream.next() => result,
             };
             let Some(result) = result else {
+                let _ = tx.send(done_sse_item()).await;
                 return;
             };
             match result {
@@ -2664,6 +2677,7 @@ fn sse_stream_from_chat_stream(
                     let error_data = serde_json::to_string(&openai_error_body(&e))
                         .unwrap_or_default();
                     let _ = tx.send(SseItem { event: Event::default().data(&error_data), json_data: error_data }).await;
+                    let _ = tx.send(done_sse_item()).await;
                     return;
                 }
             }
@@ -3522,12 +3536,19 @@ pub async fn kv_index_status(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_gateway_headers, compose_gateway_headers, forward_client_headers,
-        is_vip_key, preferred_stream_usage, UsageTrackerState,
+        build_gateway_headers, compose_gateway_headers, done_sse_item,
+        forward_client_headers, is_vip_key, preferred_stream_usage,
+        sse_stream_from_chat_stream, UsageTracker, UsageTrackerState,
     };
     use axum::http::{HeaderMap, HeaderName, HeaderValue};
-    use boom_core::types::{PromptTokensDetails, Usage};
+    use boom_core::types::{
+        ChatStream, ChatStreamChunk, MessageRole, PromptTokensDetails, StreamChoice,
+        StreamDelta, Usage,
+    };
+    use boom_core::GatewayError;
+    use futures::StreamExt;
     use serde_json::json;
+    use std::convert::Infallible;
 
     #[test]
     fn vip_true_in_metadata() {
@@ -3775,6 +3796,78 @@ mod tests {
             preferred_stream_usage(&observed, Some(&provider)),
             (Some(7), Some(3), Some(2))
         );
+    }
+
+    fn terminal_chunk() -> ChatStreamChunk {
+        ChatStreamChunk {
+            id: "chatcmpl-test".to_string(),
+            object: "chat.completion.chunk".to_string(),
+            created: 0,
+            model: "test-model".to_string(),
+            choices: vec![StreamChoice {
+                index: 0,
+                delta: StreamDelta {
+                    role: None,
+                    content: None,
+                    tool_calls: None,
+                    reasoning_content: None,
+                },
+                finish_reason: Some("stop".to_string()),
+            }],
+            usage: None,
+            raw_data: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_emits_done_sentinel_on_normal_end() {
+        let chunk = ChatStreamChunk {
+            id: "chatcmpl-test".to_string(),
+            object: "chat.completion.chunk".to_string(),
+            created: 0,
+            model: "test-model".to_string(),
+            choices: vec![StreamChoice {
+                index: 0,
+                delta: StreamDelta {
+                    role: Some(MessageRole::Assistant),
+                    content: Some("hi".to_string()),
+                    tool_calls: None,
+                    reasoning_content: None,
+                },
+                finish_reason: None,
+            }],
+            usage: None,
+            raw_data: None,
+        };
+        let stream: ChatStream = Box::pin(futures::stream::iter(vec![Ok(chunk), Ok(terminal_chunk())]));
+        let sse = sse_stream_from_chat_stream(stream, UsageTracker::default());
+
+        let items: Vec<_> = sse.collect::<Vec<Result<_, Infallible>>>().await
+            .into_iter().map(|r| r.unwrap()).collect();
+        assert!(!items.is_empty());
+        let last = items.last().unwrap();
+        assert_eq!(last.json_data, "[DONE]");
+    }
+
+    #[tokio::test]
+    async fn stream_emits_done_sentinel_after_error() {
+        let stream: ChatStream = Box::pin(futures::stream::iter(vec![
+            Err(GatewayError::UpstreamError { status: 500, message: "boom".into() }),
+        ]));
+        let sse = sse_stream_from_chat_stream(stream, UsageTracker::default());
+
+        let items: Vec<_> = sse.collect::<Vec<Result<_, Infallible>>>().await
+            .into_iter().map(|r| r.unwrap()).collect();
+        assert_eq!(items.len(), 2);
+        let error_body: serde_json::Value = serde_json::from_str(&items[0].json_data).unwrap();
+        assert!(error_body.get("error").is_some());
+        assert_eq!(items[1].json_data, "[DONE]");
+    }
+
+    #[tokio::test]
+    async fn done_sse_item_carries_literal_done() {
+        let item = done_sse_item();
+        assert_eq!(item.json_data, "[DONE]");
     }
 
 }
