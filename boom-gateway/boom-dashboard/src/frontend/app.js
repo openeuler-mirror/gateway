@@ -374,8 +374,10 @@
     }
     if (section === "admin-config") {
       startOtlpStatusPoll();
+      startTraceOtlpStatusPoll();
     } else {
       stopOtlpStatusPoll();
+      stopTraceOtlpStatusPoll();
     }
     if (section === "admin-models") loadModels();
     else if (section === "admin-plans") loadPlans();
@@ -3213,6 +3215,7 @@
       { group: "runtime", section: "runtime-general",      label: t("config.section.general_settings"),     icon: "general",       html: renderCardGeneral(cfg.general_settings || {}) },
       { group: "runtime", section: "runtime-health",       label: t("config.section.deployment_health_check"), icon: "health",     html: renderCardHealthCheck(cfg.deployment_health_check || {}) },
       { group: "runtime", section: "runtime-prompt-log",   label: t("config.section.prompt_log"),            icon: "prompt-log",   html: renderCardPromptLog(cfg.prompt_log || {}) },
+      { group: "runtime", section: "runtime-trace",        label: t("config.section.trace"),                 icon: "trace",        html: renderCardTrace(cfg.trace || {}) },
       { group: "traffic", section: "traffic-rate-limit",   label: t("config.section.rate_limit"),            icon: "rate-limit",    html: renderCardRateLimit(cfg.rate_limit || {}) },
       { group: "traffic", section: "traffic-plans",       label: t("config.section.plan_settings"),          icon: "plans",         html: renderCardPlanSettings(cfg.plan_settings || {}, cfg) },
       { group: "routing", section: "routing-router",      label: t("config.section.router_settings"),       icon: "router",        html: renderCardRouter(cfg.router_settings || {}) },
@@ -3262,6 +3265,7 @@
       "general": '<circle cx="8" cy="8" r="6.5"/><path d="M8 5v3M8 11h.01"/>',
       "health": '<path d="M1.5 8h3l1.5-4 3 8 1.5-4h3.5"/>',
       "prompt-log": '<rect x="2" y="2" width="12" height="12" rx="1.5"/><path d="M5 5h6M5 8h6M5 11h3"/>',
+      "trace": '<path d="M2 8h3l2-4 3 8 2-4h2"/>',
       "rate-limit": '<circle cx="8" cy="8" r="6.5"/><path d="M8 4.5V8l2.5 1.5"/>',
       "plans": '<rect x="2" y="2" width="12" height="12" rx="1.5"/><path d="M5 5h6M5 8h4M5 11h2"/>',
       "router": '<circle cx="4" cy="4" r="2"/><circle cx="12" cy="8" r="2"/><circle cx="4" cy="12" r="2"/><path d="M6 4h2M8 8h2M6 12h2"/>',
@@ -3432,6 +3436,55 @@
     </div>`;
   }
 
+  function renderCardTrace(p) {
+    const o = (p && p.otlp) || {};
+    const f = (p && p.report_filter) || {};
+    return `<div class="form-card" data-section="trace">
+      <div class="form-card-title">${t("config.section.trace")}</div>
+      <div class="form-card-grid">
+        ${fieldCheckbox("cfg-tr-enabled", t("config.field.trace_enabled"), p.enabled, { tip: t("config.tip.trace_enabled") })}
+        ${fieldCheckbox("cfg-tr-capture-body", t("config.field.trace_capture_body"), p.capture_body !== false, { tip: t("config.tip.trace_capture_body") })}
+        ${fieldNum("cfg-tr-max-body-bytes", t("config.field.trace_max_body_bytes"), p.max_body_bytes || 16384, { min: 256, step: 256, tip: t("config.tip.trace_max_body_bytes") })}
+        ${fieldCheckbox("cfg-tr-propagate-only", t("config.field.trace_propagate_only"), p.propagate_only !== false, { tip: t("config.tip.trace_propagate_only") })}
+        ${fieldNum("cfg-tr-slow-threshold-ms", t("config.field.trace_slow_threshold_ms"), p.slow_threshold_ms || 5000, { min: 100, step: 100, tip: t("config.tip.trace_slow_threshold_ms") })}
+      </div>
+
+      <div class="form-card-subtitle">${t("config.section.trace_filter")}</div>
+      <div class="form-card-grid">
+        ${fieldFullList("cfg-tr-filter-keys", t("config.field.trace_tracestate_keys"), f.tracestate_keys || [])}
+        ${fieldText("cfg-tr-filter-regex", t("config.field.trace_trace_id_regex"), f.trace_id_regex || "", { full: true, tip: t("config.tip.trace_trace_id_regex") })}
+      </div>
+
+      <div class="form-card-subtitle">${t("config.section.trace_otlp")}</div>
+      <div class="form-card-grid">
+        ${fieldCheckbox("cfg-tr-otlp-enabled", t("config.field.otlp_enabled"), o.enabled, { tip: t("config.tip.trace_otlp") })}
+        <div class="form-group field-full">
+          <label>${t("config.field.otlp_endpoint")} ${tip(t("config.tip.otlp_endpoint"))}</label>
+          <div id="cfg-tr-otlp-ping" class="otlp-ping-row" data-state="unknown">
+            <span class="otlp-ping-dot"></span>
+            <span class="otlp-ping-text">${t("config.tip.otlp_ping_unknown")}</span>
+          </div>
+          <div class="otlp-endpoint-row">
+            <input id="cfg-tr-otlp-endpoint" type="text" value="${esc(o.endpoint || "")}" placeholder="http://otel-collector:4318">
+            <button type="button" id="cfg-tr-otlp-test" class="btn-small btn-secondary">${t("action.test")}</button>
+          </div>
+        </div>
+        ${fieldText("cfg-tr-otlp-service-name", t("config.field.otlp_service_name"), o.service_name, { placeholder: "boom-gateway", tip: t("config.tip.otlp_service_name") })}
+        ${fieldText("cfg-tr-otlp-service-version", t("config.field.otlp_service_version"), o.service_version || "", { placeholder: t("config.tip.otlp_service_version_default"), tip: t("config.tip.otlp_service_version_default") })}
+        ${fieldNum("cfg-tr-otlp-timeout-secs", t("config.field.otlp_timeout_secs"), o.timeout_secs, { min: 1, tip: t("config.tip.otlp_timeout_secs") })}
+        ${fieldNum("cfg-tr-otlp-batch-size", t("config.field.otlp_batch_size"), o.batch_size, { min: 1, tip: t("config.tip.otlp_batch_size") })}
+        ${fieldNum("cfg-tr-otlp-flush-interval-secs", t("config.field.otlp_flush_interval_secs"), o.flush_interval_secs, { min: 1, tip: t("config.tip.otlp_flush_interval_secs") })}
+        ${fieldNum("cfg-tr-otlp-max-attribute-bytes", t("config.field.otlp_max_attribute_bytes"), o.max_attribute_bytes, { min: 256, step: 256, tip: t("config.tip.otlp_max_attribute_bytes") })}
+        ${fieldNum("cfg-tr-otlp-max-queue-size", t("config.field.otlp_max_queue_size"), o.max_queue_size, { min: 100, step: 100, tip: t("config.tip.otlp_max_queue_size") })}
+        ${fieldTextarea("cfg-tr-otlp-headers", t("config.field.otlp_headers"), o.headers || {}, { rows: 3, tip: t("config.tip.otlp_headers") })}
+      </div>
+
+      <div class="form-card-actions">
+        <button class="btn-primary btn-small" data-save="trace">${t("action.save")}</button>
+      </div>
+    </div>`;
+  }
+
   function renderCardRouter(r) {
     return `<div class="form-card" data-section="router_settings">
       <div class="form-card-title">${t("config.section.router_settings")}</div>
@@ -3520,6 +3573,8 @@
     wireDirtyTracking();
     const testBtn = document.getElementById("cfg-pl-otlp-test");
     if (testBtn) testBtn.addEventListener("click", otlpPingOnce);
+    const traceTestBtn = document.getElementById("cfg-tr-otlp-test");
+    if (traceTestBtn) traceTestBtn.addEventListener("click", traceOtlpPingOnce);
   }
 
   // ── Config page sidebar (Runtime/Traffic/Routing sub-items) ────
@@ -3690,6 +3745,76 @@
     }
   }
 
+  // ── Trace OTLP endpoint connectivity indicator (mirror of prompt-log's)
+  // One-shot Test button probes the form-input endpoint; the periodic poll
+  // reads the live traces exporter's state. Independent state from the
+  // prompt-log indicator (two channels, two exporters).
+  async function traceOtlpPingOnce() {
+    const btn = document.getElementById("cfg-tr-otlp-test");
+    const pingRow = document.getElementById("cfg-tr-otlp-ping");
+    if (!btn || !pingRow) return;
+    const endpoint = (document.getElementById("cfg-tr-otlp-endpoint")?.value || "").trim();
+    if (!endpoint) {
+      otlpPingSetState(pingRow, "unknown", t("config.tip.otlp_ping_no_endpoint"));
+      return;
+    }
+    btn.disabled = true;
+    btn.textContent = t("config.tip.otlp_ping_pending");
+    otlpPingSetState(pingRow, "pending", t("config.tip.otlp_ping_pending"));
+    try {
+      const r = await api("/admin/trace/otlp-probe", {
+        method: "POST",
+        body: JSON.stringify({ endpoint }),
+      });
+      if (r && r.ok && typeof r.latency_ms === "number") {
+        const ms = r.latency_ms;
+        otlpPingSetState(pingRow, "ok", `${t("config.tip.otlp_ping_ok")} · ${ms} ms`);
+      } else {
+        otlpPingSetState(pingRow, "fail", `${t("config.tip.otlp_ping_fail")} · ${r && r.error ? r.error : ""}`.trim().replace(/[·\s]+$/, ""));
+      }
+    } catch (err) {
+      otlpPingSetState(pingRow, "fail", `${t("config.tip.otlp_ping_fail")} · ${err.message}`);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = t("action.test");
+    }
+  }
+
+  let traceOtlpStatusTimer = null;
+  function startTraceOtlpStatusPoll() {
+    stopTraceOtlpStatusPoll();
+    traceOtlpStatusPoll();
+    traceOtlpStatusTimer = setInterval(traceOtlpStatusPoll, 5000);
+  }
+  function stopTraceOtlpStatusPoll() {
+    if (traceOtlpStatusTimer) {
+      clearInterval(traceOtlpStatusTimer);
+      traceOtlpStatusTimer = null;
+    }
+  }
+  async function traceOtlpStatusPoll() {
+    const pingRow = document.getElementById("cfg-tr-otlp-ping");
+    if (!pingRow) return;
+    if (pingRow.getAttribute("data-state") === "pending") return;
+    try {
+      const r = await api("/admin/trace/otlp-status", { method: "GET" });
+      if (!r || !r.ok) {
+        otlpPingSetState(pingRow, "fail", t("config.tip.otlp_ping_fail"));
+        return;
+      }
+      if (r.status === "online") {
+        otlpPingSetState(pingRow, "ok", t("config.tip.otlp_status_online"));
+      } else if (r.status === "offline") {
+        const ep = r.endpoint ? ` · ${r.endpoint}` : "";
+        otlpPingSetState(pingRow, "fail", `${t("config.tip.otlp_status_offline")}${ep}`);
+      } else {
+        otlpPingSetState(pingRow, "unknown", t("config.tip.otlp_status_disabled"));
+      }
+    } catch (err) {
+      // ignore — same as prompt-log poll
+    }
+  }
+
   async function reloadConfigHandler() {
     try {
       await api("/admin/config/reload", { method: "POST" });
@@ -3773,6 +3898,30 @@
             max_attribute_bytes: numOr($("cfg-pl-otlp-max-attribute-bytes"), 4096),
             headers: parseJsonInput($("cfg-pl-otlp-headers"), {}),
             max_queue_size: numOr($("cfg-pl-otlp-max-queue-size"), 10000),
+          },
+        });
+      } else if (kind === "trace") {
+        await saveConfigSection("trace", {
+          enabled: $("cfg-tr-enabled").checked,
+          capture_body: $("cfg-tr-capture-body").checked,
+          max_body_bytes: numOr($("cfg-tr-max-body-bytes"), 16384),
+          propagate_only: $("cfg-tr-propagate-only").checked,
+          slow_threshold_ms: numOr($("cfg-tr-slow-threshold-ms"), 5000),
+          report_filter: {
+            tracestate_keys: parseListInput($("cfg-tr-filter-keys")),
+            trace_id_regex: $("cfg-tr-filter-regex").value || null,
+          },
+          otlp: {
+            enabled: $("cfg-tr-otlp-enabled").checked,
+            endpoint: $("cfg-tr-otlp-endpoint").value || "",
+            service_name: $("cfg-tr-otlp-service-name").value || "boom-gateway",
+            service_version: $("cfg-tr-otlp-service-version").value || null,
+            timeout_secs: numOr($("cfg-tr-otlp-timeout-secs"), 10),
+            batch_size: numOr($("cfg-tr-otlp-batch-size"), 512),
+            flush_interval_secs: numOr($("cfg-tr-otlp-flush-interval-secs"), 5),
+            max_attribute_bytes: numOr($("cfg-tr-otlp-max-attribute-bytes"), 4096),
+            headers: parseJsonInput($("cfg-tr-otlp-headers"), {}),
+            max_queue_size: numOr($("cfg-tr-otlp-max-queue-size"), 10000),
           },
         });
       } else if (kind === "router") {
