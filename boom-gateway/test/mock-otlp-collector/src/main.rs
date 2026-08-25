@@ -1,14 +1,15 @@
 //! Mock OTLP/HTTP receiver for the gateway's telemetry push.
 //!
 //! Decodes `ExportLogsServiceRequest` protobuf from POST `/v1/logs` and
-//! pretty-prints each LogRecord. Two modes:
+//! `ExportTraceServiceRequest` protobuf from POST `/v1/traces`, then
+//! pretty-prints each record. Two modes:
 //!
 //! - **brief** (default): one line per record. OTel header fields
 //!   (trace_id / span_id / severity / body, first 80 chars) only. Good for
 //!   live monitoring while you trigger requests against the gateway.
-//! - **full** (`--full`): dumps every attribute on every LogRecord, plus
-//!   resource attributes and dropped_attributes_count. Good for verifying
-//!   field mappings while developing new entry types.
+//! - **full** (`--full`): dumps every attribute on every LogRecord / Span,
+//!   plus resource attributes and dropped_attributes_count. Good for
+//!   verifying field mappings while developing new entry types.
 //!
 //! The crate is intentionally a separate Cargo project (see `[workspace]`
 //! in Cargo.toml) — `cargo build --workspace` from the gateway root does
@@ -22,6 +23,7 @@ use axum::{http::StatusCode, routing::post, Router};
 use clap::Parser;
 use opentelemetry_proto::tonic::{
     collector::logs::v1::ExportLogsServiceRequest,
+    collector::trace::v1::ExportTraceServiceRequest,
     common::v1::any_value::Value,
     logs::v1::SeverityNumber as Sev,
 };
@@ -82,13 +84,14 @@ async fn main() {
 
     let app = Router::new()
         .route("/v1/logs", post(handle_logs))
+        .route("/v1/traces", post(handle_traces))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     tracing::info!(
         addr = %addr,
         full_mode = args.full,
-        "mock-otlp-collector listening — POST /v1/logs"
+        "mock-otlp-collector listening — POST /v1/logs, POST /v1/traces"
     );
     axum::serve(listener, app).await.unwrap();
 }
@@ -139,6 +142,133 @@ async fn handle_logs(
 
     // Empty ExportLogsServiceResponse (code 0).
     (StatusCode::OK, b"")
+}
+
+async fn handle_traces(
+    axum::extract::State(state): axum::extract::State<SinkState>,
+    body: Bytes,
+) -> (StatusCode, &'static [u8]) {
+    let req_seq = state
+        .seq
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    let req: ExportTraceServiceRequest = match ExportTraceServiceRequest::decode(&body[..]) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(
+                req_seq,
+                body_bytes = body.len(),
+                "trace decode failed: {e}"
+            );
+            // Same rationale as logs: returning 200 prevents the gateway
+            // from retrying a broken batch forever.
+            return (StatusCode::OK, b"");
+        }
+    };
+
+    let total: usize = req
+        .resource_spans
+        .iter()
+        .flat_map(|rs| rs.scope_spans.iter())
+        .map(|ss| ss.spans.len())
+        .sum();
+
+    // Same connectivity-probe shortcut as logs — silently 200 the empty
+    // probes the dashboard's Test button sends to check reachability.
+    if total == 0 {
+        tracing::debug!(req_seq, "empty trace probe (dashboard connectivity check)");
+        return (StatusCode::OK, b"");
+    }
+
+    if state.full {
+        print_traces_full(req_seq, &req);
+    } else {
+        print_traces_brief(req_seq, &req, state.brief_chars, total);
+    }
+
+    // Empty ExportTraceServiceResponse (code 0).
+    (StatusCode::OK, b"")
+}
+
+fn print_traces_brief(req_seq: u64, req: &ExportTraceServiceRequest, brief_chars: usize, total: usize) {
+    let now = chrono_now();
+    println!("[{now} req#{req_seq}] trace batch={total} spans");
+    for rs in &req.resource_spans {
+        for ss in &rs.scope_spans {
+            for sp in &ss.spans {
+                let trace_id = hex(&sp.trace_id);
+                let span_id = hex(&sp.span_id);
+                let parent = hex(&sp.parent_span_id);
+                let name = sp.name.clone();
+                let start_ms = sp.start_time_unix_nano / 1_000_000;
+                let dur_ms = if sp.end_time_unix_nano > 0 {
+                    (sp.end_time_unix_nano - sp.start_time_unix_nano) / 1_000_000
+                } else {
+                    0
+                };
+                let parent_part = if parent.is_empty() {
+                    String::new()
+                } else {
+                    format!("parent={parent} ")
+                };
+                let name_short = truncate_str(&name, brief_chars);
+                let status_code = sp.status.as_ref().map(|s| s.code).unwrap_or(0);
+                let status_str = match status_code {
+                    0 => "unset",
+                    1 => "ok",
+                    2 => "error",
+                    _ => "?",
+                };
+                println!(
+                    "  trace={trace_id} span={span_id} {parent_part}name=\"{name_short}\" start={start_ms} dur={dur_ms}ms status={status_str}"
+                );
+            }
+        }
+    }
+}
+
+fn print_traces_full(req_seq: u64, req: &ExportTraceServiceRequest) {
+    let now = chrono_now();
+    let total: usize = req
+        .resource_spans
+        .iter()
+        .flat_map(|rs| rs.scope_spans.iter())
+        .map(|ss| ss.spans.len())
+        .sum();
+    println!("\n[{now} req#{req_seq}] ExportTraceServiceRequest: {} resource_spans, {} spans", req.resource_spans.len(), total);
+    for (ri, rs) in req.resource_spans.iter().enumerate() {
+        println!("\n-- ResourceSpans[{ri}] --");
+        if let Some(res) = &rs.resource {
+            for attr in &res.attributes {
+                println!("  resource.attr: {} = {}", attr.key, format_any(&attr.value));
+            }
+        }
+        for (si, ss) in rs.scope_spans.iter().enumerate() {
+            let scope_name = ss
+                .scope
+                .as_ref()
+                .map(|s| s.name.clone())
+                .unwrap_or_default();
+            println!("\n  ScopeSpans[{si}] scope.name={scope_name:?} {} spans", ss.spans.len());
+            for (spi, sp) in ss.spans.iter().enumerate() {
+                println!("\n    Span[{spi}]:");
+                println!("      trace_id={} span_id={}", hex(&sp.trace_id), hex(&sp.span_id));
+                let parent = hex(&sp.parent_span_id);
+                if !parent.is_empty() {
+                    println!("      parent_span_id={parent}");
+                }
+                println!("      name: {}", sp.name);
+                println!("      start_unix_nano: {}", sp.start_time_unix_nano);
+                println!("      end_unix_nano: {}", sp.end_time_unix_nano);
+                if let Some(st) = &sp.status {
+                    println!("      status: code={} message={:?}", st.code, st.message);
+                }
+                for attr in &sp.attributes {
+                    println!("      attr: {} = {}", attr.key, format_any(&attr.value));
+                }
+            }
+        }
+    }
 }
 
 fn print_brief(req_seq: u64, req: &ExportLogsServiceRequest, brief_chars: usize, total: usize) {

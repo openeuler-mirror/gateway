@@ -3978,9 +3978,9 @@
     btn.textContent = t("config.tip.otlp_ping_pending");
     otlpPingSetState(pingRow, "pending", t("config.tip.otlp_ping_pending"));
     try {
-      const r = await api("/admin/trace/otlp-probe", {
+      const r = await api("/admin/trace/otlp-ping", {
         method: "POST",
-        body: JSON.stringify({ endpoint }),
+        body: JSON.stringify({ endpoint, headers: {}, timeout_secs: 5 }),
       });
       if (r && r.ok && typeof r.latency_ms === "number") {
         const ms = r.latency_ms;

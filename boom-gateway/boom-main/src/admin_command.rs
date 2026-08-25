@@ -121,6 +121,26 @@ pub async fn admin_command_handler(mut rx: tokio::sync::mpsc::Receiver<AdminComm
                 let result = boom_promptlog::ping_endpoint(&probe_config).await;
                 let _ = reply.send(result);
             }
+            AdminCommand::PingTraceOtlpEndpoint { endpoint, headers, timeout_secs, reply } => {
+                // Mirror of PingOtlpEndpoint but for the traces channel —
+                // sends an empty ExportTraceServiceRequest to validate
+                // collector connectivity before saving config. Single attempt,
+                // no retry.
+                let probe_config = boom_core::OtlpConfig {
+                    enabled: true,
+                    endpoint,
+                    service_name: "boom-gateway".to_string(),
+                    service_version: None,
+                    timeout_secs,
+                    batch_size: 512,
+                    flush_interval_secs: 5,
+                    max_attribute_bytes: 4096,
+                    headers,
+                    max_queue_size: 10000,
+                };
+                let result = boom_trace::ping_endpoint(&probe_config).await;
+                let _ = reply.send(result);
+            }
             AdminCommand::GetOtlpStatus { reply } => {
                 // Read-only snapshot of the live exporter's state machine.
                 // The writer's `otlp_status` takes an owned Arc out of the

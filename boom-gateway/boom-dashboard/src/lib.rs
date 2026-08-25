@@ -289,6 +289,10 @@ pub fn build_router<S: Clone + Send + Sync + 'static>(state: DashboardState) -> 
             "/dashboard/api/admin/trace/otlp-probe",
             post(handlers_admin::trace_otlp_probe),
         )
+        .route(
+            "/dashboard/api/admin/trace/otlp-ping",
+            post(handlers_admin::ping_trace_otlp_endpoint),
+        )
         // Admin — Hot-reload config.
         .route(
             "/dashboard/api/admin/config/reload",

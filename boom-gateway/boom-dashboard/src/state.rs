@@ -106,6 +106,17 @@ pub enum AdminCommand {
     ProbeOtlp {
         reply: oneshot::Sender<Option<boom_promptlog::ProbeResult>>,
     },
+    /// Probe a remote OTLP/HTTP collector for traces. Same shape as
+    /// `PingOtlpEndpoint` but sends an `ExportTraceServiceRequest` instead
+    /// of an `ExportLogsServiceRequest`. The dashboard's trace card Test
+    /// button calls this so the operator can type a new endpoint and test
+    /// it before saving.
+    PingTraceOtlpEndpoint {
+        endpoint: String,
+        headers: std::collections::HashMap<String, String>,
+        timeout_secs: u64,
+        reply: oneshot::Sender<Result<u64, String>>,
+    },
 }
 
 pub type AdminTx = mpsc::Sender<AdminCommand>;
