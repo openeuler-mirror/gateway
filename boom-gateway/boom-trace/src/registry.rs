@@ -20,20 +20,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Default cap on the active span table. When full, the oldest span is
-/// evicted (and forwarded to the slow ring if it was slow). Sized for
-/// ~10s of headroom at 10k QPS — should be plenty for debugging "which
-/// request is stuck" queries.
+/// evicted. Sized for ~10s of headroom at 10k QPS — should be plenty for
+/// debugging "which request is stuck" queries.
 const DEFAULT_ACTIVE_CAP: usize = 100_000;
 
-/// Default cap on the slow ring buffer (most recent N slow spans).
-const DEFAULT_SLOW_CAP: usize = 1_000;
+/// Default cap on the recent-finalized ring (most recent N spans of any
+/// duration, OK or error). The dashboard shows "what just happened" by
+/// merging active + recent — the operator sees the last ~100 spans
+/// regardless of duration. Older finalized spans drop off as new ones
+/// come in. Bounded so it can't grow unbounded under load.
+const DEFAULT_RECENT_CAP: usize = 100;
 
-/// Default threshold (ms) for "slow" — used when `slow_threshold_ms` not
-/// configured. Spans slower than this land in the ring buffer.
-const DEFAULT_SLOW_THRESHOLD_MS: u64 = 5_000;
-
-/// Ring buffer of recently-finalized slow spans (FIFO, fixed capacity).
-/// Older entries drop off the back as new slow spans come in.
+/// Ring buffer of recently-finalized spans (FIFO, fixed capacity).
+/// Older entries drop off the back as new ones come in. Used for the
+/// recent ring — every finalized span (OK or error) lands here.
 struct SlowRing {
     items: VecDeque<RequestSpan>,
     cap: usize,
@@ -68,13 +68,12 @@ impl SlowRing {
 /// and `enqueue_finalized` is a no-op.
 pub struct TraceRegistry {
     active: DashMap<String, RequestSpan>,
-    slow_ring: std::sync::Mutex<SlowRing>,
+    recent_ring: std::sync::Mutex<SlowRing>,
     otlp: Arc<ArcSwap<Option<Arc<TraceExporter>>>>,
     flush_handle: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
     /// When true, the OTLP exporter is configured and `enqueue_finalized`
     /// forwards the span to OTLP traces. Driven by `TraceConfig.enabled`.
     enabled: std::sync::atomic::AtomicBool,
-    slow_threshold_ms: AtomicU64,
     total_started: AtomicU64,
     total_finalized: AtomicU64,
     total_error: AtomicU64,
@@ -88,11 +87,10 @@ impl TraceRegistry {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             active: DashMap::with_capacity(1024),
-            slow_ring: std::sync::Mutex::new(SlowRing::new(DEFAULT_SLOW_CAP)),
+            recent_ring: std::sync::Mutex::new(SlowRing::new(DEFAULT_RECENT_CAP)),
             otlp: Arc::new(ArcSwap::from_pointee(None)),
             flush_handle: Arc::new(std::sync::Mutex::new(None)),
             enabled: std::sync::atomic::AtomicBool::new(false),
-            slow_threshold_ms: AtomicU64::new(DEFAULT_SLOW_THRESHOLD_MS),
             total_started: AtomicU64::new(0),
             total_finalized: AtomicU64::new(0),
             total_error: AtomicU64::new(0),
@@ -129,13 +127,6 @@ impl TraceRegistry {
             endpoint = %config.endpoint,
             "Trace exporter hot-swapped"
         );
-    }
-
-    /// Set the slow-span threshold (ms). Spans with duration > this land in
-    /// the slow ring. Defaults to 5_000; boom-main reads from `TraceConfig`
-    /// and sets at startup / reload.
-    pub fn set_slow_threshold_ms(&self, ms: u64) {
-        self.slow_threshold_ms.store(ms, Ordering::Relaxed);
     }
 
     /// Whether the trace channel is enabled. Read at every request ingress
@@ -212,8 +203,9 @@ impl TraceRegistry {
     }
 
     /// Mark the span as finalized-OK and remove it from the active table.
-    /// If the duration exceeded `slow_threshold_ms`, push a snapshot into
-    /// the slow ring. If OTLP is enabled, enqueue the span for export.
+    /// Every finalized span (regardless of duration) lands in the recent
+    /// ring so the dashboard can show "what just finished". If OTLP is
+    /// enabled, also enqueue for export to the collector.
     pub fn finalize_ok(&self, request_id: &str, now_unix_nano: u64) {
         let span = match self.active.remove(request_id) {
             Some((_, s)) => s,
@@ -221,12 +213,9 @@ impl TraceRegistry {
         };
         let mut span = span;
         span.finalize_ok(now_unix_nano);
-        let duration_ms = (span.end_time_unix_nano - span.start_time_unix_nano) / 1_000_000;
         self.total_finalized.fetch_add(1, Ordering::Relaxed);
-        if duration_ms > self.slow_threshold_ms.load(Ordering::Relaxed) {
-            if let Ok(mut ring) = self.slow_ring.lock() {
-                ring.push(span.clone());
-            }
+        if let Ok(mut ring) = self.recent_ring.lock() {
+            ring.push(span.clone());
         }
         if self.enabled.load(Ordering::Relaxed) {
             if let Some(exp) = self.otlp.load().as_ref() {
@@ -240,8 +229,7 @@ impl TraceRegistry {
     }
 
     /// Mark the span as finalized-ERROR with a message, remove from active,
-    /// bump the error counter, push to slow ring (errors are always slow-ish
-    /// to investigate), enqueue to OTLP.
+    /// bump the error counter, push to recent ring, enqueue to OTLP.
     pub fn finalize_error(&self, request_id: &str, now_unix_nano: u64, message: String) {
         let span = match self.active.remove(request_id) {
             Some((_, s)) => s,
@@ -251,7 +239,7 @@ impl TraceRegistry {
         span.finalize_error(now_unix_nano, message);
         self.total_finalized.fetch_add(1, Ordering::Relaxed);
         self.total_error.fetch_add(1, Ordering::Relaxed);
-        if let Ok(mut ring) = self.slow_ring.lock() {
+        if let Ok(mut ring) = self.recent_ring.lock() {
             ring.push(span.clone());
         }
         if self.enabled.load(Ordering::Relaxed) {
@@ -288,8 +276,8 @@ impl TraceApi for TraceRegistry {
                 .into_iter()
                 .map(|s| s.to_snapshot())
                 .collect(),
-            slow: self
-                .slow_ring
+            recent: self
+                .recent_ring
                 .lock()
                 .map(|ring| ring.snapshot().into_iter().map(|s| s.to_snapshot()).collect())
                 .unwrap_or_default(),
@@ -332,9 +320,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn start_finalize_ok_lands_in_slow_ring_when_over_threshold() {
+    async fn start_finalize_ok_lands_in_recent_ring() {
+        // Every finalized span lands in the recent ring, regardless of
+        // duration. The slow-ring concept is gone — the dashboard just
+        // shows the most recent N spans.
         let reg = TraceRegistry::new();
-        reg.set_slow_threshold_ms(0); // anything is slow
         let w3c = make_w3c();
         let _span = reg.start_request(
             "req-1".to_string(),
@@ -348,13 +338,13 @@ mod tests {
         let snap = reg.snapshot().await;
         assert_eq!(snap.total_spans_started, 1);
         assert_eq!(snap.total_spans_finalized, 1);
-        assert_eq!(snap.slow.len(), 1);
-        assert_eq!(snap.slow[0].request_id, "req-1");
+        assert_eq!(snap.recent.len(), 1);
+        assert_eq!(snap.recent[0].request_id, "req-1");
         assert!(snap.active.is_empty());
     }
 
     #[tokio::test]
-    async fn finalize_error_bumps_error_counter_and_pushes_slow() {
+    async fn finalize_error_bumps_error_counter_and_pushes_recent() {
         let reg = TraceRegistry::new();
         let w3c = make_w3c();
         let _span = reg.start_request(
@@ -368,8 +358,8 @@ mod tests {
         reg.finalize_error("req-2", 2_000, "boom".to_string());
         let snap = reg.snapshot().await;
         assert_eq!(snap.total_spans_error, 1);
-        assert_eq!(snap.slow.len(), 1);
-        assert_eq!(snap.slow[0].status, SpanStatus::Error);
+        assert_eq!(snap.recent.len(), 1);
+        assert_eq!(snap.recent[0].status, SpanStatus::Error);
     }
 
     #[tokio::test]

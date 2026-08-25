@@ -1618,10 +1618,6 @@ pub struct TraceConfig {
     /// paying for full-fidelity tracing on every request.
     #[serde(default)]
     pub report_filter: TraceFilterConfig,
-    /// Slow-span threshold (ms). Spans with duration > this land in the slow
-    /// ring buffer (recent N slow spans for dashboard inspection). Default 5s.
-    #[serde(default = "default_trace_slow_threshold_ms")]
-    pub slow_threshold_ms: u64,
 }
 
 fn default_trace_capture_body() -> bool {
@@ -1636,10 +1632,6 @@ fn default_trace_propagate_only() -> bool {
     true
 }
 
-fn default_trace_slow_threshold_ms() -> u64 {
-    5_000
-}
-
 impl Default for TraceConfig {
     fn default() -> Self {
         Self {
@@ -1649,7 +1641,6 @@ impl Default for TraceConfig {
             max_body_bytes: default_trace_max_body_bytes(),
             propagate_only: default_trace_propagate_only(),
             report_filter: TraceFilterConfig::default(),
-            slow_threshold_ms: default_trace_slow_threshold_ms(),
         }
     }
 }
@@ -1686,7 +1677,6 @@ mod trace_config_tests {
         assert!(cfg.propagate_only, "propagate_only defaults true");
         assert!(cfg.capture_body, "capture_body defaults true");
         assert_eq!(cfg.max_body_bytes, 16 * 1024);
-        assert_eq!(cfg.slow_threshold_ms, 5_000);
         assert!(cfg.report_filter.tracestate_keys.is_empty());
         assert!(cfg.report_filter.trace_id_regex.is_none());
     }
@@ -1704,14 +1694,12 @@ propagate_only: false
 report_filter:
   tracestate_keys: [opencode_user_id]
   trace_id_regex: "^abc"
-slow_threshold_ms: 1000
 "#;
         let cfg: TraceConfig = serde_yaml::from_str(yaml).unwrap();
         assert!(cfg.enabled);
         assert!(!cfg.propagate_only);
         assert!(!cfg.capture_body);
         assert_eq!(cfg.max_body_bytes, 4096);
-        assert_eq!(cfg.slow_threshold_ms, 1000);
         assert_eq!(cfg.report_filter.tracestate_keys, vec!["opencode_user_id".to_string()]);
         assert_eq!(cfg.report_filter.trace_id_regex.as_deref(), Some("^abc"));
     }

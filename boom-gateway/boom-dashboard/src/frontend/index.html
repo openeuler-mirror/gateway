@@ -334,7 +334,7 @@
               </div>
             </div>
 
-            <!-- Trace pane: live spans + slow ring + counters -->
+            <!-- Trace pane: live spans + recent finalized + counters -->
             <div class="debug-pane" data-pane="trace">
               <div class="section-header" style="margin-top:1.5rem">
                 <h2 data-i18n="debug.trace.otlp_status">OTLP Traces Exporter</h2>
@@ -358,21 +358,16 @@
                   <span class="tc-value" data-trace-counter="total_error">0</span>
                 </div>
                 <div class="trace-counter-card">
-                  <span class="tc-label" data-i18n="debug.trace.counter_slow">Slow (ring)</span>
-                  <span class="tc-value" data-trace-counter="slow">0</span>
+                  <span class="tc-label" data-i18n="debug.trace.counter_recent">Recent</span>
+                  <span class="tc-value" data-trace-counter="recent">0</span>
                 </div>
               </div>
 
               <div class="section-header" style="margin-top:1.5rem">
-                <h2 data-i18n="debug.trace.active_title">Active Spans</h2>
+                <h2 data-i18n="debug.trace.recent_title">Recent Spans</h2>
                 <button class="btn-small" id="btn-trace-refresh" data-i18n="action.refresh">Refresh</button>
               </div>
-              <div id="trace-active-wrap"><p class="muted" data-i18n="debug.trace.empty">No spans.</p></div>
-
-              <div class="section-header" style="margin-top:2rem">
-                <h2 data-i18n="debug.trace.slow_title">Slow Request Ring</h2>
-              </div>
-              <div id="trace-slow-wrap"><p class="muted" data-i18n="debug.trace.empty">No spans.</p></div>
+              <div id="trace-recent-wrap"><p class="muted" data-i18n="debug.trace.empty">No spans.</p></div>
             </div>
           </section>
 

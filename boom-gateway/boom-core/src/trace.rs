@@ -85,9 +85,11 @@ pub struct TraceSnapshot {
     /// Currently in-flight spans (start_time set, end_time=0). Bounded by
     /// the registry's active-span cap; oldest evicted on overflow.
     pub active: Vec<RequestSpan>,
-    /// Most recent N finalized slow spans (duration > slow_threshold).
-    /// Bounded by the registry's slow-ring capacity.
-    pub slow: Vec<RequestSpan>,
+    /// Most recent N finalized spans (any duration, OK or error). Bounded
+    /// by the registry's recent-ring capacity (default 100). The dashboard
+    /// merges `active` + `recent` to show "what just happened" without
+    /// needing an OTLP backend.
+    pub recent: Vec<RequestSpan>,
     /// Lifetime counters (monotonic across reloads — the registry is on
     /// AppState's top-level Arc per CLAUDE.md §4).
     pub total_spans_started: u64,
@@ -104,7 +106,8 @@ pub struct TraceSnapshot {
 /// and the dashboard surfaces "disabled".
 #[async_trait]
 pub trait TraceApi: Send + Sync + 'static {
-    /// Point-in-time snapshot of active + slow spans + lifetime counters.
+    /// Point-in-time snapshot of active + recent finalized spans + lifetime
+    /// counters.
     async fn snapshot(&self) -> TraceSnapshot;
 
     /// Read-only state of the OTLP traces exporter. Returns `None` when

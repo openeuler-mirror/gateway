@@ -1290,8 +1290,8 @@
   }
 
   async function loadTraceSnapshot() {
-    const activeWrap = document.getElementById("trace-active-wrap");
-    if (!activeWrap) return; // pane not rendered
+    const wrap = document.getElementById("trace-recent-wrap");
+    if (!wrap) return; // pane not rendered
     try {
       const [snap, otlpStatus] = await Promise.all([
         api("/admin/trace/snapshot"),
@@ -1303,13 +1303,30 @@
         const el = document.querySelector(`[data-trace-counter="${k}"]`);
         if (el) el.textContent = String(v);
       };
-      set("active", snap.active ? snap.active.length : 0);
+      const activeCount = snap.active ? snap.active.length : 0;
+      const recentCount = snap.recent ? snap.recent.length : 0;
+      set("active", activeCount);
       set("total_finalized", snap.total_spans_finalized || 0);
       set("total_error", snap.total_spans_error || 0);
-      set("slow", snap.slow ? snap.slow.length : 0);
-      // Render tables
-      renderTraceActive(snap.active || []);
-      renderTraceSlow(snap.slow || []);
+      set("recent", recentCount);
+      // Merge active + recent, dedupe by request_id, sort by start_time desc,
+      // cap at 100. (Active spans and finalized spans share request_id space,
+      // so dedupe avoids double-listing a span that finalized between polls.)
+      const seen = new Set();
+      const merged = [];
+      const pushIfNew = (s) => {
+        if (!s || !s.request_id) return;
+        if (seen.has(s.request_id)) return;
+        seen.add(s.request_id);
+        merged.push(s);
+      };
+      (snap.active || []).forEach(pushIfNew);
+      (snap.recent || []).forEach(pushIfNew);
+      merged.sort((a, b) =>
+        (b.start_time_unix_nano || 0) - (a.start_time_unix_nano || 0)
+      );
+      const capped = merged.slice(0, 100);
+      renderTraceRecent(capped);
       // OTLP indicator
       const ind = document.getElementById("trace-otlp-indicator");
       if (ind && otlpStatus) {
@@ -1342,11 +1359,14 @@
     return `${(ms / 1000).toFixed(2)} s`;
   }
 
-  function traceAttrToHtml(v) {
+  // Render a primitive (string/int/bool) attribute value as HTML.
+  // Used for the simple scalar attributes (boom-gateway.request.id,
+  // boom-gateway.time_in_queue, boom-gateway.user.id).
+  function traceScalarToHtml(v) {
     if (v === null || v === undefined) return "—";
     if (typeof v === "string") return esc(v);
     if (typeof v === "number" || typeof v === "boolean") return String(v);
-    // Object/JSON body — pretty-print for inspection.
+    // Fall-back for unexpected object on a scalar slot.
     try {
       return `<pre class="trace-attr-json">${esc(JSON.stringify(v, null, 2))}</pre>`;
     } catch (_) {
@@ -1354,82 +1374,130 @@
     }
   }
 
-  function renderTraceActive(spans) {
-    const wrap = document.getElementById("trace-active-wrap");
-    if (!wrap) return;
-    if (!spans.length) {
-      wrap.innerHTML = `<p class="muted">${t("debug.trace.empty")}</p>`;
-      return;
-    }
-    // Sort by start_time descending — newest request on top.
-    const sorted = [...spans].sort((a, b) =>
-      (b.start_time_unix_nano || 0) - (a.start_time_unix_nano || 0)
-    );
-    const rows = sorted.map((s) => {
-      const startNs = s.start_time_unix_nano || 0;
-      const liveMs = startNs ? Date.now() - startNs / 1e6 : 0;
-      return `<tr>
-        <td>${traceFormatTime(startNs)}</td>
-        <td><code>${esc(s.request_id || "")}</code></td>
-        <td>${esc(s.model || "")}</td>
-        <td><code>${esc(s.api_path || "")}</code></td>
-        <td>${s.is_stream ? "●" : ""}</td>
-        <td>${esc(s.status || "unset")}</td>
-        <td data-live-duration data-start-ns="${startNs}">${traceFormatDuration(liveMs)}</td>
-        <td><code>${esc(s.trace_id || "")}</code></td>
-        <td><code>${esc(s.span_id || "")}</code></td>
-        <td><code>${esc(s.parent_span_id || "")}</code></td>
-      </tr>
-      <tr class="trace-detail-row">
-        <td colspan="10">
-          <details>
-            <summary>${t("debug.trace.expand_attributes")} (${(s.attributes || []).length})</summary>
-            <table class="trace-attr-table">
-              ${(s.attributes || []).map(([k, v]) =>
-                `<tr><td class="ta-key"><code>${esc(k)}</code></td><td class="ta-val">${traceAttrToHtml(v)}</td></tr>`
-              ).join("")}
-            </table>
-          </details>
-        </td>
-      </tr>`;
-    }).join("");
-    wrap.innerHTML = `<table class="data-table trace-table">
-      <thead><tr>
-        <th>${t("debug.trace.col_start")}</th>
-        <th>${t("debug.trace.col_request_id")}</th>
-        <th>${t("debug.trace.col_model")}</th>
-        <th>${t("debug.trace.col_api")}</th>
-        <th>${t("debug.trace.col_stream")}</th>
-        <th>${t("debug.trace.col_status")}</th>
-        <th>${t("debug.trace.col_duration")}</th>
-        <th>${t("debug.trace.col_trace_id")}</th>
-        <th>${t("debug.trace.col_span_id")}</th>
-        <th>${t("debug.trace.col_parent")}</th>
-      </tr></thead>
-      <tbody>${rows}</tbody>
-    </table>`;
+  // Truncate a long string to N chars with an ellipsis. Used for message
+  // content previews in the OTel-semantic body renderer.
+  function traceTruncate(s, n) {
+    if (typeof s !== "string") s = String(s ?? "");
+    return s.length > n ? s.slice(0, n) + "…" : s;
   }
 
-  function renderTraceSlow(spans) {
-    const wrap = document.getElementById("trace-slow-wrap");
+  // Render an OpenAI-style llm_request body as a compact summary following
+  // OTel GenAI semantic conventions: model + messages[] (role + content
+  // preview) + key params (temperature / max_tokens / stream). Falls back to
+  // a raw JSON pre when the shape doesn't match expectations.
+  function traceLlmRequestToHtml(body) {
+    if (!body || typeof body !== "object") {
+      return `<span class="muted">—</span>`;
+    }
+    const model = body.model ? esc(String(body.model)) : "<span class='muted'>—</span>";
+    const msgs = Array.isArray(body.messages) ? body.messages : [];
+    const msgRows = msgs.map((m, i) => {
+      const role = (m && m.role) ? esc(String(m.role)) : "—";
+      let content = (m && (m.content ?? m.text)) ?? "";
+      if (Array.isArray(content)) {
+        // OpenAI vision/tool-call content is an array of typed parts.
+        content = content
+          .map((p) => (p && (p.text || p.type)) ? (p.text || `[${p.type}]`) : "")
+          .filter(Boolean)
+          .join(" / ");
+      }
+      content = traceTruncate(content, 400);
+      return `<tr><td class="ta-key"><code>${i}</code></td><td class="ta-val"><code>${role}</code></td><td class="ta-val">${esc(content)}</td></tr>`;
+    }).join("");
+    const params = [];
+    if (body.temperature !== undefined) params.push(`temperature=${body.temperature}`);
+    if (body.max_tokens !== undefined) params.push(`max_tokens=${body.max_tokens}`);
+    if (body.stream !== undefined) params.push(`stream=${body.stream}`);
+    const paramsHtml = params.length
+      ? `<div class="trace-body-params"><code>${esc(params.join(" · "))}</code></div>`
+      : "";
+    return `<div class="trace-body-summary">
+      <div class="trace-body-row"><span class="tb-label">model</span><code>${model}</code></div>
+      ${paramsHtml}
+      <table class="trace-attr-table trace-body-messages">
+        <thead><tr><th>#</th><th>role</th><th>content (preview)</th></tr></thead>
+        <tbody>${msgRows || `<tr><td colspan="3" class="muted">—</td></tr>`}</tbody>
+      </table>
+    </div>`;
+  }
+
+  // Render an OpenAI-style llm_response body: choices[0].message.content +
+  // usage tokens + finish_reason. Falls back to raw JSON on shape mismatch.
+  function traceLlmResponseToHtml(body) {
+    if (!body || typeof body !== "object") {
+      return `<span class="muted">—</span>`;
+    }
+    const choices = Array.isArray(body.choices) ? body.choices : [];
+    const choiceRows = choices.map((c, i) => {
+      const msg = (c && c.message) || {};
+      const role = msg.role ? esc(String(msg.role)) : "—";
+      let content = msg.content ?? "";
+      if (Array.isArray(content)) {
+        content = content
+          .map((p) => (p && (p.text || p.type)) ? (p.text || `[${p.type}]`) : "")
+          .filter(Boolean)
+          .join(" / ");
+      }
+      content = traceTruncate(content, 600);
+      const finish = (c && c.finish_reason) ? esc(String(c.finish_reason)) : "—";
+      return `<tr><td class="ta-key"><code>${i}</code></td><td class="ta-val"><code>${role}</code></td><td class="ta-val">${esc(content)}</td><td class="ta-val"><code>${finish}</code></td></tr>`;
+    }).join("");
+    const usage = body.usage || {};
+    const usageRows = [];
+    if (usage.prompt_tokens !== undefined) usageRows.push(`<span class="tb-label">prompt</span><code>${esc(String(usage.prompt_tokens))}</code>`);
+    if (usage.completion_tokens !== undefined) usageRows.push(`<span class="tb-label">completion</span><code>${esc(String(usage.completion_tokens))}</code>`);
+    if (usage.total_tokens !== undefined) usageRows.push(`<span class="tb-label">total</span><code>${esc(String(usage.total_tokens))}</code>`);
+    const usageHtml = usageRows.length
+      ? `<div class="trace-body-usage">${usageRows.join(" · ")}</div>`
+      : "";
+    return `<div class="trace-body-summary">
+      <table class="trace-attr-table trace-body-choices">
+        <thead><tr><th>#</th><th>role</th><th>content (preview)</th><th>finish</th></tr></thead>
+        <tbody>${choiceRows || `<tr><td colspan="4" class="muted">—</td></tr>`}</tbody>
+      </table>
+      ${usageHtml}
+    </div>`;
+  }
+
+  // Render one attribute value. For the LLM body attributes, dispatch to the
+  // OTel-semantic renderers above; for other attributes, use the scalar
+  // renderer (objects that aren't recognized bodies fall through to a JSON
+  // pre for inspection).
+  function traceAttrToHtml(key, v) {
+    if (v === null || v === undefined) return "—";
+    if (key === "boom-gateway.llm_request") return traceLlmRequestToHtml(v);
+    if (key === "boom-gateway.llm_response") return traceLlmResponseToHtml(v);
+    if (typeof v === "string") return esc(v);
+    if (typeof v === "number" || typeof v === "boolean") return String(v);
+    // Unknown object — pretty-print for inspection.
+    try {
+      return `<pre class="trace-attr-json">${esc(JSON.stringify(v, null, 2))}</pre>`;
+    } catch (_) {
+      return esc(String(v));
+    }
+  }
+
+  function renderTraceRecent(spans) {
+    const wrap = document.getElementById("trace-recent-wrap");
     if (!wrap) return;
     if (!spans.length) {
       wrap.innerHTML = `<p class="muted">${t("debug.trace.empty")}</p>`;
       return;
     }
-    // Sort by duration desc — slowest on top.
-    const sorted = [...spans].sort((a, b) => {
-      const da = (a.end_time_unix_nano || 0) - (a.start_time_unix_nano || 0);
-      const db = (b.end_time_unix_nano || 0) - (b.start_time_unix_nano || 0);
-      return db - da;
-    });
-    const rows = sorted.map((s) => {
+    // Already sorted + capped by the caller; one row per span + a details row.
+    const rows = spans.map((s) => {
       const startNs = s.start_time_unix_nano || 0;
       const endNs = s.end_time_unix_nano || 0;
-      const durationMs = endNs ? (endNs - startNs) / 1e6 : 0;
+      const isActive = !endNs;
+      const durationMs = isActive && startNs
+        ? Date.now() - startNs / 1e6
+        : endNs ? (endNs - startNs) / 1e6 : 0;
       const errCell = s.error_message
         ? `<span class="error-msg">${esc(s.error_message)}</span>`
         : (s.status === "error" ? '<span class="error-msg">—</span>' : "");
+      const durAttrs = isActive
+        ? `data-live-duration data-start-ns="${startNs}"`
+        : "";
       return `<tr>
         <td>${traceFormatTime(startNs)}</td>
         <td><code>${esc(s.request_id || "")}</code></td>
@@ -1437,7 +1505,7 @@
         <td><code>${esc(s.api_path || "")}</code></td>
         <td>${s.is_stream ? "●" : ""}</td>
         <td>${esc(s.status || "unset")}</td>
-        <td>${traceFormatDuration(durationMs)}</td>
+        <td ${durAttrs}>${traceFormatDuration(durationMs)}</td>
         <td>${errCell}</td>
       </tr>
       <tr class="trace-detail-row">
@@ -1446,7 +1514,7 @@
             <summary>${t("debug.trace.expand_attributes")} (${(s.attributes || []).length})</summary>
             <table class="trace-attr-table">
               ${(s.attributes || []).map(([k, v]) =>
-                `<tr><td class="ta-key"><code>${esc(k)}</code></td><td class="ta-val">${traceAttrToHtml(v)}</td></tr>`
+                `<tr><td class="ta-key"><code>${esc(k)}</code></td><td class="ta-val">${traceAttrToHtml(k, v)}</td></tr>`
               ).join("")}
             </table>
           </details>
@@ -3662,7 +3730,6 @@
         ${fieldCheckbox("cfg-tr-capture-body", t("config.field.trace_capture_body"), p.capture_body !== false, { tip: t("config.tip.trace_capture_body") })}
         ${fieldNum("cfg-tr-max-body-bytes", t("config.field.trace_max_body_bytes"), p.max_body_bytes || 16384, { min: 256, step: 256, tip: t("config.tip.trace_max_body_bytes") })}
         ${fieldCheckbox("cfg-tr-propagate-only", t("config.field.trace_propagate_only"), p.propagate_only !== false, { tip: t("config.tip.trace_propagate_only") })}
-        ${fieldNum("cfg-tr-slow-threshold-ms", t("config.field.trace_slow_threshold_ms"), p.slow_threshold_ms || 5000, { min: 100, step: 100, tip: t("config.tip.trace_slow_threshold_ms") })}
       </div>
 
       <div class="form-card-subtitle">${t("config.section.trace_filter")}</div>
@@ -4122,7 +4189,6 @@
           capture_body: $("cfg-tr-capture-body").checked,
           max_body_bytes: numOr($("cfg-tr-max-body-bytes"), 16384),
           propagate_only: $("cfg-tr-propagate-only").checked,
-          slow_threshold_ms: numOr($("cfg-tr-slow-threshold-ms"), 5000),
           report_filter: {
             tracestate_keys: parseListInput($("cfg-tr-filter-keys")),
             trace_id_regex: $("cfg-tr-filter-regex").value || null,

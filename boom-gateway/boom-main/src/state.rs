@@ -303,11 +303,10 @@ impl AppState {
         // is constructed lazily via `replace_otlp` once we resolve the final
         // TraceConfig (default = disabled, no exporter). The exporter is
         // feature-gated to `otlp` — without the feature, TraceRegistry still
-        // works as an in-memory active/slow table for the dashboard, just no
-        // OTLP push.
+        // works as an in-memory active/recent table for the dashboard, just
+        // no OTLP push.
         let trace_registry = boom_trace::TraceRegistry::new();
         let trace_config = config.trace.clone().unwrap_or_default();
-        trace_registry.set_slow_threshold_ms(trace_config.slow_threshold_ms);
         #[cfg(feature = "otlp")]
         {
             trace_registry
@@ -611,11 +610,9 @@ impl AppState {
 
         // 5b. Hot-reload trace config — same pattern as prompt_log. Rebuilds
         //     the OTLP traces exporter when its sub-config changes. The
-        //     registry itself (active table + slow ring) is untouched — only
-        //     the exporter + slow threshold + enabled flag swap.
+        //     registry itself (active table + recent ring) is untouched —
+        //     only the exporter + enabled flag swap.
         let new_trace_config = new_config.trace.clone().unwrap_or_default();
-        self.trace
-            .set_slow_threshold_ms(new_trace_config.slow_threshold_ms);
         #[cfg(feature = "otlp")]
         {
             // `replace_otlp` is the canonical hot-swap entry: aborts the old
