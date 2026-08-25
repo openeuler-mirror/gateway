@@ -745,6 +745,45 @@ p.error { color: var(--danger); font-style: italic; margin: 0; }
 .debug-pane { display: none; }
 .debug-pane.active { display: block; }
 
+/* ── Trace pane: counters + tables ─────────────────────── */
+.trace-counters {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+  margin-top: 1rem;
+}
+.trace-counter-card {
+  padding: 12px;
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.trace-counter-card .tc-label { font-size: .75rem; color: var(--text3); }
+.trace-counter-card .tc-value { font-size: 1.5rem; font-weight: 600; }
+.trace-table { table-layout: fixed; }
+.trace-table code { word-break: break-all; font-size: .85em; }
+.trace-table .trace-detail-row > td { padding: 0 0 0 0; }
+.trace-table .trace-detail-row details { padding: 4px 8px 8px; }
+.trace-attr-table { width: 100%; border-collapse: collapse; margin-top: 4px; }
+.trace-attr-table .ta-key { width: 30%; vertical-align: top; padding: 4px 8px; }
+.trace-attr-table .ta-val { vertical-align: top; padding: 4px 8px; }
+.trace-attr-json {
+  margin: 0;
+  max-height: 240px;
+  overflow: auto;
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 6px;
+  font-size: .8em;
+}
+@media (max-width: 768px) {
+  .trace-counters { grid-template-columns: repeat(2, 1fr); }
+}
+
 /* ── Anomaly explainer (collapsible) ─────────────────────── */
 .anomaly-explainer {
   margin: 0.5rem 0 1rem;

@@ -384,7 +384,7 @@
     else if (section === "admin-keys") { setupKeysSearch(); loadKeys(); }
     else if (section === "admin-quota") loadQuota();
     else if (section === "admin-logs") { setupLogsFilters(); loadLogs(); }
-    else if (section === "admin-debug") { setupDebugSubtabs(); setupAnomalyControls(); loadAgentStats(); loadRebalanceMoves(); loadKvcDfx(); loadAuditLogStats(); }
+    else if (section === "admin-debug") { setupDebugSubtabs(); setupAnomalyControls(); setupTracePane(); loadAgentStats(); loadRebalanceMoves(); loadKvcDfx(); loadAuditLogStats(); }
     else if (section === "admin-config") loadConfigPage();
   }
 
@@ -1225,6 +1225,11 @@
         document.querySelectorAll(".debug-pane").forEach((p) => {
           p.classList.toggle("active", p.dataset.pane === target);
         });
+        // Start the trace poll only while the trace pane is visible —
+        // avoids unnecessary background requests when the user is on
+        // Overview / Anomalies.
+        if (target === "trace") startTracePanePoll();
+        else stopTracePanePoll();
       });
     });
   }
@@ -1250,6 +1255,217 @@
     if (refreshBtn) {
       refreshBtn.addEventListener("click", loadAnomalies);
     }
+  }
+
+  // ── Debug sub-tab: OTEL Trace ──────────────────────────────────
+  // Polls /admin/trace/snapshot every 2s while the trace pane is visible.
+  // Mirrors the OTLp status poll pattern in the config page but with a
+  // faster cadence (snapshot has live duration values worth refreshing).
+  let tracePaneSetup = false;
+  let tracePaneTimer = null;
+  const TRACE_POLL_INTERVAL_MS = 2000;
+
+  function setupTracePane() {
+    if (tracePaneSetup) return;
+    tracePaneSetup = true;
+    const refreshBtn = document.getElementById("btn-trace-refresh");
+    if (refreshBtn) refreshBtn.addEventListener("click", loadTraceSnapshot);
+    // If the user lands on the trace pane directly (rare but possible via
+    // a bookmarked hash), kick off the poll.
+    const activeTab = document.querySelector(".debug-subtab.active");
+    if (activeTab && activeTab.dataset.subtab === "trace") startTracePanePoll();
+  }
+
+  function startTracePanePoll() {
+    if (tracePaneTimer) return;
+    loadTraceSnapshot();
+    tracePaneTimer = setInterval(loadTraceSnapshot, TRACE_POLL_INTERVAL_MS);
+  }
+
+  function stopTracePanePoll() {
+    if (tracePaneTimer) {
+      clearInterval(tracePaneTimer);
+      tracePaneTimer = null;
+    }
+  }
+
+  async function loadTraceSnapshot() {
+    const activeWrap = document.getElementById("trace-active-wrap");
+    if (!activeWrap) return; // pane not rendered
+    try {
+      const [snap, otlpStatus] = await Promise.all([
+        api("/admin/trace/snapshot"),
+        api("/admin/trace/otlp-status", { method: "GET" }).catch(() => null),
+      ]);
+      if (!snap) return;
+      // Update counters
+      const set = (k, v) => {
+        const el = document.querySelector(`[data-trace-counter="${k}"]`);
+        if (el) el.textContent = String(v);
+      };
+      set("active", snap.active ? snap.active.length : 0);
+      set("total_finalized", snap.total_spans_finalized || 0);
+      set("total_error", snap.total_spans_error || 0);
+      set("slow", snap.slow ? snap.slow.length : 0);
+      // Render tables
+      renderTraceActive(snap.active || []);
+      renderTraceSlow(snap.slow || []);
+      // OTLP indicator
+      const ind = document.getElementById("trace-otlp-indicator");
+      if (ind && otlpStatus) {
+        if (otlpStatus.status === "online") {
+          otlpPingSetState(ind, "ok", t("config.tip.otlp_status_online"));
+        } else if (otlpStatus.status === "offline") {
+          const ep = otlpStatus.endpoint ? ` · ${otlpStatus.endpoint}` : "";
+          otlpPingSetState(ind, "fail", `${t("config.tip.otlp_status_offline")}${ep}`);
+        } else {
+          otlpPingSetState(ind, "unknown", t("config.tip.otlp_status_disabled"));
+        }
+      }
+    } catch (err) {
+      // Don't toast — the poll will retry in 2s. Just log to console.
+      console.warn("trace snapshot load failed:", err.message);
+    }
+  }
+
+  function traceFormatTime(unixNanos) {
+    if (!unixNanos) return "—";
+    const ms = Math.floor(unixNanos / 1e6);
+    const d = new Date(ms);
+    const pad = (n) => String(n).padStart(2, "0");
+    return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  }
+
+  function traceFormatDuration(ms) {
+    if (ms < 1) return "0 ms";
+    if (ms < 1000) return `${ms.toFixed(0)} ms`;
+    return `${(ms / 1000).toFixed(2)} s`;
+  }
+
+  function traceAttrToHtml(v) {
+    if (v === null || v === undefined) return "—";
+    if (typeof v === "string") return esc(v);
+    if (typeof v === "number" || typeof v === "boolean") return String(v);
+    // Object/JSON body — pretty-print for inspection.
+    try {
+      return `<pre class="trace-attr-json">${esc(JSON.stringify(v, null, 2))}</pre>`;
+    } catch (_) {
+      return esc(String(v));
+    }
+  }
+
+  function renderTraceActive(spans) {
+    const wrap = document.getElementById("trace-active-wrap");
+    if (!wrap) return;
+    if (!spans.length) {
+      wrap.innerHTML = `<p class="muted">${t("debug.trace.empty")}</p>`;
+      return;
+    }
+    // Sort by start_time descending — newest request on top.
+    const sorted = [...spans].sort((a, b) =>
+      (b.start_time_unix_nano || 0) - (a.start_time_unix_nano || 0)
+    );
+    const rows = sorted.map((s) => {
+      const startNs = s.start_time_unix_nano || 0;
+      const liveMs = startNs ? Date.now() - startNs / 1e6 : 0;
+      return `<tr>
+        <td>${traceFormatTime(startNs)}</td>
+        <td><code>${esc(s.request_id || "")}</code></td>
+        <td>${esc(s.model || "")}</td>
+        <td><code>${esc(s.api_path || "")}</code></td>
+        <td>${s.is_stream ? "●" : ""}</td>
+        <td>${esc(s.status || "unset")}</td>
+        <td data-live-duration data-start-ns="${startNs}">${traceFormatDuration(liveMs)}</td>
+        <td><code>${esc(s.trace_id || "")}</code></td>
+        <td><code>${esc(s.span_id || "")}</code></td>
+        <td><code>${esc(s.parent_span_id || "")}</code></td>
+      </tr>
+      <tr class="trace-detail-row">
+        <td colspan="10">
+          <details>
+            <summary>${t("debug.trace.expand_attributes")} (${(s.attributes || []).length})</summary>
+            <table class="trace-attr-table">
+              ${(s.attributes || []).map(([k, v]) =>
+                `<tr><td class="ta-key"><code>${esc(k)}</code></td><td class="ta-val">${traceAttrToHtml(v)}</td></tr>`
+              ).join("")}
+            </table>
+          </details>
+        </td>
+      </tr>`;
+    }).join("");
+    wrap.innerHTML = `<table class="data-table trace-table">
+      <thead><tr>
+        <th>${t("debug.trace.col_start")}</th>
+        <th>${t("debug.trace.col_request_id")}</th>
+        <th>${t("debug.trace.col_model")}</th>
+        <th>${t("debug.trace.col_api")}</th>
+        <th>${t("debug.trace.col_stream")}</th>
+        <th>${t("debug.trace.col_status")}</th>
+        <th>${t("debug.trace.col_duration")}</th>
+        <th>${t("debug.trace.col_trace_id")}</th>
+        <th>${t("debug.trace.col_span_id")}</th>
+        <th>${t("debug.trace.col_parent")}</th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+  }
+
+  function renderTraceSlow(spans) {
+    const wrap = document.getElementById("trace-slow-wrap");
+    if (!wrap) return;
+    if (!spans.length) {
+      wrap.innerHTML = `<p class="muted">${t("debug.trace.empty")}</p>`;
+      return;
+    }
+    // Sort by duration desc — slowest on top.
+    const sorted = [...spans].sort((a, b) => {
+      const da = (a.end_time_unix_nano || 0) - (a.start_time_unix_nano || 0);
+      const db = (b.end_time_unix_nano || 0) - (b.start_time_unix_nano || 0);
+      return db - da;
+    });
+    const rows = sorted.map((s) => {
+      const startNs = s.start_time_unix_nano || 0;
+      const endNs = s.end_time_unix_nano || 0;
+      const durationMs = endNs ? (endNs - startNs) / 1e6 : 0;
+      const errCell = s.error_message
+        ? `<span class="error-msg">${esc(s.error_message)}</span>`
+        : (s.status === "error" ? '<span class="error-msg">—</span>' : "");
+      return `<tr>
+        <td>${traceFormatTime(startNs)}</td>
+        <td><code>${esc(s.request_id || "")}</code></td>
+        <td>${esc(s.model || "")}</td>
+        <td><code>${esc(s.api_path || "")}</code></td>
+        <td>${s.is_stream ? "●" : ""}</td>
+        <td>${esc(s.status || "unset")}</td>
+        <td>${traceFormatDuration(durationMs)}</td>
+        <td>${errCell}</td>
+      </tr>
+      <tr class="trace-detail-row">
+        <td colspan="8">
+          <details>
+            <summary>${t("debug.trace.expand_attributes")} (${(s.attributes || []).length})</summary>
+            <table class="trace-attr-table">
+              ${(s.attributes || []).map(([k, v]) =>
+                `<tr><td class="ta-key"><code>${esc(k)}</code></td><td class="ta-val">${traceAttrToHtml(v)}</td></tr>`
+              ).join("")}
+            </table>
+          </details>
+        </td>
+      </tr>`;
+    }).join("");
+    wrap.innerHTML = `<table class="data-table trace-table">
+      <thead><tr>
+        <th>${t("debug.trace.col_start")}</th>
+        <th>${t("debug.trace.col_request_id")}</th>
+        <th>${t("debug.trace.col_model")}</th>
+        <th>${t("debug.trace.col_api")}</th>
+        <th>${t("debug.trace.col_stream")}</th>
+        <th>${t("debug.trace.col_status")}</th>
+        <th>${t("debug.trace.col_duration")}</th>
+        <th>${t("debug.trace.col_error")}</th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
   }
 
   async function loadAnomalies() {
@@ -5866,11 +6082,13 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
   window._loadLogsPage = (p) => loadLogs(p);
 
   // ── Debug page: KVC DFX table ─────────────────────
-  // Show the Debug nav link if compiled with debug-tools.
-  if (window.__KVC_DEBUG) {
-    var navDebug = document.getElementById("nav-admin-debug");
-    if (navDebug) navDebug.style.display = "";
-  }
+  // Show the Debug nav link unconditionally — trace pane is useful at
+  // runtime regardless of whether the binary was compiled with KVC
+  // debug-tools. KVC DFX section still gates its content behind the
+  // feature flag (renders a "compile with --features debug-tools" hint
+  // when off), so hiding the nav is no longer warranted.
+  var navDebug = document.getElementById("nav-admin-debug");
+  if (navDebug) navDebug.style.display = "";
 
   // Filter state for the KVC DFX table (mirrors the Logs page filter pattern).
   var kvcFilters = {};
