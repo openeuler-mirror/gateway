@@ -106,6 +106,17 @@ pub enum AdminCommand {
     ProbeOtlp {
         reply: oneshot::Sender<Option<boom_promptlog::ProbeResult>>,
     },
+    /// Probe a remote OTLP/HTTP collector for traces. Same shape as
+    /// `PingOtlpEndpoint` but sends an `ExportTraceServiceRequest` instead
+    /// of an `ExportLogsServiceRequest`. The dashboard's trace card Test
+    /// button calls this so the operator can type a new endpoint and test
+    /// it before saving.
+    PingTraceOtlpEndpoint {
+        endpoint: String,
+        headers: std::collections::HashMap<String, String>,
+        timeout_secs: u64,
+        reply: oneshot::Sender<Result<u64, String>>,
+    },
 }
 
 pub type AdminTx = mpsc::Sender<AdminCommand>;
@@ -159,6 +170,10 @@ pub struct DashboardState {
     /// blocking pool queue, inflight). Polled every 1.5s by the admin
     /// stats page's top sparkline chart.
     pub stressmon: Arc<dyn boom_core::StressmonApi>,
+    /// Trace channel — active span table + slow ring + OTLP traces exporter
+    /// status. Erased to `Arc<dyn TraceApi>` so boom-dashboard stays leaf-of-
+    /// boom-core (no dep on boom-trace). Polled by the admin trace page.
+    pub trace: Arc<dyn boom_core::TraceApi>,
 }
 
 impl DashboardState {
@@ -180,6 +195,7 @@ impl DashboardState {
         auth: Arc<dyn KeyAliasLookup>,
         log_dropped: Option<Arc<dyn boom_core::LogDroppedCounter>>,
         stressmon: Arc<dyn boom_core::StressmonApi>,
+        trace: Arc<dyn boom_core::TraceApi>,
     ) -> Self {
         // Derive JWT secret from master_key, or use a random fallback.
         let jwt_secret = master_key
@@ -206,6 +222,7 @@ impl DashboardState {
             auth,
             log_dropped,
             stressmon,
+            trace,
         }
     }
 }

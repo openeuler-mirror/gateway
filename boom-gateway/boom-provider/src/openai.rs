@@ -261,7 +261,7 @@ impl Provider for OpenAIProvider {
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use wiremock::matchers::{method, path, header};
+    use wiremock::matchers::{body_partial_json, method, path, header};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     /// Build a minimal request, optionally carrying gateway-internal headers.
@@ -327,6 +327,41 @@ mod tests {
 
     fn provider_for(uri: String, api_key: Option<String>) -> OpenAIProvider {
         OpenAIProvider::new(Client::new(), api_key, Some(uri), "test-model", None, false)
+    }
+
+    /// Extra fields clients send (`reasoning_effort`, `service_tier`, etc.)
+    /// must reach the upstream OpenAI-compatible body as-is — the gateway does
+    /// not whitelist the OpenAI protocol field set.
+    #[tokio::test]
+    async fn extra_fields_are_forwarded_to_upstream_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_partial_json(serde_json::json!({
+                "reasoning_effort": "high",
+                "service_tier": "auto",
+                "prompt_cache_key": "pc-1",
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fake_completion_response()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = provider_for(server.uri(), None);
+        let mut req = request_with_headers(&[]);
+        req.extra.insert(
+            "reasoning_effort".to_string(),
+            serde_json::json!("high"),
+        );
+        req.extra.insert(
+            "service_tier".to_string(),
+            serde_json::json!("auto"),
+        );
+        req.extra.insert(
+            "prompt_cache_key".to_string(),
+            serde_json::json!("pc-1"),
+        );
+        let _ = provider.chat(req).await.unwrap();
     }
 
     #[tokio::test]

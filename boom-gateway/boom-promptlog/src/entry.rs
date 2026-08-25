@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Which phase of the request lifecycle this entry records.
 ///
@@ -54,8 +55,12 @@ pub struct PromptLogEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub headers: Option<HashMap<String, String>>,
     // ── Request phase ─────────────────────────────────────────────
+    /// `Arc<serde_json::Value>` so the same allocation is shared with
+    /// `boom_trace::RequestSpan`'s `boom-gateway.llm_request` attribute
+    /// (single-source-of-truth for the request body across both channels).
+    /// serde serializes `Arc<T>` transparently as `T`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub request: Option<serde_json::Value>,
+    pub request: Option<Arc<serde_json::Value>>,
     // ── Response phase ───────────────────────────────────────────
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status_code: Option<i32>,
@@ -64,8 +69,10 @@ pub struct PromptLogEntry {
     /// Assembled full response body. For streaming responses this is the
     /// reconstructed ChatCompletion-style JSON (content concatenated, not a
     /// chunk array). For non-streaming responses it's the literal body.
+    /// `Arc` so the same allocation is shared with `boom_trace::RequestSpan`'s
+    /// `boom-gateway.llm_response` attribute.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub response: Option<serde_json::Value>,
+    pub response: Option<Arc<serde_json::Value>>,
     /// Internal Fusion Panel/Aggregator calls for the parent request.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fusion: Option<serde_json::Value>,
@@ -73,7 +80,7 @@ pub struct PromptLogEntry {
     /// Only populated when `capture_raw_upstream` is enabled and the endpoint
     /// performs format conversion (e.g., `/v1/messages`).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub raw_upstream_response: Option<serde_json::Value>,
+    pub raw_upstream_response: Option<Arc<serde_json::Value>>,
     /// Standardized error code for failed/interrupted requests. See
     /// `StreamErrorCode` for the canonical values. `None` on success.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -112,7 +119,7 @@ impl PromptLogEntry {
         model: &str,
         api_path: &str,
         is_stream: bool,
-        request_body: serde_json::Value,
+        request_body: Arc<serde_json::Value>,
         client_ip: Option<&str>,
         headers: Option<HashMap<String, String>>,
     ) -> Self {
@@ -170,7 +177,7 @@ impl PromptLogEntry {
         }
     }
 
-    pub fn set_response(&mut self, response: serde_json::Value) {
+    pub fn set_response(&mut self, response: Arc<serde_json::Value>) {
         self.response = Some(response);
     }
 
@@ -178,7 +185,7 @@ impl PromptLogEntry {
         self.fusion = Some(fusion);
     }
 
-    pub fn set_raw_upstream_response(&mut self, raw: serde_json::Value) {
+    pub fn set_raw_upstream_response(&mut self, raw: Arc<serde_json::Value>) {
         self.raw_upstream_response = Some(raw);
     }
 
@@ -208,7 +215,7 @@ mod tests {
             "gpt-4",
             "/v1/chat/completions",
             false,
-            serde_json::json!({"messages": []}),
+            Arc::new(serde_json::json!({"messages": []})),
             Some("127.0.0.1"),
             None,
         );
@@ -233,7 +240,7 @@ mod tests {
             "claude-3",
             "/v1/messages",
             true,
-            serde_json::json!({}),
+            Arc::new(serde_json::json!({})),
             None,
             Some(HashMap::from([("x-trace-id".to_string(), "t1".to_string())])),
         );
@@ -255,7 +262,7 @@ mod tests {
 
         // Setters mutate response-phase fields.
         resp.set_status(200, 1234);
-        resp.set_response(serde_json::json!({"id": "resp-2"}));
+        resp.set_response(Arc::new(serde_json::json!({"id": "resp-2"})));
         assert_eq!(resp.status_code, Some(200));
         assert_eq!(resp.duration_ms, Some(1234));
         assert!(resp.response.is_some());
@@ -276,7 +283,7 @@ mod tests {
             "m",
             "/p",
             false,
-            serde_json::json!({}),
+            Arc::new(serde_json::json!({})),
             None,
             None,
         );
@@ -286,5 +293,33 @@ mod tests {
         let resp = PromptLogEntry::new_response_from(&req);
         let v = serde_json::to_value(&resp).unwrap();
         assert_eq!(v["phase"], "response");
+    }
+
+    /// Two PromptLogEntry objects pointing at the same Arc should share
+    /// the allocation — the foundation of the body single-source design.
+    #[test]
+    fn body_arc_is_shared_between_request_and_clone() {
+        let body = Arc::new(serde_json::json!({"messages": [{"role": "user", "content": "hi"}]}));
+        let strong_count_before = Arc::strong_count(&body);
+        let entry = PromptLogEntry::new_request(
+            "req-arc",
+            None,
+            "kh",
+            None,
+            None,
+            "m",
+            "/p",
+            false,
+            body.clone(),
+            None,
+            None,
+        );
+        // entry.request holds a clone of the Arc, so strong_count incremented.
+        assert!(Arc::strong_count(&body) > strong_count_before);
+        // The body data is the same — Arc derefs transparently.
+        assert_eq!(
+            entry.request.as_ref().unwrap().as_ref(),
+            &serde_json::json!({"messages": [{"role": "user", "content": "hi"}]})
+        );
     }
 }

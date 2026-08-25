@@ -274,6 +274,25 @@ pub fn build_router<S: Clone + Send + Sync + 'static>(state: DashboardState) -> 
             "/dashboard/api/admin/prompt-log/otlp-probe",
             post(handlers_admin::probe_otlp),
         )
+        // Admin — OTel Traces (active span table + slow ring + exporter).
+        // Read-only through `Arc<dyn TraceApi>` (boom-core trait) — no
+        // dependency on boom-trace from this crate.
+        .route(
+            "/dashboard/api/admin/trace/snapshot",
+            get(handlers_admin::trace_snapshot),
+        )
+        .route(
+            "/dashboard/api/admin/trace/otlp-status",
+            get(handlers_admin::trace_otlp_status),
+        )
+        .route(
+            "/dashboard/api/admin/trace/otlp-probe",
+            post(handlers_admin::trace_otlp_probe),
+        )
+        .route(
+            "/dashboard/api/admin/trace/otlp-ping",
+            post(handlers_admin::ping_trace_otlp_endpoint),
+        )
         // Admin — Hot-reload config.
         .route(
             "/dashboard/api/admin/config/reload",

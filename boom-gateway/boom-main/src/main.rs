@@ -227,6 +227,7 @@ fn build_router(state: AppState) -> Router {
         key_alias_lookup,
         state.log_writer.clone().map(|w| w as Arc<dyn boom_core::LogDroppedCounter>),
         state.stressmon.clone(),
+        state.trace.clone() as Arc<dyn boom_core::TraceApi>,
     );
     let dashboard_router = boom_dashboard::build_router(dashboard_state);
 

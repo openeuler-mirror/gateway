@@ -235,7 +235,7 @@ mod tests {
             "gpt-4",
             "/v1/chat/completions",
             false,
-            serde_json::json!({}),
+            Arc::new(serde_json::json!({})),
             None,
             None,
         );
@@ -254,7 +254,7 @@ mod tests {
             "gpt-4",
             "/v1/chat/completions",
             false,
-            serde_json::json!({}),
+            Arc::new(serde_json::json!({})),
             None,
             None,
         );

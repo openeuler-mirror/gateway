@@ -374,15 +374,17 @@
     }
     if (section === "admin-config") {
       startOtlpStatusPoll();
+      startTraceOtlpStatusPoll();
     } else {
       stopOtlpStatusPoll();
+      stopTraceOtlpStatusPoll();
     }
     if (section === "admin-models") loadModels();
     else if (section === "admin-plans") loadPlans();
     else if (section === "admin-keys") { setupKeysSearch(); loadKeys(); }
     else if (section === "admin-quota") loadQuota();
     else if (section === "admin-logs") { setupLogsFilters(); loadLogs(); }
-    else if (section === "admin-debug") { setupDebugSubtabs(); setupAnomalyControls(); loadAgentStats(); loadRebalanceMoves(); loadKvcDfx(); loadAuditLogStats(); }
+    else if (section === "admin-debug") { setupDebugSubtabs(); setupAnomalyControls(); setupTracePane(); loadAgentStats(); loadRebalanceMoves(); loadKvcDfx(); loadAuditLogStats(); }
     else if (section === "admin-config") loadConfigPage();
   }
 
@@ -1223,6 +1225,11 @@
         document.querySelectorAll(".debug-pane").forEach((p) => {
           p.classList.toggle("active", p.dataset.pane === target);
         });
+        // Start the trace poll only while the trace pane is visible —
+        // avoids unnecessary background requests when the user is on
+        // Overview / Anomalies.
+        if (target === "trace") startTracePanePoll();
+        else stopTracePanePoll();
       });
     });
   }
@@ -1248,6 +1255,285 @@
     if (refreshBtn) {
       refreshBtn.addEventListener("click", loadAnomalies);
     }
+  }
+
+  // ── Debug sub-tab: OTEL Trace ──────────────────────────────────
+  // Polls /admin/trace/snapshot every 2s while the trace pane is visible.
+  // Mirrors the OTLp status poll pattern in the config page but with a
+  // faster cadence (snapshot has live duration values worth refreshing).
+  let tracePaneSetup = false;
+  let tracePaneTimer = null;
+  const TRACE_POLL_INTERVAL_MS = 2000;
+
+  function setupTracePane() {
+    if (tracePaneSetup) return;
+    tracePaneSetup = true;
+    const refreshBtn = document.getElementById("btn-trace-refresh");
+    if (refreshBtn) refreshBtn.addEventListener("click", loadTraceSnapshot);
+    // If the user lands on the trace pane directly (rare but possible via
+    // a bookmarked hash), kick off the poll.
+    const activeTab = document.querySelector(".debug-subtab.active");
+    if (activeTab && activeTab.dataset.subtab === "trace") startTracePanePoll();
+  }
+
+  function startTracePanePoll() {
+    if (tracePaneTimer) return;
+    loadTraceSnapshot();
+    tracePaneTimer = setInterval(loadTraceSnapshot, TRACE_POLL_INTERVAL_MS);
+  }
+
+  function stopTracePanePoll() {
+    if (tracePaneTimer) {
+      clearInterval(tracePaneTimer);
+      tracePaneTimer = null;
+    }
+  }
+
+  async function loadTraceSnapshot() {
+    const wrap = document.getElementById("trace-recent-wrap");
+    if (!wrap) return; // pane not rendered
+    try {
+      const [snap, otlpStatus] = await Promise.all([
+        api("/admin/trace/snapshot"),
+        api("/admin/trace/otlp-status", { method: "GET" }).catch(() => null),
+      ]);
+      if (!snap) return;
+      // Update counters
+      const set = (k, v) => {
+        const el = document.querySelector(`[data-trace-counter="${k}"]`);
+        if (el) el.textContent = String(v);
+      };
+      const activeCount = snap.active ? snap.active.length : 0;
+      const recentCount = snap.recent ? snap.recent.length : 0;
+      set("active", activeCount);
+      set("total_finalized", snap.total_spans_finalized || 0);
+      set("total_error", snap.total_spans_error || 0);
+      set("recent", recentCount);
+      // Merge active + recent, dedupe by request_id, sort by start_time desc,
+      // cap at 100. (Active spans and finalized spans share request_id space,
+      // so dedupe avoids double-listing a span that finalized between polls.)
+      const seen = new Set();
+      const merged = [];
+      const pushIfNew = (s) => {
+        if (!s || !s.request_id) return;
+        if (seen.has(s.request_id)) return;
+        seen.add(s.request_id);
+        merged.push(s);
+      };
+      (snap.active || []).forEach(pushIfNew);
+      (snap.recent || []).forEach(pushIfNew);
+      merged.sort((a, b) =>
+        (b.start_time_unix_nano || 0) - (a.start_time_unix_nano || 0)
+      );
+      const capped = merged.slice(0, 100);
+      renderTraceRecent(capped);
+      // OTLP indicator
+      const ind = document.getElementById("trace-otlp-indicator");
+      if (ind && otlpStatus) {
+        if (otlpStatus.status === "online") {
+          otlpPingSetState(ind, "ok", t("config.tip.otlp_status_online"));
+        } else if (otlpStatus.status === "offline") {
+          const ep = otlpStatus.endpoint ? ` · ${otlpStatus.endpoint}` : "";
+          otlpPingSetState(ind, "fail", `${t("config.tip.otlp_status_offline")}${ep}`);
+        } else {
+          otlpPingSetState(ind, "unknown", t("config.tip.otlp_status_disabled"));
+        }
+      }
+    } catch (err) {
+      // Don't toast — the poll will retry in 2s. Just log to console.
+      console.warn("trace snapshot load failed:", err.message);
+    }
+  }
+
+  function traceFormatTime(unixNanos) {
+    if (!unixNanos) return "—";
+    const ms = Math.floor(unixNanos / 1e6);
+    const d = new Date(ms);
+    const pad = (n) => String(n).padStart(2, "0");
+    return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  }
+
+  function traceFormatDuration(ms) {
+    if (ms < 1) return "0 ms";
+    if (ms < 1000) return `${ms.toFixed(0)} ms`;
+    return `${(ms / 1000).toFixed(2)} s`;
+  }
+
+  // Render a primitive (string/int/bool) attribute value as HTML.
+  // Used for the simple scalar attributes (boom-gateway.request.id,
+  // boom-gateway.time_in_queue, boom-gateway.user.id).
+  function traceScalarToHtml(v) {
+    if (v === null || v === undefined) return "—";
+    if (typeof v === "string") return esc(v);
+    if (typeof v === "number" || typeof v === "boolean") return String(v);
+    // Fall-back for unexpected object on a scalar slot.
+    try {
+      return `<pre class="trace-attr-json">${esc(JSON.stringify(v, null, 2))}</pre>`;
+    } catch (_) {
+      return esc(String(v));
+    }
+  }
+
+  // Truncate a long string to N chars with an ellipsis. Used for message
+  // content previews in the OTel-semantic body renderer.
+  function traceTruncate(s, n) {
+    if (typeof s !== "string") s = String(s ?? "");
+    return s.length > n ? s.slice(0, n) + "…" : s;
+  }
+
+  // Render an OpenAI-style llm_request body as a compact summary following
+  // OTel GenAI semantic conventions: model + messages[] (role + content
+  // preview) + key params (temperature / max_tokens / stream). Falls back to
+  // a raw JSON pre when the shape doesn't match expectations.
+  function traceLlmRequestToHtml(body) {
+    if (!body || typeof body !== "object") {
+      return `<span class="muted">—</span>`;
+    }
+    const model = body.model ? esc(String(body.model)) : "<span class='muted'>—</span>";
+    const msgs = Array.isArray(body.messages) ? body.messages : [];
+    const msgRows = msgs.map((m, i) => {
+      const role = (m && m.role) ? esc(String(m.role)) : "—";
+      let content = (m && (m.content ?? m.text)) ?? "";
+      if (Array.isArray(content)) {
+        // OpenAI vision/tool-call content is an array of typed parts.
+        content = content
+          .map((p) => (p && (p.text || p.type)) ? (p.text || `[${p.type}]`) : "")
+          .filter(Boolean)
+          .join(" / ");
+      }
+      content = traceTruncate(content, 400);
+      return `<tr><td class="ta-key"><code>${i}</code></td><td class="ta-val"><code>${role}</code></td><td class="ta-val">${esc(content)}</td></tr>`;
+    }).join("");
+    const params = [];
+    if (body.temperature !== undefined) params.push(`temperature=${body.temperature}`);
+    if (body.max_tokens !== undefined) params.push(`max_tokens=${body.max_tokens}`);
+    if (body.stream !== undefined) params.push(`stream=${body.stream}`);
+    const paramsHtml = params.length
+      ? `<div class="trace-body-params"><code>${esc(params.join(" · "))}</code></div>`
+      : "";
+    return `<div class="trace-body-summary">
+      <div class="trace-body-row"><span class="tb-label">model</span><code>${model}</code></div>
+      ${paramsHtml}
+      <table class="trace-attr-table trace-body-messages">
+        <thead><tr><th>#</th><th>role</th><th>content (preview)</th></tr></thead>
+        <tbody>${msgRows || `<tr><td colspan="3" class="muted">—</td></tr>`}</tbody>
+      </table>
+    </div>`;
+  }
+
+  // Render an OpenAI-style llm_response body: choices[0].message.content +
+  // usage tokens + finish_reason. Falls back to raw JSON on shape mismatch.
+  function traceLlmResponseToHtml(body) {
+    if (!body || typeof body !== "object") {
+      return `<span class="muted">—</span>`;
+    }
+    const choices = Array.isArray(body.choices) ? body.choices : [];
+    const choiceRows = choices.map((c, i) => {
+      const msg = (c && c.message) || {};
+      const role = msg.role ? esc(String(msg.role)) : "—";
+      let content = msg.content ?? "";
+      if (Array.isArray(content)) {
+        content = content
+          .map((p) => (p && (p.text || p.type)) ? (p.text || `[${p.type}]`) : "")
+          .filter(Boolean)
+          .join(" / ");
+      }
+      content = traceTruncate(content, 600);
+      const finish = (c && c.finish_reason) ? esc(String(c.finish_reason)) : "—";
+      return `<tr><td class="ta-key"><code>${i}</code></td><td class="ta-val"><code>${role}</code></td><td class="ta-val">${esc(content)}</td><td class="ta-val"><code>${finish}</code></td></tr>`;
+    }).join("");
+    const usage = body.usage || {};
+    const usageRows = [];
+    if (usage.prompt_tokens !== undefined) usageRows.push(`<span class="tb-label">prompt</span><code>${esc(String(usage.prompt_tokens))}</code>`);
+    if (usage.completion_tokens !== undefined) usageRows.push(`<span class="tb-label">completion</span><code>${esc(String(usage.completion_tokens))}</code>`);
+    if (usage.total_tokens !== undefined) usageRows.push(`<span class="tb-label">total</span><code>${esc(String(usage.total_tokens))}</code>`);
+    const usageHtml = usageRows.length
+      ? `<div class="trace-body-usage">${usageRows.join(" · ")}</div>`
+      : "";
+    return `<div class="trace-body-summary">
+      <table class="trace-attr-table trace-body-choices">
+        <thead><tr><th>#</th><th>role</th><th>content (preview)</th><th>finish</th></tr></thead>
+        <tbody>${choiceRows || `<tr><td colspan="4" class="muted">—</td></tr>`}</tbody>
+      </table>
+      ${usageHtml}
+    </div>`;
+  }
+
+  // Render one attribute value. For the LLM body attributes, dispatch to the
+  // OTel-semantic renderers above; for other attributes, use the scalar
+  // renderer (objects that aren't recognized bodies fall through to a JSON
+  // pre for inspection).
+  function traceAttrToHtml(key, v) {
+    if (v === null || v === undefined) return "—";
+    if (key === "boom-gateway.llm_request") return traceLlmRequestToHtml(v);
+    if (key === "boom-gateway.llm_response") return traceLlmResponseToHtml(v);
+    if (typeof v === "string") return esc(v);
+    if (typeof v === "number" || typeof v === "boolean") return String(v);
+    // Unknown object — pretty-print for inspection.
+    try {
+      return `<pre class="trace-attr-json">${esc(JSON.stringify(v, null, 2))}</pre>`;
+    } catch (_) {
+      return esc(String(v));
+    }
+  }
+
+  function renderTraceRecent(spans) {
+    const wrap = document.getElementById("trace-recent-wrap");
+    if (!wrap) return;
+    if (!spans.length) {
+      wrap.innerHTML = `<p class="muted">${t("debug.trace.empty")}</p>`;
+      return;
+    }
+    // Already sorted + capped by the caller; one row per span + a details row.
+    const rows = spans.map((s) => {
+      const startNs = s.start_time_unix_nano || 0;
+      const endNs = s.end_time_unix_nano || 0;
+      const isActive = !endNs;
+      const durationMs = isActive && startNs
+        ? Date.now() - startNs / 1e6
+        : endNs ? (endNs - startNs) / 1e6 : 0;
+      const errCell = s.error_message
+        ? `<span class="error-msg">${esc(s.error_message)}</span>`
+        : (s.status === "error" ? '<span class="error-msg">—</span>' : "");
+      const durAttrs = isActive
+        ? `data-live-duration data-start-ns="${startNs}"`
+        : "";
+      return `<tr>
+        <td>${traceFormatTime(startNs)}</td>
+        <td><code>${esc(s.request_id || "")}</code></td>
+        <td>${esc(s.model || "")}</td>
+        <td><code>${esc(s.api_path || "")}</code></td>
+        <td>${s.is_stream ? "●" : ""}</td>
+        <td>${esc(s.status || "unset")}</td>
+        <td ${durAttrs}>${traceFormatDuration(durationMs)}</td>
+        <td>${errCell}</td>
+      </tr>
+      <tr class="trace-detail-row">
+        <td colspan="8">
+          <details>
+            <summary>${t("debug.trace.expand_attributes")} (${(s.attributes || []).length})</summary>
+            <table class="trace-attr-table">
+              ${(s.attributes || []).map(([k, v]) =>
+                `<tr><td class="ta-key"><code>${esc(k)}</code></td><td class="ta-val">${traceAttrToHtml(k, v)}</td></tr>`
+              ).join("")}
+            </table>
+          </details>
+        </td>
+      </tr>`;
+    }).join("");
+    wrap.innerHTML = `<table class="data-table trace-table">
+      <thead><tr>
+        <th>${t("debug.trace.col_start")}</th>
+        <th>${t("debug.trace.col_request_id")}</th>
+        <th>${t("debug.trace.col_model")}</th>
+        <th>${t("debug.trace.col_api")}</th>
+        <th>${t("debug.trace.col_stream")}</th>
+        <th>${t("debug.trace.col_status")}</th>
+        <th>${t("debug.trace.col_duration")}</th>
+        <th>${t("debug.trace.col_error")}</th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
   }
 
   async function loadAnomalies() {
@@ -3213,6 +3499,7 @@
       { group: "runtime", section: "runtime-general",      label: t("config.section.general_settings"),     icon: "general",       html: renderCardGeneral(cfg.general_settings || {}) },
       { group: "runtime", section: "runtime-health",       label: t("config.section.deployment_health_check"), icon: "health",     html: renderCardHealthCheck(cfg.deployment_health_check || {}) },
       { group: "runtime", section: "runtime-prompt-log",   label: t("config.section.prompt_log"),            icon: "prompt-log",   html: renderCardPromptLog(cfg.prompt_log || {}) },
+      { group: "runtime", section: "runtime-trace",        label: t("config.section.trace"),                 icon: "trace",        html: renderCardTrace(cfg.trace || {}) },
       { group: "traffic", section: "traffic-rate-limit",   label: t("config.section.rate_limit"),            icon: "rate-limit",    html: renderCardRateLimit(cfg.rate_limit || {}) },
       { group: "traffic", section: "traffic-plans",       label: t("config.section.plan_settings"),          icon: "plans",         html: renderCardPlanSettings(cfg.plan_settings || {}, cfg) },
       { group: "routing", section: "routing-router",      label: t("config.section.router_settings"),       icon: "router",        html: renderCardRouter(cfg.router_settings || {}) },
@@ -3262,6 +3549,7 @@
       "general": '<circle cx="8" cy="8" r="6.5"/><path d="M8 5v3M8 11h.01"/>',
       "health": '<path d="M1.5 8h3l1.5-4 3 8 1.5-4h3.5"/>',
       "prompt-log": '<rect x="2" y="2" width="12" height="12" rx="1.5"/><path d="M5 5h6M5 8h6M5 11h3"/>',
+      "trace": '<path d="M2 8h3l2-4 3 8 2-4h2"/>',
       "rate-limit": '<circle cx="8" cy="8" r="6.5"/><path d="M8 4.5V8l2.5 1.5"/>',
       "plans": '<rect x="2" y="2" width="12" height="12" rx="1.5"/><path d="M5 5h6M5 8h4M5 11h2"/>',
       "router": '<circle cx="4" cy="4" r="2"/><circle cx="12" cy="8" r="2"/><circle cx="4" cy="12" r="2"/><path d="M6 4h2M8 8h2M6 12h2"/>',
@@ -3432,6 +3720,54 @@
     </div>`;
   }
 
+  function renderCardTrace(p) {
+    const o = (p && p.otlp) || {};
+    const f = (p && p.report_filter) || {};
+    return `<div class="form-card" data-section="trace">
+      <div class="form-card-title">${t("config.section.trace")}</div>
+      <div class="form-card-grid">
+        ${fieldCheckbox("cfg-tr-enabled", t("config.field.trace_enabled"), p.enabled, { tip: t("config.tip.trace_enabled") })}
+        ${fieldCheckbox("cfg-tr-capture-body", t("config.field.trace_capture_body"), p.capture_body !== false, { tip: t("config.tip.trace_capture_body") })}
+        ${fieldNum("cfg-tr-max-body-bytes", t("config.field.trace_max_body_bytes"), p.max_body_bytes || 16384, { min: 256, step: 256, tip: t("config.tip.trace_max_body_bytes") })}
+        ${fieldCheckbox("cfg-tr-propagate-only", t("config.field.trace_propagate_only"), p.propagate_only !== false, { tip: t("config.tip.trace_propagate_only") })}
+      </div>
+
+      <div class="form-card-subtitle">${t("config.section.trace_filter")}</div>
+      <div class="form-card-grid">
+        ${fieldFullList("cfg-tr-filter-keys", t("config.field.trace_tracestate_keys"), f.tracestate_keys || [])}
+        ${fieldText("cfg-tr-filter-regex", t("config.field.trace_trace_id_regex"), f.trace_id_regex || "", { full: true, tip: t("config.tip.trace_trace_id_regex") })}
+      </div>
+
+      <div class="form-card-subtitle">${t("config.section.trace_otlp")}</div>
+      <div class="form-card-grid">
+        ${fieldCheckbox("cfg-tr-otlp-enabled", t("config.field.otlp_enabled"), o.enabled, { tip: t("config.tip.trace_otlp") })}
+        <div class="form-group field-full">
+          <label>${t("config.field.otlp_endpoint")} ${tip(t("config.tip.otlp_endpoint"))}</label>
+          <div id="cfg-tr-otlp-ping" class="otlp-ping-row" data-state="unknown">
+            <span class="otlp-ping-dot"></span>
+            <span class="otlp-ping-text">${t("config.tip.otlp_ping_unknown")}</span>
+          </div>
+          <div class="otlp-endpoint-row">
+            <input id="cfg-tr-otlp-endpoint" type="text" value="${esc(o.endpoint || "")}" placeholder="http://otel-collector:4318">
+            <button type="button" id="cfg-tr-otlp-test" class="btn-small btn-secondary">${t("action.test")}</button>
+          </div>
+        </div>
+        ${fieldText("cfg-tr-otlp-service-name", t("config.field.otlp_service_name"), o.service_name, { placeholder: "boom-gateway", tip: t("config.tip.otlp_service_name") })}
+        ${fieldText("cfg-tr-otlp-service-version", t("config.field.otlp_service_version"), o.service_version || "", { placeholder: t("config.tip.otlp_service_version_default"), tip: t("config.tip.otlp_service_version_default") })}
+        ${fieldNum("cfg-tr-otlp-timeout-secs", t("config.field.otlp_timeout_secs"), o.timeout_secs, { min: 1, tip: t("config.tip.otlp_timeout_secs") })}
+        ${fieldNum("cfg-tr-otlp-batch-size", t("config.field.otlp_batch_size"), o.batch_size, { min: 1, tip: t("config.tip.otlp_batch_size") })}
+        ${fieldNum("cfg-tr-otlp-flush-interval-secs", t("config.field.otlp_flush_interval_secs"), o.flush_interval_secs, { min: 1, tip: t("config.tip.otlp_flush_interval_secs") })}
+        ${fieldNum("cfg-tr-otlp-max-attribute-bytes", t("config.field.otlp_max_attribute_bytes"), o.max_attribute_bytes, { min: 256, step: 256, tip: t("config.tip.otlp_max_attribute_bytes") })}
+        ${fieldNum("cfg-tr-otlp-max-queue-size", t("config.field.otlp_max_queue_size"), o.max_queue_size, { min: 100, step: 100, tip: t("config.tip.otlp_max_queue_size") })}
+        ${fieldTextarea("cfg-tr-otlp-headers", t("config.field.otlp_headers"), o.headers || {}, { rows: 3, tip: t("config.tip.otlp_headers") })}
+      </div>
+
+      <div class="form-card-actions">
+        <button class="btn-primary btn-small" data-save="trace">${t("action.save")}</button>
+      </div>
+    </div>`;
+  }
+
   function renderCardRouter(r) {
     return `<div class="form-card" data-section="router_settings">
       <div class="form-card-title">${t("config.section.router_settings")}</div>
@@ -3520,6 +3856,8 @@
     wireDirtyTracking();
     const testBtn = document.getElementById("cfg-pl-otlp-test");
     if (testBtn) testBtn.addEventListener("click", otlpPingOnce);
+    const traceTestBtn = document.getElementById("cfg-tr-otlp-test");
+    if (traceTestBtn) traceTestBtn.addEventListener("click", traceOtlpPingOnce);
   }
 
   // ── Config page sidebar (Runtime/Traffic/Routing sub-items) ────
@@ -3690,6 +4028,76 @@
     }
   }
 
+  // ── Trace OTLP endpoint connectivity indicator (mirror of prompt-log's)
+  // One-shot Test button probes the form-input endpoint; the periodic poll
+  // reads the live traces exporter's state. Independent state from the
+  // prompt-log indicator (two channels, two exporters).
+  async function traceOtlpPingOnce() {
+    const btn = document.getElementById("cfg-tr-otlp-test");
+    const pingRow = document.getElementById("cfg-tr-otlp-ping");
+    if (!btn || !pingRow) return;
+    const endpoint = (document.getElementById("cfg-tr-otlp-endpoint")?.value || "").trim();
+    if (!endpoint) {
+      otlpPingSetState(pingRow, "unknown", t("config.tip.otlp_ping_no_endpoint"));
+      return;
+    }
+    btn.disabled = true;
+    btn.textContent = t("config.tip.otlp_ping_pending");
+    otlpPingSetState(pingRow, "pending", t("config.tip.otlp_ping_pending"));
+    try {
+      const r = await api("/admin/trace/otlp-ping", {
+        method: "POST",
+        body: JSON.stringify({ endpoint, headers: {}, timeout_secs: 5 }),
+      });
+      if (r && r.ok && typeof r.latency_ms === "number") {
+        const ms = r.latency_ms;
+        otlpPingSetState(pingRow, "ok", `${t("config.tip.otlp_ping_ok")} · ${ms} ms`);
+      } else {
+        otlpPingSetState(pingRow, "fail", `${t("config.tip.otlp_ping_fail")} · ${r && r.error ? r.error : ""}`.trim().replace(/[·\s]+$/, ""));
+      }
+    } catch (err) {
+      otlpPingSetState(pingRow, "fail", `${t("config.tip.otlp_ping_fail")} · ${err.message}`);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = t("action.test");
+    }
+  }
+
+  let traceOtlpStatusTimer = null;
+  function startTraceOtlpStatusPoll() {
+    stopTraceOtlpStatusPoll();
+    traceOtlpStatusPoll();
+    traceOtlpStatusTimer = setInterval(traceOtlpStatusPoll, 5000);
+  }
+  function stopTraceOtlpStatusPoll() {
+    if (traceOtlpStatusTimer) {
+      clearInterval(traceOtlpStatusTimer);
+      traceOtlpStatusTimer = null;
+    }
+  }
+  async function traceOtlpStatusPoll() {
+    const pingRow = document.getElementById("cfg-tr-otlp-ping");
+    if (!pingRow) return;
+    if (pingRow.getAttribute("data-state") === "pending") return;
+    try {
+      const r = await api("/admin/trace/otlp-status", { method: "GET" });
+      if (!r || !r.ok) {
+        otlpPingSetState(pingRow, "fail", t("config.tip.otlp_ping_fail"));
+        return;
+      }
+      if (r.status === "online") {
+        otlpPingSetState(pingRow, "ok", t("config.tip.otlp_status_online"));
+      } else if (r.status === "offline") {
+        const ep = r.endpoint ? ` · ${r.endpoint}` : "";
+        otlpPingSetState(pingRow, "fail", `${t("config.tip.otlp_status_offline")}${ep}`);
+      } else {
+        otlpPingSetState(pingRow, "unknown", t("config.tip.otlp_status_disabled"));
+      }
+    } catch (err) {
+      // ignore — same as prompt-log poll
+    }
+  }
+
   async function reloadConfigHandler() {
     try {
       await api("/admin/config/reload", { method: "POST" });
@@ -3773,6 +4181,29 @@
             max_attribute_bytes: numOr($("cfg-pl-otlp-max-attribute-bytes"), 4096),
             headers: parseJsonInput($("cfg-pl-otlp-headers"), {}),
             max_queue_size: numOr($("cfg-pl-otlp-max-queue-size"), 10000),
+          },
+        });
+      } else if (kind === "trace") {
+        await saveConfigSection("trace", {
+          enabled: $("cfg-tr-enabled").checked,
+          capture_body: $("cfg-tr-capture-body").checked,
+          max_body_bytes: numOr($("cfg-tr-max-body-bytes"), 16384),
+          propagate_only: $("cfg-tr-propagate-only").checked,
+          report_filter: {
+            tracestate_keys: parseListInput($("cfg-tr-filter-keys")),
+            trace_id_regex: $("cfg-tr-filter-regex").value || null,
+          },
+          otlp: {
+            enabled: $("cfg-tr-otlp-enabled").checked,
+            endpoint: $("cfg-tr-otlp-endpoint").value || "",
+            service_name: $("cfg-tr-otlp-service-name").value || "boom-gateway",
+            service_version: $("cfg-tr-otlp-service-version").value || null,
+            timeout_secs: numOr($("cfg-tr-otlp-timeout-secs"), 10),
+            batch_size: numOr($("cfg-tr-otlp-batch-size"), 512),
+            flush_interval_secs: numOr($("cfg-tr-otlp-flush-interval-secs"), 5),
+            max_attribute_bytes: numOr($("cfg-tr-otlp-max-attribute-bytes"), 4096),
+            headers: parseJsonInput($("cfg-tr-otlp-headers"), {}),
+            max_queue_size: numOr($("cfg-tr-otlp-max-queue-size"), 10000),
           },
         });
       } else if (kind === "router") {
@@ -5717,11 +6148,13 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
   window._loadLogsPage = (p) => loadLogs(p);
 
   // ── Debug page: KVC DFX table ─────────────────────
-  // Show the Debug nav link if compiled with debug-tools.
-  if (window.__KVC_DEBUG) {
-    var navDebug = document.getElementById("nav-admin-debug");
-    if (navDebug) navDebug.style.display = "";
-  }
+  // Show the Debug nav link unconditionally — trace pane is useful at
+  // runtime regardless of whether the binary was compiled with KVC
+  // debug-tools. KVC DFX section still gates its content behind the
+  // feature flag (renders a "compile with --features debug-tools" hint
+  // when off), so hiding the nav is no longer warranted.
+  var navDebug = document.getElementById("nav-admin-debug");
+  if (navDebug) navDebug.style.display = "";
 
   // Filter state for the KVC DFX table (mirrors the Logs page filter pattern).
   var kvcFilters = {};

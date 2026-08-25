@@ -260,6 +260,7 @@
             <div class="debug-subtabs">
               <button class="debug-subtab active" data-subtab="overview" data-i18n="debug.subtab.overview">Overview</button>
               <button class="debug-subtab" data-subtab="anomalies" data-i18n="debug.subtab.anomalies">Anomalies</button>
+              <button class="debug-subtab" data-subtab="trace" data-i18n="debug.subtab.trace">OTEL Trace</button>
             </div>
 
             <!-- Overview pane: original debug content -->
@@ -331,6 +332,42 @@
                 </details>
                 <p class="muted" data-i18n="debug.anomalies.hint">Click Refresh to load. Default: last 1 day.</p>
               </div>
+            </div>
+
+            <!-- Trace pane: live spans + recent finalized + counters -->
+            <div class="debug-pane" data-pane="trace">
+              <div class="section-header" style="margin-top:1.5rem">
+                <h2 data-i18n="debug.trace.otlp_status">OTLP Traces Exporter</h2>
+                <span class="otlp-ping-row" id="trace-otlp-indicator" data-state="unknown">
+                  <span class="otlp-ping-dot"></span>
+                  <span class="otlp-ping-text" data-i18n="debug.trace.status_unknown">Unknown</span>
+                </span>
+              </div>
+
+              <div class="trace-counters" id="trace-counters">
+                <div class="trace-counter-card">
+                  <span class="tc-label" data-i18n="debug.trace.counter_active">Active</span>
+                  <span class="tc-value" data-trace-counter="active">0</span>
+                </div>
+                <div class="trace-counter-card">
+                  <span class="tc-label" data-i18n="debug.trace.counter_total_finalized">Finalized</span>
+                  <span class="tc-value" data-trace-counter="total_finalized">0</span>
+                </div>
+                <div class="trace-counter-card">
+                  <span class="tc-label" data-i18n="debug.trace.counter_total_error">Errors</span>
+                  <span class="tc-value" data-trace-counter="total_error">0</span>
+                </div>
+                <div class="trace-counter-card">
+                  <span class="tc-label" data-i18n="debug.trace.counter_recent">Recent</span>
+                  <span class="tc-value" data-trace-counter="recent">0</span>
+                </div>
+              </div>
+
+              <div class="section-header" style="margin-top:1.5rem">
+                <h2 data-i18n="debug.trace.recent_title">Recent Spans</h2>
+                <button class="btn-small" id="btn-trace-refresh" data-i18n="action.refresh">Refresh</button>
+              </div>
+              <div id="trace-recent-wrap"><p class="muted" data-i18n="debug.trace.empty">No spans.</p></div>
             </div>
           </section>
 

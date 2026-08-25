@@ -745,6 +745,56 @@ p.error { color: var(--danger); font-style: italic; margin: 0; }
 .debug-pane { display: none; }
 .debug-pane.active { display: block; }
 
+/* ── Trace pane: counters + tables ─────────────────────── */
+.trace-counters {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+  margin-top: 1rem;
+}
+.trace-counter-card {
+  padding: 12px;
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.trace-counter-card .tc-label { font-size: .75rem; color: var(--text3); }
+.trace-counter-card .tc-value { font-size: 1.5rem; font-weight: 600; }
+.trace-table { table-layout: fixed; }
+.trace-table code { word-break: break-all; font-size: .85em; }
+.trace-table .trace-detail-row > td { padding: 0 0 0 0; }
+.trace-table .trace-detail-row details { padding: 4px 8px 8px; }
+.trace-attr-table { width: 100%; border-collapse: collapse; margin-top: 4px; table-layout: auto; }
+.trace-attr-table .ta-key { width: auto; max-width: 300px; word-break: break-all; vertical-align: top; padding: 4px 8px; }
+.trace-attr-table .ta-val { vertical-align: top; padding: 4px 8px; word-break: break-word; }
+.trace-attr-json {
+  margin: 0;
+  max-height: 240px;
+  overflow: auto;
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 6px;
+  font-size: .8em;
+}
+/* OTel-semantic body renderer (boom-gateway.llm_request / llm_response) */
+.trace-body-summary { display: flex; flex-direction: column; gap: 6px; }
+.trace-body-row { display: flex; gap: 8px; align-items: center; font-size: .9em; }
+.trace-body-row .tb-label { color: var(--text-muted); min-width: 60px; }
+.trace-body-params code,
+.trace-body-usage { font-size: .85em; color: var(--text-muted); }
+.trace-body-params { display: inline-block; }
+.trace-body-messages th,
+.trace-body-choices th { text-align: left; padding: 4px 8px; font-size: .8em; color: var(--text-muted); }
+.trace-body-messages td,
+.trace-body-choices td { padding: 4px 8px; }
+@media (max-width: 768px) {
+  .trace-counters { grid-template-columns: repeat(2, 1fr); }
+}
+
 /* ── Anomaly explainer (collapsible) ─────────────────────── */
 .anomaly-explainer {
   margin: 0.5rem 0 1rem;

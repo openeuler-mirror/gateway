@@ -5312,6 +5312,128 @@ pub async fn get_anomalies(
     .into_response()
 }
 
+// ═══════════════════════════════════════════════════════════
+// OTel Traces — active span table + slow ring + OTLP exporter status.
+// Reads through `Arc<dyn boom_core::TraceApi>` so boom-dashboard stays
+// leaf-of-boom-core (no dep on boom-trace). The dashboard page polls
+// snapshot every 2s for the "active spans" + "slow ring" tables, and
+// the OTLP status endpoint every 5s for the connectivity indicator
+// (mirrors the prompt-log OTLP status cadence).
+// ═══════════════════════════════════════════════════════════
+
+/// GET `/admin/trace/snapshot` — active + slow spans + counters.
+/// Returns the in-memory snapshot (no DB hit). Polled by the admin
+/// trace page every 2s for the live "active spans" table.
+pub async fn trace_snapshot(
+    _session: AdminSession,
+    Extension(state): Extension<Arc<DashboardState>>,
+) -> Response {
+    let snap = state.trace.snapshot().await;
+    Json(snap).into_response()
+}
+
+/// GET `/admin/trace/otlp-status` — live OTLP traces exporter state.
+/// Returns `{ok:true, status:"online"|"offline", endpoint, ...}` when
+/// configured, or `{ok:true, status:"disabled"}` when trace channel is
+/// off. Mirrors the prompt-log `otlp-status` contract.
+pub async fn trace_otlp_status(
+    _session: AdminSession,
+    Extension(state): Extension<Arc<DashboardState>>,
+) -> Response {
+    match state.trace.otlp_status().await {
+        Some(snap) => Json(json!({
+            "ok": true,
+            "status": snap.status,
+            "endpoint": snap.endpoint,
+            "last_failure_ts": snap.last_failure_ts,
+            "last_recovery_ts": snap.last_recovery_ts,
+            "consecutive_probe_failures": snap.consecutive_probe_failures,
+            "total_offline_episodes": snap.total_offline_episodes,
+            "total_dropped_during_offline": snap.total_dropped_during_offline,
+            "dropped_count": snap.dropped_count,
+        }))
+        .into_response(),
+        None => Json(json!({
+            "ok": true,
+            "status": "disabled",
+            "endpoint": "",
+        }))
+        .into_response(),
+    }
+}
+
+/// POST `/admin/trace/otlp-probe` — manually probe the OTLP traces
+/// exporter. On success returns `{ok:true, latency_ms}`; on failure
+/// returns `{ok:false, error}`. Does NOT drive Online → Offline (only
+/// repeated flush failures do) — same semantics as prompt-log's probe.
+pub async fn trace_otlp_probe(
+    _session: AdminSession,
+    Extension(state): Extension<Arc<DashboardState>>,
+) -> Response {
+    match state.trace.probe_otlp().await {
+        Some(boom_core::ProbeResult::Ok { latency_ms }) => {
+            Json(json!({ "ok": true, "latency_ms": latency_ms })).into_response()
+        }
+        Some(boom_core::ProbeResult::Fail { error }) => {
+            Json(json!({ "ok": false, "error": error })).into_response()
+        }
+        None => Json(json!({
+            "ok": false,
+            "error": "OTLP traces exporter not configured"
+        }))
+        .into_response(),
+    }
+}
+
+/// POST `/admin/trace/otlp-ping` — probe a remote OTLP traces collector.
+/// Body: `{ "endpoint": "...", "headers": {...}, "timeout_secs": 5 }`.
+/// Sends an empty `ExportTraceServiceRequest` and returns `{ok, latency_ms}`
+/// on success or `{ok:false, error}` on failure. Used by the connectivity
+/// indicator above the endpoint input on the trace card — operator can
+/// type a new endpoint and test it before saving. Symmetric with
+/// `ping_otlp_endpoint` (the prompt-log equivalent).
+pub async fn ping_trace_otlp_endpoint(
+    _session: AdminSession,
+    Extension(state): Extension<Arc<DashboardState>>,
+    Json(req): Json<PingOtlpEndpointRequest>,
+) -> Response {
+    if req.endpoint.trim().is_empty() {
+        return Json(json!({"ok": false, "error": "endpoint not configured"}))
+            .into_response();
+    }
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    if state
+        .admin_tx
+        .send(crate::state::AdminCommand::PingTraceOtlpEndpoint {
+            endpoint: req.endpoint.clone(),
+            headers: req.headers.clone(),
+            timeout_secs: req.timeout_secs,
+            reply: reply_tx,
+        })
+        .await
+        .is_err()
+    {
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "Admin command handler unavailable",
+        )
+            .into_response();
+    }
+    match reply_rx.await {
+        Ok(Ok(latency_ms)) => Json(json!({
+            "ok": true,
+            "latency_ms": latency_ms,
+        }))
+        .into_response(),
+        Ok(Err(e)) => Json(json!({"ok": false, "error": e})).into_response(),
+        Err(_) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "Admin command handler dropped reply",
+        )
+            .into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{normalize_pagination, CreateKeyRequest};

@@ -924,6 +924,7 @@ mod tests {
     use super::*;
     use crate::entry::PromptLogEntry;
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     fn make_request_entry(id: &str, trace_id: Option<String>) -> PromptLogEntry {
         PromptLogEntry::new_request(
@@ -935,7 +936,7 @@ mod tests {
             "gpt-4",
             "/v1/chat/completions",
             true,
-            serde_json::json!({"messages": [{"role": "user", "content": "hi"}]}),
+            Arc::new(serde_json::json!({"messages": [{"role": "user", "content": "hi"}]})),
             Some("127.0.0.1"),
             Some(HashMap::from([
                 ("x-trace-id".to_string(), "trace-1".to_string()),
@@ -991,7 +992,7 @@ mod tests {
         let req = make_request_entry("req-2", None);
         let mut resp = PromptLogEntry::new_response_from(&req);
         resp.set_status(500, 1500);
-        resp.set_response(serde_json::json!({"choices": []}));
+        resp.set_response(Arc::new(serde_json::json!({"choices": []})));
         resp.set_error(error_code::UPSTREAM_ERROR, "boom".to_string());
 
         let cfg = OtlpConfig::default();
@@ -1030,7 +1031,7 @@ mod tests {
         let mut entry = make_request_entry("req-3", None);
         // Build a request body way over 64-byte budget.
         let big = "x".repeat(5000);
-        entry.request = Some(serde_json::json!({"big": big}));
+        entry.request = Some(Arc::new(serde_json::json!({"big": big})));
         let cfg = OtlpConfig::default();
         let resource = build_resource(&cfg);
         let rl = convert_entry_to_log_records(&entry, &resource, 64);
