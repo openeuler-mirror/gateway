@@ -1,0 +1,43 @@
+[package]
+name = "boom-trace"
+version.workspace = true
+edition.workspace = true
+
+[features]
+# OTLP traces push is on by default. The exporter only activates when
+# `trace.otlp.enabled` is set in YAML, so the cost of carrying the codegen is
+# the few extra crates linked in — no runtime behavior unless configured.
+# Disable with `--no-default-features` for an embedded build that doesn't
+# need OTLP at all.
+default = ["otlp"]
+otlp = [
+    "dep:opentelemetry-proto",
+    "dep:reqwest",
+    "dep:prost",
+    "dep:sha2",
+]
+
+[dependencies]
+boom-core = { path = "../boom-core" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+dashmap = { workspace = true }
+arc-swap = { workspace = true }
+chrono = { workspace = true }
+# hex is non-optional — `trace_filter_matches` (always compiled) encodes the
+# W3C trace_id as 32-char lowercase hex for pattern matching.
+hex = { workspace = true }
+
+# OTLP exporter deps — only pulled in when the `otlp` feature is on.
+# Pinned to match boom-promptlog so the proto-generated types stay compatible
+# (the two crates share the same opentelemetry-proto major.minor).
+opentelemetry-proto = { version = "0.32", optional = true, default-features = false, features = ["gen-tonic-messages", "trace", "with-serde"] }
+reqwest = { workspace = true, optional = true }
+prost = { version = "0.14", optional = true }
+sha2 = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

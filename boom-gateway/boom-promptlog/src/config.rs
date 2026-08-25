@@ -1,4 +1,8 @@
 use serde::Deserialize;
+// `OtlpConfig` lives in boom-core now so boom-trace can share it without
+// depending on this crate. Re-export for back-compat with anything that
+// was importing `boom_promptlog::OtlpConfig`.
+pub use boom_core::OtlpConfig;
 
 /// Prompt logging configuration.
 ///
@@ -22,7 +26,7 @@ use serde::Deserialize;
 ///     headers: {}
 ///     max_queue_size: 10000
 /// ```
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
 pub struct PromptLogConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -50,106 +54,6 @@ pub struct PromptLogConfig {
     /// are still written; this is a second sink, not a replacement.
     #[serde(default)]
     pub otlp: OtlpConfig,
-}
-
-/// OTLP export configuration. When `enabled=false` (the default) the gateway
-/// runs purely on local JSONL files; flipping it on spawns a background
-/// exporter that batches entries and POSTs them as `ExportLogsServiceRequest`
-/// protobuf to `{endpoint}/v1/logs`.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
-pub struct OtlpConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    /// OTLP/HTTP base URL, e.g. `http://otel-collector:4318`. The exporter
-    /// appends `/v1/logs` itself.
-    #[serde(default)]
-    pub endpoint: String,
-    #[serde(default = "default_service_name")]
-    pub service_name: String,
-    /// Defaults to the gateway's CARGO_PKG_VERSION when None.
-    #[serde(default)]
-    pub service_version: Option<String>,
-    #[serde(default = "default_timeout_secs")]
-    pub timeout_secs: u64,
-    #[serde(default = "default_batch_size")]
-    pub batch_size: usize,
-    #[serde(default = "default_flush_interval_secs")]
-    pub flush_interval_secs: u64,
-    /// Per-attribute byte budget. Request/response bodies that exceed this get
-    /// truncated and the record's `dropped_attributes_count` is incremented.
-    #[serde(default = "default_max_attribute_bytes")]
-    pub max_attribute_bytes: usize,
-    /// Extra HTTP headers to attach to OTLP POSTs (e.g. SaaS backend auth).
-    #[serde(default)]
-    pub headers: std::collections::HashMap<String, String>,
-    /// In-memory queue cap. When full, oldest entries are dropped with a
-    /// `tracing::warn!` — the gateway must never block on OTLP.
-    #[serde(default = "default_max_queue_size")]
-    pub max_queue_size: usize,
-}
-
-impl Default for PromptLogConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            dir: default_dir(),
-            max_file_size_mb: default_max_file_size(),
-            capture_raw_upstream: false,
-            excluded_keys: Vec::new(),
-            excluded_teams: Vec::new(),
-            record_headers: Vec::new(),
-            otlp: OtlpConfig::default(),
-        }
-    }
-}
-
-impl Default for OtlpConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            endpoint: String::new(),
-            service_name: default_service_name(),
-            service_version: None,
-            timeout_secs: default_timeout_secs(),
-            batch_size: default_batch_size(),
-            flush_interval_secs: default_flush_interval_secs(),
-            max_attribute_bytes: default_max_attribute_bytes(),
-            headers: std::collections::HashMap::new(),
-            max_queue_size: default_max_queue_size(),
-        }
-    }
-}
-
-fn default_dir() -> String {
-    "/data/prompt_logs".to_string()
-}
-
-fn default_max_file_size() -> u64 {
-    50
-}
-
-fn default_service_name() -> String {
-    "boom-gateway".to_string()
-}
-
-fn default_timeout_secs() -> u64 {
-    10
-}
-
-fn default_batch_size() -> usize {
-    512
-}
-
-fn default_flush_interval_secs() -> u64 {
-    5
-}
-
-fn default_max_attribute_bytes() -> usize {
-    4096
-}
-
-fn default_max_queue_size() -> usize {
-    10000
 }
 
 impl PromptLogConfig {
@@ -208,4 +112,12 @@ impl PromptLogConfig {
         }
         c
     }
+}
+
+fn default_dir() -> String {
+    "/data/prompt_logs".to_string()
+}
+
+fn default_max_file_size() -> u64 {
+    50
 }

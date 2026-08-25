@@ -159,6 +159,10 @@ pub struct DashboardState {
     /// blocking pool queue, inflight). Polled every 1.5s by the admin
     /// stats page's top sparkline chart.
     pub stressmon: Arc<dyn boom_core::StressmonApi>,
+    /// Trace channel — active span table + slow ring + OTLP traces exporter
+    /// status. Erased to `Arc<dyn TraceApi>` so boom-dashboard stays leaf-of-
+    /// boom-core (no dep on boom-trace). Polled by the admin trace page.
+    pub trace: Arc<dyn boom_core::TraceApi>,
 }
 
 impl DashboardState {
@@ -180,6 +184,7 @@ impl DashboardState {
         auth: Arc<dyn KeyAliasLookup>,
         log_dropped: Option<Arc<dyn boom_core::LogDroppedCounter>>,
         stressmon: Arc<dyn boom_core::StressmonApi>,
+        trace: Arc<dyn boom_core::TraceApi>,
     ) -> Self {
         // Derive JWT secret from master_key, or use a random fallback.
         let jwt_secret = master_key
@@ -206,6 +211,7 @@ impl DashboardState {
             auth,
             log_dropped,
             stressmon,
+            trace,
         }
     }
 }

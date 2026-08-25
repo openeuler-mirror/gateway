@@ -53,6 +53,11 @@ pub struct Config {
     /// Prompt log configuration (transparent pass-through to boom-promptlog).
     #[serde(default)]
     pub prompt_log: Option<serde_json::Value>,
+    /// OTel traces configuration — gateway-side W3C trace context + OTLP
+    /// traces exporter. Independent of `prompt_log`: the four combinations
+    /// (logs on/off × traces on/off) are all supported. See `TraceConfig`.
+    #[serde(default)]
+    pub trace: Option<TraceConfig>,
     /// Gateway hook configuration. Optional — when absent or all entries
     /// disabled, the gateway runs as if the hook framework didn't exist.
     #[serde(default)]
@@ -1558,5 +1563,166 @@ ml_service:
         let ml = cfg.ml_service.expect("ml_service should be set");
         assert_eq!(ml.url, "http://127.0.0.1:2345");
         assert_eq!(ml.timeout_ms, 50);
+    }
+}
+
+// ── OTel Traces ──────────────────────────────────────────────────────────────
+
+/// Top-level OTel traces configuration. Lives here (typed) rather than as a
+/// `serde_json::Value` pass-through (like `prompt_log`) because the trace
+/// config carries new gateway-owned fields (`capture_body`, `max_body_bytes`,
+/// `propagate_only`, `report_filter`) — these are boom-config's responsibility,
+/// and the field manifest (CLAUDE.md §9) should enforce coverage.
+///
+/// `otlp` reuses `boom_core::OtlpConfig` (the leaf-crate single source of
+/// truth, shared with boom-promptlog's `PromptLogConfig.otlp`).
+///
+/// The four-combination matrix (prompt_log × trace on/off) is enforced by the
+/// independence of this struct from `PromptLogConfig` — both channels read
+/// their own switch and consult the body Arc independently.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+pub struct TraceConfig {
+    /// Master switch for the trace channel. When false, no spans are created,
+    /// nothing is enqueued to the OTLP traces exporter, and the slow ring is
+    /// not populated. `propagate_only` controls whether traceparent headers
+    /// are still forwarded.
+    #[serde(default)]
+    pub enabled: bool,
+    /// OTLP exporter configuration. Same shape as `prompt_log.otlp` (they
+    /// share `boom_core::OtlpConfig`) — but the trace exporter targets
+    /// `/v1/traces`, the log exporter targets `/v1/logs`. Independent batch
+    /// queue + state machine: one channel hanging does not affect the other.
+    #[serde(default)]
+    pub otlp: boom_core::OtlpConfig,
+    /// When true, span attributes include `boom-gateway.llm_request` and
+    /// `boom-gateway.llm_response` (body, shared Arc with prompt log entries
+    /// when both channels are on — zero-copy). When false, only metadata
+    /// attributes (request.id, time_in_queue, user.id) are set.
+    #[serde(default = "default_trace_capture_body")]
+    pub capture_body: bool,
+    /// Body truncation threshold (bytes). Bodies larger than this are
+    /// truncated to the threshold and a `boom-gateway.body_truncated=true`
+    /// attribute is set. Default 16 KiB — large enough for typical prompts,
+    /// small enough to keep span payloads reasonable.
+    #[serde(default = "default_trace_max_body_bytes")]
+    pub max_body_bytes: usize,
+    /// When true, the gateway still propagates inbound `traceparent` /
+    /// `tracestate` to the upstream LLM call even when `enabled=false`. This
+    /// is the W3C proxy-node minimum obligation — the gateway forwards
+    /// trace context without producing any spans itself. Default true.
+    #[serde(default = "default_trace_propagate_only")]
+    pub propagate_only: bool,
+    /// Filter that decides which inbound requests get a span. A request must
+    /// match the filter (any tracestate key OR trace_id regex) to be traced.
+    /// Lets ops trace a subset (e.g. only `opencode_user_id` traffic) without
+    /// paying for full-fidelity tracing on every request.
+    #[serde(default)]
+    pub report_filter: TraceFilterConfig,
+    /// Slow-span threshold (ms). Spans with duration > this land in the slow
+    /// ring buffer (recent N slow spans for dashboard inspection). Default 5s.
+    #[serde(default = "default_trace_slow_threshold_ms")]
+    pub slow_threshold_ms: u64,
+}
+
+fn default_trace_capture_body() -> bool {
+    true
+}
+
+fn default_trace_max_body_bytes() -> usize {
+    16 * 1024
+}
+
+fn default_trace_propagate_only() -> bool {
+    true
+}
+
+fn default_trace_slow_threshold_ms() -> u64 {
+    5_000
+}
+
+impl Default for TraceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            otlp: boom_core::OtlpConfig::default(),
+            capture_body: default_trace_capture_body(),
+            max_body_bytes: default_trace_max_body_bytes(),
+            propagate_only: default_trace_propagate_only(),
+            report_filter: TraceFilterConfig::default(),
+            slow_threshold_ms: default_trace_slow_threshold_ms(),
+        }
+    }
+}
+
+/// Filter for which inbound requests get a span. Matches if EITHER the
+/// tracestate carries any of `tracestate_keys` OR the trace_id matches
+/// `trace_id_regex` (regex search). Both empty ⇒ trace every request.
+///
+/// This is intentionally config-driven (not hardcoded to opencode) so the
+/// same gateway can be re-point at different upstream agents by editing YAML
+/// rather than rebuilding.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Default)]
+pub struct TraceFilterConfig {
+    /// tracestate keys whose presence triggers tracing. Example:
+    /// `["opencode_user_id"]` — any request whose tracestate carries this key
+    /// is traced. Multiple keys OR-match (any one present triggers).
+    #[serde(default)]
+    pub tracestate_keys: Vec<String>,
+    /// Optional regex applied to the W3C trace_id (32-char lowercase hex).
+    /// When set, a match triggers tracing (in addition to tracestate_keys).
+    /// Use a leading anchor (`^`) for prefix matching.
+    #[serde(default)]
+    pub trace_id_regex: Option<String>,
+}
+
+#[cfg(test)]
+mod trace_config_tests {
+    use super::*;
+
+    #[test]
+    fn trace_config_defaults_to_disabled_but_propagating() {
+        let cfg = TraceConfig::default();
+        assert!(!cfg.enabled);
+        assert!(cfg.propagate_only, "propagate_only defaults true");
+        assert!(cfg.capture_body, "capture_body defaults true");
+        assert_eq!(cfg.max_body_bytes, 16 * 1024);
+        assert_eq!(cfg.slow_threshold_ms, 5_000);
+        assert!(cfg.report_filter.tracestate_keys.is_empty());
+        assert!(cfg.report_filter.trace_id_regex.is_none());
+    }
+
+    #[test]
+    fn trace_config_parses_from_yaml() {
+        let yaml = r#"
+enabled: true
+otlp:
+  enabled: true
+  endpoint: http://collector:4318
+capture_body: false
+max_body_bytes: 4096
+propagate_only: false
+report_filter:
+  tracestate_keys: [opencode_user_id]
+  trace_id_regex: "^abc"
+slow_threshold_ms: 1000
+"#;
+        let cfg: TraceConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.enabled);
+        assert!(!cfg.propagate_only);
+        assert!(!cfg.capture_body);
+        assert_eq!(cfg.max_body_bytes, 4096);
+        assert_eq!(cfg.slow_threshold_ms, 1000);
+        assert_eq!(cfg.report_filter.tracestate_keys, vec!["opencode_user_id".to_string()]);
+        assert_eq!(cfg.report_filter.trace_id_regex.as_deref(), Some("^abc"));
+    }
+
+    #[test]
+    fn trace_config_omitting_all_fields_uses_defaults() {
+        let yaml = "enabled: true\n";
+        let cfg: TraceConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.enabled);
+        assert!(cfg.propagate_only);
+        assert!(cfg.capture_body);
+        assert_eq!(cfg.max_body_bytes, 16 * 1024);
     }
 }

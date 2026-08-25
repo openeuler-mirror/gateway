@@ -103,6 +103,12 @@ pub struct AppState {
     /// to `Arc<dyn StressmonApi>` at the point where DashboardState is
     /// built — dashboard stays leaf-of-boom-core that way.
     pub stressmon: Arc<boom_stressmon::StressmonCollector>,
+    /// OTel traces registry — active span table + slow ring + OTLP traces
+    /// exporter. Survives reloads (top-level Arc, CLAUDE.md §4). The exporter
+    /// is hot-swapped via `replace_otlp` when `trace.otlp` config changes.
+    /// Dashboard reads through the `TraceApi` trait (boom-core) so
+    /// boom-dashboard doesn't depend on boom-trace.
+    pub trace: Arc<boom_trace::TraceRegistry>,
 }
 
 /// The state that gets swapped on config reload.
@@ -292,6 +298,23 @@ impl AppState {
             boom_promptlog::FilePromptLogQuery::new(prompt_log_writer.config_handle()),
         );
 
+        // Trace registry — top-level Arc, survives reloads (CLAUDE.md §4).
+        // Active span table + slow ring live here; the OTLP traces exporter
+        // is constructed lazily via `replace_otlp` once we resolve the final
+        // TraceConfig (default = disabled, no exporter). The exporter is
+        // feature-gated to `otlp` — without the feature, TraceRegistry still
+        // works as an in-memory active/slow table for the dashboard, just no
+        // OTLP push.
+        let trace_registry = boom_trace::TraceRegistry::new();
+        let trace_config = config.trace.clone().unwrap_or_default();
+        trace_registry.set_slow_threshold_ms(trace_config.slow_threshold_ms);
+        #[cfg(feature = "otlp")]
+        {
+            trace_registry
+                .replace_otlp(&trace_config.otlp, trace_config.enabled)
+                .await;
+        }
+
         let inner = Self::build_inner(config, &db_pool, chrono::Utc::now(), 0)?;
 
         // Single shared Arc<ArcSwap> for kv_index — AppState and
@@ -340,6 +363,7 @@ impl AppState {
             kv_prune_handle: Arc::new(std::sync::Mutex::new(None)),
             kvc_orchestrator,
             stressmon,
+            trace: trace_registry,
         };
         state.register_fusion_models(&state.inner.load().config)?;
         Ok(state)
@@ -583,6 +607,25 @@ impl AppState {
             }
         } else {
             self.prompt_log_writer.update_config(boom_promptlog::PromptLogConfig::default());
+        }
+
+        // 5b. Hot-reload trace config — same pattern as prompt_log. Rebuilds
+        //     the OTLP traces exporter when its sub-config changes. The
+        //     registry itself (active table + slow ring) is untouched — only
+        //     the exporter + slow threshold + enabled flag swap.
+        let new_trace_config = new_config.trace.clone().unwrap_or_default();
+        self.trace
+            .set_slow_threshold_ms(new_trace_config.slow_threshold_ms);
+        #[cfg(feature = "otlp")]
+        {
+            // `replace_otlp` is the canonical hot-swap entry: aborts the old
+            // flush task, runs a best-effort final flush, constructs a new
+            // exporter (or None if disabled). Calling it unconditionally on
+            // reload is correct (idempotent for "no change") — the flush on an
+            // unchanged config is typically a no-op (queue empty).
+            self.trace
+                .replace_otlp(&new_trace_config.otlp, new_trace_config.enabled)
+                .await;
         }
 
         // 6. Build new inner state.

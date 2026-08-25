@@ -21,6 +21,7 @@ use boom_limiter::{
 };
 use boom_promptlog::{PromptLogEntry, PromptLogStream};
 use boom_routing::{InFlightGuard, ModelCostRate, Router};
+use boom_trace::{TraceGuard, W3cContext, parse_traceparent};
 use futures::StreamExt;
 use std::convert::Infallible;
 use std::pin::Pin;
@@ -32,7 +33,7 @@ use std::time::Instant;
 fn write_prompt_log_error(
     state: &AppState,
     should_capture: bool,
-    request_body: Option<&serde_json::Value>,
+    request_body: Option<&Arc<serde_json::Value>>,
     trace_id: Option<String>,
     request_id: &str,
     identity: &AuthIdentity,
@@ -44,7 +45,13 @@ fn write_prompt_log_error(
     error: &GatewayError,
     prompt_trace: Option<&SharedProviderPromptTrace>,
     start: Instant,
+    trace_guard: Option<&mut boom_trace::TraceGuard>,
 ) {
+    // Mark the trace span as ending in error (does not short-circuit — we
+    // still write prompt log entries below when should_capture is on).
+    if let Some(g) = trace_guard {
+        g.mark_error(error.to_string());
+    }
     if !should_capture {
         return;
     }
@@ -68,7 +75,7 @@ fn write_prompt_log_error(
     state.prompt_log_writer.send(request_entry.clone());
 
     let mut response_entry = PromptLogEntry::new_response_from(&request_entry);
-    response_entry.set_response(openai_error_body(error));
+    response_entry.set_response(Arc::new(openai_error_body(error)));
     if let Some(trace) = prompt_trace {
         trace.finalize();
         if let Some(fusion) = trace.snapshot() {
@@ -355,6 +362,10 @@ struct LoggedStream<S> {
     plan_charge: Option<PlanCharge>,
     /// Provider-supplied actual cost. Set only by composite providers.
     provider_billing: Option<ProviderBilling>,
+    /// Trace guard — when Some, finalizes the gateway span on stream Drop.
+    /// Moved into the stream wrapper on the streaming path so the span's
+    /// end_time is the actual stream-end time (not handler-return time).
+    trace_guard: Option<boom_trace::TraceGuard>,
 }
 
 impl<S> LoggedStream<S> {
@@ -376,6 +387,7 @@ impl<S> LoggedStream<S> {
             agent_stats,
             plan_charge: None,
             provider_billing: None,
+            trace_guard: None,
         }
     }
 
@@ -391,6 +403,13 @@ impl<S> LoggedStream<S> {
 
     fn with_provider_billing(mut self, billing: ProviderBilling) -> Self {
         self.provider_billing = Some(billing);
+        self
+    }
+
+    /// Attach the trace guard so its Drop runs at stream end (not at
+    /// handler return — which is before the stream is actually consumed).
+    fn with_trace_guard(mut self, guard: boom_trace::TraceGuard) -> Self {
+        self.trace_guard = Some(guard);
         self
     }
 }
@@ -528,7 +547,7 @@ async fn chat_completions_inner(
         identity.team_id.as_deref(),
     );
     let prompt_log_req_body = if prompt_log_should {
-        serde_json::to_value(&req).ok()
+        serde_json::to_value(&req).ok().map(Arc::new)
     } else {
         None
     };
@@ -579,6 +598,43 @@ async fn chat_completions_inner(
     } else {
         None
     };
+
+    // Trace channel: parse W3C context, run filter, open a TraceGuard if the
+    // request qualifies. The guard lives for the handler scope and finalizes
+    // on Drop (OK or ERROR based on whether `mark_error` was called). Body
+    // Arc is shared between the span's `llm_request` / `llm_response`
+    // attributes and the prompt log entry — zero-copy.
+    let trace_cfg = inner.config.trace.clone().unwrap_or_default();
+    let w3c_ctx: Option<W3cContext> = headers
+        .get("traceparent")
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_traceparent);
+    let should_trace = trace_cfg.enabled
+        && w3c_ctx
+            .as_ref()
+            .map(|w| boom_trace::trace_filter_matches(&trace_cfg.report_filter.tracestate_keys, &trace_cfg.report_filter.trace_id_regex, w))
+            .unwrap_or(false);
+    let mut trace_guard = if let Some(w3c) = w3c_ctx.as_ref() {
+        TraceGuard::start(
+            state.trace.clone(),
+            request_id.clone(),
+            w3c,
+            model.clone(),
+            api_path.to_string(),
+            is_stream,
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64,
+            should_trace,
+        )
+    } else {
+        None
+    };
+    // Capture request body for the span attribute (if capture_body on). Same
+    // Arc as the prompt log entry — shared, zero-copy.
+    if let (Some(g), Some(body)) = (trace_guard.as_ref(), prompt_log_req_body.as_ref()) {
+        if trace_cfg.capture_body {
+            g.set_llm_request(body.clone());
+        }
+    }
 
     // 1. Model access check (deployment-aware, alias-aware).
     check_model_access(identity, &req.model, &state.router, &inner.config.general_settings.public_models)
@@ -695,6 +751,24 @@ async fn chat_completions_inner(
         g.wait_duration().as_millis().min(i32::MAX as u128) as i32
     });
 
+    // Stamp trace attributes that the issue requires: request.id (always),
+    // time_in_queue (from fc_guard), user.id (extracted from tracestate
+    // when the inbound request carries one — conventionally the
+    // `opencode_user_id` key but configurable per-deployment via the
+    // tracestate filter). No-op when trace channel is off.
+    if let Some(g) = trace_guard.as_ref() {
+        use boom_core::trace::SpanAttributeValue;
+        g.set_attribute("boom-gateway.request.id", SpanAttributeValue::String(request_id.clone()));
+        if let Some(qw) = queue_wait_ms {
+            g.set_attribute("boom-gateway.time_in_queue", SpanAttributeValue::Int(qw as i64));
+        }
+        if let Some(w3c) = w3c_ctx.as_ref() {
+            if let Some(uid) = w3c.tracestate_value("opencode_user_id") {
+                g.set_attribute("boom-gateway.user.id", SpanAttributeValue::String(uid));
+            }
+        }
+    }
+
     // Attach gateway-internal headers (e.g. X-Gateway-Priority) plus the
     // client-whitelisted headers. The compose function injects client
     // whitelist first, gateway-controlled values second (overriding any
@@ -707,6 +781,49 @@ async fn chat_completions_inner(
         api_path,
         provider.client_type_header(),
     );
+    // Inject the child traceparent for the upstream LLM call. parent_span_id
+    // is the gateway's span_id; trace_id is the inbound W3C trace_id. When
+    // the trace channel is disabled (or no inbound traceparent), the
+    // `propagate_only` flag still forwards the original traceparent
+    // unchanged (W3C proxy-node minimum obligation). When neither channel
+    // is on AND propagate_only=false, we don't inject anything — the
+    // upstream sees no traceparent.
+    if let Some(w3c) = w3c_ctx.as_ref() {
+        if let Some(g) = trace_guard.as_ref() {
+            // Trace channel on: mint a child traceparent with gateway span as parent.
+            let child_tp = boom_trace::build_child_traceparent(
+                w3c.trace_id,
+                g.child_parent_span_id(),
+                w3c.sampled,
+            );
+            req.gateway_headers.insert(
+                "traceparent".to_string(),
+                child_tp,
+            );
+            if !w3c.trace_state.is_empty() {
+                req.gateway_headers.insert(
+                    "tracestate".to_string(),
+                    w3c.trace_state.clone(),
+                );
+            }
+        } else if trace_cfg.propagate_only {
+            // Trace channel off but propagate_only=true: forward the inbound
+            // traceparent unchanged. Read back the raw header value we
+            // already parsed.
+            if let Some(raw) = headers.get("traceparent").and_then(|v| v.to_str().ok()) {
+                req.gateway_headers.insert(
+                    "traceparent".to_string(),
+                    raw.to_string(),
+                );
+            }
+            if let Some(raw) = headers.get("tracestate").and_then(|v| v.to_str().ok()) {
+                req.gateway_headers.insert(
+                    "tracestate".to_string(),
+                    raw.to_string(),
+                );
+            }
+        }
+    }
     let provider_billing = ProviderBilling::default();
     let provider_prompt_trace = prompt_log_should.then(|| provider.create_prompt_trace()).flatten();
     let provider_context = ProviderCallContext {
@@ -748,6 +865,7 @@ async fn chat_completions_inner(
                     &e,
                     provider_prompt_trace.as_ref(),
                     start,
+                    trace_guard.as_mut(),
                 );
                 crate::health_monitor::record_request_failure(&state, &deployment_id, &e);
                 return Err(GatewayErrorReply(e, true));
@@ -808,6 +926,15 @@ async fn chat_completions_inner(
         }, start, usage, Some(state.agent_stats.clone()))
         .with_plan_charge(plan_charge)
         .with_provider_billing(provider_billing);
+        // Move the trace guard into the stream wrapper so its Drop runs at
+        // stream end (the actual response completion time), not at handler
+        // return. `.take()` returns None on the non-streaming path; the
+        // guard there drops at handler return — which is also the response
+        // completion (non-streaming returns the body in the same future).
+        let logged = match trace_guard.take() {
+            Some(g) => logged.with_trace_guard(g),
+            None => logged,
+        };
 
         // Wrap with prompt log stream if enabled, then wrap in Sse.
         if let Some(sender) = prompt_log_sender {
@@ -883,6 +1010,7 @@ async fn chat_completions_inner(
                     &e,
                     provider_prompt_trace.as_ref(),
                     start,
+                    trace_guard.as_mut(),
                 );
                 crate::health_monitor::record_request_failure(&state, &deployment_id, &e);
                 return Err(GatewayErrorReply(e, false));
@@ -984,9 +1112,14 @@ async fn chat_completions_inner(
                 );
                 let _ = sender.send(request_entry.clone());
                 let mut response_entry = PromptLogEntry::new_response_from(&request_entry);
-                response_entry.set_response(
-                    serde_json::to_value(&resp).unwrap_or(serde_json::Value::Null),
-                );
+                let resp_arc = Arc::new(serde_json::to_value(&resp).unwrap_or(serde_json::Value::Null));
+                response_entry.set_response(resp_arc.clone());
+                // Span sees the same Arc — zero-copy body single-source.
+                if let Some(g) = trace_guard.as_ref() {
+                    if trace_cfg.capture_body {
+                        g.set_llm_response(resp_arc);
+                    }
+                }
                 if let Some(trace) = provider_prompt_trace.as_ref() {
                     trace.finalize();
                     if let Some(fusion) = trace.snapshot() {
@@ -2729,7 +2862,7 @@ pub async fn messages(
     );
     let prompt_log_capture_raw = prompt_log_should && state.prompt_log_writer.config().capture_raw_upstream;
     let prompt_log_req_body = if prompt_log_should {
-        serde_json::to_value(&req).ok()
+        serde_json::to_value(&req).ok().map(Arc::new)
     } else {
         None
     };
@@ -2777,6 +2910,39 @@ pub async fn messages(
     } else {
         None
     };
+
+    // Trace channel: parse W3C context, run filter, open a TraceGuard if the
+    // request qualifies. See the chat_completions path for the long-form
+    // explanation — both handlers share the same logic.
+    let trace_cfg = inner.config.trace.clone().unwrap_or_default();
+    let w3c_ctx: Option<W3cContext> = headers
+        .get("traceparent")
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_traceparent);
+    let should_trace = trace_cfg.enabled
+        && w3c_ctx
+            .as_ref()
+            .map(|w| boom_trace::trace_filter_matches(&trace_cfg.report_filter.tracestate_keys, &trace_cfg.report_filter.trace_id_regex, w))
+            .unwrap_or(false);
+    let mut trace_guard = if let Some(w3c) = w3c_ctx.as_ref() {
+        TraceGuard::start(
+            state.trace.clone(),
+            request_id.clone(),
+            w3c,
+            model.clone(),
+            "/v1/messages".to_string(),
+            is_stream,
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64,
+            should_trace,
+        )
+    } else {
+        None
+    };
+    if let (Some(g), Some(body)) = (trace_guard.as_ref(), prompt_log_req_body.as_ref()) {
+        if trace_cfg.capture_body {
+            g.set_llm_request(body.clone());
+        }
+    }
 
     // 1. Model access check (deployment-aware, alias-aware).
     check_model_access(identity, &openai_req.model, &state.router, &inner.config.general_settings.public_models)
@@ -2888,6 +3054,21 @@ pub async fn messages(
         g.wait_duration().as_millis().min(i32::MAX as u128) as i32
     });
 
+    // Stamp trace attributes (request.id, time_in_queue, user.id). Mirror
+    // of the chat_completions path.
+    if let Some(g) = trace_guard.as_ref() {
+        use boom_core::trace::SpanAttributeValue;
+        g.set_attribute("boom-gateway.request.id", SpanAttributeValue::String(request_id.clone()));
+        if let Some(qw) = queue_wait_ms {
+            g.set_attribute("boom-gateway.time_in_queue", SpanAttributeValue::Int(qw as i64));
+        }
+        if let Some(w3c) = w3c_ctx.as_ref() {
+            if let Some(uid) = w3c.tracestate_value("opencode_user_id") {
+                g.set_attribute("boom-gateway.user.id", SpanAttributeValue::String(uid));
+            }
+        }
+    }
+
     // Attach gateway-internal headers (e.g. X-Gateway-Priority) plus the
     // client-whitelisted headers. compose injects client whitelist first,
     // gateway-controlled values second (overriding any same-named client
@@ -2900,6 +3081,40 @@ pub async fn messages(
         "/v1/messages",
         provider.client_type_header(),
     );
+    // Inject child traceparent — see chat_completions path for the long-form
+    // explanation of the propagate_only / trace-on branching.
+    if let Some(w3c) = w3c_ctx.as_ref() {
+        if let Some(g) = trace_guard.as_ref() {
+            let child_tp = boom_trace::build_child_traceparent(
+                w3c.trace_id,
+                g.child_parent_span_id(),
+                w3c.sampled,
+            );
+            openai_req.gateway_headers.insert(
+                "traceparent".to_string(),
+                child_tp,
+            );
+            if !w3c.trace_state.is_empty() {
+                openai_req.gateway_headers.insert(
+                    "tracestate".to_string(),
+                    w3c.trace_state.clone(),
+                );
+            }
+        } else if trace_cfg.propagate_only {
+            if let Some(raw) = headers.get("traceparent").and_then(|v| v.to_str().ok()) {
+                openai_req.gateway_headers.insert(
+                    "traceparent".to_string(),
+                    raw.to_string(),
+                );
+            }
+            if let Some(raw) = headers.get("tracestate").and_then(|v| v.to_str().ok()) {
+                openai_req.gateway_headers.insert(
+                    "tracestate".to_string(),
+                    raw.to_string(),
+                );
+            }
+        }
+    }
 
     // Capture request body for debug recording if debug mode is enabled.
     let debug_req_body = if state.debug_store.is_enabled() {
@@ -2915,6 +3130,9 @@ pub async fn messages(
             Err(e) => {
                 log_error(&state, &identity, &model, "/v1/messages", true, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()));
                 crate::health_monitor::record_request_failure(&state, &deployment_id, &e);
+                if let Some(g) = trace_guard.as_mut() {
+                    g.mark_error(e.to_string());
+                }
                 // plan_charge drops here without commit — no quota consumed.
                 return Err(AnthropicErrorReply(e, true));
             }
@@ -2978,6 +3196,12 @@ pub async fn messages(
             queue_wait_ms,
         }, start, usage, Some(state.agent_stats.clone()))
         .with_plan_charge(plan_charge);
+        // Move the trace guard into the stream wrapper (mirror of the
+        // chat_completions path — see comment there for the rationale).
+        let logged = match trace_guard.take() {
+            Some(g) => logged.with_trace_guard(g),
+            None => logged,
+        };
 
         // Wrap with prompt log stream if enabled, then wrap in Sse.
         if let Some(sender) = prompt_log_sender {
@@ -3016,6 +3240,9 @@ pub async fn messages(
             Err(e) => {
                 log_error(&state, &identity, &model, "/v1/messages", false, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()));
                 crate::health_monitor::record_request_failure(&state, &deployment_id, &e);
+                if let Some(g) = trace_guard.as_mut() {
+                    g.mark_error(e.to_string());
+                }
                 // plan_charge drops here without commit — no quota consumed.
                 return Err(AnthropicErrorReply(e, false));
             }
@@ -3113,14 +3340,21 @@ pub async fn messages(
                 if prompt_log_capture_raw {
                     if let Some(ref raw) = response.raw_response {
                         response_entry.set_raw_upstream_response(
-                            serde_json::from_str::<serde_json::Value>(raw)
-                                .unwrap_or(serde_json::Value::String(raw.clone())),
+                            Arc::new(
+                                serde_json::from_str::<serde_json::Value>(raw)
+                                    .unwrap_or(serde_json::Value::String(raw.clone())),
+                            ),
                         );
                     }
                 }
-                response_entry.set_response(
-                    serde_json::to_value(&anthropic_resp).unwrap_or(serde_json::Value::Null),
-                );
+                let resp_arc = Arc::new(serde_json::to_value(&anthropic_resp).unwrap_or(serde_json::Value::Null));
+                response_entry.set_response(resp_arc.clone());
+                // Span sees the same Arc — zero-copy body single-source.
+                if let Some(g) = trace_guard.as_ref() {
+                    if trace_cfg.capture_body {
+                        g.set_llm_response(resp_arc);
+                    }
+                }
                 response_entry.set_status(200, duration_ms as u64);
                 let _ = sender.send(response_entry);
             }

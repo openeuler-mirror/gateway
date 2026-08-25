@@ -38,7 +38,7 @@ Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
 ### 1. 模块依赖方向：单向、无环
 
 ```
-boom-core ← boom-auth, boom-provider, boom-config, boom-limiter, boom-audit
+boom-core ← boom-auth, boom-provider, boom-config, boom-limiter, boom-audit, boom-trace
 boom-routing → boom-core, boom-config, boom-ctxaware, boom-flowcontrol, boom-fusion
 boom-main → 依赖所有 boom-* 模块（组装层）
 boom-dashboard → boom-core, boom-limiter, boom-routing, boom-audit（禁止依赖 boom-provider, boom-config）
@@ -47,6 +47,7 @@ boom-dashboard → boom-core, boom-limiter, boom-routing, boom-audit（禁止依
 - **boom-core 是唯一的叶子依赖**。所有功能模块只依赖 boom-core，不互相依赖。
 - **boom-main 是唯一的根**。它负责组装所有模块、管理生命周期、处理路由。其他模块之间不直接通信。
 - **boom-dashboard 不依赖 boom-provider 和 boom-config**。Dashboard 需要操作模型/配置时，通过 AdminCommand channel 异步通知 boom-main 处理。
+- **boom-trace 是 leaf crate**（与 boom-stressmon 同款），只依赖 boom-core。`TraceApi` trait 定义在 boom-core（§5 trait-over-concrete-type 模式），让 boom-dashboard 用 `Arc<dyn TraceApi>` 消费而不依赖本 crate。
 
 ### 2. 每个模块有清晰的职责边界
 
@@ -59,6 +60,7 @@ boom-dashboard → boom-core, boom-limiter, boom-routing, boom-audit（禁止依
 | boom-limiter | 滑动窗口限流、并发控制、PlanStore | 不感知 Provider |
 | boom-routing | DeploymentStore、AliasStore、调度策略、Fusion 虚拟 Provider 编排 | 不实现上游 HTTP 协议；只调用 `Provider` trait |
 | boom-audit | 请求日志读写（boom_request_log 表） | 不做路由决策 |
+| boom-trace | 请求级 trace 链路 + 延迟分布（in-memory 直方图、慢请求 ring buffer、OTLP traces 导出） | 不写 DB 表（持久化归 boom-audit）、不记 prompt 内容（归 boom-promptlog）、不做路由决策 |
 | boom-dashboard | Web UI + REST API + JWT 认证 | 不直接操作 Provider/Config |
 | boom-main | 路由处理、状态组装、热加载、后台任务 | 不在 handler 里写业务逻辑 |
 
@@ -166,6 +168,7 @@ boom-gateway/           — Rust workspace root
   boom-limiter/         — 速率限制 + 并发控制 + PlanStore
   boom-routing/         — DeploymentStore + AliasStore
   boom-audit/           — 请求日志读写
+  boom-trace/           — 请求级 trace 链路 + 延迟分布
   boom-dashboard/       — Web 管理 UI + REST API
   boom-main/            — 主程序入口、路由、状态组装
 misc/LB/                — Pingora 负载均衡代理（独立项目）

@@ -61,6 +61,12 @@ pub struct PromptLogStream<S, F> {
     delta_fn: F,
     /// Shared buffer for raw upstream SSE chunks (before format conversion).
     /// Only set when `capture_raw_upstream` is enabled for Anthropic-format endpoints.
+    /// `Vec<String>` of complete SSE event blocks — each entry is one
+    /// `data: {...}\n\n` segment. The producer appends; this wrapper reads +
+    /// ships on Drop. Kept as `Vec<String>` (not a single tee `String`)
+    /// because downstream consumers (raw_upstream_response attribute)
+    /// expect discrete chunks for forensic replay — concatenating would
+    /// lose the chunk boundaries.
     raw_upstream_chunks: Option<Arc<std::sync::Mutex<Vec<String>>>>,
     /// Adds provider-owned metadata after the wrapped stream has been dropped.
     entry_enricher: Option<Arc<dyn Fn(&mut PromptLogEntry) + Send + Sync>>,
@@ -114,8 +120,10 @@ impl<S, F> Drop for PromptLogStream<S, F> {
         // Build a ChatCompletion-style assembled response. This isn't a chunk
         // array — it's the message a client would have received if it had
         // buffered the whole stream. Lets a human reading the JSONL see the
-        // final assistant text without replaying chunks.
-        let response = serde_json::json!({
+        // final assistant text without replaying chunks. Wrap in `Arc` so
+        // the same allocation can be shared with `boom_trace::RequestSpan`'s
+        // `boom-gateway.llm_response` attribute (single-source-of-truth).
+        let response = Arc::new(serde_json::json!({
             "id": req_entry.request_id,
             "object": "chat.completion",
             "model": req_entry.model,
@@ -128,7 +136,7 @@ impl<S, F> Drop for PromptLogStream<S, F> {
                 "finish_reason": self.finish_reason.clone(),
             }],
             "usage": self.usage.clone(),
-        });
+        }));
 
         let mut entry = PromptLogEntry::new_response_from(&req_entry);
         entry.set_response(response);
@@ -158,6 +166,8 @@ impl<S, F> Drop for PromptLogStream<S, F> {
         }
 
         // Capture raw upstream chunks if available (before format conversion).
+        // Wrapped in Arc so the same allocation can be shared with the trace
+        // span's `boom-gateway.llm_response` attribute if the producer wires it.
         if let Some(ref raw_chunks) = self.raw_upstream_chunks {
             if let Ok(guard) = raw_chunks.lock() {
                 if !guard.is_empty() {
@@ -165,11 +175,11 @@ impl<S, F> Drop for PromptLogStream<S, F> {
                         .iter()
                         .filter_map(|s| serde_json::from_str::<serde_json::Value>(s).ok())
                         .collect();
-                    entry.set_raw_upstream_response(serde_json::json!({
+                    entry.set_raw_upstream_response(Arc::new(serde_json::json!({
                         "stream": true,
                         "raw_chunk_count": raw_values.len(),
                         "raw_chunks": raw_values,
-                    }));
+                    })));
                 }
             }
         }
@@ -235,6 +245,7 @@ mod tests {
     use futures::stream;
     use futures::StreamExt;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
 
     fn make_request_entry(id: &str) -> PromptLogEntry {
         PromptLogEntry::new_request(
@@ -246,7 +257,7 @@ mod tests {
             "gpt-4",
             "/v1/chat/completions",
             true,
-            serde_json::json!({}),
+            Arc::new(serde_json::json!({})),
             None,
             None,
         )
@@ -376,7 +387,7 @@ mod tests {
             "test-model",
             "/v1/chat/completions",
             true,
-            serde_json::json!({"model": "test-model"}),
+            Arc::new(serde_json::json!({"model": "test-model"})),
             None,
             None,
         );
@@ -391,9 +402,9 @@ mod tests {
             None,
         )
         .with_entry_enricher(Arc::new(move |entry| {
-            entry.set_raw_upstream_response(serde_json::json!({
+            entry.set_raw_upstream_response(Arc::new(serde_json::json!({
                 "inner_dropped": snapshot_dropped.load(Ordering::SeqCst)
-            }));
+            })));
         }));
 
         drop(stream);
