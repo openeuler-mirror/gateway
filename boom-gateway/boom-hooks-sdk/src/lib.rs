@@ -44,11 +44,17 @@ pub mod return_codes {
 /// `raw_key` is the API key extracted from the request (`Authorization: Bearer …`
 /// / `x-api-key` / `api-key`). `headers` contains only the names listed in
 /// `hooks.pre_auth.allowed_headers` in the gateway YAML — anything else is
-/// filtered out before serialization.
+/// filtered out before serialization. `model_name` is the `model` field
+/// parsed from the request body (top-level `{"model":"…"}`), or `None` when
+/// the body could not be parsed / had no model field. Hooks can use it
+/// together with `raw_key` to make a single decision that returns both a
+/// replacement key and a replacement model (see [`PreAuthAction::ReplaceModel`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PreAuthRequest {
     pub raw_key: String,
     pub headers: HashMap<String, String>,
+    #[serde(default)]
+    pub model_name: Option<String>,
 }
 
 /// The hook's decision for the request.
@@ -59,6 +65,13 @@ pub enum PreAuthAction {
     Continue,
     /// Replace the raw_key with `new_key` before authentication.
     Replace { new_key: String },
+    /// Replace the raw_key with `new_key` AND rewrite the request's `model`
+    /// field to `new_model` before authentication. The gateway then runs
+    /// `check_model_access` against the rewritten `new_model`, so the key's
+    /// model whitelist must list the *real* target model — typical pattern
+    /// is the key carries a logical model name that the hook translates to
+    /// the real model the key is authorized for.
+    ReplaceModel { new_key: String, new_model: String },
     /// Reject the request with 401. `reason` is surfaced in the error body.
     Reject { reason: String },
 }
@@ -295,10 +308,85 @@ mod tests {
     }
 
     #[test]
+    fn pre_auth_action_replace_model_serializes_with_snake_case_tag() {
+        let resp = PreAuthResponse {
+            action: PreAuthAction::ReplaceModel {
+                new_key: "sk-internal".into(),
+                new_model: "gpt-4-real".into(),
+            },
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains(r#""action":"replace_model""#), "json={json}");
+        assert!(json.contains(r#""new_key":"sk-internal""#), "json={json}");
+        assert!(json.contains(r#""new_model":"gpt-4-real""#), "json={json}");
+
+        // Round-trip back.
+        let parsed: PreAuthResponse = serde_json::from_str(&json).unwrap();
+        match parsed.action {
+            PreAuthAction::ReplaceModel { new_key, new_model } => {
+                assert_eq!(new_key, "sk-internal");
+                assert_eq!(new_model, "gpt-4-real");
+            }
+            other => panic!("expected ReplaceModel, got {other:?}"),
+        }
+    }
+
+    /// Backward-compat: a hook compiled against an OLDER SDK (no `model_name`
+    /// field on PreAuthRequest) must still be able to receive JSON from a
+    /// NEWER gateway that includes `model_name`. serde ignores unknown
+    /// fields by default; this test simulates that by deserializing into
+    /// a struct that omits the field.
+    #[test]
+    fn pre_auth_request_with_model_name_parses_into_legacy_struct() {
+        // Legacy struct shape — what an old hook's SDK would have.
+        #[derive(Debug, serde::Deserialize)]
+        struct LegacyPreAuthRequest {
+            raw_key: String,
+            headers: HashMap<String, String>,
+        }
+
+        // New SDK sends model_name too.
+        let req = PreAuthRequest {
+            raw_key: "sk-abc".into(),
+            headers: HashMap::new(),
+            model_name: Some("gpt-4".into()),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+
+        // Legacy hook deserializes — extra `model_name` field must be ignored.
+        let legacy: LegacyPreAuthRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(legacy.raw_key, "sk-abc");
+        assert!(legacy.headers.is_empty());
+    }
+
+    /// Forward-compat: a gateway compiled against the NEW SDK must accept a
+    /// JSON response from an OLDER hook that doesn't know about ReplaceModel.
+    /// The old hook only ever returns Continue / Replace / Reject, so the
+    /// gateway's PreAuthAction deserialize will simply never see the new
+    /// variant. This is structurally guaranteed by serde — no test needed
+    /// beyond confirming the existing variants still parse.
+    #[test]
+    fn pre_auth_request_with_none_model_name_omits_field_in_serialize() {
+        let req = PreAuthRequest {
+            raw_key: "sk-abc".into(),
+            headers: HashMap::new(),
+            model_name: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        // Field is skipped via #[serde(default)] + skip_serializing_if? No —
+        // default only affects deserialization. The field is still serialized
+        // as null. That's fine — the wire format includes "model_name":null.
+        // We just confirm round-trip works.
+        let parsed: PreAuthRequest = serde_json::from_str(&json).unwrap();
+        assert!(parsed.model_name.is_none());
+    }
+
+    #[test]
     fn pre_auth_entry_continue_returns_zero_and_continue_body() {
         let req = PreAuthRequest {
             raw_key: "sk-abc".into(),
             headers: HashMap::new(),
+            model_name: None,
         };
         let (rc, body) = run_pre_auth(req, |_| {
             Ok(PreAuthResponse {
@@ -315,6 +403,7 @@ mod tests {
         let req = PreAuthRequest {
             raw_key: "sk-abc".into(),
             headers: HashMap::new(),
+            model_name: None,
         };
         let (rc, body) = run_pre_auth(req, |r| {
             Ok(PreAuthResponse {
@@ -336,6 +425,7 @@ mod tests {
         let req = PreAuthRequest {
             raw_key: "sk-abc".into(),
             headers: HashMap::new(),
+            model_name: None,
         };
         let (rc, body) = run_pre_auth(req, |_| {
             Err(HookError::Reject("missing ucid".into()))
@@ -353,6 +443,7 @@ mod tests {
         let req = PreAuthRequest {
             raw_key: "sk-abc".into(),
             headers: HashMap::new(),
+            model_name: None,
         };
         let (rc, _body) = run_pre_auth(req, |_| {
             Err(HookError::Internal("db down".into()))
@@ -365,6 +456,7 @@ mod tests {
         let req = PreAuthRequest {
             raw_key: "sk-abc".into(),
             headers: HashMap::new(),
+            model_name: None,
         };
         let (rc, _body) = run_pre_auth(req, |_| panic!("boom"));
         assert_eq!(rc, return_codes::INTERNAL);

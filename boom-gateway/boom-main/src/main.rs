@@ -151,16 +151,28 @@ async fn async_main(args: Args, config: boom_config::Config) -> anyhow::Result<(
 }
 
 fn build_router(state: AppState) -> Router {
-    let api_routes = Router::new()
+    // LLM endpoints — these routes use `CachedJson<T>` (a `FromRequest`)
+    // as the body extractor, paired with `RequiredAuth` (a
+    // `FromRequestParts`). `RequiredAuth` is FromRequestParts because
+    // axum 0.8 forbids two `FromRequest` extractors in one handler
+    // signature. To let `RequiredAuth` still see the request's `model`
+    // field for the pre_auth hook, the `buffer_request_body` middleware
+    // buffers the body once into `Request::extensions()` as
+    // `CachedBodyBytes` *before* any extractor runs. Both `RequiredAuth`
+    // (probe) and `CachedJson<T>` (deserialize) then read from extensions.
+    let llm_routes = Router::new()
         // Primary routes (with /v1 prefix)
         .route("/v1/chat/completions", post(routes::chat_completions))
         .route("/v1/messages", post(routes::messages))
-        .route("/v1/models", get(routes::list_models))
-        .route("/v1/models/{id}", get(routes::get_model))
         .route("/v1/completions", post(routes::completions))
         // Alias routes (without /v1 prefix — OpenAI client compatibility)
         .route("/chat/completions", post(routes::chat_completions))
         .route("/completions", post(routes::completions))
+        .layer(axum::middleware::from_fn(extractor::buffer_request_body));
+
+    let api_routes = Router::new()
+        .route("/v1/models", get(routes::list_models))
+        .route("/v1/models/{id}", get(routes::get_model))
         .route("/models", get(routes::list_models))
         .route("/models/{id}", get(routes::get_model))
         // Unsupported endpoints (return proper errors)
@@ -233,6 +245,7 @@ fn build_router(state: AppState) -> Router {
 
     let request_count = state.request_count.clone();
     Router::new()
+        .merge(llm_routes)
         .merge(api_routes)
         .merge(health_routes)
         .merge(internal_routes)

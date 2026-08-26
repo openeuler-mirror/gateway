@@ -187,6 +187,12 @@ impl LoadedHook {
 /// - `Continue` — original raw_key should be used (either the hook said
 ///   `Continue`, or the call failed and `failure_mode = allow` degraded).
 /// - `Replace(new_key)` — hook swapped the key.
+/// - `ReplaceModel { new_key, new_model }` — hook swapped the key AND wants
+///   the request's `model` field rewritten to `new_model` before auth +
+///   routing. The caller (RequiredAuth extractor) is responsible for
+///   surfacing `new_model` to the handler so `check_model_access` runs
+///   against the rewritten model name (the key's whitelist must list the
+///   *real* target model).
 /// - `Reject(reason)` — hook rejected the request, return 401.
 /// - `Deny` — the call failed and `failure_mode = deny` was set. Caller
 ///   returns a 500 to the client.
@@ -196,6 +202,7 @@ pub enum PreAuthOutcome {
     NoHook,
     Continue,
     Replace(String),
+    ReplaceModel { new_key: String, new_model: String },
     Reject(String),
     Deny,
 }
@@ -231,11 +238,15 @@ impl HookRegistry {
     /// Run the `pre_auth` hook for a request and apply `failure_mode`.
     ///
     /// `headers` is the full request HeaderMap; the registry filters it down
-    /// to `allowed_headers` before passing to the plugin.
+    /// to `allowed_headers` before passing to the plugin. `model` is the
+    /// top-level `model` field parsed from the request body (`None` if the
+    /// body couldn't be parsed / had no model field) — lets the hook make a
+    /// single decision that returns both `new_key` and `new_model`.
     pub fn pre_auth(
         &self,
         raw_key: &str,
         headers: &axum::http::HeaderMap,
+        model: Option<&str>,
     ) -> PreAuthOutcome {
         let Some(hook) = self.pre_auth.as_ref() else {
             return PreAuthOutcome::NoHook;
@@ -254,11 +265,15 @@ impl HookRegistry {
                     }
                 })
                 .collect(),
+            model_name: model.map(String::from),
         };
 
         match hook.call(req) {
             Ok(PreAuthAction::Continue) => PreAuthOutcome::Continue,
             Ok(PreAuthAction::Replace { new_key }) => PreAuthOutcome::Replace(new_key),
+            Ok(PreAuthAction::ReplaceModel { new_key, new_model }) => {
+                PreAuthOutcome::ReplaceModel { new_key, new_model }
+            }
             Ok(PreAuthAction::Reject { reason }) => PreAuthOutcome::Reject(reason),
             Err(e) => {
                 tracing::warn!(error = %e, "pre_auth hook call failed");
@@ -326,7 +341,7 @@ mod tests {
     fn empty_config_produces_no_hook_outcome() {
         let cfg = HooksConfig::default();
         let reg = HookRegistry::from_config(&cfg).expect("empty config should load");
-        let outcome = reg.pre_auth("sk-anything", &HeaderMap::new());
+        let outcome = reg.pre_auth("sk-anything", &HeaderMap::new(), None);
         assert!(matches!(outcome, PreAuthOutcome::NoHook));
     }
 
@@ -344,7 +359,7 @@ mod tests {
         };
         let reg = HookRegistry::from_config(&cfg).expect("disabled config should load");
         assert!(matches!(
-            reg.pre_auth("sk-abc", &HeaderMap::new()),
+            reg.pre_auth("sk-abc", &HeaderMap::new(), None),
             PreAuthOutcome::NoHook
         ));
     }
@@ -364,7 +379,7 @@ mod tests {
         let cfg = make_cfg(&path, HookFailureMode::Allow, r#"{"prefix":"sk-customer-"}"#);
         let reg = HookRegistry::from_config(&cfg).expect("plugin should load");
 
-        let outcome = reg.pre_auth("sk-abc", &HeaderMap::new());
+        let outcome = reg.pre_auth("sk-abc", &HeaderMap::new(), None);
         match outcome {
             PreAuthOutcome::Replace(new_key) => {
                 assert!(
@@ -397,7 +412,7 @@ mod tests {
         let cfg = make_cfg(&path, HookFailureMode::Allow, "{}");
         let reg = HookRegistry::from_config(&cfg).expect("plugin should load");
 
-        let outcome = reg.pre_auth("sk-abc", &HeaderMap::new());
+        let outcome = reg.pre_auth("sk-abc", &HeaderMap::new(), None);
         match outcome {
             PreAuthOutcome::Replace(new_key) => {
                 // Accept either the default or the persisted value from an
