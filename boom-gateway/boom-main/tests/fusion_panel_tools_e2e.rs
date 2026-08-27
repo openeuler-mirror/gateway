@@ -138,6 +138,8 @@ impl TempConfig {
         panel_b: SocketAddr,
         aggregator: SocketAddr,
         panel_timeout_secs: Option<u64>,
+        aggregator_enabled: bool,
+        panel_a_serve_not_match: bool,
     ) -> Self {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -157,6 +159,7 @@ impl TempConfig {
             r#"
 model_list:
   - model_name: panel-a
+    serve_not_match: {panel_a_serve_not_match}
     model_info:
       id: panel-a-deployment
     litellm_params:
@@ -173,6 +176,7 @@ model_list:
       api_base: http://{panel_b}/v1
       timeout: 30
   - model_name: aggregator
+    enabled: {aggregator_enabled}
     model_info:
       id: aggregator-deployment
     litellm_params:
@@ -225,6 +229,8 @@ deployment_health_check:
             panel_a = panel_a,
             panel_b = panel_b,
             aggregator = aggregator,
+            aggregator_enabled = aggregator_enabled,
+            panel_a_serve_not_match = panel_a_serve_not_match,
             prompt_log_dir = prompt_log_dir.display(),
         );
         fs::write(&path, content).expect("failed to write temporary config");
@@ -270,7 +276,29 @@ impl TestGateway {
             panel_b.address,
             aggregator.address,
             panel_timeout_secs,
+            true,
+            false,
         );
+        Self::start_with_config(config).await
+    }
+
+    async fn start_with_disabled_aggregator(
+        panel_a: &MockUpstream,
+        panel_b: &MockUpstream,
+        aggregator: &MockUpstream,
+    ) -> Self {
+        let config = TempConfig::create_with_options(
+            panel_a.address,
+            panel_b.address,
+            aggregator.address,
+            None,
+            false,
+            true,
+        );
+        Self::start_with_config(config).await
+    }
+
+    async fn start_with_config(config: TempConfig) -> Self {
         let port = unused_port();
         let mut process = GatewayProcess::spawn(&config.path, port);
         let client = reqwest::Client::new();
@@ -1064,6 +1092,59 @@ async fn aggregator_header_failure_falls_back_for_json_and_stream() {
         assert_eq!(call["status"], "failed");
         assert_eq!(call["error"]["upstream_status"], 502);
     }
+}
+
+#[tokio::test]
+async fn disabled_aggregator_does_not_block_startup_and_fails_at_runtime() {
+    let panel_a = start_mock(MockBehavior::Success {
+        model: "panel-a-upstream",
+        content: "panel A answer",
+    })
+    .await;
+    let panel_b = start_mock(MockBehavior::Success {
+        model: "panel-b-upstream",
+        content: "panel B answer",
+    })
+    .await;
+    let aggregator = start_mock(MockBehavior::Success {
+        model: "aggregator-upstream",
+        content: "must not be called",
+    })
+    .await;
+
+    // Reaching this point proves the real Gateway process became healthy even
+    // though the Fusion workflow's configured aggregator is disabled. Panel A
+    // is also the "*" catch-all, which must not take over this child call.
+    let gateway =
+        TestGateway::start_with_disabled_aggregator(&panel_a, &panel_b, &aggregator).await;
+
+    let json_response = gateway
+        .post(&fusion_request("missing aggregator json", false, None))
+        .await;
+    assert_eq!(json_response.status(), StatusCode::BAD_GATEWAY);
+    let json_body: Value = json_response.json().await.unwrap();
+    assert_eq!(json_body["error"]["type"], "provider_error");
+    let json_message = json_body["error"]["message"].as_str().unwrap();
+    assert!(json_message.contains("failed at aggregator stage"));
+    assert!(json_message.contains("Model not found: aggregator"));
+
+    let stream_response = gateway
+        .post(&fusion_request("missing aggregator stream", true, None))
+        .await;
+    assert_eq!(stream_response.status(), StatusCode::OK);
+    let stream_body = stream_response.text().await.unwrap();
+    let stream_error = sse_json_events(&stream_body)
+        .into_iter()
+        .find(|event| event["error"]["type"] == "provider_error")
+        .expect("stream did not contain a provider_error event");
+    assert_eq!(stream_error["error"]["code"], 502);
+    let stream_message = stream_error["error"]["message"].as_str().unwrap();
+    assert!(stream_message.contains("failed at aggregator stage"));
+    assert!(stream_message.contains("Model not found: aggregator"));
+
+    assert_eq!(panel_a.call_count(), 2);
+    assert_eq!(panel_b.call_count(), 2);
+    assert_eq!(aggregator.call_count(), 0);
 }
 
 #[tokio::test]

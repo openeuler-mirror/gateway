@@ -203,6 +203,12 @@ Reload 时真实 deployment store 会先按现有流程重建，然后重新注�
 新请求通过同一个 Router 观察新 Provider；已经取得旧 Provider 的进行中请求继续
 使用旧 workflow 和运行时快照。
 
+Panel 或 aggregator 当前没有活跃 deployment 时，FusionProvider 仍会完成注册，
+Gateway 启动和 reload 不会因此失败。实际请求执行到对应子模型时，由运行期路由返回
+模型不可用错误；缺失 aggregator 不会触发 panel 降级。对当前活跃 provider 的
+OpenAI 兼容协议校验仍在注册期执行。Fusion 子模型只在显式模型或 alias 解析后的
+deployment candidates 中调度，不使用 `*` catch-all 替代缺失依赖。
+
 启动和 reload 会同时检查 DB-only deployment 与 alias。Workflow 模型名与任何
 已有资源冲突时直接拒绝，不覆盖或遮蔽真实资源。Reload 在清空旧 store 前完成 DB
 命名空间预检。
