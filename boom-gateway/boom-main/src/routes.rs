@@ -1,4 +1,4 @@
-use crate::extractor::RequiredAuth;
+use crate::extractor::{CachedJson, RequiredAuth};
 use crate::request_log::{log_error, log_error_with_queue_wait, log_error_with_usage, log_request, RequestLog};
 use crate::state::AppState;
 use axum::extract::{ConnectInfo, Path, State};
@@ -517,7 +517,7 @@ pub async fn chat_completions(
     auth: RequiredAuth,
     headers: axum::http::HeaderMap,
     ConnectInfo(remote_addr): ConnectInfo<std::net::SocketAddr>,
-    Json(req): Json<ChatCompletionRequest>,
+    CachedJson(req): CachedJson<ChatCompletionRequest>,
 ) -> Result<impl IntoResponse, GatewayErrorReply> {
     chat_completions_inner(state, auth, &headers, Some(remote_addr), req, "/v1/chat/completions").await
 }
@@ -525,7 +525,7 @@ pub async fn chat_completions(
 /// Shared inner logic for chat completions and legacy completions.
 async fn chat_completions_inner(
     state: AppState,
-    auth: RequiredAuth,
+    mut auth: RequiredAuth,
     headers: &axum::http::HeaderMap,
     remote_addr: Option<std::net::SocketAddr>,
     mut req: ChatCompletionRequest,
@@ -533,9 +533,15 @@ async fn chat_completions_inner(
 ) -> Result<impl IntoResponse, GatewayErrorReply> {
     let start = Instant::now();
     let request_id = new_request_id();
-    let identity = auth.identity();
     let client_ip = extract_client_ip(headers, remote_addr);
     let inner = state.inner.load();
+    // pre_auth hook may have decided to rewrite the request's model (along
+    // with the key). Apply before any downstream consumer — check_model_access
+    // will then verify the rewritten model is in the key's whitelist.
+    if let Some(new_model) = auth.take_new_model() {
+        req.model = new_model;
+    }
+    let identity = auth.identity();
     let model = req.model.clone();
     let is_stream = req.stream.unwrap_or(false);
 
@@ -1144,7 +1150,7 @@ pub async fn completions(
     auth: RequiredAuth,
     headers: axum::http::HeaderMap,
     ConnectInfo(remote_addr): ConnectInfo<std::net::SocketAddr>,
-    Json(req): Json<CompletionRequest>,
+    CachedJson(req): CachedJson<CompletionRequest>,
 ) -> Result<impl IntoResponse, GatewayErrorReply> {
     let chat_req = req.into_chat_request();
     chat_completions_inner(state, auth, &headers, Some(remote_addr), chat_req, "/v1/completions").await
@@ -2825,16 +2831,24 @@ fn sse_stream_from_chat_stream(
 
 pub async fn messages(
     State(state): State<AppState>,
-    auth: RequiredAuth,
+    mut auth: RequiredAuth,
     headers: axum::http::HeaderMap,
     ConnectInfo(remote_addr): ConnectInfo<std::net::SocketAddr>,
-    Json(mut req): Json<AnthropicMessagesRequest>,
+    CachedJson(mut req): CachedJson<AnthropicMessagesRequest>,
 ) -> Result<impl IntoResponse, AnthropicErrorReply> {
     let start = Instant::now();
     let request_id = new_request_id();
-    let identity = auth.identity();
     let client_ip = extract_client_ip(&headers, Some(remote_addr));
     let inner = state.inner.load();
+
+    // pre_auth hook may have decided to rewrite the request's model (along
+    // with the key). Apply before anthropic_request_to_openai so the
+    // converted openai_req inherits the rewritten model — downstream
+    // check_model_access / limiter / prompt log / trace all see new_model.
+    if let Some(new_model) = auth.take_new_model() {
+        req.model = new_model;
+    }
+    let identity = auth.identity();
 
     // Optional body rewrite: strip Claude Code's attribution block from the
     // system prompt. Done before anthropic_request_to_openai so that both the

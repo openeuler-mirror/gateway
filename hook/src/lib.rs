@@ -1,20 +1,41 @@
-//! 最简 pre_auth hook demo —— 打印 masked key 后透传。
+//! 最简 pre_auth hook demo —— 打印 key + model name 后透传。
 //!
 //! 行为：
-//!   1. gateway 每收到一个请求，extractor 提取 raw_key 后调本 hook
-//!   2. 本 hook 把 key 脱敏后用 eprintln! 打印到 stderr
-//!      - 前 3 个字符原样显示
-//!      - 中间所有字符替换为 *
-//!      - 末尾 6 个字符原样显示
-//!   3. 返回 Continue，让 gateway 用原 raw_key 继续走原生认证
+//!   1. gateway 每收到一个请求，extractor 提取 raw_key + 从 body 解析
+//!      顶层 `model` 字段后调本 hook
+//!   2. 本 hook 把 key 脱敏（前 3 + 中间全 * + 末尾 6）+ model 原样，
+//!      用 eprintln! 打印到 stderr
+//!   3. 返回 Continue，让 gateway 用原 raw_key 和原 model 继续走原生
+//!      认证 + 路由（行为不变）
 //!
-//! masking 示例：
-//!   "sk-abcdefghij"  (13 字符) → "sk-*******ghij"
-//!   "sk-abcd"        (7 字符)  → "sk-*abcd"      (末尾 6 位 = 整个后半段)
-//!   "short"          (5 字符)  → "***short" 的反向？见 mask_key 函数
+//! ## 改 model name（老板的需求）
 //!
-//! 注意：本 demo 不需要 hook_init（没有初始化逻辑），所以不导出该符号。
-//! gateway 加载时找不到 hook_init 会跳过，不影响 pre_auth 调用。
+//! 默认走 `PreAuthAction::Continue`（透传，不改 key 也不改 model）。
+//! 要改 model 时，把 `pre_auth` 函数里返回 Continue 的那行换成：
+//!
+//! ```ignore
+//! Ok(PreAuthResponse {
+//!     action: PreAuthAction::ReplaceModel {
+//!         new_key: req.raw_key.clone(),   // key 不改，原样
+//!         new_model: "your-real-model".to_string(),  // ← 改这里
+//!     },
+//! })
+//! ```
+//!
+//! gateway 收到 `ReplaceModel` 后：用 `new_key` 认证 + 用 `new_model`
+//! 走 `check_model_access` 验证 + 路由。**不绕过权限**——`new_key` 在
+//! DB 里的 `models` 白名单必须列 `new_model` 这个真实名，不能列
+//! logical 名，否则 403。
+//!
+//! ## 想连 key 一起改？
+//!
+//! 把上面的 `new_key: req.raw_key.clone()` 换成你想用的真实 key 即可。
+//! 典型场景：客户端用私有协议 key，hook 翻译成 gateway DB 里的真实 key。
+//!
+//! ## 不需要 hook_init
+//!
+//! 本 demo 没有初始化逻辑，不导出 `hook_init` 符号。gateway 加载时找
+//! 不到 `hook_init` 会跳过，不影响 `pre_auth` 调用。
 
 use boom_hooks_sdk::{pre_auth_entry, PreAuthAction, PreAuthRequest, PreAuthResponse};
 use std::ffi::c_char;
@@ -51,17 +72,26 @@ pub extern "C" fn pre_auth(
         out_cap,
         out_len,
         |req: PreAuthRequest| {
-            // 打印 masked key + 本 hook 配置的 allowed_headers 里的 header
-            // （本 demo 默认 allowed_headers: []，所以 headers 为空）
+            // 打印 masked key + 原始 model name（None 表示 body 里没有
+            // 顶层 model 字段，或 body 不是合法 JSON）
             eprintln!(
-                "[pre-auth-demo] key={} headers={:?}",
+                "[pre-auth-demo] key={} model={:?}",
                 mask_key(&req.raw_key),
-                req.headers
+                req.model_name,
             );
-            // 透传：用原 raw_key 走原生认证
+
+            // —— 默认：透传，不改 key 也不改 model ——
             Ok(PreAuthResponse {
                 action: PreAuthAction::Continue,
             })
+
+            // —— 改 model name：把上面 4 行注释掉，用下面这段 ——
+            // Ok(PreAuthResponse {
+            //     action: PreAuthAction::ReplaceModel {
+            //         new_key: req.raw_key.clone(),
+            //         new_model: "your-real-model".to_string(),
+            //     },
+            // })
         },
     )
 }

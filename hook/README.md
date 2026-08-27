@@ -2,10 +2,33 @@
 
 最简 pre_auth hook 示例。行为：
 
-1. gateway 收到请求，extractor 从 `Authorization` / `x-api-key` / `api-key` 提取 `raw_key`
+1. gateway 收到请求，extractor 从 `Authorization` / `x-api-key` / `api-key` 提取 `raw_key`，从 body 解析顶层 `model` 字段
 2. 调用本 hook 的 `pre_auth` 符号
-3. 本 hook 把 key 脱敏（前 3 + 中间全 `*` + 末尾 6）后用 `eprintln!` 打到 stderr
-4. 返回 `Continue`，让 gateway 用原 `raw_key` 继续走原生认证（行为不变）
+3. 本 hook 把 key 脱敏（前 3 + 中间全 `*` + 末尾 6）+ 原始 model name 用 `eprintln!` 打到 stderr
+4. 返回 `Continue`，让 gateway 用原 `raw_key` 和原 model 继续走原生认证 + 路由（行为不变）
+
+## 改 model name
+
+默认走 `Continue`（透传）。要改 model 时，打开 `src/lib.rs`，把 `pre_auth` 函数里返回 `Continue` 的那 4 行注释掉，启用下面注释里的 `ReplaceModel` 段：
+
+```rust
+// —— 默认：透传 ——
+// Ok(PreAuthResponse {
+//     action: PreAuthAction::Continue,
+// })
+
+// —— 改 model name ——
+Ok(PreAuthResponse {
+    action: PreAuthAction::ReplaceModel {
+        new_key: req.raw_key.clone(),               // key 不改
+        new_model: "your-real-model".to_string(),   // ← 改成真实 model 名
+    },
+})
+```
+
+gateway 收到 `ReplaceModel` 后：用 `new_key` 认证 + 用 `new_model` 走 `check_model_access` 验证 + 路由。**不绕过权限**——`new_key` 在 DB 里的 `models` 白名单必须列 `new_model` 这个真实名，不能列 logical 名，否则 403。
+
+想连 key 一起改，把 `new_key: req.raw_key.clone()` 换成你想用的真实 key 即可（典型场景：客户端用私有协议 key，hook 翻译成 gateway DB 里的真实 key）。
 
 ## 编译
 
@@ -51,7 +74,7 @@ curl -X POST http://localhost:4000/v1/chat/completions \
 在 `gateway.log` 里能看到：
 
 ```
-[pre-auth-demo] key=sk-*******ghij headers={}
+[pre-auth-demo] key=sk-****efghij model=Some("gpt-4o")
 ```
 
 ## masking 规则
@@ -70,9 +93,10 @@ curl -X POST http://localhost:4000/v1/chat/completions \
 
 把这个 demo 改成实际业务场景：
 
+- **改 model name**：默认 `Continue` → 注释启用 `ReplaceModel`（见上文）
 - **加前缀**：`PreAuthAction::Continue` → `PreAuthAction::Replace { new_key: format!("sk-customer-{}", req.raw_key) }`
 - **删后缀**：用 `req.raw_key.trim_end_matches("-internal")` 后 Replace
-- **查表转换**：加 `hook_init` 符号建 DB 连接池,`pre_auth` 闭包内查表后 Replace
+- **查表转换**：加 `hook_init` 符号建 DB 连接池,`pre_auth` 闭包内查表后 Replace / ReplaceModel
 - **拒审**：`PreAuthAction::Reject { reason: "..." }` 或 `Err(HookError::Reject("...".into()))`
 
 ## 文件结构
