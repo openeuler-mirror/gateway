@@ -81,7 +81,7 @@ pub fn register_fusion_providers(
     runtime: FusionRuntime,
 ) -> Result<(), GatewayError> {
     let registry = build_registry(settings)?;
-    validate_fusion_child_providers(settings, deployment_store, alias_store)?;
+    validate_available_fusion_child_provider_protocols(settings, deployment_store, alias_store)?;
     for model in settings.models.keys() {
         if deployment_store.contains(model) {
             return Err(GatewayError::ConfigError(format!(
@@ -113,7 +113,7 @@ pub fn register_fusion_providers(
     Ok(())
 }
 
-fn validate_fusion_child_providers(
+fn validate_available_fusion_child_provider_protocols(
     settings: &WorkflowSettings,
     deployment_store: &DeploymentStore,
     alias_store: &AliasStore,
@@ -129,15 +129,16 @@ fn validate_fusion_child_providers(
             let resolved_model = alias_store
                 .resolve(&instance.model)
                 .unwrap_or_else(|| instance.model.clone());
-            let providers = deployment_store
+            let Some(providers) = deployment_store
                 .get_providers(&resolved_model)
                 .filter(|providers| !providers.is_empty())
-                .ok_or_else(|| {
-                    GatewayError::ConfigError(format!(
-                        "workflow '{}' {} model '{}' resolves to model '{}', which has no active deployment",
-                        workflow_id, role, instance.model, resolved_model
-                    ))
-                })?;
+            else {
+                // Deployments can be taken offline independently of workflow
+                // configuration. Child routing reports the missing model when
+                // the Fusion model is invoked; it must not prevent startup or
+                // reload.
+                continue;
+            };
             for provider in providers {
                 if provider.protocol() != ProviderProtocol::OpenAiCompatible {
                     return Err(GatewayError::ConfigError(format!(
@@ -437,9 +438,16 @@ impl RoutingModelInvoker {
         } else {
             Vec::new()
         };
+        let candidates = self
+            .runtime
+            .deployment_store
+            .get_providers(&resolved_model)
+            .filter(|providers| !providers.is_empty())
+            .ok_or_else(|| GatewayError::ModelNotFound(resolved_model.clone()))?;
         let selection = router
-            .select_provider_with_prefix(
+            .select_with_candidates(
                 &resolved_model,
+                &candidates,
                 Some(&self.context.key_hash),
                 input_chars,
                 &prefix_bytes,
@@ -1425,6 +1433,112 @@ workflow_settings:
         assert!(error.contains("panel model 'panel-alias'"));
         assert!(error.contains("provider 'fake'"));
         assert!(error.contains("OpenAI-compatible provider"));
+    }
+
+    #[tokio::test]
+    async fn fusion_missing_child_deployments_fail_at_runtime_not_registration() {
+        let config: Config = serde_yaml::from_str(
+            r#"
+model_list:
+  - model_name: panel
+    litellm_params:
+      model: openai/panel
+  - model_name: aggregator
+    enabled: false
+    litellm_params:
+      model: openai/aggregator
+workflow_settings:
+  models:
+    fusion: direct_synthesis
+  workflows:
+    direct_synthesis:
+      type: direct_synthesis
+      roles:
+        panel:
+          - model: panel
+          - model: panel
+        aggregator:
+          model: aggregator
+"#,
+        )
+        .unwrap();
+        config.validate().unwrap();
+
+        // The panel remains active, but the configured aggregator deployment
+        // is offline and therefore absent from the runtime store. A wildcard
+        // provider must not silently take over the Fusion child call.
+        let deployment_store = Arc::new(DeploymentStore::new());
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let panel_provider: Arc<dyn Provider> = Arc::new(FakeProvider {
+            calls: calls.clone(),
+            fail_models: Arc::new(Mutex::new(HashSet::new())),
+            invalid_models: Arc::new(Mutex::new(HashSet::new())),
+            models: vec!["panel".to_string()],
+            protocol: ProviderProtocol::OpenAiCompatible,
+        });
+        deployment_store.add_deployment("panel", panel_provider.clone());
+        deployment_store.add_deployment("*", panel_provider);
+        let alias_store = Arc::new(AliasStore::new());
+        let router = Arc::new(Router::new(
+            deployment_store.clone(),
+            alias_store.clone(),
+            Arc::new(RecordingPolicy {
+                key_hashes: Arc::new(Mutex::new(Vec::new())),
+            }),
+        ));
+        let runtime = FusionRuntime::new(
+            Arc::downgrade(&router),
+            deployment_store.clone(),
+            Arc::new(FlowController::new()),
+            Arc::new(InFlightTracker::new()),
+            Arc::new(RequestRateTracker::new()),
+            Arc::new(ArcSwap::from_pointee(None)),
+            true,
+            1200,
+        );
+
+        register_fusion_providers(
+            &config.workflow_settings,
+            &deployment_store,
+            &alias_store,
+            runtime,
+        )
+        .unwrap();
+
+        let fusion = router
+            .select_provider_with_prefix("fusion", Some("parent-key"), 4, &[])
+            .expect("Fusion provider must remain registered")
+            .provider;
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "fusion",
+            "messages": [{"role": "user", "content": "solve it"}]
+        }))
+        .unwrap();
+        let error = fusion
+            .chat_with_context(
+                request,
+                ProviderCallContext {
+                    key_hash: "parent-key".to_string(),
+                    key_alias: None,
+                    is_vip: false,
+                    api_path: "/v1/chat/completions".to_string(),
+                    billing: ProviderBilling::default(),
+                    prompt_trace: None,
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(&error, GatewayError::ProviderError(_)));
+        assert_eq!(error.status_code(), 502);
+        let message = error.to_string();
+        assert!(message.contains("failed at aggregator stage"));
+        assert!(message.contains("Model not found: aggregator"));
+        assert!(calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|request| request.model == "panel"));
     }
 
     #[tokio::test]

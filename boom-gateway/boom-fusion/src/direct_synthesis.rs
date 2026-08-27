@@ -281,6 +281,9 @@ impl DirectSynthesisWorkflow {
                 add_usage(&mut usage, &invocation.response.usage);
                 invocation.response
             }
+            Err(error @ GatewayError::ModelNotFound(_)) => {
+                return Err(self.missing_aggregator_failure(&error));
+            }
             Err(_) => valid_panels[0].response.clone(),
         };
         response.usage = usage;
@@ -320,10 +323,30 @@ impl DirectSynthesisWorkflow {
                     aggregator_model: self.config.aggregator.model.clone(),
                 }),
             }),
+            Err(error @ GatewayError::ModelNotFound(_)) => {
+                Err(self.missing_aggregator_failure(&error))
+            }
             Err(_) => Ok(WorkflowStreamExecution {
                 stream: response_stream(&valid_panels[0].response, &panel_usage),
             }),
         }
+    }
+
+    fn missing_aggregator_failure(&self, error: &GatewayError) -> WorkflowFailure {
+        let failure = FusionFailure::from_error(
+            WorkflowRole::Aggregator,
+            None,
+            self.config.aggregator.model.clone(),
+            Some(1),
+            error,
+        );
+        workflow_failure(
+            &self.id,
+            "aggregator",
+            1,
+            "aggregator model has no active deployment",
+            &[failure],
+        )
     }
 }
 
@@ -788,6 +811,7 @@ mod tests {
         calls: Mutex<Vec<(WorkflowRole, ChatCompletionRequest)>>,
         panels: Vec<PanelBehavior>,
         aggregator_error: bool,
+        aggregator_missing: bool,
         aggregator_stream_error: bool,
         aggregator_empty: bool,
     }
@@ -798,6 +822,7 @@ mod tests {
                 calls: Mutex::new(Vec::new()),
                 panels,
                 aggregator_error: false,
+                aggregator_missing: false,
                 aggregator_stream_error: false,
                 aggregator_empty: false,
             }
@@ -823,6 +848,9 @@ mod tests {
         ) -> Result<ModelInvocation, GatewayError> {
             self.calls.lock().unwrap().push((role, request.clone()));
             if role == WorkflowRole::Aggregator {
+                if self.aggregator_missing {
+                    return Err(GatewayError::ModelNotFound(request.model));
+                }
                 if self.aggregator_error {
                     return Err(GatewayError::ProviderError(
                         "aggregator unavailable".to_string(),
@@ -872,6 +900,9 @@ mod tests {
             request: ChatCompletionRequest,
         ) -> Result<ModelStreamInvocation, GatewayError> {
             self.calls.lock().unwrap().push((role, request.clone()));
+            if self.aggregator_missing {
+                return Err(GatewayError::ModelNotFound(request.model));
+            }
             if self.aggregator_error {
                 return Err(GatewayError::ProviderError(
                     "aggregator unavailable".to_string(),
@@ -1131,6 +1162,43 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.response.model, "panel-0");
+    }
+
+    #[tokio::test]
+    async fn missing_aggregator_deployment_fails_instead_of_falling_back() {
+        let json_error = match workflow()
+            .execute(WorkflowContext {
+                request: request(false),
+                invoker: Arc::new(TestInvoker {
+                    aggregator_missing: true,
+                    ..TestInvoker::new(vec![PanelBehavior::Valid, PanelBehavior::Valid])
+                }),
+            })
+            .await
+        {
+            Ok(_) => panic!("missing aggregator deployment unexpectedly fell back"),
+            Err(error) => error,
+        };
+        let json_message = json_error.to_string();
+        assert!(json_message.contains("failed at aggregator stage"));
+        assert!(json_message.contains("Model not found: aggregator"));
+
+        let stream_error = match workflow()
+            .execute_stream(WorkflowContext {
+                request: request(false),
+                invoker: Arc::new(TestInvoker {
+                    aggregator_missing: true,
+                    ..TestInvoker::new(vec![PanelBehavior::Valid, PanelBehavior::Valid])
+                }),
+            })
+            .await
+        {
+            Ok(_) => panic!("missing aggregator deployment unexpectedly streamed a fallback"),
+            Err(error) => error,
+        };
+        let stream_message = stream_error.to_string();
+        assert!(stream_message.contains("failed at aggregator stage"));
+        assert!(stream_message.contains("Model not found: aggregator"));
     }
 
     #[tokio::test]

@@ -159,7 +159,7 @@ bench 报告和 Backend 503，不能只看客户端 HTTP 结果。
 
 标准性能压测不启用 Prompt Log，避免每个请求的详细日志 I/O 改写吞吐结果。
 Fusion Prompt Log 的功能、成功和故障场景由
-`boom-main/tests/fusion_panel_tools_e2e.rs` 中的 14 个真实 Gateway E2E 覆盖。
+`boom-main/tests/fusion_panel_tools_e2e.rs` 中的 15 个真实 Gateway E2E 覆盖。
 
 环境变量可覆盖单项参数以调试脚本，但默认值始终是本 README 的原始参数。服务启动时
 默认最多重试 5 次，可用 `FUSION_LOAD_START_RETRIES` 调整。例如：
