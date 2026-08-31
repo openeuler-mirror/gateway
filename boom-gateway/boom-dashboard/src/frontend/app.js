@@ -209,7 +209,20 @@
   }
 
   // ── API helpers ───────────────────────────────────────
+  // All write operations (POST/PUT/PATCH/DELETE) trigger a single unified
+  // confirm dialog before the request is sent. This is the one entry point
+  // for accidental-click protection — call sites don't need to confirm on
+  // their own, and existing per-call confirms should be removed to avoid
+  // double-prompting. Caller can pass `skipConfirm: true` to bypass (used
+  // by internal batch sequences where the user already confirmed once).
   async function api(path, opts = {}) {
+    const method = (opts.method || "GET").toUpperCase();
+    const isWrite = ["POST", "PUT", "PATCH", "DELETE"].includes(method);
+    if (isWrite && !opts.skipConfirm) {
+      if (!confirm(t("common.confirm_write"))) {
+        throw new Error(t("common.canceled"));
+      }
+    }
     const res = await fetch(API + path, {
       headers: { "Content-Type": "application/json", ...opts.headers },
       ...opts,
@@ -2917,7 +2930,6 @@
   }
 
   window._deletePlan = async (name) => {
-    if (!confirm(t("confirm.delete_plan", { name }))) return;
     await api(`/admin/plans/${encodeURIComponent(name)}`, { method: "DELETE" });
     loadPlans();
   };
@@ -3117,12 +3129,10 @@
     loadKeys();
   };
   window._resetKeyLimits = async (hash) => {
-    if (!confirm(t("confirm.reset_key"))) return;
     const r = await api(`/admin/limits/reset/${encodeURIComponent(hash)}`, { method: "POST" });
     alert(r.message || t("alert.done"));
   };
   window._deleteKey = async (hash, alias) => {
-    if (!confirm(t("confirm.delete_key", { name: alias || hash.slice(0, 12) }))) return;
     try {
       await api(`/admin/keys/${encodeURIComponent(hash)}`, { method: "DELETE" });
       loadKeys();
@@ -3377,7 +3387,6 @@
   };
 
   window._deleteModel = async (id, name) => {
-    if (!confirm(t("confirm.delete_model", { name }))) return;
     await api(`/admin/models/${encodeURIComponent(id)}`, { method: "DELETE" });
     loadModels();
   };
@@ -3435,7 +3444,6 @@
   };
 
   window._deleteAlias = async (name) => {
-    if (!confirm(t("confirm.delete_alias", { name }))) return;
     await api(`/admin/aliases/${encodeURIComponent(name)}`, { method: "DELETE" });
     loadModels();
   };
@@ -4286,7 +4294,6 @@
   };
 
   window._deleteCostTemplate = async (name) => {
-    if (!confirm(t("confirm.delete", { name }))) return;
     const current = ((_configCache && _configCache.cost_templates) || []).filter((t) => t.name !== name);
     try { await saveConfigSection("cost_templates", current); } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
   };
@@ -4483,7 +4490,6 @@
     }
     const btnResetAll = document.getElementById("btn-reset-all-limits");
     if (btnResetAll) btnResetAll.addEventListener("click", async () => {
-      if (!confirm(t("confirm.reset_all"))) return;
       const r = await api("/admin/limits/reset", { method: "POST" });
       alert(r.message || t("alert.done"));
     });
@@ -4511,7 +4517,6 @@
     if (btnAlias) btnAlias.addEventListener("click", showNewAliasModal);
     const btnReload = document.getElementById("btn-reload-config");
     if (btnReload) btnReload.addEventListener("click", async () => {
-      if (!confirm(t("confirm.reload"))) return;
       btnReload.disabled = true;
       btnReload.textContent = t("action.reloading");
       try {
@@ -5328,23 +5333,27 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
         });
         // Plan assignment lives in a separate table (boom_key_plan_assignment)
         // so it has its own endpoints. Sync only when the dropdown changed —
-        // avoids a spurious POST/DELETE churn on every save.
+        // avoids a spurious POST/DELETE churn on every save. These are part
+        // of the same user-initiated save, so skipConfirm avoids re-prompting
+        // (the user already confirmed via the PUT above).
         //   ""            → DELETE (row goes away, follows default_plan)
         //   "__no_plan__" → POST with plan_name=null (explicit opt-out)
         //   "{name}"      → POST with plan_name=name
         const newPlanSel = document.getElementById("m-edit-plan").value;
         if (newPlanSel !== currentPlanSel) {
           if (newPlanSel === "") {
-            await api(`/admin/assignments/${encodeURIComponent(key.token_hash)}`, { method: "DELETE" });
+            await api(`/admin/assignments/${encodeURIComponent(key.token_hash)}`, { method: "DELETE", skipConfirm: true });
           } else if (newPlanSel === "__no_plan__") {
             await api("/admin/assignments", {
               method: "POST",
               body: JSON.stringify({ key_hash: key.token_hash, plan_name: null }),
+              skipConfirm: true,
             });
           } else {
             await api("/admin/assignments", {
               method: "POST",
               body: JSON.stringify({ key_hash: key.token_hash, plan_name: newPlanSel }),
+              skipConfirm: true,
             });
           }
         }
@@ -5354,6 +5363,7 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
           await api("/admin/prompt-log/key", {
             method: "POST",
             body: JSON.stringify({ key_hash: key.token_hash, excluded: noPromptLog }),
+            skipConfirm: true,
           });
         }
         hideModal();
@@ -5795,12 +5805,6 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
 
   window._quotaKeyAction = async (token, scope) => {
     if (!scope) return;
-    const confirmKey = scope === "cumulative"
-      ? "quota.confirm_reset_key_cumulative"
-      : scope === "windows"
-      ? "quota.confirm_reset_key_windows"
-      : "quota.confirm_reset_key_all";
-    if (!confirm(t(confirmKey))) return;
     const suffix = scope === "all" ? "" : `/${scope}`;
     try {
       await api(`/admin/quota/reset/key/${encodeURIComponent(token)}${suffix}`, { method: "POST" });
@@ -5814,7 +5818,6 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
   // Remove a key from its team by PUTting team_id="" (backend translates
   // empty string to NULL). Only shown on team detail pages (teamId set).
   window._removeKeyFromTeam = async (token, btn) => {
-    if (!confirm(t("quota.confirm_remove_from_team"))) return;
     btn.disabled = true;
     try {
       await api(`/admin/keys/${encodeURIComponent(token)}`, {
@@ -5832,12 +5835,6 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
 
   window._quotaTeamAction = async (teamId, scope) => {
     if (!scope) return;
-    const confirmKey = scope === "cumulative"
-      ? "quota.confirm_reset_team_cumulative"
-      : scope === "windows"
-      ? "quota.confirm_reset_team_windows"
-      : "quota.confirm_reset_team_all";
-    if (!confirm(t(confirmKey))) return;
     const suffix = scope === "all" ? "" : `/${scope}`;
     try {
       await api(`/admin/quota/reset/team/${encodeURIComponent(teamId)}${suffix}`, { method: "POST" });
@@ -5921,14 +5918,18 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
               models: body.models,
             }),
           });
+          // Follow-up team-assignment calls are part of the same user-initiated
+          // save — skipConfirm avoids re-prompting (PUT above already confirmed).
           if (selectedPlan && selectedPlan !== currentExplicit) {
             await api("/admin/team-assignments", {
               method: "POST",
               body: JSON.stringify({ team_id: p.team_id, plan_name: selectedPlan }),
+              skipConfirm: true,
             });
           } else if (!selectedPlan && currentExplicit) {
             await api("/admin/team-assignments/" + encodeURIComponent(p.team_id), {
               method: "DELETE",
+              skipConfirm: true,
             });
           }
         } else {
@@ -5937,6 +5938,7 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
             await api("/admin/team-assignments", {
               method: "POST",
               body: JSON.stringify({ team_id: body.team_id, plan_name: selectedPlan }),
+              skipConfirm: true,
             });
           }
         }
@@ -5985,7 +5987,6 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
       alert(t("alert.cannot_delete_team", { count: keyCount }));
       return;
     }
-    if (!confirm(t("confirm.delete_team", { name: teamId }))) return;
     try {
       await api("/admin/teams/" + encodeURIComponent(teamId), { method: "DELETE" });
       loadQuotaOverview();
