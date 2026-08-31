@@ -784,19 +784,25 @@ impl AppState {
     ///     (from boom_rate_limit_plan)
     ///
     /// Other singleton sections (`server`, `router_settings.schedule_policy`,
-    /// `general_settings`, etc.) are preserved verbatim. Then triggers a
-    /// reload so the new config takes effect.
+    /// `general_settings`, etc.) are preserved verbatim.
     ///
     /// Before writing, rolls a single `.bak` copy so a bad edit can be undone
     /// by hand (serde_yaml serialization drops comments, so the .bak is also
     /// the only record of pre-edit annotation).
     ///
-    /// Returns `Err(message)` if any step fails so the caller can surface
-    /// the failure to the user. The DB write that triggered this persist has
-    /// already committed by the time we run, so a persist failure leaves a
-    /// real divergence: DB has the new state, YAML/memory don't. The caller
-    /// must NOT silently report success in that case — see
-    /// [`admin_command_handler`] for the warning-augmented reply pattern.
+    /// **Best-effort persistence (v4):** the caller (CRUD handlers) has
+    /// already written DB + updated in-memory state by the time this runs,
+    /// so a YAML write failure must NOT block the operation. Returns
+    /// `Err(message)` when YAML could not be persisted so the caller can
+    /// surface a warning to the operator — but the deployment is already
+    /// routable. A read-only YAML file therefore no longer causes
+    /// `model_not_found` for newly-created deployments.
+    ///
+    /// This function does NOT call `reload()` — the in-memory state has
+    /// already been updated by the store DB-write methods (or the handler
+    /// via `reload_model_deployments`). Calling reload here would clear + rebuild
+    /// the whole store, briefly taking routing offline and violating the
+    /// "maximize availability" principle.
     pub async fn persist_config_in_place(&self) -> Result<(), String> {
         let pool = match &self.db_pool {
             Some(p) => p,
@@ -805,30 +811,27 @@ impl AppState {
 
         backup_yaml(&self.config_path);
 
-        let mut root: serde_yaml::Value = boom_config::read_raw_yaml(&self.config_path)
-            .map_err(|e| format!("read config: {}", e))?;
+        let mut root: serde_yaml::Value = match boom_config::read_raw_yaml(&self.config_path) {
+            Ok(v) => v,
+            Err(e) => return Err(format!("read config: {}", e)),
+        };
 
-        let snapshot = build_config_snapshot_value(pool)
-            .await
-            .map_err(|e| format!("build snapshot from DB: {}", e))?;
+        let snapshot = match build_config_snapshot_value(pool).await {
+            Ok(v) => v,
+            Err(e) => return Err(format!("build snapshot from DB: {}", e)),
+        };
 
-        merge_runtime_sections(&mut root, &snapshot)
-            .map_err(|e| format!("merge runtime sections: {}", e))?;
+        if let Err(e) = merge_runtime_sections(&mut root, &snapshot) {
+            return Err(format!("merge runtime sections: {}", e));
+        }
 
-        boom_config::write_yaml_atomic(&self.config_path, &root)
-            .map_err(|e| format!("write config: {}", e))?;
-
-        tracing::info!(path = %self.config_path, "Config persisted in place");
-
-        // Reload after the write succeeded. A reload failure here is less
-        // bad than a write failure (YAML is current; memory just lags and
-        // the next manual reload picks it up), but still report it so the
-        // user knows to retry.
-        self.reload()
-            .await
-            .map_err(|e| format!("reload after persist: {}", e))?;
-
-        Ok(())
+        match boom_config::write_yaml_atomic(&self.config_path, &root) {
+            Ok(()) => {
+                tracing::info!(path = %self.config_path, "Config persisted in place");
+                Ok(())
+            }
+            Err(e) => Err(format!("write config: {}", e)),
+        }
     }
 
     /// Update a single config section in the live `config.yaml` and reload.
