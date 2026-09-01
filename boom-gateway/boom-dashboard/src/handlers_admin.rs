@@ -5141,7 +5141,7 @@ pub async fn get_anomalies(
             ),
             None => (
                 "",
-                "rlog.{dim_col} AS alias".to_string(),
+                format!("rlog.{dim_col} AS alias"),
                 String::new(),
             ),
         };
