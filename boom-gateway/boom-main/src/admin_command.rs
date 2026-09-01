@@ -16,15 +16,22 @@ pub async fn admin_command_handler(mut rx: tokio::sync::mpsc::Receiver<AdminComm
         match cmd {
             AdminCommand::CreateModel { req, reply } => {
                 let mut result = handle_create_model(&state, req).await;
-                // Persist BEFORE replying so a failure can be surfaced.
-                // DB write has already committed at this point — a persist
-                // failure leaves DB ahead of YAML/memory, which the user
-                // needs to know about (rather than seeing a fake 200 OK).
+                // Best-effort YAML sync AFTER DB write + in-memory update have
+                // succeeded (store.*_db + reload_model_deployments already ran
+                // inside the handler). A YAML write failure does NOT block
+                // routing — the deployment is already routable from the
+                // in-memory store. Surface the failure as a warning so the
+                // operator knows the DB↔YAML split exists; a subsequent reload
+                // will reload from the stale YAML and OVERWRITE this DB change
+                // (Scenario D — YAML absolutely wins on reload).
                 if result.is_ok() {
                     if let Err(e) = state.persist_config_in_place().await {
                         augment_with_warning(&mut result, format!(
-                            "DB write succeeded but config did not reload: {}. \
-                             Use the Reload button to retry.", e
+                            "DB write succeeded and the deployment is routable, \
+                             but YAML sync failed: {e}. The next reload will \
+                             rebuild the store from the stale YAML and overwrite \
+                             this DB change. Fix the YAML file's write \
+                             permissions, then re-apply this change."
                         ));
                     }
                 }
@@ -32,11 +39,16 @@ pub async fn admin_command_handler(mut rx: tokio::sync::mpsc::Receiver<AdminComm
             }
             AdminCommand::UpdateModel { id, req, reply } => {
                 let mut result = handle_update_model(&state, id, req).await;
+                // Same best-effort YAML sync as CreateModel — see that arm for
+                // the Scenario D warning rationale.
                 if result.is_ok() {
                     if let Err(e) = state.persist_config_in_place().await {
                         augment_with_warning(&mut result, format!(
-                            "DB write succeeded but config did not reload: {}. \
-                             Use the Reload button to retry.", e
+                            "DB write succeeded and the deployment is routable, \
+                             but YAML sync failed: {e}. The next reload will \
+                             rebuild the store from the stale YAML and overwrite \
+                             this DB change. Fix the YAML file's write \
+                             permissions, then re-apply this change."
                         ));
                     }
                 }
@@ -44,24 +56,32 @@ pub async fn admin_command_handler(mut rx: tokio::sync::mpsc::Receiver<AdminComm
             }
             AdminCommand::DeleteModel { id, reply } => {
                 let mut result = handle_delete_model(&state, id).await;
+                // Same best-effort YAML sync as CreateModel — see that arm for
+                // the Scenario D warning rationale.
                 if result.is_ok() {
                     if let Err(e) = state.persist_config_in_place().await {
                         augment_with_warning(&mut result, format!(
-                            "DB write succeeded but config did not reload: {}. \
-                             Use the Reload button to retry.", e
+                            "DB write succeeded and the deployment is removed \
+                             from routing, but YAML sync failed: {e}. The next \
+                             reload will rebuild the store from the stale YAML \
+                             and re-add this deployment. Fix the YAML file's \
+                             write permissions, then re-delete it."
                         ));
                     }
                 }
                 let _ = reply.send(result);
             }
-            AdminCommand::ConfigChanged => {
-                // Fire-and-forget: no reply channel. Just log on failure.
-                if let Err(e) = state.persist_config_in_place().await {
-                    tracing::error!(
-                        "ConfigChanged persist failed (no reply channel to surface): {}",
-                        e
-                    );
+            AdminCommand::ConfigChanged { reply } => {
+                // Best-effort YAML persistence. The caller (alias/plan CRUD)
+                // has already updated DB + in-memory state, so a YAML write
+                // failure must not block the operation. Surface the result
+                // back so the dashboard handler can attach a warning to the
+                // HTTP response instead of silently dropping it.
+                let result = state.persist_config_in_place().await;
+                if let Err(e) = &result {
+                    tracing::warn!("ConfigChanged YAML persist failed: {}", e);
                 }
+                let _ = reply.send(result);
             }
             AdminCommand::ReloadConfig { reply } => {
                 match state.reload().await {
@@ -174,6 +194,61 @@ fn augment_with_warning(result: &mut Result<Value, String>, warning: String) {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Warning attaches to a successful JSON-object Result. The Result
+    /// stays Ok because the primary DB write succeeded; the warning surfaces
+    /// the secondary YAML failure so the frontend can prompt the operator
+    /// to fix file permissions.
+    #[test]
+    fn augment_with_warning_attaches_to_ok_object() {
+        let mut result: Result<Value, String> = Ok(json!({"ok": true, "id": "abc"}));
+        augment_with_warning(
+            &mut result,
+            "YAML sync failed: read-only file system".to_string(),
+        );
+        let v = result.unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["id"], "abc");
+        assert_eq!(v["warning"], "YAML sync failed: read-only file system");
+    }
+
+    /// Warning does NOT downgrade Ok to Err — that would make the frontend
+    /// treat a routable deployment as a failed operation, undoing the whole
+    /// point of the best-effort YAML write refactor.
+    #[test]
+    fn augment_with_warning_keeps_result_ok() {
+        let mut result: Result<Value, String> = Ok(json!({"ok": true}));
+        augment_with_warning(&mut result, "any warning".to_string());
+        assert!(result.is_ok(), "augment_with_warning must not flip Ok → Err");
+    }
+
+    /// Warning on Err Result is a no-op — the error string already carries
+    /// the primary failure; layering a YAML warning on top would confuse the
+    /// operator about which step failed.
+    #[test]
+    fn augment_with_warning_no_op_on_err() {
+        let mut result: Result<Value, String> = Err("DB insert failed".to_string());
+        augment_with_warning(&mut result, "YAML also failed".to_string());
+        assert_eq!(result.unwrap_err(), "DB insert failed");
+    }
+
+    /// Warning on non-object JSON (e.g. `json!(true)`) is a no-op — there's
+    /// no object to insert the field into. The Result still stays Ok so the
+    /// operation succeeds (the primary write did succeed), but the warning
+    /// is lost. This matches the contract: handlers always return JSON
+    /// objects, so this branch is defensive only.
+    #[test]
+    fn augment_with_warning_no_op_on_non_object() {
+        let mut result: Result<Value, String> = Ok(json!(true));
+        augment_with_warning(&mut result, "warning".to_string());
+        let v = result.unwrap();
+        assert!(v.get("warning").is_none());
+    }
+}
+
 async fn handle_create_model(
     state: &AppState,
     req: boom_dashboard::handlers_admin::CreateDeploymentRequest,
@@ -212,11 +287,12 @@ async fn handle_create_model(
         .await
         .map_err(|e| format!("DB insert failed: {}", e))?;
 
-    // Memory rebuild is handled by persist_config_in_place → reload, which
-    // walks the YAML model_list via build_deployments_from_config. Doing it
-    // manually here was both redundant (reload wipes + rebuilds the store)
-    // and lossy (the manual path skipped serve_not_match wildcard registration
-    // that the YAML path handles correctly).
+    // Reload the affected model + wildcard from DB into the live store so the
+    // new deployment is routable immediately. YAML persistence (handled by
+    // persist_config_in_place in the dispatcher) is best-effort and must not
+    // block in-memory activation — a read-only YAML file must not cause
+    // model_not_found for a deployment whose DB row already committed.
+    reload_model_deployments(db_pool, &state.deployment_store, &req.model_name).await;
 
     Ok(json!({"ok": true, "id": id, "model_name": req.model_name}))
 }
@@ -264,9 +340,10 @@ async fn handle_update_model(
         return Err("Model deployment not found".to_string());
     }
 
-    // Memory rebuild deferred to persist_config_in_place → reload (called by
-    // the admin command dispatcher after this handler returns). Doing it
-    // manually here would be wiped and redone by reload anyway.
+    // Reload the affected model + wildcard from DB so the updated deployment
+    // (new api_base/api_key/serve_not_match toggle) takes effect immediately.
+    // YAML persistence is best-effort in the dispatcher.
+    reload_model_deployments(db_pool, &state.deployment_store, &req.model_name).await;
 
     Ok(json!({"ok": true}))
 }
@@ -298,15 +375,23 @@ async fn handle_delete_model(
         .await
         .map_err(|e| format!("DB delete failed: {}", e))?;
 
-    let (model_name, _old_deployment_id) = match info {
+    let (model_name, old_deployment_id) = match info {
         Some(t) => t,
         None => return Err("Model deployment not found".to_string()),
     };
 
-    // Memory rebuild + orphan flow-control slot cleanup deferred to
-    // persist_config_in_place → reload. seed_flow_controller_from_config
-    // walks the post-edit YAML and calls retain_slots(active_ids), which
-    // removes any slot whose deployment_id is no longer present.
+    // Remove the deleted deployment from the live store + wildcard key, and
+    // release its flow-control slot. YAML persistence is best-effort in the
+    // dispatcher; these in-memory updates make the deletion take effect
+    // immediately even when YAML is read-only.
+    if let Some(did) = old_deployment_id.as_deref() {
+        state.deployment_store.remove_deployment_by_deployment_id(did);
+        state.flow_controller.remove_slot(did);
+    } else {
+        // No deployment_id on the deleted row — fall back to a full reload of
+        // the affected model + wildcard so the store stays consistent.
+        reload_model_deployments(db_pool, &state.deployment_store, &model_name).await;
+    }
 
     tracing::info!(model = %model_name, "Model deployment deleted");
     Ok(json!({"ok": true, "model_name": model_name}))
@@ -341,6 +426,39 @@ pub async fn reload_model_deployments(
             model = model_name,
             "refused to reload deployments for an exclusive model"
         );
+    }
+
+    // Reload the "*" wildcard key whenever the affected model contributes
+    // catch-all providers, so auto-disable/enable and CRUD stay consistent
+    // with the YAML-seed path (which registers serve_not_match deployments
+    // under both their real model_name and "*" — see build_deployments_from_config).
+    // Skipping this leaves stale Arc<dyn Provider> entries in "*" that route
+    // to deployments already removed from their owning model.
+    reload_wildcard_deployments(pool, deployment_store).await;
+}
+
+/// Rebuild the "*" wildcard key from every enabled serve_not_match deployment
+/// in DB. Called by `reload_model_deployments` after a per-model reload so the
+/// wildcard stays in sync without a full store clear+rebuild.
+async fn reload_wildcard_deployments(
+    pool: &sqlx::PgPool,
+    deployment_store: &Arc<DeploymentStore>,
+) {
+    let rows = match DeploymentStore::load_wildcard_rows(pool).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("Failed to reload wildcard deployments: {}", e);
+            return;
+        }
+    };
+    let mut providers: Vec<Arc<dyn Provider>> = Vec::new();
+    for row in &rows {
+        if let Some(p) = build_provider_from_row(row) {
+            providers.push(p);
+        }
+    }
+    if !deployment_store.set_deployments("*".to_string(), providers) {
+        tracing::error!("refused to reload wildcard '*' deployments (exclusive model conflict)");
     }
 }
 

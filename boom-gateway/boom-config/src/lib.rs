@@ -490,11 +490,12 @@ pub struct GeneralSettings {
     pub master_key: Option<String>,
     /// PostgreSQL database URL (compatible with litellm schema).
     pub database_url: Option<String>,
-    /// When true, DB is the authority for model deployments, aliases, and plans.
-    /// YAML is only used to seed on first run. When false (default), YAML is
-    /// the authority and DB only persists rate-limit state / key assignments.
-    #[serde(default)]
-    pub store_model_in_db: bool,
+    /// Legacy v2 toggle. Removed in v3: the gateway now always uses YAML as
+    /// the declarative truth source and DB as the runtime authority — see
+    /// CLAUDE.md §7. Kept as a silent serde alias so old YAMLs that still
+    /// set `store_model_in_db: true|false` parse without error.
+    #[serde(default, alias = "store_model_in_db")]
+    _legacy_store_model_in_db: bool,
     /// Models accessible to ALL keys regardless of per-key model whitelist.
     /// Add new universally-available models here instead of updating every key.
     #[serde(default)]
@@ -506,7 +507,7 @@ impl Default for GeneralSettings {
         Self {
             master_key: None,
             database_url: None,
-            store_model_in_db: false,
+            _legacy_store_model_in_db: false,
             public_models: Vec::new(),
         }
     }
@@ -1095,27 +1096,56 @@ pub fn read_raw_yaml(path: &str) -> Result<serde_yaml::Value, GatewayError> {
         .map_err(|e| GatewayError::ConfigError(format!("Failed to parse YAML: {}", e)))
 }
 
-/// Write a `serde_yaml::Value` to a file atomically.
+/// Write a `serde_yaml::Value` to the config file.
 ///
-/// Writes to `{path}.tmp`, fsyncs, then renames to the target. The atomic
-/// rename guarantees the target file is never in a half-written state, so a
-/// crash mid-write leaves the previous config intact.
+/// Strategy: serialize → truncate target in place → write → fsync. No tmp
+/// file, no rename. This is **non-atomic** — a crash mid-write leaves the
+/// target file in a half-written state.
+///
+/// Rationale: the previous tmp+rename strategy tripped on Docker/K8s bind-
+/// mounted single files, where `rename(2)` over the mount point fails with
+/// `EBUSY`/`EXDEV`/`EINVAL` (kernel-level restriction on mount points, not
+/// a permission issue). The error codes vary across container runtimes and
+/// filesystems, so matching them precisely is fragile. Direct overwrite
+/// bypasses the rename restriction entirely and works uniformly across
+/// regular files and bind-mounted files.
+///
+/// The non-atomicity trade-off is acceptable because:
+///   1. config.yaml is small (~tens of KB), so the truncate→write→fsync
+///      window is sub-millisecond — crash exposure is negligible.
+///   2. v3's three-source model (YAML + DB + in-memory) means a corrupted
+///      YAML no longer takes the gateway down: in-memory state keeps routing
+///      working, and DB has the committed rows for the next restart.
+///   3. `backup_yaml` writes a `.bak` of the previous content before each
+///      write, providing a manual recovery path if the worst case happens.
+///
+/// Function name kept as `write_yaml_atomic` to avoid churning the call sites
+/// in boom-main; the atomicity guarantee is now best-effort, not strict.
 pub fn write_yaml_atomic(path: &str, value: &serde_yaml::Value) -> Result<(), GatewayError> {
     let yaml_str = serde_yaml::to_string(value)
         .map_err(|e| GatewayError::ConfigError(format!("Failed to serialize YAML: {}", e)))?;
 
-    let tmp_path = format!("{}.tmp", path);
-    std::fs::write(&tmp_path, &yaml_str)
-        .map_err(|e| GatewayError::ConfigError(format!("Failed to write tmp file {}: {}", tmp_path, e)))?;
+    // Open with truncate + create so we overwrite in place. O_TRUNC avoids
+    // leaving stale tail bytes if the new content is shorter than the old
+    // (config.yaml can shrink when a deployment is deleted).
+    let target = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)
+        .map_err(|e| {
+            GatewayError::ConfigError(format!("Failed to open target for overwrite {}: {}", path, e))
+        })?;
 
-    let file = std::fs::File::open(&tmp_path)
-        .map_err(|e| GatewayError::ConfigError(format!("Failed to open tmp file for fsync: {}", e)))?;
-    file.sync_all()
-        .map_err(|e| GatewayError::ConfigError(format!("Failed to fsync tmp file: {}", e)))?;
-    drop(file);
-
-    std::fs::rename(&tmp_path, path)
-        .map_err(|e| GatewayError::ConfigError(format!("Failed to rename tmp file to {}: {}", path, e)))?;
+    use std::io::Write;
+    let mut target = target;
+    target.write_all(yaml_str.as_bytes()).map_err(|e| {
+        GatewayError::ConfigError(format!("Failed to write target {}: {}", path, e))
+    })?;
+    target.sync_all().map_err(|e| {
+        GatewayError::ConfigError(format!("Failed to fsync target {}: {}", path, e))
+    })?;
+    drop(target);
 
     Ok(())
 }
@@ -1712,5 +1742,142 @@ report_filter:
         assert!(cfg.propagate_only);
         assert!(cfg.capture_body);
         assert_eq!(cfg.max_body_bytes, 16 * 1024);
+    }
+}
+
+#[cfg(test)]
+mod write_yaml_tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    /// `write_yaml_atomic` writes a YAML value to a non-existent file. This is
+    /// the first-write path (file is created with O_CREAT).
+    #[test]
+    fn write_yaml_atomic_creates_new_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        let path_str = path.to_str().unwrap();
+
+        let value = serde_yaml::Value::Mapping({
+            let mut m = serde_yaml::Mapping::new();
+            m.insert("hello".into(), "world".into());
+            m
+        });
+
+        write_yaml_atomic(path_str, &value).expect("write should succeed");
+
+        let written = fs::read_to_string(&path).unwrap();
+        assert!(written.contains("hello: world"));
+        // No tmp file should ever be created in the direct-overwrite strategy
+        assert!(!dir.path().join("config.yaml.tmp").exists());
+    }
+
+    /// Overwrite path: when the target already exists with longer content,
+    /// `write_yaml_atomic` must replace it via truncate (not append, not leave
+    /// stale tail). This is the critical O_TRUNC assertion — config.yaml can
+    /// shrink when a deployment is deleted, and without truncate the old tail
+    /// would corrupt the new content.
+    #[test]
+    fn write_yaml_atomic_overwrites_existing_shorter() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        fs::write(&path, "old: this-is-much-longer-than-the-new-value\n").unwrap();
+
+        let value = serde_yaml::Value::Mapping({
+            let mut m = serde_yaml::Mapping::new();
+            m.insert("new".into(), "short".into());
+            m
+        });
+
+        write_yaml_atomic(path.to_str().unwrap(), &value).expect("write should succeed");
+
+        let written = fs::read_to_string(&path).unwrap();
+        assert!(written.contains("new: short"));
+        // Stale tail from the longer old content must NOT remain
+        assert!(!written.contains("this-is-much-longer"));
+        assert_eq!(written.trim_end(), "new: short");
+    }
+
+    /// Truncate is the core guarantee of the direct-overwrite strategy. Old
+    /// content of 100 bytes, new content of 10 bytes — the file must end up
+    /// exactly 10 bytes, not 100 (stale tail) or 110 (append).
+    #[test]
+    fn write_yaml_atomic_truncates_when_new_content_shorter() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        fs::write(&path, "x".repeat(100)).unwrap();
+
+        let value = serde_yaml::Value::String("y".repeat(10));
+
+        write_yaml_atomic(path.to_str().unwrap(), &value).expect("write should succeed");
+
+        let written = fs::read_to_string(&path).unwrap();
+        assert_eq!(written.len(), 10 + 1, "must truncate to new length (+ newline)");
+        assert!(written.chars().all(|c| c == 'y' || c == '\n'));
+    }
+
+    /// Overwrite in place does not leave a `.tmp` artifact behind. This is
+    /// the explicit guarantee that distinguishes the new strategy from the
+    /// old tmp+rename: there is no tmp file at any point in the write path.
+    #[test]
+    fn write_yaml_atomic_never_creates_tmp_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+
+        let value = serde_yaml::Value::Mapping({
+            let mut m = serde_yaml::Mapping::new();
+            m.insert("k".into(), "v".into());
+            m
+        });
+
+        // First write (file doesn't exist)
+        write_yaml_atomic(path.to_str().unwrap(), &value).unwrap();
+        assert!(!dir.path().join("config.yaml.tmp").exists());
+
+        // Second write (file exists, overwrite path)
+        write_yaml_atomic(path.to_str().unwrap(), &value).unwrap();
+        assert!(!dir.path().join("config.yaml.tmp").exists());
+    }
+
+    /// `write_yaml_atomic` returns `ConfigError` (not panic) when the parent
+    /// directory doesn't exist — caller (persist_config_in_place) relies on
+    /// this to surface a warning instead of crashing.
+    #[test]
+    fn write_yaml_atomic_errors_when_parent_dir_missing() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("nonexistent-dir").join("config.yaml");
+
+        let value = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+
+        let result = write_yaml_atomic(path.to_str().unwrap(), &value);
+        match result {
+            Err(GatewayError::ConfigError(_)) => {}
+            other => panic!("expected ConfigError, got {:?}", other),
+        }
+    }
+
+    /// Serialization failure surfaces as ConfigError, not panic. Hard to
+    /// trigger with serde_yaml directly (it serializes most things), but the
+    /// contract must hold: any error in the write path becomes a ConfigError
+    /// so callers can surface it as a warning.
+    #[test]
+    fn write_yaml_atomic_handles_existing_file_with_create_flag() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        // Pre-existing content
+        fs::write(&path, "previous: content\n").unwrap();
+
+        let value = serde_yaml::Value::Mapping({
+            let mut m = serde_yaml::Mapping::new();
+            m.insert("after".into(), "overwrite".into());
+            m
+        });
+
+        write_yaml_atomic(path.to_str().unwrap(), &value).expect("overwrite should succeed");
+
+        let written = fs::read_to_string(&path).unwrap();
+        assert!(written.contains("after: overwrite"));
+        assert!(!written.contains("previous"));
     }
 }

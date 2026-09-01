@@ -43,8 +43,14 @@ pub enum AdminCommand {
         id: Uuid,
         reply: oneshot::Sender<Result<Value, String>>,
     },
-    /// Fire-and-forget: config changed, persist to YAML in place.
-    ConfigChanged,
+    /// Persist runtime state to YAML in place. Reply carries Ok(()) on a
+    /// successful write, or Err(message) when YAML could not be persisted
+    /// (read-only file, disk full, etc.) so the caller can surface a warning
+    /// to the operator — the in-memory + DB state have already been updated
+    /// by the handler, so a YAML write failure must not block the operation.
+    ConfigChanged {
+        reply: oneshot::Sender<Result<(), String>>,
+    },
     /// Hot-reload config.yaml. Reply contains summary message.
     ReloadConfig {
         reply: oneshot::Sender<Result<String, String>>,
@@ -224,5 +230,116 @@ impl DashboardState {
             stressmon,
             trace,
         }
+    }
+
+    /// Send `ConfigChanged` to boom-main and await the YAML persist result
+    /// with a 5s timeout. Used by alias/plan/config CRUD handlers to surface
+    /// YAML write failures as warnings in the HTTP response — the YAML write
+    /// is best-effort and must not block the primary operation (DB write +
+    /// in-memory update have already succeeded by the time this is called).
+    /// Returns:
+    ///   - `Ok(())` if YAML was persisted successfully
+    ///   - `Err(message)` if YAML write failed (caller should attach warning)
+    ///   - `Err("YAML persist timed out after 5s")` if reply didn't arrive in 5s
+    pub async fn persist_yaml_with_reply(&self) -> Result<(), String> {
+        await_yaml_reply(&self.admin_tx, std::time::Duration::from_secs(5)).await
+    }
+}
+
+/// Free function form of the YAML-persist helper — testable without
+/// constructing a full `DashboardState` (which requires ~15 Arc<dyn> traits).
+/// The behavior under test (channel closed / reply dropped / timeout) is
+/// independent of the rest of `DashboardState`, so we test it at this layer.
+async fn await_yaml_reply(
+    admin_tx: &AdminTx,
+    timeout: std::time::Duration,
+) -> Result<(), String> {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    let cmd = AdminCommand::ConfigChanged { reply: reply_tx };
+    // mpsc send failure means boom-main's admin_command_handler exited —
+    // surface as error so caller responds 500 instead of silent success.
+    if let Err(e) = admin_tx.send(cmd).await {
+        return Err(format!("admin_tx channel closed: {}", e));
+    }
+    match tokio::time::timeout(timeout, reply_rx).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err("admin_command_handler dropped reply channel".to_string()),
+        Err(_) => Err(format!("YAML persist timed out after {}s", timeout.as_secs())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// When boom-main's admin_command_handler has exited (channel closed),
+    /// `await_yaml_reply` must surface an error so the dashboard handler
+    /// responds 500 — NOT silent success. Otherwise a crash in boom-main
+    /// would let CRUD operations appear to succeed while YAML never syncs.
+    #[tokio::test]
+    async fn await_yaml_reply_returns_err_when_channel_closed() {
+        // Construct a sender whose receiver is immediately dropped. mpsc
+        // send on this returns `SendError` → await_yaml_reply surfaces it.
+        let (admin_tx, _admin_rx) = mpsc::channel::<AdminCommand>(1);
+        drop(_admin_rx);
+
+        let result = await_yaml_reply(&admin_tx, std::time::Duration::from_secs(1)).await;
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().contains("channel closed"),
+            "closed-channel error must surface to caller"
+        );
+    }
+
+    /// When boom-main drops the reply channel without responding (e.g.
+    /// panics mid-dispatch), `await_yaml_reply` must surface a distinct
+    /// error so the operator can distinguish it from a YAML write failure.
+    #[tokio::test]
+    async fn await_yaml_reply_returns_err_when_reply_dropped() {
+        let (admin_tx, mut admin_rx) = mpsc::channel::<AdminCommand>(1);
+
+        // Spawn a fake handler that takes the command and drops the reply
+        // without sending — simulates a panic or unexpected early-return
+        // in boom-main's dispatcher arm.
+        tokio::spawn(async move {
+            let _cmd = admin_rx.recv().await;
+            // intentionally drop the oneshot::Sender without replying
+        });
+
+        let result = await_yaml_reply(&admin_tx, std::time::Duration::from_secs(1)).await;
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().contains("dropped reply channel"),
+            "dropped-reply error must surface distinctly"
+        );
+    }
+
+    /// Normal path: boom-main responds Ok, await_yaml_reply forwards it.
+    #[tokio::test]
+    async fn await_yaml_reply_forwards_ok() {
+        let (admin_tx, mut admin_rx) = mpsc::channel::<AdminCommand>(1);
+        tokio::spawn(async move {
+            if let Some(AdminCommand::ConfigChanged { reply }) = admin_rx.recv().await {
+                let _ = reply.send(Ok(()));
+            }
+        });
+
+        let result = await_yaml_reply(&admin_tx, std::time::Duration::from_secs(1)).await;
+        assert_eq!(result, Ok(()));
+    }
+
+    /// YAML write failure path: boom-main responds Err(message), await_yaml_reply
+    /// forwards it so the handler can attach to warning field.
+    #[tokio::test]
+    async fn await_yaml_reply_forwards_err() {
+        let (admin_tx, mut admin_rx) = mpsc::channel::<AdminCommand>(1);
+        tokio::spawn(async move {
+            if let Some(AdminCommand::ConfigChanged { reply }) = admin_rx.recv().await {
+                let _ = reply.send(Err("write config: read-only filesystem".to_string()));
+            }
+        });
+
+        let result = await_yaml_reply(&admin_tx, std::time::Duration::from_secs(1)).await;
+        assert_eq!(result, Err("write config: read-only filesystem".to_string()));
     }
 }

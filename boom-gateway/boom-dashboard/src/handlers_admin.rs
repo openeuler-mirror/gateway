@@ -161,8 +161,17 @@ pub async fn upsert_plan(
         state.plan_store.upsert_plan(plan);
     }
 
-    let _ = state.admin_tx.send(crate::state::AdminCommand::ConfigChanged).await;
-    Ok(Json(json!({"ok": true, "plan_name": req.name})))
+    // Best-effort YAML sync — surface failure as warning field (not error,
+    // since DB + in-memory state are already committed).
+    let yaml_warning = match state.persist_yaml_with_reply().await {
+        Ok(()) => None,
+        Err(e) => Some(e),
+    };
+    Ok(Json(json!({
+        "ok": true,
+        "plan_name": req.name,
+        "warning": yaml_warning,
+    })))
 }
 
 pub async fn delete_plan(
@@ -183,7 +192,16 @@ pub async fn delete_plan(
     };
 
     if deleted {
-        let _ = state.admin_tx.send(crate::state::AdminCommand::ConfigChanged).await;
+        // Best-effort YAML sync — surface failure as warning field.
+        let yaml_warning = match state.persist_yaml_with_reply().await {
+            Ok(()) => None,
+            Err(e) => Some(e),
+        };
+        return Json(json!({
+            "ok": deleted,
+            "plan_name": name,
+            "warning": yaml_warning,
+        }));
     }
 
     Json(json!({"ok": deleted, "plan_name": name}))
@@ -1001,43 +1019,31 @@ pub async fn assign_key(
             if let Some(ref pool) = state.db_pool {
                 match state.plan_store.assign_key_no_plan_db(pool, &req.key_hash).await {
                     Ok(()) => {
-                        let _ = state
-                            .admin_tx
-                            .send(crate::state::AdminCommand::ConfigChanged)
-                            .await;
-                        Json(json!({"ok": true})).into_response()
+                        let yaml_warning = state.persist_yaml_with_reply().await.err();
+                        Json(json!({"ok": true, "warning": yaml_warning})).into_response()
                     }
                     Err(e) => (axum::http::StatusCode::BAD_REQUEST, e).into_response(),
                 }
             } else {
                 state.plan_store.assign_key_no_plan(&req.key_hash);
-                let _ = state
-                    .admin_tx
-                    .send(crate::state::AdminCommand::ConfigChanged)
-                    .await;
-                Json(json!({"ok": true})).into_response()
+                let yaml_warning = state.persist_yaml_with_reply().await.err();
+                Json(json!({"ok": true, "warning": yaml_warning})).into_response()
             }
         }
         Some(Some(ref name)) => {
             if let Some(ref pool) = state.db_pool {
                 match state.plan_store.assign_key_db(pool, &req.key_hash, name).await {
                     Ok(()) => {
-                        let _ = state
-                            .admin_tx
-                            .send(crate::state::AdminCommand::ConfigChanged)
-                            .await;
-                        Json(json!({"ok": true})).into_response()
+                        let yaml_warning = state.persist_yaml_with_reply().await.err();
+                        Json(json!({"ok": true, "warning": yaml_warning})).into_response()
                     }
                     Err(e) => (axum::http::StatusCode::BAD_REQUEST, e).into_response(),
                 }
             } else {
                 match state.plan_store.assign_key(&req.key_hash, name) {
                     Ok(()) => {
-                        let _ = state
-                            .admin_tx
-                            .send(crate::state::AdminCommand::ConfigChanged)
-                            .await;
-                        Json(json!({"ok": true})).into_response()
+                        let yaml_warning = state.persist_yaml_with_reply().await.err();
+                        Json(json!({"ok": true, "warning": yaml_warning})).into_response()
                     }
                     Err(e) => (axum::http::StatusCode::BAD_REQUEST, e).into_response(),
                 }
@@ -1069,7 +1075,8 @@ pub async fn unassign_key(
     };
 
     if removed {
-        let _ = state.admin_tx.send(crate::state::AdminCommand::ConfigChanged).await;
+        let yaml_warning = state.persist_yaml_with_reply().await.err();
+        return Json(json!({"ok": removed, "warning": yaml_warning}));
     }
 
     Json(json!({"ok": removed}))
@@ -1093,11 +1100,8 @@ pub async fn assign_team_plan(
             .await
         {
             Ok(()) => {
-                let _ = state
-                    .admin_tx
-                    .send(crate::state::AdminCommand::ConfigChanged)
-                    .await;
-                Json(json!({"ok": true})).into_response()
+                let yaml_warning = state.persist_yaml_with_reply().await.err();
+                Json(json!({"ok": true, "warning": yaml_warning})).into_response()
             }
             Err(e) => (axum::http::StatusCode::BAD_REQUEST, e).into_response(),
         }
@@ -1107,11 +1111,8 @@ pub async fn assign_team_plan(
             .assign_team(&req.team_id, &req.plan_name)
         {
             Ok(()) => {
-                let _ = state
-                    .admin_tx
-                    .send(crate::state::AdminCommand::ConfigChanged)
-                    .await;
-                Json(json!({"ok": true})).into_response()
+                let yaml_warning = state.persist_yaml_with_reply().await.err();
+                Json(json!({"ok": true, "warning": yaml_warning})).into_response()
             }
             Err(e) => (axum::http::StatusCode::BAD_REQUEST, e).into_response(),
         }
@@ -1140,10 +1141,8 @@ pub async fn unassign_team_plan(
     };
 
     if removed {
-        let _ = state
-            .admin_tx
-            .send(crate::state::AdminCommand::ConfigChanged)
-            .await;
+        let yaml_warning = state.persist_yaml_with_reply().await.err();
+        return Json(json!({"ok": removed, "warning": yaml_warning})).into_response();
     }
 
     Json(json!({"ok": removed})).into_response()
@@ -2047,8 +2046,12 @@ pub async fn create_alias(
     }
 
     tracing::info!(alias = %req.alias_name, target = %req.target_model, "Alias created");
-    let _ = state.admin_tx.send(crate::state::AdminCommand::ConfigChanged).await;
-    Json(json!({"ok": true, "alias_name": req.alias_name})).into_response()
+    let yaml_warning = state.persist_yaml_with_reply().await.err();
+    Json(json!({
+        "ok": true,
+        "alias_name": req.alias_name,
+        "warning": yaml_warning,
+    })).into_response()
 }
 
 pub async fn update_alias(
@@ -2081,8 +2084,8 @@ pub async fn update_alias(
 
     match state.alias_store.update_db(db_pool, &alias_name, &input).await {
         Ok(true) => {
-            let _ = state.admin_tx.send(crate::state::AdminCommand::ConfigChanged).await;
-            Json(json!({"ok": true})).into_response()
+            let yaml_warning = state.persist_yaml_with_reply().await.err();
+            Json(json!({"ok": true, "warning": yaml_warning})).into_response()
         }
         Ok(false) => Json(json!({"error": "Alias not found"})).into_response(),
         Err(e) => {
@@ -2107,8 +2110,12 @@ pub async fn delete_alias(
     match state.alias_store.delete_db(db_pool, &alias_name).await {
         Ok(true) => {
             tracing::info!(alias = %alias_name, "Alias deleted");
-            let _ = state.admin_tx.send(crate::state::AdminCommand::ConfigChanged).await;
-            Json(json!({"ok": true, "alias_name": alias_name})).into_response()
+            let yaml_warning = state.persist_yaml_with_reply().await.err();
+            Json(json!({
+                "ok": true,
+                "alias_name": alias_name,
+                "warning": yaml_warning,
+            })).into_response()
         }
         Ok(false) => Json(json!({"error": "Alias not found"})).into_response(),
         Err(e) => {
@@ -4470,14 +4477,15 @@ pub async fn quota_reset_key(
     let limiter_cleared = state.limiter.clear_for_key(&key_hash);
     match state.limiter.clear_key_all(db_pool, &key_hash).await {
         Ok(snap) => {
-            let _ = state
-                .admin_tx
-                .send(crate::state::AdminCommand::ConfigChanged)
-                .await;
+            // Best-effort YAML sync — quota reset itself does not change YAML
+            // sections (model_list/aliases/plans), but we still ping boom-main
+            // to keep behavior consistent with other admin mutations.
+            let yaml_warning = state.persist_yaml_with_reply().await.err();
             tracing::info!(key_hash = %key_hash, limiter_cleared, "Admin reset key quota");
             Json(json!({
                 "key_hash": key_hash,
                 "limiter_windows_cleared": limiter_cleared,
+                "warning": yaml_warning,
                 "previous": {
                     "total_input_tokens": snap.input_tokens,
                     "total_output_tokens": snap.output_tokens,
@@ -4540,15 +4548,13 @@ pub async fn quota_reset_team(
     let member_count = member_keys.len();
     match state.limiter.reset_team_all(db_pool, &team_id, &member_keys).await {
         Ok(()) => {
-            let _ = state
-                .admin_tx
-                .send(crate::state::AdminCommand::ConfigChanged)
-                .await;
+            let yaml_warning = state.persist_yaml_with_reply().await.err();
             tracing::info!(team_id = %team_id, member_count, limiter_cleared, "Admin reset team quota");
             Json(json!({
                 "team_id": team_id,
                 "member_keys_reset": member_count,
                 "limiter_windows_cleared": limiter_cleared,
+                "warning": yaml_warning,
             }))
             .into_response()
         }
@@ -4601,15 +4607,13 @@ pub async fn quota_reset_key_cumulative(
         .await
     {
         Ok(snap) => {
-            let _ = state
-                .admin_tx
-                .send(crate::state::AdminCommand::ConfigChanged)
-                .await;
+            let yaml_warning = state.persist_yaml_with_reply().await.err();
             tracing::info!(key_hash = %key_hash, team_id = ?team_id, "Admin reset key cumulative");
             Json(json!({
                 "key_hash": key_hash,
                 "team_id": team_id,
                 "scope": "cumulative",
+                "warning": yaml_warning,
                 "previous": {
                     "total_input_tokens": snap.input_tokens,
                     "total_output_tokens": snap.output_tokens,
@@ -4655,16 +4659,14 @@ pub async fn quota_reset_key_windows(
         .await
     {
         Ok(quota_windows_cleared) => {
-            let _ = state
-                .admin_tx
-                .send(crate::state::AdminCommand::ConfigChanged)
-                .await;
+            let yaml_warning = state.persist_yaml_with_reply().await.err();
             tracing::info!(key_hash = %key_hash, limiter_cleared, quota_windows_cleared, "Admin reset key windows");
             Json(json!({
                 "key_hash": key_hash,
                 "scope": "windows",
                 "limiter_windows_cleared": limiter_cleared,
                 "quota_windows_cleared": quota_windows_cleared,
+                "warning": yaml_warning,
             }))
             .into_response()
         }
@@ -4714,15 +4716,13 @@ pub async fn quota_reset_team_cumulative(
         .await
     {
         Ok(_) => {
-            let _ = state
-                .admin_tx
-                .send(crate::state::AdminCommand::ConfigChanged)
-                .await;
+            let yaml_warning = state.persist_yaml_with_reply().await.err();
             tracing::info!(team_id = %team_id, member_count, "Admin reset team cumulative");
             Json(json!({
                 "team_id": team_id,
                 "scope": "cumulative",
                 "member_keys_reset": member_count,
+                "warning": yaml_warning,
             }))
             .into_response()
         }
@@ -4780,10 +4780,7 @@ pub async fn quota_reset_team_windows(
         .await
     {
         Ok(quota_windows_cleared) => {
-            let _ = state
-                .admin_tx
-                .send(crate::state::AdminCommand::ConfigChanged)
-                .await;
+            let yaml_warning = state.persist_yaml_with_reply().await.err();
             tracing::info!(team_id = %team_id, member_count, limiter_cleared, quota_windows_cleared, "Admin reset team windows");
             Json(json!({
                 "team_id": team_id,
@@ -4791,6 +4788,7 @@ pub async fn quota_reset_team_windows(
                 "member_keys_reset": member_count,
                 "limiter_windows_cleared": limiter_cleared,
                 "quota_windows_cleared": quota_windows_cleared,
+                "warning": yaml_warning,
             }))
             .into_response()
         }
@@ -5143,7 +5141,7 @@ pub async fn get_anomalies(
             ),
             None => (
                 "",
-                "rlog.{dim_col} AS alias".to_string(),
+                format!("rlog.{dim_col} AS alias"),
                 String::new(),
             ),
         };

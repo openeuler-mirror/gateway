@@ -11,3 +11,6 @@ serde_yaml = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 rust_decimal = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

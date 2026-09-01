@@ -146,6 +146,11 @@ pub struct DeploymentProviderRow {
     pub headers: serde_json::Value,
     pub deployment_id: Option<String>,
     pub client_type_header: Option<bool>,
+    /// Whether this deployment also serves as catch-all for unmatched model
+    /// names. Mirrors ModelEntry.serve_not_match in boom-config. Defaults to
+    /// false for legacy rows.
+    #[sqlx(default)]
+    pub serve_not_match: bool,
 }
 
 /// Minimal deployment row used by boom-main health monitor.
@@ -235,8 +240,7 @@ const DEPLOYMENT_ROW_SELECT_COLUMNS: &str = concat!(
 /// Extracted as a const so the `snapshot_db_includes_disabled_rows` test can
 /// statically verify the absence of `enabled IS NOT FALSE`. Putting the filter
 /// back here would silently turn "disable" into "delete" on the next
-/// `persist_config_in_place` → `sync_yaml_to_db` round-trip in
-/// `store_model_in_db: false` mode.
+/// `persist_config_in_place` → `sync_yaml_to_db` round-trip.
 const SNAPSHOT_DB_SQL: &str = "SELECT id, model_name, litellm_model, api_key, api_key_env, api_base, api_version, aws_region_name, aws_access_key_id, aws_secret_access_key, rpm, tpm, timeout, headers, temperature, max_tokens, enabled, auto_disabled, source, deployment_id, quota_count_ratio, max_inflight_queue_len, max_context_len, client_type_header, serve_not_match, model_info, created_at, updated_at FROM boom_model_deployment ORDER BY model_name, created_at";
 
 /// Input for creating/updating a deployment in DB.
@@ -465,6 +469,21 @@ impl DeploymentStore {
         None
     }
 
+    /// Remove a single deployment by deployment_id from every key it appears
+    /// under (both its real model_name and the "*" wildcard when
+    /// serve_not_match registered it there). Used by CRUD handlers that
+    /// incrementally update memory after a DB write, instead of clearing +
+    /// rebuilding the whole model group.
+    ///
+    /// We keep an empty list (rather than removing the key) so
+    /// `resolve_candidates` can distinguish "configured but all down" from
+    /// "never configured" — the empty list suppresses wildcard fallthrough.
+    pub fn remove_deployment_by_deployment_id(&self, deployment_id: &str) {
+        for mut entry in self.deployments.iter_mut() {
+            entry.value_mut().retain(|p| p.deployment_id() != Some(deployment_id));
+        }
+    }
+
     // ── DB operations (boom_routing owns boom_model_deployment table) ──
 
     /// Sync YAML deployments to DB: delete source='yaml' rows, insert current YAML,
@@ -579,12 +598,31 @@ impl DeploymentStore {
     pub async fn load_model_rows(pool: &sqlx::PgPool, model_name: &str) -> Result<Vec<DeploymentProviderRow>, sqlx::Error> {
         sqlx::query_as::<_, DeploymentProviderRow>(
             r#"SELECT model_name, litellm_model, api_key, api_key_env, api_base, api_version,
-                      aws_region_name, timeout, headers, deployment_id, client_type_header
+                      aws_region_name, timeout, headers, deployment_id, client_type_header,
+                      serve_not_match
                FROM boom_model_deployment
                WHERE model_name = $1 AND enabled IS NOT FALSE
                ORDER BY created_at"#,
         )
         .bind(model_name)
+        .fetch_all(pool)
+        .await
+    }
+
+    /// Load every enabled deployment flagged `serve_not_match=true`. These
+    /// providers are also registered under the "*" wildcard key, so the
+    /// wildcard reload after a per-model CRUD rebuilds "*" from this set
+    /// instead of leaving stale Arc<dyn Provider> entries pointing at removed
+    /// deployments.
+    pub async fn load_wildcard_rows(pool: &sqlx::PgPool) -> Result<Vec<DeploymentProviderRow>, sqlx::Error> {
+        sqlx::query_as::<_, DeploymentProviderRow>(
+            r#"SELECT model_name, litellm_model, api_key, api_key_env, api_base, api_version,
+                      aws_region_name, timeout, headers, deployment_id, client_type_header,
+                      serve_not_match
+               FROM boom_model_deployment
+               WHERE serve_not_match = true AND enabled IS NOT FALSE
+               ORDER BY created_at"#,
+        )
         .fetch_all(pool)
         .await
     }
@@ -768,11 +806,10 @@ impl DeploymentStore {
     /// Includes disabled rows so YAML round-trip preserves `enabled: false`
     /// state. The earlier `WHERE enabled IS NOT FALSE` filter caused
     /// disabled deployments to vanish from YAML after `persist_config_in_place`,
-    /// and in `store_model_in_db: false` mode the subsequent `sync_yaml_to_db`
-    /// would physically DELETE the source='db' row — effectively turning
-    /// "disable" into "delete". Routing exclusion is handled separately by
-    /// `load_db_only_rows`, which correctly filters disabled rows for the
-    /// in-memory routing table.
+    /// and the subsequent `sync_yaml_to_db` would physically DELETE the
+    /// source='db' row — effectively turning "disable" into "delete". Routing
+    /// exclusion is handled separately by `load_db_only_rows`, which correctly
+    /// filters disabled rows for the in-memory routing table.
     pub async fn snapshot_db(pool: &sqlx::PgPool) -> Result<Vec<DeploymentRow>, sqlx::Error> {
         sqlx::query_as::<_, DeploymentRow>(SNAPSHOT_DB_SQL)
             .fetch_all(pool)
@@ -875,10 +912,9 @@ mod tests {
     /// `snapshot_db` MUST include disabled rows so YAML round-trip preserves
     /// `enabled: false` state. The earlier `WHERE enabled IS NOT FALSE` filter
     /// caused disabled deployments to vanish from YAML after
-    /// `persist_config_in_place`, and in `store_model_in_db: false` mode the
-    /// subsequent `sync_yaml_to_db` would physically DELETE the source='db'
-    /// row — effectively turning "disable" into "delete". This test prevents
-    /// the filter from being re-introduced.
+    /// `persist_config_in_place`, and the subsequent `sync_yaml_to_db` would
+    /// physically DELETE the source='db' row — effectively turning "disable"
+    /// into "delete". This test prevents the filter from being re-introduced.
     #[test]
     fn snapshot_db_includes_disabled_rows() {
         assert!(

@@ -114,10 +114,14 @@ Dashboard 需要执行写操作（创建模型、修改配置等）时：
 ### 7. 热加载（Hot Reload）规则
 
 - SIGHUP / `POST /admin/config/reload` 触发热加载。
-- `store_model_in_db=true` 模式：只重新 seed `source='yaml'` 的 DB 行，`source='db'` 的行不动。
-- `store_model_in_db=false` 模式：从 YAML 重建所有 store。
-- **热加载不得清除运行时计数器**（limiter、concurrency guard、assignment 等不受影响）。
+- **三数据源角色**：
+  - **YAML** — 声明式真相源 + 启动种子。reload 时绝对胜出：覆盖 DB 中 `source='yaml'` 行 + 删除冲突的 `source='db'` 行。运行期写为 best-effort，失败只 warn 不阻断。
+  - **DB** — 运行期权威 + 多实例共享。CRUD 写操作目标；`store.*_db` 方法 DB 写成功后立即调 `reload_model_deployments`（boom-main 层）直改内存，新部署立即可路由，不依赖 YAML 写或 reload。
+  - **内存** — 路由唯一来源 + 最大服务兜底。启动从 YAML+DB 拉；运行期 CRUD 直改；YAML 和 DB 都失败时仍按内存状态服务。
+- **reload 不得清除运行时计数器**（limiter、concurrency guard、assignment 等不受影响）。
+- **场景 D（YAML 只读 + DB 写成功后 reload）的已知权衡**：reload 走 YAML→内存→sync_yaml_to_db，YAML 是旧值会把 DB 中 `source='db'` 的新行视为冲突删除。这是显式选择（YAML 绝对胜出），通过 CRUD handler 返回的 `warning` 字段提示运维修复 YAML 权限后重新应用。
 - **kv_index 是第三种生命周期**：它放在 AppState 顶层（`Arc<ArcSwap<Option<…>>>`），但与 deployment_store / plan_store 等"跨 reload 内容存活"不同——`schedule_policy` / `block_size` / `max_blocks` / `router_ttl_secs` 变化会**重建空 trie**（旧 trie 随 ArcSwap 替换被 drop，新 trie 从空开始）。**trie 是自学习的**：不订阅 vLLM ZMQ 事件，由 `KvcOrchestrator` 在每次路由后把请求前缀（system+tools+messages 字节序列化 → 按 `block_size` 切块 → xxhash）记录到选中 worker 下；下一个相同前缀的请求即命中。驱逐只有 gateway 侧 LRU（`max_blocks`）+ TTL（`router_ttl_secs`，后台扫描）。这是 over-approximation（vLLM 实际 evict 后 trie 仍乐观保留，靠 LRU/TTL 老化）。`cache_weight`/`load_weight`/`tier_weight` 纯权重变化不 wipe trie（policy 热重建即可）。瞬态查询命中空 trie → 0 hit → 按负载评分路由（无 key_affinity 回退）。
+- **已废弃字段**：`general_settings.store_model_in_db`（v2 双模式开关）在 v3 中已废弃。新模型总是 YAML 真相源 + DB 运行期权威。YAML 中残留该字段会被静默忽略（`#[serde(alias)]`），不要在新 YAML 中使用。
 
 ### 8. 新增模块检查清单
 
@@ -147,6 +151,20 @@ YAML / DB / Dashboard 前端涉及"同一个字段"的多个定义点。新增�
 - 不要在 `state.rs::build_config_snapshot_value` 中临时拼字段 —— 它应当只是 manifest + 结构体的派生输出（业务转换除外，如 `Decimal/per_token → per_million`）
 - 不要新增"只在前端 / 只在 DB / 只在 YAML"出现的字段 —— manifest 是登记处，未登记即不存在
 - 不要绕过 manifest 直接 grep SQL 加字段 —— 走 const → 测试 → SQL 的链路，让编译失败当 guard
+
+### 10. 配置写路径（CRUD + YAML 同步）模式
+
+CRUD handler（model/alias/plan/quota reset 等）的写路径必须遵循以下顺序，违反任何一条都会复现 "YAML 只读 → 新模型 model_not_found" 的旧 bug：
+
+1. **DB 写**（store.*_db 内部完成 DB INSERT/UPDATE/DELETE）。
+2. **直改内存**：DB 写成功后立即调 `reload_model_deployments`（model 路径）或对应的 `*_store.*` 内存方法（alias/plan 路径）——**不依赖后续 reload 或 YAML 写**。这是关键：即使 YAML 是只读的，新配置也必须立即可路由。
+3. **best-effort 写 YAML**：调 `DashboardState::persist_yaml_with_reply()`（内部走 `AdminCommand::ConfigChanged` → boom-main 的 `persist_config_in_place`）。失败只 warn，不阻断。
+4. **响应前端**：YAML 写失败时，handler 在 JSON 响应中加 `warning: Option<String>` 字段（不能转成 error——主操作已成功）；前端弹提示让运维修复 YAML 权限。
+5. **CRUD handler 不调 `reload()`**：reload 是 YAML→内存的单向覆盖，会清空 store 短暂中断路由。CRUD 路径已经直改内存，再 reload 反而违反"最大服务能力"原则。
+
+**DeploymentStore 与 PlanStore/AliasStore 的对齐**：v2 时 DeploymentStore 的 `create_db/update_db/delete_db` 是关联函数（只写 DB 不改内存），是配置写路径的唯一例外。v3 中已对齐——所有 store 的 `*_db` 方法在 DB 写成功后由调用方（boom-main 的 handler 层）调内存直改 helper，与 PlanStore/AliasStore 行为一致。
+
+**ConfigChanged reply channel**：所有 18 处 alias/plan/quota CRUD handler 的 `admin_tx.send(ConfigChanged)` 都改走 `persist_yaml_with_reply()`，YAML 写状态通过 reply surface 到 HTTP 响应的 `warning` 字段——满足"YAML 写失败必须有明确提示"的要求，不再静默丢。
 
 ## Key Patterns
 
