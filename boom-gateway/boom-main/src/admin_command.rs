@@ -2,7 +2,7 @@ use boom_core::provider::Provider;
 use boom_dashboard::state::AdminCommand;
 use boom_routing::DeploymentStore;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -292,7 +292,7 @@ async fn handle_create_model(
     // persist_config_in_place in the dispatcher) is best-effort and must not
     // block in-memory activation — a read-only YAML file must not cause
     // model_not_found for a deployment whose DB row already committed.
-    reload_model_deployments(db_pool, &state.deployment_store, &req.model_name).await;
+    reload_model_deployments(state, &req.model_name).await;
 
     Ok(json!({"ok": true, "id": id, "model_name": req.model_name}))
 }
@@ -341,9 +341,9 @@ async fn handle_update_model(
     }
 
     // Reload the affected model + wildcard from DB so the updated deployment
-    // (new api_base/api_key/serve_not_match toggle) takes effect immediately.
-    // YAML persistence is best-effort in the dispatcher.
-    reload_model_deployments(db_pool, &state.deployment_store, &req.model_name).await;
+    // (new api_base/api_key/flow-control limits/serve_not_match toggle) takes
+    // effect immediately. YAML persistence is best-effort in the dispatcher.
+    reload_model_deployments(state, &req.model_name).await;
 
     Ok(json!({"ok": true}))
 }
@@ -390,19 +390,28 @@ async fn handle_delete_model(
     } else {
         // No deployment_id on the deleted row — fall back to a full reload of
         // the affected model + wildcard so the store stays consistent.
-        reload_model_deployments(db_pool, &state.deployment_store, &model_name).await;
+        reload_model_deployments(state, &model_name).await;
     }
 
     tracing::info!(model = %model_name, "Model deployment deleted");
     Ok(json!({"ok": true, "model_name": model_name}))
 }
 
-/// Reload all deployments for a specific model_name from DB into the deployment store.
-pub async fn reload_model_deployments(
-    pool: &sqlx::PgPool,
-    deployment_store: &Arc<DeploymentStore>,
-    model_name: &str,
-) {
+/// Reload all deployments for a specific model_name from DB into the live
+/// stores — the single apply point for CRUD and auto-disable/enable changes.
+///
+/// Applies every in-memory consumer of a deployment row, not just the
+/// provider list: FlowController slots, per-model quota ratio, and the
+/// per-model cost rate. This is the CRUD-path counterpart of the YAML build
+/// path (build_deployments_from_config + seed_flow_controller_from_config);
+/// the two must stay behaviourally identical, or web edits end up "saved
+/// but not effective until manual reload".
+pub async fn reload_model_deployments(state: &AppState, model_name: &str) {
+    let Some(pool) = state.db_pool.as_ref() else {
+        tracing::error!(model = model_name, "reload_model_deployments: no DB pool available");
+        return;
+    };
+
     let rows = match DeploymentStore::load_model_rows(pool, model_name).await {
         Ok(r) => r,
         Err(e) => {
@@ -410,6 +419,16 @@ pub async fn reload_model_deployments(
             return;
         }
     };
+
+    // Snapshot live deployment_ids before the swap so flow-control slots of
+    // removed deployments (auto-disable, deployment_id change) get released.
+    let old_ids: HashSet<String> = state
+        .deployment_store
+        .get_providers(model_name)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|p| p.deployment_id().map(str::to_string))
+        .collect();
 
     let mut providers: Vec<Arc<dyn Provider>> = Vec::new();
     for row in &rows {
@@ -421,11 +440,59 @@ pub async fn reload_model_deployments(
     // Always set (even empty) so resolve_candidates can distinguish
     // "configured but all down" from "never configured". An empty provider
     // list prevents silent fallthrough to the wildcard catch-all.
-    if !deployment_store.set_deployments(model_name.to_string(), providers) {
+    if !state.deployment_store.set_deployments(model_name.to_string(), providers) {
         tracing::error!(
             model = model_name,
             "refused to reload deployments for an exclusive model"
         );
+    }
+
+    // FlowController slots: update-or-create for rows still present;
+    // ensure_slot removes the slot when both limits are 0, so clearing the
+    // limits via the web UI is honoured here too.
+    let mut new_ids: HashSet<String> = HashSet::new();
+    for row in &rows {
+        if let Some(did) = row.deployment_id.as_deref() {
+            state.flow_controller.ensure_slot(
+                did,
+                &boom_flowcontrol::FlowControlConfig {
+                    max_inflight: row.max_inflight_queue_len.unwrap_or(0).max(0) as u32,
+                    max_context: row.max_context_len.unwrap_or(0).max(0) as u64,
+                },
+            );
+            new_ids.insert(did.to_string());
+        }
+    }
+    for gone in old_ids.difference(&new_ids) {
+        state.flow_controller.remove_slot(gone);
+    }
+
+    // Per-model quota ratio (newest row wins; reset to 1 when no rows remain).
+    let ratio = rows
+        .last()
+        .and_then(|r| r.quota_count_ratio)
+        .unwrap_or(1)
+        .max(0) as u64;
+    state.deployment_store.set_quota_ratio(model_name, ratio);
+
+    // Per-model cost rate from model_info.cost_template — same shared
+    // derivation as the YAML build path. Clear any stale rate when no row
+    // yields one (set_cost_rate removes the entry on a zero rate).
+    let config_guard = state.inner.load_full();
+    let mut applied_cost = false;
+    for row in &rows {
+        let Some(info_value) = row.model_info.as_ref() else { continue };
+        let Ok(info) = serde_json::from_value::<boom_config::ModelInfo>(info_value.clone()) else {
+            tracing::warn!(model = model_name, "failed to parse model_info JSON on deployment row");
+            continue;
+        };
+        if let Some(rate) = crate::state::cost_rate_from_model_info(&config_guard.config, model_name, &info) {
+            state.deployment_store.set_cost_rate(model_name, rate);
+            applied_cost = true;
+        }
+    }
+    if !applied_cost {
+        state.deployment_store.set_cost_rate(model_name, Default::default());
     }
 
     // Reload the "*" wildcard key whenever the affected model contributes
@@ -434,7 +501,7 @@ pub async fn reload_model_deployments(
     // under both their real model_name and "*" — see build_deployments_from_config).
     // Skipping this leaves stale Arc<dyn Provider> entries in "*" that route
     // to deployments already removed from their owning model.
-    reload_wildcard_deployments(pool, deployment_store).await;
+    reload_wildcard_deployments(pool, &state.deployment_store).await;
 }
 
 /// Rebuild the "*" wildcard key from every enabled serve_not_match deployment
@@ -466,15 +533,16 @@ async fn reload_wildcard_deployments(
 /// then reload the deployment store so the node is immediately excluded from routing.
 /// Uses the actual model_name from the DB record (not the requested model name)
 /// so that wildcard `*` deployments are correctly reloaded.
-pub async fn auto_disable_deployment(
-    pool: &sqlx::PgPool,
-    deployment_store: &Arc<DeploymentStore>,
-    deployment_id: &str,
-) {
+pub async fn auto_disable_deployment(state: &AppState, deployment_id: &str) {
     tracing::warn!(
         deployment_id = %deployment_id,
         "Auto-disabling deployment due to consecutive failures"
     );
+
+    let Some(pool) = state.db_pool.as_ref() else {
+        tracing::error!(deployment_id = %deployment_id, "auto_disable_deployment: no DB pool available");
+        return;
+    };
 
     let actual_model_name = match DeploymentStore::auto_disable_db(pool, deployment_id).await {
         Ok(Some(name)) => name,
@@ -488,8 +556,9 @@ pub async fn auto_disable_deployment(
         }
     };
 
-    // Reload deployments for the ACTUAL model_name from DB (removes the disabled one from memory).
-    reload_model_deployments(pool, deployment_store, &actual_model_name).await;
+    // Reload deployments for the ACTUAL model_name from DB (removes the disabled
+    // one from memory, releases its flow-control slot).
+    reload_model_deployments(state, &actual_model_name).await;
 
     tracing::warn!(
         deployment_id = %deployment_id,
@@ -499,15 +568,16 @@ pub async fn auto_disable_deployment(
 }
 
 /// Auto-enable a deployment that was previously auto-disabled, then reload routing.
-pub async fn auto_enable_deployment(
-    pool: &sqlx::PgPool,
-    deployment_store: &Arc<DeploymentStore>,
-    deployment_id: &str,
-) {
+pub async fn auto_enable_deployment(state: &AppState, deployment_id: &str) {
     tracing::info!(
         deployment_id = %deployment_id,
         "Auto-enabling deployment after successful recovery checks"
     );
+
+    let Some(pool) = state.db_pool.as_ref() else {
+        tracing::error!(deployment_id = %deployment_id, "auto_enable_deployment: no DB pool available");
+        return;
+    };
 
     let actual_model_name = match DeploymentStore::auto_enable_db(pool, deployment_id).await {
         Ok(Some(name)) => name,
@@ -521,7 +591,7 @@ pub async fn auto_enable_deployment(
         }
     };
 
-    reload_model_deployments(pool, deployment_store, &actual_model_name).await;
+    reload_model_deployments(state, &actual_model_name).await;
 
     tracing::info!(
         deployment_id = %deployment_id,

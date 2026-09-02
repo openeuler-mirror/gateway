@@ -87,14 +87,7 @@ pub fn record_request_failure(state: &AppState, deployment_id: &Option<String>, 
             let state = state.clone();
             let did = did.clone();
             tokio::spawn(async move {
-                if let Some(ref pool) = state.db_pool {
-                    crate::admin_command::auto_disable_deployment(
-                        pool,
-                        &state.deployment_store,
-                        &did,
-                    )
-                    .await;
-                }
+                crate::admin_command::auto_disable_deployment(&state, &did).await;
                 state.deployment_health.clear(&did);
                 state.request_failure_counter.remove(&did);
             });
@@ -179,8 +172,7 @@ async fn run_offline_checker(state: AppState, mut shutdown: tokio::sync::broadca
                     );
                     if count >= cfg.failure_threshold.max(1) {
                         crate::admin_command::auto_disable_deployment(
-                            pool,
-                            &state.deployment_store,
+                            &state,
                             &target.deployment_id,
                         )
                         .await;
@@ -243,8 +235,7 @@ async fn run_recovery_checker(state: AppState, mut shutdown: tokio::sync::broadc
                     );
                     if count >= cfg.recovery_threshold.max(1) {
                         crate::admin_command::auto_enable_deployment(
-                            pool,
-                            &state.deployment_store,
+                            &state,
                             &target.deployment_id,
                         )
                         .await;
