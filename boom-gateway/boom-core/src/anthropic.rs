@@ -186,11 +186,14 @@ pub fn openai_response_to_anthropic(resp: &ChatCompletionResponse) -> AnthropicM
         model: resp.model.clone(),
         stop_reason,
         stop_sequence: None,
-        usage: AnthropicUsage {
-            input_tokens: resp.usage.prompt_tokens,
-            output_tokens: resp.usage.completion_tokens,
-            cache_creation_input_tokens: resp.usage.cache_creation_input_tokens,
-            cache_read_input_tokens: resp.usage.cache_read_input_tokens,
+        usage: {
+            let usage = resp.usage.clone().unwrap_or_default();
+            AnthropicUsage {
+                input_tokens: usage.prompt_tokens,
+                output_tokens: usage.completion_tokens,
+                cache_creation_input_tokens: usage.cache_creation_input_tokens,
+                cache_read_input_tokens: usage.cache_read_input_tokens,
+            }
         },
     }
 }
@@ -984,14 +987,14 @@ mod tests {
                 finish_reason: Some("stop".to_string()),
                 logprobs: None,
             }],
-            usage: Usage {
+            usage: Some(Usage {
                 prompt_tokens: 10,
                 completion_tokens: 5,
                 total_tokens: 15,
                 cache_creation_input_tokens: Some(3),
                 cache_read_input_tokens: Some(7),
                 prompt_tokens_details: None,
-            },
+            }),
             system_fingerprint: None,
             raw_response: None,
         };
@@ -1037,14 +1040,14 @@ mod tests {
                 finish_reason: Some("stop".to_string()),
                 logprobs: None,
             }],
-            usage: Usage {
+            usage: Some(Usage {
                 prompt_tokens: 1,
                 completion_tokens: 1,
                 total_tokens: 2,
                 cache_creation_input_tokens: None,
                 cache_read_input_tokens: None,
                 prompt_tokens_details: None,
-            },
+            }),
             system_fingerprint: None,
             raw_response: None,
         };

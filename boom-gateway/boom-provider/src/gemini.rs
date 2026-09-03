@@ -286,14 +286,14 @@ impl GeminiProvider {
                 finish_reason: finish_for_choice,
                 logprobs: None,
             }],
-            usage: Usage {
+            usage: Some(Usage {
                 prompt_tokens,
                 completion_tokens,
                 total_tokens: prompt_tokens + completion_tokens,
                 cache_creation_input_tokens: None,
                 cache_read_input_tokens: None,
                 prompt_tokens_details: None,
-            },
+            }),
             system_fingerprint: None,
             raw_response: None,
         }

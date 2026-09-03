@@ -473,4 +473,87 @@ mod tests {
             "no X-Gateway-Priority header should be sent when gateway_headers is empty"
         );
     }
+
+    /// Regression: non-standard upstreams serving only /chat/completions may
+    /// omit `usage`. The response must still parse (usage = None, token
+    /// accounting skipped) instead of failing the whole request.
+    #[tokio::test]
+    async fn chat_response_without_usage_parses() {
+        let server = MockServer::start().await;
+        let mut body = fake_completion_response();
+        body.as_object_mut().unwrap().remove("usage");
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = provider_for(server.uri(), None);
+        let resp = provider.chat(request_with_headers(&[])).await.expect("missing usage must not fail parsing");
+        assert!(resp.usage.is_none());
+    }
+
+    /// Passthrough identity fields (id/object/created) are not load-bearing;
+    /// a backend returning bare choices must still parse.
+    #[tokio::test]
+    async fn chat_response_without_passthrough_fields_parses() {
+        let server = MockServer::start().await;
+        let body = serde_json::json!({
+            "model": "test-model",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "hi" },
+                "finish_reason": "stop"
+            }]
+        });
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = provider_for(server.uri(), None);
+        let resp = provider.chat(request_with_headers(&[])).await.expect("missing passthrough fields must not fail parsing");
+        assert!(matches!(
+            &resp.choices[0].message.content,
+            MessageContent::Text(text) if text == "hi"
+        ));
+    }
+
+    /// Stream chunks missing non-semantic fields (object) and the usage-only
+    /// final chunk missing `choices` must not be silently dropped.
+    #[tokio::test]
+    async fn stream_chunks_with_missing_fields_are_not_dropped() {
+        let server = MockServer::start().await;
+        let sse = concat!(
+            "data: {\"id\":\"1\",\"created\":0,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"1\",\"created\":0,\"model\":\"m\",\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2,\"total_tokens\":7}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = provider_for(server.uri(), None);
+        let stream = provider.chat_stream(request_with_headers(&[])).await.expect("stream must start");
+        let chunks: Vec<_> = stream
+            .filter_map(|c| async move { c.ok() })
+            .collect()
+            .await;
+        assert_eq!(chunks.len(), 2, "both chunks must survive parsing");
+        assert_eq!(
+            chunks[0].choices[0].delta.content.as_deref(),
+            Some("hi")
+        );
+        assert_eq!(chunks[1].usage.as_ref().unwrap().prompt_tokens, Some(5));
+    }
 }

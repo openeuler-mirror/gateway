@@ -704,9 +704,11 @@ impl ModelInvoker for RoutingModelInvoker {
             }
         };
         self.record_success(deployment_id.as_deref());
-        self.context.billing.add_actual_usage(&response.usage);
-        let cost = response_cost(&cost_rate, &response.usage);
-        self.context.billing.add_actual_cost(&cost);
+        if let Some(ref usage) = response.usage {
+            self.context.billing.add_actual_usage(usage);
+            let cost = response_cost(&cost_rate, usage);
+            self.context.billing.add_actual_cost(&cost);
+        }
 
         Ok(ModelInvocation { response })
     }
@@ -1186,12 +1188,12 @@ mod tests {
                     finish_reason: Some("stop".to_string()),
                     logprobs: None,
                 }],
-                usage: Usage {
+                usage: Some(Usage {
                     prompt_tokens: 2,
                     completion_tokens: 1,
                     total_tokens: 3,
                     ..Usage::default()
-                },
+                }),
                 system_fingerprint: None,
                 raw_response: None,
             })
@@ -1662,7 +1664,7 @@ workflow_settings:
             .await
             .unwrap();
 
-        assert_eq!(result.usage.total_tokens, 9);
+        assert_eq!(result.usage.unwrap().total_tokens, 9);
         assert_eq!(billing.actual_usage().unwrap().total_tokens, 9);
         let actual_cost = billing.actual_cost().unwrap();
         assert_eq!(actual_cost.regular_input, 12.into());
@@ -1775,7 +1777,7 @@ workflow_settings:
             )
             .await
             .unwrap();
-        assert_eq!(fallback.usage.total_tokens, 6);
+        assert_eq!(fallback.usage.unwrap().total_tokens, 6);
         assert_eq!(fallback_billing.actual_usage().unwrap().total_tokens, 6);
         assert_eq!(fallback_billing.actual_cost().unwrap().total(), 36.into());
 

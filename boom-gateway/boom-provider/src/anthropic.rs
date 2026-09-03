@@ -503,14 +503,14 @@ impl AnthropicProvider {
                 finish_reason,
                 logprobs: None,
             }],
-            usage: Usage {
+            usage: Some(Usage {
                 prompt_tokens: input_tokens,
                 completion_tokens: output_tokens,
                 total_tokens: input_tokens + output_tokens,
                 cache_creation_input_tokens: cache_creation,
                 cache_read_input_tokens: cache_read,
                 prompt_tokens_details: None,
-            },
+            }),
             system_fingerprint: None,
             raw_response: None,
         }

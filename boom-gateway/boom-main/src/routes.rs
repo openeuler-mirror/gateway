@@ -1030,20 +1030,20 @@ async fn chat_completions_inner(
         crate::health_monitor::reset_request_failure(&state, &deployment_id);
 
         let duration_ms = start.elapsed().as_millis() as i32;
-        let input_tokens = response.usage.prompt_tokens as i32;
-        let output_tokens = response.usage.completion_tokens as i32;
+        // None = upstream did not report usage → log NULL, settle 0 tokens.
+        let usage = response.usage.as_ref();
+        let input_tokens = usage.map(|u| u.prompt_tokens as i32);
+        let output_tokens = usage.map(|u| u.completion_tokens as i32);
         // Settle quota: real token counts from vLLM go to key + team cumulative
         // and 1-min TPM windows. Cost is computed from the model's cost_rate;
         // cached_tokens get the discounted rate when configured.
-        let provider_cached = response
-            .usage
-            .prompt_tokens_details
-            .as_ref()
+        let provider_cached = usage
+            .and_then(|u| u.prompt_tokens_details.as_ref())
             .and_then(|d| d.cached_tokens);
         plan_charge.settle(
-            input_tokens as u64,
+            input_tokens.unwrap_or(0) as u64,
             provider_cached.unwrap_or(0).max(0) as u64,
-            output_tokens as u64,
+            output_tokens.unwrap_or(0) as u64,
             provider_billing.actual_cost(),
         );
         // Preserve Option: None = upstream didn't return cached_tokens (no KV
@@ -1072,8 +1072,8 @@ async fn chat_completions_inner(
                 status_code: 200,
                 error_type: None,
                 error_message: None,
-                input_tokens: Some(input_tokens),
-                output_tokens: Some(output_tokens),
+                input_tokens,
+                output_tokens,
                 duration_ms: Some(duration_ms),
                 ttft_ms: None,
                 deployment_id,
@@ -1088,7 +1088,11 @@ async fn chat_completions_inner(
                 queue_wait_ms,
             },
         );
-        state.agent_stats.record_tokens(api_path, input_tokens as u64, output_tokens as u64);
+        state.agent_stats.record_tokens(
+            api_path,
+            input_tokens.unwrap_or(0) as u64,
+            output_tokens.unwrap_or(0) as u64,
+        );
 
         // Normalize internal ContentPart::Reasoning to standard OpenAI `reasoning_content`
         // field so clients receive {"reasoning_content": "..."} instead of non-standard
@@ -3268,20 +3272,20 @@ pub async fn messages(
         crate::health_monitor::reset_request_failure(&state, &deployment_id);
 
         let duration_ms = start.elapsed().as_millis() as i32;
-        let input_tokens = response.usage.prompt_tokens as i32;
-        let output_tokens = response.usage.completion_tokens as i32;
+        // None = upstream did not report usage → log NULL, settle 0 tokens.
+        let usage = response.usage.as_ref();
+        let input_tokens = usage.map(|u| u.prompt_tokens as i32);
+        let output_tokens = usage.map(|u| u.completion_tokens as i32);
         // Settle quota: real token counts from vLLM go to key + team cumulative
         // and 1-min TPM windows. Cost is computed from the model's cost_rate;
         // cached_tokens get the discounted rate when configured.
-        let provider_cached = response
-            .usage
-            .prompt_tokens_details
-            .as_ref()
+        let provider_cached = usage
+            .and_then(|u| u.prompt_tokens_details.as_ref())
             .and_then(|d| d.cached_tokens);
         plan_charge.settle(
-            input_tokens as u64,
+            input_tokens.unwrap_or(0) as u64,
             provider_cached.unwrap_or(0).max(0) as u64,
-            output_tokens as u64,
+            output_tokens.unwrap_or(0) as u64,
             None,
         );
         // Preserve Option: None = upstream didn't return cached_tokens (no KV
@@ -3310,8 +3314,8 @@ pub async fn messages(
                 status_code: 200,
                 error_type: None,
                 error_message: None,
-                input_tokens: Some(input_tokens),
-                output_tokens: Some(output_tokens),
+                input_tokens,
+                output_tokens,
                 duration_ms: Some(duration_ms),
                 ttft_ms: None,
                 deployment_id,
@@ -3326,7 +3330,11 @@ pub async fn messages(
                 queue_wait_ms,
             },
         );
-        state.agent_stats.record_tokens("/v1/messages", input_tokens as u64, output_tokens as u64);
+        state.agent_stats.record_tokens(
+            "/v1/messages",
+            input_tokens.unwrap_or(0) as u64,
+            output_tokens.unwrap_or(0) as u64,
+        );
 
         let anthropic_resp = openai_response_to_anthropic(&response);
 
