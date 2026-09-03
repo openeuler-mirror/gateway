@@ -4,7 +4,166 @@ use boom_core::GatewayError;
 use async_trait::async_trait;
 use futures::stream::StreamExt;
 use reqwest::Client;
+use std::collections::BTreeMap;
 use tokio_stream::wrappers::ReceiverStream;
+
+/// Assemble a complete ChatCompletionResponse from an SSE body. Used when a
+/// non-standard upstream answers a non-streaming request with
+/// `text/event-stream` chunks anyway: `data:` payloads are ChatStreamChunks
+/// whose deltas are concatenated per choice, and the final usage-only chunk
+/// (if any) becomes the response usage.
+fn assemble_sse_response(text: &str) -> Result<ChatCompletionResponse, String> {
+    #[derive(Default)]
+    struct AssembledToolCall {
+        id: String,
+        call_type: String,
+        name: String,
+        arguments: String,
+    }
+    #[derive(Default)]
+    struct AssembledChoice {
+        role: Option<MessageRole>,
+        content: String,
+        reasoning: String,
+        finish_reason: Option<String>,
+        tool_calls: BTreeMap<u32, AssembledToolCall>,
+    }
+
+    let mut id = String::new();
+    let mut created = 0u64;
+    let mut model = String::new();
+    let mut choices: BTreeMap<u32, AssembledChoice> = BTreeMap::new();
+    let mut usage: Option<Usage> = None;
+    let mut saw_chunk = false;
+
+    for line in text.lines() {
+        let Some(data) = line.strip_prefix("data:").map(str::trim) else {
+            continue;
+        };
+        if data == "[DONE]" {
+            break;
+        }
+        let chunk: ChatStreamChunk = match serde_json::from_str(data) {
+            Ok(chunk) => chunk,
+            Err(e) => {
+                tracing::warn!("Skipping unparseable SSE chunk in non-stream response: {}", e);
+                continue;
+            }
+        };
+        saw_chunk = true;
+        if id.is_empty() && !chunk.id.is_empty() {
+            id = chunk.id;
+        }
+        if created == 0 {
+            created = chunk.created;
+        }
+        if model.is_empty() && !chunk.model.is_empty() {
+            model = chunk.model;
+        }
+        for choice in chunk.choices {
+            let entry = choices.entry(choice.index).or_default();
+            if let Some(role) = choice.delta.role {
+                entry.role.get_or_insert(role);
+            }
+            if let Some(content) = choice.delta.content {
+                entry.content.push_str(&content);
+            }
+            if let Some(reasoning) = choice.delta.reasoning_content {
+                entry.reasoning.push_str(&reasoning);
+            }
+            if let Some(calls) = choice.delta.tool_calls {
+                for call in calls {
+                    let tc = entry.tool_calls.entry(call.index).or_default();
+                    if let Some(v) = call.id {
+                        if tc.id.is_empty() {
+                            tc.id = v;
+                        }
+                    }
+                    if let Some(v) = call.call_type {
+                        if tc.call_type.is_empty() {
+                            tc.call_type = v;
+                        }
+                    }
+                    if let Some(func) = call.function {
+                        if let Some(v) = func.name {
+                            if tc.name.is_empty() {
+                                tc.name = v;
+                            }
+                        }
+                        if let Some(v) = func.arguments {
+                            tc.arguments.push_str(&v);
+                        }
+                    }
+                }
+            }
+            if choice.finish_reason.is_some() {
+                entry.finish_reason = choice.finish_reason;
+            }
+        }
+        if let Some(stream_usage) = chunk.usage {
+            usage = Some(Usage {
+                prompt_tokens: stream_usage.prompt_tokens.unwrap_or(0).max(0) as u32,
+                completion_tokens: stream_usage.completion_tokens.unwrap_or(0).max(0) as u32,
+                total_tokens: stream_usage.total_tokens.unwrap_or(0).max(0) as u32,
+                prompt_tokens_details: stream_usage.prompt_tokens_details,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            });
+        }
+    }
+
+    if !saw_chunk {
+        return Err("SSE response contained no parseable data chunks".to_string());
+    }
+
+    let choices = choices
+        .into_iter()
+        .map(|(index, c)| Choice {
+            index,
+            message: Message {
+                role: c.role.unwrap_or(MessageRole::Assistant),
+                content: MessageContent::Text(c.content),
+                name: None,
+                tool_calls: if c.tool_calls.is_empty() {
+                    None
+                } else {
+                    Some(
+                        c.tool_calls
+                            .into_values()
+                            .map(|tc| ToolCall {
+                                id: tc.id,
+                                call_type: if tc.call_type.is_empty() {
+                                    "function".to_string()
+                                } else {
+                                    tc.call_type
+                                },
+                                function: FunctionCall {
+                                    name: tc.name,
+                                    arguments: tc.arguments,
+                                },
+                            })
+                            .collect(),
+                    )
+                },
+                tool_call_id: None,
+                reasoning_content: (!c.reasoning.is_empty()).then_some(c.reasoning),
+            },
+            finish_reason: c.finish_reason,
+            logprobs: None,
+        })
+        .collect();
+
+    Ok(ChatCompletionResponse {
+        id,
+        object: "chat.completion".to_string(),
+        created,
+        model,
+        choices,
+        usage,
+        system_fingerprint: None,
+        raw_response: None,
+    })
+}
 
 /// OpenAI provider — also serves as the base for Azure (same API format).
 pub struct OpenAIProvider {
@@ -113,14 +272,34 @@ impl Provider for OpenAIProvider {
             GatewayError::ProviderError("Failed to read upstream response".to_string())
         })?;
 
-        let mut parsed: ChatCompletionResponse = match serde_json::from_str(&raw_text) {
-            Ok(parsed) => parsed,
-            Err(e) => {
-                tracing::error!("Failed to parse OpenAI response: {}", e);
-                return Err(GatewayError::UpstreamParseError {
-                    parse_error: e.to_string(),
-                    raw_body: raw_text,
-                });
+        // Tolerate a UTF-8 BOM: some upstreams prepend one invisibly (curl
+        // output looks fine) and serde_json fails with "expected value at
+        // line 1 column 1". Stripped for parsing only — raw_response and the
+        // prompt-log raw body keep the bytes as sent.
+        let parse_input = raw_text.strip_prefix('\u{feff}').unwrap_or(&raw_text);
+        let mut parsed: ChatCompletionResponse = if parse_input.trim_start().starts_with("data:") {
+            // Non-standard upstream answered a non-streaming request with an
+            // SSE stream — assemble the chunks into a complete response.
+            match assemble_sse_response(parse_input) {
+                Ok(assembled) => assembled,
+                Err(e) => {
+                    tracing::error!("Failed to assemble SSE response for non-stream request: {}", e);
+                    return Err(GatewayError::UpstreamParseError {
+                        parse_error: e,
+                        raw_body: raw_text,
+                    });
+                }
+            }
+        } else {
+            match serde_json::from_str(parse_input) {
+                Ok(parsed) => parsed,
+                Err(e) => {
+                    tracing::error!("Failed to parse OpenAI response: {}", e);
+                    return Err(GatewayError::UpstreamParseError {
+                        parse_error: e.to_string(),
+                        raw_body: raw_text,
+                    });
+                }
             }
         };
 
@@ -522,6 +701,62 @@ mod tests {
             }
             other => panic!("expected UpstreamParseError, got: {other:?}"),
         }
+    }
+
+    /// A UTF-8 BOM before the JSON (invisible in terminal curl output, but
+    /// serde_json fails at line 1 column 1) must be tolerated.
+    #[tokio::test]
+    async fn chat_response_with_utf8_bom_parses() {
+        let server = MockServer::start().await;
+        let body = format!("\u{feff}{}", fake_completion_response());
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = provider_for(server.uri(), None);
+        let resp = provider.chat(request_with_headers(&[])).await.expect("BOM-prefixed JSON must parse");
+        assert!(resp.usage.is_some());
+    }
+
+    /// Non-standard upstreams may answer a non-streaming request with an SSE
+    /// stream — the chunks must be assembled into a complete response.
+    #[tokio::test]
+    async fn chat_sse_answer_to_non_stream_request_is_assembled() {
+        let server = MockServer::start().await;
+        let sse = concat!(
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"test-model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hel\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"test-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"test-model\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"test-model\",\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2,\"total_tokens\":7}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = provider_for(server.uri(), None);
+        let resp = provider.chat(request_with_headers(&[])).await.expect("SSE answer must be assembled");
+        assert_eq!(resp.id, "chatcmpl-1");
+        assert_eq!(resp.object, "chat.completion");
+        assert_eq!(resp.choices.len(), 1);
+        assert_eq!(resp.choices[0].finish_reason.as_deref(), Some("stop"));
+        assert!(matches!(
+            &resp.choices[0].message.content,
+            MessageContent::Text(text) if text == "Hello"
+        ));
+        let usage = resp.usage.expect("usage from final chunk");
+        assert_eq!(usage.prompt_tokens, 5);
+        assert_eq!(usage.total_tokens, 7);
     }
 
     /// Passthrough identity fields (id/object/created) are not load-bearing;
