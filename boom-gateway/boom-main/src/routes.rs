@@ -75,6 +75,15 @@ fn write_prompt_log_error(
     state.prompt_log_writer.send(request_entry.clone());
 
     let mut response_entry = PromptLogEntry::new_response_from(&request_entry);
+    // Parse failures carry the raw upstream body — record it verbatim
+    // (regardless of capture_raw_upstream) so non-standard upstreams are
+    // diagnosable from the prompt log alone. Valid JSON bodies are stored
+    // as JSON; non-JSON bodies fall back to a string value.
+    if let Some(raw) = error.raw_upstream_body() {
+        let raw_value = serde_json::from_str::<serde_json::Value>(raw)
+            .unwrap_or_else(|_| serde_json::Value::String(raw.to_string()));
+        response_entry.set_raw_upstream_response(Arc::new(raw_value));
+    }
     response_entry.set_response(Arc::new(openai_error_body(error)));
     if let Some(trace) = prompt_trace {
         trace.finalize();
@@ -94,7 +103,9 @@ fn write_prompt_log_error(
             boom_promptlog::error_code::RATE_LIMITED
         }
         GatewayError::UpstreamTimeout => boom_promptlog::error_code::TIMEOUT,
-        GatewayError::UpstreamError { .. } | GatewayError::ProviderError(_) => {
+        GatewayError::UpstreamError { .. }
+        | GatewayError::ProviderError(_)
+        | GatewayError::UpstreamParseError { .. } => {
             boom_promptlog::error_code::UPSTREAM_ERROR
         }
         GatewayError::ConfigError(_) | GatewayError::InternalError(_) => {

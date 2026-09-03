@@ -113,10 +113,16 @@ impl Provider for OpenAIProvider {
             GatewayError::ProviderError("Failed to read upstream response".to_string())
         })?;
 
-        let mut parsed: ChatCompletionResponse = serde_json::from_str(&raw_text).map_err(|e| {
-            tracing::error!("Failed to parse OpenAI response: {}", e);
-            GatewayError::ProviderError("Failed to process upstream response".to_string())
-        })?;
+        let mut parsed: ChatCompletionResponse = match serde_json::from_str(&raw_text) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                tracing::error!("Failed to parse OpenAI response: {}", e);
+                return Err(GatewayError::UpstreamParseError {
+                    parse_error: e.to_string(),
+                    raw_body: raw_text,
+                });
+            }
+        };
 
         parsed.raw_response = Some(raw_text);
         Ok(parsed)
@@ -492,6 +498,30 @@ mod tests {
         let provider = provider_for(server.uri(), None);
         let resp = provider.chat(request_with_headers(&[])).await.expect("missing usage must not fail parsing");
         assert!(resp.usage.is_none());
+    }
+
+    /// Parse failures must carry the raw body and the serde detail up to the
+    /// route layer so the prompt log records exactly what the upstream sent.
+    #[tokio::test]
+    async fn chat_unparseable_response_carries_raw_body() {
+        let server = MockServer::start().await;
+        let body = "{\"not\":\"a valid completion\"}";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = provider_for(server.uri(), None);
+        let err = provider.chat(request_with_headers(&[])).await.unwrap_err();
+        match err {
+            GatewayError::UpstreamParseError { parse_error, raw_body } => {
+                assert!(parse_error.contains("missing field"), "unexpected parse error: {parse_error}");
+                assert_eq!(raw_body, body);
+            }
+            other => panic!("expected UpstreamParseError, got: {other:?}"),
+        }
     }
 
     /// Passthrough identity fields (id/object/created) are not load-bearing;
