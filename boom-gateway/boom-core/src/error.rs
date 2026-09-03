@@ -39,6 +39,16 @@ pub enum GatewayError {
     #[error("Provider error: {0}")]
     ProviderError(String),
 
+    /// Upstream returned HTTP success but the body failed schema parsing.
+    /// Carries the serde error and the raw body so the prompt log records
+    /// exactly what the upstream sent instead of dropping it at the
+    /// provider layer.
+    #[error("Failed to process upstream response: {parse_error}")]
+    UpstreamParseError {
+        parse_error: String,
+        raw_body: String,
+    },
+
     #[error("Budget exceeded for key")]
     BudgetExceeded,
 
@@ -84,7 +94,7 @@ impl GatewayError {
             Self::AuthError(_) => 401,
             Self::RateLimitExceeded { .. } | Self::ConcurrencyExceeded { .. } => 429,
             Self::ModelNotFound(_) => 404,
-            Self::ProviderError(_) => 502,
+            Self::ProviderError(_) | Self::UpstreamParseError { .. } => 502,
             Self::BudgetExceeded => 402,
             Self::ConfigError(_) => 500,
             Self::KeyExpired => 401,
@@ -142,7 +152,7 @@ impl GatewayError {
     /// (unreachable upstream or authentication failure) that will not self-heal.
     pub fn is_deployment_failure(&self) -> bool {
         match self {
-            Self::ProviderError(_) => true,
+            Self::ProviderError(_) | Self::UpstreamParseError { .. } => true,
             Self::UpstreamError { status, .. } => *status == 401 || *status == 403,
             _ => false,
         }
@@ -164,8 +174,17 @@ impl GatewayError {
             Self::NotSupported(_) => "not_supported",
             Self::UnsupportedMode(_) => "unsupported_mode_error",
             Self::ProviderError(_) => "provider_error",
+            Self::UpstreamParseError { .. } => "upstream_parse_error",
             Self::FlowControlQueueTimeout { .. } => "flow_control_timeout",
             Self::ConfigError(_) | Self::InternalError(_) => "internal_error",
+        }
+    }
+
+    /// Raw upstream body carried by parse failures, for the prompt log.
+    pub fn raw_upstream_body(&self) -> Option<&str> {
+        match self {
+            Self::UpstreamParseError { raw_body, .. } => Some(raw_body),
+            _ => None,
         }
     }
 }

@@ -1170,6 +1170,71 @@ async fn validate_db_workflow_namespace(
 // YAML → Memory (no-DB fallback)
 // ═══════════════════════════════════════════════════════════
 
+/// Derive a model's cost rate from its `model_info.cost_template`.
+///
+/// Pricing is sourced exclusively from `cost_templates` — model_info no longer
+/// carries inline cost fields (v3 single-source-of-truth refactor). The
+/// `cost_template` name selects which template applies; missing template =
+/// no rate. YAML/DB rates are CNY per million tokens (e.g. `0.27` = ¥0.27/1M
+/// tokens), converted to per-token Decimal internally for accurate accounting
+/// on small requests.
+///
+/// Shared by the YAML build path (`build_deployments_from_config`) and the
+/// CRUD apply path (`reload_model_deployments`) so both stay identical.
+pub(crate) fn cost_rate_from_model_info(
+    config: &Config,
+    model_name: &str,
+    info: &boom_config::ModelInfo,
+) -> Option<boom_routing::ModelCostRate> {
+    use rust_decimal::prelude::FromPrimitive;
+    let per_million_to_per_token = |v: Option<f64>| -> Option<rust_decimal::Decimal> {
+        v.and_then(rust_decimal::Decimal::from_f64)
+            .map(|d| d / rust_decimal::Decimal::from(1_000_000))
+    };
+
+    // Template lookup is the only source of rates now.
+    let template_rates = info.cost_template.as_ref().and_then(|tn| {
+        config.lookup_cost_template(tn).map(|t| {
+            (
+                t.input_cost_per_million_tokens,
+                t.cached_input_cost_per_million_tokens,
+                t.output_cost_per_million_tokens,
+            )
+        })
+    });
+
+    if let (Some(ref tn), None) = (&info.cost_template, &template_rates) {
+        tracing::warn!(
+            model = %model_name,
+            template = %tn,
+            "cost_template not found in cost_templates — no rate registered"
+        );
+    }
+
+    let (src_input, src_cached, src_output) = template_rates?;
+    let input_rate = per_million_to_per_token(src_input);
+    let cached_rate = per_million_to_per_token(src_cached);
+    let output_rate = per_million_to_per_token(src_output);
+
+    if input_rate.is_some() || output_rate.is_some() || cached_rate.is_some() {
+        tracing::info!(
+            model = %model_name,
+            template = ?info.cost_template,
+            input_per_1m = src_input.unwrap_or(0.0),
+            cached_per_1m = src_cached.unwrap_or(0.0),
+            output_per_1m = src_output.unwrap_or(0.0),
+            "Registered cost rate (CNY per million tokens)"
+        );
+        Some(boom_routing::ModelCostRate::with_cached(
+            input_rate.unwrap_or_default(),
+            cached_rate.unwrap_or_default(),
+            output_rate.unwrap_or_default(),
+        ))
+    } else {
+        None
+    }
+}
+
 /// Build deployments directly from YAML config into DeploymentStore.
 fn build_deployments_from_config(config: &Config, deployment_store: &Arc<DeploymentStore>) {
     deployment_store.clear();
@@ -1226,61 +1291,11 @@ fn build_deployments_from_config(config: &Config, deployment_store: &Arc<Deploym
                 deployment_store.set_quota_ratio(&entry.model_name, ratio);
 
                 // Per-model cost rates for billing/quota accounting.
-                // Pricing is sourced exclusively from `cost_templates` —
-                // model_info no longer carries inline cost fields (v3 single-
-                // source-of-truth refactor). The model_info.cost_template name
-                // selects which template applies; missing template = no rate.
-                //
-                // YAML rates are CNY per million tokens (e.g. `0.27` = ¥0.27/1M
-                // tokens). Convert to per-token Decimal internally for accurate
-                // accounting on small requests.
+                // Derivation lives in `cost_rate_from_model_info` so the YAML
+                // build path and the CRUD apply path stay identical.
                 if let Some(info) = entry.model_info.as_ref() {
-                    use rust_decimal::prelude::FromPrimitive;
-                    let per_million_to_per_token = |v: Option<f64>| -> Option<rust_decimal::Decimal> {
-                        v.and_then(rust_decimal::Decimal::from_f64)
-                            .map(|d| d / rust_decimal::Decimal::from(1_000_000))
-                    };
-
-                    // Template lookup is the only source of rates now.
-                    let template_rates = info.cost_template.as_ref().and_then(|tn| {
-                        config.lookup_cost_template(tn).map(|t| {
-                            (
-                                t.input_cost_per_million_tokens,
-                                t.cached_input_cost_per_million_tokens,
-                                t.output_cost_per_million_tokens,
-                            )
-                        })
-                    });
-
-                    if let (Some(ref tn), None) = (&info.cost_template, &template_rates) {
-                        tracing::warn!(
-                            model = %entry.model_name,
-                            template = %tn,
-                            "cost_template not found in cost_templates — no rate registered"
-                        );
-                    }
-
-                    if let Some((src_input, src_cached, src_output)) = template_rates {
-                        let input_rate = per_million_to_per_token(src_input);
-                        let cached_rate = per_million_to_per_token(src_cached);
-                        let output_rate = per_million_to_per_token(src_output);
-
-                        if input_rate.is_some() || output_rate.is_some() || cached_rate.is_some() {
-                            let rate = boom_routing::ModelCostRate::with_cached(
-                                input_rate.unwrap_or_default(),
-                                cached_rate.unwrap_or_default(),
-                                output_rate.unwrap_or_default(),
-                            );
-                            deployment_store.set_cost_rate(&entry.model_name, rate);
-                            tracing::info!(
-                                model = %entry.model_name,
-                                template = ?info.cost_template,
-                                input_per_1m = src_input.unwrap_or(0.0),
-                                cached_per_1m = src_cached.unwrap_or(0.0),
-                                output_per_1m = src_output.unwrap_or(0.0),
-                                "Registered cost rate (CNY per million tokens)"
-                            );
-                        }
+                    if let Some(rate) = cost_rate_from_model_info(config, &entry.model_name, info) {
+                        deployment_store.set_cost_rate(&entry.model_name, rate);
                     }
                 }
             }

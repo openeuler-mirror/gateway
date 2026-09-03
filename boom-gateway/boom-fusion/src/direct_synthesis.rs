@@ -169,7 +169,9 @@ impl DirectSynthesisWorkflow {
         for (index, model, result) in join_all(panel_futures).await {
             match result {
                 Ok(invocation) => {
-                    add_usage(&mut round.usage, &invocation.response.usage);
+                    if let Some(ref usage) = invocation.response.usage {
+                        add_usage(&mut round.usage, usage);
+                    }
                     if valid_panel(&invocation.response) {
                         round.valid.push(PanelSuccess { index, invocation });
                     } else {
@@ -266,7 +268,7 @@ impl DirectSynthesisWorkflow {
         let valid_panels = match panel_outcome {
             PanelOutcome::Single(invocation) => {
                 let mut response = invocation.response;
-                response.usage = usage;
+                response.usage = Some(usage);
                 return Ok(WorkflowExecution { response });
             }
             PanelOutcome::Aggregate(valid_panels) => valid_panels,
@@ -278,7 +280,9 @@ impl DirectSynthesisWorkflow {
             .await
         {
             Ok(invocation) => {
-                add_usage(&mut usage, &invocation.response.usage);
+                if let Some(ref invocation_usage) = invocation.response.usage {
+                    add_usage(&mut usage, invocation_usage);
+                }
                 invocation.response
             }
             Err(error @ GatewayError::ModelNotFound(_)) => {
@@ -286,7 +290,7 @@ impl DirectSynthesisWorkflow {
             }
             Err(_) => valid_panels[0].response.clone(),
         };
-        response.usage = usage;
+        response.usage = Some(usage);
         Ok(WorkflowExecution { response })
     }
 
@@ -1005,12 +1009,12 @@ mod tests {
                 finish_reason: Some("stop".to_string()),
                 logprobs: None,
             }],
-            usage: Usage {
+            usage: Some(Usage {
                 prompt_tokens: 2,
                 completion_tokens: 1,
                 total_tokens: 3,
                 ..Usage::default()
-            },
+            }),
             system_fingerprint: None,
             raw_response: None,
         }

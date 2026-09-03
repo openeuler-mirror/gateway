@@ -133,6 +133,12 @@ pub struct DeploymentRow {
 }
 
 /// Minimal deployment row for provider creation.
+///
+/// Besides the provider-building columns this also carries the derived-state
+/// columns (flow control limits, quota ratio, cost metadata) so that
+/// `reload_model_deployments` can apply EVERY in-memory consumer of a row in
+/// one place — not just the provider list. Dropping columns here re-introduces
+/// the "saved in web UI but not effective until manual reload" class of bug.
 #[derive(Debug, sqlx::FromRow)]
 pub struct DeploymentProviderRow {
     pub model_name: String,
@@ -151,6 +157,15 @@ pub struct DeploymentProviderRow {
     /// false for legacy rows.
     #[sqlx(default)]
     pub serve_not_match: bool,
+    /// Derived-state columns (FlowController slots, quota ratio, cost rates).
+    #[sqlx(default)]
+    pub quota_count_ratio: Option<i64>,
+    #[sqlx(default)]
+    pub max_inflight_queue_len: Option<i32>,
+    #[sqlx(default)]
+    pub max_context_len: Option<i64>,
+    #[sqlx(default)]
+    pub model_info: Option<serde_json::Value>,
 }
 
 /// Minimal deployment row used by boom-main health monitor.
@@ -599,7 +614,8 @@ impl DeploymentStore {
         sqlx::query_as::<_, DeploymentProviderRow>(
             r#"SELECT model_name, litellm_model, api_key, api_key_env, api_base, api_version,
                       aws_region_name, timeout, headers, deployment_id, client_type_header,
-                      serve_not_match
+                      serve_not_match, quota_count_ratio, max_inflight_queue_len,
+                      max_context_len, model_info
                FROM boom_model_deployment
                WHERE model_name = $1 AND enabled IS NOT FALSE
                ORDER BY created_at"#,
@@ -618,7 +634,8 @@ impl DeploymentStore {
         sqlx::query_as::<_, DeploymentProviderRow>(
             r#"SELECT model_name, litellm_model, api_key, api_key_env, api_base, api_version,
                       aws_region_name, timeout, headers, deployment_id, client_type_header,
-                      serve_not_match
+                      serve_not_match, quota_count_ratio, max_inflight_queue_len,
+                      max_context_len, model_info
                FROM boom_model_deployment
                WHERE serve_not_match = true AND enabled IS NOT FALSE
                ORDER BY created_at"#,

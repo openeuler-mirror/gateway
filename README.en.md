@@ -6,44 +6,40 @@
 
 [中文](README.md) | **English**
 
-A production-grade LLM API gateway built in Rust. Unified request entry point for OpenAI, Anthropic, Gemini, Bedrock, vLLM, Ollama and 20+ providers. Compatible with the litellm key schema, with self-built rate limiting, plan management, flow control, cost/billing, web dashboard, request auditing, and full prompt logging.
+A production-grade LLM API gateway built in Rust. It unifies 20+ upstream providers (OpenAI, Anthropic, Gemini, Bedrock, vLLM, Ollama, ...), stays compatible with the litellm key system, and ships its own rate limiting, plans, billing, traffic governance, web dashboard, auditing, and full prompt logging. Its core differentiator: **intelligent scheduling optimized for vLLM prefix caching** — session-prefix affinity, key affinity, semantic routing, and feedback-driven load balancing.
 
 [![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange)](https://www.rust-lang.org/)
 [![License: MulanPSL v2](https://img.shields.io/badge/License-MulanPSL%20v2-green.svg)](LICENSE)
 
 ---
 
-## Features
+## Intelligent Scheduling
 
-- **Multi-Provider Routing** — OpenAI / Anthropic / Azure / Gemini / Bedrock / vLLM / Ollama etc.
-- **Direct Synthesis Workflow** — Run multiple panels concurrently, then synthesize a standard streaming or non-streaming OpenAI response with an aggregator
-- **Load Balancing** — Round-robin, key-affinity, or KVC-aware scheduling across same-name deployments, with live rebalancing counters
-- **Rate Limiting** — Sliding window + concurrency control + custom time windows + scheduled plans
-- **Plan System** — Flexible key plans and team plans (with `member_plan` inheritance), key/team→plan assignment, 3-level fallback
-- **Quota & Cost** — Per-model `quota_count_ratio`, plus `cost_templates` pricing and per-window token/cost limits
-- **Flow Control** — Per-deployment max inflight requests + max context chars, VIP priority queue
-- **Auto-Disable** — Consecutive request-failure detection auto-disables faulty deployments (including wildcard `*`)
-- **Deployment Health Probes** — Active `/metric` probing with automatic offline/recovery (configurable thresholds)
-- **KV-Cache Aware Routing** — Subscribe to vLLM KV-cache events via ZMQ, route requests to the worker with the most cached prefix, reducing TTFT
-- **Public Models** — `public_models` config grants all keys access to selected models without whitelist updates
-- **Anthropic Native** — `/v1/messages` endpoint (Claude Code / opencode compatible)
-- **Prompt Logging** — Full request/response bodies (incl. raw SSE chunks) written to disk as rotating, gzip-compressed JSONL; toggle per team/key from the dashboard
-- **Agent Statistics** — Client-type classification (Anthropic-native vs. Other) with a 60-minute breakdown on the dashboard
-- **Web Dashboard** — SPA admin panel: keys, models, aliases, plans, teams, quota, logs, real-time inflight + agent stats
-- **Hot Reload** — SIGHUP, API, or dashboard button; zero-downtime config swap via ArcSwap
-- **Request Auditing** — Full request logs (tokens, duration, status), streaming requests track real duration
-- **Debug Recording** — Optional upstream response capture for error diagnosis (behind the `debug-tools` feature)
-- **Containerized LB** — The `misc/LB` front-end ships as a Docker image (multi-stage Rust build on openEuler runtime)
+Scheduling policies are pluggable and hot-swappable (`router_settings.schedule_policy`), implemented entirely on the gateway side with zero intrusion into upstreams:
+
+- **Session-prefix affinity (`kvc_aware`)** — A self-learning prefix trie on the gateway side: each request's conversation prefix (system + tools + messages, in fixed order) is chunked and hashed into a block chain recorded under the actually selected worker; the next request with the same prefix hits it directly. Candidates are scored on a unified axis `score = cache_weight × hit_ratio + load_weight × (1 − load_pct/100)`, sending requests to the worker with the most cache hits that is not overloaded — significantly reducing TTFT. When the hit rate runs low, the gateway can actively request a full KV cache report from upstream to correct the index; LRU + TTL aging, no vLLM event subscription required.
+- **Key affinity (`key_affinity`)** — Requests from the same key + model stick to the same deployment to maximize upstream session-level cache reuse; new keys warm up on lowest-load spreading, and traffic migrates automatically once the load gap exceeds the rebalance threshold.
+- **Semantic routing (`auto_router`)** — A virtual model classifies requests by content and routes dynamically: a built-in heuristic classifier (keyword / length / code-block / reasoning / tool-call signals), or an external ML classification service (falls back to local on failure), dispatching requests to small / medium / large tiers of real models.
+- **Feedback-driven load balancing** — A real-time load-signal bus (in-flight counts, flow-control queue depth, request success rate) drives scheduling: unified scoring, hard exclusion of overloaded nodes (configurable threshold), capacity rebalancing (a dominant node hands off traffic once it exceeds the least-loaded candidate by a set percentage), and round-robin tie-breaking; rebalance moves over a 60-minute window are observable in the dashboard.
+- **Unhealthy node governance** — Automatic circuit breaking on consecutive failures, active `/metric` probing with automatic off-line/recovery (configurable thresholds), traffic bypass for overloaded nodes, and automatic re-entry after recovery; the `"*"` fallback deployment is equally protected.
+
+## Traffic Governance & Observability
+
+- **Flow control** — Per-deployment caps on max in-flight requests and total in-flight context characters: over-limit requests queue (VIP keys dispatched first), oversized requests are rejected immediately; slots release automatically on response completion or client disconnect.
+- **3-dimensional rate limiting & billing** — Key / team two-layer plans; counts / tokens / costs sliding windows + lifetime cumulative quotas; time-of-day schedules (crossing midnight) switch limits automatically.
+- **End-to-end observability** — Per-request TTFT, duration, queue wait, scheduling policy, and KV hit ratio persisted; anomaly outlier detection (IQR); OTel trace export; full prompt logging (rolling + gzip, dynamically toggleable per team / key).
+
+## Gateway Fundamentals
+
+Unified access to 20+ upstream providers; litellm key-system compatibility; native Anthropic `/v1/messages` (works with Claude Code / opencode); Direct Synthesis Workflow (fan out to multiple panel models, then aggregate into a standard OpenAI response); public models, model aliases, and `"*"` fallback routing; web dashboard (keys / models / plans / quotas / logs / real-time in-flight & stats); zero-downtime hot reload via SIGHUP / API / dashboard button.
 
 ---
 
 ## Benchmarks
 
-Test environment: **kunpeng920** (ARM64). Stress-tested with `mock-backend` (zero inference latency, returns 100–400 chars of random content) and `bench-client` under `boom-gateway/test/`. Workload: **~50K input context + 100–500 output tokens**, **with prompt-log disk writes and OTLP export enabled**. **All latency values are in ms**, reported as p50 / p90 / p99 / p999 / mean.
+Environment: **kunpeng920** (ARM64). Load generated by `mock-backend` (no inference latency, returns 100–400 chars of random content) and `bench-client` from `boom-gateway/test/`. Workload: **~50K input context + 100–500 output tokens**, **with prompt-log disk writes + OTLP reporting enabled**. **All figures in ms**.
 
-### Non-Streaming
-
-> Unit: ms
+### Non-streaming
 
 | Target RPS | p50 | p90 | p99 | p999 | mean |
 |---------|-----|-----|-----|------|------|
@@ -55,8 +51,6 @@ Test environment: **kunpeng920** (ARM64). Stress-tested with `mock-backend` (zer
 
 ### Streaming TTFT (time to first token)
 
-> Unit: ms
-
 | Target RPS | p50 | p90 | p99 | p999 | mean |
 |---------|-----|-----|-----|------|------|
 | 50    | 54.1 | 58.0 | 62.4 | 80.9 | 43.4 |
@@ -65,9 +59,7 @@ Test environment: **kunpeng920** (ARM64). Stress-tested with `mock-backend` (zer
 | 1000  | 65.3 | 99.0 | 169.0 | 5607.0 | 80.2 |
 | 2000  | 87.3 | 281.0 | 1047.0 | 6295.0 | 155.0 |
 
-### Streaming E2E (incl. mock-backend simulating 500 tps token emission, ~200–1000ms per request)
-
-> Unit: ms
+### Streaming E2E (mock-backend simulating 500 tps token emission, ~200–1000ms per request)
 
 | Target RPS | p50 | p90 | p99 | p999 | mean |
 |---------|-----|-----|-----|------|------|
@@ -77,227 +69,77 @@ Test environment: **kunpeng920** (ARM64). Stress-tested with `mock-backend` (zer
 | 1000  | 2373 | 6512 | 7794 | 8130 | 2996 |
 | 2000  | 1564 | 7254 | 8839 | 9232 | 2822 |
 
-**Reading the numbers**:
+**Reading**: non-streaming p50 stays at 9–10ms with p999 ≤ 36.5ms — the gateway itself is not the bottleneck under load. Streaming TTFT holds ~54ms up to 500 RPS; queuing appears from 1000 RPS, with saturation determined at the first-token stage — token emission adds no further amplification.
 
-- **Non-streaming**: p50 stays at 9–10ms across all RPS levels; p999 at 1000/2000 RPS is only 34.6 / 36.5ms — the gateway itself is not the bottleneck; the long tail is mostly mock-backend scheduling jitter.
-- **Streaming TTFT**: p50 holds at ~54ms up to 500 RPS; queueing shows up starting at 1000 RPS (p999 jumps to 5.6s, indicating the connection pool or SSE push path is near its saturation knee).
-- **Streaming E2E**: under 500 RPS, p50 is ~540ms (close to the theoretical floor set by mock token emission); beyond 1000 RPS, p50/p999 rise sharply, consistent with the TTFT knee — i.e. streaming saturation is determined at the first-token stage; the subsequent token-emission stage adds no further amplification.
-
-> Source: `boom-gateway/test/` toolchain. Reproduction steps in [boom-gateway/test/README.md](boom-gateway/test/README.md).
+> Reproduce with the toolchain in [boom-gateway/test/README.md](boom-gateway/test/README.md).
 
 ---
 
-## Quick Start
+## Getting Started
 
-### Prerequisites
+### Deploy from Source
 
-- Rust 1.75+ (with cargo)
-- PostgreSQL 13+ (for key authentication and persistence)
-
-### 1. Build
+Prerequisites: Rust 1.75+ (with cargo), PostgreSQL 13+.
 
 ```bash
-git clone https://github.com/your-org/BooMGateway.git
-cd BooMGateway
+git clone https://atomgit.com/openeuler/gateway.git
+cd gateway
 
-# Build release binary
 cargo build --release
-
-# The binary is at target/release/boom-gateway
+# binary at target/release/boom-gateway
 ```
 
-### 2. Prepare Database
-
-Create an empty PostgreSQL database. BooMGateway auto-creates all required tables on startup:
+**1. Prepare the database** — an empty database is enough; all tables are created automatically at startup:
 
 ```bash
-# Create database (any name works)
 createdb boom_gateway
-
-# Or via psql
-psql -U postgres -c "CREATE DATABASE boom_gateway;"
+# or: psql -U postgres -c "CREATE DATABASE boom_gateway;"
 ```
 
-That's it — no manual schema migration needed. The gateway auto-creates 11 `boom_*` tables:
-
-| Table | Owner | Purpose |
-|-------|-------|---------|
-| `boom_request_log` | boom-audit | Request logs with token counts, duration, status |
-| `boom_model_deployment` | boom-routing | Model deployment configs |
-| `boom_model_alias` | boom-routing | Model alias mappings |
-| `boom_rate_limit_state` | boom-limiter | Rate-limit window counters |
-| `boom_rate_limit_cumulative` | boom-limiter | Permanent cumulative token/cost totals |
-| `boom_key_plan_assignment` | boom-limiter | Key-to-plan assignments |
-| `boom_team_plan_assignment` | boom-limiter | Team-to-plan assignments |
-| `boom_rate_limit_plan` | boom-limiter | Plan definitions |
-| `boom_config` | boom-dashboard | Generic KV config store |
-| `boom_team_table` | boom-dashboard | Team definitions with model access |
-| `boom_verification_token` | boom-dashboard / boom-auth | API key/token records (litellm-compatible schema) |
-
-### 3. Configure
-
-Create `config.yaml` (the repo ships `config.example.yaml` — copy it as a starting point):
-
-```bash
-cp config.example.yaml config.yaml
-```
+**2. Write a minimal `config.yaml`** (see [CONFIG_EXAMPLE.md](CONFIG_EXAMPLE.md) for all fields):
 
 ```yaml
-# Model deployments
 model_list:
   - model_name: gpt-4o
     litellm_params:
       model: openai/gpt-4o
       api_key: os.environ/OPENAI_API_KEY
 
-  - model_name: claude-sonnet
-    litellm_params:
-      model: anthropic/claude-sonnet-4-20250514
-      api_key: os.environ/ANTHROPIC_API_KEY
-
-  - model_name: deepseek-chat
-    litellm_params:
-      model: openai/deepseek-chat
-      api_base: https://api.deepseek.com/v1
-      api_key: os.environ/DEEPSEEK_API_KEY
-
-  # Catch-all: model names matching no configured model_name route here
+  # Fallback route: requests matching no model_name land here
   - model_name: "*"
     litellm_params:
-      model: openai/gpt-4o-mini
+      model: openai/gpt-4o
       api_key: os.environ/OPENAI_API_KEY
 
-  # With flow control — protect expensive backends from burst traffic
-  # - model_name: claude-opus
-  #   model_info:
-  #     id: opus-node-1               # deployment_id for flow control slot
-  #   flow_control:
-  #     model_queue_limit: 20          # max concurrent in-flight requests
-  #     model_context_limit: 2000000   # max total input chars across in-flight
-  #   litellm_params:
-  #     model: anthropic/claude-opus-4-20250514
-  #     api_key: os.environ/ANTHROPIC_API_KEY
-
-# Direct Synthesis: clients request fusion; the Gateway runs panels concurrently and aggregates them
-workflow_settings:
-  models:
-    fusion: direct_synthesis
-  workflows:
-    direct_synthesis:
-      type: direct_synthesis
-      roles:
-        panel:
-          - model: gpt-4o
-            temperature: 0.3
-          - model: claude-sonnet
-            temperature: 0.3
-          - model: deepseek-chat
-            temperature: 0.3
-        aggregator:
-          model: gpt-4o
-          temperature: 0.0
-
-# General settings
 general_settings:
   master_key: os.environ/MASTER_KEY
   database_url: os.environ/DATABASE_URL
-  # Models accessible to ALL keys regardless of per-key whitelist
-  public_models:
-    - deepseek-chat
 
-# Server
 server:
   host: 0.0.0.0
   port: 4000
-  workers: 4
-
-# Rate limiting
-rate_limit:
-  enabled: true
-  default_rpm: 60
-
-# Plans (key plans and team plans)
-plan_settings:
-  default_plan: "basic"
-  default_team_plan: "team_basic"
-  plans:
-    basic:                                # key plan
-      concurrency_limit: 4
-      rpm_limit: 60
-      window_limits:
-        - [100, 18000]
-    pro:                                  # key plan
-      concurrency_limit: 10
-      rpm_limit: 120
-      window_limits:
-        - [500, 18000]
-    team_basic:                           # team plan, members inherit "basic"
-      type: team
-      member_plan: basic
-
-# Full request/response logging to disk (off by default)
-prompt_log:
-  enabled: false
-  dir: "/data/prompt_logs"
-  max_file_size_mb: 50
-  capture_raw_upstream: false             # also store pre-conversion upstream body (/v1/messages etc.)
-  excluded_keys: []
-  excluded_teams: []
-
-# Active health probing for deployments
-deployment_health_check:
-  auto_offline_enabled: true
-  auto_recovery_enabled: true
-  path: /metric
-  failure_threshold: 3
-  recovery_threshold: 2
 ```
 
-`fusion` appears in `/v1/models` like an ordinary model and is invoked through
-`/v1/chat/completions`. Panels always run concurrently with non-streaming
-requests; the aggregator returns a standard streaming or non-streaming OpenAI
-response according to the client request. Every child call re-enters the Gateway
-Router and retains model resolution, scheduling, flow control, and inflight
-governance. Workflows are not currently supported on `/v1/messages`.
-
-See [CONFIG_EXAMPLE.md](CONFIG_EXAMPLE.md) for the complete reference (also covers `router_settings`, `cost_templates`, KV-cache-aware routing, and more).
-
-### 4. Run
+**3. Start**:
 
 ```bash
-# Set environment variables
 export MASTER_KEY="sk-your-master-key"
 export DATABASE_URL="postgres://user:pass@localhost:5432/boom_gateway"
 export OPENAI_API_KEY="sk-..."
-export ANTHROPIC_API_KEY="sk-ant-..."
 
-# Run
-cargo run --release -p boom-main
-
-# Or run the built binary directly
-./target/release/boom-gateway
+./target/release/boom-gateway --config config.yaml
 ```
 
-CLI flags (override `config.yaml`):
+**4. Create a key and make a call**:
 
 ```bash
-boom-gateway --config config.yaml --host 0.0.0.0 --port 4000
-boom-gateway --reboot      # gracefully stop a running instance, then start
-```
-
-### 5. Create Keys & Start Using
-
-```bash
-# Create an API key via dashboard API
+# Create an API key via the dashboard API (the plaintext key is shown once — save it immediately)
 curl -X POST http://localhost:4000/dashboard/api/admin/keys \
   -H "Authorization: Bearer $MASTER_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"key_alias": "alice", "plan_name": "pro"}'
+  -d '{"key_alias": "alice"}'
 
-# Response: {"key": "sk-...", "token_hash": "...", "key_name": null}
-# Copy the key — it's shown only once!
-
-# Use it
+# Use the gateway just like OpenAI
 curl http://localhost:4000/v1/chat/completions \
   -H "Authorization: Bearer sk-your-new-key" \
   -H "Content-Type: application/json" \
@@ -307,36 +149,40 @@ curl http://localhost:4000/v1/chat/completions \
   }'
 ```
 
-### 6. Dashboard
+Open `http://localhost:4000/dashboard` in a browser for the management dashboard (log in as admin with the master key, or as a regular user with an API key).
 
-Open `http://localhost:4000/dashboard` in your browser. Log in as `admin` with your master key (or as a regular user with an API key).
+### Container Deployment
+
+The containerized deployment is being finalized — please deploy from source for now.
 
 ---
 
-## Project Structure
+## Project Layout
 
 ```
-BooMGateway/
-├── boom-gateway/           Rust workspace root (14 crates)
-│   ├── boom-core/          Core traits and shared types
-│   ├── boom-auth/          Key authentication (SHA-256 + DB + master key)
-│   ├── boom-config/        YAML config parsing with env var expansion
-│   ├── boom-fusion/        Workflow abstractions and Direct Synthesis orchestration
-│   ├── boom-provider/      LLM provider implementations
-│   ├── boom-limiter/       Sliding window rate limiter + concurrency + PlanStore
-│   ├── boom-flowcontrol/   Per-deployment flow control with VIP priority
-│   ├── boom-routing/       DeploymentStore + AliasStore + scheduling policies
-│   ├── boom-kvindex/       KV-cache prefix index + ZMQ subscriber + tokenization
-│   ├── boom-ctxaware/      Client-type classification + agent statistics
-│   ├── boom-promptlog/     Full request/response logging to disk (JSONL)
-│   ├── boom-audit/         Request log read/write
-│   ├── boom-dashboard/     Web UI + REST API + JWT auth
-│   └── boom-main/          Entry point, routing, state assembly (binary: boom-gateway)
-├── misc/LB/                Pingora load balancer (optional front-end, Dockerized)
-├── misc/logo.svg           Project logo
-├── config.example.yaml     Complete config reference
-├── ARCH.md                 Architecture design document
-└── CLAUDE.md               Development guidelines
+gateway/
+├── Cargo.toml             Rust workspace root (members under boom-gateway/)
+├── boom-gateway/          All crates
+│   ├── boom-core/         Core traits & shared types (leaf dependency)
+│   ├── boom-auth/         Key authentication (SHA-256 + DB + master key, litellm-compatible)
+│   ├── boom-config/       YAML parsing + env expansion + field manifest
+│   ├── boom-provider/     LLM provider implementations (OpenAI / Anthropic / Bedrock, ...)
+│   ├── boom-routing/      DeploymentStore + AliasStore + scheduling policies
+│   ├── boom-kvindex/      KV prefix index (self-learning trie)
+│   ├── boom-fusion/       Workflow abstraction & Direct Synthesis orchestration
+│   ├── boom-flowcontrol/  Per-deployment flow control (VIP priority queue)
+│   ├── boom-limiter/      Sliding-window rate limiting + concurrency + PlanStore
+│   ├── boom-ctxaware/     Client-type detection & stats
+│   ├── boom-promptlog/    Full request/response logging (JSONL)
+│   ├── boom-audit/        Request audit log
+│   ├── boom-trace/        OTel traces + latency distribution
+│   ├── boom-stressmon/    Stress monitoring
+│   ├── boom-hooks-sdk/    Hook SDK
+│   ├── boom-dashboard/    Web UI + REST API + JWT auth
+│   └── boom-main/         Entry point, routing, state assembly (binary: boom-gateway)
+├── misc/LB/               Pingora load balancer (optional frontend, containerized)
+├── config.example.yaml    Full configuration reference
+└── docs/                  Design docs & API manual
 ```
 
 ## Tech Stack
@@ -344,349 +190,29 @@ BooMGateway/
 | Component | Technology |
 |-----------|-----------|
 | Language | Rust (edition 2021) |
-| HTTP Framework | Axum |
-| Async Runtime | Tokio (multi-thread) |
-| Database | PostgreSQL (sqlx, auto-migrate) |
+| HTTP framework | Axum |
+| Async runtime | Tokio (multi-threaded) |
+| Database | PostgreSQL (sqlx, auto migrations) |
 | Concurrency | DashMap, ArcSwap |
-| KV Events | ZMQ (PUB/SUB), MessagePack |
-| Cost / Billing | rust_decimal |
+| Billing | rust_decimal |
 | CLI | clap |
 | Auth | SHA-256 token hashing, JWT sessions |
 
-## API Endpoints
-
-### Client API (requires API key)
-
-| Endpoint | Description |
-|----------|-------------|
-| `POST /v1/chat/completions` | OpenAI chat (streaming / non-streaming, workflow models) |
-| `POST /v1/messages` | Anthropic Messages API |
-| `POST /v1/completions` | OpenAI completions |
-| `POST /v1/embeddings` | Returns "not supported" (route exists, uniformly rejected) |
-| `POST /v1/audio/speech` · `/audio/transcriptions` · `/v1/moderations` | Returns "not supported" (route exists, uniformly rejected) |
-| `GET /v1/models` | Models visible to the key (deployments + aliases) |
-| `GET /v1/models/{id}` | Single model info |
-
-> OpenAI client-compatible aliases (without `/v1` prefix) are also provided: `/chat/completions`, `/completions`, `/models`, `/models/{id}`.
-
-### Admin API (master key)
-
-| Endpoint | Description |
-|----------|-------------|
-| `POST /admin/config/reload` | Hot-reload config.yaml |
-| `PUT /admin/plans` · `GET /admin/plans` · `DELETE /admin/plans/{name}` | Plan CRUD |
-| `POST /admin/plans/assign` · `DELETE /admin/plans/assign/{key_hash}` · `GET /admin/plans/assignments` | Key→plan assignment |
-
-### Dashboard — Auth
-
-| Endpoint | Description |
-|----------|-------------|
-| `POST /dashboard/api/auth/login` | Log in (admin via master key, or user via API key) |
-| `POST /dashboard/api/auth/logout` | Clear session |
-| `GET /dashboard/api/auth/me` | Current session info |
-
-### Dashboard — User API (session, scoped to caller's key)
-
-| Endpoint | Description |
-|----------|-------------|
-| `GET /dashboard/api/user/plan` | Current plan + remaining quota |
-| `GET /dashboard/api/user/usage` | Token / cost / request usage |
-| `GET /dashboard/api/user/key-info` | Key metadata (alias, team, models, RPM) |
-| `GET /dashboard/api/user/logs` | Own request logs (paginated) |
-| `GET /dashboard/api/user/request-status` | Real-time status of in-flight requests |
-
-### Dashboard — Admin API (admin session)
-
-**Keys**
-| Endpoint | Description |
-|----------|-------------|
-| `GET /dashboard/api/admin/keys` | List keys |
-| `POST /dashboard/api/admin/keys` · `/keys/batch` | Create / batch-create keys |
-| `POST /dashboard/api/admin/keys/import` | Import external keys |
-| `PUT /dashboard/api/admin/keys/{token_hash}` | Update a key |
-| `DELETE /dashboard/api/admin/keys/{token_hash}` | Delete a key |
-| `POST /dashboard/api/admin/keys/{token_hash}/block` · `/unblock` | Block / unblock a key |
-
-**Models & aliases**
-| Endpoint | Description |
-|----------|-------------|
-| `GET` · `POST /dashboard/api/admin/models` | List / create model deployment |
-| `PUT` · `DELETE /dashboard/api/admin/models/{id}` | Update / delete model deployment |
-| `GET` · `POST /dashboard/api/admin/aliases` | List / create model alias |
-| `PUT` · `DELETE /dashboard/api/admin/aliases/{alias_name}` | Update / delete model alias |
-
-**Plans, assignments & teams**
-| Endpoint | Description |
-|----------|-------------|
-| `GET` · `PUT /dashboard/api/admin/plans` · `DELETE /dashboard/api/admin/plans/{name}` | Plan CRUD |
-| `POST /dashboard/api/admin/assignments` · `DELETE` · `GET` | Key→plan assignment |
-| `POST /dashboard/api/admin/team-assignments` · `DELETE /{team_id}` | Team→plan assignment |
-| `POST /dashboard/api/admin/teams` · `PUT` · `DELETE /dashboard/api/admin/teams/{team_id}` | Team CRUD with model access control |
-
-**Quota**
-| Endpoint | Description |
-|----------|-------------|
-| `GET /dashboard/api/admin/quota/overview` | Team-organized quota overview |
-| `GET /dashboard/api/admin/quota/team/{id}` · `/unassigned` · `/key/{key_hash}/windows` | Quota detail |
-| `POST /dashboard/api/admin/quota/reset/key/{key_hash}` · `/team/{id}` | Reset cumulative / window quota (by key or team) |
-| `POST /dashboard/api/admin/quota/reset/key/{key_hash}/cumulative` · `/windows` | Reset per-key cumulative / window quota |
-| `POST /dashboard/api/admin/quota/reset/team/{id}/cumulative` · `/windows` | Reset per-team cumulative / window quota |
-
-**Logs & stats**
-| Endpoint | Description |
-|----------|-------------|
-| `GET /dashboard/api/admin/logs` | Request logs (column filters) |
-| `GET /dashboard/api/admin/usage/{key_hash}` | Per-key usage |
-| `GET /dashboard/api/admin/stats/inflight` | Real-time inflight + flow control |
-| `GET /dashboard/api/admin/stats/agents` | Client-type breakdown (Anthropic / Other) |
-| `GET /dashboard/api/admin/stats/deployments/summary` | Per-deployment 24h summary |
-| `GET /dashboard/api/admin/stats/request_rate` | Per-deployment request rate |
-| `GET /dashboard/api/admin/stats/rebalance-moves` | Load-balance move counts |
-| `GET /dashboard/api/admin/stats/audit-log` | Audit log drop counter (channel full / batch failures) |
-
-**Prompt log**
-| Endpoint | Description |
-|----------|-------------|
-| `GET /dashboard/api/admin/prompt-log/status` | Capture status |
-| `POST /dashboard/api/admin/prompt-log/toggle` · `/team` · `/key` | Toggle capture (global / team / key) |
-| `GET /dashboard/api/admin/prompt-log/entry/{request_id}` | Fetch one stored entry |
-
-**Rate limits & config**
-| Endpoint | Description |
-|----------|-------------|
-| `POST /dashboard/api/admin/limits/reset/{key_hash}` · `/reset` | Reset rate-limit windows |
-| `GET` · `PUT /dashboard/api/admin/config` | Read / incrementally update full config |
-| `GET /dashboard/api/admin/config/schema` | Config field manifest (declarative UI schema) |
-| `POST /dashboard/api/admin/config/reload` | Hot-reload from dashboard UI |
-
-**Debug**
-| Endpoint | Description |
-|----------|-------------|
-| `GET /dashboard/api/admin/debug/status` · `POST /toggle` | Debug recording control |
-| `GET /dashboard/api/admin/debug/errors/{request_id}` | Fetch a recorded error |
-
-> Debug routes are always registered (no feature flag required); the `debug-tools` feature only controls whether the Debug entry is shown in the static page.
-
-### Health Checks (no auth)
-
-| Endpoint | Description |
-|----------|-------------|
-| `GET /health` | Full health status |
-| `GET /health/live` | Liveness probe |
-| `GET /health/ready` | Readiness probe |
-
-### Internal (no auth)
-
-| Endpoint | Description |
-|----------|-------------|
-| `GET /internal/kv-index` | KV-cache prefix index status and Trie contents |
-
----
-
-## Flow Control
-
-Per-deployment flow control protects backends from burst traffic. When configured, the gateway queues requests that exceed concurrency or context limits, with **VIP keys getting priority dispatch**.
-
-### How It Works
-
-```
-Request arrives
-  │
-  ├─ Check max_inflight ──── exceeded? ──→ queue (VIP first)
-  │                                           │
-  ├─ Check max_context ───── exceeded? ──→ reject immediately
-  │                                           │
-  └─ Acquire guard (RAII) ──→ release on stream end / response drop
-```
-
-### Configuration
-
-Add `flow_control` to any model deployment (requires `model_info.id`):
-
-```yaml
-model_list:
-  - model_name: claude-opus
-    model_info:
-      id: opus-node-1
-    flow_control:
-      model_queue_limit: 20          # max concurrent requests to this backend
-      model_context_limit: 2000000   # max total input chars across all in-flight
-    litellm_params:
-      model: anthropic/claude-opus-4-20250514
-      api_key: os.environ/ANTHROPIC_API_KEY
-```
-
-Or configure per-deployment via the dashboard (Model Edit dialog).
-
-### VIP Priority Queue
-
-Keys with `"vip": true` in their metadata skip the normal queue — their requests are always dispatched before non-VIP waiters:
-
-```bash
-# Create a VIP key
-curl -X POST http://localhost:4000/dashboard/api/admin/keys \
-  -H "Authorization: Bearer $MASTER_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"key_alias": "vip-user", "metadata": {"vip": true}}'
-```
-
-When a deployment slot frees up, the dispatcher greedily fills capacity from the VIP queue first, then the normal queue. This ensures premium users experience minimal latency even under heavy load.
-
-### Key Behaviors
-
-| Scenario | Behavior |
-|----------|----------|
-| `max_inflight` reached | Queue the request (VIP first), timeout after 1200s |
-| `max_context` exceeded | Reject immediately (single request too large) |
-| Request completes | Guard drops, slot freed, next waiter dispatched |
-| Client disconnects | Guard drops, slot freed automatically |
-
-### Monitoring
-
-Real-time flow control stats are visible on the dashboard In-Flight panel, including:
-- Current in-flight count and context usage per deployment
-- Number of queued waiters (VIP vs. normal)
-- Individual waiter details (key alias, wait duration)
-
----
-
-## KV-Cache Aware Routing
-
-Route requests to the vLLM worker that already holds the most relevant KV-cache prefix, reducing recomputation and TTFT. The gateway subscribes to vLLM's ZMQ KV-cache events, builds a token-prefix Trie index, and matches incoming requests against it.
-
-### How It Works
-
-```
-vLLM Workers publish KV events via ZMQ
-  │
-  ▼
-Gateway subscribes and builds per-model Token Prefix Trie
-  │
-  ▼
-Request arrives → Tokenize → Walk Trie → Score candidates → Select best worker
-```
-
-**Scoring**: `combined_score = cache_weight × hit_ratio + tier_weight × tier_score + load_weight × load_score`
-
-No match → falls back to lowest-load selection.
-
-### Configuration
-
-```yaml
-router_settings:
-  schedule_policy: kvc_aware
-
-  kvc_aware:
-    block_size: 128                 # must match vLLM's block_size
-    cache_weight: 0.5               # KV prefix hit weight
-    tier_weight: 0.3                # storage tier weight
-    load_weight: 0.2                # load weight
-    tokenizer_dir: /data/tokenizers # per-model tokenizer files
-    zmq_endpoints:
-      - "tcp://10.0.0.1:5557"
-      - "tcp://10.0.0.2:5557"
-    zmq_topic_prefix: "kv@"
-```
-
-Each model needs its tokenizer files under `{tokenizer_dir}/{model_name}/`:
-- `tokenizer.json` — HuggingFace tokenizer
-- `tokenizer_config.json` — chat_template, special tokens
-- `chat_template.jinja` — optional standalone template file
-
-### Identity Alignment
-
-Gateway and vLLM identifiers must match:
-
-| Dimension | Gateway | vLLM | Must match |
-|-----------|---------|------|-----------|
-| Model name | `model_name` in YAML | `--served-model-name` | Yes |
-| Worker ID | `model_info.id` in YAML | ZMQ topic worker_id | Yes |
-| Block size | `kvc_aware.block_size` | `--block-size` | Yes |
-
-```yaml
-- model_name: MiniMax-M2.7
-  litellm_params:
-    model: hosted_vllm/MiniMax-M2.7
-    api_base: http://10.0.0.1:8000
-  model_info:
-    id: "10.0.0.1"                   # match ZMQ topic worker_id
-```
-
-### Monitoring
-
-`GET /internal/kv-index` — inspect Trie contents, block counts, and worker assignments.
-
-See [docs/kvc-aware-design.md](docs/kvc-aware-design.md) for the full design document.
-
----
-
-## Prompt Logging
-
-`boom-promptlog` captures the complete request and response of every request (including raw SSE chunks for streaming) and writes them to disk as JSONL — for debugging and audit.
-
-- Layout `{dir}/{team_alias}/{key_hash}/log_NNNNNN.jsonl`, rotated and gzip-compressed in the background.
-- Streaming responses are recorded via a stream wrapper that accumulates raw event chunks (no field-level parsing).
-- Optional `capture_raw_upstream` stores the pre-conversion upstream body on format-converting paths (e.g. `/v1/messages`).
-- Toggle capture globally, per team, or per key from the dashboard — changes apply immediately via hot reload.
-
-```yaml
-prompt_log:
-  enabled: false
-  dir: "/data/prompt_logs"
-  max_file_size_mb: 50
-  capture_raw_upstream: false
-  excluded_keys: []
-  excluded_teams: []
-```
-
----
-
-## Hot Reload
-
-Three ways to trigger, all zero-downtime via ArcSwap atomic swap:
-
-1. **Signal**: `kill -HUP <pid>`
-2. **API**: `POST /admin/config/reload` (master key auth)
-3. **Dashboard**: Click "Reload Config" button
-
-Runtime counters (limiter, concurrency, assignments) survive reload.
-
----
-
-## Load Balancer (misc/LB)
-
-Pingora-based standalone load balancer as an optional front-end. It ships as a Docker image (multi-stage Rust build on an openEuler runtime). Highlights:
-
-- Routing by `host` (wildcard `*.example.com`), `path` prefix (segment-boundary aware), and `client_ip` CIDR; first match wins
-- Backend policies: active-active (consistent hash + API-key affinity) and active-standby (ordered failover); default backends support a failover list
-- Health checks: TCP / HTTP GET probes with configurable interval and failure threshold; connect failures retry on another backend
-- Resilience: idempotent 5xx retries that exclude the failing backend, plus per-route timeout overrides
-- Security: hot-reloaded IP blacklist, trusted-proxy-aware XFF handling, upstream TLS, request body limits, request-smuggling defense-in-depth
-- Observability: `/__lb_metrics` Prometheus counters (status buckets/errors/retries/latency histogram), `/__lb_healthz` liveness, structured access logs with status, latency and errors
-- Hot reload: config and blacklist changes apply automatically (lock-free ArcSwap)
-
-```bash
-./misc/LB/start.sh start              # Auto-build + cert generation
-./misc/LB/start.sh start routes.yaml  # Custom config
-./misc/LB/start.sh status | stop | restart
-```
-
-See [misc/LB/README.en.md](misc/LB/README.en.md) for the full config reference and operations guide.
-
----
-
 ## Documentation
 
-| Document | Description |
+| Doc | Description |
 |----------|-------------|
-| [ARCH.md](ARCH.md) | Architecture: module diagram, request flow, state management, DB schema |
-| [DESCRIPTOR.md](DESCRIPTOR.md) | Detailed architecture description |
-| [CONFIG_EXAMPLE.md](CONFIG_EXAMPLE.md) | Complete config field reference |
-| [docs/kvc-aware-design.md](docs/kvc-aware-design.md) | KVC-Aware routing design document |
-| [docs/kvc-aware-event-reporting-research.md](docs/kvc-aware-event-reporting-research.md) | KV-cache event reporting research (NVIDIA Dynamo, llm-d) |
-| [docs/vip-header-forwarding-design.md](docs/vip-header-forwarding-design.md) | VIP request info forwarding (`X-Gateway-Priority` header) |
-| [docs/direct-synthesis-workflow-design.md](docs/direct-synthesis-workflow-design.md) | Direct Synthesis Workflow architecture, configuration, and execution semantics |
-| [CLAUDE.md](CLAUDE.md) | Development guidelines and architecture principles |
+| [USER_GUIDE.md](USER_GUIDE.md) | User guide: feature modules, configuration, recommendations |
+| [docs/api-reference.md](docs/api-reference.md) | API quick reference: all endpoints + curl examples |
+| [CONFIG_EXAMPLE.md](CONFIG_EXAMPLE.md) | Full configuration field reference |
+| [docs/software-design.md](docs/software-design.md) | Software design: module responsibilities, feature inventory, DB schema |
+| [docs/architecture-overview.md](docs/architecture-overview.md) | Architecture overview |
+| [docs/internal-request-flow.md](docs/internal-request-flow.md) | Internal request flow in detail |
+| [ARCH.md](ARCH.md) · [DESCRIPTOR.md](DESCRIPTOR.md) | Architecture design docs |
+| [docs/direct-synthesis-workflow-design.md](docs/direct-synthesis-workflow-design.md) | Direct Synthesis Workflow design |
+| [docs/kvc-aware-design.md](docs/kvc-aware-design.md) | Early KV-affinity routing design (ZMQ-subscription based; current behavior is the gateway-side self-learning trie — see software-design.md) |
+| [misc/LB/README.md](misc/LB/README.md) | Pingora load-balancer frontend |
+| [CLAUDE.md](CLAUDE.md) | Development guide & architecture principles |
 
 ## License
 

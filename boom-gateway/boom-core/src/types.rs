@@ -328,12 +328,23 @@ pub struct ToolFunction {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatCompletionResponse {
+    /// Passthrough identity fields default to empty/0 when a non-standard
+    /// upstream omits them — they are never load-bearing for gateway logic,
+    /// and missing them must not fail the whole response parse.
+    #[serde(default)]
     pub id: String,
+    #[serde(default)]
     pub object: String,
+    #[serde(default)]
     pub created: u64,
+    #[serde(default)]
     pub model: String,
     pub choices: Vec<Choice>,
-    pub usage: Usage,
+    /// None = upstream did not report usage (non-standard backend). Token
+    /// accounting (audit log, quota settle, KV hit rate) is then skipped
+    /// rather than fabricating zeros.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_fingerprint: Option<String>,
     /// Raw upstream response text (before any parsing), set by providers.
@@ -384,10 +395,18 @@ pub type ChatStream = Pin<Box<dyn Stream<Item = Result<ChatStreamChunk, GatewayE
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatStreamChunk {
+    /// Same leniency as ChatCompletionResponse: identity fields default when
+    /// missing; `choices` defaults to empty so usage-only final chunks from
+    /// non-standard upstreams still parse instead of being silently dropped.
+    #[serde(default)]
     pub id: String,
+    #[serde(default)]
     pub object: String,
+    #[serde(default)]
     pub created: u64,
+    #[serde(default)]
     pub model: String,
+    #[serde(default)]
     pub choices: Vec<StreamChoice>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<StreamUsage>,
