@@ -6,44 +6,40 @@
 
 **中文** | [English](README.en.md)
 
-一个使用 Rust 构建的生产级 LLM API 网关。统一接入 OpenAI、Anthropic、Gemini、Bedrock、vLLM、Ollama 等 20+ 上游服务商。兼容 litellm 密钥体系，自建速率限制、套餐管理、流量控制、计费、Web 管理面板、请求审计与完整 prompt 落盘。
+使用 Rust 构建的生产级 LLM API 网关。统一接入 OpenAI、Anthropic、Gemini、Bedrock、vLLM、Ollama 等 20+ 上游服务商；兼容 litellm 密钥体系，自建限流、套餐、计费、流量治理、Web 管理面板、审计与完整 prompt 落盘。核心差异化能力：**面向 vLLM 前缀缓存优化的智能调度**——会话前缀亲和、密钥亲和、语义路由与反馈式负载均衡。
 
 [![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange)](https://www.rust-lang.org/)
 [![License: MulanPSL v2](https://img.shields.io/badge/License-MulanPSL%20v2-green.svg)](LICENSE)
 
 ---
 
-## 特性
+## 智能调度
 
-- **多服务商路由** — OpenAI / Anthropic / Azure / Gemini / Bedrock / vLLM / Ollama 等
-- **Direct Synthesis Workflow** — 并发调用多个 panel，再由 aggregator 合成标准 OpenAI 流式或非流式响应
-- **负载均衡** — 在同名 deployment 之间支持轮询、密钥亲和或 KV-cache 感知调度，并提供实时再平衡计数
-- **速率限制** — 滑动窗口 + 并发控制 + 自定义时间窗口 + 定时套餐切换
-- **套餐体系** — 灵活的密钥套餐与团队套餐（含 `member_plan` 继承），密钥/团队→套餐绑定，三级回退
-- **配额与计费** — 按模型设置 `quota_count_ratio`，并通过 `cost_templates` 定价、按窗口的 token/费用上限
-- **流量控制** — 按 deployment 限制最大在途请求数与最大上下文字符数，VIP 优先队列
-- **自动熔断** — 连续请求失败检测，自动禁用异常 deployment（含兜底 `*`）
-- **Deployment 健康探测** — 主动探测 `/metric`，支持自动下线/恢复（阈值可配）
-- **KV-Cache 感知路由** — 通过 ZMQ 订阅 vLLM KV-cache 事件，把请求路由到缓存命中前缀最多的 worker，降低 TTFT
-- **公开模型** — 通过 `public_models` 配置，让所有密钥都能访问指定模型，无需逐个更新白名单
-- **Anthropic 原生** — 提供 `/v1/messages` 端点（兼容 Claude Code / opencode）
-- **Prompt 落盘** — 完整请求/响应内容（含原始 SSE 分块）以滚动、gzip 压缩的 JSONL 写入磁盘；可在面板按团队/密钥动态开关
-- **客户端统计** — 客户端类型分类（Anthropic 原生 vs 其他），面板提供 60 分钟细分
-- **Web 管理面板** — 单页管理端：密钥、模型、别名、套餐、团队、配额、日志、实时在途 + 客户端统计
-- **热加载** — 支持 SIGHUP、API 或面板按钮触发，通过 ArcSwap 实现零停机配置切换
-- **请求审计** — 完整请求日志（token 数、耗时、状态），流式请求记录真实耗时
-- **调试录制** — 可选的上游响应抓取，便于排错（受 `debug-tools` feature 控制）
-- **容器化 LB** — `misc/LB` 前端以 Docker 镜像提供（Rust 多阶段构建，openEuler 运行时）
+调度策略可插拔、可热切换（`router_settings.schedule_policy`），全部为网关侧实现，对上游零侵入：
+
+- **会话前缀亲和（`kvc_aware`）** — 网关侧自学习前缀 Trie：把每个请求的会话前缀（system + tools + messages，固定序）按块切分并哈希为块链，记录到实际选中的 worker 名下；下一个相同前缀的请求直接命中。按 per-worker 命中深度统一评分 `score = cache_weight × hit_ratio + load_weight × (1 − load_pct/100)`，把请求送往缓存命中最多且未过载的 worker，显著降低 TTFT。命中率不足时可主动向上游请求全量 KV cache report 修正索引；LRU + TTL 老化，不依赖 vLLM 事件订阅。
+- **密钥亲和（`key_affinity`）** — 同一密钥 + 模型的请求粘滞到同一 deployment，最大化上游会话级缓存复用；新密钥预热期按最低负载散开，负载差超过阈值自动迁移再平衡。
+- **语义路由（`auto_router`）** — 虚拟模型按请求内容动态分级：内置启发式分类器（关键词 / 长度 / 代码块 / 推理链 / 工具调用信号评分），或对接外部 ML 分类服务（失败自动回落本地），将请求路由到 small / medium / large 不同规格的真实模型。
+- **反馈式负载均衡** — 实时负载信号总线（在途计数、流控队列深度、请求成功速率）驱动调度：统一评分选优、过载节点硬排除（阈值可配）、容量再平衡（优势节点超出最低候选一定百分比即移交流量）、顶分并列轮转打散；60 分钟窗口的迁移统计可在面板观测。
+- **异常节点治理** — 连续失败自动熔断、`/metric` 主动探活自动上下线（阈值可配）、过载节点流量旁路、恢复后自动回流；兜底部署 `"*"` 同样受保护。
+
+## 流量治理与可观测
+
+- **流控** — 按 deployment 限制最大在途请求数与在途上下文字符总量：超限排队（VIP 密钥优先派发），超大请求立即拒绝；槽位随响应结束 / 客户端断连自动释放。
+- **三维限流与计费** — 密钥 / 团队双层套餐，counts / tokens / costs 三维滑动窗口 + 终身累计配额，时段计划（支持跨午夜）自动切档。
+- **全链路可观测** — 每请求落库 TTFT、耗时、排队时长、调度策略与 KV 命中率；异常离群检测（IQR）；OTel trace 导出；完整 prompt 落盘（滚动 + gzip，可按团队 / 密钥动态开关）。
+
+## 网关基础能力
+
+统一接入 20+ 上游服务商；litellm 密钥体系兼容；Anthropic 原生 `/v1/messages`（Claude Code / opencode 可直连）；Direct Synthesis Workflow（并发调用多个 panel 模型后由 aggregator 合成标准 OpenAI 响应）；公开模型、模型别名与 `"*"` 兜底路由；Web 管理面板（密钥 / 模型 / 套餐 / 配额 / 日志 / 实时在途与统计）；SIGHUP / API / 面板按钮零停机热加载。
 
 ---
 
 ## 性能实测
 
-测试环境：**kunpeng920**（ARM64）。使用 `boom-gateway/test/` 下的 `mock-backend`（无推理延迟，仅返回 100~400 字符随机内容）与 `bench-client` 对网关压测。负载形态：**约 50K 输入上下文 + 输出 100~500 token**，**打开 prompt log 写盘 + OTLP 上报**。**所有数据单位均为 ms**，按 p50 / p90 / p99 / p999 / mean 列出。
+测试环境：**kunpeng920**（ARM64）。使用 `boom-gateway/test/` 下的 `mock-backend`（无推理延迟，仅返回 100~400 字符随机内容）与 `bench-client` 对网关压测。负载形态：**约 50K 输入上下文 + 输出 100~500 token**，**打开 prompt log 写盘 + OTLP 上报**。**所有数据单位均为 ms**。
 
 ### 非流式
-
-> 单位：ms
 
 | 目标 RPS | p50 | p90 | p99 | p999 | mean |
 |---------|-----|-----|-----|------|------|
@@ -55,8 +51,6 @@
 
 ### 流式 TTFT（首 token 延迟）
 
-> 单位：ms
-
 | 目标 RPS | p50 | p90 | p99 | p999 | mean |
 |---------|-----|-----|-----|------|------|
 | 50    | 54.1 | 58.0 | 62.4 | 80.9 | 43.4 |
@@ -67,8 +61,6 @@
 
 ### 流式 E2E（含 mock-backend 模拟 500 tps 吐 token，每请求约 200~1000ms）
 
-> 单位：ms
-
 | 目标 RPS | p50 | p90 | p99 | p999 | mean |
 |---------|-----|-----|-----|------|------|
 | 50    | 539 | 811 | 875 | 909 | 537 |
@@ -77,225 +69,77 @@
 | 1000  | 2373 | 6512 | 7794 | 8130 | 2996 |
 | 2000  | 1564 | 7254 | 8839 | 9232 | 2822 |
 
-**解读**：
+**解读**：非流式 p50 全程稳定在 9~10ms，p999 ≤ 36.5ms——网关自身在压测下未成为瓶颈。流式 TTFT 在 500 RPS 内维持 ~54ms；1000 RPS 起出现排队，饱和拐点由首 token 阶段决定，后续吐 token 阶段未额外放大延迟。
 
-- **非流式**：p50 全程稳定在 9~10ms，p999 在 1000/2000 RPS 下分别为 34.6 / 36.5ms —— 网关本身在压测下未成为瓶颈，长尾主要由 mock-backend 调度抖动贡献。
-- **流式 TTFT**：500 RPS 内 p50 维持 ~54ms；1000 RPS 起出现排队（p999 跳至 5.6s，提示连接池或 SSE 推送路径接近饱和拐点）。
-- **流式 E2E**：500 RPS 以内 p50 ~540ms（接近 mock 吐 token 的理论下限）；1000 RPS 后 p50/p999 显著上升，与 TTFT 拐点一致 —— 即流式饱和由首 token 阶段决定，后续吐 token 阶段未额外放大延迟。
-
-> 数据来源：`boom-gateway/test/` 压测工具链。复现方式见 [boom-gateway/test/README.md](boom-gateway/test/README.md)。
+> 复现方式见 [boom-gateway/test/README.md](boom-gateway/test/README.md)。
 
 ---
 
 ## 快速开始
 
-### 前置条件
+### 源码部署
 
-- Rust 1.75+（含 cargo）
-- PostgreSQL 13+（用于密钥认证与持久化）
-
-### 1. 构建
+前置条件：Rust 1.75+（含 cargo）、PostgreSQL 13+。
 
 ```bash
-git clone https://github.com/your-org/BooMGateway.git
-cd BooMGateway
+git clone https://atomgit.com/openeuler/gateway.git
+cd gateway
 
-# 构建 release 二进制
 cargo build --release
-
 # 二进制位于 target/release/boom-gateway
 ```
 
-### 2. 准备数据库
-
-创建一个空的 PostgreSQL 数据库。BooMGateway 会在启动时自动创建所需的所有表：
+**1. 准备数据库** — 只需一个空库，启动时自动创建全部表：
 
 ```bash
-# 创建数据库（名字任意）
 createdb boom_gateway
-
-# 或通过 psql
-psql -U postgres -c "CREATE DATABASE boom_gateway;"
+# 或：psql -U postgres -c "CREATE DATABASE boom_gateway;"
 ```
 
-就这些 —— 无需手动建表。网关会自动创建 11 张 `boom_*` 表：
-
-| 表 | 归属模块 | 用途 |
-|-------|-------|---------|
-| `boom_request_log` | boom-audit | 请求日志（含 token 数、耗时、状态） |
-| `boom_model_deployment` | boom-routing | 模型 deployment 配置 |
-| `boom_model_alias` | boom-routing | 模型别名映射 |
-| `boom_rate_limit_state` | boom-limiter | 速率限制窗口计数 |
-| `boom_rate_limit_cumulative` | boom-limiter | 永久累计的 token/费用总量 |
-| `boom_key_plan_assignment` | boom-limiter | 密钥→套餐绑定 |
-| `boom_team_plan_assignment` | boom-limiter | 团队→套餐绑定 |
-| `boom_rate_limit_plan` | boom-limiter | 套餐定义 |
-| `boom_config` | boom-dashboard | 通用 KV 配置存储 |
-| `boom_team_table` | boom-dashboard | 团队定义（含模型访问权限） |
-| `boom_verification_token` | boom-dashboard / boom-auth | API 密钥/token 记录（兼容 litellm schema） |
-
-### 3. 配置
-
-创建 `config.yaml`（仓库自带 `config.example.yaml`，可拷贝作为起点）：
-
-```bash
-cp config.example.yaml config.yaml
-```
+**2. 编写最小配置** `config.yaml`（完整字段参考见 [CONFIG_EXAMPLE.md](CONFIG_EXAMPLE.md)）：
 
 ```yaml
-# 模型 deployment
 model_list:
   - model_name: gpt-4o
     litellm_params:
       model: openai/gpt-4o
       api_key: os.environ/OPENAI_API_KEY
 
-  - model_name: claude-sonnet
-    litellm_params:
-      model: anthropic/claude-sonnet-4-20250514
-      api_key: os.environ/ANTHROPIC_API_KEY
-
-  - model_name: deepseek-chat
-    litellm_params:
-      model: openai/deepseek-chat
-      api_base: https://api.deepseek.com/v1
-      api_key: os.environ/DEEPSEEK_API_KEY
-
   # 兜底路由：匹配不到任何 model_name 的请求路由到这里
   - model_name: "*"
     litellm_params:
-      model: openai/gpt-4o-mini
+      model: openai/gpt-4o
       api_key: os.environ/OPENAI_API_KEY
 
-  # 带流量控制 —— 保护昂贵的后端免受突发流量冲击
-  # - model_name: claude-opus
-  #   model_info:
-  #     id: opus-node-1               # 流量控制槽位的 deployment_id
-  #   flow_control:
-  #     model_queue_limit: 20          # 最大并发在途请求数
-  #     model_context_limit: 2000000   # 在途请求的最大输入字符总和
-  #   litellm_params:
-  #     model: anthropic/claude-opus-4-20250514
-  #     api_key: os.environ/ANTHROPIC_API_KEY
-
-# Direct Synthesis：客户端请求 fusion，Gateway 并发调用 panel 后由 aggregator 合成结果
-workflow_settings:
-  models:
-    fusion: direct_synthesis
-  workflows:
-    direct_synthesis:
-      type: direct_synthesis
-      roles:
-        panel:
-          - model: gpt-4o
-            temperature: 0.3
-          - model: claude-sonnet
-            temperature: 0.3
-          - model: deepseek-chat
-            temperature: 0.3
-        aggregator:
-          model: gpt-4o
-          temperature: 0.0
-
-# 通用设置
 general_settings:
   master_key: os.environ/MASTER_KEY
   database_url: os.environ/DATABASE_URL
-  # 所有密钥均可访问的模型（不受各密钥白名单限制）
-  public_models:
-    - deepseek-chat
 
-# 服务
 server:
   host: 0.0.0.0
   port: 4000
-  workers: 4
-
-# 速率限制
-rate_limit:
-  enabled: true
-  default_rpm: 60
-
-# 套餐（密钥套餐与团队套餐）
-plan_settings:
-  default_plan: "basic"
-  default_team_plan: "team_basic"
-  plans:
-    basic:                                # 密钥套餐
-      concurrency_limit: 4
-      rpm_limit: 60
-      window_limits:
-        - [100, 18000]
-    pro:                                  # 密钥套餐
-      concurrency_limit: 10
-      rpm_limit: 120
-      window_limits:
-        - [500, 18000]
-    team_basic:                           # 团队套餐，成员继承 "basic"
-      type: team
-      member_plan: basic
-
-# 完整请求/响应落盘（默认关闭）
-prompt_log:
-  enabled: false
-  dir: "/data/prompt_logs"
-  max_file_size_mb: 50
-  capture_raw_upstream: false             # 同时记录格式转换前的上游响应（如 /v1/messages）
-  excluded_keys: []
-  excluded_teams: []
-
-# Deployment 主动健康探测
-deployment_health_check:
-  auto_offline_enabled: true
-  auto_recovery_enabled: true
-  path: /metric
-  failure_threshold: 3
-  recovery_threshold: 2
 ```
 
-`fusion` 会像普通模型一样出现在 `/v1/models`，并通过 `/v1/chat/completions`
-使用。Panel 始终并发执行非流式调用，aggregator 根据客户端请求返回流式或非流式
-标准 OpenAI 响应。每个子调用都会重新进入 Gateway Router，继续应用模型解析、调度、
-流量控制和 inflight 治理。Workflow 当前不支持 `/v1/messages`。
-
-完整字段说明见 [CONFIG_EXAMPLE.md](CONFIG_EXAMPLE.md)（另含 `router_settings`、`cost_templates`、KV-cache 感知路由等）。
-
-### 4. 运行
+**3. 启动**：
 
 ```bash
-# 设置环境变量
 export MASTER_KEY="sk-your-master-key"
 export DATABASE_URL="postgres://user:pass@localhost:5432/boom_gateway"
 export OPENAI_API_KEY="sk-..."
-export ANTHROPIC_API_KEY="sk-ant-..."
 
-# 运行
-cargo run --release -p boom-main
-
-# 或直接运行构建好的二进制
-./target/release/boom-gateway
+./target/release/boom-gateway --config config.yaml
 ```
 
-CLI 参数（覆盖 `config.yaml`）：
+**4. 创建密钥并调用**：
 
 ```bash
-boom-gateway --config config.yaml --host 0.0.0.0 --port 4000
-boom-gateway --reboot      # 先优雅停止运行中的实例，再启动
-```
-
-### 5. 创建密钥并开始使用
-
-```bash
-# 通过面板 API 创建一个 API 密钥
+# 通过面板 API 创建一个 API 密钥（响应中的明文密钥只显示一次，请立即保存）
 curl -X POST http://localhost:4000/dashboard/api/admin/keys \
   -H "Authorization: Bearer $MASTER_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"key_alias": "alice", "plan_name": "pro"}'
+  -d '{"key_alias": "alice"}'
 
-# 响应：{"key": "sk-...", "token_hash": "...", "key_name": null}
-# 请立即保存该密钥 —— 它只会显示一次！
-
-# 使用它
+# 像使用 OpenAI 一样使用网关
 curl http://localhost:4000/v1/chat/completions \
   -H "Authorization: Bearer sk-your-new-key" \
   -H "Content-Type: application/json" \
@@ -305,36 +149,40 @@ curl http://localhost:4000/v1/chat/completions \
   }'
 ```
 
-### 6. 管理面板
+浏览器打开 `http://localhost:4000/dashboard` 进入管理面板（master key 以 admin 登录，API key 以普通用户登录）。
 
-在浏览器打开 `http://localhost:4000/dashboard`，用 master key 以 `admin` 身份登录（或用 API key 以普通用户身份登录）。
+### 容器部署
+
+容器化部署方案正在完善中，当前请使用源码部署。
 
 ---
 
 ## 项目结构
 
 ```
-BooMGateway/
-├── boom-gateway/           Rust workspace 根目录（14 个 crate）
-│   ├── boom-core/          核心 trait 与公共类型
-│   ├── boom-auth/          密钥认证（SHA-256 + DB + master key）
-│   ├── boom-config/        YAML 配置解析（含环境变量展开）
-│   ├── boom-fusion/        Workflow 抽象与 Direct Synthesis 编排
-│   ├── boom-provider/      LLM Provider 实现
-│   ├── boom-limiter/       滑动窗口限流 + 并发控制 + PlanStore
-│   ├── boom-flowcontrol/   按 deployment 的流量控制（含 VIP 优先）
-│   ├── boom-routing/       DeploymentStore + AliasStore + 调度策略
-│   ├── boom-kvindex/       KV-cache 前缀索引 + ZMQ 订阅 + 分词
-│   ├── boom-ctxaware/      客户端类型分类 + 客户端统计
-│   ├── boom-promptlog/     完整请求/响应落盘（JSONL）
-│   ├── boom-audit/         请求日志读写
-│   ├── boom-dashboard/     Web UI + REST API + JWT 认证
-│   └── boom-main/          入口、路由、状态组装（二进制名：boom-gateway）
-├── misc/LB/                Pingora 负载均衡（可选前端，已容器化）
-├── misc/logo.svg           项目 logo
-├── config.example.yaml     完整配置参考
-├── ARCH.md                 架构设计文档
-└── CLAUDE.md               开发指南
+gateway/
+├── Cargo.toml             Rust workspace 根（成员见 boom-gateway/）
+├── boom-gateway/          全部 crate
+│   ├── boom-core/         核心 trait 与公共类型（叶子依赖）
+│   ├── boom-auth/         密钥认证（SHA-256 + DB + master key，litellm 兼容）
+│   ├── boom-config/       YAML 配置解析 + 环境变量展开 + 字段 manifest
+│   ├── boom-provider/     LLM Provider 实现（OpenAI / Anthropic / Bedrock 等）
+│   ├── boom-routing/      DeploymentStore + AliasStore + 调度策略族
+│   ├── boom-kvindex/      KV 前缀索引（自学习 Trie）
+│   ├── boom-fusion/       Workflow 抽象与 Direct Synthesis 编排
+│   ├── boom-flowcontrol/  按 deployment 的流量控制（VIP 优先队列）
+│   ├── boom-limiter/      滑动窗口限流 + 并发控制 + PlanStore
+│   ├── boom-ctxaware/     客户端类型识别与统计
+│   ├── boom-promptlog/    完整请求/响应落盘（JSONL）
+│   ├── boom-audit/        请求日志读写
+│   ├── boom-trace/        OTel trace 链路 + 延迟分布
+│   ├── boom-stressmon/    压力监控
+│   ├── boom-hooks-sdk/    Hook SDK
+│   ├── boom-dashboard/    Web UI + REST API + JWT 认证
+│   └── boom-main/         入口、路由、状态组装（二进制名：boom-gateway）
+├── misc/LB/               Pingora 负载均衡（可选前端，已容器化）
+├── config.example.yaml    完整配置参考
+└── docs/                  设计文档与 API 手册
 ```
 
 ## 技术栈
@@ -346,344 +194,24 @@ BooMGateway/
 | 异步运行时 | Tokio（多线程） |
 | 数据库 | PostgreSQL（sqlx，自动迁移） |
 | 并发原语 | DashMap、ArcSwap |
-| KV 事件 | ZMQ（PUB/SUB）、MessagePack |
 | 计费 | rust_decimal |
 | CLI | clap |
 | 认证 | SHA-256 token 哈希、JWT 会话 |
-
-## API 端点
-
-### 客户端 API（需 API key）
-
-| 端点 | 说明 |
-|----------|-------------|
-| `POST /v1/chat/completions` | OpenAI 对话（流式 / 非流式，支持 workflow 模型） |
-| `POST /v1/messages` | Anthropic Messages API |
-| `POST /v1/completions` | OpenAI completions |
-| `POST /v1/embeddings` | 返回"不支持"（路由存在，统一拒绝） |
-| `POST /v1/audio/speech` · `/audio/transcriptions` · `/v1/moderations` | 返回"不支持"（路由存在，统一拒绝） |
-| `GET /v1/models` | 当前密钥可见的模型（deployment + 别名） |
-| `GET /v1/models/{id}` | 单个模型信息 |
-
-> 同时提供 OpenAI 客户端兼容别名（不带 `/v1` 前缀）：`/chat/completions`、`/completions`、`/models`、`/models/{id}`。
-
-### 管理 API（需 master key）
-
-| 端点 | 说明 |
-|----------|-------------|
-| `POST /admin/config/reload` | 热加载 config.yaml |
-| `PUT /admin/plans` · `GET /admin/plans` · `DELETE /admin/plans/{name}` | 套餐 CRUD |
-| `POST /admin/plans/assign` · `DELETE /admin/plans/assign/{key_hash}` · `GET /admin/plans/assignments` | 密钥→套餐绑定 |
-
-### 面板 — 认证
-
-| 端点 | 说明 |
-|----------|-------------|
-| `POST /dashboard/api/auth/login` | 登录（admin 用 master key，用户用 API key） |
-| `POST /dashboard/api/auth/logout` | 清除会话 |
-| `GET /dashboard/api/auth/me` | 当前会话信息 |
-
-### 面板 — 用户 API（会话认证，仅限调用者自己的密钥）
-
-| 端点 | 说明 |
-|----------|-------------|
-| `GET /dashboard/api/user/plan` | 当前套餐 + 剩余配额 |
-| `GET /dashboard/api/user/usage` | token / 费用 / 请求数用量 |
-| `GET /dashboard/api/user/key-info` | 密钥元信息（别名、团队、模型、RPM） |
-| `GET /dashboard/api/user/logs` | 自己的请求日志（分页） |
-| `GET /dashboard/api/user/request-status` | 在途请求的实时状态 |
-
-### 面板 — 管理 API（admin 会话）
-
-**密钥**
-| 端点 | 说明 |
-|----------|-------------|
-| `GET /dashboard/api/admin/keys` | 列出密钥 |
-| `POST /dashboard/api/admin/keys` · `/keys/batch` | 创建 / 批量创建密钥 |
-| `POST /dashboard/api/admin/keys/import` | 导入外部密钥 |
-| `PUT /dashboard/api/admin/keys/{token_hash}` | 更新密钥 |
-| `DELETE /dashboard/api/admin/keys/{token_hash}` | 删除密钥 |
-| `POST /dashboard/api/admin/keys/{token_hash}/block` · `/unblock` | 封禁 / 解封密钥 |
-
-**模型与别名**
-| 端点 | 说明 |
-|----------|-------------|
-| `GET` · `POST /dashboard/api/admin/models` | 列出 / 创建模型 deployment |
-| `PUT` · `DELETE /dashboard/api/admin/models/{id}` | 更新 / 删除模型 deployment |
-| `GET` · `POST /dashboard/api/admin/aliases` | 列出 / 创建模型别名 |
-| `PUT` · `DELETE /dashboard/api/admin/aliases/{alias_name}` | 更新 / 删除模型别名 |
-
-**套餐、绑定与团队**
-| 端点 | 说明 |
-|----------|-------------|
-| `GET` · `PUT /dashboard/api/admin/plans` · `DELETE /dashboard/api/admin/plans/{name}` | 套餐 CRUD |
-| `POST /dashboard/api/admin/assignments` · `DELETE` · `GET` | 密钥→套餐绑定 |
-| `POST /dashboard/api/admin/team-assignments` · `DELETE /{team_id}` | 团队→套餐绑定 |
-`POST /dashboard/api/admin/teams` `PUT` `DELETE /dashboard/api/admin/teams/{team_id}`
-
-**配额**
-| 端点 | 说明 |
-|----------|-------------|
-| `GET /dashboard/api/admin/quota/overview` | 按团队的配额总览 |
-| `GET /dashboard/api/admin/quota/team/{id}` · `/unassigned` · `/key/{key_hash}/windows` | 配额明细 |
-| `POST /dashboard/api/admin/quota/reset/key/{key_hash}` · `/team/{id}` | 重置累计 / 窗口配额（按密钥或团队） |
-| `POST /dashboard/api/admin/quota/reset/key/{key_hash}/cumulative` · `/windows` | 重置单密钥累计 / 窗口配额 |
-| `POST /dashboard/api/admin/quota/reset/team/{id}/cumulative` · `/windows` | 重置单团队累计 / 窗口配额 |
-
-**日志与统计**
-| 端点 | 说明 |
-|----------|-------------|
-| `GET /dashboard/api/admin/logs` | 请求日志（支持列过滤） |
-| `GET /dashboard/api/admin/usage/{key_hash}` | 单密钥用量 |
-| `GET /dashboard/api/admin/stats/inflight` | 实时在途 + 流量控制 |
-| `GET /dashboard/api/admin/stats/agents` | 客户端类型分布（Anthropic / 其他） |
-| `GET /dashboard/api/admin/stats/deployments/summary` | 各 deployment 24 小时汇总 |
-| `GET /dashboard/api/admin/stats/request_rate` | 各 deployment 请求速率 |
-| `GET /dashboard/api/admin/stats/rebalance-moves` | 负载均衡迁移次数 |
-| `GET /dashboard/api/admin/stats/audit-log` | 审计日志丢弃计数（channel full / 批量失败） |
-
-**Prompt 日志**
-| 端点 | 说明 |
-|----------|-------------|
-| `GET /dashboard/api/admin/prompt-log/status` | 录制状态 |
-| `POST /dashboard/api/admin/prompt-log/toggle` · `/team` · `/key` | 开关录制（全局 / 团队 / 密钥） |
-| `GET /dashboard/api/admin/prompt-log/entry/{request_id}` | 读取单条记录 |
-
-**速率限制与配置**
-| 端点 | 说明 |
-|----------|-------------|
-| `POST /dashboard/api/admin/limits/reset/{key_hash}` · `/reset` | 重置速率限制窗口 |
-| `GET` · `PUT /dashboard/api/admin/config` | 读取 / 增量更新完整配置 |
-| `GET /dashboard/api/admin/config/schema` | 配置字段 manifest（声明式 UI schema） |
-| `POST /dashboard/api/admin/config/reload` | 从面板 UI 热加载 |
-
-**调试**
-| 端点 | 说明 |
-|----------|-------------|
-| `GET /dashboard/api/admin/debug/status` · `POST /toggle` | 调试录制开关 |
-| `GET /dashboard/api/admin/debug/errors/{request_id}` | 读取录制的错误 |
-
-> 调试路由始终注册（无需 feature flag）；`debug-tools` feature 仅用于是否在静态页面中展示 Debug 入口。
-
-### 健康检查（无需认证）
-
-| 端点 | 说明 |
-|----------|-------------|
-| `GET /health` | 完整健康状态 |
-| `GET /health/live` | 存活探针 |
-| `GET /health/ready` | 就绪探针 |
-
-### 内部接口（无需认证）
-
-| 端点 | 说明 |
-|----------|-------------|
-| `GET /internal/kv-index` | KV-cache 前缀索引状态与 Trie 内容 |
-
----
-
-## 流量控制
-
-按 deployment 的流量控制可保护后端免受突发流量冲击。配置后，网关会把超过并发或上下文上限的请求排队，**VIP 密钥享有优先调度**。
-
-### 工作机制
-
-```
-请求到达
-  │
-  ├─ 检查 max_inflight ──── 超限? ──→ 入队（VIP 优先）
-  │                                       │
-  ├─ 检查 max_context ──── 超限? ──→ 立即拒绝
-  │                                       │
-  └─ 获取 guard（RAII） ──→ 流结束 / 响应 drop 时释放
-```
-
-### 配置
-
-为任意模型 deployment 添加 `flow_control`（需要 `model_info.id`）：
-
-```yaml
-model_list:
-  - model_name: claude-opus
-    model_info:
-      id: opus-node-1
-    flow_control:
-      model_queue_limit: 20          # 到该后端的最大并发请求数
-      model_context_limit: 2000000   # 所有在途请求的最大输入字符总和
-    litellm_params:
-      model: anthropic/claude-opus-4-20250514
-      api_key: os.environ/ANTHROPIC_API_KEY
-```
-
-也可以通过面板（模型编辑对话框）按 deployment 配置。
-
-### VIP 优先队列
-
-元数据中带 `"vip": true` 的密钥会跳过普通队列 —— 它们的请求总是先于非 VIP 等待者被调度：
-
-```bash
-# 创建一个 VIP 密钥
-curl -X POST http://localhost:4000/dashboard/api/admin/keys \
-  -H "Authorization: Bearer $MASTER_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"key_alias": "vip-user", "metadata": {"vip": true}}'
-```
-
-当某个 deployment 槽位释放时，调度器会先贪婪地从 VIP 队列补满容量，再处理普通队列。这保证了在高负载下，高级用户也能获得最低延迟。
-
-### 关键行为
-
-| 场景 | 行为 |
-|----------|----------|
-| 达到 `max_inflight` | 请求入队（VIP 优先），1200 秒后超时 |
-| 超过 `max_context` | 立即拒绝（单个请求过大） |
-| 请求完成 | guard 释放，槽位归还，调度下一个等待者 |
-| 客户端断开 | guard 释放，自动归还槽位 |
-
-### 监控
-
-面板的「在途」页可实时查看流量控制统计，包括：
-- 各 deployment 当前的在途数与上下文用量
-- 排队等待者数量（VIP vs 普通）
-- 单个等待者详情（密钥别名、已等待时长）
-
----
-
-## KV-Cache 感知路由
-
-把请求路由到已持有最相关 KV-cache 前缀的 vLLM worker，减少重复计算与 TTFT。网关订阅 vLLM 的 ZMQ KV-cache 事件，构建 token 前缀 Trie 索引，并用它匹配到达的请求。
-
-### 工作机制
-
-```
-vLLM worker 通过 ZMQ 发布 KV 事件
-  │
-  ▼
-网关订阅并构建按模型的 Token 前缀 Trie
-  │
-  ▼
-请求到达 → 分词 → 遍历 Trie → 为候选打分 → 选择最优 worker
-```
-
-**打分**：`combined_score = cache_weight × hit_ratio + tier_weight × tier_score + load_weight × load_score`
-
-无匹配 → 回退到最低负载选择。
-
-### 配置
-
-```yaml
-router_settings:
-  schedule_policy: kvc_aware
-
-  kvc_aware:
-    block_size: 128                 # 必须与 vLLM 的 block_size 一致
-    cache_weight: 0.5               # KV 前缀命中权重
-    tier_weight: 0.3                # 存储层级权重
-    load_weight: 0.2                # 负载权重
-    tokenizer_dir: /data/tokenizers # 按模型的分词器文件
-    zmq_endpoints:
-      - "tcp://10.0.0.1:5557"
-      - "tcp://10.0.0.2:5557"
-    zmq_topic_prefix: "kv@"
-```
-
-每个模型需要在 `{tokenizer_dir}/{model_name}/` 下放置分词器文件：
-- `tokenizer.json` — HuggingFace 分词器
-- `tokenizer_config.json` — chat_template、特殊 token
-- `chat_template.jinja` — 可选的独立模板文件
-
-### 标识对齐
-
-网关与 vLLM 的标识必须一致：
-
-| 维度 | 网关 | vLLM | 必须一致 |
-|-----------|---------|------|-----------|
-| 模型名 | YAML 中的 `model_name` | `--served-model-name` | 是 |
-| Worker ID | YAML 中的 `model_info.id` | ZMQ topic 的 worker_id | 是 |
-| Block 大小 | `kvc_aware.block_size` | `--block-size` | 是 |
-
-```yaml
-- model_name: MiniMax-M2.7
-  litellm_params:
-    model: hosted_vllm/MiniMax-M2.7
-    api_base: http://10.0.0.1:8000
-  model_info:
-    id: "10.0.0.1"                   # 与 ZMQ topic 的 worker_id 一致
-```
-
-### 监控
-
-`GET /internal/kv-index` — 查看 Trie 内容、block 数量与 worker 分配。
-
-完整设计文档见 [docs/kvc-aware-design.md](docs/kvc-aware-design.md)。
-
----
-
-## Prompt 落盘
-
-`boom-promptlog` 抓取每个请求的完整请求与响应（流式请求含原始 SSE 分块），以 JSONL 写入磁盘 —— 用于调试与审计。
-
-- 目录结构 `{dir}/{team_alias}/{key_hash}/log_NNNNNN.jsonl`，后台滚动并 gzip 压缩。
-- 流式响应通过流包装器累积原始事件分块录制（不做字段级解析）。
-- 可选 `capture_raw_upstream` 在格式转换路径（如 `/v1/messages`）上额外存储转换前的上游响应。
-- 可在面板按全局、团队或密钥开关录制 —— 通过热加载即时生效。
-
-```yaml
-prompt_log:
-  enabled: false
-  dir: "/data/prompt_logs"
-  max_file_size_mb: 50
-  capture_raw_upstream: false
-  excluded_keys: []
-  excluded_teams: []
-```
-
----
-
-## 热加载
-
-三种触发方式，均通过 ArcSwap 原子交换实现零停机：
-
-1. **信号**：`kill -HUP <pid>`
-2. **API**：`POST /admin/config/reload`（需 master key）
-3. **面板**：点击「Reload Config」按钮
-
-运行时计数器（限流、并发、绑定）在热加载后保留。
-
----
-
-## 负载均衡（misc/LB）
-
-基于 Pingora 的独立负载均衡器，可作为可选前端。它以 Docker 镜像提供（Rust 多阶段构建，openEuler 运行时）。核心能力：
-
-- 路由：`host`（含通配符 `*.example.com`）、`path` 前缀（按段边界）、`client_ip` CIDR，首条匹配生效
-- 后端策略：多活（一致性哈希 + API Key 亲和）与主备（按序 failover），默认后端支持 failover 列表
-- 健康检查：TCP / HTTP GET 探测，周期与失败阈值可配；连接失败自动重试换节点
-- 韧性：5xx 重试（幂等方法限定，自动排除坏后端）+ 每路由超时覆盖
-- 安全：IP 黑名单（热加载）、trusted_proxies + XFF 防伪造、上游 TLS、请求体上限、请求走私纵深防御
-- 可观测：`/__lb_metrics` Prometheus 计数（状态码分桶/错误/重试/延迟直方图）、`/__lb_healthz` 探活、结构化访问日志（状态码/耗时/错误）
-- 热加载：配置与黑名单变更自动生效（ArcSwap 无锁切换）
-
-```bash
-./misc/LB/start.sh start              # 自动构建 + 生成证书
-./misc/LB/start.sh start routes.yaml  # 自定义配置
-./misc/LB/start.sh status | stop | restart
-```
-
-详细配置与运维说明见 [misc/LB/README.md](misc/LB/README.md)。
-
----
 
 ## 文档
 
 | 文档 | 说明 |
 |----------|-------------|
-| [ARCH.md](ARCH.md) | 架构：模块图、请求流程、状态管理、DB schema |
-| [DESCRIPTOR.md](DESCRIPTOR.md) | 详细架构说明 |
+| [USER_GUIDE.md](USER_GUIDE.md) | 用户操作手册：功能模块、参数配置、建议配置 |
+| [docs/api-reference.md](docs/api-reference.md) | API 速查手册：全部端点 + curl 示例 |
 | [CONFIG_EXAMPLE.md](CONFIG_EXAMPLE.md) | 完整配置字段参考 |
-| [docs/kvc-aware-design.md](docs/kvc-aware-design.md) | KVC 感知路由设计文档 |
-| [docs/kvc-aware-event-reporting-research.md](docs/kvc-aware-event-reporting-research.md) | KV-cache 事件上报机制调研（NVIDIA Dynamo、llm-d） |
-| [docs/vip-header-forwarding-design.md](docs/vip-header-forwarding-design.md) | VIP 请求信息透传（`X-Gateway-Priority` header） |
-| [docs/direct-synthesis-workflow-design.md](docs/direct-synthesis-workflow-design.md) | Direct Synthesis Workflow 架构、配置与执行语义 |
+| [docs/software-design.md](docs/software-design.md) | 软件设计：模块职责、特性清单、DB schema |
+| [docs/architecture-overview.md](docs/architecture-overview.md) | 架构总览 |
+| [docs/internal-request-flow.md](docs/internal-request-flow.md) | 内部请求流转详解 |
+| [ARCH.md](ARCH.md) · [DESCRIPTOR.md](DESCRIPTOR.md) | 架构设计文档 |
+| [docs/direct-synthesis-workflow-design.md](docs/direct-synthesis-workflow-design.md) | Direct Synthesis Workflow 设计 |
+| [docs/kvc-aware-design.md](docs/kvc-aware-design.md) | KV 亲和路由早期设计（基于 ZMQ 订阅架构；现行为网关侧自学习 Trie，以 software-design.md 为准） |
+| [misc/LB/README.md](misc/LB/README.md) | Pingora 负载均衡前端 |
 | [CLAUDE.md](CLAUDE.md) | 开发指南与架构原则 |
 
 ## 许可证
