@@ -15,19 +15,48 @@ A production-grade LLM API gateway built in Rust. It unifies 20+ upstream provid
 
 ## Intelligent Scheduling
 
-Scheduling policies are pluggable and hot-swappable (`router_settings.schedule_policy`), implemented entirely on the gateway side with zero intrusion into upstreams:
+Scheduling policies are pluggable and hot-swappable (`router_settings.schedule_policy`), implemented entirely on the gateway side with zero intrusion into upstreams. The goal: route every request to the right node at the lowest latency and cost.
 
-- **Session-prefix affinity (`kvc_aware`)** — A self-learning prefix trie on the gateway side: each request's conversation prefix (system + tools + messages, in fixed order) is chunked and hashed into a block chain recorded under the actually selected worker; the next request with the same prefix hits it directly. Candidates are scored on a unified axis `score = cache_weight × hit_ratio + load_weight × (1 − load_pct/100)`, sending requests to the worker with the most cache hits that is not overloaded — significantly reducing TTFT. When the hit rate runs low, the gateway can actively request a full KV cache report from upstream to correct the index; LRU + TTL aging, no vLLM event subscription required.
-- **Key affinity (`key_affinity`)** — Requests from the same key + model stick to the same deployment to maximize upstream session-level cache reuse; new keys warm up on lowest-load spreading, and traffic migrates automatically once the load gap exceeds the rebalance threshold.
-- **Semantic routing (`auto_router`)** — A virtual model classifies requests by content and routes dynamically: a built-in heuristic classifier (keyword / length / code-block / reasoning / tool-call signals), or an external ML classification service (falls back to local on failure), dispatching requests to small / medium / large tiers of real models.
-- **Feedback-driven load balancing** — A real-time load-signal bus (in-flight counts, flow-control queue depth, request success rate) drives scheduling: unified scoring, hard exclusion of overloaded nodes (configurable threshold), capacity rebalancing (a dominant node hands off traffic once it exceeds the least-loaded candidate by a set percentage), and round-robin tie-breaking; rebalance moves over a 60-minute window are observable in the dashboard.
-- **Unhealthy node governance** — Automatic circuit breaking on consecutive failures, active `/metric` probing with automatic off-line/recovery (configurable thresholds), traffic bypass for overloaded nodes, and automatic re-entry after recovery; the `"*"` fallback deployment is equally protected.
+- **Session-prefix affinity (`kvc_aware`)**, offered in two flavors:
+  - **Gateway-side**: no inference-end event subscription and no upstream changes required to gain prefix-cache reuse — requests sharing a conversation prefix land where the upstream KV cache already holds it, significantly lowering TTFT
+  - **Subscription-based**: subscribes to event reporting from inference ends / KVC pooling components for finer-grained KVC-affinity scheduling (at a correspondingly higher deployment complexity)
+  - Both flavors balance cache benefit against node load: prefer the node with the most cache hits, but never pile onto an overloaded one
+- **Key affinity (`key_affinity`)**
+  - Requests from the same key + model stick to the same node, maximizing upstream session-level cache reuse
+  - Automatic migration and rebalancing when node load becomes uneven
+- **Semantic routing (`auto_router`)**
+  - Classifies requests by content (reasoning chains, code, tool calls, and other signals)
+  - Simple requests don't burn large-model capacity; complex ones aren't downgraded to a small model
+  - Built-in heuristics, or an external ML classification service with automatic local fallback
+- **Feedback-driven load balancing**
+  - Node selection driven by real-time load and health — requests never pile onto hotspots
+  - Dominant nodes hand off traffic automatically; overloaded nodes are bypassed automatically
+  - Migration and rebalancing are observable in the dashboard
+- **Unhealthy node governance**
+  - Automatic circuit breaking on consecutive failures, active probing with automatic off-line/recovery, and automatic re-entry after recovery — no manual intervention
+  - The `"*"` fallback deployment is equally protected
 
 ## Traffic Governance & Observability
 
-- **Flow control** — Per-deployment caps on max in-flight requests and total in-flight context characters: over-limit requests queue (VIP keys dispatched first), oversized requests are rejected immediately; slots release automatically on response completion or client disconnect.
-- **3-dimensional rate limiting & billing** — Key / team two-layer plans; counts / tokens / costs sliding windows + lifetime cumulative quotas; time-of-day schedules (crossing midnight) switch limits automatically.
-- **End-to-end observability** — Per-request TTFT, duration, queue wait, scheduling policy, and KV hit ratio persisted; anomaly outlier detection (IQR); OTel trace export; full prompt logging (rolling + gzip, dynamically toggleable per team / key).
+- **Flow control**
+  - Over-limit requests queue instead of being rejected, with VIP keys served first
+  - Oversized requests fail fast without dragging down the queue
+  - Slots release automatically on completion or client disconnect — no leaks
+- **3-dimensional rate limiting & billing**
+  - Key / team two-layer plans with independent counts / tokens / costs limits
+  - Lifetime cumulative quotas and time-of-day schedules that switch automatically, even across midnight
+- **End-to-end observability**
+  - Per-request TTFT, duration, queue wait, scheduling decision, and KV hit ratio are all persisted and queryable
+  - Anomalous requests are flagged automatically; OTel traces export the full chain
+  - Full prompt logging, dynamically toggleable per team / key
+- **Agent type analysis**
+  - Automatically identifies which kind of client / agent a request comes from — no client-side declaration needed
+  - Request volume and input / output token consumption split by agent type, showing who actually burns the capacity
+  - Minute-by-minute trends over the last hour, visualized in the dashboard
+- **Outlier sample analysis**
+  - Automatically scans latency, queueing, KV hit ratio, error rate, and more for outliers — anomalies surface themselves instead of requiring log dredging
+  - Drill down along four dimensions: key / model / node / team, pinpointing the source directly
+  - Results ranked by severity so the worst offenders come first
 
 ## Gateway Fundamentals
 
@@ -35,9 +64,16 @@ Unified access to 20+ upstream providers; litellm key-system compatibility; nati
 
 ---
 
+## Performance Advantages
+
+- **Single instance handles extreme QPS** — ordinary scale needs no cluster and no horizontal scaling; one process carries the traffic, minimizing deployment and ops cost
+- **Observability fully on, no degradation** — with full request-log DB writes, complete prompt logging (automatic compression & rotation), and OTLP reporting all enabled, gateway overhead stays modest: non-streaming p50 ~10ms, p999 ≤ 36.5ms
+- **Stable latency under high load** — at 2000 RPS the non-streaming latency shows no meaningful degradation; the bottleneck stays upstream at inference, never the gateway
+- **Figures below are measured**, and reproducible with one command
+
 ## Benchmarks
 
-Environment: **kunpeng920** (ARM64). Load generated by `mock-backend` (no inference latency, returns 100–400 chars of random content) and `bench-client` from `boom-gateway/test/`. Workload: **~50K input context + 100–500 output tokens**, **with prompt-log disk writes + OTLP reporting enabled**. **All figures in ms**.
+Environment: **kunpeng920** (ARM64). Load generated by `mock-backend` (no inference latency, returns 100–400 chars of random content) and `bench-client` from `boom-gateway/test/`. Workload: **~50K input context + 100–500 output tokens**, **with prompt-log disk writes + OTLP reporting enabled** (PostgreSQL audit logging is on by default once `database_url` is set). **All figures in ms**.
 
 ### Non-streaming
 
