@@ -7,9 +7,9 @@
 | 报告日期 | 2026-08-10 |
 | 完整压测日期 | 2026-08-08 |
 | Gateway 代码基线 | `bc5d2fb` (`fix(fusion): harden direct synthesis streaming and diagnostics`) |
-| 压测入口 | `boom-gateway/test/fusion-load-e2e.sh` |
-| 负载客户端 | `boom-gateway/test/bench-client` |
-| 模拟上游 | `boom-gateway/test/mock-backend` |
+| 压测入口 | `test/fusion-load-e2e.sh` |
+| 负载客户端 | `test/bench-client` |
+| 模拟上游 | `test/mock-backend` |
 | 完整运行输出目录 | `/tmp/boom-fusion-readme-20260808T163447Z-1056292` |
 
 本报告测试的是 BooMGateway 在明确 Mock Backend 行为下的吞吐、延迟、鉴权和
@@ -334,13 +334,13 @@ delta reports:  7
 完整 README 参数：
 
 ```bash
-./boom-gateway/test/fusion-load-e2e.sh
+./test/fusion-load-e2e.sh
 ```
 
 已构建 release 二进制时：
 
 ```bash
-FUSION_LOAD_SKIP_BUILD=1 ./boom-gateway/test/fusion-load-e2e.sh
+FUSION_LOAD_SKIP_BUILD=1 ./test/fusion-load-e2e.sh
 ```
 
 报告、实时输出、Gateway/Mock/PostgreSQL 日志和 Backend 增量默认保存在：

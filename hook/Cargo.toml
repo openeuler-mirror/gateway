@@ -13,7 +13,7 @@ crate-type = ["cdylib"]
 [workspace]
 
 [dependencies]
-boom-hooks-sdk = { path = "../boom-gateway/boom-hooks-sdk" }
+boom-hooks-sdk = { path = "../crates/boom-hooks-sdk" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

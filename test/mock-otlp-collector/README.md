@@ -14,17 +14,17 @@
 独立 Cargo 项目（不在 gateway workspace 内，避免拖累日常 `cargo build --workspace`）：
 
 ```bash
-cd boom-gateway/test/mock-otlp-collector && cargo build --release
+cd test/mock-otlp-collector && cargo build --release
 ```
 
-产物在 `boom-gateway/test/mock-otlp-collector/target/release/mock-otlp-collector`。
+产物在 `test/mock-otlp-collector/target/release/mock-otlp-collector`。
 
 ## 启动
 
 最简单：
 
 ```bash
-./boom-gateway/test/mock-otlp-collector/target/release/mock-otlp-collector
+./test/mock-otlp-collector/target/release/mock-otlp-collector
 ```
 
 默认监听 `0.0.0.0:4318`（OTLP/HTTP 标准端口），简要打印模式。
@@ -32,7 +32,7 @@ cd boom-gateway/test/mock-otlp-collector && cargo build --release
 切完整打印：
 
 ```bash
-./boom-gateway/test/mock-otlp-collector/target/release/mock-otlp-collector --full
+./test/mock-otlp-collector/target/release/mock-otlp-collector --full
 ```
 
 可选参数：
@@ -82,7 +82,7 @@ cd boom-gateway/test/mock-otlp-collector && cargo build --release
 
 ```bash
 # 终端 1：起 mock-otlp-collector
-./boom-gateway/test/mock-otlp-collector/target/release/mock-otlp-collector
+./test/mock-otlp-collector/target/release/mock-otlp-collector
 
 # 终端 2（gateway workspace 根目录）：跑离线 replay 工具推一批日志
 cd boom-gateway

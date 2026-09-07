@@ -178,7 +178,7 @@ CRUD handler（model/alias/plan/quota reset 等）的写路径必须遵循以下
 ## Repository Layout
 
 ```
-boom-gateway/           — Rust workspace root
+crates/                 — 全部 workspace 成员 crate
   boom-core/            — 核心 trait 和公共类型
   boom-auth/            — 密钥认证（litellm 兼容）
   boom-config/          — YAML 配置解析
@@ -189,5 +189,7 @@ boom-gateway/           — Rust workspace root
   boom-trace/           — 请求级 trace 链路 + 延迟分布
   boom-dashboard/       — Web 管理 UI + REST API
   boom-main/            — 主程序入口、路由、状态组装
+test/                   — 压测与测试工具（独立于主 workspace 的子项目）
+hook/                   — pre_auth hook demo（独立 workspace）
 misc/LB/                — Pingora 负载均衡代理（独立项目）
 ```

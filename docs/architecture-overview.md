@@ -6,7 +6,6 @@
 > - [用户感知模块](./user-facing-modules.md) — 面向业务方的功能描述
 > - [内部请求流](./internal-request-flow.md) — 面向开发者的逐行代码追踪
 > - [KV-Cache 设计](./kvc-aware-design.md) — L3 KvcAware 完整设计
-> - [架构图集](../boom-gateway/ppt/boom-arch-2p/architecture-diagram.md) — PPT 配套字符画
 
 ---
 
@@ -676,16 +675,15 @@ CMD ["boom-main", "--config", "/etc/boom/config.yaml"]
 
 | 路径 | 内容 |
 |------|------|
-| `boom-gateway/CLAUDE.md` | 项目硬约束、模块依赖原则、热加载规则 |
-| `boom-gateway/boom-main/src/state.rs` | AppState 定义、reload 实现、create_policy |
-| `boom-gateway/boom-main/src/routes.rs` | `/v1/chat` 主请求路径 |
-| `boom-gateway/boom-routing/src/policy/` | L0~L3 调度策略实现 |
-| `boom-gateway/boom-kvindex/src/` | ZMQ subscriber + TokenPrefixIndex Trie |
-| `boom-gateway/boom-dashboard/src/admin_command.rs` | AdminCommand enum 定义 |
+| `CLAUDE.md` | 项目硬约束、模块依赖原则、热加载规则 |
+| `crates/boom-main/src/state.rs` | AppState 定义、reload 实现、create_policy |
+| `crates/boom-main/src/routes.rs` | `/v1/chat` 主请求路径 |
+| `crates/boom-routing/src/policy/` | L0~L3 调度策略实现 |
+| `crates/boom-kvindex/src/` | ZMQ subscriber + TokenPrefixIndex Trie |
+| `crates/boom-dashboard/src/admin_command.rs` | AdminCommand enum 定义 |
 | `docs/user-facing-modules.md` | 用户感知功能详细描述 |
 | `docs/internal-request-flow.md` | 内部请求流逐行追踪 |
 | `docs/kvc-aware-design.md` | L3 KvcAware 完整设计 |
-| `boom-gateway/ppt/boom-arch-2p/` | 架构图 PPT + 字符画 |
 
 ---
 
@@ -747,4 +745,4 @@ RAII Drop 链的优势：
 
 ---
 
-*本文档与 `boom-gateway/CLAUDE.md` 互为补充：CLAUDE.md 是"必须遵守"的硬约束清单，本文档是"为什么这样约束"的设计论证。*
+*本文档与 `CLAUDE.md` 互为补充：CLAUDE.md 是"必须遵守"的硬约束清单，本文档是"为什么这样约束"的设计论证。*

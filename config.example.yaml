@@ -316,7 +316,7 @@ prompt_log:
 #   4. hook 调用本身失败（panic / 错误码 / buffer 溢出）→ 按 failure_mode
 #      处理：allow=降级走原生认证（默认）；deny=返回 500
 #
-# 编写 hook：参考 boom-gateway/example-hooks/ 目录的示例 crate，用
+# 编写 hook：参考 crates/example-hooks/ 目录的示例 crate，用
 # boom-hooks-sdk 的 pre_auth_entry / hook_init_entry 助手，只写业务
 # 闭包即可，序列化、catch_unwind、return code 都由 SDK 处理。
 # ──────────────────────────────────────────────────────────────────────

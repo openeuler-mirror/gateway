@@ -42,7 +42,7 @@ cargo build --release
 #   Linux  → target/release/libpre_auth_demo.so
 ```
 
-> 依赖 `boom-hooks-sdk`，路径是 `../boom-gateway/boom-hooks-sdk`，所以必须在仓库内编译，不能拷贝出去单独编译。
+> 依赖 `boom-hooks-sdk`，路径是 `../crates/boom-hooks-sdk`，所以必须在仓库内编译，不能拷贝出去单独编译。
 
 ## 配置 gateway 加载
 

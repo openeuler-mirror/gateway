@@ -14,7 +14,7 @@
 //! The crate is intentionally a separate Cargo project (see `[workspace]`
 //! in Cargo.toml) — `cargo build --workspace` from the gateway root does
 //! NOT compile this tool. Build it explicitly:
-//!   cd boom-gateway/test/mock-otlp-collector && cargo build --release
+//!   cd test/mock-otlp-collector && cargo build --release
 
 use std::net::SocketAddr;
 

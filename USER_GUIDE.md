@@ -910,13 +910,13 @@ export OPENAI_API_KEY="sk-..."
 export ANTHROPIC_API_KEY="sk-ant-..."
 
 # 直接运行（默认读 config.yaml）
-./target/release/boom-main
+./target/release/boom-gateway
 
 # 指定配置文件与端口
-./target/release/boom-main --config /etc/boom/config.yaml --port 4000
+./target/release/boom-gateway --config /etc/boom/config.yaml --port 4000
 
 # 覆盖 host
-./target/release/boom-main --host 127.0.0.1
+./target/release/boom-gateway --host 127.0.0.1
 ```
 
 CLI 参数：
@@ -955,7 +955,7 @@ curl -X POST http://localhost:4000/admin/config/reload \
 ### 5.3 --reboot：安全重启
 
 ```bash
-./target/release/boom-main --reboot
+./target/release/boom-gateway --reboot
 ```
 
 `--reboot` 会先优雅停止已运行的 boom-gateway 实例再启动新进程：

@@ -6,7 +6,7 @@ edition = "2021"
 # Empty [workspace] table keeps this package OUT of the parent gateway workspace
 # so `cargo build --workspace` from /Users/icecream/code/atomgit/gateway doesn't
 # compile this test tool. Build explicitly:
-#   cd boom-gateway/test/mock-otlp-collector && cargo build --release
+#   cd test/mock-otlp-collector && cargo build --release
 [workspace]
 
 [[bin]]

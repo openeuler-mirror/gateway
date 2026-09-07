@@ -517,7 +517,7 @@ deployment 的：
 Prompt 作为编译期静态资产存放在：
 
 ```text
-boom-gateway/boom-fusion/src/prompts/
+crates/boom-fusion/src/prompts/
 ```
 
 包含：

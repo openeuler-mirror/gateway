@@ -102,9 +102,9 @@ jobs:
       - name: Build bench-client
         run: |
           source "$HOME/.cargo/env"
-          cd repo_workspace/boom-gateway/test/bench-client && cargo build --release
+          cd repo_workspace/test/bench-client && cargo build --release
 
       - name: Build mock-backend
         run: |
           source "$HOME/.cargo/env"
-          cd repo_workspace/boom-gateway/test/mock-backend && cargo build --release
+          cd repo_workspace/test/mock-backend && cargo build --release
