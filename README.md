@@ -17,10 +17,10 @@
 
 调度策略可插拔、可热切换（`router_settings.schedule_policy`），全部在网关侧实现，对上游零侵入。目标：让每个请求都以最低延迟、最低成本到达最合适的节点。
 
-- **会话前缀亲和（`kvc_aware`）**，提供两种方案：
-  - **网关侧方案**：无需订阅推理端事件、无需上游改造，即可获得前缀缓存复用收益——相同会话前缀的请求自动命中上游已有的 KV cache，显著降低 TTFT
-  - **订阅上报方案**：通过订阅推理端 / KVC 池化组件事件上报，实现更加精细的 KVC 亲和调度（部署复杂度相应提高）
-  - 两种方案下均缓存收益与节点负载联合寻优：优先缓存命中最多的节点，但不把请求压向过载节点
+- **会话前缀亲和（`kvc_aware`）**
+  - 相同会话前缀的请求自动命中上游已有的 KV cache，显著降低 TTFT
+  - 缓存收益与节点负载联合寻优：优先缓存命中最多的节点，但不把请求压向过载节点
+  - 无需 vLLM 事件订阅、无需上游改造，即可获得前缀缓存复用收益
 - **密钥亲和（`key_affinity`）**
   - 同一密钥 + 模型的请求稳定落在同一节点，最大化上游会话级缓存复用
   - 节点负载失衡时自动迁移再平衡
@@ -50,7 +50,7 @@
   - 异常请求自动识别，OTel trace 全链路导出
   - 完整 prompt 落盘，可按团队 / 密钥动态开关
 - **Agent 类型分析**
-  - 自动识别请求来自哪类客户端 / Agent，无需调用方做任何声明
+  - 自动区分 Anthropic 原生客户端（Claude Code / opencode 等）与 OpenAI 兼容调用方，无需调用方做任何声明
   - 请求量与输入 / 输出 token 消耗按类型分账，看清不同 Agent 各自的资源占用
   - 面板按分钟粒度呈现近一小时趋势
 - **离群样本分析**
@@ -73,7 +73,7 @@
 
 ## 性能实测
 
-测试环境：**kunpeng920**（ARM64）。使用 `boom-gateway/test/` 下的 `mock-backend`（无推理延迟，仅返回 100~400 字符随机内容）与 `bench-client` 对网关压测。负载形态：**约 50K 输入上下文 + 输出 100~500 token**，**打开 prompt log 写盘 + OTLP 上报**（PostgreSQL 审计落库默认随 `database_url` 开启）。**所有数据单位均为 ms**。
+测试环境：**kunpeng920**（ARM64）。使用 `test/` 下的 `mock-backend`（无推理延迟，仅返回 100~400 字符随机内容）与 `bench-client` 对网关压测。负载形态：**约 50K 输入上下文 + 输出 100~500 token**，**打开 prompt log 写盘 + OTLP 上报**（PostgreSQL 审计落库默认随 `database_url` 开启）。**所有数据单位均为 ms**。
 
 ### 非流式
 
@@ -107,7 +107,7 @@
 
 **解读**：非流式 p50 全程稳定在 9~10ms，p999 ≤ 36.5ms——网关自身在压测下未成为瓶颈。流式 TTFT 在 500 RPS 内维持 ~54ms；1000 RPS 起出现排队，饱和拐点由首 token 阶段决定，后续吐 token 阶段未额外放大延迟。
 
-> 复现方式见 [boom-gateway/test/README.md](boom-gateway/test/README.md)。
+> 复现方式见 [test/README.md](test/README.md)。
 
 ---
 
@@ -132,7 +132,7 @@ createdb boom_gateway
 # 或：psql -U postgres -c "CREATE DATABASE boom_gateway;"
 ```
 
-**2. 编写最小配置** `config.yaml`（完整字段参考见 [CONFIG_EXAMPLE.md](CONFIG_EXAMPLE.md)）：
+**2. 编写最小配置** `config.yaml`（完整字段参考见 [config.example.yaml](config.example.yaml)，每个字段带注释）：
 
 ```yaml
 model_list:
@@ -197,8 +197,8 @@ curl http://localhost:4000/v1/chat/completions \
 
 ```
 gateway/
-├── Cargo.toml             Rust workspace 根（成员见 boom-gateway/）
-├── boom-gateway/          全部 crate
+├── Cargo.toml             Rust workspace 根（成员见 crates/）
+├── crates/                全部 crate
 │   ├── boom-core/         核心 trait 与公共类型（叶子依赖）
 │   ├── boom-auth/         密钥认证（SHA-256 + DB + master key，litellm 兼容）
 │   ├── boom-config/       YAML 配置解析 + 环境变量展开 + 字段 manifest
@@ -216,6 +216,8 @@ gateway/
 │   ├── boom-hooks-sdk/    Hook SDK
 │   ├── boom-dashboard/    Web UI + REST API + JWT 认证
 │   └── boom-main/         入口、路由、状态组装（二进制名：boom-gateway）
+├── test/                  压测与测试工具（bench-client / mock-backend 等）
+├── hook/                  pre_auth hook demo（独立 workspace）
 ├── misc/LB/               Pingora 负载均衡（可选前端，已容器化）
 ├── config.example.yaml    完整配置参考
 └── docs/                  设计文档与 API 手册
@@ -238,13 +240,12 @@ gateway/
 
 | 文档 | 说明 |
 |----------|-------------|
-| [USER_GUIDE.md](USER_GUIDE.md) | 用户操作手册：功能模块、参数配置、建议配置 |
+| [USER_GUIDE.md](USER_GUIDE.md) | 用户操作手册：功能模块、参数配置、建议配置、运维操作 |
+| [config.example.yaml](config.example.yaml) | 完整配置参考（每个字段带注释） |
 | [docs/api-reference.md](docs/api-reference.md) | API 速查手册：全部端点 + curl 示例 |
-| [CONFIG_EXAMPLE.md](CONFIG_EXAMPLE.md) | 完整配置字段参考 |
 | [docs/software-design.md](docs/software-design.md) | 软件设计：模块职责、特性清单、DB schema |
 | [docs/architecture-overview.md](docs/architecture-overview.md) | 架构总览 |
 | [docs/internal-request-flow.md](docs/internal-request-flow.md) | 内部请求流转详解 |
-| [ARCH.md](ARCH.md) · [DESCRIPTOR.md](DESCRIPTOR.md) | 架构设计文档 |
 | [docs/direct-synthesis-workflow-design.md](docs/direct-synthesis-workflow-design.md) | Direct Synthesis Workflow 设计 |
 | [docs/kvc-aware-design.md](docs/kvc-aware-design.md) | KV 亲和路由早期设计（基于 ZMQ 订阅架构；现行为网关侧自学习 Trie，以 software-design.md 为准） |
 | [misc/LB/README.md](misc/LB/README.md) | Pingora 负载均衡前端 |

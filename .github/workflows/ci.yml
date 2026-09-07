@@ -87,8 +87,8 @@ jobs:
             ~/.cargo/git
             misc/LB/target
             hook/target
-            boom-gateway/test/bench-client/target
-            boom-gateway/test/mock-backend/target
+            test/bench-client/target
+            test/mock-backend/target
           key: cargo-standalone-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
           restore-keys: cargo-standalone-${{ runner.os }}-
 
@@ -99,7 +99,7 @@ jobs:
         run: cd hook && cargo build --release
 
       - name: Build bench-client
-        run: cd boom-gateway/test/bench-client && cargo build --release
+        run: cd test/bench-client && cargo build --release
 
       - name: Build mock-backend
-        run: cd boom-gateway/test/mock-backend && cargo build --release
+        run: cd test/mock-backend && cargo build --release

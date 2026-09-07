@@ -305,7 +305,7 @@ mod tests {
     /// Locate `libexample_pre_auth_hook.{so,dylib}` from the workspace target dir.
     fn find_hook_so() -> String {
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        // boom-main is at <workspace>/boom-gateway/boom-main — workspace root
+        // boom-main is at <workspace>/crates/boom-main — workspace root
         // is two levels up.
         let workspace_root = std::path::Path::new(manifest_dir).join("../..");
         for profile in ["release", "debug"] {

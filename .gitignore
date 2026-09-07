@@ -1,4 +1,5 @@
-/target
+# 构建产物（任何层级的 target/，含独立子 workspace）
+target/
 *.swp
 *.swo
 *~
@@ -6,3 +7,12 @@
 config.yaml
 !misc/LB/config.yaml
 .env
+
+# 归档目录：演示素材等工作产物，不进仓库
+/archive
+
+# PPT 构建产物（slides html / 缩略图等）
+docs/ppt/workspace/
+
+# 本地会话目录
+.claude/

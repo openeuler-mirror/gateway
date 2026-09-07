@@ -19,8 +19,8 @@
 两个工具都是独立的 Cargo 项目（**不**在 gateway workspace 内，避免拖累日常 build）：
 
 ```bash
-cd boom-gateway/test/mock-backend && cargo build --release
-cd boom-gateway/test/bench-client && cargo build --release
+cd test/mock-backend && cargo build --release
+cd test/bench-client && cargo build --release
 ```
 
 产物在各自 `target/release/` 下。
@@ -31,7 +31,7 @@ cd boom-gateway/test/bench-client && cargo build --release
 
 ```bash
 # 1. 起 mock 后端
-./boom-gateway/test/mock-backend/target/release/mock-backend \
+./test/mock-backend/target/release/mock-backend \
   --bind 127.0.0.1:9000 --min-chars 100 --max-chars 400
 
 # 2. 起 gateway，model_list 指向 mock
@@ -54,7 +54,7 @@ curl -s -X POST http://127.0.0.1:8080/v1/chat/completions \
   -d '{"model":"mock-gpt-4o","messages":[{"role":"user","content":"hi"}],"stream":false}'
 
 # 4. 跑压测（OpenAI 流式，50 QPS，5 秒）
-./boom-gateway/test/bench-client/target/release/bench-client \
+./test/bench-client/target/release/bench-client \
   --target http://127.0.0.1:8080 \
   --format openai \
   --keys sk-master-xxx \
@@ -142,7 +142,7 @@ Gateway 和协议转换 mock-backend 直接请求 `mock-gpt-4o` / `mock-claude`�
 bench 报告和 Backend 503，不能只看客户端 HTTP 结果。
 
 ```bash
-./boom-gateway/test/fusion-load-e2e.sh
+./test/fusion-load-e2e.sh
 ```
 
 脚本默认使用 release 构建。Mock 输出、chunk 间隔和并发上限也使用本 README
@@ -179,7 +179,7 @@ FUSION_LOAD_SHORT_PROMPT_CHARS=1000 \
 FUSION_LOAD_LONG_PROMPT_CHARS=100000 \
 FUSION_LOAD_RAMP_MODE=ramp=100,5000,500,30 \
 FUSION_LOAD_RAMP_DURATION=15m \
-./boom-gateway/test/fusion-load-e2e.sh
+./test/fusion-load-e2e.sh
 ```
 
 已构建对应 profile 的二进制时可设置 `FUSION_LOAD_SKIP_BUILD=1`。该压测
