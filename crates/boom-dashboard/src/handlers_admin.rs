@@ -158,7 +158,7 @@ pub async fn upsert_plan(
             tracing::error!("Failed to persist plan to DB: {}", e);
         }
     } else {
-        state.plan_store.upsert_plan(plan);
+        let _ = state.plan_store.upsert_plan(plan);
     }
 
     // Best-effort YAML sync — surface failure as warning field (not error,
@@ -330,14 +330,10 @@ pub async fn list_keys(
 
     let _total_before_filter = rows.len() as i64;
 
-    // Single-pass limiter scan: aggregate usage for all keys at once.
-    let all_usage = state.limiter.get_all_key_usage();
-
     let mut keys: Vec<Value> = rows
         .into_iter()
         .map(|r| {
             let token_prefix = format!("{}...", &r.token[..8.min(r.token.len())]);
-            let (usage_count, usage_reset_secs) = all_usage.get(&r.token).copied().unwrap_or((0, 0));
             // Three-state plan assignment. The frontend distinguishes:
             //   - "default"   → no DB row (follows default_plan at runtime)
             //   - "no_plan"   → row with plan_name IS NULL (explicit opt-out)
@@ -356,38 +352,40 @@ pub async fn list_keys(
                 Some(None) => None,
             };
 
-            // Aggregate current-window tokens & cost from limiter. We pick
-            // the smallest window_secs per kind — that's the "tightest" current
-            // window (typically 60s) and matches what users expect in a usage
-            // snapshot column. Cross-window aggregation would mix limits.
-            let mut tokens_min_secs: Option<(u64, u64, u64)> = None; // (secs, count, remaining)
-            let mut cost_min_secs: Option<(u64, u64, u64)> = None; // (secs, micros, remaining)
-            for w in state.limiter.peek_key_windows(&r.token) {
-                match w.kind {
-                    boom_limiter::WindowKind::Tokens => {
-                        match tokens_min_secs {
-                            None => tokens_min_secs = Some((w.window_secs, w.count, w.remaining_secs)),
-                            Some((s, _, _)) if w.window_secs < s => {
-                                tokens_min_secs = Some((w.window_secs, w.count, w.remaining_secs));
-                            }
-                            _ => {}
-                        }
-                    }
-                    boom_limiter::WindowKind::CostMicros => {
-                        match cost_min_secs {
-                            None => cost_min_secs = Some((w.window_secs, w.count, w.remaining_secs)),
-                            Some((s, _, _)) if w.window_secs < s => {
-                                cost_min_secs = Some((w.window_secs, w.count, w.remaining_secs));
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-            let usage_tokens = tokens_min_secs.map(|(_, c, _)| c).unwrap_or(0);
-            let usage_cost_micros = cost_min_secs.map(|(_, c, _)| c).unwrap_or(0);
-            let usage_cost = rust_decimal::Decimal::from(usage_cost_micros)
-                / rust_decimal::Decimal::from(1_000_000);
+            // Per-window usage within the plan's CURRENT schedule slot — the
+            // same `effective_limits` the enforcement path consults, so the
+            // displayed range always matches what limiting actually applies.
+            // Plan windows live in the `__plan__` namespace (cross-model
+            // aggregated). Keys without a plan get an empty list.
+            let usage_windows: Vec<Value> = match &plan_name {
+                Some(n) => state
+                    .plan_store
+                    .get_plan(n)
+                    .map(|p| {
+                        let (_, active, _) = p.effective_limits();
+                        let mut secs: Vec<u64> =
+                            active.iter().map(|w| w.window_secs).collect();
+                        secs.sort();
+                        secs.dedup();
+                        state
+                            .limiter
+                            .peek_plan_windows(&r.token, &secs)
+                            .iter()
+                            .map(|w| {
+                                json!({
+                                    "window_secs": w.window_secs,
+                                    "counts": w.counts,
+                                    "tokens": w.tokens,
+                                    "cost": (rust_decimal::Decimal::from(w.costs_micros)
+                                        / rust_decimal::Decimal::from(1_000_000)).to_string(),
+                                    "remaining_secs": w.remaining_secs,
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                None => Vec::new(),
+            };
 
             // Cumulative total cost across the key's lifetime — comes from
             // limiter.cumulative (boom_rate_limit_cumulative backed), NOT
@@ -423,21 +421,29 @@ pub async fn list_keys(
                 "expires": r.expires.map(|d| d.to_string()),
                 "metadata": r.metadata,
                 "created_at": r.created_at.map(|d| d.to_string()),
-                "usage_count": usage_count,
-                "usage_reset_secs": usage_reset_secs,
-                "usage_tokens": usage_tokens,
-                "usage_cost": usage_cost.to_string(),
+                "usage_windows": usage_windows,
                 "plan_name": plan_name,
                 "plan_assignment_kind": plan_assignment_kind,
             })
         })
         .collect();
 
-    // Sort globally by usage_count descending.
+    // Sort globally by busiest window (max counts, tie-break max tokens).
+    let window_max = |k: &Value, field: &str| -> u64 {
+        k.get("usage_windows")
+            .and_then(|v| v.as_array())
+            .map(|ws| {
+                ws.iter()
+                    .filter_map(|w| w.get(field).and_then(|f| f.as_u64()))
+                    .max()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0)
+    };
     keys.sort_by(|a, b| {
-        let ca = a.get("usage_count").and_then(|v| v.as_u64()).unwrap_or(0);
-        let cb = b.get("usage_count").and_then(|v| v.as_u64()).unwrap_or(0);
-        cb.cmp(&ca)
+        window_max(b, "counts")
+            .cmp(&window_max(a, "counts"))
+            .then_with(|| window_max(b, "tokens").cmp(&window_max(a, "tokens")))
     });
 
     // Filter VIP-only if requested.

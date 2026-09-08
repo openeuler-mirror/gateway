@@ -454,9 +454,19 @@ impl PlanStore {
 
     // ── Plan CRUD ──────────────────────────────────────────────
 
-    pub fn upsert_plan(&self, plan: RateLimitPlan) {
+    /// Insert or update a plan in memory. Single choke point for schedule
+    /// overlap validation — YAML load, DB restore, dashboard writes and the
+    /// master-key API all funnel through here. Overlapping slots are rejected
+    /// (warn + not inserted) so `effective_limits` never silently shadows one
+    /// slot with another.
+    pub fn upsert_plan(&self, plan: RateLimitPlan) -> Result<(), String> {
+        if let Err(msg) = plan.validate_schedule_overlap() {
+            tracing::warn!(plan = %plan.name, "Rejected plan with overlapping schedule slots: {}", msg);
+            return Err(msg);
+        }
         let name = plan.name.clone();
         self.plans.insert(name, plan);
+        Ok(())
     }
 
     pub fn get_plan(&self, name: &str) -> Option<RateLimitPlan> {
@@ -824,7 +834,7 @@ impl PlanStore {
 
         for row in &rows {
             let plan = row_to_plan(row);
-            self.upsert_plan(plan);
+            let _ = self.upsert_plan(plan);
         }
 
         tracing::info!("Loaded {} DB-only plan(s)", rows.len());
@@ -933,7 +943,7 @@ impl PlanStore {
             .bind(&schedule_json)
         )?;
 
-        self.upsert_plan(plan.clone());
+        let _ = self.upsert_plan(plan.clone());
         Ok(())
     }
 
@@ -1586,5 +1596,34 @@ mod tests {
             ScheduleSlot { hours: "21:00-9:00".to_string(), ..Default::default() },
         ];
         assert!(plan.validate_schedule_overlap().is_err());
+    }
+
+    /// `upsert_plan` is the single choke point for overlap validation — a bad
+    /// plan must not land in the in-memory store (it would silently shadow
+    /// slots in `effective_limits`).
+    #[test]
+    fn test_upsert_plan_rejects_overlapping_schedule() {
+        let store = PlanStore::new();
+        let mut plan = RateLimitPlan::default_for_test();
+        plan.name = "overlap_plan".to_string();
+        plan.schedule = vec![
+            ScheduleSlot { hours: "9:00-21:00".to_string(), ..Default::default() },
+            ScheduleSlot { hours: "10:00-11:00".to_string(), ..Default::default() },
+        ];
+        assert!(store.upsert_plan(plan).is_err());
+        assert!(store.get_plan("overlap_plan").is_none(), "rejected plan must not be stored");
+    }
+
+    #[test]
+    fn test_upsert_plan_accepts_valid_schedule() {
+        let store = PlanStore::new();
+        let mut plan = RateLimitPlan::default_for_test();
+        plan.name = "valid_plan".to_string();
+        plan.schedule = vec![
+            ScheduleSlot { hours: "9:00-21:00".to_string(), ..Default::default() },
+            ScheduleSlot { hours: "21:00-9:00".to_string(), ..Default::default() },
+        ];
+        assert!(store.upsert_plan(plan).is_ok());
+        assert!(store.get_plan("valid_plan").is_some());
     }
 }

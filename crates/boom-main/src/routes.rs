@@ -1404,7 +1404,12 @@ pub async fn admin_upsert_plan(
 ) -> Result<Json<serde_json::Value>, GatewayErrorReply> {
     require_master(auth.identity())?;
     let name = plan.name.clone();
-    state.plan_store.upsert_plan(plan);
+    if let Err(msg) = state.plan_store.upsert_plan(plan) {
+        return Err(GatewayErrorReply(
+            GatewayError::ConfigError(format!("Plan '{}' rejected: {}", name, msg)),
+            false,
+        ));
+    }
     tracing::info!(plan = %name, "Plan upserted");
     Ok(Json(serde_json::json!({
         "status": "ok",
