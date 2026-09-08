@@ -320,6 +320,9 @@ pub fn convert_entry_to_log_records(
         }
         attrs.push(otlp_kv_string("prompt_log.raw_upstream_response", &s));
     }
+    // Note: bg_request / raw_response are deliberately NOT exported over
+    // OTLP — they are forensic fields that only make sense at full size in
+    // the local JSONL sink.
 
     // Headers — emit as a nested kvlist attribute. Each header value is also
     // subject to truncation.

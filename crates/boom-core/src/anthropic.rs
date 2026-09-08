@@ -103,6 +103,7 @@ pub fn anthropic_request_to_openai(req: &AnthropicMessagesRequest) -> ChatComple
         extra,
         gateway_headers: HashMap::new(),
         kv_cache_report_full: false,
+        raw_capture: None,
     }
 }
 

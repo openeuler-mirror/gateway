@@ -44,6 +44,7 @@ fn write_prompt_log_error(
     headers: Option<&std::collections::HashMap<String, String>>,
     error: &GatewayError,
     prompt_trace: Option<&SharedProviderPromptTrace>,
+    raw_capture: Option<&boom_core::provider::SharedRawCapture>,
     start: Instant,
     trace_guard: Option<&mut boom_trace::TraceGuard>,
 ) {
@@ -75,14 +76,23 @@ fn write_prompt_log_error(
     state.prompt_log_writer.send(request_entry.clone());
 
     let mut response_entry = PromptLogEntry::new_response_from(&request_entry);
+    // Raw upstream exchange from the provider side channel (only exists
+    // when capture_raw_upstream is on). Covers upstream HTTP error bodies
+    // and parse failures uniformly.
+    if let Some(cap) = raw_capture {
+        response_entry.set_raw_exchange(cap.take_request_body(), cap.take_response_body());
+    }
     // Parse failures carry the raw upstream body — record it verbatim
     // (regardless of capture_raw_upstream) so non-standard upstreams are
     // diagnosable from the prompt log alone. Valid JSON bodies are stored
-    // as JSON; non-JSON bodies fall back to a string value.
-    if let Some(raw) = error.raw_upstream_body() {
-        let raw_value = serde_json::from_str::<serde_json::Value>(raw)
-            .unwrap_or_else(|_| serde_json::Value::String(raw.to_string()));
-        response_entry.set_raw_upstream_response(Arc::new(raw_value));
+    // as JSON; non-JSON bodies fall back to a string value. Skipped when
+    // the capture channel already provided the same bytes via raw_response.
+    if raw_capture.is_none() {
+        if let Some(raw) = error.raw_upstream_body() {
+            let raw_value = serde_json::from_str::<serde_json::Value>(raw)
+                .unwrap_or_else(|_| serde_json::Value::String(raw.to_string()));
+            response_entry.set_raw_upstream_response(Arc::new(raw_value));
+        }
     }
     response_entry.set_response(Arc::new(openai_error_body(error)));
     if let Some(trace) = prompt_trace {
@@ -563,6 +573,17 @@ async fn chat_completions_inner(
         &identity.key_hash,
         identity.team_id.as_deref(),
     );
+    // Raw exchange capture channel — handed to the provider via the request
+    // side channel; the provider records the exact bytes it sends/receives.
+    let prompt_log_raw_capture = if prompt_log_should
+        && state.prompt_log_writer.config().capture_raw_upstream
+    {
+        Some(std::sync::Arc::new(
+            boom_core::provider::RawCaptureChannel::default(),
+        ))
+    } else {
+        None
+    };
     let prompt_log_req_body = if prompt_log_should {
         serde_json::to_value(&req).ok().map(Arc::new)
     } else {
@@ -859,6 +880,10 @@ async fn chat_completions_inner(
         None
     };
 
+    // Hand the raw capture channel to the provider (taken out at its send
+    // site; never serialized).
+    req.raw_capture = prompt_log_raw_capture.clone();
+
     // 4. Route to provider (streaming or non-streaming).
     if is_stream {
         let stream = match provider.chat_stream_with_context(req, provider_context).await {
@@ -881,6 +906,7 @@ async fn chat_completions_inner(
                     prompt_log_headers.as_ref(),
                     &e,
                     provider_prompt_trace.as_ref(),
+                    prompt_log_raw_capture.as_ref(),
                     start,
                     trace_guard.as_mut(),
                 );
@@ -979,17 +1005,24 @@ async fn chat_completions_inner(
                     sender,
                     prompt_entry,
                     sse_raw_data_extractor(),
-                    None,
                 );
-                // Provider-owned trace snapshot (fusion/KV-index/etc.) is
-                // injected into the Response-phase entry built on Drop —
-                // runs AFTER the inner stream's Drop so trace finalization
-                // side effects are visible to the snapshot.
-                if let Some(trace) = provider_prompt_trace.clone() {
+                // Provider-owned trace snapshot (fusion/KV-index/etc.) and the
+                // raw upstream exchange are injected into the Response-phase
+                // entry built on Drop — runs AFTER the inner stream's Drop so
+                // trace finalization side effects and the final captured
+                // frames are visible.
+                if provider_prompt_trace.is_some() || prompt_log_raw_capture.is_some() {
+                    let trace = provider_prompt_trace.clone();
+                    let raw_capture = prompt_log_raw_capture.clone();
                     prompt_logged = prompt_logged.with_entry_enricher(Arc::new(move |entry| {
-                        trace.finalize();
-                        if let Some(fusion) = trace.snapshot() {
-                            entry.set_fusion(fusion);
+                        if let Some(trace) = trace.as_ref() {
+                            trace.finalize();
+                            if let Some(fusion) = trace.snapshot() {
+                                entry.set_fusion(fusion);
+                            }
+                        }
+                        if let Some(cap) = raw_capture.as_ref() {
+                            entry.set_raw_exchange(cap.take_request_body(), cap.take_response_body());
                         }
                     }));
                 }
@@ -1026,6 +1059,7 @@ async fn chat_completions_inner(
                     prompt_log_headers.as_ref(),
                     &e,
                     provider_prompt_trace.as_ref(),
+                    prompt_log_raw_capture.as_ref(),
                     start,
                     trace_guard.as_mut(),
                 );
@@ -1146,6 +1180,9 @@ async fn chat_completions_inner(
                     if let Some(fusion) = trace.snapshot() {
                         response_entry.set_fusion(fusion);
                     }
+                }
+                if let Some(cap) = prompt_log_raw_capture.as_ref() {
+                    response_entry.set_raw_exchange(cap.take_request_body(), cap.take_response_body());
                 }
                 response_entry.set_status(200, duration_ms as u64);
                 let _ = sender.send(response_entry);
@@ -2890,6 +2927,13 @@ pub async fn messages(
         identity.team_id.as_deref(),
     );
     let prompt_log_capture_raw = prompt_log_should && state.prompt_log_writer.config().capture_raw_upstream;
+    let prompt_log_raw_capture = if prompt_log_capture_raw {
+        Some(std::sync::Arc::new(
+            boom_core::provider::RawCaptureChannel::default(),
+        ))
+    } else {
+        None
+    };
     let prompt_log_req_body = if prompt_log_should {
         serde_json::to_value(&req).ok().map(Arc::new)
     } else {
@@ -3152,16 +3196,35 @@ pub async fn messages(
         None
     };
 
+    // Hand the raw capture channel to the provider (taken out at its send
+    // site; never serialized).
+    openai_req.raw_capture = prompt_log_raw_capture.clone();
+
     // 4. Route to provider.
     if is_stream {
         let stream = match provider.chat_stream(openai_req).await {
             Ok(s) => s,
             Err(e) => {
                 log_error(&state, &identity, &model, "/v1/messages", true, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()));
+                write_prompt_log_error(
+                    &state,
+                    prompt_log_should,
+                    prompt_log_req_body.as_ref(),
+                    prompt_log_trace_id.clone(),
+                    &request_id,
+                    &identity,
+                    &model,
+                    "/v1/messages",
+                    true,
+                    &client_ip,
+                    prompt_log_headers.as_ref(),
+                    &e,
+                    None,
+                    prompt_log_raw_capture.as_ref(),
+                    start,
+                    trace_guard.as_mut(),
+                );
                 crate::health_monitor::record_request_failure(&state, &deployment_id, &e);
-                if let Some(g) = trace_guard.as_mut() {
-                    g.mark_error(e.to_string());
-                }
                 // plan_charge drops here without commit — no quota consumed.
                 return Err(AnthropicErrorReply(e, true));
             }
@@ -3170,13 +3233,7 @@ pub async fn messages(
         let _decision = plan_charge.commit();
         crate::health_monitor::reset_request_failure(&state, &deployment_id);
         let usage = UsageTracker::default();
-        // Create shared buffer for raw upstream SSE chunks (before Anthropic transcoding).
-        let raw_upstream_buf = if prompt_log_capture_raw {
-            Some(std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new())))
-        } else {
-            None
-        };
-        let sse_stream = sse_stream_from_anthropic_chat_stream(stream, model.clone(), usage.clone(), raw_upstream_buf.clone());
+        let sse_stream = sse_stream_from_anthropic_chat_stream(stream, model.clone(), usage.clone());
         let inflight_guard = if let Some(ref did) = deployment_id {
             InFlightGuard::new_for_deployment(state.inflight.clone(), &inflight_model, did, input_chars as u64)
         } else {
@@ -3251,7 +3308,14 @@ pub async fn messages(
                 // Request-phase fires immediately. Stream wrapper's Drop
                 // emits the Response-phase entry with assembled content.
                 let _ = sender.send(prompt_entry.clone());
-                let prompt_logged = PromptLogStream::new(logged, sender, prompt_entry, sse_anthropic_extractor(), raw_upstream_buf);
+                let mut prompt_logged = PromptLogStream::new(logged, sender, prompt_entry, sse_anthropic_extractor());
+                // Raw upstream exchange is injected on Drop — after the inner
+                // stream finished so all captured frames are visible.
+                if let Some(cap) = prompt_log_raw_capture.clone() {
+                    prompt_logged = prompt_logged.with_entry_enricher(Arc::new(move |entry| {
+                        entry.set_raw_exchange(cap.take_request_body(), cap.take_response_body());
+                    }));
+                }
                 let response = Sse::new(sse_item_to_event(prompt_logged)).keep_alive(KeepAlive::default());
                 return Ok(response.into_response());
             }
@@ -3268,10 +3332,25 @@ pub async fn messages(
             Ok(r) => r,
             Err(e) => {
                 log_error(&state, &identity, &model, "/v1/messages", false, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()));
+                write_prompt_log_error(
+                    &state,
+                    prompt_log_should,
+                    prompt_log_req_body.as_ref(),
+                    prompt_log_trace_id.clone(),
+                    &request_id,
+                    &identity,
+                    &model,
+                    "/v1/messages",
+                    false,
+                    &client_ip,
+                    prompt_log_headers.as_ref(),
+                    &e,
+                    None,
+                    prompt_log_raw_capture.as_ref(),
+                    start,
+                    trace_guard.as_mut(),
+                );
                 crate::health_monitor::record_request_failure(&state, &deployment_id, &e);
-                if let Some(g) = trace_guard.as_mut() {
-                    g.mark_error(e.to_string());
-                }
                 // plan_charge drops here without commit — no quota consumed.
                 return Err(AnthropicErrorReply(e, false));
             }
@@ -3350,9 +3429,8 @@ pub async fn messages(
         let anthropic_resp = openai_response_to_anthropic(&response);
 
         // Prompt log: emit Request-phase immediately, then Response-phase with
-        // the converted Anthropic response. Raw upstream bytes (when enabled)
-        // travel only on the Response-phase entry — the Request-phase entry's
-        // raw_upstream_response is None.
+        // the converted Anthropic response. The raw gateway→upstream exchange
+        // (when enabled) travels only on the Response-phase entry.
         if let Some(sender) = prompt_log_sender {
             if let Some(req_body) = prompt_log_req_body {
                 let request_entry = PromptLogEntry::new_request(
@@ -3370,15 +3448,8 @@ pub async fn messages(
                 );
                 let _ = sender.send(request_entry.clone());
                 let mut response_entry = PromptLogEntry::new_response_from(&request_entry);
-                if prompt_log_capture_raw {
-                    if let Some(ref raw) = response.raw_response {
-                        response_entry.set_raw_upstream_response(
-                            Arc::new(
-                                serde_json::from_str::<serde_json::Value>(raw)
-                                    .unwrap_or(serde_json::Value::String(raw.clone())),
-                            ),
-                        );
-                    }
+                if let Some(cap) = prompt_log_raw_capture.as_ref() {
+                    response_entry.set_raw_exchange(cap.take_request_body(), cap.take_response_body());
                 }
                 let resp_arc = Arc::new(serde_json::to_value(&anthropic_resp).unwrap_or(serde_json::Value::Null));
                 response_entry.set_response(resp_arc.clone());
@@ -3402,7 +3473,6 @@ fn sse_stream_from_anthropic_chat_stream(
     stream: ChatStream,
     model: String,
     usage: UsageTracker,
-    raw_upstream_sink: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
 ) -> impl futures::Stream<Item = Result<SseItem, Infallible>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<SseItem>(64);
 
@@ -3413,14 +3483,6 @@ fn sse_stream_from_anthropic_chat_stream(
         while let Some(result) = stream.next().await {
             match result {
                 Ok(chunk) => {
-                    // Capture raw upstream chunk before transcoding (if enabled).
-                    if let Some(ref sink) = raw_upstream_sink {
-                        if let Some(ref raw) = chunk.raw_data {
-                            if let Ok(mut guard) = sink.lock() {
-                                guard.push(raw.clone());
-                            }
-                        }
-                    }
                     // Extract usage from the chunk (OpenAI sends usage in the final chunk).
                     if let Some(ref u) = chunk.usage {
                         if let Ok(mut g) = usage.lock() {

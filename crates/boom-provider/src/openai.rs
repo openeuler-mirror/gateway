@@ -238,7 +238,14 @@ impl Provider for OpenAIProvider {
     async fn chat(&self, mut req: ChatCompletionRequest) -> Result<ChatCompletionResponse, GatewayError> {
         // Take gateway-internal headers out before the request is serialized.
         let gateway_headers = std::mem::take(&mut req.gateway_headers);
+        let raw_capture = std::mem::take(&mut req.raw_capture);
         let body = self.build_request(req);
+        // Record the exact serialized bytes — reqwest's .json() serializes
+        // the same Value with the same serializer, so this is byte-identical
+        // to what goes on the wire.
+        if let Some(ref cap) = raw_capture {
+            cap.record_request_body(&body.to_string());
+        }
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
 
         let mut builder = self.client.post(&url);
@@ -261,6 +268,9 @@ impl Provider for OpenAIProvider {
         let status = resp.status();
         if !status.is_success() {
             let error_body = resp.text().await.unwrap_or_default();
+            if let Some(ref cap) = raw_capture {
+                cap.push_response_frame(error_body.clone());
+            }
             return Err(GatewayError::UpstreamError {
                 status: status.as_u16(),
                 message: error_body,
@@ -271,6 +281,9 @@ impl Provider for OpenAIProvider {
             tracing::error!("Failed to read OpenAI response body: {}", e);
             GatewayError::ProviderError("Failed to read upstream response".to_string())
         })?;
+        if let Some(ref cap) = raw_capture {
+            cap.push_response_frame(raw_text.clone());
+        }
 
         // Tolerate a UTF-8 BOM: some upstreams prepend one invisibly (curl
         // output looks fine) and serde_json fails with "expected value at
@@ -310,7 +323,11 @@ impl Provider for OpenAIProvider {
     async fn chat_stream(&self, mut req: ChatCompletionRequest) -> Result<ChatStream, GatewayError> {
         // Take gateway-internal headers out before the request is serialized.
         let gateway_headers = std::mem::take(&mut req.gateway_headers);
+        let raw_capture = std::mem::take(&mut req.raw_capture);
         let mut body = self.build_request(req);
+        if let Some(ref cap) = raw_capture {
+            cap.record_request_body(&body.to_string());
+        }
         // Ensure stream is enabled and request usage in the final chunk.
         if let Some(obj) = body.as_object_mut() {
             obj.insert("stream".to_string(), serde_json::Value::Bool(true));
@@ -342,6 +359,9 @@ impl Provider for OpenAIProvider {
         let status = resp.status();
         if !status.is_success() {
             let error_body = resp.text().await.unwrap_or_default();
+            if let Some(ref cap) = raw_capture {
+                cap.push_response_frame(error_body.clone());
+            }
             return Err(GatewayError::UpstreamError {
                 status: status.as_u16(),
                 message: error_body,
@@ -361,6 +381,13 @@ impl Provider for OpenAIProvider {
                     chunk_result = stream.next() => chunk_result,
                 };
                 let Some(chunk_result) = chunk_result else {
+                    // Upstream ended. Flush any partial (unterminated) frame
+                    // so the raw capture shows exactly where truncation hit.
+                    if let Some(ref cap) = raw_capture {
+                        if !buffer.is_empty() {
+                            cap.push_response_frame(std::mem::take(&mut buffer));
+                        }
+                    }
                     return;
                 };
                 match chunk_result {
@@ -370,6 +397,12 @@ impl Provider for OpenAIProvider {
                         while let Some(pos) = buffer.find("\n\n") {
                             let event_text = buffer[..pos].to_string();
                             buffer = buffer[pos + 2..].to_string();
+                            // Capture the raw frame before any parsing —
+                            // keeps event:/data: prefixes and frames that
+                            // fail JSON parse.
+                            if let Some(ref cap) = raw_capture {
+                                cap.push_response_frame(event_text.clone());
+                            }
 
                             for line in event_text.lines() {
                                 if let Some(data) = line.strip_prefix("data: ") {
@@ -485,6 +518,7 @@ mod tests {
             extra: Default::default(),
             gateway_headers,
             kv_cache_report_full: false,
+            raw_capture: None,
         }
     }
 

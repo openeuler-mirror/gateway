@@ -107,6 +107,67 @@ pub trait ProviderPromptTrace: Send + Sync {
 
 pub type SharedProviderPromptTrace = Arc<dyn ProviderPromptTrace>;
 
+/// Side channel capturing the exact bodies exchanged with the upstream
+/// provider. Created by the route layer when `prompt_log.capture_raw_upstream`
+/// is enabled; providers write at their send/receive sites; the prompt log
+/// entry reads the buffers when the Response-phase entry is composed.
+///
+/// Semantics:
+/// - `request_body`: the JSON string exactly as serialized for the upstream
+///   call (byte-identical to what reqwest puts on the wire — same Value,
+///   same serializer).
+/// - `response_frames`: one entry per complete SSE frame for streaming
+///   (frame text as received, `event:`/`data:` prefixes and comments kept,
+///   frames that fail JSON parse included), or the whole body as a single
+///   entry for non-streaming responses and upstream HTTP error bodies.
+///   Callers join frames with `\n\n` to reconstruct the raw stream.
+#[derive(Debug, Default)]
+pub struct RawCaptureChannel {
+    pub request_body: Mutex<Option<String>>,
+    pub response_frames: Mutex<Vec<String>>,
+}
+
+impl RawCaptureChannel {
+    /// Record the upstream request body. First writer wins — later calls
+    /// (e.g. retries) do not overwrite, keeping the log deterministic.
+    pub fn record_request_body(&self, body: &str) {
+        if let Ok(mut slot) = self.request_body.lock() {
+            if slot.is_none() {
+                *slot = Some(body.to_string());
+            }
+        }
+    }
+
+    pub fn push_response_frame(&self, frame: String) {
+        if let Ok(mut frames) = self.response_frames.lock() {
+            frames.push(frame);
+        }
+    }
+
+    pub fn take_request_body(&self) -> Option<String> {
+        self.request_body.lock().ok().and_then(|mut slot| slot.take())
+    }
+
+    /// Drain accumulated frames into a single raw string. Streaming frames
+    /// are joined with `\n\n` (the SSE frame separator); a lone
+    /// non-streaming body is returned verbatim.
+    pub fn take_response_body(&self) -> Option<String> {
+        let frames = self
+            .response_frames
+            .lock()
+            .ok()
+            .map(|mut frames| std::mem::take(&mut *frames))
+            .unwrap_or_default();
+        if frames.is_empty() {
+            None
+        } else {
+            Some(frames.join("\n\n"))
+        }
+    }
+}
+
+pub type SharedRawCapture = Arc<RawCaptureChannel>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderProtocol {
     OpenAiCompatible,
@@ -262,4 +323,44 @@ pub trait DeploymentQueueInfo: Send + Sync + 'static {
     /// Maximum concurrent capacity (max_inflight) for a deployment.
     /// Returns 0 if the deployment has no flow control configured (unlimited).
     fn max_capacity(&self, deployment_id: &str) -> u32;
+}
+
+#[cfg(test)]
+mod raw_capture_tests {
+    use super::*;
+
+    #[test]
+    fn request_body_first_writer_wins() {
+        let cap = RawCaptureChannel::default();
+        cap.record_request_body("first");
+        cap.record_request_body("second");
+        assert_eq!(cap.take_request_body().as_deref(), Some("first"));
+        assert_eq!(cap.take_request_body(), None, "take drains the slot");
+    }
+
+    #[test]
+    fn streaming_frames_join_with_blank_line_separator() {
+        let cap = RawCaptureChannel::default();
+        cap.push_response_frame("data: {\"a\":1}".to_string());
+        cap.push_response_frame("data: [DONE]".to_string());
+        assert_eq!(
+            cap.take_response_body().as_deref(),
+            Some("data: {\"a\":1}\n\ndata: [DONE]")
+        );
+        assert_eq!(cap.take_response_body(), None, "take drains the frames");
+    }
+
+    #[test]
+    fn single_non_streaming_body_returned_verbatim() {
+        let cap = RawCaptureChannel::default();
+        cap.push_response_frame("{\"id\":\"x\"}".to_string());
+        assert_eq!(cap.take_response_body().as_deref(), Some("{\"id\":\"x\"}"));
+    }
+
+    #[test]
+    fn empty_channel_takes_return_none() {
+        let cap = RawCaptureChannel::default();
+        assert_eq!(cap.take_request_body(), None);
+        assert_eq!(cap.take_response_body(), None);
+    }
 }

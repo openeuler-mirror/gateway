@@ -59,15 +59,6 @@ pub struct PromptLogStream<S, F> {
     /// Extracts ChunkDelta from a stream item. Returns `None` for non-data
     /// events (e.g. comment lines in Anthropic SSE).
     delta_fn: F,
-    /// Shared buffer for raw upstream SSE chunks (before format conversion).
-    /// Only set when `capture_raw_upstream` is enabled for Anthropic-format endpoints.
-    /// `Vec<String>` of complete SSE event blocks — each entry is one
-    /// `data: {...}\n\n` segment. The producer appends; this wrapper reads +
-    /// ships on Drop. Kept as `Vec<String>` (not a single tee `String`)
-    /// because downstream consumers (raw_upstream_response attribute)
-    /// expect discrete chunks for forensic replay — concatenating would
-    /// lose the chunk boundaries.
-    raw_upstream_chunks: Option<Arc<std::sync::Mutex<Vec<String>>>>,
     /// Adds provider-owned metadata after the wrapped stream has been dropped.
     entry_enricher: Option<Arc<dyn Fn(&mut PromptLogEntry) + Send + Sync>>,
 }
@@ -80,7 +71,6 @@ impl<S, F> PromptLogStream<S, F> {
         sender: mpsc::UnboundedSender<PromptLogEntry>,
         request_entry: PromptLogEntry,
         delta_fn: F,
-        raw_upstream_chunks: Option<Arc<std::sync::Mutex<Vec<String>>>>,
     ) -> Self {
         let start = Instant::now();
         Self {
@@ -93,7 +83,6 @@ impl<S, F> PromptLogStream<S, F> {
             usage: None,
             end_state: None,
             delta_fn,
-            raw_upstream_chunks,
             entry_enricher: None,
         }
     }
@@ -158,30 +147,12 @@ impl<S, F> Drop for PromptLogStream<S, F> {
             entry.error_code = Some(code);
         }
 
-        // Let the producer inject extra fields (e.g. fusion trace snapshot)
+        // Let the producer inject extra fields (e.g. fusion trace snapshot,
+        // raw upstream exchange captured via the provider side channel)
         // before the entry ships. Runs AFTER inner stream drop so the trace
         // can observe finalization side effects.
         if let Some(enricher) = &self.entry_enricher {
             enricher(&mut entry);
-        }
-
-        // Capture raw upstream chunks if available (before format conversion).
-        // Wrapped in Arc so the same allocation can be shared with the trace
-        // span's `boom-gateway.llm_response` attribute if the producer wires it.
-        if let Some(ref raw_chunks) = self.raw_upstream_chunks {
-            if let Ok(guard) = raw_chunks.lock() {
-                if !guard.is_empty() {
-                    let raw_values: Vec<serde_json::Value> = guard
-                        .iter()
-                        .filter_map(|s| serde_json::from_str::<serde_json::Value>(s).ok())
-                        .collect();
-                    entry.set_raw_upstream_response(Arc::new(serde_json::json!({
-                        "stream": true,
-                        "raw_chunk_count": raw_values.len(),
-                        "raw_chunks": raw_values,
-                    })));
-                }
-            }
         }
 
         if let Err(e) = self.sender.send(entry) {
@@ -293,7 +264,7 @@ mod tests {
             },
         ];
         let s = stream::iter(chunks);
-        let mut wrapper = PromptLogStream::new(s, tx, req, extractor, None);
+        let mut wrapper = PromptLogStream::new(s, tx, req, extractor);
         // Drive the stream to completion so the wrapper sees the terminal chunk.
         while let Some(_) = wrapper.next().await {}
         drop(wrapper);
@@ -316,7 +287,7 @@ mod tests {
             // No terminal chunk — stream just ends.
         ];
         let s = stream::iter(chunks);
-        let mut wrapper = PromptLogStream::new(s, tx, req, extractor, None);
+        let mut wrapper = PromptLogStream::new(s, tx, req, extractor);
         // Drive the stream to completion — but it ends without a finish_reason
         // marker, so Drop should record a truncation.
         while let Some(_) = wrapper.next().await {}
@@ -342,7 +313,7 @@ mod tests {
             usage: None,
         }];
         let s = stream::iter(chunks);
-        let _wrapper = PromptLogStream::new(s, tx, req, extractor, None);
+        let _wrapper = PromptLogStream::new(s, tx, req, extractor);
         drop(_wrapper);
         let entry = rx.recv().await.expect("entry sent");
         assert_eq!(entry.phase, LogPhase::Response);
@@ -399,7 +370,6 @@ mod tests {
             sender,
             entry,
             |_item: &serde_json::Value| None::<ChunkDelta>,
-            None,
         )
         .with_entry_enricher(Arc::new(move |entry| {
             entry.set_raw_upstream_response(Arc::new(serde_json::json!({

@@ -214,6 +214,14 @@ pub struct ChatCompletionRequest {
     /// not in this core type. Not set by clients — set by the gateway after routing.
     #[serde(skip, default)]
     pub kv_cache_report_full: bool,
+    /// Raw capture side channel for prompt logging — set by the route layer
+    /// when `prompt_log.capture_raw_upstream` is enabled, taken out by the
+    /// provider at its send site to record the exact request/response bytes
+    /// exchanged with the upstream. Same serde-skip pattern as
+    /// `gateway_headers`: never parsed from client bodies (no spoofing),
+    /// never serialized into the upstream JSON.
+    #[serde(skip)]
+    pub raw_capture: Option<crate::provider::SharedRawCapture>,
 }
 
 // ============================================================
@@ -296,6 +304,7 @@ impl CompletionRequest {
             extra: self.extra,
             gateway_headers: HashMap::new(),
             kv_cache_report_full: false,
+            raw_capture: None,
         }
     }
 }

@@ -294,7 +294,7 @@ prompt_log:
   enabled: false                    # 全局开关，默认关闭
   dir: "/data/prompt_logs"          # 日志根目录，按天分子目录
   max_file_size_mb: 50              # 单文件大小上限（MB），超过自动滚动
-  capture_raw_upstream: false       # 同时记录上游原始响应（仅格式转换路径如 /v1/messages）
+  capture_raw_upstream: false       # 同时记录网关↔上游原始交换（bg_request=网关组装发送的请求体，raw_response=上游原始响应；流式按SSE帧拼接，含解析失败帧与上游错误体）
   excluded_keys: []                 # 跳过这些 key（key_hash），不记录
   excluded_teams: []                # 跳过这些 team（team_id），不记录
   record_headers: []                # 记录到 prompt log 的请求 header 白名单（小写）；空=不记录任何 header，避免泄漏 Authorization/Cookie 等

@@ -983,6 +983,7 @@ mod tests {
             extra: Default::default(),
             gateway_headers: HashMap::new(),
             kv_cache_report_full: false,
+            raw_capture: None,
         }
     }
 
