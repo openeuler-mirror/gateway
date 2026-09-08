@@ -724,7 +724,7 @@
       "tip.team.plan": "Pick a type=team plan, or leave on default to fall back to default_team_plan (YAML-configured).",
       "tip.team.models": "Select model access for this team. Check 'Full Access' for unrestricted access to all current and future models, or pick specific models. Stored as empty array in DB.",
 
-      "keys.col.usage": "Usage (per-window count/tokens/cost)",
+      "keys.col.usage": "Usage (count/tokens/cost)",
       "keys.col.reset": "Reset",
       "keys.col.spend": "Spend",
       "keys.col.budget": "Budget",
@@ -1636,7 +1636,7 @@
       "tip.team.plan": "选一个 type=team 的套餐;留默认则回退到 default_team_plan(YAML 配置)。",
       "tip.team.models": "选择团队的模型权限。勾选\"全部访问\"表示对当前和未来模型都有全权限(数据库存空数组);或勾选具体模型。",
 
-      "keys.col.usage": "用量(窗口内次数/token/计费)",
+      "keys.col.usage": "用量(次数/token/计费)",
       "keys.col.reset": "重置",
       "keys.col.spend": "消费",
       "keys.col.budget": "预算",

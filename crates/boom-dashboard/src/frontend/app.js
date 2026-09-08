@@ -3044,18 +3044,6 @@
       if (v >= 1e3) return (v / 1e3).toFixed(2) + "K";
       return String(v);
     };
-    const fmtWin = (secs) => {
-      const v = Number(secs) || 0;
-      if (v % 86400 === 0) return (v / 86400) + "d";
-      if (v % 3600 === 0) return (v / 3600) + "h";
-      if (v % 60 === 0) return (v / 60) + "m";
-      return v + "s";
-    };
-    const renderUsageCell = (k) => {
-      const ws = k.usage_windows || [];
-      if (!ws.length) return '<span class="muted">-</span>';
-      return ws.map((w) => `<div><span class="badge">${fmtWin(w.window_secs)}</span> <span class="mono">${w.counts || 0}/${fmtTokens(w.tokens)}/${fmtCost(w.cost)}</span>${w.remaining_secs > 0 ? ` <span class="muted" style="font-size:11px">${t("req.resets_in", { time: formatCountdown(w.remaining_secs) })}</span>` : ""}</div>`).join("");
-    };
     wrap.innerHTML = `<table>
       <tr><th>${t("keys.col.token")}</th><th>${t("keys.col.alias")}</th><th>${t("keys.col.user")}</th><th>${t("keys.col.plan")}</th><th>${t("keys.col.usage")}</th><th>${t("keys.col.spend")}</th><th>${t("keys.col.budget")}</th><th>${t("keys.col.status")}</th><th>${t("keys.col.actions")}</th></tr>
       ${keys.map((k) => `<tr>
@@ -3063,7 +3051,7 @@
         <td>${esc(k.key_alias || "-")}${k.key_prefix ? ' <span class="badge badge-prefix">' + esc(k.key_prefix) + "</span>" : ""}${k.tag ? ' <span class="badge badge-tag">' + esc(k.tag) + "</span>" : ""}</td>
         <td>${esc(k.user_id || "-")}</td>
         <td>${renderKeyPlanCell(k)}</td>
-        <td>${renderUsageCell(k)}</td>
+        <td><span class="mono">${k.usage_count || 0}/${fmtTokens(k.usage_tokens)}/${fmtCost(k.usage_cost)}</span><br><span class="muted" style="font-size:11px">${formatCountdown(k.usage_reset_secs || 0)}</span></td>
         <td>${fmtCost(k.spend)}</td>
         <td>${k.max_budget != null ? "$" + k.max_budget : "-"}</td>
         <td>${k.blocked
@@ -3593,8 +3581,8 @@
     return `<div class="form-group${opts.full ? " field-full" : ""}"><label for="${id}">${esc(label)}${fieldTipHTML(opts)}</label><input id="${id}" type="number" value="${esc(v)}" ${opts.min !== undefined ? `min="${opts.min}"` : ""} ${opts.step ? `step="${opts.step}"` : ""}></div>`;
   }
   function fieldCheckbox(id, label, checked, opts = {}) {
-    const note = opts.note ? ` <span class="field-note-danger">${esc(opts.note)}</span>` : "";
-    return `<div class="form-group field-checkbox"><input id="${id}" type="checkbox" ${checked ? "checked" : ""}><label for="${id}">${esc(label)}${fieldTipHTML(opts)}${note}</label></div>`;
+    const note = opts.note ? `<div class="field-note-danger">${esc(opts.note)}</div>` : "";
+    return `<div class="form-group field-checkbox"><input id="${id}" type="checkbox" ${checked ? "checked" : ""}><label for="${id}">${esc(label)}${fieldTipHTML(opts)}</label>${note}</div>`;
   }
   function fieldSelect(id, label, options, selected, opts = {}) {
     const opts2 = options.map((o) => {

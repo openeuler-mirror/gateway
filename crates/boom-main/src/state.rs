@@ -1401,7 +1401,7 @@ fn load_plans_from_config(plan_store: &Arc<PlanStore>, config: &Config) {
             total_cost_limit: pc.total_cost_limit,
             schedule: convert_schedule(&pc.schedule),
         };
-        let _ = plan_store.upsert_plan(plan);
+        plan_store.upsert_plan(plan);
     }
 
     match &config.plan_settings.default_plan {

@@ -20,7 +20,7 @@ use boom_core::types::{LimitDimension, RateLimitDecision, RateLimitKey, WindowLi
 use dashmap::DashMap;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 // ═══════════════════════════════════════════════════════════
@@ -81,17 +81,6 @@ pub struct WindowInfo {
     pub window_secs: u64,
     pub count: u64,
     pub elapsed_secs: u64,
-    pub remaining_secs: u64,
-}
-
-/// Aggregated plan-namespace window stats for one window_secs of a key.
-/// Returned by `peek_plan_windows` for the dashboard keys listing.
-#[derive(Debug, Clone, Serialize)]
-pub struct PlanWindowStats {
-    pub window_secs: u64,
-    pub counts: u64,
-    pub tokens: u64,
-    pub costs_micros: u64,
     pub remaining_secs: u64,
 }
 
@@ -604,52 +593,26 @@ impl SlidingWindowLimiter {
             .collect()
     }
 
-    /// Aggregate plan-namespace window counters for a key, filtered to the
-    /// currently-active `window_secs` set (from `RateLimitPlan::effective_limits`).
-    ///
-    /// Plan windows live under the reserved `model = "__plan__"` namespace
-    /// (cache_key `{key_hash}:__plan__:{window_secs}`), so they are already
-    /// cross-model aggregated and never mixed with legacy per-model entries.
-    /// Windows in `active_secs` without a counter emit a zero entry so callers
-    /// can render a stable window list; expired counters are skipped.
-    pub fn peek_plan_windows(&self, key_hash: &str, active_secs: &[u64]) -> Vec<PlanWindowStats> {
+    /// Single-pass aggregation of usage for ALL keys (counts dimension only).
+    /// Returns `HashMap<key_hash, (total_counts, max_remaining_secs)>`.
+    /// Skips team namespace entries (`__team__{tid}`) — those aren't real keys.
+    pub fn get_all_key_usage(&self) -> HashMap<String, (u64, u64)> {
         let now = now_epoch_secs();
-        let mut out: Vec<PlanWindowStats> = active_secs
-            .iter()
-            .map(|&s| PlanWindowStats {
-                window_secs: s,
-                counts: 0,
-                tokens: 0,
-                costs_micros: 0,
-                remaining_secs: 0,
-            })
-            .collect();
-        let prefix = format!("{}:__plan__:", key_hash);
+        let mut result: HashMap<String, (u64, u64)> = HashMap::new();
         for entry in self.windows.iter() {
-            let ck = entry.key();
-            if !ck.starts_with(&prefix) {
+            // cache_key format: "{key_hash}:{model}:{window_secs}"
+            let key_hash = entry.key().split(':').next().unwrap_or("");
+            if key_hash.starts_with("__team__") {
                 continue;
             }
-            let secs: u64 = match ck[prefix.len()..].parse() {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            let idx = match out.iter().position(|p| p.window_secs == secs) {
-                Some(i) => i,
-                None => continue,
-            };
             let counter = entry.value();
-            let elapsed = now.saturating_sub(counter.window_start);
-            if elapsed >= counter.window_secs {
-                continue;
-            }
-            let p = &mut out[idx];
-            p.counts = counter.counts;
-            p.tokens = counter.tokens;
-            p.costs_micros = counter.costs_micros;
-            p.remaining_secs = counter.window_secs - elapsed;
+            let remaining =
+                counter.window_secs.saturating_sub(now.saturating_sub(counter.window_start));
+            let slot = result.entry(key_hash.to_string()).or_insert((0, 0));
+            slot.0 += counter.counts;
+            slot.1 = slot.1.max(remaining);
         }
-        out
+        result
     }
 
     /// List all non-expired token/cost window entries for a given key.
@@ -1717,110 +1680,5 @@ mod tests {
 
         // After reset, peek returns 0.
         assert_eq!(limiter.peek_cumulative(&scope, CumulativeKind::TotalInputTokens), 0);
-    }
-
-    #[tokio::test]
-    async fn test_peek_plan_windows_aggregates_and_filters() {
-        let limiter = SlidingWindowLimiter::new();
-        let plan_key = RateLimitKey {
-            key_hash: "pk1".to_string(),
-            model: "__plan__".to_string(),
-        };
-        let windows = vec![
-            WindowLimit {
-                counts: Some(100),
-                tokens: Some(10_000),
-                costs: None,
-                window_secs: 60,
-            },
-            WindowLimit {
-                counts: None,
-                tokens: None,
-                costs: Some(Decimal::new(50, 0)),
-                window_secs: 3600,
-            },
-        ];
-        let scope = QuotaScope::Key { key_hash: "pk1".to_string() };
-
-        // Two requests through plan windows: counts=2 on both windows,
-        // tokens=5000 + costs=$1 land on BOTH window_secs (settle rolls all).
-        limiter.commit_counts(&plan_key, &windows, 1);
-        limiter.commit_counts(&plan_key, &windows, 1);
-        limiter.settle_usage(&plan_key, &scope, &windows, 3000, 2000, 1_000_000, 0, 0);
-
-        // Legacy per-model entry for the same key — must NOT leak in.
-        let legacy_key = RateLimitKey {
-            key_hash: "pk1".to_string(),
-            model: "gpt-4".to_string(),
-        };
-        limiter.commit_counts(&legacy_key, &vec![WindowLimit {
-            counts: Some(10),
-            tokens: None,
-            costs: None,
-            window_secs: 60,
-        }], 7);
-
-        // Another key's plan entry — must NOT leak in.
-        let other_key = RateLimitKey {
-            key_hash: "pk2".to_string(),
-            model: "__plan__".to_string(),
-        };
-        limiter.commit_counts(&other_key, &vec![WindowLimit {
-            counts: Some(10),
-            tokens: None,
-            costs: None,
-            window_secs: 60,
-        }], 99);
-
-        let stats = limiter.peek_plan_windows("pk1", &[60, 3600, 86400]);
-        assert_eq!(stats.len(), 3, "one entry per active window_secs, zeros included");
-
-        let by_secs = |s: u64| stats.iter().find(|p| p.window_secs == s).unwrap();
-        let w60 = by_secs(60);
-        assert_eq!(w60.counts, 2, "legacy per-model counts must be excluded");
-        assert_eq!(w60.tokens, 5000);
-        assert_eq!(w60.costs_micros, 1_000_000);
-        assert!(w60.remaining_secs > 0 && w60.remaining_secs <= 60);
-
-        let w3600 = by_secs(3600);
-        // counts only accumulate on windows that configure a counts limit —
-        // this fixture's 1h window carries costs only.
-        assert_eq!(w3600.counts, 0);
-        assert_eq!(w3600.tokens, 5000);
-        assert!(w3600.remaining_secs > 60);
-
-        let w86400 = by_secs(86400);
-        assert_eq!((w86400.counts, w86400.tokens, w86400.costs_micros, w86400.remaining_secs), (0, 0, 0, 0));
-    }
-
-    #[tokio::test]
-    async fn test_peek_plan_windows_skips_expired() {
-        let limiter = SlidingWindowLimiter::new();
-        let plan_key = RateLimitKey {
-            key_hash: "exp1".to_string(),
-            model: "__plan__".to_string(),
-        };
-        let windows = vec![WindowLimit {
-            counts: Some(100),
-            tokens: None,
-            costs: None,
-            window_secs: 60,
-        }];
-        limiter.commit_counts(&plan_key, &windows, 3);
-
-        // Force the window into the expired state (started 120s ago).
-        limiter
-            .windows
-            .get_mut("exp1:__plan__:60")
-            .unwrap()
-            .window_start = now_epoch_secs() - 120;
-
-        let stats = limiter.peek_plan_windows("exp1", &[60]);
-        assert_eq!(stats.len(), 1);
-        assert_eq!(
-            (stats[0].counts, stats[0].tokens, stats[0].costs_micros, stats[0].remaining_secs),
-            (0, 0, 0, 0),
-            "expired counter must read as zero"
-        );
     }
 }

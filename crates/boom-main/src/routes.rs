@@ -1404,12 +1404,7 @@ pub async fn admin_upsert_plan(
 ) -> Result<Json<serde_json::Value>, GatewayErrorReply> {
     require_master(auth.identity())?;
     let name = plan.name.clone();
-    if let Err(msg) = state.plan_store.upsert_plan(plan) {
-        return Err(GatewayErrorReply(
-            GatewayError::ConfigError(format!("Plan '{}' rejected: {}", name, msg)),
-            false,
-        ));
-    }
+    state.plan_store.upsert_plan(plan);
     tracing::info!(plan = %name, "Plan upserted");
     Ok(Json(serde_json::json!({
         "status": "ok",
@@ -2765,7 +2760,6 @@ fn sse_stream_from_chat_stream(
 ) -> impl futures::Stream<Item = Result<SseItem, Infallible>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<SseItem>(32);
     tokio::spawn(async move {
-        let mut tool_arg_buf: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
         let mut stream = std::pin::pin!(stream);
         loop {
             let result = tokio::select! {
@@ -2777,7 +2771,7 @@ fn sse_stream_from_chat_stream(
                 return;
             };
             match result {
-                Ok(mut chunk) => {
+                Ok(chunk) => {
                     if let Some(ref u) = chunk.usage {
                         if let Ok(mut g) = usage.lock() {
                             g.prompt_tokens = u.prompt_tokens;
@@ -2790,79 +2784,6 @@ fn sse_stream_from_chat_stream(
                         }
                     }
 
-                    let has_finish = chunk.choices.iter().any(|c| c.finish_reason.is_some());
-
-                    // Buffer tool_call arguments via take() — zero-copy, no clone.
-                    for choice in &mut chunk.choices {
-                        if let Some(ref mut tool_calls) = choice.delta.tool_calls {
-                            for tc in tool_calls.iter_mut() {
-                                let args_taken = tc.function.as_mut().and_then(|f| f.arguments.take());
-                                if let Some(args) = args_taken {
-                                    if !args.is_empty() {
-                                        // Fast path: incremental fragments almost never end with '}'.
-                                        // Skip the expensive JSON parse when the string clearly isn't
-                                        // a complete object.
-                                        let is_complete = args.starts_with('{')
-                                            && args.ends_with('}')
-                                            && serde_json::from_str::<serde_json::Value>(&args).is_ok();
-                                        let has_existing = tool_arg_buf.get(&tc.index).map_or(false, |e| !e.is_empty());
-
-                                        if is_complete && has_existing {
-                                            tool_arg_buf.insert(tc.index, args); // move, no clone
-                                        } else {
-                                            tool_arg_buf.entry(tc.index).or_default().push_str(&args);
-                                        }
-                                    }
-                                    // arguments already taken — chunk emits without them
-                                }
-                            }
-                        }
-                    }
-
-                    // At finish, flush buffered arguments BEFORE the finish chunk
-                    // so the client accumulates complete args before seeing finish_reason.
-                    if has_finish {
-                        let mut indices: Vec<u32> = tool_arg_buf.keys().copied().collect();
-                        indices.sort();
-                        for idx in indices {
-                            if let Some(buf) = tool_arg_buf.remove(&idx) {
-                                if !buf.is_empty() {
-                                    let flush_chunk = ChatStreamChunk {
-                                        id: String::new(), // client ignores id on intermediate chunks
-                                        object: "chat.completion.chunk".to_string(),
-                                        created: 0,
-                                        model: String::new(),
-                                        choices: vec![StreamChoice {
-                                            index: 0,
-                                            delta: StreamDelta {
-                                                role: None,
-                                                content: None,
-                                                tool_calls: Some(vec![ToolCallDelta {
-                                                    index: idx,
-                                                    id: None,
-                                                    call_type: None,
-                                                    function: Some(FunctionCallDelta {
-                                                        name: None,
-                                                        arguments: Some(buf), // move, no clone
-                                                    }),
-                                                }]),
-                                                reasoning_content: None,
-                                            },
-                                            finish_reason: None,
-                                        }],
-                                        usage: None,
-                                        raw_data: None,
-                                    };
-                                    let data = serde_json::to_string(&flush_chunk).unwrap_or_default();
-                                    if tx.send(SseItem { event: Event::default().data(&data), json_data: data }).await.is_err() {
-                                        return;
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // Emit the original chunk (arguments already taken).
                     let data = serde_json::to_string(&chunk).unwrap_or_default();
                     if tx.send(SseItem { event: Event::default().data(&data), json_data: data }).await.is_err() {
                         return;
@@ -3876,8 +3797,8 @@ mod tests {
     };
     use axum::http::{HeaderMap, HeaderName, HeaderValue};
     use boom_core::types::{
-        ChatStream, ChatStreamChunk, MessageRole, PromptTokensDetails, StreamChoice,
-        StreamDelta, Usage,
+        ChatStream, ChatStreamChunk, FunctionCallDelta, MessageRole, PromptTokensDetails,
+        StreamChoice, StreamDelta, ToolCallDelta, Usage,
     };
     use boom_core::GatewayError;
     use futures::StreamExt;
@@ -4181,6 +4102,110 @@ mod tests {
         assert!(!items.is_empty());
         let last = items.last().unwrap();
         assert_eq!(last.json_data, "[DONE]");
+    }
+
+    #[tokio::test]
+    async fn stream_passes_tool_call_fragments_through_unaggregated() {
+        let tool_chunk = |args: &str, finish: Option<&str>| ChatStreamChunk {
+            id: "chatcmpl-test".to_string(),
+            object: "chat.completion.chunk".to_string(),
+            created: 0,
+            model: "test-model".to_string(),
+            choices: vec![StreamChoice {
+                index: 0,
+                delta: StreamDelta {
+                    role: None,
+                    content: None,
+                    tool_calls: Some(vec![ToolCallDelta {
+                        index: 0,
+                        id: None,
+                        call_type: None,
+                        function: Some(FunctionCallDelta {
+                            name: None,
+                            arguments: Some(args.to_string()),
+                        }),
+                    }]),
+                    reasoning_content: None,
+                },
+                finish_reason: finish.map(|s| s.to_string()),
+            }],
+            usage: None,
+            raw_data: None,
+        };
+
+        // Incremental fragments including a self-contained trailing fragment
+        // must be forwarded verbatim, in order — no buffering, no flush chunk.
+        let fragments = ["{\"na", "me\": \"get_", "weather\", \"city\": \"BJ\"}", "{}"];
+        let mut chunks: Vec<Result<ChatStreamChunk, GatewayError>> = fragments
+            .iter()
+            .map(|a| Ok(tool_chunk(a, None)))
+            .collect();
+        chunks.push(Ok(tool_chunk("", Some("tool_calls"))));
+
+        let stream: ChatStream = Box::pin(futures::stream::iter(chunks));
+        let sse = sse_stream_from_chat_stream(stream, UsageTracker::default());
+
+        let items: Vec<_> = sse.collect::<Vec<Result<_, Infallible>>>().await
+            .into_iter().map(|r| r.unwrap()).collect();
+        // N data chunks + [DONE]; no injected flush chunk.
+        assert_eq!(items.len(), fragments.len() + 2);
+
+        for (i, expected) in fragments.iter().enumerate() {
+            let chunk: ChatStreamChunk = serde_json::from_str(&items[i].json_data).unwrap();
+            let args = chunk.choices[0].delta.tool_calls.as_ref().unwrap()[0]
+                .function
+                .as_ref()
+                .unwrap()
+                .arguments
+                .as_deref()
+                .unwrap_or("");
+            assert_eq!(args, *expected, "fragment {} reordered or altered", i);
+        }
+        let finish_chunk: ChatStreamChunk = serde_json::from_str(&items[fragments.len()].json_data).unwrap();
+        assert_eq!(
+            finish_chunk.choices[0].finish_reason.as_deref(),
+            Some("tool_calls")
+        );
+        assert_eq!(items.last().unwrap().json_data, "[DONE]");
+    }
+
+    #[tokio::test]
+    async fn stream_preserves_chunk_order_and_count() {
+        let text_chunk = |content: &str| ChatStreamChunk {
+            id: "chatcmpl-test".to_string(),
+            object: "chat.completion.chunk".to_string(),
+            created: 0,
+            model: "test-model".to_string(),
+            choices: vec![StreamChoice {
+                index: 0,
+                delta: StreamDelta {
+                    role: None,
+                    content: Some(content.to_string()),
+                    tool_calls: None,
+                    reasoning_content: None,
+                },
+                finish_reason: None,
+            }],
+            usage: None,
+            raw_data: None,
+        };
+        let stream: ChatStream = Box::pin(futures::stream::iter(vec![
+            Ok(text_chunk("a")),
+            Ok(text_chunk("b")),
+            Ok(text_chunk("c")),
+            Ok(terminal_chunk()),
+        ]));
+        let sse = sse_stream_from_chat_stream(stream, UsageTracker::default());
+
+        let items: Vec<_> = sse.collect::<Vec<Result<_, Infallible>>>().await
+            .into_iter().map(|r| r.unwrap()).collect();
+        assert_eq!(items.len(), 5);
+        for (i, expected) in ["a", "b", "c", ""].iter().enumerate() {
+            let chunk: ChatStreamChunk = serde_json::from_str(&items[i].json_data).unwrap();
+            let content = chunk.choices[0].delta.content.as_deref().unwrap_or("");
+            assert_eq!(content, *expected);
+        }
+        assert_eq!(items.last().unwrap().json_data, "[DONE]");
     }
 
     #[tokio::test]
