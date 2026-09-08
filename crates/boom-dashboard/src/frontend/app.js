@@ -3581,7 +3581,8 @@
     return `<div class="form-group${opts.full ? " field-full" : ""}"><label for="${id}">${esc(label)}${fieldTipHTML(opts)}</label><input id="${id}" type="number" value="${esc(v)}" ${opts.min !== undefined ? `min="${opts.min}"` : ""} ${opts.step ? `step="${opts.step}"` : ""}></div>`;
   }
   function fieldCheckbox(id, label, checked, opts = {}) {
-    return `<div class="form-group field-checkbox"><input id="${id}" type="checkbox" ${checked ? "checked" : ""}><label for="${id}">${esc(label)}${fieldTipHTML(opts)}</label></div>`;
+    const note = opts.note ? `<div class="field-note-danger">${esc(opts.note)}</div>` : "";
+    return `<div class="form-group field-checkbox"><input id="${id}" type="checkbox" ${checked ? "checked" : ""}><label for="${id}">${esc(label)}${fieldTipHTML(opts)}</label>${note}</div>`;
   }
   function fieldSelect(id, label, options, selected, opts = {}) {
     const opts2 = options.map((o) => {
@@ -3692,7 +3693,7 @@
         ${fieldCheckbox("cfg-pl-enabled", t("config.field.enabled"), p.enabled)}
         ${fieldText("cfg-pl-dir", t("config.field.dir"), p.dir, { full: true })}
         ${fieldNum("cfg-pl-max-mb", t("config.field.max_file_size_mb"), p.max_file_size_mb, { min: 1 })}
-        ${fieldCheckbox("cfg-pl-capture", t("config.field.capture_raw_upstream"), p.capture_raw_upstream)}
+        ${fieldCheckbox("cfg-pl-capture", t("config.field.capture_raw_upstream"), p.capture_raw_upstream, { note: t("config.tip.capture_raw_upstream") })}
         ${fieldFullList("cfg-pl-excluded-keys", t("config.field.excluded_keys"), p.excluded_keys || [])}
         ${fieldFullList("cfg-pl-excluded-teams", t("config.field.excluded_teams"), p.excluded_teams || [])}
         ${fieldFullList("cfg-pl-record-headers", t("config.field.record_headers"), p.record_headers || [])}
