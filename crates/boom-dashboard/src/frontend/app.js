@@ -3593,8 +3593,8 @@
     return `<div class="form-group${opts.full ? " field-full" : ""}"><label for="${id}">${esc(label)}${fieldTipHTML(opts)}</label><input id="${id}" type="number" value="${esc(v)}" ${opts.min !== undefined ? `min="${opts.min}"` : ""} ${opts.step ? `step="${opts.step}"` : ""}></div>`;
   }
   function fieldCheckbox(id, label, checked, opts = {}) {
-    const note = opts.note ? `<div class="field-note-danger">${esc(opts.note)}</div>` : "";
-    return `<div class="form-group field-checkbox"><input id="${id}" type="checkbox" ${checked ? "checked" : ""}><label for="${id}">${esc(label)}${fieldTipHTML(opts)}</label>${note}</div>`;
+    const note = opts.note ? ` <span class="field-note-danger">${esc(opts.note)}</span>` : "";
+    return `<div class="form-group field-checkbox"><input id="${id}" type="checkbox" ${checked ? "checked" : ""}><label for="${id}">${esc(label)}${fieldTipHTML(opts)}${note}</label></div>`;
   }
   function fieldSelect(id, label, options, selected, opts = {}) {
     const opts2 = options.map((o) => {
