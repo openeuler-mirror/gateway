@@ -373,7 +373,7 @@ impl Provider for OpenAIProvider {
 
         tokio::spawn(async move {
             let mut stream = resp.bytes_stream();
-            let mut buffer = String::new();
+            let mut parser = crate::sse::SseParser::new();
 
             loop {
                 let chunk_result = tokio::select! {
@@ -381,47 +381,61 @@ impl Provider for OpenAIProvider {
                     chunk_result = stream.next() => chunk_result,
                 };
                 let Some(chunk_result) = chunk_result else {
-                    // Upstream ended. Flush any partial (unterminated) frame
-                    // so the raw capture shows exactly where truncation hit.
+                    // Upstream ended. Spec end-of-file handling: dispatch any
+                    // pending event, and flush leftover raw bytes so capture
+                    // shows exactly where truncation hit.
+                    let (events, leftover) = parser.finish();
+                    for event in events {
+                        if let Some(ref cap) = raw_capture {
+                            cap.push_response_frame(event.raw.clone());
+                        }
+                        let data = event.data.trim();
+                        if data.is_empty() || data == "[DONE]" {
+                            continue;
+                        }
+                        match serde_json::from_str::<ChatStreamChunk>(data) {
+                            Ok(mut chunk) => {
+                                chunk.raw_data = Some(data.to_string());
+                                if tx.send(Ok(Some(chunk))).await.is_err() {
+                                    return;
+                                }
+                            }
+                            Err(e) => tracing::warn!("Failed to parse SSE chunk: {}", e),
+                        }
+                    }
                     if let Some(ref cap) = raw_capture {
-                        if !buffer.is_empty() {
-                            cap.push_response_frame(std::mem::take(&mut buffer));
+                        if !leftover.is_empty() {
+                            cap.push_response_frame(leftover);
                         }
                     }
                     return;
                 };
                 match chunk_result {
                     Ok(bytes) => {
-                        buffer.push_str(&String::from_utf8_lossy(&bytes));
-                        // Process complete SSE lines.
-                        while let Some(pos) = buffer.find("\n\n") {
-                            let event_text = buffer[..pos].to_string();
-                            buffer = buffer[pos + 2..].to_string();
+                        for event in parser.push(&bytes) {
                             // Capture the raw frame before any parsing —
                             // keeps event:/data: prefixes and frames that
                             // fail JSON parse.
                             if let Some(ref cap) = raw_capture {
-                                cap.push_response_frame(event_text.clone());
+                                cap.push_response_frame(event.raw.clone());
                             }
-
-                            for line in event_text.lines() {
-                                if let Some(data) = line.strip_prefix("data: ") {
-                                    let data = data.trim();
-                                    if data == "[DONE]" {
-                                        let _ = tx.send(Ok(None)).await;
+                            let data = event.data.trim();
+                            if data.is_empty() {
+                                continue;
+                            }
+                            if data == "[DONE]" {
+                                let _ = tx.send(Ok(None)).await;
+                                return;
+                            }
+                            match serde_json::from_str::<ChatStreamChunk>(data) {
+                                Ok(mut chunk) => {
+                                    chunk.raw_data = Some(data.to_string());
+                                    if tx.send(Ok(Some(chunk))).await.is_err() {
                                         return;
                                     }
-                                    match serde_json::from_str::<ChatStreamChunk>(data) {
-                                        Ok(mut chunk) => {
-                                            chunk.raw_data = Some(data.to_string());
-                                            if tx.send(Ok(Some(chunk))).await.is_err() {
-                                                return;
-                                            }
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!("Failed to parse SSE chunk: {}", e);
-                                        }
-                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Failed to parse SSE chunk: {}", e);
                                 }
                             }
                         }
@@ -854,5 +868,274 @@ mod tests {
             Some("hi")
         );
         assert_eq!(chunks[1].usage.as_ref().unwrap().prompt_tokens, Some(5));
+    }
+
+    /// Regression: the SSE spec allows `data:{...}` without a space after the
+    /// colon, and a vLLM-fork upstream emits exactly that form (plus a
+    /// non-standard `name` field inside delta). The streaming parser used to
+    /// require `"data: "` and silently dropped every chunk — empty reply, no
+    /// error. Payload mirrors the real upstream shape.
+    #[tokio::test]
+    async fn chat_stream_data_prefix_without_space_parses() {
+        let sse = concat!(
+            "data:{\"choices\":[{\"delta\":{\"content\":\"<think>\\n\\nHere\",\"name\":\"\",\"role\":\"assistant\"},\"index\":0}],\"created\":2143545432432,\"id\":\"653624532443\",\"model\":\"Qwen3.6-35B-MLP\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":0,\"prompt_tokens\":0,\"total_tokens\":0}}\n\n",
+            "data:{\"choices\":[{\"delta\":{\"content\":\"lo\"},\"index\":0}],\"created\":2143545432432,\"id\":\"653624532443\",\"model\":\"Qwen3.6-35B-MLP\",\"object\":\"chat.completion.chunk\"}\n\n",
+            "data:{\"choices\":[],\"created\":2143545432432,\"id\":\"653624532443\",\"model\":\"Qwen3.6-35B-MLP\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":7,\"prompt_tokens\":5,\"total_tokens\":12}}\n\n",
+            "data:[DONE]\n\n",
+        );
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = provider_for(server.uri(), None);
+        let stream = provider.chat_stream(request_with_headers(&[])).await.expect("stream must start");
+        let chunks: Vec<_> = stream
+            .filter_map(|c| async move { c.ok() })
+            .collect()
+            .await;
+        assert_eq!(chunks.len(), 3, "no-space data: chunks must not be dropped");
+        assert_eq!(
+            chunks[0].choices[0].delta.content.as_deref(),
+            Some("<think>\n\nHere")
+        );
+        assert!(
+            matches!(
+                chunks[0].choices[0].delta.role,
+                Some(MessageRole::Assistant)
+            ),
+            "role must survive parsing"
+        );
+        assert_eq!(chunks[2].usage.as_ref().unwrap().total_tokens, Some(12));
+    }
+
+    /// Regression: the SSE spec allows CRLF framing, but the splitter only
+    /// understood "\n\n" — a CRLF-framed upstream would hang the whole
+    /// stream silently. CRLF frames must parse like LF ones.
+    #[tokio::test]
+    async fn chat_stream_crlf_framing_parses() {
+        let sse = "data: {\"id\":\"1\",\"created\":0,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"},\"finish_reason\":null}]}\r\n\r\ndata: [DONE]\r\n\r\n";
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = provider_for(server.uri(), None);
+        let stream = provider.chat_stream(request_with_headers(&[])).await.expect("stream must start");
+        let chunks: Vec<_> = stream
+            .filter_map(|c| async move { c.ok() })
+            .collect()
+            .await;
+        assert_eq!(chunks.len(), 1, "CRLF-framed chunk must not hang the stream");
+        assert_eq!(chunks[0].choices[0].delta.content.as_deref(), Some("hi"));
+    }
+
+    /// Regression: a closed role enum used to fail the chunk parse (silent
+    /// drop) on unknown roles like OpenAI's "developer". It must degrade to
+    /// MessageRole::Unknown instead.
+    #[tokio::test]
+    async fn chat_stream_unknown_role_degrades_instead_of_drop() {
+        let sse = concat!(
+            "data: {\"id\":\"1\",\"created\":0,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"developer\",\"content\":\"hi\"},\"finish_reason\":null}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = provider_for(server.uri(), None);
+        let stream = provider.chat_stream(request_with_headers(&[])).await.expect("stream must start");
+        let chunks: Vec<_> = stream
+            .filter_map(|c| async move { c.ok() })
+            .collect()
+            .await;
+        assert_eq!(chunks.len(), 1, "unknown-role chunk must not be dropped");
+        assert!(
+            matches!(chunks[0].choices[0].delta.role, Some(MessageRole::Unknown)),
+            "unknown role must degrade to MessageRole::Unknown"
+        );
+    }
+
+    /// Regression: tool_call deltas without `index` (single-call omission by
+    /// some backends) used to fail the chunk parse and silently drop the
+    /// tool call. Missing index must default to 0.
+    #[tokio::test]
+    async fn chat_stream_tool_call_delta_without_index_parses() {
+        let sse = concat!(
+            "data: {\"id\":\"1\",\"created\":0,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"f\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = provider_for(server.uri(), None);
+        let stream = provider.chat_stream(request_with_headers(&[])).await.expect("stream must start");
+        let chunks: Vec<_> = stream
+            .filter_map(|c| async move { c.ok() })
+            .collect()
+            .await;
+        assert_eq!(chunks.len(), 1, "index-less tool_call chunk must not be dropped");
+        let calls = chunks[0].choices[0].delta.tool_calls.as_ref().unwrap();
+        assert_eq!(calls[0].index, 0);
+        assert_eq!(calls[0].id.as_deref(), Some("call_1"));
+    }
+
+    /// Regression: `usage` present but with a null/missing member used to
+    /// fail the whole response parse. Must degrade to 0 instead.
+    #[tokio::test]
+    async fn chat_response_with_partial_or_null_usage_parses() {
+        let server = MockServer::start().await;
+        let body = serde_json::json!({
+            "id": "chatcmpl-test",
+            "model": "test-model",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "hi" },
+                "finish_reason": "stop"
+            }],
+            "usage": { "prompt_tokens": 5, "completion_tokens": null }
+        });
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = provider_for(server.uri(), None);
+        let resp = provider.chat(request_with_headers(&[])).await.expect("partial usage must not fail parsing");
+        let usage = resp.usage.expect("usage must be captured");
+        assert_eq!(usage.prompt_tokens, 5);
+        assert_eq!(usage.completion_tokens, 0);
+        assert_eq!(usage.total_tokens, 0);
+    }
+
+    /// Explicit nulls in identity fields must not fail the parse (serde
+    /// `default` only covers missing fields, not null).
+    #[tokio::test]
+    async fn chat_response_with_null_identity_fields_parses() {
+        let server = MockServer::start().await;
+        let body = serde_json::json!({
+            "id": null,
+            "object": null,
+            "created": null,
+            "model": null,
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "hi" },
+                "finish_reason": "stop"
+            }]
+        });
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body.to_string()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = provider_for(server.uri(), None);
+        let resp = provider.chat(request_with_headers(&[])).await.expect("null identity fields must not fail parsing");
+        assert_eq!(resp.id, "");
+        assert_eq!(resp.model, "");
+    }
+
+    /// An unknown role in a non-stream response must degrade to
+    /// MessageRole::Unknown instead of failing the whole parse.
+    #[tokio::test]
+    async fn chat_response_with_unknown_role_parses() {
+        let server = MockServer::start().await;
+        let body = serde_json::json!({
+            "id": "1",
+            "model": "m",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "developer", "content": "hi" },
+                "finish_reason": "stop"
+            }]
+        });
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = provider_for(server.uri(), None);
+        let resp = provider.chat(request_with_headers(&[])).await.expect("unknown role must not fail parsing");
+        assert!(matches!(resp.choices[0].message.role, MessageRole::Unknown));
+    }
+
+    /// Content parts with types the gateway doesn't model (audio, file, ...)
+    /// must be preserved verbatim instead of failing the whole response.
+    #[tokio::test]
+    async fn chat_response_with_unknown_content_part_is_preserved() {
+        let server = MockServer::start().await;
+        let audio_part = serde_json::json!({
+            "type": "input_audio",
+            "input_audio": { "data": "SGVsbG8=", "format": "wav" }
+        });
+        let body = serde_json::json!({
+            "id": "1",
+            "model": "m",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        { "type": "text", "text": "hi" },
+                        audio_part
+                    ]
+                },
+                "finish_reason": "stop"
+            }]
+        });
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body.to_string()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = provider_for(server.uri(), None);
+        let resp = provider.chat(request_with_headers(&[])).await.expect("unknown content part must not fail parsing");
+        let MessageContent::Parts(parts) = &resp.choices[0].message.content else {
+            panic!("expected parts content");
+        };
+        assert_eq!(parts.len(), 2);
+        let ContentPart::Unknown(raw) = &parts[1] else {
+            panic!("second part must be Unknown, got {:?}", parts[1]);
+        };
+        assert_eq!(*raw, audio_part, "unknown part must round-trip verbatim");
     }
 }

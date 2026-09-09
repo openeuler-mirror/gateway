@@ -100,6 +100,15 @@ impl GeminiProvider {
                         }]
                     }));
                 }
+                // Gemini only knows user/model roles; unknown roles from other
+                // dialects are conservatively passed as user.
+                MessageRole::Unknown => {
+                    let parts = Self::content_to_gemini_parts(&msg.content);
+                    contents.push(serde_json::json!({
+                        "role": "user",
+                        "parts": parts,
+                    }));
+                }
             }
         }
 
@@ -194,6 +203,9 @@ impl GeminiProvider {
                         // Gemini has no reasoning block — emit as text.
                         if reasoning.is_empty() { None } else { Some(serde_json::json!({"text": reasoning})) }
                     }
+                    // Gemini has no target shape for part types it doesn't
+                    // model — drop the part rather than fail the request.
+                    ContentPart::Unknown(_) => None,
                 })
                 .collect(),
             _ => Vec::new(),
@@ -404,7 +416,9 @@ impl Provider for GeminiProvider {
                             buffer = buffer[pos + 2..].to_string();
 
                             for line in event_text.lines() {
-                                if let Some(data) = line.strip_prefix("data: ") {
+                                // SSE spec allows "data:payload" without a space;
+                                // some upstreams always emit that form.
+                                if let Some(data) = line.strip_prefix("data:") {
                                     let data = data.trim();
                                     if let Ok(gemini_resp) =
                                         serde_json::from_str::<serde_json::Value>(data)
