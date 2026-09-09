@@ -1874,6 +1874,13 @@ td.kvc-prefix .kvc-sub { font-size: 11px; color: var(--text3); }
 .badge-active { background: var(--success-bg); color: var(--success); }
 .badge-blocked { background: var(--danger-bg); color: var(--danger); }
 .badge-plan { background: var(--primary-bg); color: var(--primary); }
+/* Visibility markers (🔒 private + team count / 🌐 public). Sit inline next
+   to model names in the models table, stats inflight table, and
+   request-rate chart cards. */
+.private-model-badge { margin-left: 6px; padding: 1px 7px; font-size: 10px; vertical-align: middle; white-space: nowrap; }
+.public-model-badge { margin-left: 6px; padding: 1px 7px; font-size: 10px; vertical-align: middle; white-space: nowrap; }
+.rb-chart-card__label .private-model-badge { margin-left: 4px; padding: 0 6px; }
+.rb-chart-card__label .public-model-badge { margin-left: 4px; padding: 0 6px; }
 .badge-plan-default {
   background: var(--surface3); color: var(--text-muted);
   font-weight: 500; margin-left: 6px; padding: 2px 7px; font-size: 10px;

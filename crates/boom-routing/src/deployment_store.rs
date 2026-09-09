@@ -7,6 +7,32 @@ use sqlx::Row;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+/// Unified per-model access-control state in memory. Derived from the
+/// `visibility` + `allowed_teams` DB columns (or the YAML equivalents) on
+/// every load path; see boom_config::ModelVisibility for the user-facing
+/// semantics of each variant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VisibilityState {
+    /// Default: normal permission rules (key/team whitelists).
+    Normal,
+    /// Accessible without any per-key permission configuration.
+    Public,
+    /// Only keys of the listed team_ids may access (empty = locked for all).
+    Private(Vec<String>),
+}
+
+impl From<(boom_config::ModelVisibility, Option<Vec<String>>)> for VisibilityState {
+    fn from((vis, teams): (boom_config::ModelVisibility, Option<Vec<String>>)) -> Self {
+        match vis {
+            boom_config::ModelVisibility::Normal => VisibilityState::Normal,
+            boom_config::ModelVisibility::Public => VisibilityState::Public,
+            boom_config::ModelVisibility::Private => {
+                VisibilityState::Private(teams.unwrap_or_default())
+            }
+        }
+    }
+}
+
 /// Per-model cost rates for billing/quota accounting.
 ///
 /// Stored separately from `DeploymentRow` because cost is metadata that
@@ -89,6 +115,11 @@ pub struct DeploymentStore {
     cost_rates: DashMap<String, ModelCostRate>,
     /// model_name → provider name for models whose candidate set is exclusive.
     exclusive_providers: DashMap<String, String>,
+    /// model_name → unified access-control state (see [`VisibilityState`]).
+    /// Absent = Normal. Mirrors the per-row `visibility` + `allowed_teams`
+    /// columns at model_name granularity: the newest row carrying a non-normal
+    /// visibility wins, and removal of a model's deployments clears the entry.
+    model_visibility: DashMap<String, VisibilityState>,
 }
 
 /// Full deployment row from boom_model_deployment table.
@@ -128,6 +159,13 @@ pub struct DeploymentRow {
     /// Mirrors ModelEntry.model_info. NULL for legacy rows.
     #[sqlx(default)]
     pub model_info: Option<serde_json::Value>,
+    /// Team ACL (JSONB array of team_ids). NULL unless visibility='private'.
+    /// Empty array = private but locked for all teams.
+    #[sqlx(default)]
+    pub allowed_teams: Option<serde_json::Value>,
+    /// Unified access-control state: 'normal' | 'public' | 'private'.
+    #[sqlx(default)]
+    pub visibility: Option<String>,
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
 }
@@ -166,6 +204,12 @@ pub struct DeploymentProviderRow {
     pub max_context_len: Option<i64>,
     #[sqlx(default)]
     pub model_info: Option<serde_json::Value>,
+    /// Team ACL (JSONB array of team_ids). NULL unless visibility='private'.
+    #[sqlx(default)]
+    pub allowed_teams: Option<serde_json::Value>,
+    /// Unified access-control state: 'normal' | 'public' | 'private'.
+    #[sqlx(default)]
+    pub visibility: Option<String>,
 }
 
 /// Minimal deployment row used by boom-main health monitor.
@@ -219,6 +263,8 @@ pub const DEPLOYMENT_CORE_COLUMNS: &[&str] = &[
     "client_type_header",
     "serve_not_match",
     "model_info",
+    "allowed_teams",
+    "visibility",
 ];
 
 /// Build an INSERT statement for `boom_model_deployment` from the canonical
@@ -238,6 +284,67 @@ fn deployment_insert_sql(source_literal: &'static str) -> String {
     )
 }
 
+/// Serialize a team ACL for the JSONB `allowed_teams` column.
+/// None is stored as SQL NULL; Some(list) as a JSON array.
+fn allowed_teams_json(teams: &Option<Vec<String>>) -> serde_json::Value {
+    match teams {
+        None => serde_json::Value::Null,
+        Some(list) => serde_json::json!(list),
+    }
+}
+
+/// Parse the JSONB `allowed_teams` column back into a team ACL.
+/// NULL / malformed → None. `[]` → Some(empty) = private, locked for all teams.
+pub fn parse_allowed_teams(value: &Option<serde_json::Value>) -> Option<Vec<String>> {
+    match value {
+        None => None,
+        Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::Array(arr)) => Some(
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect(),
+        ),
+        // Non-array garbage: treat as locked rather than guessing intent.
+        Some(_) => Some(Vec::new()),
+    }
+}
+
+/// `visibility` column value for a [`boom_config::ModelVisibility`].
+fn visibility_str(v: boom_config::ModelVisibility) -> &'static str {
+    match v {
+        boom_config::ModelVisibility::Normal => "normal",
+        boom_config::ModelVisibility::Public => "public",
+        boom_config::ModelVisibility::Private => "private",
+    }
+}
+
+/// Parse the `visibility` TEXT column. Unknown values fail safe to Normal.
+fn parse_visibility_str(s: &Option<String>) -> boom_config::ModelVisibility {
+    match s.as_deref() {
+        Some("public") => boom_config::ModelVisibility::Public,
+        Some("private") => boom_config::ModelVisibility::Private,
+        Some("normal") | None | Some(_) => boom_config::ModelVisibility::Normal,
+    }
+}
+
+/// Combine the `visibility` + `allowed_teams` DB columns into the in-memory
+/// state. Strictly trusts the visibility column — legacy rows written before
+/// the column existed are normalized by the DB migration instead, so a stale
+/// non-NULL allowed_teams on a 'normal' row cannot silently re-privatize a
+/// model the operator switched back to normal.
+pub fn visibility_from_db(
+    vis: &Option<String>,
+    allowed_teams: &Option<serde_json::Value>,
+) -> VisibilityState {
+    match parse_visibility_str(vis) {
+        boom_config::ModelVisibility::Public => VisibilityState::Public,
+        boom_config::ModelVisibility::Private => {
+            VisibilityState::Private(parse_allowed_teams(allowed_teams).unwrap_or_default())
+        }
+        boom_config::ModelVisibility::Normal => VisibilityState::Normal,
+    }
+}
+
 /// Canonical SELECT column list for full-row reads (`DeploymentRow`).
 /// Adds the DB-managed columns to `DEPLOYMENT_CORE_COLUMNS`.
 const DEPLOYMENT_ROW_SELECT_COLUMNS: &str = concat!(
@@ -246,7 +353,7 @@ const DEPLOYMENT_ROW_SELECT_COLUMNS: &str = concat!(
     "rpm, tpm, timeout, headers, temperature, max_tokens, enabled, auto_disabled, ",
     "source, deployment_id, quota_count_ratio, ",
     "max_inflight_queue_len, max_context_len, client_type_header, ",
-    "serve_not_match, model_info, ",
+    "serve_not_match, model_info, allowed_teams, visibility, ",
     "created_at, updated_at"
 );
 
@@ -256,7 +363,7 @@ const DEPLOYMENT_ROW_SELECT_COLUMNS: &str = concat!(
 /// statically verify the absence of `enabled IS NOT FALSE`. Putting the filter
 /// back here would silently turn "disable" into "delete" on the next
 /// `persist_config_in_place` → `sync_yaml_to_db` round-trip.
-const SNAPSHOT_DB_SQL: &str = "SELECT id, model_name, litellm_model, api_key, api_key_env, api_base, api_version, aws_region_name, aws_access_key_id, aws_secret_access_key, rpm, tpm, timeout, headers, temperature, max_tokens, enabled, auto_disabled, source, deployment_id, quota_count_ratio, max_inflight_queue_len, max_context_len, client_type_header, serve_not_match, model_info, created_at, updated_at FROM boom_model_deployment ORDER BY model_name, created_at";
+const SNAPSHOT_DB_SQL: &str = "SELECT id, model_name, litellm_model, api_key, api_key_env, api_base, api_version, aws_region_name, aws_access_key_id, aws_secret_access_key, rpm, tpm, timeout, headers, temperature, max_tokens, enabled, auto_disabled, source, deployment_id, quota_count_ratio, max_inflight_queue_len, max_context_len, client_type_header, serve_not_match, model_info, allowed_teams, visibility, created_at, updated_at FROM boom_model_deployment ORDER BY model_name, created_at";
 
 /// Input for creating/updating a deployment in DB.
 ///
@@ -288,6 +395,11 @@ pub struct DeploymentInput {
     pub client_type_header: bool,
     pub serve_not_match: bool,
     pub model_info: Option<serde_json::Value>,
+    /// Team ACL. Meaningful only when visibility = Private; None otherwise.
+    pub allowed_teams: Option<Vec<String>>,
+    /// Unified access-control state. Private consumes `allowed_teams`;
+    /// Normal/Public ignore it (and should carry None).
+    pub visibility: boom_config::ModelVisibility,
 }
 
 impl DeploymentStore {
@@ -298,6 +410,7 @@ impl DeploymentStore {
             quota_ratios: DashMap::new(),
             cost_rates: DashMap::new(),
             exclusive_providers: DashMap::new(),
+            model_visibility: DashMap::new(),
         }
     }
 
@@ -366,6 +479,51 @@ impl DeploymentStore {
         self.exclusive_providers.contains_key(model_name)
     }
 
+    /// Set the unified access-control state for a model. `Normal` clears the
+    /// entry (absent = Normal is the default state).
+    pub fn set_visibility(&self, model_name: &str, state: VisibilityState) {
+        match state {
+            VisibilityState::Normal => {
+                self.model_visibility.remove(model_name);
+            }
+            other => {
+                self.model_visibility.insert(model_name.to_string(), other);
+            }
+        }
+    }
+
+    /// Current access-control state of a model. Absent entries are Normal.
+    pub fn visibility(&self, model_name: &str) -> VisibilityState {
+        self.model_visibility
+            .get(model_name)
+            .map(|r| r.value().clone())
+            .unwrap_or(VisibilityState::Normal)
+    }
+
+    /// Whether the model is public (bypasses all per-key permission checks).
+    pub fn is_public_model(&self, model_name: &str) -> bool {
+        matches!(self.visibility(model_name), VisibilityState::Public)
+    }
+
+    /// Whether the model is private (team ACL governs access).
+    pub fn is_private_model(&self, model_name: &str) -> bool {
+        matches!(self.visibility(model_name), VisibilityState::Private(_))
+    }
+
+    /// Check whether a team_id is granted access to a model. For private
+    /// models this is the only authorization criterion (ACL membership).
+    /// Returns true for normal/public models — callers apply their own rules
+    /// for those states.
+    pub fn team_can_access(&self, model_name: &str, team_id: Option<&str>) -> bool {
+        match self.visibility(model_name) {
+            VisibilityState::Private(acl) => match team_id {
+                Some(tid) => acl.iter().any(|t| t == tid),
+                None => false,
+            },
+            VisibilityState::Normal | VisibilityState::Public => true,
+        }
+    }
+
     /// Remove all deployments for the given model name.
     /// Returns true if the model existed.
     pub fn remove_deployments(&self, model_name: &str) -> bool {
@@ -378,6 +536,7 @@ impl DeploymentStore {
             return false;
         }
         self.rr_counters.remove(model_name);
+        self.model_visibility.remove(model_name);
         self.deployments.remove(model_name).is_some()
     }
 
@@ -388,6 +547,7 @@ impl DeploymentStore {
         self.quota_ratios.clear();
         self.cost_rates.clear();
         self.exclusive_providers.clear();
+        self.model_visibility.clear();
     }
 
     /// Set the quota count ratio for a model.
@@ -556,6 +716,8 @@ impl DeploymentStore {
                 .bind(d.client_type_header)
                 .bind(d.serve_not_match)
                 .bind(d.model_info.as_ref().unwrap_or(&serde_json::Value::Null))
+                .bind(allowed_teams_json(&d.allowed_teams))
+                .bind(visibility_str(d.visibility))
                 .execute(pool)
                 .await?;
         }
@@ -568,7 +730,8 @@ impl DeploymentStore {
     pub async fn load_db_only_rows(pool: &sqlx::PgPool) -> Result<Vec<DeploymentProviderRow>, sqlx::Error> {
         sqlx::query_as::<_, DeploymentProviderRow>(
             r#"SELECT model_name, litellm_model, api_key, api_key_env, api_base, api_version,
-                      aws_region_name, timeout, headers, deployment_id, client_type_header
+                      aws_region_name, timeout, headers, deployment_id, client_type_header,
+                      allowed_teams, visibility
                FROM boom_model_deployment
                WHERE source = 'db' AND enabled IS NOT FALSE
                ORDER BY model_name, created_at"#,
@@ -615,7 +778,7 @@ impl DeploymentStore {
             r#"SELECT model_name, litellm_model, api_key, api_key_env, api_base, api_version,
                       aws_region_name, timeout, headers, deployment_id, client_type_header,
                       serve_not_match, quota_count_ratio, max_inflight_queue_len,
-                      max_context_len, model_info
+                      max_context_len, model_info, allowed_teams, visibility
                FROM boom_model_deployment
                WHERE model_name = $1 AND enabled IS NOT FALSE
                ORDER BY created_at"#,
@@ -635,7 +798,7 @@ impl DeploymentStore {
             r#"SELECT model_name, litellm_model, api_key, api_key_env, api_base, api_version,
                       aws_region_name, timeout, headers, deployment_id, client_type_header,
                       serve_not_match, quota_count_ratio, max_inflight_queue_len,
-                      max_context_len, model_info
+                      max_context_len, model_info, allowed_teams, visibility
                FROM boom_model_deployment
                WHERE serve_not_match = true AND enabled IS NOT FALSE
                ORDER BY created_at"#,
@@ -679,6 +842,8 @@ impl DeploymentStore {
             .bind(input.client_type_header)
             .bind(input.serve_not_match)
             .bind(input.model_info.as_ref().unwrap_or(&serde_json::Value::Null))
+            .bind(allowed_teams_json(&input.allowed_teams))
+            .bind(visibility_str(input.visibility))
             .fetch_one(pool)
             .await?;
 
@@ -708,6 +873,8 @@ impl DeploymentStore {
                    client_type_header = $22,
                    serve_not_match = $23,
                    model_info = COALESCE($24, model_info),
+                   allowed_teams = $25,
+                   visibility = $26,
                    updated_at = NOW()
                WHERE id = $1"#,
         )
@@ -735,6 +902,8 @@ impl DeploymentStore {
         .bind(input.client_type_header)
         .bind(input.serve_not_match)
         .bind(input.model_info.as_ref().unwrap_or(&serde_json::Value::Null))
+        .bind(allowed_teams_json(&input.allowed_teams))
+        .bind(visibility_str(input.visibility))
         .execute(pool)
         .await?;
 
@@ -870,7 +1039,9 @@ mod tests {
                 max_inflight_queue_len = $20, max_context_len = $21,
                 client_type_header = $22,
                 serve_not_match = $23,
-                model_info = COALESCE($24, model_info)
+                model_info = COALESCE($24, model_info),
+                allowed_teams = $25,
+                visibility = $26
         "#;
         for col in DEPLOYMENT_CORE_COLUMNS {
             let needle = format!(" {} ", col);
@@ -953,5 +1124,71 @@ mod tests {
         for col in DEPLOYMENT_CORE_COLUMNS {
             assert!(seen.insert(*col), "duplicate column `{}` in DEPLOYMENT_CORE_COLUMNS", col);
         }
+    }
+
+    /// Team ACL JSONB round-trip: None → NULL → None,
+    /// Some(teams) → array → Some(teams), Some(empty) → [] → Some(empty).
+    #[test]
+    fn allowed_teams_json_roundtrip() {
+        assert!(allowed_teams_json(&None).is_null());
+        assert_eq!(
+            parse_allowed_teams(&Some(allowed_teams_json(&None))),
+            None
+        );
+
+        let acl = Some(vec!["team-a".to_string(), "team-b".to_string()]);
+        let encoded = allowed_teams_json(&acl);
+        assert_eq!(parse_allowed_teams(&Some(encoded)), acl);
+
+        let locked = Some(Vec::<String>::new());
+        let encoded = allowed_teams_json(&locked);
+        assert_eq!(parse_allowed_teams(&Some(encoded)), locked);
+
+        // Non-array garbage fails closed: private with empty grant set.
+        assert_eq!(
+            parse_allowed_teams(&Some(serde_json::json!("oops"))),
+            Some(Vec::new())
+        );
+    }
+
+    /// visibility + allowed_teams columns combine into the in-memory state.
+    /// The DB loader strictly trusts the visibility column (legacy rows are
+    /// fixed by migration_add_visibility, not by inference here).
+    #[test]
+    fn visibility_from_db_combines_columns() {
+        use boom_config::ModelVisibility;
+
+        assert_eq!(
+            visibility_from_db(&Some("normal".into()), &None),
+            VisibilityState::Normal
+        );
+        assert_eq!(
+            visibility_from_db(&Some("public".into()), &None),
+            VisibilityState::Public
+        );
+        assert_eq!(
+            visibility_from_db(&Some("private".into()), &Some(serde_json::json!(["t1"]))),
+            VisibilityState::Private(vec!["t1".to_string()])
+        );
+        // private without an ACL list = locked for everyone.
+        assert_eq!(
+            visibility_from_db(&Some("private".into()), &None),
+            VisibilityState::Private(Vec::new())
+        );
+        // Stale allowed_teams on a normal row must NOT re-privatize.
+        assert_eq!(
+            visibility_from_db(&Some("normal".into()), &Some(serde_json::json!(["t1"]))),
+            VisibilityState::Normal
+        );
+        // Unknown value fails safe to normal.
+        assert_eq!(
+            visibility_from_db(&Some("garbage".into()), &None),
+            VisibilityState::Normal
+        );
+        assert_eq!(
+            visibility_from_db(&None, &None),
+            VisibilityState::Normal
+        );
+        assert_eq!(visibility_str(ModelVisibility::Public), "public");
     }
 }

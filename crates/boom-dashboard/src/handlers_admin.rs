@@ -1784,6 +1784,14 @@ pub struct CreateDeploymentRequest {
     /// When true, this deployment also serves as catch-all for unmatched model names.
     #[serde(default)]
     pub serve_not_match: bool,
+    /// Team ACL (meaningful only when visibility = "private"):
+    /// None = unset; Some(team_ids) = private, only keys of the listed teams
+    /// may access; Some([]) = locked for all teams.
+    #[serde(default)]
+    pub allowed_teams: Option<Vec<String>>,
+    /// Unified access-control state: "normal" | "public" | "private".
+    #[serde(default)]
+    pub visibility: Option<String>,
     /// Cost metadata (input/cached/output cost per million tokens).
     #[serde(default)]
     pub model_info: Option<serde_json::Value>,
@@ -1857,6 +1865,8 @@ pub async fn list_models(
                 "max_context_len": r.max_context_len,
                 "client_type_header": r.client_type_header.unwrap_or(false),
                 "serve_not_match": r.serve_not_match,
+                "allowed_teams": r.allowed_teams,
+                "visibility": r.visibility.clone().unwrap_or_else(|| "normal".to_string()),
                 "model_info": r.model_info,
                 "cost_per_million": {
                     "input": per_million(rate.input_cost_per_token),

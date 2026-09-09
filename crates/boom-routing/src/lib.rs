@@ -14,7 +14,7 @@ pub mod router;
 pub use alias_store::{AliasInput, AliasRow, AliasStore};
 pub use deployment_store::{
     DeploymentHealthTarget, DeploymentInput, DeploymentProviderRow, DeploymentRow, DeploymentStore,
-    ModelCostRate,
+    ModelCostRate, VisibilityState, parse_allowed_teams, visibility_from_db,
 };
 pub use fusion::{register_fusion_providers, FusionRuntime};
 pub use auto_router::{

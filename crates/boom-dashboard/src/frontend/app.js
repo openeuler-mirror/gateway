@@ -95,7 +95,46 @@
   }
 
   // Invalidate caches after mutations
-  function invalidateCaches() { cachedModelNames = null; cachedPlanNames = null; }
+  function invalidateCaches() { cachedModelNames = null; cachedPlanNames = null; cachedModelVis = null; }
+
+  // ── Model visibility badge ────────────────────────────
+  // model_name → { visibility, allowed_teams } from /admin/models rows,
+  // non-normal models only. Used by the stats and models pages to badge
+  // public (🌐) and private (🔒 + team count) deployments.
+  let cachedModelVis = null;
+
+  async function getModelVisibility() {
+    if (cachedModelVis) return cachedModelVis;
+    try {
+      const data = await api("/admin/models");
+      const map = {};
+      (data.models || []).forEach((m) => {
+        if (m.visibility && m.visibility !== "normal") {
+          map[m.model_name] = {
+            visibility: m.visibility,
+            allowed_teams: Array.isArray(m.allowed_teams) ? m.allowed_teams : [],
+          };
+        }
+      });
+      cachedModelVis = map;
+    } catch { cachedModelVis = {}; }
+    return cachedModelVis;
+  }
+
+  // Badge for non-normal models. `vis` accepts either the getModelVisibility
+  // map entry { visibility, allowed_teams } or a raw /admin/models row
+  // (visibility + allowed_teams fields); normal/absent → "".
+  function visibilityBadgeFor(vis) {
+    if (!vis || !vis.visibility || vis.visibility === "normal") return "";
+    if (vis.visibility === "public") {
+      return '<span class="badge badge-plan public-model-badge" title="'
+        + esc(t("models.public_model")) + '">🌐</span>';
+    }
+    const teams = Array.isArray(vis.allowed_teams) ? vis.allowed_teams : [];
+    return '<span class="badge badge-plan private-model-badge" title="'
+      + esc(t("models.private_teams", { n: teams.length })) + '">🔒 '
+      + teams.length + '</span>';
+  }
 
   // ── Init ──────────────────────────────────────────────
   document.addEventListener("DOMContentLoaded", () => {
@@ -820,14 +859,14 @@
 
   async function loadInflight() {
     try {
-      const data = await api("/admin/stats/inflight");
-      renderInflightTable(data);
+      const [data, vis] = await Promise.all([api("/admin/stats/inflight"), getModelVisibility()]);
+      renderInflightTable(data, vis);
     } catch (err) {
       console.error("loadInflight error:", err);
     }
   }
 
-  function renderInflightTable(data) {
+  function renderInflightTable(data, visMap) {
     const wrap = document.getElementById("inflight-table-wrap");
     var deployments = data.deployments || [];
 
@@ -876,7 +915,8 @@
             reqsHtml = '<span class="cell-tip" data-tip="' + reqItems.join("&#10;").replace(/"/g, "&quot;") + '">' + reqsDisplay + '</span>';
           }
 
-          var deployCell = renderDeployCell(d.model, d.deployment_id);
+          var deployCell = renderDeployCell(d.model, d.deployment_id)
+            + (visMap ? visibilityBadgeFor(visMap[d.model]) : "");
 
           // 24h aggregates — read from cache populated on page load / Refresh button.
           var s = d.deployment_id ? deployment24hSummary[d.deployment_id] : null;
@@ -1034,14 +1074,14 @@
   // ── Request Rate Charts ──────────────────────────────────
   async function loadRequestRateStats() {
     try {
-      const data = await api(buildStatsUrl("/admin/stats/request_rate", "rate"));
-      renderRequestRateCharts(data.charts || [], data.window);
+      const [data, vis] = await Promise.all([api(buildStatsUrl("/admin/stats/request_rate", "rate")), getModelVisibility()]);
+      renderRequestRateCharts(data.charts || [], data.window, vis);
     } catch (err) {
       console.error("loadRequestRateStats error:", err);
     }
   }
 
-  function renderRequestRateCharts(charts, window) {
+  function renderRequestRateCharts(charts, window, visMap) {
     const wrap = document.getElementById("request-rate-wrap");
     if (!wrap) return;
     setRangeWindowNote("rate", window && window.from, window && window.to);
@@ -1052,7 +1092,9 @@
       var events = chart.events || [];
       if (!events.length) return;
       var isTotal = chart.deployment_id === "_total" || chart.model === "ALL";
-      var label = isTotal ? t("stats.rate.all_models") : esc(chart.model);
+      var label = isTotal
+        ? t("stats.rate.all_models")
+        : esc(chart.model) + visibilityBadgeFor(visMap ? visMap[chart.model] : null);
       // Fixed segment order from the backend (alphabetical deployment_id).
       var segmentOrder = chart.deployments || [];
 
@@ -3197,8 +3239,10 @@
           aliasCell = '<button class="btn-small" onclick="window._showModelAliases(\'' + esc(m.model_name) + '\')">'
             + esc(t("models.aliases.view_detail", { n: aliases.length })) + '</button>';
         }
+        // Visibility badge on the model name cell: 🌐 public / 🔒 private + team count.
+        const visBadge = visibilityBadgeFor(m);
         return `<tr class="${rowClass}">
-        <td>${renderDeployCell(m.model_name, m.deployment_id)}</td>
+        <td>${renderDeployCell(m.model_name, m.deployment_id)} ${visBadge}</td>
         <td>${aliasCell}</td>
         <td class="mono">${esc(m.litellm_model)}</td>
         <td>${costCell}</td>
@@ -3227,6 +3271,10 @@
     const p = prefill || {};
     const headers = p.headers || {};
     const modelInfo = p.model_info || {};
+    // Unified visibility. Legacy rows without the field infer private from
+    // a non-null allowed_teams array.
+    const visVal = p.visibility || (Array.isArray(p.allowed_teams) ? "private" : "normal");
+    const allowedTeams = Array.isArray(p.allowed_teams) ? p.allowed_teams : null;
     const __html = `
       <h3>${p.id ? t("form.model.title_edit") : t("form.model.title_create")}</h3>
       <div class="form-grid">
@@ -3289,6 +3337,22 @@
           </div>
         </div>
         <div class="form-card">
+          <div class="form-card-title">${t("model_card.access")}</div>
+          <div class="form-card-grid">
+            <div class="form-group"><label>${t("form.model.visibility")} ${tip(t("tip.model.visibility"))}</label>
+              <select id="m-model-visibility">
+                <option value="normal" ${visVal === "normal" ? "selected" : ""}>${t("form.model.visibility_normal")}</option>
+                <option value="public" ${visVal === "public" ? "selected" : ""}>${t("form.model.visibility_public")}</option>
+                <option value="private" ${visVal === "private" ? "selected" : ""}>${t("form.model.visibility_private")}</option>
+              </select>
+            </div>
+            <div class="form-group field-full" id="m-model-allowed-teams-wrap" style="display:${visVal === "private" ? "" : "none"}">
+              <label>${t("form.model.allowed_teams")} ${tip(t("tip.model.allowed_teams"))}</label>
+              <div id="m-model-allowed-teams"></div>
+            </div>
+          </div>
+        </div>
+        <div class="form-card">
           <div class="form-card-title">${t("model_card.cost")}</div>
           <div class="form-card-grid">
             <div class="form-group field-full"><label>${t("form.model.cost_template")} ${tip(t("tip.model.cost_template"))}</label>
@@ -3321,6 +3385,31 @@
     };
     syncAwsCard();
     providerSel.addEventListener("change", syncAwsCard);
+    // Visibility select: show/hide the team ACL multi-select (private only).
+    const visSel = document.getElementById("m-model-visibility");
+    const teamsWrap = document.getElementById("m-model-allowed-teams-wrap");
+    const syncPrivateCard = () => {
+      teamsWrap.style.display = visSel.value === "private" ? "" : "none";
+    };
+    visSel.addEventListener("change", syncPrivateCard);
+    // Populate the team ACL multi-select. Teams come from the quota-overview
+    // cache — same source as the key form's team dropdown. Reuses the
+    // mcc-* dropdown combo styles (plain multi-select, no "all" shortcut).
+    const populateModelTeams = async () => {
+      const container = document.getElementById("m-model-allowed-teams");
+      if (!container) return;
+      let teams = window._teams;
+      if (!teams) {
+        try {
+          const data = await api("/admin/quota/overview");
+          teams = data.teams || [];
+          window._teams = teams;
+        } catch { teams = []; }
+      }
+      const options = teams.map((tm) => ({ value: tm.team_id, label: tm.team_alias || tm.team_id }));
+      initPlainCombo(container, allowedTeams || [], options, t("model_card.teams_none_selected"), t("model_card.no_teams"));
+    };
+    populateModelTeams();
     document.getElementById("m-model-submit").addEventListener("click", async () => {
       try {
         const providerVal = document.getElementById("m-model-provider").value;
@@ -3358,6 +3447,13 @@
           enabled: document.getElementById("m-model-enabled").checked,
           serve_not_match: document.getElementById("m-model-serve-not-match").checked,
           client_type_header: document.getElementById("m-model-client-type").checked,
+          // Visibility drives the team ACL: only "private" submits a team
+          // array (empty = private but locked for everyone); normal/public
+          // submit null so stale ACLs can't linger.
+          visibility: visSel.value,
+          allowed_teams: visSel.value === "private"
+            ? Array.from(document.querySelectorAll("#m-model-allowed-teams .mcc-item input[type=checkbox]:checked")).map((c) => c.value)
+            : null,
           headers,
         };
         if (Object.keys(modelInfo).length > 0) body.model_info = modelInfo;
@@ -3618,12 +3714,8 @@
       <div class="form-card-grid">
         <div class="form-group"><label>${t("config.field.master_key")}</label><input value="${esc(masked(g.master_key))}" readonly style="opacity:.6"></div>
         <div class="form-group"><label>${t("config.field.database_url")}</label><input value="${esc(masked(g.database_url))}" readonly style="opacity:.6"></div>
-        ${fieldFullList("cfg-general-public-models", t("config.field.public_models"), g.public_models || [])}
       </div>
       <p class="modal-hint">${t("config.tip.master_key_readonly")}</p>
-      <div class="form-card-actions">
-        <button class="btn-primary btn-small" data-save="general">${t("action.save")}</button>
-      </div>
     </div>`;
   }
 
@@ -4143,8 +4235,6 @@
           port: numOr($("cfg-server-port"), 4000),
           workers: numOr($("cfg-server-workers"), 4),
         });
-      } else if (kind === "general") {
-        await saveConfigSection("general_settings.public_models", parseListInput($("cfg-general-public-models")));
       } else if (kind === "rate_limit") {
         const tpmRaw = $("cfg-rl-default-tpm").value;
         await saveConfigSection("rate_limit", {
@@ -6442,6 +6532,42 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
   // - "all-team-models" option: when checked, overrides to full access
   // - Individual model checkboxes for fine-grained control
   // - Shows currently selected models in a display area
+
+  /// Plain multi-select combo (mcc-* styles, no "all" shortcut option).
+  /// Used for team ACL selection on the model form. Selected values are read
+  /// back via container.querySelectorAll('.mcc-item input:checked').
+  /// `noneSelectedLabel` shows in the display when nothing is checked;
+  /// `emptyLabel` shows inside the dropdown when there are no options.
+  function initPlainCombo(container, selected, options, noneSelectedLabel, emptyLabel) {
+    const checked = new Set(selected || []);
+    const labelOf = (v) => { const o = options.find((x) => x.value === v); return o ? o.label : v; };
+    const displayText = () => {
+      const names = Array.from(container.querySelectorAll('.mcc-item input[type="checkbox"]:checked')).map((c) => labelOf(c.value));
+      return names.join(", ") || noneSelectedLabel;
+    };
+    container.classList.add("model-check-combo");
+    container.innerHTML = `
+      <div class="mcc-display">${esc([...checked].map(labelOf).join(", ") || noneSelectedLabel)}</div>
+      <div class="mcc-dropdown hidden">
+        ${options.map((o) => `<label class="mcc-item"><input type="checkbox" value="${esc(o.value)}" ${checked.has(o.value) ? "checked" : ""}> ${esc(o.label)} <span class="mono muted">${esc(o.value)}</span></label>`).join("")
+          || `<div class="mcc-item">${esc(emptyLabel)}</div>`}
+      </div>
+    `;
+    const display = container.querySelector(".mcc-display");
+    const dropdown = container.querySelector(".mcc-dropdown");
+    const cbs = container.querySelectorAll('.mcc-item input[type="checkbox"]');
+    display.addEventListener("click", (e) => {
+      e.stopPropagation();
+      document.querySelectorAll(".mcc-dropdown").forEach((d) => { if (d !== dropdown) d.classList.add("hidden"); });
+      dropdown.classList.toggle("hidden");
+    });
+    document.addEventListener("click", (e) => {
+      if (!container.contains(e.target)) dropdown.classList.add("hidden");
+    });
+    cbs.forEach((cb) => cb.addEventListener("change", () => {
+      display.textContent = displayText();
+    }));
+  }
 
   function initModelCombo(container, existingModels, allNames, isTeam = false) {
     const checked = new Set(existingModels || []);

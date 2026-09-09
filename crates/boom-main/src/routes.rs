@@ -675,7 +675,7 @@ async fn chat_completions_inner(
     }
 
     // 1. Model access check (deployment-aware, alias-aware).
-    check_model_access(identity, &req.model, &state.router, &inner.config.general_settings.public_models)
+    check_model_access(identity, &req.model, &state.router)
         .map_err(|e| {
             log_error(&state, &identity, &model, api_path, is_stream, start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()));
             GatewayErrorReply(e, false)
@@ -1217,16 +1217,21 @@ pub async fn list_models(
     auth: RequiredAuth,
 ) -> Result<Json<serde_json::Value>, GatewayErrorReply> {
     let identity = auth.identity();
-    let inner = state.inner.load();
 
     // Collect all visible model names (deployments + non-hidden aliases, excluding "*").
     let all_names = state.router.visible_model_names();
-    let public_models = &inner.config.general_settings.public_models;
 
     let visible: Vec<ModelInfo> = if identity.models.is_empty() {
-        // Unrestricted key — show all visible models.
+        // Unrestricted key — show all visible models except private ones
+        // (those require the key's team to be in the model's ACL).
         all_names
             .iter()
+            .filter(|name| {
+                let resolved = state.router.resolve_model(name).unwrap_or_else(|| name.to_string());
+                !state.router.is_private_model(name) && !state.router.is_private_model(&resolved)
+                    || state.router.team_can_access(name, identity.team_id.as_deref())
+                    || state.router.team_can_access(&resolved, identity.team_id.as_deref())
+            })
             .map(|name| ModelInfo {
                 id: name.clone(),
                 object: "model".to_string(),
@@ -1235,10 +1240,10 @@ pub async fn list_models(
             })
             .collect()
     } else {
-        // Restricted key — show models the key has access to + public_models.
+        // Restricted key — show models the key has access to + public models.
         all_names
             .iter()
-            .filter(|name| is_model_visible(name, &identity.models, &state.router, public_models))
+            .filter(|name| is_model_visible(name, &identity, &state.router))
             .map(|name| ModelInfo {
                 id: name.clone(),
                 object: "model".to_string(),
@@ -1264,18 +1269,21 @@ pub async fn get_model(
     Path(model_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, GatewayErrorReply> {
     let identity = auth.identity();
-    let inner = state.inner.load();
 
     // Collect all visible model names (same logic as list_models).
     let all_names = state.router.visible_model_names();
-    let public_models = &inner.config.general_settings.public_models;
 
     let is_accessible = if identity.models.is_empty() {
-        true // Unrestricted key — check existence only.
+        // Unrestricted key — everything except private models the key's team
+        // isn't authorized for.
+        let resolved = state.router.resolve_model(&model_id).unwrap_or_else(|| model_id.to_string());
+        !state.router.is_private_model(&model_id) && !state.router.is_private_model(&resolved)
+            || state.router.team_can_access(&model_id, identity.team_id.as_deref())
+            || state.router.team_can_access(&resolved, identity.team_id.as_deref())
     } else {
-        // Restricted key — check if model_id is in the accessible set (including public_models).
+        // Restricted key — check if model_id is in the accessible set (including public models).
         all_names.iter()
-            .filter(|name| is_model_visible(name, &identity.models, &state.router, public_models))
+            .filter(|name| is_model_visible(name, &identity, &state.router))
             .any(|name| name == &model_id)
     };
 
@@ -1596,19 +1604,25 @@ impl From<GatewayError> for GatewayErrorReply {
 // ============================================================
 
 /// Check if a model name should be visible to a restricted key.
-/// Considers: key whitelist, aliases, and public_models.
-fn is_model_visible(
-    name: &str,
-    key_models: &[String],
-    router: &Router,
-    public_models: &[String],
-) -> bool {
+/// Considers: key whitelist, aliases, model visibility (public/private),
+/// and the private-model team ACL (private models are visible only to keys
+/// of ACL teams).
+fn is_model_visible(name: &str, identity: &AuthIdentity, router: &Router) -> bool {
     // Public model — always visible.
-    if public_models.iter().any(|m| m == name)
-        || router.resolve_model(name).map_or(false, |target| public_models.iter().any(|m| m == &target))
-    {
+    if router.is_public_model(name) {
         return true;
     }
+    let resolved = router.resolve_model(name).unwrap_or_else(|| name.to_string());
+    if router.is_public_model(&resolved) {
+        return true;
+    }
+    // Private model (or an alias to one) — visible only to ACL teams.
+    if router.is_private_model(name) || router.is_private_model(&resolved) {
+        return identity.key_hash == "master"
+            || router.team_can_access(name, identity.team_id.as_deref())
+            || router.team_can_access(&resolved, identity.team_id.as_deref());
+    }
+    let key_models = &identity.models;
     // Direct match in key's allowed list.
     if key_models.iter().any(|m| m == name && m != "*") {
         return true;
@@ -1643,14 +1657,39 @@ fn check_model_access(
     identity: &AuthIdentity,
     model: &str,
     router: &Router,
-    public_models: &[String],
 ) -> Result<(), GatewayError> {
     // Public model — bypass all key-level whitelist checks.
     // Match both the requested name and its alias target (if any).
-    let is_public = public_models.iter().any(|m| m == model)
-        || router.resolve_model(model).map_or(false, |target| public_models.iter().any(|m| m == &target));
-    if is_public {
+    if router.is_public_model(model) {
         return Ok(());
+    }
+    let resolved = router.resolve_model(model).unwrap_or_else(|| model.to_string());
+    if router.is_public_model(&resolved) {
+        return Ok(());
+    }
+
+    // Private model (team ACL on the deployment). The ACL fully replaces the
+    // normal whitelist rules: an unrestricted key (empty models list) or a
+    // `*` wildcard does NOT grant access — only the key's team_id being in
+    // the ACL does. The master key (key_hash == "master", no team) bypasses.
+    // Check the alias target too, so an alias pointing at a private model
+    // cannot be used as a side door.
+    if router.is_private_model(model) || router.is_private_model(&resolved) {
+        if identity.key_hash == "master"
+            || router.team_can_access(model, identity.team_id.as_deref())
+            || router.team_can_access(&resolved, identity.team_id.as_deref())
+        {
+            tracing::debug!(
+                "check_model_access: key={:?}, model={}, result=allow (private model, team ACL)",
+                identity.key_name, model
+            );
+            return Ok(());
+        }
+        tracing::debug!(
+            "check_model_access: key={:?}, model={}, team={:?}, result=deny (private model, team not in ACL)",
+            identity.key_name, model, identity.team_id
+        );
+        return Err(GatewayError::ModelNotAllowed(model.to_string()));
     }
 
     // Unrestricted key
@@ -2944,7 +2983,7 @@ pub async fn messages(
     }
 
     // 1. Model access check (deployment-aware, alias-aware).
-    check_model_access(identity, &openai_req.model, &state.router, &inner.config.general_settings.public_models)
+    check_model_access(identity, &openai_req.model, &state.router)
         .map_err(|e| {
             log_error(&state, &identity, &model, "/v1/messages", is_stream, start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()));
             AnthropicErrorReply(e, is_stream)

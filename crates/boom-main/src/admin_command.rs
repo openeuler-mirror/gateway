@@ -1,6 +1,6 @@
 use boom_core::provider::Provider;
 use boom_dashboard::state::AdminCommand;
-use boom_routing::DeploymentStore;
+use boom_routing::{DeploymentStore, VisibilityState, visibility_from_db};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -249,6 +249,20 @@ mod tests {
     }
 }
 
+/// Parse the request's visibility string into the enum. System boundary —
+/// unknown values are rejected rather than silently treated as normal.
+fn parse_model_visibility(s: &Option<String>) -> Result<boom_config::ModelVisibility, String> {
+    match s.as_deref() {
+        None | Some("normal") => Ok(boom_config::ModelVisibility::Normal),
+        Some("public") => Ok(boom_config::ModelVisibility::Public),
+        Some("private") => Ok(boom_config::ModelVisibility::Private),
+        Some(other) => Err(format!(
+            "invalid visibility '{}': expected normal|public|private",
+            other
+        )),
+    }
+}
+
 async fn handle_create_model(
     state: &AppState,
     req: boom_dashboard::handlers_admin::CreateDeploymentRequest,
@@ -256,6 +270,7 @@ async fn handle_create_model(
     ensure_not_workflow_model(state, &req.model_name)?;
     let db_pool = state.db_pool.as_ref().ok_or("Database not available")?;
     let headers_json = serde_json::to_value(&req.headers).unwrap_or(json!({}));
+    let visibility = parse_model_visibility(&req.visibility)?;
 
     let input = boom_routing::DeploymentInput {
         model_name: req.model_name.clone(),
@@ -281,6 +296,12 @@ async fn handle_create_model(
         client_type_header: req.client_type_header,
         serve_not_match: req.serve_not_match,
         model_info: req.model_info.clone(),
+        allowed_teams: if visibility == boom_config::ModelVisibility::Private {
+            req.allowed_teams.clone()
+        } else {
+            None
+        },
+        visibility,
     };
 
     let id = DeploymentStore::create_db(db_pool, &input)
@@ -305,6 +326,7 @@ async fn handle_update_model(
     ensure_not_workflow_model(state, &req.model_name)?;
     let db_pool = state.db_pool.as_ref().ok_or("Database not available")?;
     let headers_json = serde_json::to_value(&req.headers).unwrap_or(json!({}));
+    let visibility = parse_model_visibility(&req.visibility)?;
 
     let input = boom_routing::DeploymentInput {
         model_name: req.model_name.clone(),
@@ -330,6 +352,12 @@ async fn handle_update_model(
         client_type_header: req.client_type_header,
         serve_not_match: req.serve_not_match,
         model_info: req.model_info.clone(),
+        allowed_teams: if visibility == boom_config::ModelVisibility::Private {
+            req.allowed_teams.clone()
+        } else {
+            None
+        },
+        visibility,
     };
 
     let updated = DeploymentStore::update_db(db_pool, id, &input)
@@ -436,6 +464,20 @@ pub async fn reload_model_deployments(state: &AppState, model_name: &str) {
             providers.push(p);
         }
     }
+
+    // Visibility at model_name granularity: the newest non-normal row wins
+    // (rows are ordered by created_at) — same convention as the quota-ratio
+    // derivation below.
+    let vis = rows
+        .iter()
+        .rev()
+        .find_map(|r| match visibility_from_db(&r.visibility, &r.allowed_teams) {
+            VisibilityState::Normal => None,
+            other => Some(other),
+        });
+    state
+        .deployment_store
+        .set_visibility(model_name, vis.unwrap_or(VisibilityState::Normal));
 
     // Always set (even empty) so resolve_candidates can distinguish
     // "configured but all down" from "never configured". An empty provider

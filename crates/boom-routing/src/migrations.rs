@@ -38,6 +38,28 @@ ALTER TABLE boom_model_deployment ADD COLUMN IF NOT EXISTS auto_disabled BOOLEAN
 "#
 }
 
+/// Migration: add allowed_teams column (team ACL for private models).
+/// NULL = public pool (normal permission rules); JSONB array = private model
+/// accessible only to keys of the listed team_ids; empty array = locked for
+/// all teams. Default NULL keeps every existing deployment public.
+pub fn migration_add_allowed_teams() -> &'static str {
+    r#"
+ALTER TABLE boom_model_deployment ADD COLUMN IF NOT EXISTS allowed_teams JSONB;
+"#
+}
+
+/// Migration: add the unified `visibility` column ('normal' | 'public' |
+/// 'private', default 'normal') and normalize legacy rows — deployments
+/// marked private via the pre-visibility `allowed_teams` marker are flipped
+/// to visibility='private'. Idempotent: the UPDATE's WHERE guard only
+/// matches rows that still need it.
+pub fn migration_add_visibility() -> &'static str {
+    r#"
+ALTER TABLE boom_model_deployment ADD COLUMN IF NOT EXISTS visibility TEXT NOT NULL DEFAULT 'normal';
+UPDATE boom_model_deployment SET visibility = 'private' WHERE allowed_teams IS NOT NULL AND visibility = 'normal';
+"#
+}
+
 /// DDL for boom_model_alias table.
 pub fn alias_ddl() -> &'static str {
     r#"
