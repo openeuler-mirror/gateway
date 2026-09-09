@@ -1816,12 +1816,16 @@ div[id$="-table-wrap"]:not(.bare) > table > thead:first-child > tr:first-child >
 }
 .mcc-dropdown.hidden { display: none; }
 .mcc-item {
-  display: flex; align-items: center; gap: 8px; padding: 7px 12px;
+  display: flex; align-items: center; gap: 8px; padding: 5px 12px;
   cursor: pointer; font-size: 13px; color: var(--text);
   transition: background var(--transition);
 }
 .mcc-item:hover { background: var(--surface2); }
-.mcc-item input[type="checkbox"] { margin: 0; cursor: pointer; accent-color: var(--primary); }
+.mcc-item input[type="checkbox"] { margin: 0; flex: 0 0 auto; cursor: pointer; accent-color: var(--primary); }
+/* Single-line compact rows: name truncates with ellipsis instead of
+   wrapping the checkbox onto its own line; the id stays right-aligned. */
+.mcc-item-name { flex: 1 1 auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mcc-item-id { flex: 0 0 auto; font-size: 11px; white-space: nowrap; opacity: .75; }
 .mcc-item-all { font-weight: 600; }
 .mcc-divider { height: 1px; background: var(--border); margin: 4px 0; }
 

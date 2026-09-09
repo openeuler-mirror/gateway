@@ -3289,6 +3289,22 @@
           </div>
         </div>
         <div class="form-card">
+          <div class="form-card-title">${t("model_card.access")}</div>
+          <div class="form-card-grid">
+            <div class="form-group"><label>${t("form.model.visibility")} ${tip(t("tip.model.visibility"))}</label>
+              <select id="m-model-visibility">
+                <option value="normal" ${visVal === "normal" ? "selected" : ""}>${t("form.model.visibility_normal")}</option>
+                <option value="public" ${visVal === "public" ? "selected" : ""}>${t("form.model.visibility_public")}</option>
+                <option value="private" ${visVal === "private" ? "selected" : ""}>${t("form.model.visibility_private")}</option>
+              </select>
+            </div>
+            <div class="form-group field-full" id="m-model-allowed-teams-wrap" style="display:${visVal === "private" ? "" : "none"}">
+              <label>${t("form.model.allowed_teams")} ${tip(t("tip.model.allowed_teams"))}</label>
+              <div id="m-model-allowed-teams"></div>
+            </div>
+          </div>
+        </div>
+        <div class="form-card">
           <div class="form-card-title">${t("model_card.auth")}</div>
           <div class="form-card-grid">
             <div class="form-group"><label>${t("form.model.api_key")} ${tip(t("tip.model.api_key"))}</label><input id="m-model-key" type="password" value="${esc(p.api_key || "")}" placeholder="sk-... or os.environ/VAR"></div>
@@ -3334,22 +3350,6 @@
           <div class="form-card-grid">
             <div class="form-group field-checkbox"><input id="m-model-serve-not-match" type="checkbox" ${p.serve_not_match ? "checked" : ""}><label for="m-model-serve-not-match">${t("form.model.serve_not_match")} ${tip(t("tip.model.serve_not_match"))}</label></div>
             <div class="form-group field-checkbox"><input id="m-model-client-type" type="checkbox" ${p.client_type_header ? "checked" : ""}><label for="m-model-client-type">${t("form.model.client_type_header")} ${tip(t("tip.model.client_type_header"))}</label></div>
-          </div>
-        </div>
-        <div class="form-card">
-          <div class="form-card-title">${t("model_card.access")}</div>
-          <div class="form-card-grid">
-            <div class="form-group"><label>${t("form.model.visibility")} ${tip(t("tip.model.visibility"))}</label>
-              <select id="m-model-visibility">
-                <option value="normal" ${visVal === "normal" ? "selected" : ""}>${t("form.model.visibility_normal")}</option>
-                <option value="public" ${visVal === "public" ? "selected" : ""}>${t("form.model.visibility_public")}</option>
-                <option value="private" ${visVal === "private" ? "selected" : ""}>${t("form.model.visibility_private")}</option>
-              </select>
-            </div>
-            <div class="form-group field-full" id="m-model-allowed-teams-wrap" style="display:${visVal === "private" ? "" : "none"}">
-              <label>${t("form.model.allowed_teams")} ${tip(t("tip.model.allowed_teams"))}</label>
-              <div id="m-model-allowed-teams"></div>
-            </div>
           </div>
         </div>
         <div class="form-card">
@@ -6549,7 +6549,7 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
     container.innerHTML = `
       <div class="mcc-display">${esc([...checked].map(labelOf).join(", ") || noneSelectedLabel)}</div>
       <div class="mcc-dropdown hidden">
-        ${options.map((o) => `<label class="mcc-item"><input type="checkbox" value="${esc(o.value)}" ${checked.has(o.value) ? "checked" : ""}> ${esc(o.label)} <span class="mono muted">${esc(o.value)}</span></label>`).join("")
+        ${options.map((o) => `<label class="mcc-item"><input type="checkbox" value="${esc(o.value)}" ${checked.has(o.value) ? "checked" : ""}><span class="mcc-item-name" title="${esc(o.label)}">${esc(o.label)}</span>${o.label !== o.value ? `<span class="mcc-item-id mono muted" title="${esc(o.value)}">${esc(o.value)}</span>` : ""}</label>`).join("")
           || `<div class="mcc-item">${esc(emptyLabel)}</div>`}
       </div>
     `;
