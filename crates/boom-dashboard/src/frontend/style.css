@@ -1816,16 +1816,25 @@ div[id$="-table-wrap"]:not(.bare) > table > thead:first-child > tr:first-child >
 }
 .mcc-dropdown.hidden { display: none; }
 .mcc-item {
-  display: flex; align-items: center; gap: 8px; padding: 5px 12px;
+  display: flex; align-items: center; gap: 8px; padding: 7px 12px;
   cursor: pointer; font-size: 13px; color: var(--text);
   transition: background var(--transition);
 }
 .mcc-item:hover { background: var(--surface2); }
-.mcc-item input[type="checkbox"] { margin: 0; flex: 0 0 auto; cursor: pointer; accent-color: var(--primary); }
-/* Single-line compact rows: name truncates with ellipsis instead of
-   wrapping the checkbox onto its own line; the id stays right-aligned. */
-.mcc-item-name { flex: 1 1 auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.mcc-item-id { flex: 0 0 auto; font-size: 11px; white-space: nowrap; opacity: .75; }
+.mcc-item input[type="checkbox"] { margin: 0; cursor: pointer; accent-color: var(--primary); }
+
+/* ── Team Picker (model form, private visibility) ───────── */
+/* Flat clickable team list — selected teams turn green. Replaced the
+   dropdown combo: no popup clipped by the modal fold, no checkbox
+   alignment issues. Compact inline-wrap rows. */
+.team-picker { display: flex; flex-wrap: wrap; gap: 4px 8px; padding: 8px 10px; background: var(--surface2); border: 1px solid var(--border); border-radius: var(--radius-sm); }
+.team-pick {
+  padding: 2px 6px; font-size: 12.5px; color: var(--text3); cursor: pointer;
+  user-select: none; white-space: nowrap; border-radius: 4px;
+  transition: color var(--transition), background var(--transition);
+}
+.team-pick:hover { color: var(--text); background: var(--surface3); }
+.team-pick.selected { color: var(--success); font-weight: 600; }
 .mcc-item-all { font-weight: 600; }
 .mcc-divider { height: 1px; background: var(--border); margin: 4px 0; }
 
@@ -1878,11 +1887,11 @@ td.kvc-prefix .kvc-sub { font-size: 11px; color: var(--text3); }
 .badge-active { background: var(--success-bg); color: var(--success); }
 .badge-blocked { background: var(--danger-bg); color: var(--danger); }
 .badge-plan { background: var(--primary-bg); color: var(--primary); }
-/* Visibility markers (🔒 private + team count / 🌐 public). Sit inline next
+/* Visibility text badges: yellow "Private" / blue "Public". Sit inline next
    to model names in the models table, stats inflight table, and
-   request-rate chart cards. */
-.private-model-badge { margin-left: 6px; padding: 1px 7px; font-size: 10px; vertical-align: middle; white-space: nowrap; }
-.public-model-badge { margin-left: 6px; padding: 1px 7px; font-size: 10px; vertical-align: middle; white-space: nowrap; }
+   request-rate chart cards. Private keeps the team count as tooltip. */
+.private-model-badge { margin-left: 6px; padding: 1px 7px; font-size: 10px; vertical-align: middle; white-space: nowrap; background: var(--warn-bg); color: var(--warn); }
+.public-model-badge { margin-left: 6px; padding: 1px 7px; font-size: 10px; vertical-align: middle; white-space: nowrap; background: var(--info-bg); color: var(--info); }
 .rb-chart-card__label .private-model-badge { margin-left: 4px; padding: 0 6px; }
 .rb-chart-card__label .public-model-badge { margin-left: 4px; padding: 0 6px; }
 .badge-plan-default {

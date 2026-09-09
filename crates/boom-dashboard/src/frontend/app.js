@@ -121,19 +121,19 @@
     return cachedModelVis;
   }
 
-  // Badge for non-normal models. `vis` accepts either the getModelVisibility
-  // map entry { visibility, allowed_teams } or a raw /admin/models row
-  // (visibility + allowed_teams fields); normal/absent → "".
+  // Text badge for non-normal models: yellow "Private" / blue "Public".
+  // `vis` accepts either the getModelVisibility map entry
+  // { visibility, allowed_teams } or a raw /admin/models row; normal/absent
+  // → "". Private keeps the team count as a hover tooltip.
   function visibilityBadgeFor(vis) {
     if (!vis || !vis.visibility || vis.visibility === "normal") return "";
     if (vis.visibility === "public") {
-      return '<span class="badge badge-plan public-model-badge" title="'
-        + esc(t("models.public_model")) + '">🌐</span>';
+      return '<span class="badge public-model-badge" title="'
+        + esc(t("models.public_model")) + '">' + esc(t("models.badge_public")) + '</span>';
     }
     const teams = Array.isArray(vis.allowed_teams) ? vis.allowed_teams : [];
-    return '<span class="badge badge-plan private-model-badge" title="'
-      + esc(t("models.private_teams", { n: teams.length })) + '">🔒 '
-      + teams.length + '</span>';
+    return '<span class="badge private-model-badge" title="'
+      + esc(t("models.private_teams", { n: teams.length })) + '">' + esc(t("models.badge_private")) + '</span>';
   }
 
   // ── Init ──────────────────────────────────────────────
@@ -3392,9 +3392,10 @@
       teamsWrap.style.display = visSel.value === "private" ? "" : "none";
     };
     visSel.addEventListener("change", syncPrivateCard);
-    // Populate the team ACL multi-select. Teams come from the quota-overview
-    // cache — same source as the key form's team dropdown. Reuses the
-    // mcc-* dropdown combo styles (plain multi-select, no "all" shortcut).
+    // Populate the team ACL picker. Teams come from the quota-overview
+    // cache — same source as the key form's team dropdown. Flat clickable
+    // list (selected = green) instead of a dropdown combo: no popup to
+    // clip against the modal fold, no checkbox alignment issues.
     const populateModelTeams = async () => {
       const container = document.getElementById("m-model-allowed-teams");
       if (!container) return;
@@ -3406,8 +3407,16 @@
           window._teams = teams;
         } catch { teams = []; }
       }
-      const options = teams.map((tm) => ({ value: tm.team_id, label: tm.team_alias || tm.team_id }));
-      initPlainCombo(container, allowedTeams || [], options, t("model_card.teams_none_selected"), t("model_card.no_teams"));
+      const selected = new Set(allowedTeams || []);
+      container.classList.add("team-picker");
+      container.innerHTML = teams.map((tm) => {
+        const label = tm.team_alias || tm.team_id;
+        const showId = label !== tm.team_id ? ` (${esc(tm.team_id)})` : "";
+        return `<span class="team-pick${selected.has(tm.team_id) ? " selected" : ""}" data-value="${esc(tm.team_id)}" title="${esc(tm.team_id)}">${esc(label)}${showId}</span>`;
+      }).join("") || `<span class="muted">${esc(t("model_card.no_teams"))}</span>`;
+      container.querySelectorAll(".team-pick").forEach((el) => {
+        el.addEventListener("click", () => el.classList.toggle("selected"));
+      });
     };
     populateModelTeams();
     document.getElementById("m-model-submit").addEventListener("click", async () => {
@@ -3452,7 +3461,7 @@
           // submit null so stale ACLs can't linger.
           visibility: visSel.value,
           allowed_teams: visSel.value === "private"
-            ? Array.from(document.querySelectorAll("#m-model-allowed-teams .mcc-item input[type=checkbox]:checked")).map((c) => c.value)
+            ? Array.from(document.querySelectorAll("#m-model-allowed-teams .team-pick.selected")).map((el) => el.dataset.value)
             : null,
           headers,
         };
@@ -6532,42 +6541,6 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
   // - "all-team-models" option: when checked, overrides to full access
   // - Individual model checkboxes for fine-grained control
   // - Shows currently selected models in a display area
-
-  /// Plain multi-select combo (mcc-* styles, no "all" shortcut option).
-  /// Used for team ACL selection on the model form. Selected values are read
-  /// back via container.querySelectorAll('.mcc-item input:checked').
-  /// `noneSelectedLabel` shows in the display when nothing is checked;
-  /// `emptyLabel` shows inside the dropdown when there are no options.
-  function initPlainCombo(container, selected, options, noneSelectedLabel, emptyLabel) {
-    const checked = new Set(selected || []);
-    const labelOf = (v) => { const o = options.find((x) => x.value === v); return o ? o.label : v; };
-    const displayText = () => {
-      const names = Array.from(container.querySelectorAll('.mcc-item input[type="checkbox"]:checked')).map((c) => labelOf(c.value));
-      return names.join(", ") || noneSelectedLabel;
-    };
-    container.classList.add("model-check-combo");
-    container.innerHTML = `
-      <div class="mcc-display">${esc([...checked].map(labelOf).join(", ") || noneSelectedLabel)}</div>
-      <div class="mcc-dropdown hidden">
-        ${options.map((o) => `<label class="mcc-item"><input type="checkbox" value="${esc(o.value)}" ${checked.has(o.value) ? "checked" : ""}><span class="mcc-item-name" title="${esc(o.label)}">${esc(o.label)}</span>${o.label !== o.value ? `<span class="mcc-item-id mono muted" title="${esc(o.value)}">${esc(o.value)}</span>` : ""}</label>`).join("")
-          || `<div class="mcc-item">${esc(emptyLabel)}</div>`}
-      </div>
-    `;
-    const display = container.querySelector(".mcc-display");
-    const dropdown = container.querySelector(".mcc-dropdown");
-    const cbs = container.querySelectorAll('.mcc-item input[type="checkbox"]');
-    display.addEventListener("click", (e) => {
-      e.stopPropagation();
-      document.querySelectorAll(".mcc-dropdown").forEach((d) => { if (d !== dropdown) d.classList.add("hidden"); });
-      dropdown.classList.toggle("hidden");
-    });
-    document.addEventListener("click", (e) => {
-      if (!container.contains(e.target)) dropdown.classList.add("hidden");
-    });
-    cbs.forEach((cb) => cb.addEventListener("change", () => {
-      display.textContent = displayText();
-    }));
-  }
 
   function initModelCombo(container, existingModels, allNames, isTeam = false) {
     const checked = new Set(existingModels || []);
