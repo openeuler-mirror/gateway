@@ -1824,10 +1824,27 @@ div[id$="-table-wrap"]:not(.bare) > table > thead:first-child > tr:first-child >
 .mcc-item input[type="checkbox"] { margin: 0; cursor: pointer; accent-color: var(--primary); }
 
 /* ── Team Picker (model form, private visibility) ───────── */
-/* Flat clickable team list — selected teams turn green. Replaced the
-   dropdown combo: no popup clipped by the modal fold, no checkbox
-   alignment issues. Compact inline-wrap rows. */
-.team-picker { display: flex; flex-wrap: wrap; gap: 4px 8px; padding: 8px 10px; background: var(--surface2); border: 1px solid var(--border); border-radius: var(--radius-sm); }
+/* Collapsed display box + bounded popup. Inside the popup, teams are
+   clickable text — selected ones turn green (no checkboxes), and the
+   popup scrolls internally so it never stretches the form. */
+.team-picker { position: relative; }
+.tp-display {
+  width: 100%; padding: 9px 12px; background: var(--surface2);
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  color: var(--text); cursor: pointer; font-size: 13px; min-height: 38px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  transition: border-color var(--transition);
+}
+.tp-display:hover { border-color: var(--primary); }
+.tp-list {
+  position: absolute; top: 100%; left: 0; right: 0; z-index: 100;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); margin-top: 2px;
+  box-shadow: var(--shadow-md); padding: 6px 8px;
+  display: flex; flex-wrap: wrap; gap: 4px 8px;
+  max-height: 220px; overflow-y: auto;
+}
+.tp-list.hidden { display: none; }
 .team-pick {
   padding: 2px 6px; font-size: 12.5px; color: var(--text3); cursor: pointer;
   user-select: none; white-space: nowrap; border-radius: 4px;

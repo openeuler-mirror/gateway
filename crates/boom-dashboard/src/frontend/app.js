@@ -3393,9 +3393,9 @@
     };
     visSel.addEventListener("change", syncPrivateCard);
     // Populate the team ACL picker. Teams come from the quota-overview
-    // cache — same source as the key form's team dropdown. Flat clickable
-    // list (selected = green) instead of a dropdown combo: no popup to
-    // clip against the modal fold, no checkbox alignment issues.
+    // cache — same source as the key form's team dropdown. Collapsed
+    // display box + bounded popup list; inside the popup, selection is
+    // green text (no checkboxes), so the list can never stretch the form.
     const populateModelTeams = async () => {
       const container = document.getElementById("m-model-allowed-teams");
       if (!container) return;
@@ -3408,14 +3408,39 @@
         } catch { teams = []; }
       }
       const selected = new Set(allowedTeams || []);
+      const labelOf = (v) => {
+        const tm = teams.find((x) => x.team_id === v);
+        return tm ? (tm.team_alias || tm.team_id) : v;
+      };
+      const displayText = () =>
+        Array.from(selected).map(labelOf).join(", ") || t("model_card.teams_none_selected");
       container.classList.add("team-picker");
-      container.innerHTML = teams.map((tm) => {
-        const label = tm.team_alias || tm.team_id;
-        const showId = label !== tm.team_id ? ` (${esc(tm.team_id)})` : "";
-        return `<span class="team-pick${selected.has(tm.team_id) ? " selected" : ""}" data-value="${esc(tm.team_id)}" title="${esc(tm.team_id)}">${esc(label)}${showId}</span>`;
-      }).join("") || `<span class="muted">${esc(t("model_card.no_teams"))}</span>`;
+      container.innerHTML = `
+        <div class="tp-display">${esc(displayText())}</div>
+        <div class="tp-list hidden">
+          ${teams.map((tm) => {
+            const label = tm.team_alias || tm.team_id;
+            const showId = label !== tm.team_id ? ` (${esc(tm.team_id)})` : "";
+            return `<span class="team-pick${selected.has(tm.team_id) ? " selected" : ""}" data-value="${esc(tm.team_id)}" title="${esc(tm.team_id)}">${esc(label)}${showId}</span>`;
+          }).join("") || `<span class="muted">${esc(t("model_card.no_teams"))}</span>`}
+        </div>
+      `;
+      const display = container.querySelector(".tp-display");
+      const list = container.querySelector(".tp-list");
+      display.addEventListener("click", (e) => {
+        e.stopPropagation();
+        list.classList.toggle("hidden");
+      });
+      document.addEventListener("click", (e) => {
+        if (!container.contains(e.target)) list.classList.add("hidden");
+      });
       container.querySelectorAll(".team-pick").forEach((el) => {
-        el.addEventListener("click", () => el.classList.toggle("selected"));
+        el.addEventListener("click", () => {
+          el.classList.toggle("selected");
+          if (el.classList.contains("selected")) selected.add(el.dataset.value);
+          else selected.delete(el.dataset.value);
+          display.textContent = displayText();
+        });
       });
     };
     populateModelTeams();
