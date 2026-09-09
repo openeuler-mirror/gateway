@@ -10,7 +10,7 @@
 use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Response, sse::{Event, Sse}},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -76,6 +76,12 @@ struct Args {
     /// keep benchmark logs clean.
     #[arg(long, default_value_t = false, env = "MOCK_DUMP_HEADERS")]
     dump_headers: bool,
+
+    /// Emit SSE frames as `data:{...}` with NO space after the colon —
+    /// simulates non-standard upstreams (some vLLM forks). Spec-legal, but
+    /// strict parsers that require `data: ` will break on it. Off by default.
+    #[arg(long, default_value_t = false)]
+    compact_sse: bool,
 }
 
 struct AppState {
@@ -276,12 +282,23 @@ async fn handle_any(
     if stream {
         let interval_ms = st.args.chunk_interval_ms;
         let ttft_ms = st.args.ttft_ms;
+        let compact_sse = st.args.compact_sse;
         let object_str = object_kind.to_string();
 
-        // Channel carries Event values; axum's Sse wraps the ReceiverStream.
+        // Channel carries pre-rendered SSE frames (raw bytes). axum's Event
+        // always renders `data: ` WITH a space, so the compact-sse mode
+        // (`data:{...}`, no space) must bypass it: frames are strings sent
+        // through a plain Body::from_stream with a manual content-type.
         // Buffer of 32 is enough to absorb client backpressure without
         // blocking the producer on every chunk.
-        let (tx, rx) = mpsc::channel::<Result<Event, std::convert::Infallible>>(32);
+        let (tx, rx) = mpsc::channel::<Result<String, std::convert::Infallible>>(32);
+        let frame = move |payload: serde_json::Value| -> String {
+            if compact_sse {
+                format!("data:{payload}\n\n")
+            } else {
+                format!("data: {payload}\n\n")
+            }
+        };
 
         tokio::spawn(async move {
             // Hold permit + inflight guard for the duration of the stream.
@@ -301,7 +318,7 @@ async fn handle_any(
                 "model": model,
                 "choices": [{"index":0,"delta":{"role":"assistant"},"logprobs":null,"finish_reason":null}]
             });
-            if tx.send(Ok(Event::default().json_data(first).unwrap())).await.is_err() {
+            if tx.send(Ok(frame(first))).await.is_err() {
                 return; // client disconnected
             }
 
@@ -326,7 +343,7 @@ async fn handle_any(
                 if interval_ms > 0 {
                     tokio::time::sleep(Duration::from_millis(interval_ms)).await;
                 }
-                if tx.send(Ok(Event::default().json_data(payload).unwrap())).await.is_err() {
+                if tx.send(Ok(frame(payload))).await.is_err() {
                     return;
                 }
             }
@@ -344,13 +361,21 @@ async fn handle_any(
                     "total_tokens": total_tokens
                 }
             });
-            let _ = tx.send(Ok(Event::default().json_data(final_payload).unwrap())).await;
+            let _ = tx.send(Ok(frame(final_payload))).await;
 
             // Closing sentinel (OpenAI convention).
-            let _ = tx.send(Ok(Event::default().data("[DONE]"))).await;
+            let done = if compact_sse {
+                "data:[DONE]\n\n"
+            } else {
+                "data: [DONE]\n\n"
+            };
+            let _ = tx.send(Ok(done.to_string())).await;
         });
 
-        Sse::new(ReceiverStream::new(rx)).into_response()
+        Response::builder()
+            .header("content-type", "text/event-stream")
+            .body(axum::body::Body::from_stream(ReceiverStream::new(rx)))
+            .unwrap()
     } else {
         if st.args.response_delay_ms > 0 {
             tokio::time::sleep(Duration::from_millis(st.args.response_delay_ms)).await;
