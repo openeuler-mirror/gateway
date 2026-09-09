@@ -3,6 +3,7 @@ pub mod azure;
 pub mod bedrock;
 pub mod gemini;
 pub mod openai;
+pub mod sse;
 
 use boom_core::provider::Provider;
 use boom_core::GatewayError;
