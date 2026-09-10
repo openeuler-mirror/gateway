@@ -1,8 +1,52 @@
 use crate::GatewayError;
 use futures::Stream;
+use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::pin::Pin;
+
+/// Lenient deserializers for upstream-facing types: OpenAI-compatible
+/// backends occasionally emit explicit `null`s or non-integer numbers for
+/// fields the gateway treats as load-bearing. `#[serde(default)]` alone only
+/// covers a *missing* field — an explicit `null` still fails the whole
+/// payload. These helpers cover both.
+mod lenient {
+    use serde::de::Error;
+    use serde::{Deserialize, Deserializer};
+
+    pub fn u32_lenient<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+        let v = serde_json::Value::deserialize(d)?;
+        match v {
+            serde_json::Value::Null => Ok(0),
+            serde_json::Value::Number(n) => {
+                let f = n.as_f64().unwrap_or(0.0);
+                Ok(f.max(0.0).min(u32::MAX as f64) as u32)
+            }
+            other => Err(Error::custom(format!("expected number, got {other}"))),
+        }
+    }
+
+    pub fn u64_lenient<'de, D: Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
+        let v = serde_json::Value::deserialize(d)?;
+        match v {
+            serde_json::Value::Null => Ok(0),
+            serde_json::Value::Number(n) => {
+                let f = n.as_f64().unwrap_or(0.0);
+                Ok(f.max(0.0).min(u64::MAX as f64) as u64)
+            }
+            other => Err(Error::custom(format!("expected number, got {other}"))),
+        }
+    }
+
+    pub fn string_lenient<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+        let v = serde_json::Value::deserialize(d)?;
+        match v {
+            serde_json::Value::Null => Ok(String::new()),
+            serde_json::Value::String(s) => Ok(s),
+            other => Err(Error::custom(format!("expected string, got {other}"))),
+        }
+    }
+}
 
 // ============================================================
 // Message Types (OpenAI-compatible)
@@ -15,6 +59,14 @@ pub enum MessageRole {
     User,
     Assistant,
     Tool,
+    /// Unknown roles from other OpenAI-compatible dialects (e.g. OpenAI's
+    /// newer "developer", legacy "function"). A closed enum here used to fail
+    /// the whole response parse (or silently drop the stream chunk) on such
+    /// values; degrading keeps the payload flowing, serialized back as
+    /// "unknown".
+    #[serde(rename = "unknown")]
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,18 +83,73 @@ impl Default for MessageContent {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
+#[derive(Debug, Clone)]
 pub enum ContentPart {
-    #[serde(rename = "text")]
     Text { text: String },
-    #[serde(rename = "image_url")]
     ImageUrl { image_url: ImageUrl },
     /// Carries Anthropic "thinking" content through the internal OpenAI-format pipeline.
     /// Non-Anthropic providers concatenate this as regular text; the Anthropic provider
     /// converts it back to a `{"type":"thinking"}` block.
-    #[serde(rename = "reasoning")]
     Reasoning { reasoning: String },
+    /// Content part with a type the gateway doesn't model (audio, file, ...).
+    /// The raw JSON is preserved verbatim and serialized back as-is: lossless
+    /// pass-through beats failing the whole payload on a closed type set.
+    /// (Serde is implemented by hand below — an internally-tagged derive has
+    /// no way to capture unmatched tags.)
+    Unknown(serde_json::Value),
+}
+
+impl Serialize for ContentPart {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            ContentPart::Text { text } => {
+                let mut map = serializer.serialize_map(Some(2))?;
+                map.serialize_entry("type", "text")?;
+                map.serialize_entry("text", text)?;
+                map.end()
+            }
+            ContentPart::ImageUrl { image_url } => {
+                let mut map = serializer.serialize_map(Some(2))?;
+                map.serialize_entry("type", "image_url")?;
+                map.serialize_entry("image_url", image_url)?;
+                map.end()
+            }
+            ContentPart::Reasoning { reasoning } => {
+                let mut map = serializer.serialize_map(Some(2))?;
+                map.serialize_entry("type", "reasoning")?;
+                map.serialize_entry("reasoning", reasoning)?;
+                map.end()
+            }
+            ContentPart::Unknown(raw) => raw.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ContentPart {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let v = serde_json::Value::deserialize(deserializer)?;
+        Ok(match v.get("type").and_then(|t| t.as_str()) {
+            Some("text") => ContentPart::Text {
+                text: v.get("text")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+            },
+            Some("image_url") => match v.get("image_url") {
+                Some(iu) => serde_json::from_value::<ImageUrl>(iu.clone())
+                    .map(|image_url| ContentPart::ImageUrl { image_url })
+                    .unwrap_or(ContentPart::Unknown(v)),
+                None => ContentPart::Unknown(v),
+            },
+            Some("reasoning") => ContentPart::Reasoning {
+                reasoning: v.get("reasoning")
+                    .and_then(|r| r.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+            },
+            _ => ContentPart::Unknown(v),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,15 +215,19 @@ impl Message {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
+    #[serde(default, deserialize_with = "lenient::string_lenient")]
     pub id: String,
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default, deserialize_with = "lenient::string_lenient")]
     pub call_type: String,
+    #[serde(default)]
     pub function: FunctionCall,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FunctionCall {
+    #[serde(default, deserialize_with = "lenient::string_lenient")]
     pub name: String,
+    #[serde(default, deserialize_with = "lenient::string_lenient")]
     pub arguments: String,
 }
 
@@ -214,6 +325,14 @@ pub struct ChatCompletionRequest {
     /// not in this core type. Not set by clients — set by the gateway after routing.
     #[serde(skip, default)]
     pub kv_cache_report_full: bool,
+    /// Raw capture side channel for prompt logging — set by the route layer
+    /// when `prompt_log.capture_raw_upstream` is enabled, taken out by the
+    /// provider at its send site to record the exact request/response bytes
+    /// exchanged with the upstream. Same serde-skip pattern as
+    /// `gateway_headers`: never parsed from client bodies (no spoofing),
+    /// never serialized into the upstream JSON.
+    #[serde(skip)]
+    pub raw_capture: Option<crate::provider::SharedRawCapture>,
 }
 
 // ============================================================
@@ -296,6 +415,7 @@ impl CompletionRequest {
             extra: self.extra,
             gateway_headers: HashMap::new(),
             kv_cache_report_full: false,
+            raw_capture: None,
         }
     }
 }
@@ -329,15 +449,16 @@ pub struct ToolFunction {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatCompletionResponse {
     /// Passthrough identity fields default to empty/0 when a non-standard
-    /// upstream omits them — they are never load-bearing for gateway logic,
-    /// and missing them must not fail the whole response parse.
-    #[serde(default)]
+    /// upstream omits them (or sends an explicit `null`) — they are never
+    /// load-bearing for gateway logic, and neither case must fail the whole
+    /// response parse.
+    #[serde(default, deserialize_with = "lenient::string_lenient")]
     pub id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient::string_lenient")]
     pub object: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient::u64_lenient")]
     pub created: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient::string_lenient")]
     pub model: String,
     pub choices: Vec<Choice>,
     /// None = upstream did not report usage (non-standard backend). Token
@@ -355,6 +476,7 @@ pub struct ChatCompletionResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Choice {
+    #[serde(default, deserialize_with = "lenient::u32_lenient")]
     pub index: u32,
     pub message: Message,
     pub finish_reason: Option<String>,
@@ -364,8 +486,15 @@ pub struct Choice {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Usage {
+    /// Aligned with the streaming StreamUsage leniency: a non-standard
+    /// backend that reports `usage` but omits/nulls one of these used to
+    /// fail the entire response parse — worse than reporting no usage at
+    /// all. Missing or null now counts as 0.
+    #[serde(default, deserialize_with = "lenient::u32_lenient")]
     pub prompt_tokens: u32,
+    #[serde(default, deserialize_with = "lenient::u32_lenient")]
     pub completion_tokens: u32,
+    #[serde(default, deserialize_with = "lenient::u32_lenient")]
     pub total_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_creation_input_tokens: Option<u32>,
@@ -396,15 +525,16 @@ pub type ChatStream = Pin<Box<dyn Stream<Item = Result<ChatStreamChunk, GatewayE
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatStreamChunk {
     /// Same leniency as ChatCompletionResponse: identity fields default when
-    /// missing; `choices` defaults to empty so usage-only final chunks from
-    /// non-standard upstreams still parse instead of being silently dropped.
-    #[serde(default)]
+    /// missing (or null); `choices` defaults to empty so usage-only final
+    /// chunks from non-standard upstreams still parse instead of being
+    /// silently dropped.
+    #[serde(default, deserialize_with = "lenient::string_lenient")]
     pub id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient::string_lenient")]
     pub object: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient::u64_lenient")]
     pub created: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient::string_lenient")]
     pub model: String,
     #[serde(default)]
     pub choices: Vec<StreamChoice>,
@@ -429,6 +559,7 @@ pub struct StreamUsage {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamChoice {
+    #[serde(default, deserialize_with = "lenient::u32_lenient")]
     pub index: u32,
     pub delta: StreamDelta,
     pub finish_reason: Option<String>,
@@ -450,6 +581,10 @@ pub struct StreamDelta {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCallDelta {
+    /// Some OpenAI-compatible backends omit `index` in tool_call deltas when
+    /// only one call is in flight (a well-known compatibility gap). Missing
+    /// it used to fail the chunk parse and silently drop the tool call.
+    #[serde(default, deserialize_with = "lenient::u32_lenient")]
     pub index: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,

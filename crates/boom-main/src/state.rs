@@ -7,7 +7,7 @@ use boom_kvindex::{TokenPrefixIndex};
 use boom_core::kv_event::KvIndexBackend;
 use boom_limiter::{PlanStore, RateLimitPlan, ScheduleSlot, SlidingWindowLimiter};
 use boom_flowcontrol::{FlowControlConfig, FlowController};
-use boom_routing::{register_fusion_providers, AliasStore, DeploymentStore, FusionRuntime, AutoRouter, InFlightTracker, KeyAffinityPolicy, MlServiceClient, RebalanceMoveTracker, RequestRateTracker, Router, RoundRobinPolicy, SchedulePolicy, StrategyRegistry, TierClassifier};
+use boom_routing::{register_fusion_providers, AliasStore, DeploymentStore, FusionRuntime, AutoRouter, InFlightTracker, KeyAffinityPolicy, MlServiceClient, RebalanceMoveTracker, RequestRateTracker, Router, RoundRobinPolicy, SchedulePolicy, StrategyRegistry, TierClassifier, VisibilityState, parse_allowed_teams, visibility_from_db};
 use boom_ctxaware::AgentStatsTracker;
 use boom_promptlog::PromptLogWriter;
 use boom_provider;
@@ -907,6 +907,21 @@ fn merge_runtime_sections(
         }
     }
 
+    // Strip the deprecated general_settings.public_models list. Visibility is
+    // exported per-model (model_list above) and the DB rows already carry
+    // visibility=public from the startup sync_yaml_to_db, so removing the
+    // legacy key here is a safe one-way migration — it never comes back.
+    if let Some(gs) = root
+        .get_mut("general_settings")
+        .and_then(|g| g.as_mapping_mut())
+    {
+        if gs.remove("public_models").is_some() {
+            tracing::info!(
+                "Stripped deprecated general_settings.public_models from YAML (superseded by per-model visibility)"
+            );
+        }
+    }
+
     Ok(())
 }
 
@@ -967,8 +982,33 @@ where
     }
 }
 
+/// Effective visibility for a YAML model entry after legacy inference:
+/// `general_settings.public_models` membership forces Public; an
+/// `allowed_teams` list without an explicit visibility infers Private
+/// (pre-visibility YAML format).
+fn effective_yaml_visibility(
+    entry: &boom_config::ModelEntry,
+    legacy_public: &std::collections::HashSet<&str>,
+) -> boom_config::ModelVisibility {
+    if legacy_public.contains(entry.model_name.as_str()) {
+        boom_config::ModelVisibility::Public
+    } else if entry.visibility == boom_config::ModelVisibility::Normal
+        && entry.allowed_teams.is_some()
+    {
+        boom_config::ModelVisibility::Private
+    } else {
+        entry.visibility
+    }
+}
+
 async fn sync_yaml_to_db(pool: &PgPool, config: &Config, plan_store: &Arc<PlanStore>) -> Result<(), sqlx::Error> {
     // ── Deployments (delegated to DeploymentStore) ──
+    let legacy_public: std::collections::HashSet<&str> = config
+        .general_settings
+        .public_models
+        .iter()
+        .map(|m| m.as_str())
+        .collect();
     let yaml_model_names: Vec<String> = config.model_list.iter()
         .map(|e| e.model_name.clone()).collect();
     let mut yaml_deployments: Vec<boom_routing::DeploymentInput> = Vec::new();
@@ -1006,6 +1046,8 @@ async fn sync_yaml_to_db(pool: &PgPool, config: &Config, plan_store: &Arc<PlanSt
             model_info: entry.model_info.as_ref().map(|mi| {
                 serde_json::to_value(mi).unwrap_or(serde_json::Value::Null)
             }),
+            allowed_teams: entry.allowed_teams.clone(),
+            visibility: effective_yaml_visibility(entry, &legacy_public),
         };
         yaml_deployments.push(d);
 
@@ -1067,6 +1109,12 @@ async fn load_db_only_deployments(
 
     let mut deployment_count = 0;
     for row in &rows {
+        // Visibility: newest non-normal row wins (rows are ordered by
+        // model_name, created_at). Normal clears the entry, so models whose
+        // visibility was switched back reset correctly.
+        let state = visibility_from_db(&row.visibility, &row.allowed_teams);
+        deployment_store.set_visibility(&row.model_name, state);
+
         let mut extra = std::collections::HashMap::new();
         if let Some(obj) = row.headers.as_object() {
             for (k, v) in obj {
@@ -1239,6 +1287,23 @@ pub(crate) fn cost_rate_from_model_info(
 fn build_deployments_from_config(config: &Config, deployment_store: &Arc<DeploymentStore>) {
     deployment_store.clear();
 
+    // Legacy general_settings.public_models: merge into the unified
+    // visibility state (Public) on matching deployments. Deprecated — the
+    // dashboard no longer edits this key; it disappears from YAML on the
+    // next persist once models carry visibility: public directly.
+    let legacy_public: std::collections::HashSet<&str> = config
+        .general_settings
+        .public_models
+        .iter()
+        .map(|m| m.as_str())
+        .collect();
+    if !legacy_public.is_empty() {
+        tracing::warn!(
+            count = legacy_public.len(),
+            "general_settings.public_models is deprecated; migrating entries to model visibility=public (remove the key from YAML)"
+        );
+    }
+
     for entry in &config.model_list {
         let p = &entry.litellm_params;
 
@@ -1256,6 +1321,16 @@ fn build_deployments_from_config(config: &Config, deployment_store: &Arc<Deploym
         let ratio = entry.model_info.as_ref()
             .and_then(|mi| mi.quota_count_ratio)
             .unwrap_or(1);
+
+        // Visibility applies at model_name granularity and is registered
+        // before the enabled check so a disabled-but-public/private model
+        // keeps its status — visibility filtering (list_models) consults
+        // the state even when no provider is routable.
+        let vis = effective_yaml_visibility(entry, &legacy_public);
+        deployment_store.set_visibility(
+            &entry.model_name,
+            VisibilityState::from((vis, entry.allowed_teams.clone())),
+        );
 
         // Skip provider creation for disabled deployments.
         if !entry.enabled {
@@ -1800,6 +1875,31 @@ async fn build_config_snapshot_value(pool: &PgPool) -> Result<serde_json::Value,
                     "client_type_header".into(),
                     serde_json::Value::Bool(true),
                 );
+            }
+
+            // ── Visibility + team ACL. Emit `visibility` only when non-normal
+            // so normal rows stay clean; `allowed_teams` only when private —
+            // Some([]) (locked) is emitted as an empty array, a distinct,
+            // intentional state. A stale allowed_teams on a normal row is NOT
+            // round-tripped (the visibility column is authoritative).
+            let vis_str = match r.visibility.as_deref() {
+                Some("public") => Some("public"),
+                Some("private") => Some("private"),
+                _ => None,
+            };
+            if let Some(v) = vis_str {
+                entry.as_object_mut().unwrap().insert(
+                    "visibility".into(),
+                    serde_json::Value::String(v.to_string()),
+                );
+            }
+            if vis_str == Some("private") {
+                if let Some(acl) = parse_allowed_teams(&r.allowed_teams) {
+                    entry.as_object_mut().unwrap().insert(
+                        "allowed_teams".into(),
+                        serde_json::json!(acl),
+                    );
+                }
             }
 
             // ── Enabled flag. Unlike the toggles above, ModelEntry.enabled

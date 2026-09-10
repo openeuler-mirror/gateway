@@ -215,15 +215,25 @@ impl AnthropicProvider {
                         MessageContent::Parts(parts) => {
                             let blocks: Vec<serde_json::Value> = parts
                                 .iter()
-                                .map(|p| match p {
+                                .filter_map(|p| match p {
                                     ContentPart::Text { text } => {
-                                        serde_json::json!({"type": "text", "text": text})
+                                        Some(serde_json::json!({"type": "text", "text": text}))
                                     }
                                     ContentPart::ImageUrl { image_url } => {
-                                        serde_json::json!({"type": "text", "text": image_url.url})
+                                        Some(serde_json::json!({"type": "text", "text": image_url.url}))
                                     }
                                     ContentPart::Reasoning { reasoning } => {
-                                        serde_json::json!({"type": "text", "text": reasoning})
+                                        Some(serde_json::json!({"type": "text", "text": reasoning}))
+                                    }
+                                    // The Anthropic protocol has no target shape for
+                                    // part types it doesn't model — dropping the part
+                                    // (warned) beats the previous hard parse failure.
+                                    ContentPart::Unknown(raw) => {
+                                        tracing::warn!(
+                                            "dropping unsupported content part type {:?} for Anthropic upstream",
+                                            raw.get("type").and_then(|t| t.as_str()).unwrap_or("?")
+                                        );
+                                        None
                                     }
                                 })
                                 .collect();
@@ -617,7 +627,7 @@ impl Provider for AnthropicProvider {
 
         tokio::spawn(async move {
             let mut stream = resp.bytes_stream();
-            let mut buffer = String::new();
+            let mut parser = crate::sse::SseParser::new();
             let response_id = generate_response_id();
             let created = now_timestamp();
 
@@ -629,33 +639,18 @@ impl Provider for AnthropicProvider {
             while let Some(chunk_result) = stream.next().await {
                 match chunk_result {
                     Ok(bytes) => {
-                        buffer.push_str(&String::from_utf8_lossy(&bytes));
-
-                        while let Some(pos) = buffer.find("\n\n") {
-                            let event_text = buffer[..pos].to_string();
-                            buffer = buffer[pos + 2..].to_string();
-
-                            let mut event_type = String::new();
-                            let mut data_str = String::new();
-
-                            for line in event_text.lines() {
-                                if let Some(val) = line.strip_prefix("event: ") {
-                                    event_type = val.trim().to_string();
-                                } else if let Some(val) = line.strip_prefix("data: ") {
-                                    data_str = val.trim().to_string();
-                                }
-                            }
-
+                        for event in parser.push(&bytes) {
+                            let data_str = event.data.trim();
                             if data_str.is_empty() {
                                 continue;
                             }
 
-                            let data: serde_json::Value = match serde_json::from_str(&data_str) {
+                            let data: serde_json::Value = match serde_json::from_str(data_str) {
                                 Ok(d) => d,
                                 Err(_) => continue,
                             };
 
-                            match event_type.as_str() {
+                            match event.event_type.as_str() {
                                 "content_block_start" => {
                                     let idx = data.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as u32;
                                     let block = data.get("content_block").unwrap_or(&serde_json::Value::Null);
@@ -989,6 +984,7 @@ mod tests {
             extra: Default::default(),
             gateway_headers,
             kv_cache_report_full: false,
+            raw_capture: None,
         }
     }
 
@@ -1086,5 +1082,91 @@ mod tests {
             !requests[0].headers.contains_key("x-gateway-priority"),
             "no x-gateway-priority header should be sent when gateway_headers is empty"
         );
+    }
+
+    /// Regression: the SSE spec allows `event:foo` / `data:foo` without a
+    /// space after the colon. The parser used to require the spaced form and
+    /// silently dropped every frame from such upstreams.
+    #[tokio::test]
+    async fn chat_stream_event_and_data_prefix_without_space_parses() {
+        let sse_body = concat!(
+            "event:message_start\ndata:{\"type\":\"message_start\",\"message\":{\"id\":\"msg_test\",\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}\n\n",
+            "event:content_block_delta\ndata:{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+            "event:message_delta\ndata:{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+            "event:message_stop\ndata:{\"type\":\"message_stop\"}\n\n",
+        );
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(sse_body)
+                    .insert_header("content-type", "text/event-stream"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = provider_for(server.uri(), None);
+        let req = request_with_gateway_headers(&[]);
+        let stream = provider.chat_stream(req).await.expect("stream must start");
+        use futures::StreamExt;
+        tokio::pin!(stream);
+        let mut saw_content = false;
+        while let Some(item) = stream.next().await {
+            if let Ok(chunk) = item {
+                if chunk
+                    .choices
+                    .iter()
+                    .any(|c| c.delta.content.as_deref() == Some("hi"))
+                {
+                    saw_content = true;
+                }
+            }
+        }
+        assert!(saw_content, "no-space event:/data: frames must not be dropped");
+    }
+
+    /// Regression: the SSE spec allows CRLF framing, but the splitter only
+    /// understood "\n\n" — a CRLF-framed upstream would hang the whole
+    /// stream silently.
+    #[tokio::test]
+    async fn chat_stream_crlf_framing_parses() {
+        let sse_body = concat!(
+            "event: content_block_delta\r\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\r\n\r\n",
+            "event: message_stop\r\n",
+            "data: {\"type\":\"message_stop\"}\r\n\r\n",
+        );
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(sse_body)
+                    .insert_header("content-type", "text/event-stream"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = provider_for(server.uri(), None);
+        let req = request_with_gateway_headers(&[]);
+        let stream = provider.chat_stream(req).await.expect("stream must start");
+        use futures::StreamExt;
+        tokio::pin!(stream);
+        let mut saw_content = false;
+        while let Some(item) = stream.next().await {
+            if let Ok(chunk) = item {
+                if chunk
+                    .choices
+                    .iter()
+                    .any(|c| c.delta.content.as_deref() == Some("hi"))
+                {
+                    saw_content = true;
+                }
+            }
+        }
+        assert!(saw_content, "CRLF-framed frames must not hang the stream");
     }
 }

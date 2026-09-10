@@ -87,6 +87,11 @@ pub fn model_deployment_fields() -> &'static [FieldMeta] {
                     label_key: "form.model.serve_not_match", tip_key: "tip.model.serve_not_match" },
         FieldMeta { field: "client_type_header", section: "behavior", input_type: "bool",
                     label_key: "form.model.client_type_header", tip_key: "tip.model.client_type_header" },
+        // ── access control ──
+        FieldMeta { field: "visibility", section: "access", input_type: "select",
+                    label_key: "form.model.visibility", tip_key: "tip.model.visibility" },
+        FieldMeta { field: "allowed_teams", section: "access", input_type: "team_list",
+                    label_key: "form.model.allowed_teams", tip_key: "tip.model.allowed_teams" },
         // ── cost ──
         FieldMeta { field: "model_info.cost_template", section: "cost", input_type: "select",
                     label_key: "form.model.cost_template", tip_key: "tip.model.cost_template" },
@@ -96,8 +101,9 @@ pub fn model_deployment_fields() -> &'static [FieldMeta] {
 /// Manifest for `general_settings.*` editable from the dashboard config page.
 pub fn general_settings_fields() -> &'static [FieldMeta] {
     &[
-        FieldMeta { field: "public_models", section: "general", input_type: "list",
-                    label_key: "config.field.public_models", tip_key: "tip.config.public_models" },
+        // `public_models` was removed: public access is now configured per
+        // model via `visibility: public` (ModelEntry.visibility). The YAML
+        // field still parses for backward compatibility but has no UI.
         // `master_key` and `database_url` are read-only on the UI (masked);
         // not exposed in the manifest of *editable* fields.
     ]
@@ -158,6 +164,7 @@ mod tests {
             "rpm", "tpm", "timeout", "headers", "temperature", "max_tokens",
             // ModelEntry (top-level)
             "model_name", "enabled", "serve_not_match", "client_type_header",
+            "allowed_teams", "visibility",
             // DB-derived
             "deployment_id", "api_key_env",
             // ModelInfo / FlowControlEntry (sub-fields exposed in UI)

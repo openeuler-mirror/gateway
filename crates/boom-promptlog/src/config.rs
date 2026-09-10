@@ -34,9 +34,12 @@ pub struct PromptLogConfig {
     pub dir: String,
     #[serde(default = "default_max_file_size")]
     pub max_file_size_mb: u64,
-    /// When true, record the raw upstream response (before any format conversion)
-    /// alongside the converted response. Only applies to endpoints that perform
-    /// format conversion (e.g., `/v1/messages` where OpenAI → Anthropic).
+    /// When true, record the raw gateway↔upstream exchange on every
+    /// Response-phase entry: `bg_request` (exact body the gateway assembled
+    /// and sent upstream) and `raw_response` (literal upstream body — SSE
+    /// frames joined for streaming, including upstream error bodies and
+    /// frames that failed parsing). Currently implemented by the OpenAI
+    /// provider; other providers record nothing for these fields.
     #[serde(default)]
     pub capture_raw_upstream: bool,
     #[serde(default)]

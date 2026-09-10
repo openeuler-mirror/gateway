@@ -350,6 +350,23 @@ pub struct FlowControlEntry {
     pub model_context_limit: Option<u64>,
 }
 
+/// Unified model visibility parameter. Mutually exclusive by construction —
+/// replaces the former pair of `general_settings.public_models` (global list)
+/// and the private-only `allowed_teams` marker.
+///
+/// - `Normal` (default): normal permission rules — key/team model whitelists,
+///   empty list = all public-pool models, `*` wildcard, etc.
+/// - `Public`: accessible without any per-key permission configuration.
+/// - `Private`: only keys of the teams listed in `allowed_teams` may access.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelVisibility {
+    #[default]
+    Normal,
+    Public,
+    Private,
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ModelEntry {
     pub model_name: String,
@@ -372,6 +389,19 @@ pub struct ModelEntry {
     /// otherwise. Default: false.
     #[serde(default)]
     pub client_type_header: bool,
+    /// Unified access-control state. See [`ModelVisibility`].
+    ///
+    /// Backward compatibility: entries written before this field existed that
+    /// carry `allowed_teams: [...]` but no `visibility` are inferred as
+    /// `Private` by the loader (the old semantic of that marker).
+    #[serde(default)]
+    pub visibility: ModelVisibility,
+    /// Team ACL — meaningful only when `visibility: private`. `Some(teams)`
+    /// grants access to keys of those team_ids; `Some([])` = locked for
+    /// everyone. Stored as team_id (stable), not team_alias. Ignored (and
+    /// should be absent) for normal/public models.
+    #[serde(default)]
+    pub allowed_teams: Option<Vec<String>>,
 }
 
 /// Provider params — compatible with litellm's `litellm_params` format.
@@ -496,9 +526,13 @@ pub struct GeneralSettings {
     /// set `store_model_in_db: true|false` parse without error.
     #[serde(default, alias = "store_model_in_db")]
     _legacy_store_model_in_db: bool,
-    /// Models accessible to ALL keys regardless of per-key model whitelist.
-    /// Add new universally-available models here instead of updating every key.
-    #[serde(default)]
+    /// DEPRECATED — superseded by per-model `visibility: public`
+    /// (see [`ModelVisibility`]). Kept for YAML backward compatibility: on
+    /// load, names here are merged into the matching deployments' Public
+    /// state (with a warning). No longer editable in the dashboard, and no
+    /// longer exported on config round-trip — edit the model's visibility
+    /// instead.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub public_models: Vec<String>,
 }
 

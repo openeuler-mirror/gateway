@@ -89,6 +89,22 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
     )
     .execute(&mut *conn)
     .await;
+    // Add allowed_teams column as JSONB team ACL (no-op if already present).
+    // NULL = public; JSONB array of team_ids = private; [] = locked.
+    let _ = sqlx::query(
+        boom_routing::migrations::migration_add_allowed_teams(),
+    )
+    .execute(&mut *conn)
+    .await;
+    // Add the unified visibility column + normalize legacy private rows.
+    // Multi-statement (ALTER + UPDATE) — MUST go through run_ddl_on_conn
+    // (raw_sql simple-query protocol). sqlx::query() uses the prepared
+    // protocol, which rejects multi-command strings; combined with the
+    // previous `let _ =` error-swallowing that left the column uncreated
+    // while every DeploymentRow SELECT referenced it ("visibility" does
+    // not exist). Propagates with `?` — startup should fail loudly when a
+    // hard-required column can't be added.
+    run_ddl_on_conn(&mut conn, boom_routing::migrations::migration_add_visibility()).await?;
     tracing::info!("Migration 2/7: done");
     tracing::info!("Migration 3/7: alias...");
     run_ddl_on_conn(&mut conn, boom_routing::migrations::alias_ddl()).await?;

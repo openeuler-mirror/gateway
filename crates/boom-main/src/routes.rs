@@ -44,6 +44,7 @@ fn write_prompt_log_error(
     headers: Option<&std::collections::HashMap<String, String>>,
     error: &GatewayError,
     prompt_trace: Option<&SharedProviderPromptTrace>,
+    raw_capture: Option<&boom_core::provider::SharedRawCapture>,
     start: Instant,
     trace_guard: Option<&mut boom_trace::TraceGuard>,
 ) {
@@ -75,14 +76,23 @@ fn write_prompt_log_error(
     state.prompt_log_writer.send(request_entry.clone());
 
     let mut response_entry = PromptLogEntry::new_response_from(&request_entry);
+    // Raw upstream exchange from the provider side channel (only exists
+    // when capture_raw_upstream is on). Covers upstream HTTP error bodies
+    // and parse failures uniformly.
+    if let Some(cap) = raw_capture {
+        response_entry.set_raw_exchange(cap.take_request_body(), cap.take_response_body());
+    }
     // Parse failures carry the raw upstream body — record it verbatim
     // (regardless of capture_raw_upstream) so non-standard upstreams are
     // diagnosable from the prompt log alone. Valid JSON bodies are stored
-    // as JSON; non-JSON bodies fall back to a string value.
-    if let Some(raw) = error.raw_upstream_body() {
-        let raw_value = serde_json::from_str::<serde_json::Value>(raw)
-            .unwrap_or_else(|_| serde_json::Value::String(raw.to_string()));
-        response_entry.set_raw_upstream_response(Arc::new(raw_value));
+    // as JSON; non-JSON bodies fall back to a string value. Skipped when
+    // the capture channel already provided the same bytes via raw_response.
+    if raw_capture.is_none() {
+        if let Some(raw) = error.raw_upstream_body() {
+            let raw_value = serde_json::from_str::<serde_json::Value>(raw)
+                .unwrap_or_else(|_| serde_json::Value::String(raw.to_string()));
+            response_entry.set_raw_upstream_response(Arc::new(raw_value));
+        }
     }
     response_entry.set_response(Arc::new(openai_error_body(error)));
     if let Some(trace) = prompt_trace {
@@ -563,6 +573,17 @@ async fn chat_completions_inner(
         &identity.key_hash,
         identity.team_id.as_deref(),
     );
+    // Raw exchange capture channel — handed to the provider via the request
+    // side channel; the provider records the exact bytes it sends/receives.
+    let prompt_log_raw_capture = if prompt_log_should
+        && state.prompt_log_writer.config().capture_raw_upstream
+    {
+        Some(std::sync::Arc::new(
+            boom_core::provider::RawCaptureChannel::default(),
+        ))
+    } else {
+        None
+    };
     let prompt_log_req_body = if prompt_log_should {
         serde_json::to_value(&req).ok().map(Arc::new)
     } else {
@@ -654,7 +675,7 @@ async fn chat_completions_inner(
     }
 
     // 1. Model access check (deployment-aware, alias-aware).
-    check_model_access(identity, &req.model, &state.router, &inner.config.general_settings.public_models)
+    check_model_access(identity, &req.model, &state.router)
         .map_err(|e| {
             log_error(&state, &identity, &model, api_path, is_stream, start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()));
             GatewayErrorReply(e, false)
@@ -859,6 +880,10 @@ async fn chat_completions_inner(
         None
     };
 
+    // Hand the raw capture channel to the provider (taken out at its send
+    // site; never serialized).
+    req.raw_capture = prompt_log_raw_capture.clone();
+
     // 4. Route to provider (streaming or non-streaming).
     if is_stream {
         let stream = match provider.chat_stream_with_context(req, provider_context).await {
@@ -881,6 +906,7 @@ async fn chat_completions_inner(
                     prompt_log_headers.as_ref(),
                     &e,
                     provider_prompt_trace.as_ref(),
+                    prompt_log_raw_capture.as_ref(),
                     start,
                     trace_guard.as_mut(),
                 );
@@ -979,17 +1005,24 @@ async fn chat_completions_inner(
                     sender,
                     prompt_entry,
                     sse_raw_data_extractor(),
-                    None,
                 );
-                // Provider-owned trace snapshot (fusion/KV-index/etc.) is
-                // injected into the Response-phase entry built on Drop —
-                // runs AFTER the inner stream's Drop so trace finalization
-                // side effects are visible to the snapshot.
-                if let Some(trace) = provider_prompt_trace.clone() {
+                // Provider-owned trace snapshot (fusion/KV-index/etc.) and the
+                // raw upstream exchange are injected into the Response-phase
+                // entry built on Drop — runs AFTER the inner stream's Drop so
+                // trace finalization side effects and the final captured
+                // frames are visible.
+                if provider_prompt_trace.is_some() || prompt_log_raw_capture.is_some() {
+                    let trace = provider_prompt_trace.clone();
+                    let raw_capture = prompt_log_raw_capture.clone();
                     prompt_logged = prompt_logged.with_entry_enricher(Arc::new(move |entry| {
-                        trace.finalize();
-                        if let Some(fusion) = trace.snapshot() {
-                            entry.set_fusion(fusion);
+                        if let Some(trace) = trace.as_ref() {
+                            trace.finalize();
+                            if let Some(fusion) = trace.snapshot() {
+                                entry.set_fusion(fusion);
+                            }
+                        }
+                        if let Some(cap) = raw_capture.as_ref() {
+                            entry.set_raw_exchange(cap.take_request_body(), cap.take_response_body());
                         }
                     }));
                 }
@@ -1026,6 +1059,7 @@ async fn chat_completions_inner(
                     prompt_log_headers.as_ref(),
                     &e,
                     provider_prompt_trace.as_ref(),
+                    prompt_log_raw_capture.as_ref(),
                     start,
                     trace_guard.as_mut(),
                 );
@@ -1147,6 +1181,9 @@ async fn chat_completions_inner(
                         response_entry.set_fusion(fusion);
                     }
                 }
+                if let Some(cap) = prompt_log_raw_capture.as_ref() {
+                    response_entry.set_raw_exchange(cap.take_request_body(), cap.take_response_body());
+                }
                 response_entry.set_status(200, duration_ms as u64);
                 let _ = sender.send(response_entry);
             }
@@ -1180,16 +1217,21 @@ pub async fn list_models(
     auth: RequiredAuth,
 ) -> Result<Json<serde_json::Value>, GatewayErrorReply> {
     let identity = auth.identity();
-    let inner = state.inner.load();
 
     // Collect all visible model names (deployments + non-hidden aliases, excluding "*").
     let all_names = state.router.visible_model_names();
-    let public_models = &inner.config.general_settings.public_models;
 
     let visible: Vec<ModelInfo> = if identity.models.is_empty() {
-        // Unrestricted key — show all visible models.
+        // Unrestricted key — show all visible models except private ones
+        // (those require the key's team to be in the model's ACL).
         all_names
             .iter()
+            .filter(|name| {
+                let resolved = state.router.resolve_model(name).unwrap_or_else(|| name.to_string());
+                !state.router.is_private_model(name) && !state.router.is_private_model(&resolved)
+                    || state.router.team_can_access(name, identity.team_id.as_deref())
+                    || state.router.team_can_access(&resolved, identity.team_id.as_deref())
+            })
             .map(|name| ModelInfo {
                 id: name.clone(),
                 object: "model".to_string(),
@@ -1198,10 +1240,10 @@ pub async fn list_models(
             })
             .collect()
     } else {
-        // Restricted key — show models the key has access to + public_models.
+        // Restricted key — show models the key has access to + public models.
         all_names
             .iter()
-            .filter(|name| is_model_visible(name, &identity.models, &state.router, public_models))
+            .filter(|name| is_model_visible(name, &identity, &state.router))
             .map(|name| ModelInfo {
                 id: name.clone(),
                 object: "model".to_string(),
@@ -1227,18 +1269,21 @@ pub async fn get_model(
     Path(model_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, GatewayErrorReply> {
     let identity = auth.identity();
-    let inner = state.inner.load();
 
     // Collect all visible model names (same logic as list_models).
     let all_names = state.router.visible_model_names();
-    let public_models = &inner.config.general_settings.public_models;
 
     let is_accessible = if identity.models.is_empty() {
-        true // Unrestricted key — check existence only.
+        // Unrestricted key — everything except private models the key's team
+        // isn't authorized for.
+        let resolved = state.router.resolve_model(&model_id).unwrap_or_else(|| model_id.to_string());
+        !state.router.is_private_model(&model_id) && !state.router.is_private_model(&resolved)
+            || state.router.team_can_access(&model_id, identity.team_id.as_deref())
+            || state.router.team_can_access(&resolved, identity.team_id.as_deref())
     } else {
-        // Restricted key — check if model_id is in the accessible set (including public_models).
+        // Restricted key — check if model_id is in the accessible set (including public models).
         all_names.iter()
-            .filter(|name| is_model_visible(name, &identity.models, &state.router, public_models))
+            .filter(|name| is_model_visible(name, &identity, &state.router))
             .any(|name| name == &model_id)
     };
 
@@ -1559,19 +1604,25 @@ impl From<GatewayError> for GatewayErrorReply {
 // ============================================================
 
 /// Check if a model name should be visible to a restricted key.
-/// Considers: key whitelist, aliases, and public_models.
-fn is_model_visible(
-    name: &str,
-    key_models: &[String],
-    router: &Router,
-    public_models: &[String],
-) -> bool {
+/// Considers: key whitelist, aliases, model visibility (public/private),
+/// and the private-model team ACL (private models are visible only to keys
+/// of ACL teams).
+fn is_model_visible(name: &str, identity: &AuthIdentity, router: &Router) -> bool {
     // Public model — always visible.
-    if public_models.iter().any(|m| m == name)
-        || router.resolve_model(name).map_or(false, |target| public_models.iter().any(|m| m == &target))
-    {
+    if router.is_public_model(name) {
         return true;
     }
+    let resolved = router.resolve_model(name).unwrap_or_else(|| name.to_string());
+    if router.is_public_model(&resolved) {
+        return true;
+    }
+    // Private model (or an alias to one) — visible only to ACL teams.
+    if router.is_private_model(name) || router.is_private_model(&resolved) {
+        return identity.key_hash == "master"
+            || router.team_can_access(name, identity.team_id.as_deref())
+            || router.team_can_access(&resolved, identity.team_id.as_deref());
+    }
+    let key_models = &identity.models;
     // Direct match in key's allowed list.
     if key_models.iter().any(|m| m == name && m != "*") {
         return true;
@@ -1606,14 +1657,39 @@ fn check_model_access(
     identity: &AuthIdentity,
     model: &str,
     router: &Router,
-    public_models: &[String],
 ) -> Result<(), GatewayError> {
     // Public model — bypass all key-level whitelist checks.
     // Match both the requested name and its alias target (if any).
-    let is_public = public_models.iter().any(|m| m == model)
-        || router.resolve_model(model).map_or(false, |target| public_models.iter().any(|m| m == &target));
-    if is_public {
+    if router.is_public_model(model) {
         return Ok(());
+    }
+    let resolved = router.resolve_model(model).unwrap_or_else(|| model.to_string());
+    if router.is_public_model(&resolved) {
+        return Ok(());
+    }
+
+    // Private model (team ACL on the deployment). The ACL fully replaces the
+    // normal whitelist rules: an unrestricted key (empty models list) or a
+    // `*` wildcard does NOT grant access — only the key's team_id being in
+    // the ACL does. The master key (key_hash == "master", no team) bypasses.
+    // Check the alias target too, so an alias pointing at a private model
+    // cannot be used as a side door.
+    if router.is_private_model(model) || router.is_private_model(&resolved) {
+        if identity.key_hash == "master"
+            || router.team_can_access(model, identity.team_id.as_deref())
+            || router.team_can_access(&resolved, identity.team_id.as_deref())
+        {
+            tracing::debug!(
+                "check_model_access: key={:?}, model={}, result=allow (private model, team ACL)",
+                identity.key_name, model
+            );
+            return Ok(());
+        }
+        tracing::debug!(
+            "check_model_access: key={:?}, model={}, team={:?}, result=deny (private model, team not in ACL)",
+            identity.key_name, model, identity.team_id
+        );
+        return Err(GatewayError::ModelNotAllowed(model.to_string()));
     }
 
     // Unrestricted key
@@ -2723,7 +2799,6 @@ fn sse_stream_from_chat_stream(
 ) -> impl futures::Stream<Item = Result<SseItem, Infallible>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<SseItem>(32);
     tokio::spawn(async move {
-        let mut tool_arg_buf: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
         let mut stream = std::pin::pin!(stream);
         loop {
             let result = tokio::select! {
@@ -2735,7 +2810,7 @@ fn sse_stream_from_chat_stream(
                 return;
             };
             match result {
-                Ok(mut chunk) => {
+                Ok(chunk) => {
                     if let Some(ref u) = chunk.usage {
                         if let Ok(mut g) = usage.lock() {
                             g.prompt_tokens = u.prompt_tokens;
@@ -2748,79 +2823,6 @@ fn sse_stream_from_chat_stream(
                         }
                     }
 
-                    let has_finish = chunk.choices.iter().any(|c| c.finish_reason.is_some());
-
-                    // Buffer tool_call arguments via take() — zero-copy, no clone.
-                    for choice in &mut chunk.choices {
-                        if let Some(ref mut tool_calls) = choice.delta.tool_calls {
-                            for tc in tool_calls.iter_mut() {
-                                let args_taken = tc.function.as_mut().and_then(|f| f.arguments.take());
-                                if let Some(args) = args_taken {
-                                    if !args.is_empty() {
-                                        // Fast path: incremental fragments almost never end with '}'.
-                                        // Skip the expensive JSON parse when the string clearly isn't
-                                        // a complete object.
-                                        let is_complete = args.starts_with('{')
-                                            && args.ends_with('}')
-                                            && serde_json::from_str::<serde_json::Value>(&args).is_ok();
-                                        let has_existing = tool_arg_buf.get(&tc.index).map_or(false, |e| !e.is_empty());
-
-                                        if is_complete && has_existing {
-                                            tool_arg_buf.insert(tc.index, args); // move, no clone
-                                        } else {
-                                            tool_arg_buf.entry(tc.index).or_default().push_str(&args);
-                                        }
-                                    }
-                                    // arguments already taken — chunk emits without them
-                                }
-                            }
-                        }
-                    }
-
-                    // At finish, flush buffered arguments BEFORE the finish chunk
-                    // so the client accumulates complete args before seeing finish_reason.
-                    if has_finish {
-                        let mut indices: Vec<u32> = tool_arg_buf.keys().copied().collect();
-                        indices.sort();
-                        for idx in indices {
-                            if let Some(buf) = tool_arg_buf.remove(&idx) {
-                                if !buf.is_empty() {
-                                    let flush_chunk = ChatStreamChunk {
-                                        id: String::new(), // client ignores id on intermediate chunks
-                                        object: "chat.completion.chunk".to_string(),
-                                        created: 0,
-                                        model: String::new(),
-                                        choices: vec![StreamChoice {
-                                            index: 0,
-                                            delta: StreamDelta {
-                                                role: None,
-                                                content: None,
-                                                tool_calls: Some(vec![ToolCallDelta {
-                                                    index: idx,
-                                                    id: None,
-                                                    call_type: None,
-                                                    function: Some(FunctionCallDelta {
-                                                        name: None,
-                                                        arguments: Some(buf), // move, no clone
-                                                    }),
-                                                }]),
-                                                reasoning_content: None,
-                                            },
-                                            finish_reason: None,
-                                        }],
-                                        usage: None,
-                                        raw_data: None,
-                                    };
-                                    let data = serde_json::to_string(&flush_chunk).unwrap_or_default();
-                                    if tx.send(SseItem { event: Event::default().data(&data), json_data: data }).await.is_err() {
-                                        return;
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // Emit the original chunk (arguments already taken).
                     let data = serde_json::to_string(&chunk).unwrap_or_default();
                     if tx.send(SseItem { event: Event::default().data(&data), json_data: data }).await.is_err() {
                         return;
@@ -2890,6 +2892,13 @@ pub async fn messages(
         identity.team_id.as_deref(),
     );
     let prompt_log_capture_raw = prompt_log_should && state.prompt_log_writer.config().capture_raw_upstream;
+    let prompt_log_raw_capture = if prompt_log_capture_raw {
+        Some(std::sync::Arc::new(
+            boom_core::provider::RawCaptureChannel::default(),
+        ))
+    } else {
+        None
+    };
     let prompt_log_req_body = if prompt_log_should {
         serde_json::to_value(&req).ok().map(Arc::new)
     } else {
@@ -2974,7 +2983,7 @@ pub async fn messages(
     }
 
     // 1. Model access check (deployment-aware, alias-aware).
-    check_model_access(identity, &openai_req.model, &state.router, &inner.config.general_settings.public_models)
+    check_model_access(identity, &openai_req.model, &state.router)
         .map_err(|e| {
             log_error(&state, &identity, &model, "/v1/messages", is_stream, start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()));
             AnthropicErrorReply(e, is_stream)
@@ -3152,16 +3161,35 @@ pub async fn messages(
         None
     };
 
+    // Hand the raw capture channel to the provider (taken out at its send
+    // site; never serialized).
+    openai_req.raw_capture = prompt_log_raw_capture.clone();
+
     // 4. Route to provider.
     if is_stream {
         let stream = match provider.chat_stream(openai_req).await {
             Ok(s) => s,
             Err(e) => {
                 log_error(&state, &identity, &model, "/v1/messages", true, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()));
+                write_prompt_log_error(
+                    &state,
+                    prompt_log_should,
+                    prompt_log_req_body.as_ref(),
+                    prompt_log_trace_id.clone(),
+                    &request_id,
+                    &identity,
+                    &model,
+                    "/v1/messages",
+                    true,
+                    &client_ip,
+                    prompt_log_headers.as_ref(),
+                    &e,
+                    None,
+                    prompt_log_raw_capture.as_ref(),
+                    start,
+                    trace_guard.as_mut(),
+                );
                 crate::health_monitor::record_request_failure(&state, &deployment_id, &e);
-                if let Some(g) = trace_guard.as_mut() {
-                    g.mark_error(e.to_string());
-                }
                 // plan_charge drops here without commit — no quota consumed.
                 return Err(AnthropicErrorReply(e, true));
             }
@@ -3170,13 +3198,7 @@ pub async fn messages(
         let _decision = plan_charge.commit();
         crate::health_monitor::reset_request_failure(&state, &deployment_id);
         let usage = UsageTracker::default();
-        // Create shared buffer for raw upstream SSE chunks (before Anthropic transcoding).
-        let raw_upstream_buf = if prompt_log_capture_raw {
-            Some(std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new())))
-        } else {
-            None
-        };
-        let sse_stream = sse_stream_from_anthropic_chat_stream(stream, model.clone(), usage.clone(), raw_upstream_buf.clone());
+        let sse_stream = sse_stream_from_anthropic_chat_stream(stream, model.clone(), usage.clone());
         let inflight_guard = if let Some(ref did) = deployment_id {
             InFlightGuard::new_for_deployment(state.inflight.clone(), &inflight_model, did, input_chars as u64)
         } else {
@@ -3251,7 +3273,14 @@ pub async fn messages(
                 // Request-phase fires immediately. Stream wrapper's Drop
                 // emits the Response-phase entry with assembled content.
                 let _ = sender.send(prompt_entry.clone());
-                let prompt_logged = PromptLogStream::new(logged, sender, prompt_entry, sse_anthropic_extractor(), raw_upstream_buf);
+                let mut prompt_logged = PromptLogStream::new(logged, sender, prompt_entry, sse_anthropic_extractor());
+                // Raw upstream exchange is injected on Drop — after the inner
+                // stream finished so all captured frames are visible.
+                if let Some(cap) = prompt_log_raw_capture.clone() {
+                    prompt_logged = prompt_logged.with_entry_enricher(Arc::new(move |entry| {
+                        entry.set_raw_exchange(cap.take_request_body(), cap.take_response_body());
+                    }));
+                }
                 let response = Sse::new(sse_item_to_event(prompt_logged)).keep_alive(KeepAlive::default());
                 return Ok(response.into_response());
             }
@@ -3268,10 +3297,25 @@ pub async fn messages(
             Ok(r) => r,
             Err(e) => {
                 log_error(&state, &identity, &model, "/v1/messages", false, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()));
+                write_prompt_log_error(
+                    &state,
+                    prompt_log_should,
+                    prompt_log_req_body.as_ref(),
+                    prompt_log_trace_id.clone(),
+                    &request_id,
+                    &identity,
+                    &model,
+                    "/v1/messages",
+                    false,
+                    &client_ip,
+                    prompt_log_headers.as_ref(),
+                    &e,
+                    None,
+                    prompt_log_raw_capture.as_ref(),
+                    start,
+                    trace_guard.as_mut(),
+                );
                 crate::health_monitor::record_request_failure(&state, &deployment_id, &e);
-                if let Some(g) = trace_guard.as_mut() {
-                    g.mark_error(e.to_string());
-                }
                 // plan_charge drops here without commit — no quota consumed.
                 return Err(AnthropicErrorReply(e, false));
             }
@@ -3350,9 +3394,8 @@ pub async fn messages(
         let anthropic_resp = openai_response_to_anthropic(&response);
 
         // Prompt log: emit Request-phase immediately, then Response-phase with
-        // the converted Anthropic response. Raw upstream bytes (when enabled)
-        // travel only on the Response-phase entry — the Request-phase entry's
-        // raw_upstream_response is None.
+        // the converted Anthropic response. The raw gateway→upstream exchange
+        // (when enabled) travels only on the Response-phase entry.
         if let Some(sender) = prompt_log_sender {
             if let Some(req_body) = prompt_log_req_body {
                 let request_entry = PromptLogEntry::new_request(
@@ -3370,15 +3413,8 @@ pub async fn messages(
                 );
                 let _ = sender.send(request_entry.clone());
                 let mut response_entry = PromptLogEntry::new_response_from(&request_entry);
-                if prompt_log_capture_raw {
-                    if let Some(ref raw) = response.raw_response {
-                        response_entry.set_raw_upstream_response(
-                            Arc::new(
-                                serde_json::from_str::<serde_json::Value>(raw)
-                                    .unwrap_or(serde_json::Value::String(raw.clone())),
-                            ),
-                        );
-                    }
+                if let Some(cap) = prompt_log_raw_capture.as_ref() {
+                    response_entry.set_raw_exchange(cap.take_request_body(), cap.take_response_body());
                 }
                 let resp_arc = Arc::new(serde_json::to_value(&anthropic_resp).unwrap_or(serde_json::Value::Null));
                 response_entry.set_response(resp_arc.clone());
@@ -3402,7 +3438,6 @@ fn sse_stream_from_anthropic_chat_stream(
     stream: ChatStream,
     model: String,
     usage: UsageTracker,
-    raw_upstream_sink: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
 ) -> impl futures::Stream<Item = Result<SseItem, Infallible>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<SseItem>(64);
 
@@ -3413,14 +3448,6 @@ fn sse_stream_from_anthropic_chat_stream(
         while let Some(result) = stream.next().await {
             match result {
                 Ok(chunk) => {
-                    // Capture raw upstream chunk before transcoding (if enabled).
-                    if let Some(ref sink) = raw_upstream_sink {
-                        if let Some(ref raw) = chunk.raw_data {
-                            if let Ok(mut guard) = sink.lock() {
-                                guard.push(raw.clone());
-                            }
-                        }
-                    }
                     // Extract usage from the chunk (OpenAI sends usage in the final chunk).
                     if let Some(ref u) = chunk.usage {
                         if let Ok(mut g) = usage.lock() {
@@ -3809,8 +3836,8 @@ mod tests {
     };
     use axum::http::{HeaderMap, HeaderName, HeaderValue};
     use boom_core::types::{
-        ChatStream, ChatStreamChunk, MessageRole, PromptTokensDetails, StreamChoice,
-        StreamDelta, Usage,
+        ChatStream, ChatStreamChunk, FunctionCallDelta, MessageRole, PromptTokensDetails,
+        StreamChoice, StreamDelta, ToolCallDelta, Usage,
     };
     use boom_core::GatewayError;
     use futures::StreamExt;
@@ -4114,6 +4141,110 @@ mod tests {
         assert!(!items.is_empty());
         let last = items.last().unwrap();
         assert_eq!(last.json_data, "[DONE]");
+    }
+
+    #[tokio::test]
+    async fn stream_passes_tool_call_fragments_through_unaggregated() {
+        let tool_chunk = |args: &str, finish: Option<&str>| ChatStreamChunk {
+            id: "chatcmpl-test".to_string(),
+            object: "chat.completion.chunk".to_string(),
+            created: 0,
+            model: "test-model".to_string(),
+            choices: vec![StreamChoice {
+                index: 0,
+                delta: StreamDelta {
+                    role: None,
+                    content: None,
+                    tool_calls: Some(vec![ToolCallDelta {
+                        index: 0,
+                        id: None,
+                        call_type: None,
+                        function: Some(FunctionCallDelta {
+                            name: None,
+                            arguments: Some(args.to_string()),
+                        }),
+                    }]),
+                    reasoning_content: None,
+                },
+                finish_reason: finish.map(|s| s.to_string()),
+            }],
+            usage: None,
+            raw_data: None,
+        };
+
+        // Incremental fragments including a self-contained trailing fragment
+        // must be forwarded verbatim, in order — no buffering, no flush chunk.
+        let fragments = ["{\"na", "me\": \"get_", "weather\", \"city\": \"BJ\"}", "{}"];
+        let mut chunks: Vec<Result<ChatStreamChunk, GatewayError>> = fragments
+            .iter()
+            .map(|a| Ok(tool_chunk(a, None)))
+            .collect();
+        chunks.push(Ok(tool_chunk("", Some("tool_calls"))));
+
+        let stream: ChatStream = Box::pin(futures::stream::iter(chunks));
+        let sse = sse_stream_from_chat_stream(stream, UsageTracker::default());
+
+        let items: Vec<_> = sse.collect::<Vec<Result<_, Infallible>>>().await
+            .into_iter().map(|r| r.unwrap()).collect();
+        // N data chunks + [DONE]; no injected flush chunk.
+        assert_eq!(items.len(), fragments.len() + 2);
+
+        for (i, expected) in fragments.iter().enumerate() {
+            let chunk: ChatStreamChunk = serde_json::from_str(&items[i].json_data).unwrap();
+            let args = chunk.choices[0].delta.tool_calls.as_ref().unwrap()[0]
+                .function
+                .as_ref()
+                .unwrap()
+                .arguments
+                .as_deref()
+                .unwrap_or("");
+            assert_eq!(args, *expected, "fragment {} reordered or altered", i);
+        }
+        let finish_chunk: ChatStreamChunk = serde_json::from_str(&items[fragments.len()].json_data).unwrap();
+        assert_eq!(
+            finish_chunk.choices[0].finish_reason.as_deref(),
+            Some("tool_calls")
+        );
+        assert_eq!(items.last().unwrap().json_data, "[DONE]");
+    }
+
+    #[tokio::test]
+    async fn stream_preserves_chunk_order_and_count() {
+        let text_chunk = |content: &str| ChatStreamChunk {
+            id: "chatcmpl-test".to_string(),
+            object: "chat.completion.chunk".to_string(),
+            created: 0,
+            model: "test-model".to_string(),
+            choices: vec![StreamChoice {
+                index: 0,
+                delta: StreamDelta {
+                    role: None,
+                    content: Some(content.to_string()),
+                    tool_calls: None,
+                    reasoning_content: None,
+                },
+                finish_reason: None,
+            }],
+            usage: None,
+            raw_data: None,
+        };
+        let stream: ChatStream = Box::pin(futures::stream::iter(vec![
+            Ok(text_chunk("a")),
+            Ok(text_chunk("b")),
+            Ok(text_chunk("c")),
+            Ok(terminal_chunk()),
+        ]));
+        let sse = sse_stream_from_chat_stream(stream, UsageTracker::default());
+
+        let items: Vec<_> = sse.collect::<Vec<Result<_, Infallible>>>().await
+            .into_iter().map(|r| r.unwrap()).collect();
+        assert_eq!(items.len(), 5);
+        for (i, expected) in ["a", "b", "c", ""].iter().enumerate() {
+            let chunk: ChatStreamChunk = serde_json::from_str(&items[i].json_data).unwrap();
+            let content = chunk.choices[0].delta.content.as_deref().unwrap_or("");
+            assert_eq!(content, *expected);
+        }
+        assert_eq!(items.last().unwrap().json_data, "[DONE]");
     }
 
     #[tokio::test]

@@ -365,9 +365,14 @@ impl Provider for FusionProvider {
 
     async fn chat_with_context(
         &self,
-        request: ChatCompletionRequest,
+        mut request: ChatCompletionRequest,
         context: ProviderCallContext,
     ) -> Result<ChatCompletionResponse, GatewayError> {
+        // Fusion fans the parent request out to multiple panels/aggregators —
+        // a shared raw-capture channel would get frames from every sub-call
+        // interleaved, so detach it. Sub-call details stay in the fusion
+        // prompt trace instead.
+        request.raw_capture = None;
         let execution = self
             .workflow
             .execute(WorkflowContext {
@@ -382,9 +387,10 @@ impl Provider for FusionProvider {
 
     async fn chat_stream_with_context(
         &self,
-        request: ChatCompletionRequest,
+        mut request: ChatCompletionRequest,
         context: ProviderCallContext,
     ) -> Result<ChatStream, GatewayError> {
+        request.raw_capture = None;
         let workflow = self.workflow.clone();
         let invoker = Arc::new(RoutingModelInvoker::new(self.runtime.clone(), context));
         // Let the route establish SSE before panel and aggregator work begins.

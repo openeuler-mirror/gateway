@@ -163,7 +163,9 @@ impl Provider for AzureProvider {
                             buffer = buffer[pos + 2..].to_string();
 
                             for line in event_text.lines() {
-                                if let Some(data) = line.strip_prefix("data: ") {
+                                // SSE spec allows "data:payload" without a space;
+                                // some upstreams always emit that form.
+                                if let Some(data) = line.strip_prefix("data:") {
                                     let data = data.trim();
                                     if data == "[DONE]" {
                                         let _ = tx.send(Ok(None)).await;
@@ -229,5 +231,90 @@ impl Provider for AzureProvider {
 
     fn client_type_header(&self) -> bool {
         self.client_type_header
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn minimal_request() -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: "test-dep".to_string(),
+            messages: vec![Message {
+                role: MessageRole::User,
+                content: MessageContent::Text("hello".to_string()),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            }],
+            temperature: None,
+            top_p: None,
+            n: None,
+            stream: None,
+            stop: None,
+            max_tokens: None,
+            max_completion_tokens: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            user: None,
+            tools: None,
+            tool_choice: None,
+            response_format: None,
+            seed: None,
+            logprobs: None,
+            top_logprobs: None,
+            logit_bias: None,
+            extra: Default::default(),
+            gateway_headers: HashMap::new(),
+            kv_cache_report_full: false,
+            raw_capture: None,
+        }
+    }
+
+    /// Regression: the SSE spec allows `data:{...}` without a space after the
+    /// colon; the streaming parser used to require `"data: "` and silently
+    /// dropped every chunk from such upstreams.
+    #[tokio::test]
+    async fn chat_stream_data_prefix_without_space_parses() {
+        let sse = concat!(
+            "data:{\"id\":\"1\",\"created\":0,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"},\"finish_reason\":null}]}\n\n",
+            "data:[DONE]\n\n",
+        );
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/openai/deployments/test-dep/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = AzureProvider::new(
+            Client::new(),
+            None,
+            Some(server.uri()),
+            "test-dep",
+            "",
+            None,
+            false,
+        );
+        let stream = provider
+            .chat_stream(minimal_request())
+            .await
+            .expect("stream must start");
+        let chunks: Vec<_> = stream
+            .filter_map(|c| async move { c.ok() })
+            .collect()
+            .await;
+        assert_eq!(chunks.len(), 1, "no-space data: chunk must not be dropped");
+        assert_eq!(chunks[0].choices[0].delta.content.as_deref(), Some("hi"));
     }
 }

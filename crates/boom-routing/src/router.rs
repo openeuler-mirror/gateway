@@ -199,6 +199,25 @@ impl Router {
         self.deployment_store.contains(model)
     }
 
+    /// Whether a model is public (visibility=public). Public models bypass
+    /// all per-key permission checks.
+    pub fn is_public_model(&self, model: &str) -> bool {
+        self.deployment_store.is_public_model(model)
+    }
+
+    /// Whether a model is private (team ACL attached). Private models bypass
+    /// the normal key/team whitelist rules — authorization is solely the
+    /// team ACL check in [`Router::team_can_access`].
+    pub fn is_private_model(&self, model: &str) -> bool {
+        self.deployment_store.is_private_model(model)
+    }
+
+    /// Team ACL check for private models. Returns true for public models;
+    /// for private models it is the only authorization criterion.
+    pub fn team_can_access(&self, model: &str, team_id: Option<&str>) -> bool {
+        self.deployment_store.team_can_access(model, team_id)
+    }
+
     /// Return all model names that should be visible in the model list.
     pub fn visible_model_names(&self) -> Vec<String> {
         let mut names: Vec<String> = self

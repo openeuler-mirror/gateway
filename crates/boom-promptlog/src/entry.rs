@@ -79,8 +79,24 @@ pub struct PromptLogEntry {
     /// Raw upstream response before any gateway format conversion.
     /// Only populated when `capture_raw_upstream` is enabled and the endpoint
     /// performs format conversion (e.g., `/v1/messages`).
+    ///
+    /// Legacy field — superseded by `raw_response` (which covers all
+    /// providers/paths); kept for reading historical JSONL files.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_upstream_response: Option<Arc<serde_json::Value>>,
+    /// Exact request body the gateway assembled and sent to the upstream,
+    /// serialized at the provider send site — byte-identical to the wire
+    /// bytes. Stored as a single string. Only when `capture_raw_upstream`
+    /// is enabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bg_request: Option<String>,
+    /// Raw upstream response as a single string. Non-streaming: the literal
+    /// body (including upstream HTTP error bodies). Streaming: SSE frames
+    /// joined with `\n\n`, preserving `event:`/`data:` prefixes, comments,
+    /// `[DONE]`, and frames that failed JSON parsing. Only when
+    /// `capture_raw_upstream` is enabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_response: Option<String>,
     /// Standardized error code for failed/interrupted requests. See
     /// `StreamErrorCode` for the canonical values. `None` on success.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -144,6 +160,8 @@ impl PromptLogEntry {
             response: None,
             fusion: None,
             raw_upstream_response: None,
+            bg_request: None,
+            raw_response: None,
             error_code: None,
             error_message: None,
         }
@@ -172,6 +190,8 @@ impl PromptLogEntry {
             response: None,
             fusion: None,
             raw_upstream_response: None,
+            bg_request: None,
+            raw_response: None,
             error_code: None,
             error_message: None,
         }
@@ -187,6 +207,13 @@ impl PromptLogEntry {
 
     pub fn set_raw_upstream_response(&mut self, raw: Arc<serde_json::Value>) {
         self.raw_upstream_response = Some(raw);
+    }
+
+    /// Stamp the raw gateway→upstream exchange captured by the provider
+    /// side channel (only when `capture_raw_upstream` is enabled).
+    pub fn set_raw_exchange(&mut self, bg_request: Option<String>, raw_response: Option<String>) {
+        self.bg_request = bg_request;
+        self.raw_response = raw_response;
     }
 
     pub fn set_status(&mut self, status_code: i32, duration_ms: u64) {

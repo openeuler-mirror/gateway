@@ -103,6 +103,7 @@ pub fn anthropic_request_to_openai(req: &AnthropicMessagesRequest) -> ChatComple
         extra,
         gateway_headers: HashMap::new(),
         kv_cache_report_full: false,
+        raw_capture: None,
     }
 }
 
@@ -219,8 +220,6 @@ pub struct AnthropicStreamTranscoder {
     thinking_block_open: bool,
     /// Maps OpenAI tool_call index → Anthropic content block index.
     tool_block_map: HashMap<u32, u32>,
-    /// Buffers argument fragments per OpenAI tool_call index.
-    tool_arg_buf: HashMap<u32, String>,
     input_tokens: u32,
     output_tokens: u32,
     cache_creation_input_tokens: Option<u32>,
@@ -241,7 +240,6 @@ impl AnthropicStreamTranscoder {
             text_block_open: false,
             thinking_block_open: false,
             tool_block_map: HashMap::new(),
-            tool_arg_buf: HashMap::new(),
             input_tokens: 0,
             output_tokens: 0,
             cache_creation_input_tokens: None,
@@ -436,29 +434,26 @@ impl AnthropicStreamTranscoder {
                             .to_string(),
                         });
                     }
-                    // Argument delta — buffer instead of emitting immediately.
+                    // Argument delta — emit immediately as input_json_delta
+                    // (pass-through, matching litellm's adapter behavior).
+                    // Fragments arriving before the id chunk (no block open)
+                    // are dropped, same as the previous buffered path.
                     if let Some(ref func) = tc.function {
                         if let Some(ref args) = func.arguments {
                             if !args.is_empty() {
-                                // vLLM quirk: the finish chunk may contain the COMPLETE
-                                // JSON arguments after already sending (possibly incomplete)
-                                // fragments. When we detect a complete JSON object AND the
-                                // buffer already has content, REPLACE the buffer with the
-                                // canonical complete version rather than concatenating.
-                                let is_vllm_complete = args.starts_with('{')
-                                    && args.ends_with('}')
-                                    && serde_json::from_str::<serde_json::Value>(args).is_ok();
-                                let has_existing = self
-                                    .tool_arg_buf
-                                    .get(&tc.index)
-                                    .map_or(false, |e| !e.is_empty());
-                                if is_vllm_complete && has_existing {
-                                    self.tool_arg_buf.insert(tc.index, args.clone());
-                                } else {
-                                    self.tool_arg_buf
-                                        .entry(tc.index)
-                                        .or_default()
-                                        .push_str(args);
+                                if let Some(block_idx) = self.tool_block_map.get(&tc.index) {
+                                    events.push(AnthropicSseEvent {
+                                        event: "content_block_delta".to_string(),
+                                        data: serde_json::json!({
+                                            "type": "content_block_delta",
+                                            "index": block_idx,
+                                            "delta": {
+                                                "type": "input_json_delta",
+                                                "partial_json": args
+                                            }
+                                        })
+                                        .to_string(),
+                                    });
                                 }
                             }
                         }
@@ -471,28 +466,11 @@ impl AnthropicStreamTranscoder {
                 // Close any open block (text or thinking).
                 self.close_open_block(&mut events);
 
-                // Close tool blocks — flush buffered args as a single partial_json first.
+                // Close tool blocks (arguments were streamed through already).
                 let mut tc_indices: Vec<u32> = self.tool_block_map.keys().copied().collect();
                 tc_indices.sort();
                 for tc_idx in &tc_indices {
                     if let Some(block_idx) = self.tool_block_map.get(tc_idx) {
-                        // Flush buffered arguments as one input_json_delta.
-                        if let Some(buf) = self.tool_arg_buf.remove(tc_idx) {
-                            if !buf.is_empty() {
-                                events.push(AnthropicSseEvent {
-                                    event: "content_block_delta".to_string(),
-                                    data: serde_json::json!({
-                                        "type": "content_block_delta",
-                                        "index": block_idx,
-                                        "delta": {
-                                            "type": "input_json_delta",
-                                            "partial_json": buf
-                                        }
-                                    })
-                                    .to_string(),
-                                });
-                            }
-                        }
                         events.push(AnthropicSseEvent {
                             event: "content_block_stop".to_string(),
                             data: serde_json::json!({ "type": "content_block_stop", "index": block_idx })
@@ -1119,5 +1097,96 @@ mod tests {
             chunk.choices[0].delta.reasoning_content.as_deref(),
             Some("stream-of-thought")
         );
+    }
+
+    fn tool_stream_chunk(
+        id: Option<&str>,
+        name: Option<&str>,
+        args: Option<&str>,
+        finish_reason: Option<&str>,
+    ) -> ChatStreamChunk {
+        let mut delta = serde_json::json!({});
+        if let Some(id) = id {
+            delta["tool_calls"] = serde_json::json!([{
+                "index": 0,
+                "id": id,
+                "type": "function",
+                "function": { "name": name, "arguments": args.unwrap_or("") }
+            }]);
+        } else if let Some(args) = args {
+            delta["tool_calls"] = serde_json::json!([{
+                "index": 0,
+                "function": { "arguments": args }
+            }]);
+        }
+        serde_json::from_value(serde_json::json!({
+            "id": "chatcmpl-t",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": "test-model",
+            "choices": [{
+                "index": 0,
+                "delta": delta,
+                "finish_reason": finish_reason
+            }]
+        }))
+        .expect("tool chunk should deserialize")
+    }
+
+    fn partial_json_of(event: &AnthropicSseEvent) -> String {
+        let v: serde_json::Value = serde_json::from_str(&event.data).unwrap();
+        v["delta"]["partial_json"].as_str().unwrap_or("").to_string()
+    }
+
+    #[test]
+    fn transcoder_streams_tool_args_through_immediately() {
+        let mut t = AnthropicStreamTranscoder::new("test-model".to_string());
+
+        let events = t.transcode(&tool_stream_chunk(
+            Some("call_1"),
+            Some("get_weather"),
+            Some("{\"na"),
+            None,
+        ));
+        // message_start + content_block_start + first fragment, all in one shot.
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].event, "message_start");
+        assert_eq!(events[1].event, "content_block_start");
+        assert_eq!(events[2].event, "content_block_delta");
+        assert_eq!(partial_json_of(&events[2]), "{\"na");
+
+        let events = t.transcode(&tool_stream_chunk(None, None, Some("me\": \"x\"}"), None));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event, "content_block_delta");
+        assert_eq!(partial_json_of(&events[0]), "me\": \"x\"}");
+
+        // Finish closes the tool block; args were already streamed, nothing held.
+        let events = t.transcode(&tool_stream_chunk(None, None, None, Some("tool_calls")));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event, "content_block_stop");
+
+        let events = t.drain();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event, "message_delta");
+        assert_eq!(events[1].event, "message_stop");
+    }
+
+    #[test]
+    fn transcoder_emits_args_before_block_stop_when_finish_carries_args() {
+        let mut t = AnthropicStreamTranscoder::new("test-model".to_string());
+        let events = t.transcode(&tool_stream_chunk(
+            Some("call_1"),
+            Some("get_weather"),
+            Some("{\"city\":"),
+            None,
+        ));
+        assert_eq!(events.len(), 3);
+
+        // vLLM GLM shape: terminal args fragment combined with finish_reason.
+        // Pass-through emits the fragment before closing the block.
+        let events = t.transcode(&tool_stream_chunk(None, None, Some("\"BJ\"}"), Some("tool_calls")));
+        let kinds: Vec<&str> = events.iter().map(|e| e.event.as_str()).collect();
+        assert_eq!(kinds, vec!["content_block_delta", "content_block_stop"]);
+        assert_eq!(partial_json_of(&events[0]), "\"BJ\"}");
     }
 }
