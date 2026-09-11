@@ -3386,13 +3386,15 @@
           + '<div class="cost-line"><span class="cost-label">' + esc(t("plan.dim.cached_input_cost")) + ':</span><span class="cost-value">' + fmtCost(c.cached_input) + '</span></div>'
           + '<div class="cost-line"><span class="cost-label">' + esc(t("plan.dim.output_cost")) + ':</span><span class="cost-value">' + fmtCost(c.output) + '</span></div>'
           + '</div>';
-        // Alias cell: 0 → "-"; 1 → chip with name; ≥2 → "View N aliases" button.
+        // Alias cell: 0 → "-"; 1 → clickable chip; ≥2 → "View N aliases".
+        // Management (add/delete/toggle) lives in the model edit modal;
+        // these only open the read-only listing.
         const aliases = aliasesMap[m.model_name] || [];
         let aliasCell;
         if (aliases.length === 0) {
           aliasCell = '<span class="muted">-</span>';
         } else if (aliases.length === 1) {
-          aliasCell = '<span class="alias-chip">' + esc(aliases[0]) + '</span>';
+          aliasCell = '<button class="alias-chip alias-chip-btn" onclick="window._showModelAliases(\'' + esc(m.model_name) + '\')">' + esc(aliases[0]) + '</button>';
         } else {
           aliasCell = '<button class="btn-small" onclick="window._showModelAliases(\'' + esc(m.model_name) + '\')">'
             + esc(t("models.aliases.view_detail", { n: aliases.length })) + '</button>';
@@ -3521,6 +3523,24 @@
             </div>
           </div>
         </div>
+        ${p.id ? `
+        <div class="form-card">
+          <div class="form-card-title">${t("model_card.aliases")} ${tip(t("tip.alias.name"))}</div>
+          <div class="form-card-grid">
+            <div class="form-group field-full">
+              <div id="m-alias-card-list" class="alias-mgmt-list"></div>
+              <div class="alias-add-row">
+                <input id="m-alias-card-new-name" placeholder="${t("form.alias.name")}" title="${esc(t("tip.alias.name"))}">
+                <select id="m-alias-card-new-hidden" title="${esc(t("tip.alias.hidden"))}">
+                  <option value="false">${t("common.no")}</option>
+                  <option value="true">${t("common.yes")}</option>
+                </select>
+                <button class="btn-small" id="m-alias-card-add">${t("models.aliases.add")}</button>
+              </div>
+              <div id="m-alias-card-msg" class="alias-mgmt-msg"></div>
+            </div>
+          </div>
+        </div>` : ""}
       </div>
       <div class="modal-actions">
         <button class="btn-secondary btn-inline" onclick="hideModal()">${t("action.cancel")}</button>
@@ -3602,6 +3622,11 @@
       });
     };
     populateModelTeams();
+    // Alias management card: edit mode only (creating a model means the
+    // alias target doesn't exist yet). Uses the SAVED model name — if the
+    // user renames the model in this form, aliases still target the old
+    // name until submitted; ops here are immediate per-alias CRUD.
+    if (p.id && p.model_name) setupAliasCard(p.model_name);
     document.getElementById("m-model-submit").addEventListener("click", async () => {
       try {
         const providerVal = document.getElementById("m-model-provider").value;
@@ -3680,61 +3705,82 @@
   };
 
   // ── Admin: Aliases ────────────────────────────────────
-  function showNewAliasModal(prefill) {
-    const p = prefill || {};
-    const __html = `
-      <h3>${p.alias_name ? t("form.alias.title_edit") : t("form.alias.title_create")}</h3>
-      <div class="form-grid">
-        <div class="form-card">
-          <div class="form-card-title">${t("alias_card.basic")}</div>
-          <div class="form-card-grid">
-            <div class="form-group field-full"><label>${t("form.alias.name")} * ${tip(t("tip.alias.name"))}</label><input id="m-alias-name" value="${esc(p.alias_name || "")}" ${p.alias_name ? "readonly" : ""}></div>
-            <div class="form-group field-full"><label>${t("form.alias.target")} * ${tip(t("tip.alias.target"))}</label><input id="m-alias-target" value="${esc(p.target_model || "")}" required list="alias-target-list"><datalist id="alias-target-list"></datalist></div>
-            <div class="form-group field-full"><label>${t("form.alias.hidden")} ${tip(t("tip.alias.hidden"))}</label><select id="m-alias-hidden"><option value="false" ${!p.hidden ? "selected" : ""}>${t("common.no")}</option><option value="true" ${p.hidden ? "selected" : ""}>${t("common.yes")}</option></select></div>
-          </div>
-        </div>
-      </div>
-      <div class="modal-actions">
-        <button class="btn-secondary btn-inline" onclick="hideModal()">${t("action.cancel")}</button>
-        <button class="btn-primary" id="m-alias-submit">${p.alias_name ? t("action.update") : t("action.create")}</button>
-      </div>
-    `;
-    showModal(__html, { xwide: true });
-    // Populate datalist with existing model names
-    getModelNames().then((names) => {
-      const dl = document.getElementById("alias-target-list");
-      if (dl) names.forEach((n) => { const o = document.createElement("option"); o.value = n; dl.appendChild(o); });
-    });
-    document.getElementById("m-alias-submit").addEventListener("click", async () => {
-      try {
-        const body = {
-          alias_name: document.getElementById("m-alias-name").value,
-          target_model: document.getElementById("m-alias-target").value,
-          hidden: document.getElementById("m-alias-hidden").value === "true",
-        };
-        const url = p.alias_name ? `/admin/aliases/${encodeURIComponent(p.alias_name)}` : "/admin/aliases";
-        const method = p.alias_name ? "PUT" : "POST";
-        await api(url, { method, body: JSON.stringify(body) });
-        hideModal();
-        invalidateCaches();
-        loadModels();
-      } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
-    });
-  }
+  // Alias management lives inside the model edit modal (see setupAliasCard);
+  // the standalone create-alias modal was removed. The table's alias cell
+  // opens a read-only listing via _showModelAliases.
+  function setupAliasCard(targetModel) {
+    const listEl = document.getElementById("m-alias-card-list");
+    const msgEl = document.getElementById("m-alias-card-msg");
+    if (!listEl) return;
+    const showError = (message) => {
+      msgEl.textContent = message;
+      msgEl.classList.add("is-error");
+    };
+    const clearMsg = () => { msgEl.textContent = ""; msgEl.classList.remove("is-error"); };
+    let allAliases = [];
 
-  window._editAlias = async (name) => {
-    try {
+    const renderList = () => {
+      const mine = allAliases.filter((a) => a.target_model === targetModel);
+      if (mine.length === 0) {
+        listEl.innerHTML = `<span class="muted">${t("models.aliases.empty")}</span>`;
+        return;
+      }
+      listEl.innerHTML = mine.map((a) => `
+        <div class="alias-mgmt-row">
+          <span class="alias-chip" title="${esc(a.alias_name)} → ${esc(a.target_model)}">${esc(a.alias_name)}</span>
+          <button class="btn-small alias-hidden-toggle${a.hidden ? " is-on" : ""}" title="${esc(t("tip.alias.hidden"))}">${t("form.alias.hidden")}: ${a.hidden ? t("common.yes") : t("common.no")}</button>
+          <button class="btn-small is-danger alias-delete-btn">${t("action.delete")}</button>
+        </div>`).join("");
+      listEl.querySelectorAll(".alias-mgmt-row").forEach((row, i) => {
+        const name = mine[i].alias_name;
+        row.querySelector(".alias-delete-btn").addEventListener("click", async () => {
+          clearMsg();
+          try {
+            await api(`/admin/aliases/${encodeURIComponent(name)}`, { method: "DELETE" });
+            await refresh();
+          } catch (err) { showError(err.message); }
+        });
+        row.querySelector(".alias-hidden-toggle").addEventListener("click", async () => {
+          clearMsg();
+          const cur = allAliases.find((x) => x.alias_name === name);
+          if (!cur) return;
+          try {
+            await api(`/admin/aliases/${encodeURIComponent(name)}`, {
+              method: "PUT",
+              body: JSON.stringify({ alias_name: name, target_model: cur.target_model, hidden: !cur.hidden }),
+            });
+            await refresh();
+          } catch (err) { showError(err.message); }
+        });
+      });
+    };
+
+    const refresh = async () => {
       const data = await api("/admin/aliases");
-      const a = (data.aliases || []).find((x) => x.alias_name === name);
-      if (!a) return;
-      showNewAliasModal(a);
-    } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
-  };
+      allAliases = data.aliases || [];
+      renderList();
+      loadModels();
+    };
 
-  window._deleteAlias = async (name) => {
-    await api(`/admin/aliases/${encodeURIComponent(name)}`, { method: "DELETE" });
-    loadModels();
-  };
+    document.getElementById("m-alias-card-add").addEventListener("click", async () => {
+      clearMsg();
+      const nameEl = document.getElementById("m-alias-card-new-name");
+      const name = nameEl.value.trim();
+      const hidden = document.getElementById("m-alias-card-new-hidden").value === "true";
+      if (!name) { showError(t("models.aliases.err_empty_name")); return; }
+      if (allAliases.some((a) => a.alias_name === name)) {
+        showError(t("models.aliases.err_exists", { name }));
+        return;
+      }
+      try {
+        await api("/admin/aliases", { method: "POST", body: JSON.stringify({ alias_name: name, target_model: targetModel, hidden }) });
+        nameEl.value = "";
+        await refresh();
+      } catch (err) { showError(err.message); }
+    });
+
+    refresh().catch((err) => showError(err.message));
+  }
 
   window._showModelAliases = async (modelName) => {
     try {
@@ -3745,17 +3791,14 @@
         ${list.length === 0
           ? `<p class="muted">${t("common.no_data")}</p>`
           : `<table class="modal-table">
-              <tr><th>${t("aliases.col.alias")}</th><th>${t("form.alias.hidden")}</th><th>${t("models.col.source")}</th><th>${t("aliases.col.actions")}</th></tr>
+              <tr><th>${t("aliases.col.alias")}</th><th>${t("form.alias.hidden")}</th><th>${t("models.col.source")}</th></tr>
               ${list.map((a) => `<tr>
                 <td><strong>${esc(a.alias_name)}</strong></td>
                 <td>${a.hidden ? t("common.yes") : t("common.no")}</td>
                 <td><span class="badge badge-plan">${esc(a.source || "-")}</span></td>
-                <td>
-                  <button class="btn-small" onclick="window._editAlias('${esc(a.alias_name)}')">${t("action.edit")}</button>
-                  <button class="btn-small is-danger" onclick="window._deleteAlias('${esc(a.alias_name)}')">${t("action.delete")}</button>
-                </td>
               </tr>`).join("")}
-            </table>`}
+            </table>
+            <p class="muted" style="margin-top:8px">${t("models.aliases.manage_hint")}</p>`}
         <div class="modal-actions">
           <button class="btn-small btn-inline" onclick="hideModal()">${t("action.close")}</button>
         </div>
@@ -4796,8 +4839,6 @@
     });
     const btnModel = document.getElementById("btn-new-model");
     if (btnModel) btnModel.addEventListener("click", showNewModelModal);
-    const btnAlias = document.getElementById("btn-new-alias");
-    if (btnAlias) btnAlias.addEventListener("click", showNewAliasModal);
     const btnReload = document.getElementById("btn-reload-config");
     if (btnReload) btnReload.addEventListener("click", async () => {
       btnReload.disabled = true;
@@ -6819,7 +6860,9 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
   function esc(s) {
     const d = document.createElement("div");
     d.textContent = s;
-    return d.innerHTML;
+    // innerHTML only escapes & < > in text nodes; quotes must be escaped
+    // manually so interpolated values can't break out of HTML attributes.
+    return d.innerHTML.replace(/"/g, "&quot;").replace(/'/g, "&#39;");
   }
 
   // Map model name → vendor slug for the logo endpoint

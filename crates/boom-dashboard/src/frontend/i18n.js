@@ -273,10 +273,7 @@
       "models.edit_title": "Edit Model Deployment",
       "models.add_title": "Add Model Deployment",
 
-      "aliases.add": "+ Add Alias",
       "aliases.col.alias": "Alias",
-      "aliases.col.target": "Target Model",
-      "aliases.col.actions": "Actions",
 
       "plans.title": "Plans",
       "plans.add": "+ Add Plan",
@@ -585,6 +582,11 @@
       "models.col.aliases": "Aliases",
       "models.aliases.view_detail": "View {n} aliases",
       "models.aliases.modal_title": "Aliases for {model}",
+      "models.aliases.empty": "No aliases yet — add one below.",
+      "models.aliases.add": "Add",
+      "models.aliases.manage_hint": "To add, delete, or toggle aliases, use this model's Edit dialog.",
+      "models.aliases.err_empty_name": "Alias name is required.",
+      "models.aliases.err_exists": "Alias '{name}' already exists.",
       "models.col.ratio": "Quota Ratio",
       "models.col.timeout": "Timeout",
       "models.col.enabled": "Enabled",
@@ -610,10 +612,7 @@
       "form.model.maxctx": "Max Context",
       "form.model.enabled": "Enabled",
 
-      "form.alias.title_create": "Create Alias",
-      "form.alias.title_edit": "Edit Alias",
       "form.alias.name": "Alias Name",
-      "form.alias.target": "Target Model",
       "form.alias.hidden": "Hidden",
 
       "form.plan.title_create": "Create Plan",
@@ -919,6 +918,7 @@
       "model_card.behavior": "Behavior",
       "model_card.access": "Access Control",
       "model_card.cost": "Cost",
+      "model_card.aliases": "Aliases",
       "form.model.headers": "Custom Headers (JSON)",
       "form.model.aws_region": "AWS Region",
       "form.model.aws_key_id": "AWS Access Key ID",
@@ -945,7 +945,6 @@
       "form.plan.total_cost": "Total Cost Limit (¥)",
       "form.plan.schedule": "Schedule (JSON)",
 
-      "alias_card.basic": "Basic",
       "key_card.basic": "Basic",
       "key_card.assignment": "Assignment",
       "key_card.limits": "Limits",
@@ -1215,10 +1214,7 @@
       "models.edit_title": "编辑模型部署",
       "models.add_title": "新增模型部署",
 
-      "aliases.add": "+ 新增别名",
       "aliases.col.alias": "别名",
-      "aliases.col.target": "目标模型",
-      "aliases.col.actions": "操作",
 
       "plans.title": "套餐",
       "plans.add": "+ 新增套餐",
@@ -1527,6 +1523,11 @@
       "models.col.aliases": "别名",
       "models.aliases.view_detail": "查看 {n} 个别名",
       "models.aliases.modal_title": "{model} 的别名",
+      "models.aliases.empty": "暂无别名，可在下方添加。",
+      "models.aliases.add": "添加",
+      "models.aliases.manage_hint": "别名的新增 / 删除 / 隐藏切换请使用该模型的“编辑”弹窗。",
+      "models.aliases.err_empty_name": "请填写别名名称。",
+      "models.aliases.err_exists": "别名“{name}”已存在。",
       "models.col.ratio": "配额倍率",
       "models.col.timeout": "超时",
       "models.col.enabled": "启用",
@@ -1552,10 +1553,7 @@
       "form.model.maxctx": "最大上下文",
       "form.model.enabled": "启用",
 
-      "form.alias.title_create": "创建别名",
-      "form.alias.title_edit": "编辑别名",
       "form.alias.name": "别名名称",
-      "form.alias.target": "目标模型",
       "form.alias.hidden": "隐藏",
 
       "form.plan.title_create": "创建套餐",
@@ -1861,6 +1859,7 @@
       "model_card.behavior": "行为",
       "model_card.access": "访问控制",
       "model_card.cost": "成本",
+      "model_card.aliases": "别名",
       "form.model.headers": "自定义 Headers (JSON)",
       "form.model.aws_region": "AWS 区域",
       "form.model.aws_key_id": "AWS Access Key ID",
@@ -1887,7 +1886,6 @@
       "form.plan.total_cost": "总成本上限 (¥)",
       "form.plan.schedule": "时间段 (JSON)",
 
-      "alias_card.basic": "基础",
       "key_card.basic": "基础",
       "key_card.assignment": "归属",
       "key_card.limits": "限流",

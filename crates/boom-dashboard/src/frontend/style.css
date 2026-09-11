@@ -2108,6 +2108,53 @@ input[list] {
   font-weight: 500;
   white-space: nowrap;
 }
+.alias-chip-btn {
+  border: 1px solid transparent;
+  cursor: pointer;
+}
+.alias-chip-btn:hover {
+  border-color: var(--primary);
+  background: var(--primary);
+  color: #fff;
+}
+
+/* ── Alias management card (model edit modal 别名卡片) ──────── */
+.alias-mgmt-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.alias-mgmt-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.alias-mgmt-row .alias-chip {
+  flex: 0 1 auto;
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.alias-mgmt-row .btn-small { flex: 0 0 auto; }
+.alias-hidden-toggle.is-on {
+  background: var(--warning-bg, rgba(232, 116, 12, .12));
+  color: var(--warning, #e8740c);
+  border-color: var(--warning, #e8740c);
+}
+.alias-add-row {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+.alias-add-row input { flex: 1 1 auto; min-width: 0; }
+.alias-add-row select { flex: 0 0 auto; width: auto; }
+.alias-add-row .btn-small { flex: 0 0 auto; white-space: nowrap; }
+.alias-mgmt-msg {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--danger);
+}
+.alias-mgmt-msg:empty { display: none; }
 
 /* ── Stats bar chart (Request Rate / high-throughput feel) ─ */
 /*
