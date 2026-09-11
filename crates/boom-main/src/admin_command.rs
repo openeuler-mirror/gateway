@@ -607,6 +607,15 @@ pub async fn auto_disable_deployment(state: &AppState, deployment_id: &str) {
         model = %actual_model_name,
         "Deployment auto-disabled and removed from routing"
     );
+
+    state.alerts.raise_alert(
+        boom_core::alert::AlertKind::DeploymentAutoDisabled,
+        format!("deployment:{deployment_id}"),
+        actual_model_name.clone(),
+        format!(
+            "Deployment '{deployment_id}' (model {actual_model_name}) was auto-disabled by health monitoring and is out of routing"
+        ),
+    );
 }
 
 /// Auto-enable a deployment that was previously auto-disabled, then reload routing.
@@ -640,6 +649,10 @@ pub async fn auto_enable_deployment(state: &AppState, deployment_id: &str) {
         model = %actual_model_name,
         "Deployment auto-enabled and restored to routing"
     );
+
+    state
+        .alerts
+        .clear_alert(&format!("deployment:{deployment_id}"));
 }
 
 /// Build a Provider from a DB deployment row (from DeploymentStore::load_model_rows).

@@ -37,6 +37,7 @@ boom-trace = { path = "../boom-trace" }
 boom-kvindex = { path = "../boom-kvindex" }
 boom-hooks-sdk = { path = "../boom-hooks-sdk" }
 boom-stressmon = { path = "../boom-stressmon" }
+boom-alert = { path = "../boom-alert" }
 axum = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }

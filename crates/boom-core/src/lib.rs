@@ -1,3 +1,4 @@
+pub mod alert;
 pub mod anthropic;
 pub mod db_util;
 pub mod debug_store;
@@ -11,6 +12,7 @@ pub mod stressmon;
 pub mod trace;
 pub mod types;
 
+pub use alert::{Alert, AlertApi, AlertKind, AlertNotifier, AlertSnapshot, AlertStatus};
 pub use debug_store::{DebugErrorEntry, DebugErrorStore};
 pub use error::GatewayError;
 pub use key_format::is_valid_prefix;

@@ -17,6 +17,7 @@ members = [
     "crates/boom-fusion",
     "crates/boom-hooks-sdk",
     "crates/boom-stressmon",
+    "crates/boom-alert",
     "crates/boom-trace",
     "crates/example-hooks",
 ]

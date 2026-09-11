@@ -282,6 +282,10 @@ pub fn build_router<S: Clone + Send + Sync + 'static>(state: DashboardState) -> 
             get(handlers_admin::trace_snapshot),
         )
         .route(
+            "/dashboard/api/admin/alerts",
+            get(handlers_admin::alerts_snapshot),
+        )
+        .route(
             "/dashboard/api/admin/trace/otlp-status",
             get(handlers_admin::trace_otlp_status),
         )

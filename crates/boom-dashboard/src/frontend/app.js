@@ -307,6 +307,7 @@
     if (role === "admin") {
       document.getElementById("page-admin").classList.add("active");
       onRoute();
+      startNavDotPoll();
     } else {
       applyUserSidebarTitle();
       document.getElementById("page-dashboard").classList.add("active");
@@ -424,6 +425,12 @@
     } else {
       stopStressPoll();
     }
+    if (section === "admin-status") {
+      loadAlerts();
+      startAlertsPoll();
+    } else {
+      stopAlertsPoll();
+    }
     if (section === "admin-config") {
       startOtlpStatusPoll();
       startTraceOtlpStatusPoll();
@@ -450,6 +457,7 @@
     if (hash.includes("/admin/debug")) return "admin-debug";
     if (hash.includes("/admin/config")) return "admin-config";
     if (hash.includes("/admin/stress")) return "admin-stress";
+    if (hash.includes("/admin/status")) return "admin-status";
     return "admin-models";
   }
 
@@ -492,6 +500,156 @@
       // Silently skip — dashboard is read-only, errors shouldn't spam the
       // console every 1.5s. Network errors usually mean logout.
     }
+  }
+
+  // ── Status / Alerts ───────────────────────────────────
+  // Nav dot + status page. A slow global poll (30s) keeps the nav dot fresh
+  // even when the user is elsewhere; entering the status page switches to a
+  // faster poll and re-renders the cards.
+  let alertsTimer = null;
+  let navDotTimer = null;
+
+  function startAlertsPoll() {
+    stopAlertsPoll();
+    loadAlerts();
+    alertsTimer = setInterval(loadAlerts, 5000);
+  }
+
+  function stopAlertsPoll() {
+    if (alertsTimer) {
+      clearInterval(alertsTimer);
+      alertsTimer = null;
+    }
+  }
+
+  function startNavDotPoll() {
+    if (navDotTimer) return;
+    updateAlertNavDot();
+    navDotTimer = setInterval(updateAlertNavDot, 30000);
+  }
+
+  async function fetchAlerts() {
+    try {
+      return await api("/admin/alerts");
+    } catch (e) {
+      return null; // read-only poll — don't spam console
+    }
+  }
+
+  function setNavDot(healthy) {
+    const dot = document.getElementById("alert-nav-dot");
+    if (!dot) return;
+    dot.classList.toggle("green", healthy);
+    dot.classList.toggle("red", !healthy);
+    dot.setAttribute("title", healthy ? t("status.healthy") : t("status.unhealthy"));
+  }
+
+  async function updateAlertNavDot() {
+    const snap = await fetchAlerts();
+    if (snap) setNavDot(snap.healthy);
+  }
+
+  async function loadAlerts() {
+    const snap = await fetchAlerts();
+    if (!snap) return;
+    setNavDot(snap.healthy);
+
+    const banner = document.getElementById("status-health-banner");
+    if (banner) {
+      banner.classList.toggle("status-banner--green", snap.healthy);
+      banner.classList.toggle("status-banner--red", !snap.healthy);
+      banner.textContent = snap.healthy
+        ? t("status.healthy")
+        : t("status.unhealthy_count", { count: snap.active_count });
+    }
+
+    const activeCount = document.getElementById("status-active-count");
+    if (activeCount) {
+      activeCount.textContent = String(snap.active_count || 0);
+      activeCount.classList.toggle("status-panel__count--red", (snap.active_count || 0) > 0);
+      activeCount.classList.toggle("status-panel__count--green", !(snap.active_count || 0));
+    }
+    const historyCount = document.getElementById("status-history-count");
+    if (historyCount) historyCount.textContent = String((snap.history || []).length);
+
+    renderActiveAlerts(snap.active || []);
+    renderAlertHistory(snap.history || []);
+  }
+
+  function fmtAlertTs(ms) {
+    if (!ms) return "—";
+    return new Date(ms).toLocaleString();
+  }
+
+  // "2h 13m" / "45s" — for live alerts duration grows until cleared.
+  function fmtDuration(fromMs, toMs) {
+    if (!fromMs) return "—";
+    const end = toMs || Date.now();
+    let s = Math.max(0, Math.floor((end - fromMs) / 1000));
+    const d = Math.floor(s / 86400); s -= d * 86400;
+    const h = Math.floor(s / 3600); s -= h * 3600;
+    const m = Math.floor(s / 60); s -= m * 60;
+    if (d > 0) return `${d}d ${h}h`;
+    if (h > 0) return `${h}h ${m}m`;
+    if (m > 0) return `${m}m ${s}s`;
+    return `${s}s`;
+  }
+
+  function alertKindLabel(kind) {
+    if (kind === "deployment_auto_disabled") return t("status.kind.deployment");
+    if (kind === "otel_exporter_offline") return t("status.kind.otel");
+    return kind || "—";
+  }
+
+  function renderActiveAlerts(alerts) {
+    const wrap = document.getElementById("status-active-wrap");
+    if (!wrap) return;
+    if (alerts.length === 0) {
+      wrap.innerHTML = `<div class="status-empty"><span class="status-empty__icon">✓</span>${t("status.no_active")}</div>`;
+      return;
+    }
+    wrap.innerHTML = alerts.map((a) => `
+      <div class="alert-card alert-card--red">
+        <div class="alert-card__top">
+          <span class="alert-card__badge alert-card__badge--red"></span>
+          <span class="alert-card__kind">${esc(alertKindLabel(a.kind))}</span>
+          <span class="alert-card__target">${esc(a.target || a.key)}</span>
+          <span class="alert-card__duration">${t("status.duration_prefix")}${esc(fmtDuration(a.raised_at))}</span>
+        </div>
+        <div class="alert-card__message">${esc(a.message || "")}</div>
+        <div class="alert-card__times">
+          <span>${t("status.raised_at")} ${esc(fmtAlertTs(a.raised_at))}</span>
+          <span class="alert-card__live">${t("status.ongoing")}</span>
+        </div>
+      </div>
+    `).join("");
+  }
+
+  function renderAlertHistory(history) {
+    const wrap = document.getElementById("status-history-wrap");
+    if (!wrap) return;
+    if (history.length === 0) {
+      wrap.innerHTML = `<div class="status-empty"><span class="status-empty__icon">—</span>${t("status.no_history")}</div>`;
+      return;
+    }
+    wrap.innerHTML = history.map((a) => {
+      const cleared = a.status === "cleared";
+      return `
+      <div class="alert-card ${cleared ? "alert-card--green" : "alert-card--red"}">
+        <div class="alert-card__top">
+          <span class="alert-card__badge ${cleared ? "alert-card__badge--green" : "alert-card__badge--red"}"></span>
+          <span class="alert-card__kind">${esc(alertKindLabel(a.kind))}</span>
+          <span class="alert-card__target">${esc(a.target || a.key)}</span>
+          <span class="alert-card__duration">${t("status.duration_prefix")}${esc(fmtDuration(a.raised_at, a.cleared_at))}</span>
+        </div>
+        <div class="alert-card__message">${esc(a.message || "")}</div>
+        <div class="alert-card__times">
+          <span>${t("status.raised_at")} ${esc(fmtAlertTs(a.raised_at))}</span>
+          <span>→</span>
+          <span>${cleared ? `${t("status.cleared_at")} ${esc(fmtAlertTs(a.cleared_at))}` : t("status.ongoing")}</span>
+        </div>
+      </div>
+    `; }).join("");
   }
 
   function renderStress(snap) {

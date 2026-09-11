@@ -5340,6 +5340,24 @@ pub async fn trace_snapshot(
     Json(snap).into_response()
 }
 
+// ═══════════════════════════════════════════════════════════
+// Alerts — active alerts + history, maintained by boom-main's alert
+// reconciler. Reads through `Arc<dyn boom_core::AlertApi>` so
+// boom-dashboard stays leaf-of-boom-core (no dep on boom-alert).
+// The status page polls this for the nav red/green light and the
+// alert cards.
+// ═══════════════════════════════════════════════════════════
+
+/// GET `/admin/alerts` — alert snapshot (healthy flag, active alerts,
+/// cleared history). In-memory, no DB hit.
+pub async fn alerts_snapshot(
+    _session: AdminSession,
+    Extension(state): Extension<Arc<DashboardState>>,
+) -> Response {
+    let snap = state.alerts.snapshot().await;
+    Json(snap).into_response()
+}
+
 /// GET `/admin/trace/otlp-status` — live OTLP traces exporter state.
 /// Returns `{ok:true, status:"online"|"offline", endpoint, ...}` when
 /// configured, or `{ok:true, status:"disabled"}` when trace channel is
