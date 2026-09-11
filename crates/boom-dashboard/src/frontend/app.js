@@ -3498,11 +3498,6 @@
             <div class="form-group"><label>${t("form.model.rpm")} ${tip(t("tip.model.rpm"))}</label><input id="m-model-rpm" type="number" value="${p.rpm || ""}"></div>
             <div class="form-group"><label>${t("form.model.tpm")} ${tip(t("tip.model.tpm"))}</label><input id="m-model-tpm" type="number" value="${p.tpm || ""}"></div>
             <div class="form-group"><label>${t("form.model.ratio")} ${tip(t("tip.model.ratio"))}</label><input id="m-model-ratio" type="number" min="1" step="1" value="${p.quota_count_ratio || 1}"></div>
-          </div>
-        </div>
-        <div class="form-card">
-          <div class="form-card-title">${t("model_card.flow_control")}</div>
-          <div class="form-card-grid">
             <div class="form-group"><label>${t("form.model.maxinflight")} ${tip(t("tip.model.maxinflight"))}</label><input id="m-model-maxinflight" type="number" min="0" value="${p.max_inflight_queue_len || ""}"></div>
             <div class="form-group"><label>${t("form.model.maxctx")} ${tip(t("tip.model.maxctx"))}</label><input id="m-model-maxctx" type="number" min="0" value="${p.max_context_len || ""}"></div>
           </div>
@@ -3519,15 +3514,10 @@
           </div>
         </div>
         <div class="form-card">
-          <div class="form-card-title">${t("model_card.behavior")}</div>
+          <div class="form-card-title">${t("model_card.misc")}</div>
           <div class="form-card-grid">
             <div class="form-group field-checkbox"><input id="m-model-serve-not-match" type="checkbox" ${p.serve_not_match ? "checked" : ""}><label for="m-model-serve-not-match">${t("form.model.serve_not_match")} ${tip(t("tip.model.serve_not_match"))}</label></div>
             <div class="form-group field-checkbox"><input id="m-model-client-type" type="checkbox" ${p.client_type_header ? "checked" : ""}><label for="m-model-client-type">${t("form.model.client_type_header")} ${tip(t("tip.model.client_type_header"))}</label></div>
-          </div>
-        </div>
-        <div class="form-card">
-          <div class="form-card-title">${t("model_card.cost")}</div>
-          <div class="form-card-grid">
             <div class="form-group field-full"><label>${t("form.model.cost_template")} ${tip(t("tip.model.cost_template"))}</label>
               <select id="m-model-cost-template">
                 <option value="">${t("common.none_option")}</option>
