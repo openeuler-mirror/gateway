@@ -307,6 +307,7 @@
     if (role === "admin") {
       document.getElementById("page-admin").classList.add("active");
       onRoute();
+      startNavDotPoll();
     } else {
       applyUserSidebarTitle();
       document.getElementById("page-dashboard").classList.add("active");
@@ -424,6 +425,12 @@
     } else {
       stopStressPoll();
     }
+    if (section === "admin-status") {
+      loadAlerts();
+      startAlertsPoll();
+    } else {
+      stopAlertsPoll();
+    }
     if (section === "admin-config") {
       startOtlpStatusPoll();
       startTraceOtlpStatusPoll();
@@ -450,6 +457,7 @@
     if (hash.includes("/admin/debug")) return "admin-debug";
     if (hash.includes("/admin/config")) return "admin-config";
     if (hash.includes("/admin/stress")) return "admin-stress";
+    if (hash.includes("/admin/status")) return "admin-status";
     return "admin-models";
   }
 
@@ -492,6 +500,156 @@
       // Silently skip — dashboard is read-only, errors shouldn't spam the
       // console every 1.5s. Network errors usually mean logout.
     }
+  }
+
+  // ── Status / Alerts ───────────────────────────────────
+  // Nav dot + status page. A slow global poll (30s) keeps the nav dot fresh
+  // even when the user is elsewhere; entering the status page switches to a
+  // faster poll and re-renders the cards.
+  let alertsTimer = null;
+  let navDotTimer = null;
+
+  function startAlertsPoll() {
+    stopAlertsPoll();
+    loadAlerts();
+    alertsTimer = setInterval(loadAlerts, 5000);
+  }
+
+  function stopAlertsPoll() {
+    if (alertsTimer) {
+      clearInterval(alertsTimer);
+      alertsTimer = null;
+    }
+  }
+
+  function startNavDotPoll() {
+    if (navDotTimer) return;
+    updateAlertNavDot();
+    navDotTimer = setInterval(updateAlertNavDot, 30000);
+  }
+
+  async function fetchAlerts() {
+    try {
+      return await api("/admin/alerts");
+    } catch (e) {
+      return null; // read-only poll — don't spam console
+    }
+  }
+
+  function setNavDot(healthy) {
+    const dot = document.getElementById("alert-nav-dot");
+    if (!dot) return;
+    dot.classList.toggle("green", healthy);
+    dot.classList.toggle("red", !healthy);
+    dot.setAttribute("title", healthy ? t("status.healthy") : t("status.unhealthy"));
+  }
+
+  async function updateAlertNavDot() {
+    const snap = await fetchAlerts();
+    if (snap) setNavDot(snap.healthy);
+  }
+
+  async function loadAlerts() {
+    const snap = await fetchAlerts();
+    if (!snap) return;
+    setNavDot(snap.healthy);
+
+    const banner = document.getElementById("status-health-banner");
+    if (banner) {
+      banner.classList.toggle("status-banner--green", snap.healthy);
+      banner.classList.toggle("status-banner--red", !snap.healthy);
+      banner.textContent = snap.healthy
+        ? t("status.healthy")
+        : t("status.unhealthy_count", { count: snap.active_count });
+    }
+
+    const activeCount = document.getElementById("status-active-count");
+    if (activeCount) {
+      activeCount.textContent = String(snap.active_count || 0);
+      activeCount.classList.toggle("status-panel__count--red", (snap.active_count || 0) > 0);
+      activeCount.classList.toggle("status-panel__count--green", !(snap.active_count || 0));
+    }
+    const historyCount = document.getElementById("status-history-count");
+    if (historyCount) historyCount.textContent = String((snap.history || []).length);
+
+    renderActiveAlerts(snap.active || []);
+    renderAlertHistory(snap.history || []);
+  }
+
+  function fmtAlertTs(ms) {
+    if (!ms) return "—";
+    return new Date(ms).toLocaleString();
+  }
+
+  // "2h 13m" / "45s" — for live alerts duration grows until cleared.
+  function fmtDuration(fromMs, toMs) {
+    if (!fromMs) return "—";
+    const end = toMs || Date.now();
+    let s = Math.max(0, Math.floor((end - fromMs) / 1000));
+    const d = Math.floor(s / 86400); s -= d * 86400;
+    const h = Math.floor(s / 3600); s -= h * 3600;
+    const m = Math.floor(s / 60); s -= m * 60;
+    if (d > 0) return `${d}d ${h}h`;
+    if (h > 0) return `${h}h ${m}m`;
+    if (m > 0) return `${m}m ${s}s`;
+    return `${s}s`;
+  }
+
+  function alertKindLabel(kind) {
+    if (kind === "deployment_auto_disabled") return t("status.kind.deployment");
+    if (kind === "otel_exporter_offline") return t("status.kind.otel");
+    return kind || "—";
+  }
+
+  function renderActiveAlerts(alerts) {
+    const wrap = document.getElementById("status-active-wrap");
+    if (!wrap) return;
+    if (alerts.length === 0) {
+      wrap.innerHTML = `<div class="status-empty"><span class="status-empty__icon">✓</span>${t("status.no_active")}</div>`;
+      return;
+    }
+    wrap.innerHTML = alerts.map((a) => `
+      <div class="alert-card alert-card--red">
+        <div class="alert-card__top">
+          <span class="alert-card__badge alert-card__badge--red"></span>
+          <span class="alert-card__kind">${esc(alertKindLabel(a.kind))}</span>
+          <span class="alert-card__target">${esc(a.target || a.key)}</span>
+          <span class="alert-card__duration">${t("status.duration_prefix")}${esc(fmtDuration(a.raised_at))}</span>
+        </div>
+        <div class="alert-card__message">${esc(a.message || "")}</div>
+        <div class="alert-card__times">
+          <span>${t("status.raised_at")} ${esc(fmtAlertTs(a.raised_at))}</span>
+          <span class="alert-card__live">${t("status.ongoing")}</span>
+        </div>
+      </div>
+    `).join("");
+  }
+
+  function renderAlertHistory(history) {
+    const wrap = document.getElementById("status-history-wrap");
+    if (!wrap) return;
+    if (history.length === 0) {
+      wrap.innerHTML = `<div class="status-empty"><span class="status-empty__icon">—</span>${t("status.no_history")}</div>`;
+      return;
+    }
+    wrap.innerHTML = history.map((a) => {
+      const cleared = a.status === "cleared";
+      return `
+      <div class="alert-card ${cleared ? "alert-card--green" : "alert-card--red"}">
+        <div class="alert-card__top">
+          <span class="alert-card__badge ${cleared ? "alert-card__badge--green" : "alert-card__badge--red"}"></span>
+          <span class="alert-card__kind">${esc(alertKindLabel(a.kind))}</span>
+          <span class="alert-card__target">${esc(a.target || a.key)}</span>
+          <span class="alert-card__duration">${t("status.duration_prefix")}${esc(fmtDuration(a.raised_at, a.cleared_at))}</span>
+        </div>
+        <div class="alert-card__message">${esc(a.message || "")}</div>
+        <div class="alert-card__times">
+          <span>${t("status.raised_at")} ${esc(fmtAlertTs(a.raised_at))}</span>
+          <span>→</span>
+          <span>${cleared ? `${t("status.cleared_at")} ${esc(fmtAlertTs(a.cleared_at))}` : t("status.ongoing")}</span>
+        </div>
+      </div>
+    `; }).join("");
   }
 
   function renderStress(snap) {
@@ -3228,13 +3386,15 @@
           + '<div class="cost-line"><span class="cost-label">' + esc(t("plan.dim.cached_input_cost")) + ':</span><span class="cost-value">' + fmtCost(c.cached_input) + '</span></div>'
           + '<div class="cost-line"><span class="cost-label">' + esc(t("plan.dim.output_cost")) + ':</span><span class="cost-value">' + fmtCost(c.output) + '</span></div>'
           + '</div>';
-        // Alias cell: 0 → "-"; 1 → chip with name; ≥2 → "View N aliases" button.
+        // Alias cell: 0 → "-"; 1 → clickable chip; ≥2 → "View N aliases".
+        // Management (add/delete/toggle) lives in the model edit modal;
+        // these only open the read-only listing.
         const aliases = aliasesMap[m.model_name] || [];
         let aliasCell;
         if (aliases.length === 0) {
           aliasCell = '<span class="muted">-</span>';
         } else if (aliases.length === 1) {
-          aliasCell = '<span class="alias-chip">' + esc(aliases[0]) + '</span>';
+          aliasCell = '<button class="alias-chip alias-chip-btn" onclick="window._showModelAliases(\'' + esc(m.model_name) + '\')">' + esc(aliases[0]) + '</button>';
         } else {
           aliasCell = '<button class="btn-small" onclick="window._showModelAliases(\'' + esc(m.model_name) + '\')">'
             + esc(t("models.aliases.view_detail", { n: aliases.length })) + '</button>';
@@ -3282,10 +3442,22 @@
           <div class="form-card-title">${t("model_card.basic")}</div>
           <div class="form-card-grid">
             <div class="form-group field-full"><label>${t("form.model.name")} * ${tip(t("tip.model.name"))}</label><input id="m-model-name" value="${esc(p.model_name || "")}" required></div>
-            <div class="form-group"><label>${t("form.model.provider")} * ${tip(t("tip.model.provider"))}</label><select id="m-model-provider"><option value="">${t("common.select_placeholder")}</option><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option><option value="azure">Azure OpenAI</option><option value="gemini">Google Gemini</option><option value="bedrock">AWS Bedrock</option></select></div>
-            <div class="form-group"><label>${t("form.model.id")} * ${tip(t("tip.model.id"))}</label><input id="m-model-id" value="${esc((p.litellm_model || "").includes("/") ? p.litellm_model.split("/").slice(1).join("/") : p.litellm_model || "")}" required></div>
             <div class="form-group"><label>${t("form.model.deployment_id")} ${tip(t("tip.model.deployment_id"))}</label><input id="m-model-deployment-id" value="${esc(p.deployment_id || "")}" placeholder="(auto UUID)"></div>
             <div class="form-group field-checkbox"><input id="m-model-enabled" type="checkbox" ${p.enabled !== false ? "checked" : ""}><label for="m-model-enabled">${t("form.model.enabled")} ${tip(t("tip.model.enabled"))}</label></div>
+            ${p.id ? `
+            <div class="form-group field-full alias-card-block">
+              <label>${t("model_card.aliases")} ${tip(t("tip.alias.name"))}</label>
+              <div id="m-alias-card-list" class="alias-mgmt-list"></div>
+              <div class="alias-add-row">
+                <input id="m-alias-card-new-name" placeholder="${t("form.alias.name")}" title="${esc(t("tip.alias.name"))}">
+                <select id="m-alias-card-new-hidden" title="${esc(t("tip.alias.hidden"))}">
+                  <option value="false">${t("common.no")}</option>
+                  <option value="true">${t("common.yes")}</option>
+                </select>
+                <button class="btn-small" id="m-alias-card-add">${t("models.aliases.add")}</button>
+              </div>
+              <div id="m-alias-card-msg" class="alias-mgmt-msg"></div>
+            </div>` : ""}
           </div>
         </div>
         <div class="form-card">
@@ -3326,11 +3498,6 @@
             <div class="form-group"><label>${t("form.model.rpm")} ${tip(t("tip.model.rpm"))}</label><input id="m-model-rpm" type="number" value="${p.rpm || ""}"></div>
             <div class="form-group"><label>${t("form.model.tpm")} ${tip(t("tip.model.tpm"))}</label><input id="m-model-tpm" type="number" value="${p.tpm || ""}"></div>
             <div class="form-group"><label>${t("form.model.ratio")} ${tip(t("tip.model.ratio"))}</label><input id="m-model-ratio" type="number" min="1" step="1" value="${p.quota_count_ratio || 1}"></div>
-          </div>
-        </div>
-        <div class="form-card">
-          <div class="form-card-title">${t("model_card.flow_control")}</div>
-          <div class="form-card-grid">
             <div class="form-group"><label>${t("form.model.maxinflight")} ${tip(t("tip.model.maxinflight"))}</label><input id="m-model-maxinflight" type="number" min="0" value="${p.max_inflight_queue_len || ""}"></div>
             <div class="form-group"><label>${t("form.model.maxctx")} ${tip(t("tip.model.maxctx"))}</label><input id="m-model-maxctx" type="number" min="0" value="${p.max_context_len || ""}"></div>
           </div>
@@ -3338,23 +3505,19 @@
         <div class="form-card">
           <div class="form-card-title">${t("model_card.tuning")}</div>
           <div class="form-card-grid">
-            <div class="form-group"><label>${t("form.model.base")} ${tip(t("tip.model.base"))}</label><input id="m-model-base" value="${esc(p.api_base || "")}" placeholder="https://api.openai.com/v1"></div>
-            <div class="form-group"><label>${t("form.model.version")} ${tip(t("tip.model.version"))}</label><input id="m-model-version" value="${esc(p.api_version || "")}"></div>
+            <div class="form-group"><label>${t("form.model.provider")} * ${tip(t("tip.model.provider"))}</label><select id="m-model-provider"><option value="">${t("common.select_placeholder")}</option><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option><option value="azure">Azure OpenAI</option><option value="gemini">Google Gemini</option><option value="bedrock">AWS Bedrock</option></select></div>
+            <div class="form-group"><label>${t("form.model.id")} * ${tip(t("tip.model.id"))}</label><input id="m-model-id" value="${esc((p.litellm_model || "").includes("/") ? p.litellm_model.split("/").slice(1).join("/") : p.litellm_model || "")}" required></div>
+            <div class="form-group field-full"><label>${t("form.model.base")} ${tip(t("tip.model.base"))}</label><input id="m-model-base" value="${esc(p.api_base || "")}" placeholder="https://api.openai.com/v1"></div>
             <div class="form-group"><label>${t("form.model.timeout")} ${tip(t("tip.model.timeout"))}</label><input id="m-model-timeout" type="number" value="${p.timeout || 1200}"></div>
             <div class="form-group"><label>${t("form.model.temp")} ${tip(t("tip.model.temp"))}</label><input id="m-model-temp" type="number" step="0.1" value="${p.temperature || ""}"></div>
             <div class="form-group"><label>${t("form.model.maxtok")} ${tip(t("tip.model.maxtok"))}</label><input id="m-model-maxtok" type="number" value="${p.max_tokens || ""}"></div>
           </div>
         </div>
         <div class="form-card">
-          <div class="form-card-title">${t("model_card.behavior")}</div>
+          <div class="form-card-title">${t("model_card.misc")}</div>
           <div class="form-card-grid">
             <div class="form-group field-checkbox"><input id="m-model-serve-not-match" type="checkbox" ${p.serve_not_match ? "checked" : ""}><label for="m-model-serve-not-match">${t("form.model.serve_not_match")} ${tip(t("tip.model.serve_not_match"))}</label></div>
             <div class="form-group field-checkbox"><input id="m-model-client-type" type="checkbox" ${p.client_type_header ? "checked" : ""}><label for="m-model-client-type">${t("form.model.client_type_header")} ${tip(t("tip.model.client_type_header"))}</label></div>
-          </div>
-        </div>
-        <div class="form-card">
-          <div class="form-card-title">${t("model_card.cost")}</div>
-          <div class="form-card-grid">
             <div class="form-group field-full"><label>${t("form.model.cost_template")} ${tip(t("tip.model.cost_template"))}</label>
               <select id="m-model-cost-template">
                 <option value="">${t("common.none_option")}</option>
@@ -3444,6 +3607,11 @@
       });
     };
     populateModelTeams();
+    // Alias management card: edit mode only (creating a model means the
+    // alias target doesn't exist yet). Uses the SAVED model name — if the
+    // user renames the model in this form, aliases still target the old
+    // name until submitted; ops here are immediate per-alias CRUD.
+    if (p.id && p.model_name) setupAliasCard(p.model_name);
     document.getElementById("m-model-submit").addEventListener("click", async () => {
       try {
         const providerVal = document.getElementById("m-model-provider").value;
@@ -3466,7 +3634,6 @@
           api_key: document.getElementById("m-model-key").value || null,
           api_key_env: document.getElementById("m-model-key-env").checked,
           api_base: document.getElementById("m-model-base").value || null,
-          api_version: document.getElementById("m-model-version").value || null,
           aws_region_name: document.getElementById("m-model-aws-region").value || null,
           aws_access_key_id: document.getElementById("m-model-aws-key").value || null,
           aws_secret_access_key: document.getElementById("m-model-aws-secret").value || null,
@@ -3522,61 +3689,82 @@
   };
 
   // ── Admin: Aliases ────────────────────────────────────
-  function showNewAliasModal(prefill) {
-    const p = prefill || {};
-    const __html = `
-      <h3>${p.alias_name ? t("form.alias.title_edit") : t("form.alias.title_create")}</h3>
-      <div class="form-grid">
-        <div class="form-card">
-          <div class="form-card-title">${t("alias_card.basic")}</div>
-          <div class="form-card-grid">
-            <div class="form-group field-full"><label>${t("form.alias.name")} * ${tip(t("tip.alias.name"))}</label><input id="m-alias-name" value="${esc(p.alias_name || "")}" ${p.alias_name ? "readonly" : ""}></div>
-            <div class="form-group field-full"><label>${t("form.alias.target")} * ${tip(t("tip.alias.target"))}</label><input id="m-alias-target" value="${esc(p.target_model || "")}" required list="alias-target-list"><datalist id="alias-target-list"></datalist></div>
-            <div class="form-group field-full"><label>${t("form.alias.hidden")} ${tip(t("tip.alias.hidden"))}</label><select id="m-alias-hidden"><option value="false" ${!p.hidden ? "selected" : ""}>${t("common.no")}</option><option value="true" ${p.hidden ? "selected" : ""}>${t("common.yes")}</option></select></div>
-          </div>
-        </div>
-      </div>
-      <div class="modal-actions">
-        <button class="btn-secondary btn-inline" onclick="hideModal()">${t("action.cancel")}</button>
-        <button class="btn-primary" id="m-alias-submit">${p.alias_name ? t("action.update") : t("action.create")}</button>
-      </div>
-    `;
-    showModal(__html, { xwide: true });
-    // Populate datalist with existing model names
-    getModelNames().then((names) => {
-      const dl = document.getElementById("alias-target-list");
-      if (dl) names.forEach((n) => { const o = document.createElement("option"); o.value = n; dl.appendChild(o); });
-    });
-    document.getElementById("m-alias-submit").addEventListener("click", async () => {
-      try {
-        const body = {
-          alias_name: document.getElementById("m-alias-name").value,
-          target_model: document.getElementById("m-alias-target").value,
-          hidden: document.getElementById("m-alias-hidden").value === "true",
-        };
-        const url = p.alias_name ? `/admin/aliases/${encodeURIComponent(p.alias_name)}` : "/admin/aliases";
-        const method = p.alias_name ? "PUT" : "POST";
-        await api(url, { method, body: JSON.stringify(body) });
-        hideModal();
-        invalidateCaches();
-        loadModels();
-      } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
-    });
-  }
+  // Alias management lives inside the model edit modal (see setupAliasCard);
+  // the standalone create-alias modal was removed. The table's alias cell
+  // opens a read-only listing via _showModelAliases.
+  function setupAliasCard(targetModel) {
+    const listEl = document.getElementById("m-alias-card-list");
+    const msgEl = document.getElementById("m-alias-card-msg");
+    if (!listEl) return;
+    const showError = (message) => {
+      msgEl.textContent = message;
+      msgEl.classList.add("is-error");
+    };
+    const clearMsg = () => { msgEl.textContent = ""; msgEl.classList.remove("is-error"); };
+    let allAliases = [];
 
-  window._editAlias = async (name) => {
-    try {
+    const renderList = () => {
+      const mine = allAliases.filter((a) => a.target_model === targetModel);
+      if (mine.length === 0) {
+        listEl.innerHTML = `<span class="muted">${t("models.aliases.empty")}</span>`;
+        return;
+      }
+      listEl.innerHTML = mine.map((a) => `
+        <div class="alias-mgmt-row">
+          <span class="alias-chip" title="${esc(a.alias_name)} → ${esc(a.target_model)}">${esc(a.alias_name)}</span>
+          <button class="btn-small alias-hidden-toggle${a.hidden ? " is-on" : ""}" title="${esc(t("tip.alias.hidden"))}">${t("form.alias.hidden")}: ${a.hidden ? t("common.yes") : t("common.no")}</button>
+          <button class="btn-small is-danger alias-delete-btn">${t("action.delete")}</button>
+        </div>`).join("");
+      listEl.querySelectorAll(".alias-mgmt-row").forEach((row, i) => {
+        const name = mine[i].alias_name;
+        row.querySelector(".alias-delete-btn").addEventListener("click", async () => {
+          clearMsg();
+          try {
+            await api(`/admin/aliases/${encodeURIComponent(name)}`, { method: "DELETE" });
+            await refresh();
+          } catch (err) { showError(err.message); }
+        });
+        row.querySelector(".alias-hidden-toggle").addEventListener("click", async () => {
+          clearMsg();
+          const cur = allAliases.find((x) => x.alias_name === name);
+          if (!cur) return;
+          try {
+            await api(`/admin/aliases/${encodeURIComponent(name)}`, {
+              method: "PUT",
+              body: JSON.stringify({ alias_name: name, target_model: cur.target_model, hidden: !cur.hidden }),
+            });
+            await refresh();
+          } catch (err) { showError(err.message); }
+        });
+      });
+    };
+
+    const refresh = async () => {
       const data = await api("/admin/aliases");
-      const a = (data.aliases || []).find((x) => x.alias_name === name);
-      if (!a) return;
-      showNewAliasModal(a);
-    } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
-  };
+      allAliases = data.aliases || [];
+      renderList();
+      loadModels();
+    };
 
-  window._deleteAlias = async (name) => {
-    await api(`/admin/aliases/${encodeURIComponent(name)}`, { method: "DELETE" });
-    loadModels();
-  };
+    document.getElementById("m-alias-card-add").addEventListener("click", async () => {
+      clearMsg();
+      const nameEl = document.getElementById("m-alias-card-new-name");
+      const name = nameEl.value.trim();
+      const hidden = document.getElementById("m-alias-card-new-hidden").value === "true";
+      if (!name) { showError(t("models.aliases.err_empty_name")); return; }
+      if (allAliases.some((a) => a.alias_name === name)) {
+        showError(t("models.aliases.err_exists", { name }));
+        return;
+      }
+      try {
+        await api("/admin/aliases", { method: "POST", body: JSON.stringify({ alias_name: name, target_model: targetModel, hidden }) });
+        nameEl.value = "";
+        await refresh();
+      } catch (err) { showError(err.message); }
+    });
+
+    refresh().catch((err) => showError(err.message));
+  }
 
   window._showModelAliases = async (modelName) => {
     try {
@@ -3587,17 +3775,14 @@
         ${list.length === 0
           ? `<p class="muted">${t("common.no_data")}</p>`
           : `<table class="modal-table">
-              <tr><th>${t("aliases.col.alias")}</th><th>${t("form.alias.hidden")}</th><th>${t("models.col.source")}</th><th>${t("aliases.col.actions")}</th></tr>
+              <tr><th>${t("aliases.col.alias")}</th><th>${t("form.alias.hidden")}</th><th>${t("models.col.source")}</th></tr>
               ${list.map((a) => `<tr>
                 <td><strong>${esc(a.alias_name)}</strong></td>
                 <td>${a.hidden ? t("common.yes") : t("common.no")}</td>
                 <td><span class="badge badge-plan">${esc(a.source || "-")}</span></td>
-                <td>
-                  <button class="btn-small" onclick="window._editAlias('${esc(a.alias_name)}')">${t("action.edit")}</button>
-                  <button class="btn-small is-danger" onclick="window._deleteAlias('${esc(a.alias_name)}')">${t("action.delete")}</button>
-                </td>
               </tr>`).join("")}
-            </table>`}
+            </table>
+            <p class="muted" style="margin-top:8px">${t("models.aliases.manage_hint")}</p>`}
         <div class="modal-actions">
           <button class="btn-small btn-inline" onclick="hideModal()">${t("action.close")}</button>
         </div>
@@ -4638,8 +4823,6 @@
     });
     const btnModel = document.getElementById("btn-new-model");
     if (btnModel) btnModel.addEventListener("click", showNewModelModal);
-    const btnAlias = document.getElementById("btn-new-alias");
-    if (btnAlias) btnAlias.addEventListener("click", showNewAliasModal);
     const btnReload = document.getElementById("btn-reload-config");
     if (btnReload) btnReload.addEventListener("click", async () => {
       btnReload.disabled = true;
@@ -6661,7 +6844,9 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
   function esc(s) {
     const d = document.createElement("div");
     d.textContent = s;
-    return d.innerHTML;
+    // innerHTML only escapes & < > in text nodes; quotes must be escaped
+    // manually so interpolated values can't break out of HTML attributes.
+    return d.innerHTML.replace(/"/g, "&quot;").replace(/'/g, "&#39;");
   }
 
   // Map model name → vendor slug for the logo endpoint

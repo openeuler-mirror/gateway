@@ -772,6 +772,21 @@ impl DeploymentStore {
         .await
     }
 
+    /// Load rows that were auto-disabled by the health monitor
+    /// (`enabled=false AND auto_disabled=true`). This is the alert
+    /// reconciler's source of truth: manual disables have
+    /// `auto_disabled=false` and are excluded.
+    pub async fn list_auto_disabled(pool: &sqlx::PgPool) -> Result<Vec<DeploymentHealthTarget>, sqlx::Error> {
+        sqlx::query_as::<_, DeploymentHealthTarget>(
+            r#"SELECT model_name, deployment_id, api_base, enabled, auto_disabled
+               FROM boom_model_deployment
+               WHERE enabled = false AND auto_disabled = true AND deployment_id IS NOT NULL
+               ORDER BY model_name, created_at"#,
+        )
+        .fetch_all(pool)
+        .await
+    }
+
     /// Load enabled deployment rows for a specific model (for reload after update/delete).
     pub async fn load_model_rows(pool: &sqlx::PgPool, model_name: &str) -> Result<Vec<DeploymentProviderRow>, sqlx::Error> {
         sqlx::query_as::<_, DeploymentProviderRow>(

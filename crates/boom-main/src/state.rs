@@ -109,6 +109,13 @@ pub struct AppState {
     /// Dashboard reads through the `TraceApi` trait (boom-core) so
     /// boom-dashboard doesn't depend on boom-trace.
     pub trace: Arc<boom_trace::TraceRegistry>,
+    /// Alert manager — active alerts + history ring. Survives reloads
+    /// (top-level Arc, CLAUDE.md §4). Populated by the alert reconciler task
+    /// (boom-main) which re-derives alert state each cycle from the
+    /// deployment store's `auto_disabled` rows and the trace registry's OTLP
+    /// exporter status; health-monitor auto-disable/enable hooks raise/clear
+    /// immediately for low latency.
+    pub alerts: Arc<boom_alert::AlertManager>,
 }
 
 /// The state that gets swapped on config reload.
@@ -363,6 +370,7 @@ impl AppState {
             kvc_orchestrator,
             stressmon,
             trace: trace_registry,
+            alerts: Arc::new(boom_alert::AlertManager::new()),
         };
         state.register_fusion_models(&state.inner.load().config)?;
         Ok(state)

@@ -180,6 +180,10 @@ pub struct DashboardState {
     /// status. Erased to `Arc<dyn TraceApi>` so boom-dashboard stays leaf-of-
     /// boom-core (no dep on boom-trace). Polled by the admin trace page.
     pub trace: Arc<dyn boom_core::TraceApi>,
+    /// Alert state — active alerts + history ring, maintained by boom-main's
+    /// alert reconciler. Erased to `Arc<dyn boom_core::AlertApi>` so
+    /// boom-dashboard doesn't depend on boom-alert. Read by the status page.
+    pub alerts: Arc<dyn boom_core::AlertApi>,
 }
 
 impl DashboardState {
@@ -202,6 +206,7 @@ impl DashboardState {
         log_dropped: Option<Arc<dyn boom_core::LogDroppedCounter>>,
         stressmon: Arc<dyn boom_core::StressmonApi>,
         trace: Arc<dyn boom_core::TraceApi>,
+        alerts: Arc<dyn boom_core::AlertApi>,
     ) -> Self {
         // Derive JWT secret from master_key, or use a random fallback.
         let jwt_secret = master_key
@@ -229,6 +234,7 @@ impl DashboardState {
             log_dropped,
             stressmon,
             trace,
+            alerts,
         }
     }
 

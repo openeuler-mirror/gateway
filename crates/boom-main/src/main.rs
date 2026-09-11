@@ -1,4 +1,5 @@
 mod admin_command;
+mod alert_reconciler;
 mod extractor;
 mod health_monitor;
 mod hooks;
@@ -92,6 +93,11 @@ async fn async_main(args: Args, config: boom_config::Config) -> anyhow::Result<(
 
     // Spawn deployment health monitor (auto offline/recovery, DB deployments only).
     health_monitor::spawn_deployment_health_monitor(state.clone(), shutdown_tx.subscribe());
+
+    // Spawn alert reconciler (rebuilds alert state from sources of truth —
+    // in-memory alerts don't survive restarts, and this also repairs any
+    // missed raise/clear within one cycle).
+    alert_reconciler::spawn_alert_reconciler(state.clone(), shutdown_tx.subscribe());
 
     // Spawn the system pressure sampler (1 Hz — CPU, RSS, tokio worker queue
     // depth, blocking pool queue, inflight). See `spawn_stressmon_sampler`.
@@ -240,6 +246,7 @@ fn build_router(state: AppState) -> Router {
         state.log_writer.clone().map(|w| w as Arc<dyn boom_core::LogDroppedCounter>),
         state.stressmon.clone(),
         state.trace.clone() as Arc<dyn boom_core::TraceApi>,
+        state.alerts.clone() as Arc<dyn boom_core::AlertApi>,
     );
     let dashboard_router = boom_dashboard::build_router(dashboard_state);
 

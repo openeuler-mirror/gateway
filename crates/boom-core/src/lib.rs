@@ -1,3 +1,4 @@
+pub mod alert;
 pub mod anthropic;
 pub mod db_util;
 pub mod debug_store;
@@ -11,6 +12,7 @@ pub mod stressmon;
 pub mod trace;
 pub mod types;
 
+pub use alert::{Alert, AlertApi, AlertKind, AlertNotifier, AlertSnapshot, AlertStatus};
 pub use debug_store::{DebugErrorEntry, DebugErrorStore};
 pub use error::GatewayError;
 pub use key_format::is_valid_prefix;
@@ -31,8 +33,8 @@ pub trait LogDroppedCounter: Send + Sync + 'static {
     fn dropped_count(&self) -> u64;
 }
 
-/// Hand-maintained release version. Semantic version (`1.0.4`) — bumped
+/// Hand-maintained release version. Semantic version (`1.0.5`) — bumped
 /// manually per release. Do NOT derive from build time, that defeats the
 /// purpose (different checkouts would diverge). Frontend prepends "v" for
 /// display, so keep this bare (no "v" prefix).
-pub const BOOM_VERSION: &str = "1.0.4";
+pub const BOOM_VERSION: &str = "1.0.5";

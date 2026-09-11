@@ -2643,6 +2643,34 @@ pub async fn get_inflight_stats(
         }));
     }
 
+    // 3. Fill in the rest from DeploymentStore — deployments with no FC
+    //    config and no in-flight requests still show as zero rows, so the
+    //    stats page reflects every deployed model. Real model names are
+    //    enumerated before the "*" wildcard key: a serve_not_match
+    //    deployment is registered under both, and should be attributed to
+    //    its real model.
+    let mut model_names = state.deployment_store.model_names();
+    model_names.sort_by_key(|m| m == "*");
+    for model_name in &model_names {
+        if let Some(providers) = state.deployment_store.get_providers(model_name) {
+            for p in &providers {
+                if let Some(did) = p.deployment_id() {
+                    rows.entry(did.to_string()).or_insert_with(|| json!({
+                        "model": model_name,
+                        "deployment_id": did,
+                        "fc_queue": 0,
+                        "in_reqs": 0,
+                        "in_reqs_max": 0,
+                        "in_context": 0,
+                        "in_context_max": 0,
+                        "queued_keys": [],
+                        "key_stats": [],
+                    }));
+                }
+            }
+        }
+    }
+
     // Sort: deployments resolvable to a model come first (alphabetical),
     // then deployments whose model is "-" (no longer in deployment_store,
     // i.e. disabled/removed config) sink to the bottom — still alphabetical
@@ -5337,6 +5365,24 @@ pub async fn trace_snapshot(
     Extension(state): Extension<Arc<DashboardState>>,
 ) -> Response {
     let snap = state.trace.snapshot().await;
+    Json(snap).into_response()
+}
+
+// ═══════════════════════════════════════════════════════════
+// Alerts — active alerts + history, maintained by boom-main's alert
+// reconciler. Reads through `Arc<dyn boom_core::AlertApi>` so
+// boom-dashboard stays leaf-of-boom-core (no dep on boom-alert).
+// The status page polls this for the nav red/green light and the
+// alert cards.
+// ═══════════════════════════════════════════════════════════
+
+/// GET `/admin/alerts` — alert snapshot (healthy flag, active alerts,
+/// cleared history). In-memory, no DB hit.
+pub async fn alerts_snapshot(
+    _session: AdminSession,
+    Extension(state): Extension<Arc<DashboardState>>,
+) -> Response {
+    let snap = state.alerts.snapshot().await;
     Json(snap).into_response()
 }
 

@@ -2108,6 +2108,56 @@ input[list] {
   font-weight: 500;
   white-space: nowrap;
 }
+.alias-chip-btn {
+  border: 1px solid transparent;
+  cursor: pointer;
+}
+.alias-chip-btn:hover {
+  border-color: var(--primary);
+  background: var(--primary);
+  color: #fff;
+}
+
+/* ── Alias management card (model edit modal 别名卡片) ──────── */
+.alias-mgmt-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.alias-mgmt-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.alias-mgmt-row .alias-chip {
+  flex: 0 1 auto;
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.alias-mgmt-row .btn-small { flex: 0 0 auto; }
+.alias-hidden-toggle.is-on {
+  background: var(--warning-bg, rgba(232, 116, 12, .12));
+  color: var(--warning, #e8740c);
+  border-color: var(--warning, #e8740c);
+}
+.alias-add-row {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+/* .form-card-grid .field-full forces width:100% on inputs/selects at equal
+ * specificity — re-qualify these to win: the name input takes all remaining
+ * space (basis 0), the hidden toggle stays a fixed narrow dropdown. */
+.form-card-grid .alias-add-row input { flex: 1 1 0; width: auto; min-width: 0; }
+.form-card-grid .alias-add-row select { flex: 0 0 auto; width: 86px; }
+.form-card-grid .alias-add-row .btn-small { flex: 0 0 auto; white-space: nowrap; }
+.alias-mgmt-msg {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--danger);
+}
+.alias-mgmt-msg:empty { display: none; }
 
 /* ── Stats bar chart (Request Rate / high-throughput feel) ─ */
 /*
@@ -2302,9 +2352,9 @@ input[list] {
   display: flex; align-items: baseline; justify-content: space-between;
   padding: 8px 12px; border-radius: 4px;
 }
-.als-ok    { background: rgba(34,197,94,.08);  color: var(--text1); }
-.als-warn  { background: rgba(234,179,8,.10);  color: var(--text1); }
-.als-bad   { background: rgba(239,68,68,.10);  color: var(--text1); }
+.als-ok    { background: rgba(34,197,94,.08);  color: var(--text); }
+.als-warn  { background: rgba(234,179,8,.10);  color: var(--text); }
+.als-bad   { background: rgba(239,68,68,.10);  color: var(--text); }
 .als-label { font-size: 13px; color: var(--text3); }
 .als-value { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
 .als-hint  { font-size: 12px; color: var(--text3); margin: 0; line-height: 1.5; }
@@ -2989,7 +3039,7 @@ input[list] {
   border-radius: var(--radius-xs);
   background: var(--surface3);
   border: 1px solid var(--border);
-  color: var(--text1);
+  color: var(--text);
   font-family: var(--mono);
   font-size: 11px;
   font-weight: 500;
@@ -3022,7 +3072,7 @@ input[list] {
   font-weight: 600;
 }
 .plan-tag-value {
-  color: var(--text1);
+  color: var(--text);
   font-weight: 500;
   font-variant-numeric: tabular-nums;
 }
@@ -3119,7 +3169,7 @@ input[list] {
   margin-bottom: 0;
 }
 .stress-info-tooltip__row b {
-  color: var(--text1);
+  color: var(--text);
   font-weight: 600;
 }
 .stress-grid {
@@ -3151,7 +3201,7 @@ input[list] {
 .stress-card__value {
   font-weight: 700;
   font-size: 14px;
-  color: var(--text1);
+  color: var(--text);
   font-variant-numeric: tabular-nums;
 }
 .stress-card__canvas {
@@ -3159,4 +3209,140 @@ input[list] {
   width: 100%;
   max-width: 100%;
   height: 220px;
+}
+
+/* ═══════════════════════════════════════════════════════
+   Status / Alerts page
+   ═══════════════════════════════════════════════════════ */
+
+/* Red/green light in the nav link. Fixed colors — the sidebar is a
+   dark surface regardless of theme, so CSS var palette doesn't apply. */
+.alert-dot {
+  width: 10px; height: 10px; border-radius: 50%;
+  margin-left: auto; flex-shrink: 0;
+  transition: background .3s ease;
+}
+.alert-dot.green {
+  background: #10b981;
+  box-shadow: 0 0 8px rgba(16,185,129,.9);
+}
+.alert-dot.red {
+  background: #ef4444;
+  box-shadow: 0 0 8px rgba(239,68,68,.9);
+  animation: alert-pulse 1.6s ease-in-out infinite;
+}
+@keyframes alert-pulse {
+  0%, 100% { box-shadow: 0 0 4px 0 rgba(239,68,68,.5); }
+  50%      { box-shadow: 0 0 10px 3px rgba(239,68,68,.75); }
+}
+
+/* Health banner pill */
+.status-banner {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 6px 16px; border-radius: 999px;
+  font-size: 13px; font-weight: 600;
+}
+.status-banner--green { background: var(--success-bg); color: var(--success); }
+.status-banner--red   { background: var(--danger-bg);  color: var(--danger); }
+.status-banner::before {
+  content: ""; width: 8px; height: 8px; border-radius: 50%;
+  background: currentColor;
+}
+.status-banner--red::before { animation: alert-pulse 1.6s ease-in-out infinite; }
+
+/* Panel cards: "Active Alerts" / "Alert History" each live in one card */
+.status-panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 20px 22px;
+  margin: 18px 0 26px;
+  box-shadow: 0 1px 3px rgba(0,0,0,.04);
+}
+.status-panel__head {
+  display: flex; align-items: center; gap: 10px;
+  padding-bottom: 14px; margin-bottom: 14px;
+  border-bottom: 1px solid var(--border);
+}
+.status-panel__title {
+  font-size: 14px; font-weight: 700; color: var(--text);
+}
+.status-panel__count {
+  font-size: 12px; font-weight: 700;
+  padding: 2px 10px; border-radius: 999px;
+  background: var(--surface2); color: var(--text2);
+}
+.status-panel__count--red    { background: var(--danger-bg);  color: var(--danger); }
+.status-panel__count--green  { background: var(--success-bg); color: var(--success); }
+
+/* One alert episode = one row card */
+.alert-card {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--border);
+  border-radius: 10px;
+  padding: 14px 18px;
+  margin-bottom: 12px;
+  background: var(--surface2);
+  transition: border-color .2s ease, box-shadow .2s ease;
+}
+.alert-card:last-child { margin-bottom: 0; }
+.alert-card--red {
+  border-left-color: var(--danger);
+  background: linear-gradient(90deg, var(--danger-bg) 0%, var(--surface2) 30%);
+}
+.alert-card--green {
+  border-left-color: var(--success);
+  background: linear-gradient(90deg, var(--success-bg) 0%, var(--surface2) 30%);
+}
+.alert-card__top {
+  display: flex; align-items: center; flex-wrap: wrap;
+  gap: 10px; margin-bottom: 8px;
+}
+.alert-card__badge {
+  width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0;
+}
+.alert-card__badge--red   { background: var(--danger); }
+.alert-card__badge--green { background: var(--success); }
+.alert-card__kind {
+  font-weight: 700; font-size: 13px;
+}
+.alert-card--red   .alert-card__kind { color: var(--danger); }
+.alert-card--green .alert-card__kind { color: var(--success); }
+.alert-card__target {
+  font-family: var(--mono); font-size: 12px;
+  color: var(--text2);
+  background: var(--surface);
+  padding: 2px 8px; border-radius: 6px;
+}
+.alert-card__duration {
+  margin-left: auto; font-size: 12px; font-weight: 600;
+  color: var(--text2); font-variant-numeric: tabular-nums;
+}
+.alert-card__message {
+  font-size: 13px; color: var(--text); line-height: 1.55;
+  margin-bottom: 10px;
+}
+.alert-card__times {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 8px;
+  font-size: 12px; color: var(--text2);
+  padding-top: 8px; border-top: 1px dashed var(--border);
+  font-variant-numeric: tabular-nums;
+}
+.alert-card__live {
+  color: var(--danger); font-weight: 600;
+  background: var(--danger-bg);
+  padding: 1px 8px; border-radius: 999px;
+}
+
+/* Empty state */
+.status-empty {
+  display: flex; align-items: center; justify-content: center; gap: 10px;
+  padding: 28px 0;
+  color: var(--text2); font-size: 13px;
+}
+.status-empty__icon {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 22px; height: 22px; border-radius: 50%;
+  background: var(--success-bg); color: var(--success);
+  font-size: 12px; font-weight: 700;
 }

@@ -284,6 +284,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "boom-alert"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "boom-core",
+ "dashmap",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "boom-audit"
 version = "0.1.0"
 dependencies = [
@@ -458,6 +471,7 @@ dependencies = [
  "arc-swap",
  "async-trait",
  "axum",
+ "boom-alert",
  "boom-audit",
  "boom-auth",
  "boom-config",
