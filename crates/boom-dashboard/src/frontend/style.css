@@ -2146,9 +2146,12 @@ input[list] {
   gap: 8px;
   margin-top: 10px;
 }
-.alias-add-row input { flex: 1 1 auto; min-width: 0; }
-.alias-add-row select { flex: 0 0 auto; width: auto; }
-.alias-add-row .btn-small { flex: 0 0 auto; white-space: nowrap; }
+/* .form-card-grid .field-full forces width:100% on inputs/selects at equal
+ * specificity — re-qualify these to win: the name input takes all remaining
+ * space (basis 0), the hidden toggle stays a fixed narrow dropdown. */
+.form-card-grid .alias-add-row input { flex: 1 1 0; width: auto; min-width: 0; }
+.form-card-grid .alias-add-row select { flex: 0 0 auto; width: 86px; }
+.form-card-grid .alias-add-row .btn-small { flex: 0 0 auto; white-space: nowrap; }
 .alias-mgmt-msg {
   margin-top: 6px;
   font-size: 12px;

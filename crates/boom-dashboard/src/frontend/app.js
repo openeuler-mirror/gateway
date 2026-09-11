@@ -3442,10 +3442,22 @@
           <div class="form-card-title">${t("model_card.basic")}</div>
           <div class="form-card-grid">
             <div class="form-group field-full"><label>${t("form.model.name")} * ${tip(t("tip.model.name"))}</label><input id="m-model-name" value="${esc(p.model_name || "")}" required></div>
-            <div class="form-group"><label>${t("form.model.provider")} * ${tip(t("tip.model.provider"))}</label><select id="m-model-provider"><option value="">${t("common.select_placeholder")}</option><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option><option value="azure">Azure OpenAI</option><option value="gemini">Google Gemini</option><option value="bedrock">AWS Bedrock</option></select></div>
-            <div class="form-group"><label>${t("form.model.id")} * ${tip(t("tip.model.id"))}</label><input id="m-model-id" value="${esc((p.litellm_model || "").includes("/") ? p.litellm_model.split("/").slice(1).join("/") : p.litellm_model || "")}" required></div>
             <div class="form-group"><label>${t("form.model.deployment_id")} ${tip(t("tip.model.deployment_id"))}</label><input id="m-model-deployment-id" value="${esc(p.deployment_id || "")}" placeholder="(auto UUID)"></div>
             <div class="form-group field-checkbox"><input id="m-model-enabled" type="checkbox" ${p.enabled !== false ? "checked" : ""}><label for="m-model-enabled">${t("form.model.enabled")} ${tip(t("tip.model.enabled"))}</label></div>
+            ${p.id ? `
+            <div class="form-group field-full alias-card-block">
+              <label>${t("model_card.aliases")} ${tip(t("tip.alias.name"))}</label>
+              <div id="m-alias-card-list" class="alias-mgmt-list"></div>
+              <div class="alias-add-row">
+                <input id="m-alias-card-new-name" placeholder="${t("form.alias.name")}" title="${esc(t("tip.alias.name"))}">
+                <select id="m-alias-card-new-hidden" title="${esc(t("tip.alias.hidden"))}">
+                  <option value="false">${t("common.no")}</option>
+                  <option value="true">${t("common.yes")}</option>
+                </select>
+                <button class="btn-small" id="m-alias-card-add">${t("models.aliases.add")}</button>
+              </div>
+              <div id="m-alias-card-msg" class="alias-mgmt-msg"></div>
+            </div>` : ""}
           </div>
         </div>
         <div class="form-card">
@@ -3498,8 +3510,9 @@
         <div class="form-card">
           <div class="form-card-title">${t("model_card.tuning")}</div>
           <div class="form-card-grid">
-            <div class="form-group"><label>${t("form.model.base")} ${tip(t("tip.model.base"))}</label><input id="m-model-base" value="${esc(p.api_base || "")}" placeholder="https://api.openai.com/v1"></div>
-            <div class="form-group"><label>${t("form.model.version")} ${tip(t("tip.model.version"))}</label><input id="m-model-version" value="${esc(p.api_version || "")}"></div>
+            <div class="form-group"><label>${t("form.model.provider")} * ${tip(t("tip.model.provider"))}</label><select id="m-model-provider"><option value="">${t("common.select_placeholder")}</option><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option><option value="azure">Azure OpenAI</option><option value="gemini">Google Gemini</option><option value="bedrock">AWS Bedrock</option></select></div>
+            <div class="form-group"><label>${t("form.model.id")} * ${tip(t("tip.model.id"))}</label><input id="m-model-id" value="${esc((p.litellm_model || "").includes("/") ? p.litellm_model.split("/").slice(1).join("/") : p.litellm_model || "")}" required></div>
+            <div class="form-group field-full"><label>${t("form.model.base")} ${tip(t("tip.model.base"))}</label><input id="m-model-base" value="${esc(p.api_base || "")}" placeholder="https://api.openai.com/v1"></div>
             <div class="form-group"><label>${t("form.model.timeout")} ${tip(t("tip.model.timeout"))}</label><input id="m-model-timeout" type="number" value="${p.timeout || 1200}"></div>
             <div class="form-group"><label>${t("form.model.temp")} ${tip(t("tip.model.temp"))}</label><input id="m-model-temp" type="number" step="0.1" value="${p.temperature || ""}"></div>
             <div class="form-group"><label>${t("form.model.maxtok")} ${tip(t("tip.model.maxtok"))}</label><input id="m-model-maxtok" type="number" value="${p.max_tokens || ""}"></div>
@@ -3523,24 +3536,6 @@
             </div>
           </div>
         </div>
-        ${p.id ? `
-        <div class="form-card">
-          <div class="form-card-title">${t("model_card.aliases")} ${tip(t("tip.alias.name"))}</div>
-          <div class="form-card-grid">
-            <div class="form-group field-full">
-              <div id="m-alias-card-list" class="alias-mgmt-list"></div>
-              <div class="alias-add-row">
-                <input id="m-alias-card-new-name" placeholder="${t("form.alias.name")}" title="${esc(t("tip.alias.name"))}">
-                <select id="m-alias-card-new-hidden" title="${esc(t("tip.alias.hidden"))}">
-                  <option value="false">${t("common.no")}</option>
-                  <option value="true">${t("common.yes")}</option>
-                </select>
-                <button class="btn-small" id="m-alias-card-add">${t("models.aliases.add")}</button>
-              </div>
-              <div id="m-alias-card-msg" class="alias-mgmt-msg"></div>
-            </div>
-          </div>
-        </div>` : ""}
       </div>
       <div class="modal-actions">
         <button class="btn-secondary btn-inline" onclick="hideModal()">${t("action.cancel")}</button>
@@ -3649,7 +3644,6 @@
           api_key: document.getElementById("m-model-key").value || null,
           api_key_env: document.getElementById("m-model-key-env").checked,
           api_base: document.getElementById("m-model-base").value || null,
-          api_version: document.getElementById("m-model-version").value || null,
           aws_region_name: document.getElementById("m-model-aws-region").value || null,
           aws_access_key_id: document.getElementById("m-model-aws-key").value || null,
           aws_secret_access_key: document.getElementById("m-model-aws-secret").value || null,
