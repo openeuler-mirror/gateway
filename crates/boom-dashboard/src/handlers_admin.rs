@@ -2643,6 +2643,34 @@ pub async fn get_inflight_stats(
         }));
     }
 
+    // 3. Fill in the rest from DeploymentStore — deployments with no FC
+    //    config and no in-flight requests still show as zero rows, so the
+    //    stats page reflects every deployed model. Real model names are
+    //    enumerated before the "*" wildcard key: a serve_not_match
+    //    deployment is registered under both, and should be attributed to
+    //    its real model.
+    let mut model_names = state.deployment_store.model_names();
+    model_names.sort_by_key(|m| m == "*");
+    for model_name in &model_names {
+        if let Some(providers) = state.deployment_store.get_providers(model_name) {
+            for p in &providers {
+                if let Some(did) = p.deployment_id() {
+                    rows.entry(did.to_string()).or_insert_with(|| json!({
+                        "model": model_name,
+                        "deployment_id": did,
+                        "fc_queue": 0,
+                        "in_reqs": 0,
+                        "in_reqs_max": 0,
+                        "in_context": 0,
+                        "in_context_max": 0,
+                        "queued_keys": [],
+                        "key_stats": [],
+                    }));
+                }
+            }
+        }
+    }
+
     // Sort: deployments resolvable to a model come first (alphabetical),
     // then deployments whose model is "-" (no longer in deployment_store,
     // i.e. disabled/removed config) sink to the bottom — still alphabetical
