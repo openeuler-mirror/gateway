@@ -4505,8 +4505,10 @@
       } else if (kind === "plan_defaults") {
         const dp = $("cfg-ps-default-plan").value;
         const dtp = $("cfg-ps-default-team-plan").value;
-        await saveConfigSection("plan_settings.default_plan", dp || null);
-        await saveConfigSection("plan_settings.default_team_plan", dtp || null);
+        await saveConfigSections([
+          ["plan_settings.default_plan", dp || null],
+          ["plan_settings.default_team_plan", dtp || null],
+        ]);
       } else if (kind === "health_check") {
         await saveConfigSection("deployment_health_check", {
           auto_offline_enabled: $("cfg-hc-auto-off").checked,
@@ -4600,10 +4602,14 @@
 
   // Multi-section save: fires all PUTs first, then a single page reload.
   // Reloading between writes would drop the other sections' DOM inputs
-  // before they are read.
+  // before they are read. The batch is confirmed once up front; the PUTs
+  // then bypass api()'s per-call confirm via skipConfirm.
   async function saveConfigSections(pairs) {
+    if (!confirm(t("common.confirm_write"))) {
+      throw new Error(t("common.canceled"));
+    }
     for (const [path, value] of pairs) {
-      await api("/admin/config", { method: "PUT", body: JSON.stringify({ path, value }) });
+      await api("/admin/config", { method: "PUT", skipConfirm: true, body: JSON.stringify({ path, value }) });
     }
     showToast(t("config.saved"));
     await loadConfigPage();
