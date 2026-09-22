@@ -526,6 +526,13 @@ pub struct GeneralSettings {
     /// set `store_model_in_db: true|false` parse without error.
     #[serde(default, alias = "store_model_in_db")]
     _legacy_store_model_in_db: bool,
+    /// HTTP header whose "name:value" is recorded into `boom_request_log.user_tag`
+    /// for per-user attribution when one key is shared by multiple users
+    /// (e.g. `user_tag_header: "X-User-Tag"` → `x-user-tag: alice`).
+    /// None/empty disables extraction. Display-only attribution — must never
+    /// participate in auth/routing decisions.
+    #[serde(default)]
+    pub user_tag_header: Option<String>,
     /// DEPRECATED — superseded by per-model `visibility: public`
     /// (see [`ModelVisibility`]). Kept for YAML backward compatibility: on
     /// load, names here are merged into the matching deployments' Public
@@ -542,6 +549,7 @@ impl Default for GeneralSettings {
             master_key: None,
             database_url: None,
             _legacy_store_model_in_db: false,
+            user_tag_header: None,
             public_models: Vec::new(),
         }
     }
@@ -1404,6 +1412,30 @@ plan_settings:
         assert_eq!(legacy.tpm_limit, Some(100_000));
         // No window_limits configured → empty vec.
         assert!(legacy.window_limits.is_empty());
+    }
+
+    #[test]
+    fn test_general_settings_user_tag_header() {
+        // Explicit header name parses through.
+        let yaml = r#"
+general_settings:
+  user_tag_header: "X-User-Tag"
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            config.general_settings.user_tag_header.as_deref(),
+            Some("X-User-Tag")
+        );
+
+        // Absent → None (feature disabled).
+        let config: Config = serde_yaml::from_str("model_list: []").unwrap();
+        assert!(config.general_settings.user_tag_header.is_none());
+
+        // Empty string → None-like disabled state after trim at use site;
+        // keep the raw empty string out of the parsed value.
+        let yaml = "general_settings:\n  user_tag_header: \"\"\n";
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.general_settings.user_tag_header.as_deref(), Some(""));
     }
 
     #[test]

@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 /// Channel capacity — sized to absorb ~2s of DB outage at 50K QPS.
 /// Single RequestLog ≈ 850 bytes → 100K slots × 850B ≈ 85 MB peak.
 const LOG_CHANNEL_CAPACITY: usize = 100_000;
-/// Max rows per batch INSERT. PG parameter limit (65535) / 25 columns ≈ 2621.
+/// Max rows per batch INSERT. PG parameter limit (65535) / 27 columns ≈ 2427.
 /// 2000 leaves headroom and aligns with flush interval at 50K QPS.
 const LOG_BATCH_SIZE: usize = 2_000;
 /// Flush window. At 50K QPS this batches ~5000 rows (3 INSERTs).
@@ -64,6 +64,10 @@ pub struct RequestLog {
     /// (ms). NULL on pass-through deployments (no slot configured) and
     /// on error paths that fire before acquire() returns.
     pub queue_wait_ms: Option<i32>,
+    /// "{header}:{value}" extracted from the configured
+    /// general_settings.user_tag_header — per-user attribution when one key
+    /// is shared by multiple users. NULL when unconfigured or absent.
+    pub user_tag: Option<String>,
 }
 
 /// Background audit-log writer.
@@ -261,8 +265,8 @@ async fn flush_batch(pool: &PgPool, buffer: &mut Vec<RequestLog>, dropped: &Atom
 
 /// Build and execute a multi-row INSERT via sqlx QueryBuilder.
 ///
-/// Uses `push_values` to construct `VALUES ($1,$2,...), ($26,...), ...` with
-/// 25 placeholders per row. At LOG_BATCH_SIZE=2000, this is 50000 placeholders
+/// Uses `push_values` to construct `VALUES ($1,$2,...), ($27,...), ...` with
+/// 27 placeholders per row. At LOG_BATCH_SIZE=2000, this is 54000 placeholders
 /// — under PG's 65535 protocol limit.
 async fn batch_insert(pool: &PgPool, batch: &[RequestLog]) -> Result<u64, sqlx::Error> {
     use sqlx::QueryBuilder;
@@ -273,7 +277,7 @@ async fn batch_insert(pool: &PgPool, batch: &[RequestLog]) -> Result<u64, sqlx::
           is_stream, status_code, error_type, error_message, \
           input_tokens, output_tokens, duration_ms, deployment_id, client_ip, ttft_ms, \
           cached_tokens, schedule_policy, kv_hit_blocks, kv_input_blocks, \
-          trie_blocks, trie_max_blocks, request_tokens, queue_wait_ms) "
+          trie_blocks, trie_max_blocks, request_tokens, queue_wait_ms, user_tag) "
     );
     qb.push_values(batch.iter(), |mut b, log| {
         b.push_bind(log.request_id.clone())
@@ -301,7 +305,8 @@ async fn batch_insert(pool: &PgPool, batch: &[RequestLog]) -> Result<u64, sqlx::
             .push_bind(log.trie_blocks)
             .push_bind(log.trie_max_blocks)
             .push_bind(log.request_tokens)
-            .push_bind(log.queue_wait_ms);
+            .push_bind(log.queue_wait_ms)
+            .push_bind(log.user_tag.clone());
     });
 
     let result = qb.build().execute(pool).await?;
@@ -335,6 +340,7 @@ pub fn log_error(
     deployment_id: Option<String>,
     request_body: Option<String>,
     client_ip: Option<String>,
+    user_tag: Option<String>,
 ) {
     log_error_with_usage(
         state,
@@ -348,6 +354,7 @@ pub fn log_error(
         deployment_id,
         request_body,
         client_ip,
+        user_tag,
         None,
         None,
     );
@@ -371,6 +378,7 @@ pub fn log_error_with_queue_wait(
     deployment_id: Option<String>,
     request_body: Option<String>,
     client_ip: Option<String>,
+    user_tag: Option<String>,
     queue_wait_ms: Option<i32>,
 ) {
     log_error_with_usage(
@@ -385,6 +393,7 @@ pub fn log_error_with_queue_wait(
         deployment_id,
         request_body,
         client_ip,
+        user_tag,
         None,
         queue_wait_ms,
     );
@@ -413,6 +422,7 @@ pub fn log_auth_error(
     error: &GatewayError,
     request_id: Option<String>,
     client_ip: Option<String>,
+    user_tag: Option<String>,
 ) {
     let key_hash = boom_auth::DbAuthenticator::hash_token(raw_key);
     let identity = AuthIdentity {
@@ -445,6 +455,7 @@ pub fn log_auth_error(
         None,
         None,
         client_ip,
+        user_tag,
         None,
         None,
     );
@@ -481,6 +492,7 @@ pub fn log_error_with_usage(
     deployment_id: Option<String>,
     request_body: Option<String>,
     client_ip: Option<String>,
+    user_tag: Option<String>,
     usage: Option<&Usage>,
     queue_wait_ms: Option<i32>,
 ) {
@@ -538,6 +550,7 @@ pub fn log_error_with_usage(
             trie_max_blocks: None,
             request_tokens: None,
             queue_wait_ms,
+            user_tag,
         },
     );
 

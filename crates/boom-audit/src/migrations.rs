@@ -103,6 +103,11 @@ pub async fn run_request_log_migration(conn: &mut sqlx::PgConnection) -> Result<
     // deployment has no flow control slot (pass-through) or on the
     // error paths that fire before acquire() returns.
     execute_alter(conn, r#"ALTER TABLE boom_request_log ADD COLUMN IF NOT EXISTS queue_wait_ms INTEGER"#).await;
+    // user_tag: "header:value" extracted from the configured
+    // general_settings.user_tag_header — identifies which end user made the
+    // request when a key is shared by multiple users. NULL when the feature
+    // is disabled or the request carried no such header.
+    execute_alter(conn, r#"ALTER TABLE boom_request_log ADD COLUMN IF NOT EXISTS user_tag TEXT"#).await;
     Ok(())
 }
 
