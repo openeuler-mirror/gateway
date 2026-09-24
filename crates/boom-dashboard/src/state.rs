@@ -123,6 +123,15 @@ pub enum AdminCommand {
         timeout_secs: u64,
         reply: oneshot::Sender<Result<u64, String>>,
     },
+    /// Invalidate the authenticator's cached token rows after a dashboard
+    /// write to `boom_verification_token` (update/block/unblock/delete),
+    /// so team reassignment, block, budget or model-list changes take effect
+    /// on the next request instead of waiting out the cache TTL. Fire-and-
+    /// forget: the DB write already succeeded, so a dead channel (boom-main
+    /// shutting down) needs no error surface.
+    InvalidateAuthCache {
+        token_hashes: Vec<String>,
+    },
 }
 
 pub type AdminTx = mpsc::Sender<AdminCommand>;

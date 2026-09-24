@@ -790,7 +790,15 @@ pub async fn update_key(
     .await;
 
     match result {
-        Ok(r) if r.rows_affected() > 0 => Json(json!({"ok": true})).into_response(),
+        Ok(r) if r.rows_affected() > 0 => {
+            let _ = state
+                .admin_tx
+                .send(crate::state::AdminCommand::InvalidateAuthCache {
+                    token_hashes: vec![token_hash.clone()],
+                })
+                .await;
+            Json(json!({"ok": true})).into_response()
+        }
         Ok(_) => (
             axum::http::StatusCode::NOT_FOUND,
             "Key not found",
@@ -827,7 +835,15 @@ pub async fn block_key(
     .await;
 
     match result {
-        Ok(r) if r.rows_affected() > 0 => Json(json!({"ok": true})).into_response(),
+        Ok(r) if r.rows_affected() > 0 => {
+            let _ = state
+                .admin_tx
+                .send(crate::state::AdminCommand::InvalidateAuthCache {
+                    token_hashes: vec![token_hash.clone()],
+                })
+                .await;
+            Json(json!({"ok": true})).into_response()
+        }
         Ok(_) => (
             axum::http::StatusCode::NOT_FOUND,
             "Key not found",
@@ -864,7 +880,15 @@ pub async fn unblock_key(
     .await;
 
     match result {
-        Ok(r) if r.rows_affected() > 0 => Json(json!({"ok": true})).into_response(),
+        Ok(r) if r.rows_affected() > 0 => {
+            let _ = state
+                .admin_tx
+                .send(crate::state::AdminCommand::InvalidateAuthCache {
+                    token_hashes: vec![token_hash.clone()],
+                })
+                .await;
+            Json(json!({"ok": true})).into_response()
+        }
         Ok(_) => (
             axum::http::StatusCode::NOT_FOUND,
             "Key not found",
@@ -921,7 +945,15 @@ pub async fn delete_key(
     .await;
 
     match result {
-        Ok(r) if r.rows_affected() > 0 => Json(json!({"ok": true})).into_response(),
+        Ok(r) if r.rows_affected() > 0 => {
+            let _ = state
+                .admin_tx
+                .send(crate::state::AdminCommand::InvalidateAuthCache {
+                    token_hashes: vec![token_hash.clone()],
+                })
+                .await;
+            Json(json!({"ok": true})).into_response()
+        }
         Ok(_) => (
             axum::http::StatusCode::NOT_FOUND,
             "Key not found",
