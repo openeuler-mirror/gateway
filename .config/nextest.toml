@@ -1,0 +1,17 @@
+# cargo-nextest 配置 — 供 DT 测试（cargo nextest run -p boom-dt）使用。
+# 原有单测仍走 cargo test，不受本文件影响。
+#
+# 本地日常：cargo nextest run -p boom-dt
+# DT 交付：  cargo nextest run -p boom-dt --profile ci   （出 JUnit XML）
+# 覆盖率：  cargo llvm-cov nextest -p boom-dt ...        （见 dt-test/README.md）
+
+[profile.default]
+# DT 用例多为进程内直调，速度快；e2e 型用例可单独放宽
+slow-timeout = { period = "60s", terminate-after = 3 }
+# 失败重试：吸收环境噪声（端口占用、teardown 噪声等）
+retries = 1
+
+[profile.ci]
+[profile.ci.junit]
+# path 相对 nextest 的 report 目录（target/nextest/<profile>/）解析
+path = "junit.xml"
