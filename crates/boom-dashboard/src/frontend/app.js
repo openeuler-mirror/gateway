@@ -3251,7 +3251,9 @@
         <td>${esc(k.key_alias || "-")}${k.key_prefix ? ' <span class="badge badge-prefix">' + esc(k.key_prefix) + "</span>" : ""}${k.tag ? ' <span class="badge badge-tag">' + esc(k.tag) + "</span>" : ""}</td>
         <td>${esc(k.user_id || "-")}</td>
         <td>${renderKeyPlanCell(k)}</td>
-        <td><span class="mono">${k.usage_count || 0}/${fmtTokens(k.usage_tokens)}/${fmtCost(k.usage_cost)}</span><br><span class="muted" style="font-size:11px">${formatCountdown(k.usage_reset_secs || 0)}</span></td>
+        <td>${k.usage_count == null
+              ? '<span class="mono">-/-/-</span>'
+              : `<span class="mono">${k.usage_count}/${fmtTokens(k.usage_tokens)}/${fmtCost(k.usage_cost)}</span><br><span class="muted" style="font-size:11px">${formatCountdown(k.usage_reset_secs || 0)}</span>`}</td>
         <td>${fmtCost(k.spend)}</td>
         <td>${k.max_budget != null ? "$" + k.max_budget : "-"}</td>
         <td>${k.blocked

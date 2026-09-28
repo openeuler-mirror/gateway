@@ -330,14 +330,10 @@ pub async fn list_keys(
 
     let _total_before_filter = rows.len() as i64;
 
-    // Single-pass limiter scan: aggregate usage for all keys at once.
-    let all_usage = state.limiter.get_all_key_usage();
-
     let mut keys: Vec<Value> = rows
         .into_iter()
         .map(|r| {
             let token_prefix = format!("{}...", &r.token[..8.min(r.token.len())]);
-            let (usage_count, usage_reset_secs) = all_usage.get(&r.token).copied().unwrap_or((0, 0));
             // Three-state plan assignment. The frontend distinguishes:
             //   - "default"   → no DB row (follows default_plan at runtime)
             //   - "no_plan"   → row with plan_name IS NULL (explicit opt-out)
@@ -356,38 +352,68 @@ pub async fn list_keys(
                 Some(None) => None,
             };
 
-            // Aggregate current-window tokens & cost from limiter. We pick
-            // the smallest window_secs per kind — that's the "tightest" current
-            // window (typically 60s) and matches what users expect in a usage
-            // snapshot column. Cross-window aggregation would mix limits.
-            let mut tokens_min_secs: Option<(u64, u64, u64)> = None; // (secs, count, remaining)
-            let mut cost_min_secs: Option<(u64, u64, u64)> = None; // (secs, micros, remaining)
-            for w in state.limiter.peek_key_windows(&r.token) {
-                match w.kind {
-                    boom_limiter::WindowKind::Tokens => {
-                        match tokens_min_secs {
-                            None => tokens_min_secs = Some((w.window_secs, w.count, w.remaining_secs)),
-                            Some((s, _, _)) if w.window_secs < s => {
-                                tokens_min_secs = Some((w.window_secs, w.count, w.remaining_secs));
+            // Window usage: all three metrics come from the key's EFFECTIVE
+            // plan windows — the same `__plan__` counters the request path
+            // charges (`{key_hash}:__plan__:{window_secs}`). No effective
+            // plan → nulls (frontend renders "-/-/-").
+            //
+            // Per dimension we report the LARGEST window that limits it (the
+            // primary quota window; smaller same-dimension windows are burst
+            // guards like the 60s rpm shorthand). If a dimension is not
+            // limited, we still report it from the largest plan window —
+            // every counter records all three dimensions, so this yields the
+            // actual usage inside the plan's window instead of a misleading 0.
+            let (usage_count, usage_tokens, usage_cost_micros, usage_reset_secs) =
+                match state.plan_store.resolve_effective_key_plan(&r.token) {
+                    None => (None, None, None, 0u64),
+                    Some(plan) => {
+                        let windows = state.limiter.peek_plan_window_usage(&r.token);
+                        let (_, effective, _) = plan.effective_limits();
+                        let mut dim_secs: [Option<u64>; 3] = [None, None, None]; // counts/tokens/cost
+                        let mut max_secs: Option<u64> = None;
+                        for w in &effective {
+                            if w.counts.is_some() {
+                                dim_secs[0] = Some(dim_secs[0].map_or(w.window_secs, |s| s.max(w.window_secs)));
                             }
-                            _ => {}
-                        }
-                    }
-                    boom_limiter::WindowKind::CostMicros => {
-                        match cost_min_secs {
-                            None => cost_min_secs = Some((w.window_secs, w.count, w.remaining_secs)),
-                            Some((s, _, _)) if w.window_secs < s => {
-                                cost_min_secs = Some((w.window_secs, w.count, w.remaining_secs));
+                            if w.tokens.is_some() {
+                                dim_secs[1] = Some(dim_secs[1].map_or(w.window_secs, |s| s.max(w.window_secs)));
                             }
-                            _ => {}
+                            if w.costs.is_some() {
+                                dim_secs[2] = Some(dim_secs[2].map_or(w.window_secs, |s| s.max(w.window_secs)));
+                            }
+                            max_secs = Some(max_secs.map_or(w.window_secs, |s| s.max(w.window_secs)));
                         }
+                        let fallback = max_secs;
+                        let pick = |secs: Option<u64>, dim: usize| -> (Option<u64>, u64) {
+                            let secs = match secs.or(fallback) {
+                                Some(s) => s,
+                                // Plan defines no windows at all (only
+                                // concurrency/total limits) — nothing is
+                                // recorded under __plan__.
+                                None => return (Some(0), 0),
+                            };
+                            match windows.iter().find(|w| w.window_secs == secs) {
+                                Some(w) => {
+                                    let v = match dim {
+                                        0 => w.counts,
+                                        1 => w.tokens,
+                                        _ => w.costs_micros,
+                                    };
+                                    (Some(v), w.window_secs.saturating_sub(w.elapsed_secs))
+                                }
+                                // Window never created (no traffic yet).
+                                None => (Some(0), 0),
+                            }
+                        };
+                        let (c, c_reset) = pick(dim_secs[0], 0);
+                        let (t, t_reset) = pick(dim_secs[1], 1);
+                        let (m, m_reset) = pick(dim_secs[2], 2);
+                        (c, t, m, c_reset.max(t_reset).max(m_reset))
                     }
-                }
-            }
-            let usage_tokens = tokens_min_secs.map(|(_, c, _)| c).unwrap_or(0);
-            let usage_cost_micros = cost_min_secs.map(|(_, c, _)| c).unwrap_or(0);
-            let usage_cost = rust_decimal::Decimal::from(usage_cost_micros)
-                / rust_decimal::Decimal::from(1_000_000);
+                };
+            let usage_cost = usage_cost_micros.map(|micros| {
+                rust_decimal::Decimal::from(micros) / rust_decimal::Decimal::from(1_000_000)
+            });
 
             // Cumulative total cost across the key's lifetime — comes from
             // limiter.cumulative (boom_rate_limit_cumulative backed), NOT
@@ -426,7 +452,7 @@ pub async fn list_keys(
                 "usage_count": usage_count,
                 "usage_reset_secs": usage_reset_secs,
                 "usage_tokens": usage_tokens,
-                "usage_cost": usage_cost.to_string(),
+                "usage_cost": usage_cost.map(|d| d.to_string()),
                 "plan_name": plan_name,
                 "plan_assignment_kind": plan_assignment_kind,
             })
