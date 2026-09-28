@@ -12,7 +12,8 @@ testcase/
 │   ├── 02-invocation.md 模型调用（协议、流式、模型列表、兜底路由）
 │   ├── 03-billing.md    计费对账（usage、单价、成本累计）
 │   ├── 04-quota.md      配额与限流（RPM/TPM/终身额度、时段计划、恢复）
-│   └── 05-admin.md      运维管理（key 管理、套餐分配、日志、热加载）
+│   ├── 05-admin.md      运维管理（key 管理、套餐分配、日志、热加载）
+│   └── 06-scheduling.md 调度策略（round_robin / key_affinity / kvc_aware）
 └── roles/             角色视图（用例引用，不重复内容）
     └── trial-user.md    前期试用者
 ```
