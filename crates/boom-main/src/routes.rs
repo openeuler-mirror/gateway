@@ -618,13 +618,30 @@ async fn chat_completions_inner(
 
     tracing::info!(request_id = %request_id, model = %model, stream = is_stream, path = api_path, "chat_completions request started");
 
+    // Shared request-body Value — ONE serialization serves the client
+    // blocklist check and the prompt log. Skipped entirely when neither is
+    // armed (no rules / switch off / key not sampled) so the blocklist costs
+    // nothing on deployments that don't use it.
+    let prompt_log_should = state.prompt_log_writer.should_capture(
+        &identity.key_hash,
+        identity.team_id.as_deref(),
+    );
+    let blocklist_armed =
+        state.block_rule_store.is_enabled() && !state.block_rule_store.is_empty();
+    let req_body_value: Option<Arc<serde_json::Value>> =
+        if blocklist_armed || prompt_log_should {
+            serde_json::to_value(&req).ok().map(Arc::new)
+        } else {
+            None
+        };
+
     // Client blocklist — before any routing/limit work. Fail-open on body
     // serialization failure (schema validation rejects the request anyway).
     check_client_block_rules(
         &state,
         &identity,
         headers,
-        serde_json::to_value(&req).ok(),
+        if blocklist_armed { req_body_value.clone() } else { None },
         &model,
         api_path,
         is_stream,
@@ -635,11 +652,6 @@ async fn chat_completions_inner(
     )
     .map_err(|e| GatewayErrorReply(e, is_stream))?;
 
-    // Prompt log: check early to avoid unnecessary cloning.
-    let prompt_log_should = state.prompt_log_writer.should_capture(
-        &identity.key_hash,
-        identity.team_id.as_deref(),
-    );
     // Raw exchange capture channel — handed to the provider via the request
     // side channel; the provider records the exact bytes it sends/receives.
     let prompt_log_raw_capture = if prompt_log_should
@@ -652,7 +664,7 @@ async fn chat_completions_inner(
         None
     };
     let prompt_log_req_body = if prompt_log_should {
-        serde_json::to_value(&req).ok().map(Arc::new)
+        req_body_value
     } else {
         None
     };
@@ -1707,15 +1719,17 @@ fn is_model_visible(name: &str, identity: &AuthIdentity, router: &Router) -> boo
 ///   whitelist
 /// - response: 403 (or the rule's configured status) with the rule's message
 ///
-/// `body` is the serialized request JSON (`serde_json::to_value(&req)`);
-/// None (serialization failure) skips the check — the request then fails
-/// naturally at schema validation.
+/// `body` is the serialized request JSON, shared with the prompt log's
+/// request capture (ONE `serde_json::to_value(&req)` per request, gated on
+/// blocklist-armed || prompt-log-sampled at the call sites — zero cost when
+/// neither applies). None (serialization failure) skips the check — the
+/// request then fails naturally at schema validation.
 #[allow(clippy::too_many_arguments)]
 fn check_client_block_rules(
     state: &AppState,
     identity: &AuthIdentity,
     headers: &axum::http::HeaderMap,
-    body: Option<serde_json::Value>,
+    body: Option<Arc<serde_json::Value>>,
     model: &str,
     api_path: &str,
     is_stream: bool,
@@ -1799,13 +1813,13 @@ fn check_client_block_rules(
         });
     }
 
-    // Prompt log — forced full capture, bypasses key sampling.
-    let body_arc = Arc::new(body);
+    // Prompt log — forced full capture, bypasses key sampling. The body Arc
+    // is shared with the caller's prompt-log capture, no extra copy.
     let header_snapshot = snapshot_prompt_log_headers(state, headers);
     write_prompt_log_error(
         state,
         true,
-        Some(&body_arc),
+        Some(&body),
         None,
         request_id,
         identity,
@@ -3093,13 +3107,29 @@ pub async fn messages(
 
     tracing::info!(request_id = %request_id, model = %model, stream = is_stream, "messages request started");
 
-    // Client blocklist — before openai conversion, matching against the
-    // native Anthropic body (model / system / messages all addressable).
+    // Shared request-body Value — ONE serialization of the native Anthropic
+    // body serves the blocklist check and the prompt log; zero when neither
+    // is armed. See the chat_completions path for the rationale.
+    let prompt_log_should = state.prompt_log_writer.should_capture(
+        &identity.key_hash,
+        identity.team_id.as_deref(),
+    );
+    let blocklist_armed =
+        state.block_rule_store.is_enabled() && !state.block_rule_store.is_empty();
+    let req_body_value: Option<Arc<serde_json::Value>> =
+        if blocklist_armed || prompt_log_should {
+            serde_json::to_value(&req).ok().map(Arc::new)
+        } else {
+            None
+        };
+
+    // Client blocklist — matching against the native Anthropic body
+    // (model / system / messages all addressable).
     check_client_block_rules(
         &state,
         &identity,
         &headers,
-        serde_json::to_value(&req).ok(),
+        if blocklist_armed { req_body_value.clone() } else { None },
         &model,
         "/v1/messages",
         is_stream,
@@ -3110,11 +3140,6 @@ pub async fn messages(
     )
     .map_err(|e| AnthropicErrorReply(e, is_stream))?;
 
-    // Prompt log: check early to avoid unnecessary cloning.
-    let prompt_log_should = state.prompt_log_writer.should_capture(
-        &identity.key_hash,
-        identity.team_id.as_deref(),
-    );
     let prompt_log_capture_raw = prompt_log_should && state.prompt_log_writer.config().capture_raw_upstream;
     let prompt_log_raw_capture = if prompt_log_capture_raw {
         Some(std::sync::Arc::new(
@@ -3124,7 +3149,7 @@ pub async fn messages(
         None
     };
     let prompt_log_req_body = if prompt_log_should {
-        serde_json::to_value(&req).ok().map(Arc::new)
+        req_body_value
     } else {
         None
     };
