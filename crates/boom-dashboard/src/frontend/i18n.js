@@ -47,6 +47,7 @@
 
       "blockrules.add": "+ New Rule",
       "blockrules.hint": "Reject requests from specific agent clients by headers / body fields / prompt content. Ops lever, not a security boundary.",
+      "blockrules.switch_off": "Rule saved, but the client blocklist switch is OFF — enable it on this card and save to activate the rule.",
       "blockrules.empty": "No rules configured.",
       "blockrules.col.name": "Rule Name",
       "blockrules.col.enabled": "Enabled",
@@ -1018,6 +1019,7 @@
 
       "blockrules.add": "+ 新建规则",
       "blockrules.hint": "按请求头 / 请求体字段 / 提示词内容拒绝特定 agent 客户端的请求。运维手段，不是安全边界。",
+      "blockrules.switch_off": "规则已保存，但客户端拦截的全局开关未开启——请在本卡片上勾选启用并保存后才会生效。",
       "blockrules.empty": "暂无规则。",
       "blockrules.col.name": "规则名",
       "blockrules.col.enabled": "启用",

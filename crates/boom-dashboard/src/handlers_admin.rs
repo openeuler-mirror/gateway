@@ -2272,6 +2272,7 @@ pub async fn create_client_block_rule(
     Json(json!({
         "ok": true,
         "name": rule.name,
+        "blocklist_enabled": state.block_rule_store.is_enabled(),
         "warning": yaml_warning,
     }))
     .into_response()
@@ -2304,7 +2305,12 @@ pub async fn update_client_block_rule(
     match state.block_rule_store.update_db(db_pool, &rule_name, &input).await {
         Ok(true) => {
             let yaml_warning = state.persist_yaml_with_reply().await.err();
-            Json(json!({"ok": true, "warning": yaml_warning})).into_response()
+            Json(json!({
+                "ok": true,
+                "blocklist_enabled": state.block_rule_store.is_enabled(),
+                "warning": yaml_warning,
+            }))
+            .into_response()
         }
         Ok(false) => Json(json!({"error": "Rule not found"})).into_response(),
         Err(e) => {

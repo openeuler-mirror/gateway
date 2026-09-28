@@ -3947,13 +3947,17 @@
         action: { message, status, code },
       });
       try {
+        let resp;
         if (isEdit) {
-          await api(`/admin/client-block-rules/${encodeURIComponent(rule.name)}`, { method: "PUT", body, skipConfirm: true });
+          resp = await api(`/admin/client-block-rules/${encodeURIComponent(rule.name)}`, { method: "PUT", body, skipConfirm: true });
         } else {
-          await api("/admin/client-block-rules", { method: "POST", body, skipConfirm: true });
+          resp = await api("/admin/client-block-rules", { method: "POST", body, skipConfirm: true });
         }
         hideModal();
         await loadBlockRules();
+        if (resp && resp.blocklist_enabled === false) {
+          alert(t("blockrules.switch_off"));
+        }
       } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
     });
   }
@@ -4342,8 +4346,9 @@
   }
 
   function renderCardBlockRules(cb) {
-    // Absent YAML section = blocklist globally off (build_block_rules_from_config).
-    const enabled = !!cb && cb.enabled !== false;
+    // Match the backend exactly: an absent YAML section leaves the switch OFF
+    // (build_block_rules_from_config) — only an explicit enabled: true is ON.
+    const enabled = !!cb && cb.enabled === true;
     return `<div class="form-card" data-section="client_blocklist">
       <div class="form-card-title">${t("config.section.client_blocklist")}</div>
       <div class="form-card-grid">

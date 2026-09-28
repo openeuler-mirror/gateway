@@ -884,7 +884,7 @@ impl AppState {
             Err(e) => return Err(format!("build snapshot from DB: {}", e)),
         };
 
-        if let Err(e) = merge_runtime_sections(&mut root, &snapshot) {
+        if let Err(e) = merge_runtime_sections(&mut root, &snapshot, self.block_rule_store.is_enabled()) {
             return Err(format!("merge runtime sections: {}", e));
         }
 
@@ -937,9 +937,13 @@ impl AppState {
 
 /// Merge runtime-derived sections (model_list, aliases, plans) from a JSON
 /// snapshot into the raw YAML value. Singleton sections are preserved as-is.
+/// `blocklist_enabled` is the running gateway's blocklist switch, materialized
+/// into the YAML when the section carries no explicit `enabled` (see the
+/// client_blocklist block below).
 fn merge_runtime_sections(
     root: &mut serde_yaml::Value,
     snapshot: &serde_json::Value,
+    blocklist_enabled: bool,
 ) -> Result<(), String> {
     let obj = snapshot
         .as_object()
@@ -970,12 +974,26 @@ fn merge_runtime_sections(
         }
     }
 
-    // Client blocklist: only the rules array is runtime state; `enabled` is a
-    // singleton scalar and stays whatever the YAML says.
+    // Client blocklist: only the rules array is runtime state. An explicit
+    // `enabled` in the YAML is preserved (the operator may have edited it
+    // without a reload). But when this merge just created the section (web
+    // CRUD persist on a config that had none), materialize the running
+    // gateway's switch — otherwise the section would parse with the serde
+    // default (enabled: true) and a restart would silently activate rules
+    // the operator never turned on.
     if let Some(rules) = obj.get("client_blocklist").and_then(|c| c.get("rules")) {
         let yaml_val = json_to_yaml(rules)?;
         boom_config::set_yaml_path(root, &["client_blocklist", "rules"], yaml_val)
             .map_err(|e| format!("set client_blocklist.rules: {}", e))?;
+        if root
+            .get("client_blocklist")
+            .and_then(|c| c.get("enabled"))
+            .is_none()
+        {
+            let yaml_enabled = json_to_yaml(&serde_json::Value::Bool(blocklist_enabled))?;
+            boom_config::set_yaml_path(root, &["client_blocklist", "enabled"], yaml_enabled)
+                .map_err(|e| format!("set client_blocklist.enabled: {}", e))?;
+        }
     }
 
     // Strip the deprecated general_settings.public_models list. Visibility is
@@ -2115,8 +2133,9 @@ async fn build_config_snapshot_value(pool: &PgPool) -> Result<serde_json::Value,
     }
 
     // ── Client blocklist rules (delegated to BlockRuleStore) ──
-    // `enabled` is a singleton scalar — merge_runtime_sections preserves the
-    // YAML's existing value; only the rules array is rebuilt from DB.
+    // Only the rules array is rebuilt from DB. `enabled` is not part of the
+    // snapshot: merge_runtime_sections preserves an explicit YAML value and
+    // materializes the running switch when the YAML has none.
     let block_rule_rows = boom_gatekeeper::BlockRuleStore::list_all_db(pool).await?;
     let block_rules: Vec<serde_json::Value> = block_rule_rows
         .iter()
@@ -2146,4 +2165,51 @@ async fn build_config_snapshot_value(pool: &PgPool) -> Result<serde_json::Value,
             "rules": block_rules,
         },
     }))
+}
+
+#[cfg(test)]
+mod merge_runtime_sections_tests {
+    use super::merge_runtime_sections;
+
+    fn snapshot_with_rules() -> serde_json::Value {
+        serde_json::json!({
+            "client_blocklist": {
+                "rules": [
+                    {
+                        "name": "r1",
+                        "enabled": true,
+                        "conditions": [{"field": "body", "op": "contains", "value": "x"}],
+                        "action": {"message": "blocked"}
+                    }
+                ]
+            }
+        })
+    }
+
+    fn parse(yaml: &str) -> serde_yaml::Value {
+        serde_yaml::from_str(yaml).expect("parse yaml")
+    }
+
+    #[test]
+    fn materializes_enabled_when_merge_creates_the_section() {
+        // Config had no client_blocklist section; a web CRUD persist is about
+        // to create it. The running switch is off — the YAML must record
+        // that, or a restart would parse the new section with the serde
+        // default (true) and silently activate the rules.
+        let mut root = parse("model_list: []\n");
+        merge_runtime_sections(&mut root, &snapshot_with_rules(), false).expect("merge");
+        let bl = root.get("client_blocklist").expect("section created");
+        assert_eq!(bl.get("enabled"), Some(&serde_yaml::Value::Bool(false)));
+        assert!(bl.get("rules").is_some());
+    }
+
+    #[test]
+    fn preserves_explicit_enabled_in_yaml() {
+        // Operator wrote enabled: true by hand (no reload yet). The merge must
+        // not stomp it with the (stale) running switch value.
+        let mut root = parse("client_blocklist:\n  enabled: true\n");
+        merge_runtime_sections(&mut root, &snapshot_with_rules(), false).expect("merge");
+        let bl = root.get("client_blocklist").expect("section kept");
+        assert_eq!(bl.get("enabled"), Some(&serde_yaml::Value::Bool(true)));
+    }
 }
