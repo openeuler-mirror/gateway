@@ -80,6 +80,27 @@ pub enum PreAuthAction {
 pub struct PreAuthResponse {
     #[serde(flatten)]
     pub action: PreAuthAction,
+    /// Custom HTTP headers the hook wants attached to the request, e.g.
+    /// `{"X-User-Tag": "alice"}`.
+    ///
+    /// Applied by the gateway for every non-rejecting action (Continue /
+    /// Replace / ReplaceModel): the entries become ordinary request headers
+    /// (insert semantics — they override client-sent values of the same
+    /// name) and flow through the exact same downstream handling as
+    /// client-sent headers, including the user_tag audit attribution,
+    /// prompt-log header capture, and the deployment client-header
+    /// whitelist for upstream forwarding. Hard-blocked names
+    /// (`authorization`, `x-gateway-*`, …) still never reach the upstream.
+    ///
+    /// Ignored on `Reject` (the request never proceeds) and never partially
+    /// applied when the hook call itself fails (panic / overflow → the
+    /// gateway's failure_mode fallback runs with no headers attached).
+    ///
+    /// JSON objects cannot carry duplicate keys, so per-name multiplicity
+    /// is not expressible on this wire — the last value wins, matching the
+    /// gateway's insert semantics.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub headers: HashMap<String, String>,
 }
 
 /// Errors a hook implementation can produce.
@@ -142,6 +163,7 @@ pub fn hash_key(key: &str) -> String {
 ///         // user logic here
 ///         Ok(boom_hooks_sdk::PreAuthResponse {
 ///             action: boom_hooks_sdk::PreAuthAction::Continue,
+///             headers: std::collections::HashMap::new(),
 ///         })
 ///     })
 /// }
@@ -205,6 +227,7 @@ where
                         HookError::Internal(r) => r.clone(),
                     },
                 },
+                headers: HashMap::new(),
             };
             if let Ok(json) = serde_json::to_vec(&resp) {
                 if json.len() <= out_cap as usize {
@@ -293,6 +316,7 @@ mod tests {
             action: PreAuthAction::Replace {
                 new_key: "sk-internal".into(),
             },
+            headers: HashMap::new(),
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains(r#""action":"replace""#));
@@ -300,6 +324,7 @@ mod tests {
 
         let resp2 = PreAuthResponse {
             action: PreAuthAction::Continue,
+            headers: HashMap::new(),
         };
         assert_eq!(
             serde_json::to_string(&resp2).unwrap(),
@@ -314,6 +339,7 @@ mod tests {
                 new_key: "sk-internal".into(),
                 new_model: "gpt-4-real".into(),
             },
+            headers: HashMap::new(),
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains(r#""action":"replace_model""#), "json={json}");
@@ -328,6 +354,72 @@ mod tests {
                 assert_eq!(new_model, "gpt-4-real");
             }
             other => panic!("expected ReplaceModel, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pre_auth_response_headers_roundtrip() {
+        let mut headers = HashMap::new();
+        headers.insert("X-User-Tag".to_string(), "alice".to_string());
+        let resp = PreAuthResponse {
+            action: PreAuthAction::Continue,
+            headers,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains(r#""action":"continue""#), "json={json}");
+        assert!(json.contains(r#""X-User-Tag":"alice""#), "json={json}");
+
+        let parsed: PreAuthResponse = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed.action, PreAuthAction::Continue));
+        assert_eq!(
+            parsed.headers.get("X-User-Tag").map(String::as_str),
+            Some("alice")
+        );
+    }
+
+    /// Old hook (never writes `headers`) + new gateway: the field defaults
+    /// to an empty map, and a no-header response serializes byte-identical
+    /// to the old wire format.
+    #[test]
+    fn pre_auth_response_without_headers_stays_wire_compatible() {
+        let parsed: PreAuthResponse = serde_json::from_str(r#"{"action":"continue"}"#).unwrap();
+        assert!(matches!(parsed.action, PreAuthAction::Continue));
+        assert!(parsed.headers.is_empty());
+
+        let resp = PreAuthResponse {
+            action: PreAuthAction::Continue,
+            headers: HashMap::new(),
+        };
+        assert_eq!(
+            serde_json::to_string(&resp).unwrap(),
+            r#"{"action":"continue"}"#
+        );
+    }
+
+    /// New hook (writes `headers`) + old gateway whose PreAuthResponse has
+    /// no such field: the unknown key lands in the flattened internally-
+    /// tagged enum's buffered content and is ignored by the variant — both
+    /// for unit variants (Continue) and struct variants (Replace).
+    #[test]
+    fn pre_auth_response_with_headers_parses_into_legacy_struct() {
+        #[derive(Debug, serde::Deserialize)]
+        struct LegacyPreAuthResponse {
+            #[serde(flatten)]
+            action: PreAuthAction,
+        }
+
+        let parsed: LegacyPreAuthResponse =
+            serde_json::from_str(r#"{"action":"continue","headers":{"X-User-Tag":"alice"}}"#)
+                .unwrap();
+        assert!(matches!(parsed.action, PreAuthAction::Continue));
+
+        let parsed: LegacyPreAuthResponse = serde_json::from_str(
+            r#"{"action":"replace","new_key":"sk-x","headers":{"X-User-Tag":"alice"}}"#,
+        )
+        .unwrap();
+        match parsed.action {
+            PreAuthAction::Replace { new_key } => assert_eq!(new_key, "sk-x"),
+            other => panic!("expected Replace, got {other:?}"),
         }
     }
 
@@ -391,6 +483,7 @@ mod tests {
         let (rc, body) = run_pre_auth(req, |_| {
             Ok(PreAuthResponse {
                 action: PreAuthAction::Continue,
+                headers: HashMap::new(),
             })
         });
         assert_eq!(rc, return_codes::OK);
@@ -410,6 +503,7 @@ mod tests {
                 action: PreAuthAction::Replace {
                     new_key: format!("sk-prefix-{}", r.raw_key),
                 },
+                headers: HashMap::new(),
             })
         });
         assert_eq!(rc, return_codes::OK);
@@ -476,6 +570,7 @@ mod tests {
             &mut out_len,
             |_| Ok(PreAuthResponse {
                 action: PreAuthAction::Continue,
+                headers: HashMap::new(),
             }),
         );
         assert_eq!(rc, return_codes::INTERNAL);

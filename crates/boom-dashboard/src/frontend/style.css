@@ -1485,6 +1485,23 @@ div[id$="-table-wrap"]:not(.bare) > table > thead:first-child > tr:first-child >
 .form-card-grid .field-full select,
 .form-card-grid .field-full textarea { width: 100%; }
 
+/* ── Block-rule condition editor (one condition per row) ── */
+/* field (mono, widest — header.<name> / body.<pointer>) | op select |
+   value (mono) | delete. Wraps to stacked on narrow modal widths. */
+.blockrule-cond-row {
+  display: grid;
+  grid-template-columns: minmax(140px, 1.2fr) minmax(90px, auto) minmax(120px, 1fr) auto;
+  gap: 6px;
+  align-items: center;
+  margin-bottom: 6px;
+}
+.blockrule-cond-row input.brc-field,
+.blockrule-cond-row input.brc-value { font-family: var(--mono-font, monospace); font-size: 12px; width: 100%; }
+.blockrule-cond-row select.brc-op { width: 100%; }
+.blockrule-cond-row .brc-del { white-space: nowrap; }
+#br-conds { display: flex; flex-direction: column; margin-bottom: 8px; }
+#br-add-cond { align-self: flex-start; }
+
 /* ── Window-limits editor (one parameter per row, in Plan modal) ── */
 /* Fixed at exactly one entry per plan / per schedule slot — matches the
    backend's effective_limits() logic which reads window_limits[0]. Each

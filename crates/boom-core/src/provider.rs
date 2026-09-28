@@ -302,6 +302,15 @@ pub trait Authenticator: KeyAliasLookup {
 
     /// Check if the identity can access the given model.
     fn check_model_access(&self, identity: &AuthIdentity, model: &str) -> Result<(), GatewayError>;
+
+    /// Invalidate the cached token row for a key hash, so the next request
+    /// re-reads the row from the database. Called after dashboard writes to
+    /// the token table (update/block/unblock/delete). Default no-op — only
+    /// caching implementations override.
+    async fn invalidate_key(&self, _key_hash: &str) {}
+
+    /// Invalidate every cached token row. Default no-op.
+    async fn invalidate_all(&self) {}
 }
 
 /// Deployment — a single model deployment configuration.

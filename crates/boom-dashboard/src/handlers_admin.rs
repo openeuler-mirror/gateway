@@ -790,7 +790,15 @@ pub async fn update_key(
     .await;
 
     match result {
-        Ok(r) if r.rows_affected() > 0 => Json(json!({"ok": true})).into_response(),
+        Ok(r) if r.rows_affected() > 0 => {
+            let _ = state
+                .admin_tx
+                .send(crate::state::AdminCommand::InvalidateAuthCache {
+                    token_hashes: vec![token_hash.clone()],
+                })
+                .await;
+            Json(json!({"ok": true})).into_response()
+        }
         Ok(_) => (
             axum::http::StatusCode::NOT_FOUND,
             "Key not found",
@@ -827,7 +835,15 @@ pub async fn block_key(
     .await;
 
     match result {
-        Ok(r) if r.rows_affected() > 0 => Json(json!({"ok": true})).into_response(),
+        Ok(r) if r.rows_affected() > 0 => {
+            let _ = state
+                .admin_tx
+                .send(crate::state::AdminCommand::InvalidateAuthCache {
+                    token_hashes: vec![token_hash.clone()],
+                })
+                .await;
+            Json(json!({"ok": true})).into_response()
+        }
         Ok(_) => (
             axum::http::StatusCode::NOT_FOUND,
             "Key not found",
@@ -864,7 +880,15 @@ pub async fn unblock_key(
     .await;
 
     match result {
-        Ok(r) if r.rows_affected() > 0 => Json(json!({"ok": true})).into_response(),
+        Ok(r) if r.rows_affected() > 0 => {
+            let _ = state
+                .admin_tx
+                .send(crate::state::AdminCommand::InvalidateAuthCache {
+                    token_hashes: vec![token_hash.clone()],
+                })
+                .await;
+            Json(json!({"ok": true})).into_response()
+        }
         Ok(_) => (
             axum::http::StatusCode::NOT_FOUND,
             "Key not found",
@@ -921,7 +945,15 @@ pub async fn delete_key(
     .await;
 
     match result {
-        Ok(r) if r.rows_affected() > 0 => Json(json!({"ok": true})).into_response(),
+        Ok(r) if r.rows_affected() > 0 => {
+            let _ = state
+                .admin_tx
+                .send(crate::state::AdminCommand::InvalidateAuthCache {
+                    token_hashes: vec![token_hash.clone()],
+                })
+                .await;
+            Json(json!({"ok": true})).into_response()
+        }
         Ok(_) => (
             axum::http::StatusCode::NOT_FOUND,
             "Key not found",
@@ -2130,6 +2162,190 @@ pub async fn delete_alias(
         Ok(false) => Json(json!({"error": "Alias not found"})).into_response(),
         Err(e) => {
             tracing::error!("Dashboard delete_alias failed: {}", e);
+            Json(json!({"error": "Internal error"})).into_response()
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+// Client Blocklist Rules
+// ═══════════════════════════════════════════════════════════
+
+#[derive(Deserialize)]
+pub struct BlockRuleRequest {
+    pub name: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub conditions: Vec<boom_gatekeeper::ConfigMatchCondition>,
+    pub action: boom_gatekeeper::ConfigBlockAction,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl BlockRuleRequest {
+    fn into_input(self) -> boom_gatekeeper::BlockRuleInput {
+        boom_gatekeeper::BlockRuleInput {
+            name: self.name,
+            enabled: self.enabled,
+            conditions: self.conditions,
+            action: self.action,
+        }
+    }
+}
+
+pub async fn list_client_block_rules(
+    _session: AdminSession,
+    Extension(state): Extension<std::sync::Arc<DashboardState>>,
+) -> Response {
+    let db_pool = match &state.db_pool {
+        Some(pool) => pool,
+        None => {
+            return Json(json!({"error": "Database not available"})).into_response();
+        }
+    };
+
+    let rows = match boom_gatekeeper::BlockRuleStore::list_all_db(db_pool).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("Dashboard list_client_block_rules query failed: {}", e);
+            return Json(json!({"error": "Internal error"})).into_response();
+        }
+    };
+
+    let rules: Vec<Value> = rows
+        .into_iter()
+        .map(|r| {
+            json!({
+                "name": r.rule_name,
+                "enabled": r.enabled.unwrap_or(true),
+                "conditions": r.conditions.unwrap_or(Value::Array(vec![])),
+                "action": r.action.unwrap_or(Value::Null),
+                "source": r.source,
+                "updated_at": r.updated_at.map(|d| d.to_string()),
+            })
+        })
+        .collect();
+
+    Json(json!({
+        "rules": rules,
+        "blocklist_enabled": state.block_rule_store.is_enabled(),
+    }))
+    .into_response()
+}
+
+pub async fn create_client_block_rule(
+    _session: AdminSession,
+    Extension(state): Extension<std::sync::Arc<DashboardState>>,
+    Json(req): Json<BlockRuleRequest>,
+) -> Response {
+    let db_pool = match &state.db_pool {
+        Some(pool) => pool,
+        None => {
+            return Json(json!({"error": "Database not available"})).into_response();
+        }
+    };
+
+    // Validate (regex compile, non-empty conditions, field syntax, status
+    // range) BEFORE writing — a rule that would be skipped at load time must
+    // not look saved. 400 with the compile error.
+    let input = req.into_input();
+    let rule = boom_gatekeeper::ConfigBlockRule {
+        name: input.name.clone(),
+        enabled: input.enabled,
+        conditions: input.conditions.clone(),
+        action: input.action.clone(),
+    };
+    if let Err(e) = boom_gatekeeper::BlockRuleStore::compile_rule(&rule) {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response();
+    }
+
+    if let Err(e) = state.block_rule_store.create_db(db_pool, &input).await {
+        tracing::error!("Dashboard create_client_block_rule failed: {}", e);
+        return Json(json!({"error": "Internal error"})).into_response();
+    }
+
+    tracing::info!(rule = %rule.name, "Client block rule created");
+    let yaml_warning = state.persist_yaml_with_reply().await.err();
+    Json(json!({
+        "ok": true,
+        "name": rule.name,
+        "blocklist_enabled": state.block_rule_store.is_enabled(),
+        "warning": yaml_warning,
+    }))
+    .into_response()
+}
+
+pub async fn update_client_block_rule(
+    _session: AdminSession,
+    Extension(state): Extension<std::sync::Arc<DashboardState>>,
+    Path(rule_name): Path<String>,
+    Json(req): Json<BlockRuleRequest>,
+) -> Response {
+    let db_pool = match &state.db_pool {
+        Some(pool) => pool,
+        None => {
+            return Json(json!({"error": "Database not available"})).into_response();
+        }
+    };
+
+    let input = req.into_input();
+    let rule = boom_gatekeeper::ConfigBlockRule {
+        name: input.name.clone(),
+        enabled: input.enabled,
+        conditions: input.conditions.clone(),
+        action: input.action.clone(),
+    };
+    if let Err(e) = boom_gatekeeper::BlockRuleStore::compile_rule(&rule) {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response();
+    }
+
+    match state.block_rule_store.update_db(db_pool, &rule_name, &input).await {
+        Ok(true) => {
+            let yaml_warning = state.persist_yaml_with_reply().await.err();
+            Json(json!({
+                "ok": true,
+                "blocklist_enabled": state.block_rule_store.is_enabled(),
+                "warning": yaml_warning,
+            }))
+            .into_response()
+        }
+        Ok(false) => Json(json!({"error": "Rule not found"})).into_response(),
+        Err(e) => {
+            tracing::error!("Dashboard update_client_block_rule failed: {}", e);
+            Json(json!({"error": "Internal error"})).into_response()
+        }
+    }
+}
+
+pub async fn delete_client_block_rule(
+    _session: AdminSession,
+    Extension(state): Extension<std::sync::Arc<DashboardState>>,
+    Path(rule_name): Path<String>,
+) -> Response {
+    let db_pool = match &state.db_pool {
+        Some(pool) => pool,
+        None => {
+            return Json(json!({"error": "Database not available"})).into_response();
+        }
+    };
+
+    match state.block_rule_store.delete_db(db_pool, &rule_name).await {
+        Ok(true) => {
+            tracing::info!(rule = %rule_name, "Client block rule deleted");
+            let yaml_warning = state.persist_yaml_with_reply().await.err();
+            Json(json!({
+                "ok": true,
+                "name": rule_name,
+                "warning": yaml_warning,
+            }))
+            .into_response()
+        }
+        Ok(false) => Json(json!({"error": "Rule not found"})).into_response(),
+        Err(e) => {
+            tracing::error!("Dashboard delete_client_block_rule failed: {}", e);
             Json(json!({"error": "Internal error"})).into_response()
         }
     }

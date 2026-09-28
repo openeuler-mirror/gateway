@@ -34,6 +34,11 @@ pub struct DebugErrorEntry {
     pub upstream_status: Option<u16>,
     pub upstream_body: Option<String>,
     pub request_body: Option<String>,
+    /// Client-block rule match evidence. Shape: `{ "rule": "<name>",
+    /// "conditions": [{ "field", "op", "value", "actual" }] }`. Only set for
+    /// `client_blocked` errors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_rule: Option<serde_json::Value>,
 }
 
 impl DebugErrorStore {

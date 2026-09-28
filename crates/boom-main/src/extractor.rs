@@ -1,6 +1,6 @@
 use crate::hooks::PreAuthOutcome;
 use crate::request_log::log_auth_error;
-use crate::routes::{GatewayErrorReply, extract_client_ip};
+use crate::routes::{GatewayErrorReply, extract_client_ip, extract_user_tag};
 use crate::state::AppState;
 use axum::body::Bytes;
 use axum::extract::{FromRequest, FromRequestParts, Request};
@@ -132,11 +132,27 @@ impl FromRequestParts<AppState> for RequiredAuth {
         // NoHook / Continue → use raw_key. Replace → swap key. ReplaceModel
         // → swap key AND surface new_model to the handler via take_new_model.
         // Reject → 401. Deny → 500.
-        let mut new_model_opt: Option<String> = None;
-        let effective_key = match inner
+        let hook_result = inner
             .hooks
-            .pre_auth(&raw_key, &parts.headers, model_opt.as_deref())
-        {
+            .pre_auth(&raw_key, &parts.headers, model_opt.as_deref());
+
+        // Hook-constructed headers become ordinary request headers —
+        // insert (override) any client-sent same-named value — before any
+        // downstream consumer reads them. From here on they are
+        // indistinguishable from client headers: user_tag attribution,
+        // prompt-log capture, and the deployment client-header whitelist
+        // for upstream forwarding all apply unchanged.
+        apply_hook_headers(&mut parts.headers, &hook_result.headers);
+
+        // Per-user attribution tag (configured header) — extracted AFTER
+        // hook header injection so hook-constructed tags are attributed on
+        // every path, including auth failures (a 401 from a shared key
+        // still shows which user sent it). No-op when user_tag_header is
+        // unconfigured.
+        let user_tag = extract_user_tag(&inner.config.general_settings, &parts.headers);
+
+        let mut new_model_opt: Option<String> = None;
+        let effective_key = match hook_result.outcome {
             PreAuthOutcome::NoHook | PreAuthOutcome::Continue => raw_key,
             PreAuthOutcome::Replace(new_key) => new_key,
             PreAuthOutcome::ReplaceModel { new_key, new_model } => {
@@ -153,6 +169,7 @@ impl FromRequestParts<AppState> for RequiredAuth {
                     &err,
                     Some(Uuid::new_v4().to_string()),
                     client_ip.clone(),
+                    user_tag.clone(),
                 );
                 return Err(GatewayErrorReply(err, false));
             }
@@ -167,6 +184,7 @@ impl FromRequestParts<AppState> for RequiredAuth {
                     &err,
                     Some(Uuid::new_v4().to_string()),
                     client_ip.clone(),
+                    user_tag.clone(),
                 );
                 return Err(GatewayErrorReply(err, false));
             }
@@ -183,6 +201,7 @@ impl FromRequestParts<AppState> for RequiredAuth {
                     &e,
                     Some(Uuid::new_v4().to_string()),
                     client_ip.clone(),
+                    user_tag.clone(),
                 );
                 return Err(GatewayErrorReply(e, false));
             }
@@ -251,6 +270,40 @@ pub async fn buffer_request_body(
     // should use `CachedJson<T>` instead, which reads from extensions).
     let req = axum::http::Request::from_parts(parts, axum::body::Body::default());
     next.run(req).await
+}
+
+/// Apply hook-constructed headers (see `PreAuthResult::headers`) to the
+/// request HeaderMap. Insert semantics: a hook header replaces any
+/// client-sent value of the same (case-insensitive) name — the hook is
+/// admin-installed trusted code, its value is authoritative.
+///
+/// Entries whose name or value fails HTTP validation (bad name syntax,
+/// control characters) are skipped with a warn instead of failing the
+/// request — a broken hook must not 500 every request. Values are
+/// validated with `HeaderValue::from_bytes` (not `from_str`) so
+/// non-ASCII UTF-8 passes as obs-text, matching `extract_user_tag`'s
+/// lossy-decode handling of non-ASCII client values.
+fn apply_hook_headers(
+    headers: &mut axum::http::HeaderMap,
+    hook_headers: &std::collections::HashMap<String, String>,
+) {
+    for (name, value) in hook_headers {
+        let name_res = axum::http::HeaderName::from_bytes(name.as_bytes());
+        let value_res = axum::http::HeaderValue::from_bytes(value.as_bytes());
+        match (name_res, value_res) {
+            (Ok(n), Ok(v)) => {
+                headers.insert(n, v);
+            }
+            (name_res, value_res) => {
+                tracing::warn!(
+                    header = %name,
+                    name_err = ?name_res.err(),
+                    value_err = ?value_res.err(),
+                    "pre_auth hook returned an invalid header, skipping"
+                );
+            }
+        }
+    }
 }
 
 /// Drop-in replacement for `axum::Json<T>` at LLM handler entry points
@@ -363,9 +416,61 @@ fn extract_api_key(parts: &axum::http::request::Parts) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::extract_api_key;
+    use super::{apply_hook_headers, extract_api_key};
     use axum::http::header::HeaderValue;
     use axum::http::Request;
+    use std::collections::HashMap;
+
+    fn hook_headers(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn apply_hook_headers_inserts_new_header() {
+        let mut headers = axum::http::HeaderMap::new();
+        apply_hook_headers(&mut headers, &hook_headers(&[("X-User-Tag", "alice")]));
+        assert_eq!(headers.get("x-user-tag").unwrap(), "alice");
+    }
+
+    #[test]
+    fn apply_hook_headers_overrides_client_header_case_insensitively() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::HeaderName::from_static("x-user-tag"),
+            HeaderValue::from_static("client-claims"),
+        );
+        // Hook uses different casing — must still replace the client value.
+        apply_hook_headers(&mut headers, &hook_headers(&[("X-User-Tag", "hook-truth")]));
+        assert_eq!(headers.get("x-user-tag").unwrap(), "hook-truth");
+        assert_eq!(headers.len(), 1, "no duplicate entry should remain");
+    }
+
+    #[test]
+    fn apply_hook_headers_skips_invalid_name() {
+        let mut headers = axum::http::HeaderMap::new();
+        apply_hook_headers(&mut headers, &hook_headers(&[("Bad Header Name", "v")]));
+        assert!(headers.is_empty());
+    }
+
+    #[test]
+    fn apply_hook_headers_skips_control_chars_in_value() {
+        let mut headers = axum::http::HeaderMap::new();
+        apply_hook_headers(&mut headers, &hook_headers(&[("X-User-Tag", "bad\u{0000}value")]));
+        assert!(headers.is_empty());
+    }
+
+    #[test]
+    fn apply_hook_headers_allows_non_ascii_value() {
+        // CJK values must survive — from_bytes treats them as obs-text,
+        // consistent with extract_user_tag's from_utf8_lossy decode.
+        let mut headers = axum::http::HeaderMap::new();
+        apply_hook_headers(&mut headers, &hook_headers(&[("X-User-Tag", "张三")]));
+        assert_eq!(headers.get("x-user-tag").unwrap().as_bytes(), "张三".as_bytes());
+    }
+
 
     fn extract_from_header(name: &str, value: &str) -> Option<String> {
         let request = Request::builder()

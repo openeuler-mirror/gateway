@@ -239,11 +239,45 @@ impl PromptLogWriter {
     pub async fn shutdown_flush(&self) {}
 }
 
-/// State for an open log file, keyed by `(team, key_hash, phase)`.
+/// State for one open log file.
 struct OpenFile {
     file: tokio::fs::File,
     size: u64,
-    sequence: u64,
+}
+
+/// One aligned generation for a key directory: the request and response
+/// files share the same sequence number and rotate together, so a request
+/// entry and the response entries of the same generation always land in
+/// files with the same `{phase}_{seq:06}` suffix. Pairing them then only
+/// ever needs to look inside one seq (at most two adjacent ones, when
+/// rotation falls between a request and its response).
+///
+/// Phase files open lazily: a generation resumed after a restart (or a phase
+/// not yet written) stays `None` until its first entry arrives.
+struct Generation {
+    seq: u64,
+    request: Option<OpenFile>,
+    response: Option<OpenFile>,
+}
+
+impl Generation {
+    fn phase(&self, phase: LogPhase) -> &Option<OpenFile> {
+        match phase {
+            LogPhase::Request => &self.request,
+            LogPhase::Response => &self.response,
+        }
+    }
+
+    fn phase_mut(&mut self, phase: LogPhase) -> &mut Option<OpenFile> {
+        match phase {
+            LogPhase::Request => &mut self.request,
+            LogPhase::Response => &mut self.response,
+        }
+    }
+}
+
+fn phase_file_name(phase: &str, seq: u64) -> String {
+    format!("{}_{:06}.jsonl", phase, seq)
 }
 
 /// Background writer loop. Each entry is written to one of two phase files
@@ -278,13 +312,19 @@ async fn background_writer_impl(
     #[cfg(feature = "otlp")] otlp: Arc<ArcSwap<Option<Arc<OtelExporter>>>>,
     #[cfg(not(feature = "otlp"))] _otlp: (),
 ) {
-    // "{team_alias}/{key_hash}/{phase}" → open file state
-    let mut open_files: HashMap<String, OpenFile> = HashMap::new();
+    // "{dir}/{team_alias}/{key_hash}" → aligned generation. The key carries
+    // the full path (including dir) so a runtime `dir` change naturally
+    // starts fresh generations in the new directory instead of rotating
+    // files under paths that no longer match the open handles.
+    let mut open_gens: HashMap<PathBuf, Generation> = HashMap::new();
 
     while let Some(entry) = receiver.recv().await {
         let cfg = config.load();
         let base_dir = PathBuf::from(&cfg.dir);
-        let max_bytes = cfg.max_file_size_mb * 1024 * 1024;
+        // Clamp to >=1MB: an explicit `max_file_size_mb: 0` would satisfy the
+        // rotation predicate on every write and rotate once per line (one
+        // file + one compress spawn per request).
+        let max_bytes = cfg.max_file_size_mb.max(1) * 1024 * 1024;
         #[cfg(feature = "otlp")]
         let otlp_enabled = cfg.otlp.enabled;
         drop(cfg); // release config guard
@@ -316,8 +356,6 @@ async fn background_writer_impl(
             LogPhase::Response => "response",
         };
         let key_dir = base_dir.join(team_dir_name).join(&entry.key_hash);
-        // Map key for open_files: use team_alias/key_hash/phase as composite key.
-        let file_key = format!("{}/{}/{}", team_dir_name, entry.key_hash, phase_name);
 
         // Ensure directory exists.
         if let Err(e) = tokio::fs::create_dir_all(&key_dir).await {
@@ -335,68 +373,94 @@ async fn background_writer_impl(
         };
         let line_bytes = json_line.len() as u64;
 
-        // Get or create open file for this team/key/phase.
-        let of = match open_files.entry(file_key.clone()) {
+        // Get or create the aligned generation for this team/key. On first
+        // sight of the directory, scan it to decide where to (re)start and
+        // compress any stale .jsonl files left over from a crash.
+        let gen = match open_gens.entry(key_dir.clone()) {
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
             std::collections::hash_map::Entry::Vacant(e) => {
-                // Scan directory for existing files to find max sequence.
-                let (seq, stale) = find_max_sequence_and_stale(&key_dir, phase_name).await;
-                let path = key_dir.join(format!("{}_{:06}.jsonl", phase_name, seq));
-
-                // Compress stale .jsonl files left over from a crash.
+                let (seq, stale) = scan_generation_state(&key_dir).await;
                 if !stale.is_empty() {
-                    let stale_paths: Vec<PathBuf> = stale
-                        .iter()
-                        .map(|s| key_dir.join(format!("{}_{:06}.jsonl", phase_name, s)))
-                        .collect();
                     tokio::spawn(async move {
-                        for p in stale_paths {
-                            if let Err(e) = compress_file(&p).await {
-                                tracing::warn!("Failed to compress stale file {:?}: {}", p, e);
+                        for p in stale {
+                            if let Err(err) = compress_file(&p).await {
+                                tracing::warn!("Failed to compress stale file {:?}: {}", p, err);
                             }
                         }
                     });
                 }
-
-                match tokio::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&path)
-                    .await
-                {
-                    Ok(file) => {
-                        let size = match tokio::fs::metadata(&path).await {
-                            Ok(m) => m.len(),
-                            Err(_) => 0,
-                        };
-                        e.insert(OpenFile { file, size, sequence: seq })
-                    }
-                    Err(err) => {
-                        tracing::error!("Failed to open prompt log file {:?}: {}", path, err);
-                        continue;
-                    }
-                }
+                e.insert(Generation { seq, request: None, response: None })
             }
         };
 
-        // Check if writing this line would exceed max file size.
-        // If current file is non-empty and would overflow, rotate to a new file.
-        if of.size > 0 && of.size + line_bytes > max_bytes {
-            let old_path = key_dir.join(format!("{}_{:06}.jsonl", phase_name, of.sequence));
-            let new_seq = of.sequence + 1;
-            let new_path = key_dir.join(format!("{}_{:06}.jsonl", phase_name, new_seq));
+        // Lazily open this phase's file at the generation seq. On a resumed
+        // generation the file already exists and metadata restores its size,
+        // so the threshold keeps counting from where the last run left off.
+        if gen.phase_mut(entry.phase).is_none() {
+            let path = key_dir.join(phase_file_name(phase_name, gen.seq));
+            match tokio::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .await
+            {
+                Ok(file) => {
+                    let size = match tokio::fs::metadata(&path).await {
+                        Ok(m) => m.len(),
+                        Err(_) => 0,
+                    };
+                    *gen.phase_mut(entry.phase) = Some(OpenFile { file, size });
+                }
+                Err(err) => {
+                    tracing::error!("Failed to open prompt log file {:?}: {}", path, err);
+                    continue;
+                }
+            }
+        }
+
+        // Rotate when this write would overflow the phase file. The whole
+        // generation rotates together — both phases — so request/response
+        // seq suffixes stay aligned. Checking only the phase being written is
+        // sufficient: files only grow on writes, and every write checks
+        // itself first, so whichever phase crosses the threshold first seals
+        // the generation.
+        let should_rotate = {
+            let of = gen.phase(entry.phase).as_ref().unwrap();
+            of.size > 0 && of.size + line_bytes + 1 > max_bytes
+        };
+        if should_rotate {
+            let old_seq = gen.seq;
+            let new_seq = old_seq + 1;
+            let new_path = key_dir.join(phase_file_name(phase_name, new_seq));
             match tokio::fs::File::create(&new_path).await {
                 Ok(file) => {
                     tracing::info!(
                         path = %new_path.display(),
                         key_hash = %entry.key_hash,
                         phase = phase_name,
-                        "Rotated prompt log file"
+                        old_seq,
+                        new_seq,
+                        "Rotated prompt log generation"
                     );
-                    *of = OpenFile { file, size: 0, sequence: new_seq };
+                    // Seal both phases: drop open handles so no later write
+                    // targets old_seq; the other phase reopens lazily at
+                    // new_seq on its next entry.
+                    gen.request = None;
+                    gen.response = None;
+                    gen.seq = new_seq;
+                    *gen.phase_mut(entry.phase) = Some(OpenFile { file, size: 0 });
+                    // Compress both sealed files that exist on disk — the
+                    // phase not written this generation (e.g. resumed from a
+                    // previous run with no handle open yet) may have none.
+                    let old_req = key_dir.join(phase_file_name("request", old_seq));
+                    let old_resp = key_dir.join(phase_file_name("response", old_seq));
                     tokio::spawn(async move {
-                        if let Err(e) = compress_file(&old_path).await {
-                            tracing::warn!("Failed to compress {:?}: {}", old_path, e);
+                        for p in [old_req, old_resp] {
+                            if matches!(tokio::fs::try_exists(&p).await, Ok(true)) {
+                                if let Err(e) = compress_file(&p).await {
+                                    tracing::warn!("Failed to compress {:?}: {}", p, e);
+                                }
+                            }
                         }
                     });
                 }
@@ -408,6 +472,7 @@ async fn background_writer_impl(
         }
 
         // Write the line.
+        let of = gen.phase_mut(entry.phase).as_mut().unwrap();
         if let Err(e) = of.file.write_all(json_line.as_bytes()).await {
             tracing::error!("Failed to write prompt log entry: {}", e);
         }
@@ -420,14 +485,25 @@ async fn background_writer_impl(
     tracing::info!("Prompt log writer channel closed, exiting background task");
 }
 
-/// Scan a directory for existing log files of the given phase.
-/// Returns (max_sequence_to_use, stale_uncompressed_sequences).
+/// Scan a key directory and decide where to (re)start writing.
 ///
-/// Files are named `{phase}_{seq:06}.jsonl` or `{phase}_{seq:06}.jsonl.gz`.
-async fn find_max_sequence_and_stale(dir: &std::path::Path, phase: &str) -> (u64, Vec<u64>) {
-    let prefix = format!("{}_", phase);
-    let mut jsonl_seqs: Vec<u64> = Vec::new();
-    let mut gz_seqs: std::collections::HashSet<u64> = std::collections::HashSet::new();
+/// Files are `{phase}_{seq:06}.jsonl` / `{phase}_{seq:06}.jsonl.gz` with
+/// request and response sharing one sequence space (a "generation"). Returns
+/// `(start_seq, stale_paths)`:
+///
+/// - If the newest uncompressed generation is aligned — both phases agree on
+///   the max `.jsonl` seq, or only one phase has files — and neither phase
+///   has a `.gz` at that seq, writing resumes at that seq: a restart
+///   mid-generation appends to the half-full pair instead of abandoning it
+///   as an uncompressed orphan until the next restart.
+/// - Otherwise (misaligned leftovers from pre-alignment runs, or a `.gz`
+///   twin already present at the newest seq) a fresh generation starts at
+///   `overall_max + 1`, and every leftover `.jsonl` without a `.gz` twin is
+///   returned as stale for compression — including the previous newest,
+///   which the old `s < newest_jsonl` filter always skipped.
+async fn scan_generation_state(dir: &std::path::Path) -> (u64, Vec<PathBuf>) {
+    let mut jsonl: Vec<(&'static str, u64)> = Vec::new();
+    let mut gz: std::collections::HashSet<(&'static str, u64)> = std::collections::HashSet::new();
 
     let mut entries = match tokio::fs::read_dir(dir).await {
         Ok(rd) => rd,
@@ -435,34 +511,75 @@ async fn find_max_sequence_and_stale(dir: &std::path::Path, phase: &str) -> (u64
     };
     while let Ok(Some(entry)) = entries.next_entry().await {
         let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        if let Some(seq_str) = name_str
-            .strip_prefix(prefix.as_str())
-            .and_then(|s| s.strip_suffix(".jsonl"))
-        {
-            if let Ok(seq) = seq_str.parse::<u64>() {
-                jsonl_seqs.push(seq);
-            }
-        } else if let Some(seq_str) = name_str
-            .strip_prefix(prefix.as_str())
-            .and_then(|s| s.strip_suffix(".jsonl.gz"))
-        {
-            if let Ok(seq) = seq_str.parse::<u64>() {
-                gz_seqs.insert(seq);
+        let name = name.to_string_lossy();
+        for phase in ["request", "response"] {
+            let Some(rest) = name.strip_prefix(&format!("{}_", phase)) else {
+                continue;
+            };
+            if let Some(seq_str) = rest.strip_suffix(".jsonl") {
+                if let Ok(seq) = seq_str.parse::<u64>() {
+                    jsonl.push((phase, seq));
+                }
+            } else if let Some(seq_str) = rest.strip_suffix(".jsonl.gz") {
+                if let Ok(seq) = seq_str.parse::<u64>() {
+                    gz.insert((phase, seq));
+                }
             }
         }
     }
 
-    let overall_max = jsonl_seqs.iter().copied().chain(gz_seqs.iter().copied()).max().unwrap_or(0);
-    let next_seq = overall_max + 1;
-
-    let newest_jsonl = jsonl_seqs.iter().copied().max().unwrap_or(0);
-    let stale: Vec<u64> = jsonl_seqs
+    let (start, stale) = plan_generation_start(&jsonl, &gz);
+    let stale_paths = stale
         .into_iter()
-        .filter(|&s| s < newest_jsonl && !gz_seqs.contains(&s))
+        .map(|(phase, seq)| dir.join(phase_file_name(phase, seq)))
+        .collect();
+    (start, stale_paths)
+}
+
+/// Pure decision core of [`scan_generation_state`], split out for testing.
+/// Takes `(phase, seq)` pairs of uncompressed files and the set of files
+/// that already have a `.gz` twin; returns the seq to write at and the
+/// uncompressed `(phase, seq)` pairs to compress.
+fn plan_generation_start(
+    jsonl: &[(&'static str, u64)],
+    gz: &std::collections::HashSet<(&'static str, u64)>,
+) -> (u64, Vec<(&'static str, u64)>) {
+    let phase_max = |p: &str| {
+        jsonl
+            .iter()
+            .filter(|(ph, _)| *ph == p)
+            .map(|(_, s)| *s)
+            .max()
+    };
+    let overall_max = jsonl
+        .iter()
+        .map(|(_, s)| *s)
+        .chain(gz.iter().map(|(_, s)| *s))
+        .max()
+        .unwrap_or(0);
+
+    // Resume only when the newest jsonl generation is aligned and no phase
+    // already has a compressed twin at that seq — a crash between writing
+    // the .gz and deleting the .jsonl would otherwise duplicate content if
+    // we appended to the jsonl.
+    let aligned_seq = match (phase_max("request"), phase_max("response")) {
+        (Some(a), Some(b)) if a == b => Some(a),
+        (Some(a), None) | (None, Some(a)) => Some(a),
+        _ => None,
+    };
+    let start = match aligned_seq {
+        Some(s) if !gz.iter().any(|(_, gs)| *gs == s) => s,
+        _ => overall_max + 1,
+    };
+
+    let stale = jsonl
+        .iter()
+        .copied()
+        .filter(|&(_, s)| s != start)
+        .filter(|&(p, s)| !gz.contains(&(p, s)))
         .collect();
 
-    (next_seq, stale)
+    (start, stale)
 }
 
 /// Compress a file to `.gz` and delete the original on success.
@@ -488,4 +605,145 @@ async fn compress_file(path: &std::path::Path) -> std::io::Result<()> {
         "Compressed prompt log file"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn gzset(pairs: &[(&'static str, u64)]) -> std::collections::HashSet<(&'static str, u64)> {
+        pairs.iter().copied().collect()
+    }
+
+    #[test]
+    fn empty_dir_starts_at_one() {
+        let (start, stale) = plan_generation_start(&[], &gzset(&[]));
+        assert_eq!(start, 1);
+        assert!(stale.is_empty());
+    }
+
+    #[test]
+    fn aligned_generation_is_resumed() {
+        let jsonl = [("request", 3), ("response", 3), ("request", 2), ("response", 1)];
+        let (start, stale) = plan_generation_start(&jsonl, &gzset(&[("request", 1), ("request", 2)]));
+        assert_eq!(start, 3);
+        // seq 1/2 are old generations: request sides already gzipped,
+        // response seq 1 has no twin yet → the only stale file.
+        assert_eq!(stale, vec![("response", 1)]);
+    }
+
+    #[test]
+    fn single_phase_generation_is_resumed() {
+        let (start, stale) = plan_generation_start(&[("request", 7)], &gzset(&[]));
+        assert_eq!(start, 7);
+        assert!(stale.is_empty());
+    }
+
+    #[test]
+    fn misaligned_generation_starts_fresh_and_compresses_all() {
+        // Pre-alignment leftovers: request stopped at 7, response at 9.
+        let (start, stale) = plan_generation_start(&[("request", 7), ("response", 9)], &gzset(&[]));
+        assert_eq!(start, 10);
+        assert_eq!(stale, vec![("request", 7), ("response", 9)]);
+    }
+
+    #[test]
+    fn gz_twin_at_newest_prevents_resume() {
+        // Crash between writing the .gz and deleting the .jsonl: resuming
+        // would append to a file whose content is already in a .gz twin.
+        let (start, stale) = plan_generation_start(
+            &[("request", 5), ("response", 5)],
+            &gzset(&[("response", 5)]),
+        );
+        assert_eq!(start, 6);
+        // response 5 is skipped (twin exists — healed state); request 5 is
+        // recompressed, which overwrites nothing but removes the jsonl.
+        assert_eq!(stale, vec![("request", 5)]);
+    }
+
+    #[test]
+    fn gz_only_dir_starts_after_max() {
+        let (start, stale) = plan_generation_start(&[], &gzset(&[("request", 4), ("response", 4)]));
+        assert_eq!(start, 5);
+        assert!(stale.is_empty());
+    }
+
+    #[tokio::test]
+    async fn lockstep_rotation_keeps_request_response_aligned() {
+        use crate::config::PromptLogConfig;
+        use std::time::{Duration, Instant};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = PromptLogConfig {
+            dir: tmp.path().to_string_lossy().into_owned(),
+            max_file_size_mb: 1,
+            ..Default::default()
+        };
+        let writer = PromptLogWriter::spawn(cfg);
+
+        let entry = |id: &str, phase: LogPhase, payload: usize| {
+            let body = Arc::new(serde_json::Value::String("x".repeat(payload)));
+            let mut e = PromptLogEntry::new_request(
+                id,
+                None,
+                "keyhash",
+                Some("alice"),
+                Some("team1"),
+                "gpt-4o",
+                "/v1/chat/completions",
+                false,
+                body,
+                Some("127.0.0.1"),
+                None,
+            );
+            e.phase = phase;
+            e
+        };
+
+        writer.send(entry("r1", LogPhase::Request, 10));
+        writer.send(entry("r1", LogPhase::Response, 10));
+        // ~1.2MB request line on a non-empty file crosses the 1MB threshold
+        // and must rotate the WHOLE generation to seq 2 — including the
+        // half-empty response file.
+        writer.send(entry("r2", LogPhase::Request, 1_200_000));
+        writer.send(entry("r2", LogPhase::Response, 10));
+
+        let key_dir = tmp.path().join("team1").join("keyhash");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(content) = tokio::fs::read_to_string(key_dir.join("response_000002.jsonl")).await {
+                if content.contains("\"r2\"") {
+                    break;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for generation-2 files to appear"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // Generation-1 files were sealed by the rotation and are compressed
+        // asynchronously — accept either form, but both phases must survive.
+        for phase in ["request", "response"] {
+            let jsonl = tokio::fs::try_exists(key_dir.join(format!("{}_000001.jsonl", phase)))
+                .await
+                .unwrap();
+            let gz = tokio::fs::try_exists(key_dir.join(format!("{}_000001.jsonl.gz", phase)))
+                .await
+                .unwrap();
+            assert!(
+                jsonl || gz,
+                "generation-1 {phase} file must survive in some form"
+            );
+        }
+        let req2 = tokio::fs::read_to_string(key_dir.join("request_000002.jsonl"))
+            .await
+            .unwrap();
+        assert!(req2.contains("\"r2\""));
+        let resp2 = tokio::fs::read_to_string(key_dir.join("response_000002.jsonl"))
+            .await
+            .unwrap();
+        assert!(resp2.contains("\"r2\""));
+    }
 }

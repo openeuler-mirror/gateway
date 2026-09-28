@@ -27,6 +27,25 @@
 //!   映射表（auto → glm / auto → qwen / auto → minimax），互不干扰。
 //! - **pre_auth**：组合两者——先判断 key 类型，再分派到对应转换函数。
 //!
+//! ## 自定义 header（自定义请求头）
+//!
+//! hook 返回的 `headers` 字段（`PreAuthResponse::headers`）可以让 hook
+//! 为请求构造自定义 HTTP header。本 demo 把 key 场景标记写入
+//! `X-User-Tag`——配合审计日志的 `general_settings.user_tag_header:
+//! "X-User-Tag"` 配置，即可实现"hook 动态计算归因标记 + 审计日志按标记
+//! 统计用量"（比如这里从 key 推场景，生产环境可换成解 JWT / 查内部表）。
+//!
+//! 网关把这些 header **当成普通请求头**处理：
+//!
+//! - **覆盖语义**：同名（大小写不敏感）时覆盖客户端自带的值——hook 是
+//!   管理员安装的可信代码，它构造的值是权威值。
+//! - **审计归属**：`user_tag` 提取发生在注入之后，成功 / 401 / 限流等
+//!   所有路径都能记录到 hook 构造的标记。
+//! - **上游透传**：走 deployment 的客户端 header 白名单
+//!   （`forward_client_headers`），白名单放行才会转发到上游；
+//!   `authorization` / `x-gateway-*` 等硬屏蔽名单照常生效，hook 无法
+//!   借此伪造凭证或优先级。
+//!
 //! ## 老板怎么扩展
 //!
 //! 1. **新增场景**：在 `KeyType` enum 加一个变体，写一个对应的
@@ -178,13 +197,27 @@ pub extern "C" fn pre_auth(
                 KeyType::Passthrough => None,
             };
 
-            // 4. 转换函数返回 Some → ReplaceModel；返回 None → 只换 key
+            // 4. 构造自定义 header：场景标记写入 X-User-Tag。网关把它
+            //    当成普通请求头——审计 user_tag 归属、promptlog 记录、
+            //    deployment 白名单透传全部生效（见模块文档）。
+            let scene = match key_type {
+                KeyType::A => "scene-a",
+                KeyType::B => "scene-b",
+                KeyType::C => "scene-c",
+                KeyType::Passthrough => "uncategorized",
+            };
+            let mut headers = std::collections::HashMap::new();
+            headers.insert("X-User-Tag".to_string(), scene.to_string());
+
+            // 5. 转换函数返回 Some → ReplaceModel；返回 None → 只换 key
             match new_model {
                 Some(new_model) => Ok(PreAuthResponse {
                     action: PreAuthAction::ReplaceModel { new_key, new_model },
+                    headers,
                 }),
                 None => Ok(PreAuthResponse {
                     action: PreAuthAction::Replace { new_key },
+                    headers,
                 }),
             }
         },

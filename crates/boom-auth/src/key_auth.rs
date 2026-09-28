@@ -32,7 +32,14 @@ impl DbAuthenticator {
             master_key,
             cache: moka::future::Cache::builder()
                 .max_capacity(10_000)
-                .time_to_idle(Duration::from_secs(300)) // 5 min TTL
+                // TTL (not TTI!) bounds staleness: entries expire 60s after
+                // write regardless of access frequency. TTI never evicted
+                // busy keys, so dashboard edits (team change, block, delete)
+                // stayed invisible for as long as the key kept receiving
+                // traffic. In-process edits additionally invalidate entries
+                // immediately via `invalidate_key`; this TTL is the fallback
+                // for other instances in a multi-instance deployment.
+                .time_to_live(Duration::from_secs(60))
                 .build(),
         }
     }
@@ -295,6 +302,16 @@ impl Authenticator for DbAuthenticator {
             Err(GatewayError::ModelNotAllowed(model.to_string()))
         }
     }
+
+    async fn invalidate_key(&self, key_hash: &str) {
+        self.cache.invalidate(key_hash).await;
+        tracing::debug!("Invalidated auth cache for token {}", &key_hash[..8]);
+    }
+
+    async fn invalidate_all(&self) {
+        self.cache.invalidate_all();
+        tracing::debug!("Invalidated entire auth cache");
+    }
 }
 
 #[async_trait]
@@ -398,5 +415,58 @@ mod tests {
         let input = vec!["gpt-4".to_string(), "claude-3".to_string()];
         assert_eq!(DbAuthenticator::resolve_team_models(input.clone()), input);
         assert_eq!(DbAuthenticator::resolve_team_models(vec![]), Vec::<String>::new());
+    }
+
+    fn sample_token(token: &str, team_id: Option<&str>) -> VerificationToken {
+        serde_json::from_value(serde_json::json!({
+            "token": token, "key_name": null, "key_alias": null, "key_prefix": null,
+            "tag": null, "spend": 0.0, "expires": null, "models": [], "aliases": null,
+            "config": null, "user_id": null, "team_id": team_id,
+            "max_parallel_requests": null, "metadata": null, "blocked": false,
+            "tpm_limit": null, "rpm_limit": null, "max_budget": null,
+            "budget_duration": null, "budget_reset_at": null,
+            "allowed_cache_controls": null, "allowed_routes": null,
+            "model_spend": null, "model_max_budget": null, "budget_id": null,
+            "organization_id": null, "created_at": null, "created_by": null,
+            "updated_at": null
+        }))
+        .unwrap()
+    }
+
+    /// The cached token row (which carries team_id) must be evictable by key
+    /// hash — this is the hook the dashboard's update/block/unblock/delete
+    /// handlers exercise via AdminCommand::InvalidateAuthCache so edits take
+    /// effect on the next request instead of waiting out the TTL.
+    #[tokio::test]
+    async fn invalidate_key_evicts_single_cached_entry() {
+        let auth = DbAuthenticator::new(None, None);
+        auth.cache
+            .insert("hash-a".to_string(), sample_token("hash-a", Some("team-old")))
+            .await;
+        auth.cache
+            .insert("hash-b".to_string(), sample_token("hash-b", Some("team-x")))
+            .await;
+        assert!(auth.cache.get("hash-a").await.is_some());
+
+        auth.invalidate_key("hash-a").await;
+
+        assert!(auth.cache.get("hash-a").await.is_none(), "invalidated entry must be gone");
+        assert!(auth.cache.get("hash-b").await.is_some(), "other entries must survive");
+    }
+
+    #[tokio::test]
+    async fn invalidate_all_clears_cache() {
+        let auth = DbAuthenticator::new(None, None);
+        auth.cache
+            .insert("hash-a".to_string(), sample_token("hash-a", Some("t1")))
+            .await;
+        auth.cache
+            .insert("hash-b".to_string(), sample_token("hash-b", Some("t2")))
+            .await;
+
+        auth.invalidate_all().await;
+
+        assert!(auth.cache.get("hash-a").await.is_none());
+        assert!(auth.cache.get("hash-b").await.is_none());
     }
 }

@@ -130,10 +130,11 @@ impl LoadedHook {
         })
     }
 
-    /// Invoke the hook for one request. Returns the hook's decision, or
-    /// `Err` if the call itself failed (panic / error code / overflow).
-    /// The caller decides how to handle `Err` based on `failure_mode`.
-    fn call(&self, req: PreAuthRequest) -> Result<PreAuthAction, GatewayError> {
+    /// Invoke the hook for one request. Returns the hook's decision
+    /// (action + any constructed headers), or `Err` if the call itself
+    /// failed (panic / error code / overflow). The caller decides how to
+    /// handle `Err` based on `failure_mode`.
+    fn call(&self, req: PreAuthRequest) -> Result<PreAuthResponse, GatewayError> {
         let req_bytes = serde_json::to_vec(&req)
             .map_err(|e| GatewayError::InternalError(format!("serialize hook req: {}", e)))?;
 
@@ -166,7 +167,7 @@ impl LoadedHook {
                     .map_err(|e| {
                         GatewayError::InternalError(format!("parse hook resp: {}", e))
                     })?;
-                Ok(resp.action)
+                Ok(resp)
             }
             return_codes::OVERFLOW => {
                 tracing::error!("hook pre_auth response overflowed {} bytes", RESPONSE_BUF_SIZE);
@@ -207,6 +208,22 @@ pub enum PreAuthOutcome {
     Deny,
 }
 
+/// Result of running the `pre_auth` hook for one request: the outcome
+/// plus any custom headers the hook constructed for the request.
+///
+/// The caller (RequiredAuth extractor) injects `headers` into the
+/// request's HeaderMap before any downstream consumer reads it — they
+/// become ordinary request headers (see `PreAuthResponse::headers` in
+/// the SDK for the full downstream contract).
+pub struct PreAuthResult {
+    pub outcome: PreAuthOutcome,
+    /// Empty unless the hook completed successfully with a non-rejecting
+    /// action. Not partially applied: a failed hook run (panic / overflow
+    /// / parse error, regardless of failure_mode) attaches nothing, and a
+    /// Reject drops whatever headers it asked for.
+    pub headers: HashMap<String, String>,
+}
+
 /// Registry of all loaded hooks. Lives in `AppStateInner` so it gets hot-
 /// swapped on config reload. Fields are `Option<...>` per hook point; `None`
 /// means "hook point not enabled" and the hot path short-circuits.
@@ -242,14 +259,20 @@ impl HookRegistry {
     /// top-level `model` field parsed from the request body (`None` if the
     /// body couldn't be parsed / had no model field) — lets the hook make a
     /// single decision that returns both `new_key` and `new_model`.
+    ///
+    /// The returned `headers` carry the hook's constructed headers (see
+    /// [`PreAuthResult`]); the caller injects them into the request.
     pub fn pre_auth(
         &self,
         raw_key: &str,
         headers: &axum::http::HeaderMap,
         model: Option<&str>,
-    ) -> PreAuthOutcome {
+    ) -> PreAuthResult {
         let Some(hook) = self.pre_auth.as_ref() else {
-            return PreAuthOutcome::NoHook;
+            return PreAuthResult {
+                outcome: PreAuthOutcome::NoHook,
+                headers: HashMap::new(),
+            };
         };
 
         let req = PreAuthRequest {
@@ -269,17 +292,36 @@ impl HookRegistry {
         };
 
         match hook.call(req) {
-            Ok(PreAuthAction::Continue) => PreAuthOutcome::Continue,
-            Ok(PreAuthAction::Replace { new_key }) => PreAuthOutcome::Replace(new_key),
-            Ok(PreAuthAction::ReplaceModel { new_key, new_model }) => {
-                PreAuthOutcome::ReplaceModel { new_key, new_model }
+            Ok(resp) => {
+                let PreAuthResponse { action, headers } = resp;
+                // Headers only ride along on non-rejecting outcomes — a
+                // rejected request never proceeds, so anything it asked
+                // for is moot.
+                let headers = if matches!(action, PreAuthAction::Reject { .. }) {
+                    HashMap::new()
+                } else {
+                    headers
+                };
+                let outcome = match action {
+                    PreAuthAction::Continue => PreAuthOutcome::Continue,
+                    PreAuthAction::Replace { new_key } => PreAuthOutcome::Replace(new_key),
+                    PreAuthAction::ReplaceModel { new_key, new_model } => {
+                        PreAuthOutcome::ReplaceModel { new_key, new_model }
+                    }
+                    PreAuthAction::Reject { reason } => PreAuthOutcome::Reject(reason),
+                };
+                PreAuthResult { outcome, headers }
             }
-            Ok(PreAuthAction::Reject { reason }) => PreAuthOutcome::Reject(reason),
             Err(e) => {
                 tracing::warn!(error = %e, "pre_auth hook call failed");
-                match hook.failure_mode {
+                // No partial application: a failed hook run attaches nothing.
+                let outcome = match hook.failure_mode {
                     HookFailureMode::Allow => PreAuthOutcome::Continue,
                     HookFailureMode::Deny => PreAuthOutcome::Deny,
+                };
+                PreAuthResult {
+                    outcome,
+                    headers: HashMap::new(),
                 }
             }
         }
@@ -341,8 +383,9 @@ mod tests {
     fn empty_config_produces_no_hook_outcome() {
         let cfg = HooksConfig::default();
         let reg = HookRegistry::from_config(&cfg).expect("empty config should load");
-        let outcome = reg.pre_auth("sk-anything", &HeaderMap::new(), None);
-        assert!(matches!(outcome, PreAuthOutcome::NoHook));
+        let result = reg.pre_auth("sk-anything", &HeaderMap::new(), None);
+        assert!(matches!(result.outcome, PreAuthOutcome::NoHook));
+        assert!(result.headers.is_empty());
     }
 
     #[test]
@@ -358,10 +401,8 @@ mod tests {
             },
         };
         let reg = HookRegistry::from_config(&cfg).expect("disabled config should load");
-        assert!(matches!(
-            reg.pre_auth("sk-abc", &HeaderMap::new(), None),
-            PreAuthOutcome::NoHook
-        ));
+        let result = reg.pre_auth("sk-abc", &HeaderMap::new(), None);
+        assert!(matches!(result.outcome, PreAuthOutcome::NoHook));
     }
 
     #[test]
@@ -379,8 +420,8 @@ mod tests {
         let cfg = make_cfg(&path, HookFailureMode::Allow, r#"{"prefix":"sk-customer-"}"#);
         let reg = HookRegistry::from_config(&cfg).expect("plugin should load");
 
-        let outcome = reg.pre_auth("sk-abc", &HeaderMap::new(), None);
-        match outcome {
+        let result = reg.pre_auth("sk-abc", &HeaderMap::new(), None);
+        match result.outcome {
             PreAuthOutcome::Replace(new_key) => {
                 assert!(
                     new_key == "sk-customer-sk-abc"
@@ -412,8 +453,8 @@ mod tests {
         let cfg = make_cfg(&path, HookFailureMode::Allow, "{}");
         let reg = HookRegistry::from_config(&cfg).expect("plugin should load");
 
-        let outcome = reg.pre_auth("sk-abc", &HeaderMap::new(), None);
-        match outcome {
+        let result = reg.pre_auth("sk-abc", &HeaderMap::new(), None);
+        match result.outcome {
             PreAuthOutcome::Replace(new_key) => {
                 // Accept either the default or the persisted value from an
                 // earlier test in the same process.
@@ -425,6 +466,36 @@ mod tests {
             }
             _ => panic!("expected Replace"),
         }
+    }
+
+    /// The example hook attaches an X-User-Tag header derived from the key
+    /// classification on every non-rejecting outcome — prove it survives
+    /// the wire round-trip into PreAuthResult.headers.
+    #[test]
+    #[ignore]
+    fn plugin_constructs_custom_headers() {
+        let path = find_hook_so();
+        let cfg = make_cfg(&path, HookFailureMode::Allow, "{}");
+        let reg = HookRegistry::from_config(&cfg).expect("plugin should load");
+
+        // Unclassified key → Replace + uncategorized tag.
+        let result = reg.pre_auth("sk-abc", &HeaderMap::new(), None);
+        assert!(matches!(result.outcome, PreAuthOutcome::Replace(_)));
+        assert_eq!(
+            result.headers.get("X-User-Tag").map(String::as_str),
+            Some("uncategorized")
+        );
+
+        // Scene-A key with a mappable model → ReplaceModel + scene-a tag.
+        let result = reg.pre_auth("customer-A-001", &HeaderMap::new(), Some("auto"));
+        assert!(matches!(
+            result.outcome,
+            PreAuthOutcome::ReplaceModel { .. }
+        ));
+        assert_eq!(
+            result.headers.get("X-User-Tag").map(String::as_str),
+            Some("scene-a")
+        );
     }
 
     #[test]

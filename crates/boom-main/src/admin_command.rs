@@ -174,6 +174,20 @@ pub async fn admin_command_handler(mut rx: tokio::sync::mpsc::Receiver<AdminComm
                 let result = state.prompt_log_writer.probe_otlp().await;
                 let _ = reply.send(result);
             }
+            AdminCommand::InvalidateAuthCache { token_hashes } => {
+                // Take the Arc out of the ArcSwap guard before awaiting so the
+                // guard is never held across an await point. load_full() gets
+                // the *current* authenticator — if a reload races us and swaps
+                // in a fresh one, its cache starts empty and the invalidation
+                // is moot, so no lockstep is needed.
+                let auth = state.inner.load_full().auth.clone();
+                for hash in &token_hashes {
+                    auth.invalidate_key(hash).await;
+                }
+                if token_hashes.len() > 1 {
+                    tracing::debug!("Invalidated auth cache for {} token(s)", token_hashes.len());
+                }
+            }
         }
     }
     tracing::warn!("Admin command handler stopped (channel closed)");

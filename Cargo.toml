@@ -19,6 +19,7 @@ members = [
     "crates/boom-stressmon",
     "crates/boom-alert",
     "crates/boom-trace",
+    "crates/boom-gatekeeper",
     "crates/example-hooks",
 ]
 
@@ -79,6 +80,9 @@ clap = { version = "4", features = ["derive"] }
 
 # concurrent collections
 dashmap = "6"
+
+# linear-time regex (blocklist rules; no ReDoS exposure)
+regex = "1"
 
 # lock-free atomic swap (hot-reload)
 arc-swap = "1"

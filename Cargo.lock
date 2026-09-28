@@ -376,6 +376,7 @@ dependencies = [
  "boom-core",
  "boom-ctxaware",
  "boom-flowcontrol",
+ "boom-gatekeeper",
  "boom-limiter",
  "boom-promptlog",
  "boom-routing",
@@ -417,6 +418,20 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tokio",
+]
+
+[[package]]
+name = "boom-gatekeeper"
+version = "0.1.0"
+dependencies = [
+ "boom-config",
+ "boom-core",
+ "chrono",
+ "regex",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tracing",
 ]
 
 [[package]]
@@ -479,6 +494,7 @@ dependencies = [
  "boom-ctxaware",
  "boom-dashboard",
  "boom-flowcontrol",
+ "boom-gatekeeper",
  "boom-hooks-sdk",
  "boom-kvindex",
  "boom-limiter",

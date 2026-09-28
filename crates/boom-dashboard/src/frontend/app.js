@@ -3790,6 +3790,178 @@
     } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
   };
 
+  // ── Admin: Client Block Rules (config-page card) ─────────
+  // Lives as a card inside the Config page (Traffic group). The global
+  // `enabled` toggle is a plain config field saved via the standard
+  // section-PUT path; the rules table below it uses the dedicated CRUD
+  // REST endpoints (DB write + in-memory direct update + YAML persist).
+
+  const BLOCK_OPS = ["eq", "contains", "regex", "prefix", "exists"];
+  const BLOCK_FIELD_SUGGESTIONS = [
+    "header.user-agent", "header.x-client-id", "header.x-title",
+    "body.model", "body.system", "body.messages", "body.messages.0.content",
+    "body.tools", "body",
+  ];
+
+  function opLabel(op) {
+    return t(`blockrules.op.${op}`);
+  }
+
+  function condSummary(cond) {
+    const v = cond.op === "exists" ? "" : ` "${cond.value}"`;
+    return `<code>${esc(cond.field)}</code> ${opLabel(cond.op)}${v}`;
+  }
+
+  async function loadBlockRules() {
+    const wrap = document.getElementById("blockrules-table-wrap");
+    if (!wrap) return;
+    try {
+      const data = await api("/admin/client-block-rules");
+      const rules = data.rules || [];
+      if (rules.length === 0) {
+        wrap.innerHTML = `<p class="muted">${t("blockrules.empty")}</p>`;
+        return;
+      }
+      wrap.innerHTML = `
+        <table class="data-table">
+          <tr><th>${t("blockrules.col.name")}</th><th>${t("blockrules.col.enabled")}</th><th>${t("blockrules.col.conditions")}</th><th>${t("blockrules.col.message")}</th><th>${t("blockrules.col.status")}</th><th>${t("models.col.source")}</th><th>${t("common.actions")}</th></tr>
+          ${rules.map((r) => `
+          <tr>
+            <td><strong>${esc(r.name)}</strong></td>
+            <td><button class="btn-small alias-hidden-toggle${r.enabled ? " is-on" : ""}" onclick="_toggleBlockRule('${esc(r.name)}', ${r.enabled ? "false" : "true"})">${r.enabled ? t("common.yes") : t("common.no")}</button></td>
+            <td style="max-width:420px">${(r.conditions || []).map((c) => `<div>${condSummary(c)}</div>`).join("") || `<span class="muted">—</span>`}</td>
+            <td style="max-width:260px" title="${esc((r.action && r.action.message) || "")}">${esc((r.action && r.action.message) || "—")}</td>
+            <td>${(r.action && r.action.status) || 403}</td>
+            <td><span class="badge badge-plan">${esc(r.source || "-")}</span></td>
+            <td>
+              <button class="btn-small" onclick="_editBlockRule('${esc(r.name)}')">${t("action.edit")}</button>
+              <button class="btn-small is-danger" onclick="_deleteBlockRule('${esc(r.name)}')">${t("action.delete")}</button>
+            </td>
+          </tr>`).join("")}
+        </table>`;
+      window._blockRulesCache = rules;
+    } catch (err) {
+      wrap.innerHTML = `<p style="color:var(--danger)">${esc(err.message)}</p>`;
+    }
+  }
+
+  window._editBlockRule = (name) => {
+    const rule = (window._blockRulesCache || []).find((r) => r.name === name);
+    if (!rule) return;
+    showBlockRuleModal(rule);
+  };
+
+  window._deleteBlockRule = async (name) => {
+    try {
+      await api(`/admin/client-block-rules/${encodeURIComponent(name)}`, { method: "DELETE" });
+      await loadBlockRules();
+    } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
+  };
+
+  window._toggleBlockRule = async (name, enabled) => {
+    const rule = (window._blockRulesCache || []).find((r) => r.name === name);
+    if (!rule) return;
+    try {
+      await api(`/admin/client-block-rules/${encodeURIComponent(name)}`, {
+        method: "PUT",
+        body: JSON.stringify({
+          name: rule.name,
+          enabled,
+          conditions: rule.conditions || [],
+          action: rule.action || { message: "" },
+        }),
+      });
+      await loadBlockRules();
+    } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
+  };
+
+  function blockRuleCondRow(i, cond) {
+    cond = cond || {};
+    return `
+      <div class="blockrule-cond-row" data-i="${i}">
+        <input class="brc-field" list="blockrule-field-suggestions" value="${esc(cond.field || "")}" placeholder="${t("blockrules.form.field")}">
+        <select class="brc-op">${BLOCK_OPS.map((op) => `<option value="${op}" ${cond.op === op ? "selected" : ""}>${opLabel(op)}</option>`).join("")}</select>
+        <input class="brc-value" value="${esc(cond.value || "")}" placeholder="${t("blockrules.form.value")}">
+        <button class="btn-small is-danger brc-del">${t("action.delete")}</button>
+      </div>`;
+  }
+
+  function showBlockRuleModal(rule) {
+    const isEdit = !!rule;
+    rule = rule || { name: "", enabled: true, conditions: [], action: { message: "", status: 403, code: "client_blocked" } };
+    const action = rule.action || {};
+    showModal(`
+      <h3>${isEdit ? t("blockrules.form.title_edit") : t("blockrules.form.title_create")}</h3>
+      <datalist id="blockrule-field-suggestions">${BLOCK_FIELD_SUGGESTIONS.map((f) => `<option value="${f}">`).join("")}</datalist>
+      <div class="form-grid">
+        <div class="form-card">
+          <div class="form-card-title">${t("blockrules.form.match_title")}</div>
+          <div class="form-card-grid">
+            <div class="form-group"><label>${t("blockrules.form.name")} *</label><input id="br-name" value="${esc(rule.name || "")}" ${isEdit ? "readonly" : ""}></div>
+            <div class="form-group field-checkbox"><input id="br-enabled" type="checkbox" ${rule.enabled !== false ? "checked" : ""}><label for="br-enabled">${t("blockrules.form.enabled")}</label></div>
+            <div class="form-group field-full">
+              <label>${t("blockrules.form.conditions")} * ${t("blockrules.form.conditions_hint")}</label>
+              <div id="br-conds">${(rule.conditions && rule.conditions.length ? rule.conditions : [null]).map((c, i) => blockRuleCondRow(i, c)).join("")}</div>
+              <button class="btn-small" id="br-add-cond">${t("blockrules.form.add_condition")}</button>
+            </div>
+          </div>
+        </div>
+        <div class="form-card">
+          <div class="form-card-title">${t("blockrules.form.action_title")}</div>
+          <div class="form-card-grid">
+            <div class="form-group field-full"><label>${t("blockrules.form.message")} *</label><input id="br-message" value="${esc(action.message || "")}"></div>
+            <div class="form-group"><label>${t("blockrules.form.status")}</label><input id="br-status" type="number" min="400" max="599" value="${action.status || 403}"></div>
+            <div class="form-group"><label>${t("blockrules.form.code")}</label><input id="br-code" value="${esc(action.code || "client_blocked")}"></div>
+          </div>
+        </div>
+      </div>
+      <div class="modal-actions">
+        <button class="btn-small btn-inline" onclick="hideModal()">${t("action.cancel")}</button>
+        <button class="btn-small btn-primary" id="br-save">${t("action.save")}</button>
+      </div>`);
+
+    const condsEl = document.getElementById("br-conds");
+    condsEl.addEventListener("click", (e) => {
+      if (e.target.classList.contains("brc-del")) e.target.closest(".blockrule-cond-row").remove();
+    });
+    document.getElementById("br-add-cond").addEventListener("click", () => {
+      condsEl.insertAdjacentHTML("beforeend", blockRuleCondRow(condsEl.children.length, null));
+    });
+
+    document.getElementById("br-save").addEventListener("click", async () => {
+      const name = document.getElementById("br-name").value.trim();
+      const message = document.getElementById("br-message").value.trim();
+      if (!name || !message) { alert(t("blockrules.form.err_required")); return; }
+      const conditions = [...condsEl.querySelectorAll(".blockrule-cond-row")].map((row) => ({
+        field: row.querySelector(".brc-field").value.trim(),
+        op: row.querySelector(".brc-op").value,
+        value: row.querySelector(".brc-value").value,
+      })).filter((c) => c.field);
+      if (conditions.length === 0) { alert(t("blockrules.form.err_no_conditions")); return; }
+      const status = parseInt(document.getElementById("br-status").value, 10) || 403;
+      const code = document.getElementById("br-code").value.trim() || "client_blocked";
+      const body = JSON.stringify({
+        name,
+        enabled: document.getElementById("br-enabled").checked,
+        conditions,
+        action: { message, status, code },
+      });
+      try {
+        let resp;
+        if (isEdit) {
+          resp = await api(`/admin/client-block-rules/${encodeURIComponent(rule.name)}`, { method: "PUT", body, skipConfirm: true });
+        } else {
+          resp = await api("/admin/client-block-rules", { method: "POST", body, skipConfirm: true });
+        }
+        hideModal();
+        await loadBlockRules();
+        if (resp && resp.blocklist_enabled === false) {
+          alert(t("blockrules.switch_off"));
+        }
+      } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
+    });
+  }
+
   // ── Admin: Config Page ────────────────────────────────
 
   let _configCache = null;
@@ -3824,6 +3996,7 @@
       { group: "runtime", section: "runtime-prompt-log",   label: t("config.section.prompt_log"),            icon: "prompt-log",   html: renderCardPromptLog(cfg.prompt_log || {}) },
       { group: "runtime", section: "runtime-trace",        label: t("config.section.trace"),                 icon: "trace",        html: renderCardTrace(cfg.trace || {}) },
       { group: "traffic", section: "traffic-rate-limit",   label: t("config.section.rate_limit"),            icon: "rate-limit",    html: renderCardRateLimit(cfg.rate_limit || {}) },
+      { group: "traffic", section: "traffic-blockrules",  label: t("config.section.client_blocklist"),       icon: "blockrules",    html: renderCardBlockRules(cfg.client_blocklist || {}) },
       { group: "traffic", section: "traffic-plans",       label: t("config.section.plan_settings"),          icon: "plans",         html: renderCardPlanSettings(cfg.plan_settings || {}, cfg) },
       { group: "routing", section: "routing-router",      label: t("config.section.router_settings"),       icon: "router",        html: renderCardRouter(cfg.router_settings || {}) },
       { group: "routing", section: "routing-cost",        label: t("config.section.cost_templates"),        icon: "cost",          html: renderCardCostTemplates(cfg.cost_templates || []) },
@@ -3874,6 +4047,7 @@
       "prompt-log": '<rect x="2" y="2" width="12" height="12" rx="1.5"/><path d="M5 5h6M5 8h6M5 11h3"/>',
       "trace": '<path d="M2 8h3l2-4 3 8 2-4h2"/>',
       "rate-limit": '<circle cx="8" cy="8" r="6.5"/><path d="M8 4.5V8l2.5 1.5"/>',
+      "blockrules": '<circle cx="8" cy="8" r="6"/><path d="M4.6 4.6l6.8 6.8"/>',
       "plans": '<rect x="2" y="2" width="12" height="12" rx="1.5"/><path d="M5 5h6M5 8h4M5 11h2"/>',
       "router": '<circle cx="4" cy="4" r="2"/><circle cx="12" cy="8" r="2"/><circle cx="4" cy="12" r="2"/><path d="M6 4h2M8 8h2M6 12h2"/>',
       "cost": '<path d="M3 2h7l3 3v9H3z"/><path d="M5 7h6M5 10h4"/>',
@@ -3934,6 +4108,7 @@
       <div class="form-card-grid">
         <div class="form-group"><label>${t("config.field.master_key")}</label><input value="${esc(masked(g.master_key))}" readonly style="opacity:.6"></div>
         <div class="form-group"><label>${t("config.field.database_url")}</label><input value="${esc(masked(g.database_url))}" readonly style="opacity:.6"></div>
+        <div class="form-group field-full"><label for="cfg-gen-user-tag-hdr">${t("config.field.user_tag_header")} ${tip(t("tip.config.user_tag_header"))}</label><input id="cfg-gen-user-tag-hdr" value="${esc(g.user_tag_header || "")}" placeholder="X-User-Tag"></div>
         ${fieldCheckbox("cfg-gen-priority-hdr", t("config.field.enable_priority_header"), router.enable_priority_header)}
         ${fieldCheckbox("cfg-gen-strip-cc", t("config.field.strip_claude_code_attribution"), router.strip_claude_code_attribution)}
         ${fieldFullList("cfg-gen-forward-hdrs", t("config.field.forward_client_headers"), router.forward_client_headers || [])}
@@ -4170,6 +4345,24 @@
     </div>`;
   }
 
+  function renderCardBlockRules(cb) {
+    // Match the backend exactly: an absent YAML section leaves the switch OFF
+    // (build_block_rules_from_config) — only an explicit enabled: true is ON.
+    const enabled = !!cb && cb.enabled === true;
+    return `<div class="form-card" data-section="client_blocklist">
+      <div class="form-card-title">${t("config.section.client_blocklist")}</div>
+      <div class="form-card-grid">
+        ${fieldCheckbox("cfg-bl-enabled", t("config.field.blocklist_enabled"), enabled)}
+      </div>
+      <p class="modal-hint">${t("blockrules.hint")}</p>
+      <div id="blockrules-table-wrap" style="margin-bottom:12px"><p class="loading">${t("common.loading")}</p></div>
+      <div class="form-card-actions">
+        <button class="btn-small" id="btn-new-blockrule">${t("blockrules.add")}</button>
+        <button class="btn-primary btn-small" data-save="client_blocklist">${t("action.save")}</button>
+      </div>
+    </div>`;
+  }
+
   function renderCardModelList(modelList) {
     const count = (modelList || []).length;
     return `<div class="form-card" data-section="model_list">
@@ -4205,6 +4398,9 @@
     if (testBtn) testBtn.addEventListener("click", otlpPingOnce);
     const traceTestBtn = document.getElementById("cfg-tr-otlp-test");
     if (traceTestBtn) traceTestBtn.addEventListener("click", traceOtlpPingOnce);
+    const btnBlockRule = document.getElementById("btn-new-blockrule");
+    if (btnBlockRule) btnBlockRule.addEventListener("click", () => showBlockRuleModal(null));
+    loadBlockRules();
   }
 
   // ── Config page sidebar (Runtime/Traffic/Routing sub-items) ────
@@ -4485,10 +4681,13 @@
         // These three live under router_settings in YAML but are surfaced on
         // the General card. Sub-path writes avoid replacing the whole
         // router_settings section (which would clobber scheduling fields).
+        // user_tag_header is a true general_settings field; empty input saves
+        // null = extraction disabled.
         await saveConfigSections([
           ["router_settings.enable_priority_header", $("cfg-gen-priority-hdr").checked],
           ["router_settings.strip_claude_code_attribution", $("cfg-gen-strip-cc").checked],
           ["router_settings.forward_client_headers", parseListInput($("cfg-gen-forward-hdrs"))],
+          ["general_settings.user_tag_header", $("cfg-gen-user-tag-hdr").value.trim() || null],
         ]);
       } else if (kind === "rate_limit") {
         const tpmRaw = $("cfg-rl-default-tpm").value;
@@ -4498,11 +4697,17 @@
           default_tpm: tpmRaw === "" ? null : Number(tpmRaw),
           window_limits: parseJsonInput($("cfg-rl-windows"), []),
         });
+      } else if (kind === "client_blocklist") {
+        // Only the global switch is a config field here; rules are managed
+        // via the dedicated CRUD endpoints (immediate effect, DB + YAML).
+        await saveConfigSection("client_blocklist.enabled", $("cfg-bl-enabled").checked);
       } else if (kind === "plan_defaults") {
         const dp = $("cfg-ps-default-plan").value;
         const dtp = $("cfg-ps-default-team-plan").value;
-        await saveConfigSection("plan_settings.default_plan", dp || null);
-        await saveConfigSection("plan_settings.default_team_plan", dtp || null);
+        await saveConfigSections([
+          ["plan_settings.default_plan", dp || null],
+          ["plan_settings.default_team_plan", dtp || null],
+        ]);
       } else if (kind === "health_check") {
         await saveConfigSection("deployment_health_check", {
           auto_offline_enabled: $("cfg-hc-auto-off").checked,
@@ -4596,10 +4801,14 @@
 
   // Multi-section save: fires all PUTs first, then a single page reload.
   // Reloading between writes would drop the other sections' DOM inputs
-  // before they are read.
+  // before they are read. The batch is confirmed once up front; the PUTs
+  // then bypass api()'s per-call confirm via skipConfirm.
   async function saveConfigSections(pairs) {
+    if (!confirm(t("common.confirm_write"))) {
+      throw new Error(t("common.canceled"));
+    }
     for (const [path, value] of pairs) {
-      await api("/admin/config", { method: "PUT", body: JSON.stringify({ path, value }) });
+      await api("/admin/config", { method: "PUT", skipConfirm: true, body: JSON.stringify({ path, value }) });
     }
     showToast(t("config.saved"));
     await loadConfigPage();
@@ -4765,6 +4974,24 @@
       const e = data.debug_error;
       if (!e) { alert(t("debug.entry_not_found")); return; }
 
+      let blockHtml = "";
+      if (e.block_rule) {
+        blockHtml = `
+          <div class="debug-section">
+            <h4>${t("debug.blockrule.title")} — <span class="mono">${esc(e.block_rule.rule || "")}</span></h4>
+            <table>
+              <tr><th>${t("debug.blockrule.field")}</th><th>${t("debug.blockrule.op")}</th><th>${t("debug.blockrule.expected")}</th><th>${t("debug.blockrule.actual")}</th></tr>
+              ${(e.block_rule.conditions || []).map((c) => `
+              <tr>
+                <td class="mono">${esc(c.field)}</td>
+                <td>${esc(c.op)}</td>
+                <td class="mono">${esc(c.value)}</td>
+                <td class="mono" style="max-width:320px;word-break:break-all">${esc(c.actual || "-")}</td>
+              </tr>`).join("")}
+            </table>
+          </div>`;
+      }
+
       let upstreamHtml = "";
       if (e.upstream_status != null) {
         upstreamHtml = `
@@ -4799,6 +5026,7 @@
           <tr><td>${t("debug.error")}</td><td>${esc(e.error_message)}</td></tr>
         </table>
         ${upstreamHtml}
+        ${blockHtml}
         ${requestHtml}
         <div class="modal-actions">
           <button class="btn-secondary btn-inline" onclick="hideModal()">${t("action.close")}</button>
@@ -6438,7 +6666,7 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
     tbody.innerHTML = logs.map((l) => {
         const etype = l.error_type || "";
         const isDebuggable = debugEnabled && l.request_id && (
-          etype === "upstream_error" || etype === "provider_error" || etype === "timeout"
+          etype === "upstream_error" || etype === "provider_error" || etype === "timeout" || etype === "client_blocked"
         );
         const errorCell = l.error_message
           ? (isDebuggable

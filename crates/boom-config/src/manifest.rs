@@ -106,6 +106,8 @@ pub fn general_settings_fields() -> &'static [FieldMeta] {
         // field still parses for backward compatibility but has no UI.
         // `master_key` and `database_url` are read-only on the UI (masked);
         // not exposed in the manifest of *editable* fields.
+        FieldMeta { field: "user_tag_header", section: "general", input_type: "text",
+                    label_key: "config.field.user_tag_header", tip_key: "tip.config.user_tag_header" },
     ]
 }
 

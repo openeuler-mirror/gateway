@@ -50,6 +50,9 @@ pub struct AppState {
     pub deployment_store: Arc<DeploymentStore>,
     /// Alias store survives reloads (preserves model aliases).
     pub alias_store: Arc<AliasStore>,
+    /// Client blocklist store (boom-gatekeeper) survives reloads. Rules are
+    /// rebuilt from YAML + DB on reload; dashboard CRUD updates it in place.
+    pub block_rule_store: Arc<boom_gatekeeper::BlockRuleStore>,
     /// Router owns deployment + alias stores for routing decisions.
     pub router: Arc<Router>,
     /// In-flight request tracker (per-model count + input chars).
@@ -220,6 +223,9 @@ impl AppState {
         let deployment_store = Arc::new(DeploymentStore::new());
         let alias_store = Arc::new(AliasStore::new());
 
+        // 4b. Client blocklist store survives across reloads.
+        let block_rule_store = Arc::new(boom_gatekeeper::BlockRuleStore::new());
+
         // In-flight tracker survives across reloads — must be created before policy.
         let inflight = Arc::new(InFlightTracker::new());
 
@@ -257,6 +263,7 @@ impl AppState {
         // 5. Build from YAML first, then layer DB-only records on top.
         build_deployments_from_config(&config, &deployment_store);
         build_aliases_from_config(&config, &alias_store, &deployment_store);
+        build_block_rules_from_config(&config, &block_rule_store);
         load_plans_from_config(&plan_store, &config);
         seed_flow_controller_from_config(&config, &flow_controller);
 
@@ -278,6 +285,7 @@ impl AppState {
             // Load source='db' records on top of YAML-built stores.
             load_db_only_deployments(pool, &deployment_store, &flow_controller).await;
             load_db_only_aliases(pool, &alias_store).await;
+            block_rule_store.load_db_only(pool).await;
             plan_store.load_db_only_plans(pool).await;
 
             // Restore runtime state.
@@ -359,6 +367,7 @@ impl AppState {
             plan_store,
             deployment_store,
             alias_store,
+            block_rule_store,
             router,
             inflight,
             request_count: Arc::new(AtomicU64::new(0)),
@@ -500,6 +509,7 @@ impl AppState {
 
         self.alias_store.clear();
         build_aliases_from_config(&new_config, &self.alias_store, &self.deployment_store);
+        build_block_rules_from_config(&new_config, &self.block_rule_store);
 
         self.plan_store.clear_plans();
         load_plans_from_config(&self.plan_store, &new_config);
@@ -582,6 +592,10 @@ impl AppState {
             with_db_timeout_void(
                 "load_db_only_aliases",
                 load_db_only_aliases(pool, &self.alias_store),
+            ).await?;
+            with_db_timeout_void(
+                "load_db_only_block_rules",
+                self.block_rule_store.load_db_only(pool),
             ).await?;
             with_db_timeout_void(
                 "load_db_only_plans",
@@ -870,7 +884,7 @@ impl AppState {
             Err(e) => return Err(format!("build snapshot from DB: {}", e)),
         };
 
-        if let Err(e) = merge_runtime_sections(&mut root, &snapshot) {
+        if let Err(e) = merge_runtime_sections(&mut root, &snapshot, self.block_rule_store.is_enabled()) {
             return Err(format!("merge runtime sections: {}", e));
         }
 
@@ -923,9 +937,13 @@ impl AppState {
 
 /// Merge runtime-derived sections (model_list, aliases, plans) from a JSON
 /// snapshot into the raw YAML value. Singleton sections are preserved as-is.
+/// `blocklist_enabled` is the running gateway's blocklist switch, materialized
+/// into the YAML when the section carries no explicit `enabled` (see the
+/// client_blocklist block below).
 fn merge_runtime_sections(
     root: &mut serde_yaml::Value,
     snapshot: &serde_json::Value,
+    blocklist_enabled: bool,
 ) -> Result<(), String> {
     let obj = snapshot
         .as_object()
@@ -953,6 +971,28 @@ fn merge_runtime_sections(
             let yaml_val = json_to_yaml(default_plan)?;
             boom_config::set_yaml_path(root, &["plan_settings", "default_plan"], yaml_val)
                 .map_err(|e| format!("set plan_settings.default_plan: {}", e))?;
+        }
+    }
+
+    // Client blocklist: only the rules array is runtime state. An explicit
+    // `enabled` in the YAML is preserved (the operator may have edited it
+    // without a reload). But when this merge just created the section (web
+    // CRUD persist on a config that had none), materialize the running
+    // gateway's switch — otherwise the section would parse with the serde
+    // default (enabled: true) and a restart would silently activate rules
+    // the operator never turned on.
+    if let Some(rules) = obj.get("client_blocklist").and_then(|c| c.get("rules")) {
+        let yaml_val = json_to_yaml(rules)?;
+        boom_config::set_yaml_path(root, &["client_blocklist", "rules"], yaml_val)
+            .map_err(|e| format!("set client_blocklist.rules: {}", e))?;
+        if root
+            .get("client_blocklist")
+            .and_then(|c| c.get("enabled"))
+            .is_none()
+        {
+            let yaml_enabled = json_to_yaml(&serde_json::Value::Bool(blocklist_enabled))?;
+            boom_config::set_yaml_path(root, &["client_blocklist", "enabled"], yaml_enabled)
+                .map_err(|e| format!("set client_blocklist.enabled: {}", e))?;
         }
     }
 
@@ -1122,6 +1162,14 @@ async fn sync_yaml_to_db(pool: &PgPool, config: &Config, plan_store: &Arc<PlanSt
         .map(|(alias, cfg)| (alias.clone(), cfg.target_model().to_string(), cfg.is_hidden()))
         .collect();
     AliasStore::sync_yaml_to_db(pool, &yaml_aliases).await?;
+
+    // ── Client block rules (delegated to BlockRuleStore) ──
+    let yaml_block_rules: Vec<boom_config::BlockRule> = config
+        .client_blocklist
+        .as_ref()
+        .map(|bl| bl.rules.clone())
+        .unwrap_or_default();
+    boom_gatekeeper::BlockRuleStore::sync_yaml_to_db(pool, &yaml_block_rules).await?;
 
     // ── Plans (delegated to PlanStore) ──
     // plan_store already has RateLimitPlan objects loaded by load_plans_from_config.
@@ -1469,6 +1517,36 @@ fn build_aliases_from_config(
         "Loaded {} alias(es), {} hidden",
         alias_store.len(),
         alias_store.hidden_count(),
+    );
+}
+
+/// Build client blocklist rules from YAML config into BlockRuleStore.
+/// An absent section disables blocking entirely (enabled=false, no rules).
+/// Broken rules are skipped with a warn — they must not block config load.
+fn build_block_rules_from_config(
+    config: &Config,
+    store: &Arc<boom_gatekeeper::BlockRuleStore>,
+) {
+    store.clear();
+    let bl = match &config.client_blocklist {
+        Some(bl) => bl,
+        None => {
+            store.set_enabled(false);
+            return;
+        }
+    };
+    store.set_enabled(bl.enabled);
+    let mut loaded = 0usize;
+    for rule in &bl.rules {
+        match store.insert_rule(rule) {
+            Ok(()) => loaded += 1,
+            Err(e) => tracing::warn!("Skip block rule '{}': {}", rule.name, e),
+        }
+    }
+    tracing::info!(
+        "Loaded {} block rule(s), blocklist {}",
+        loaded,
+        if bl.enabled { "enabled" } else { "disabled" },
     );
 }
 
@@ -2054,6 +2132,22 @@ async fn build_config_snapshot_value(pool: &PgPool) -> Result<serde_json::Value,
         plans_map.insert(r.name.clone(), serde_json::Value::Object(plan_obj));
     }
 
+    // ── Client blocklist rules (delegated to BlockRuleStore) ──
+    // Only the rules array is rebuilt from DB. `enabled` is not part of the
+    // snapshot: merge_runtime_sections preserves an explicit YAML value and
+    // materializes the running switch when the YAML has none.
+    let block_rule_rows = boom_gatekeeper::BlockRuleStore::list_all_db(pool).await?;
+    let block_rules: Vec<serde_json::Value> = block_rule_rows
+        .iter()
+        .filter_map(|row| match row.to_rule() {
+            Ok(rule) => serde_json::to_value(&rule).ok(),
+            Err(e) => {
+                tracing::warn!("Skip block rule in config snapshot: {}", e);
+                None
+            }
+        })
+        .collect();
+
     // ── Assemble top-level ──
     let mut plan_settings = serde_json::Map::new();
     if let Some(dp) = default_plan {
@@ -2067,5 +2161,55 @@ async fn build_config_snapshot_value(pool: &PgPool) -> Result<serde_json::Value,
             "model_group_alias": model_group_alias,
         },
         "plan_settings": plan_settings,
+        "client_blocklist": {
+            "rules": block_rules,
+        },
     }))
+}
+
+#[cfg(test)]
+mod merge_runtime_sections_tests {
+    use super::merge_runtime_sections;
+
+    fn snapshot_with_rules() -> serde_json::Value {
+        serde_json::json!({
+            "client_blocklist": {
+                "rules": [
+                    {
+                        "name": "r1",
+                        "enabled": true,
+                        "conditions": [{"field": "body", "op": "contains", "value": "x"}],
+                        "action": {"message": "blocked"}
+                    }
+                ]
+            }
+        })
+    }
+
+    fn parse(yaml: &str) -> serde_yaml::Value {
+        serde_yaml::from_str(yaml).expect("parse yaml")
+    }
+
+    #[test]
+    fn materializes_enabled_when_merge_creates_the_section() {
+        // Config had no client_blocklist section; a web CRUD persist is about
+        // to create it. The running switch is off — the YAML must record
+        // that, or a restart would parse the new section with the serde
+        // default (true) and silently activate the rules.
+        let mut root = parse("model_list: []\n");
+        merge_runtime_sections(&mut root, &snapshot_with_rules(), false).expect("merge");
+        let bl = root.get("client_blocklist").expect("section created");
+        assert_eq!(bl.get("enabled"), Some(&serde_yaml::Value::Bool(false)));
+        assert!(bl.get("rules").is_some());
+    }
+
+    #[test]
+    fn preserves_explicit_enabled_in_yaml() {
+        // Operator wrote enabled: true by hand (no reload yet). The merge must
+        // not stomp it with the (stale) running switch value.
+        let mut root = parse("client_blocklist:\n  enabled: true\n");
+        merge_runtime_sections(&mut root, &snapshot_with_rules(), false).expect("merge");
+        let bl = root.get("client_blocklist").expect("section kept");
+        assert_eq!(bl.get("enabled"), Some(&serde_yaml::Value::Bool(true)));
+    }
 }

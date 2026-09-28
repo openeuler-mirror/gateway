@@ -200,10 +200,15 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
     .await;
     tracing::info!("Migration 9/9: done");
 
+    // 7. Client block rules (boom-gatekeeper).
+    tracing::info!("Migration 10: client_block_rule...");
+    run_ddl_on_conn(&mut conn, boom_gatekeeper::migrations::block_rule_ddl()).await?;
+    tracing::info!("Migration 10: done");
+
     // Connection returns to pool on drop.
     drop(conn);
 
-    tracing::info!("BooMGateway persistence tables ensured (9 tables)");
+    tracing::info!("BooMGateway persistence tables ensured (10 tables)");
     Ok(())
 }
 
