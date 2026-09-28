@@ -125,6 +125,15 @@ pub fn build_router<S: Clone + Send + Sync + 'static>(state: DashboardState) -> 
             "/dashboard/api/admin/aliases/{alias_name}",
             put(handlers_admin::update_alias).delete(handlers_admin::delete_alias),
         )
+        // Admin — Client blocklist rule CRUD.
+        .route(
+            "/dashboard/api/admin/client-block-rules",
+            get(handlers_admin::list_client_block_rules).post(handlers_admin::create_client_block_rule),
+        )
+        .route(
+            "/dashboard/api/admin/client-block-rules/{rule_name}",
+            put(handlers_admin::update_client_block_rule).delete(handlers_admin::delete_client_block_rule),
+        )
         // Admin — Request Logs.
         .route(
             "/dashboard/api/admin/logs",

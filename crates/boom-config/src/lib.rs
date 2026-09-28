@@ -62,6 +62,11 @@ pub struct Config {
     /// disabled, the gateway runs as if the hook framework didn't exist.
     #[serde(default)]
     pub hooks: HooksConfig,
+    /// Client blocklist — declarative rules that reject requests from
+    /// specific agent clients (matched by headers / body fields / prompt
+    /// content) with a configurable message. Optional; absent = no blocking.
+    #[serde(default)]
+    pub client_blocklist: Option<ClientBlocklistConfig>,
 }
 
 /// Top-level hook configuration. Each entry corresponds to one hook point
@@ -1846,5 +1851,182 @@ mod write_yaml_tests {
         let written = fs::read_to_string(&path).unwrap();
         assert!(written.contains("after: overwrite"));
         assert!(!written.contains("previous"));
+    }
+}
+
+// ── Client Blocklist ─────────────────────────────────────────────────────────
+
+/// Top-level `client_blocklist` section: declarative rules that reject
+/// requests from specific agent clients. Matched after authentication (audit
+/// rows carry key attribution) and before model access checks.
+///
+/// Field addressing inside `MatchCondition::field`:
+/// - `header.<name>` — request header, case-insensitive name lookup
+/// - `body.<json_pointer>` — request-body field, e.g. `body.model`,
+///   `body.system`, `body.messages.0.content`, `body.tools`; extracted value
+///   is stringified (strings verbatim, everything else JSON-encoded)
+/// - `body` — the whole request body serialized as text
+///
+/// This is an ops lever, not a security boundary: headers and prompts are
+/// client-controlled and can be forged. The strong boundary remains key
+/// blocking / model permissions.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+pub struct ClientBlocklistConfig {
+    /// Master switch. When false, all rules are skipped on the hot path.
+    #[serde(default = "default_blocklist_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub rules: Vec<BlockRule>,
+}
+
+fn default_blocklist_enabled() -> bool {
+    true
+}
+
+impl Default for ClientBlocklistConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_blocklist_enabled(),
+            rules: Vec::new(),
+        }
+    }
+}
+
+/// One named blocking rule. Conditions inside a rule are ANDed; the first
+/// matching enabled rule wins and its action is applied.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+pub struct BlockRule {
+    /// Unique rule name (primary key in `boom_client_block_rule`).
+    pub name: String,
+    #[serde(default = "default_rule_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub conditions: Vec<MatchCondition>,
+    pub action: BlockAction,
+}
+
+fn default_rule_enabled() -> bool {
+    true
+}
+
+/// A single match condition against a request field.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+pub struct MatchCondition {
+    /// Field selector — see `ClientBlocklistConfig` docs for the syntax.
+    pub field: String,
+    pub op: BlockOp,
+    /// Expected value. Ignored for `exists`.
+    #[serde(default)]
+    pub value: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum BlockOp {
+    Eq,
+    Contains,
+    Regex,
+    Prefix,
+    Exists,
+}
+
+/// What to answer when a rule matches.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+pub struct BlockAction {
+    /// HTTP status for the rejection. Default 403.
+    #[serde(default = "default_block_status")]
+    pub status: Option<u16>,
+    /// Human-readable rejection reason returned in the error body.
+    pub message: String,
+    /// Error `code` in the OpenAI-style error body. Default "client_blocked".
+    #[serde(default = "default_block_code")]
+    pub code: Option<String>,
+}
+
+fn default_block_status() -> Option<u16> {
+    Some(403)
+}
+
+fn default_block_code() -> Option<String> {
+    Some("client_blocked".to_string())
+}
+
+impl BlockAction {
+    pub fn effective_status(&self) -> u16 {
+        self.status.unwrap_or(403)
+    }
+
+    pub fn effective_code(&self) -> &str {
+        self.code.as_deref().unwrap_or("client_blocked")
+    }
+}
+
+#[cfg(test)]
+mod client_blocklist_tests {
+    use super::*;
+
+    #[test]
+    fn parses_full_section() {
+        let yaml = r#"
+client_blocklist:
+  enabled: true
+  rules:
+    - name: block-cursor
+      enabled: true
+      conditions:
+        - { field: header.user-agent, op: contains, value: "cursor" }
+        - { field: body.model, op: eq, value: "gpt-4o" }
+      action:
+        status: 403
+        message: "blocked"
+        code: cursor_banned
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        let bl = cfg.client_blocklist.expect("section present");
+        assert!(bl.enabled);
+        assert_eq!(bl.rules.len(), 1);
+        let rule = &bl.rules[0];
+        assert_eq!(rule.name, "block-cursor");
+        assert_eq!(rule.conditions.len(), 2);
+        assert_eq!(rule.conditions[0].field, "header.user-agent");
+        assert_eq!(rule.conditions[0].op, BlockOp::Contains);
+        assert_eq!(rule.action.effective_code(), "cursor_banned");
+        assert_eq!(rule.action.effective_status(), 403);
+    }
+
+    #[test]
+    fn absent_section_is_none_and_defaults_apply() {
+        let cfg: Config = serde_yaml::from_str("model_list: []\n").unwrap();
+        assert!(cfg.client_blocklist.is_none());
+
+        let yaml = r#"
+client_blocklist:
+  rules:
+    - name: minimal
+      conditions:
+        - { field: body, op: exists }
+      action: { message: "no" }
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        let bl = cfg.client_blocklist.unwrap();
+        // enabled / rule enabled default to true; action defaults kick in.
+        assert!(bl.enabled);
+        assert!(bl.rules[0].enabled);
+        assert_eq!(bl.rules[0].action.effective_status(), 403);
+        assert_eq!(bl.rules[0].action.effective_code(), "client_blocked");
+        assert_eq!(bl.rules[0].conditions[0].op, BlockOp::Exists);
+    }
+
+    #[test]
+    fn unknown_op_fails_to_parse() {
+        let yaml = r#"
+client_blocklist:
+  rules:
+    - name: bad
+      conditions:
+        - { field: body, op: wildcard, value: x }
+      action: { message: "no" }
+"#;
+        assert!(serde_yaml::from_str::<Config>(yaml).is_err());
     }
 }

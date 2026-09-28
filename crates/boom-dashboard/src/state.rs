@@ -178,6 +178,9 @@ pub struct DashboardState {
     pub agent_stats: Arc<AgentStatsTracker>,
     /// Authenticator — used for key alias lookups (reads boom_verification_token).
     pub auth: Arc<dyn KeyAliasLookup>,
+    /// Client blocklist store (boom-gatekeeper) — rule CRUD + hot-path check
+    /// share the same compiled rules.
+    pub block_rule_store: Arc<boom_gatekeeper::BlockRuleStore>,
     /// Audit-log drop counter (channel full or batch INSERT failures).
     /// None when DB not configured (no LogWriter). Surfaced on the debug page.
     pub log_dropped: Option<Arc<dyn boom_core::LogDroppedCounter>>,
@@ -212,6 +215,7 @@ impl DashboardState {
         request_rate: Arc<RequestRateTracker>,
         agent_stats: Arc<AgentStatsTracker>,
         auth: Arc<dyn KeyAliasLookup>,
+        block_rule_store: Arc<boom_gatekeeper::BlockRuleStore>,
         log_dropped: Option<Arc<dyn boom_core::LogDroppedCounter>>,
         stressmon: Arc<dyn boom_core::StressmonApi>,
         trace: Arc<dyn boom_core::TraceApi>,
@@ -240,6 +244,7 @@ impl DashboardState {
             request_rate,
             agent_stats,
             auth,
+            block_rule_store,
             log_dropped,
             stressmon,
             trace,

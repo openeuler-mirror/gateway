@@ -106,6 +106,7 @@ fn write_prompt_log_error(
         GatewayError::ModelNotFound(_) | GatewayError::ModelNotAllowed(_) => {
             boom_promptlog::error_code::MODEL_NOT_ALLOWED
         }
+        GatewayError::ClientBlocked { .. } => boom_promptlog::error_code::CLIENT_BLOCKED,
         GatewayError::AuthError(_) | GatewayError::KeyExpired | GatewayError::KeyBlocked => {
             boom_promptlog::error_code::AUTH_FAILED
         }
@@ -617,6 +618,23 @@ async fn chat_completions_inner(
 
     tracing::info!(request_id = %request_id, model = %model, stream = is_stream, path = api_path, "chat_completions request started");
 
+    // Client blocklist — before any routing/limit work. Fail-open on body
+    // serialization failure (schema validation rejects the request anyway).
+    check_client_block_rules(
+        &state,
+        &identity,
+        headers,
+        serde_json::to_value(&req).ok(),
+        &model,
+        api_path,
+        is_stream,
+        &request_id,
+        &client_ip,
+        user_tag.clone(),
+        start,
+    )
+    .map_err(|e| GatewayErrorReply(e, is_stream))?;
+
     // Prompt log: check early to avoid unnecessary cloning.
     let prompt_log_should = state.prompt_log_writer.should_capture(
         &identity.key_hash,
@@ -646,30 +664,9 @@ async fn chat_completions_inner(
     // Clone request_id and model for prompt log (they get moved into RequestLog later).
     let prompt_log_rid = if prompt_log_should { Some(request_id.clone()) } else { None };
     let prompt_log_model = if prompt_log_should { Some(model.clone()) } else { None };
-    // Snapshot whitelisted request headers (only when configured). Empty
-    // record_headers = capture nothing (security default to avoid leaking
-    // Authorization/Cookie/etc). Header names lowercased on both sides.
+    // Snapshot whitelisted request headers (only when configured).
     let prompt_log_headers: Option<std::collections::HashMap<String, String>> = if prompt_log_should {
-        let cfg = state.prompt_log_writer.config();
-        if cfg.record_headers.is_empty() {
-            None
-        } else {
-            let allow: std::collections::HashSet<&str> = cfg
-                .record_headers
-                .iter()
-                .map(|s| s.as_str())
-                .collect();
-            let mut map = std::collections::HashMap::new();
-            for (name, val) in headers.iter() {
-                let name_lower = name.as_str().to_lowercase();
-                if allow.contains(name_lower.as_str()) {
-                    if let Ok(v) = val.to_str() {
-                        map.insert(name_lower, v.to_string());
-                    }
-                }
-            }
-            if map.is_empty() { None } else { Some(map) }
-        }
+        snapshot_prompt_log_headers(&state, headers)
     } else {
         None
     };
@@ -1575,7 +1572,13 @@ fn openai_error_body(error: &GatewayError) -> serde_json::Value {
         "error": {
             "message": error.to_string(),
             "type": error.error_type(),
-            "code": error.status_code(),
+            // ClientBlocked carries the rule's configured code string
+            // ("client_blocked" by default); everything else keeps the
+            // numeric status as the code.
+            "code": match error.client_block_code() {
+                Some(code) => serde_json::json!(code),
+                None => serde_json::json!(error.status_code()),
+            },
         }
     })
 }
@@ -1690,6 +1693,161 @@ fn is_model_visible(name: &str, identity: &AuthIdentity, router: &Router) -> boo
 // ============================================================
 // Model Access Check (deployment-aware, uses stores)
 // ============================================================
+
+/// Check client blocklist rules for an incoming (already authenticated)
+/// request. Called at both LLM entry points — `chat_completions_inner` and
+/// `messages` — after identity extraction, before model access checks, so
+/// audit rows carry key attribution.
+///
+/// On match:
+/// - audit: `log_error_with_usage` (ClientBlocked is not a dedup member →
+///   every rejection is logged in full)
+/// - prompt log: `write_prompt_log_error` with `should_capture=true` — the
+///   full request body is captured even when the key isn't in the sampling
+///   whitelist
+/// - response: 403 (or the rule's configured status) with the rule's message
+///
+/// `body` is the serialized request JSON (`serde_json::to_value(&req)`);
+/// None (serialization failure) skips the check — the request then fails
+/// naturally at schema validation.
+#[allow(clippy::too_many_arguments)]
+fn check_client_block_rules(
+    state: &AppState,
+    identity: &AuthIdentity,
+    headers: &axum::http::HeaderMap,
+    body: Option<serde_json::Value>,
+    model: &str,
+    api_path: &str,
+    is_stream: bool,
+    request_id: &str,
+    client_ip: &str,
+    user_tag: Option<String>,
+    start: Instant,
+) -> Result<(), GatewayError> {
+    // Hot-path fast exit: no rules loaded or blocklist disabled.
+    if state.block_rule_store.is_empty() || !state.block_rule_store.is_enabled() {
+        return Ok(());
+    }
+    let Some(body) = body else {
+        return Ok(());
+    };
+    let Some(m) = state.block_rule_store.check(
+        |name| {
+            headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        },
+        &body,
+    ) else {
+        return Ok(());
+    };
+
+    let err = GatewayError::ClientBlocked {
+        status: m.action.effective_status(),
+        message: m.action.message.clone(),
+        code: m.action.effective_code().to_string(),
+    };
+    tracing::warn!(
+        request_id = %request_id,
+        rule = %m.rule_name,
+        key = identity.key_alias.as_deref().or(identity.key_name.as_deref()).unwrap_or("-"),
+        model = model,
+        "request blocked by client blocklist rule"
+    );
+
+    // Audit log — full fidelity, never deduped.
+    crate::request_log::log_error_with_usage(
+        state,
+        identity,
+        model,
+        api_path,
+        is_stream,
+        start,
+        &err,
+        Some(request_id.to_string()),
+        None,
+        None,
+        Some(client_ip.to_string()),
+        user_tag,
+        None,
+        None,
+    );
+
+    // Debug detail — rule name + per-condition evidence (which field held
+    // what value), plus the full request body. Only captured while the logs
+    // page's debug toggle is on; gated here to skip serialization otherwise.
+    if state.debug_store.is_enabled() {
+        state.debug_store.record(boom_core::DebugErrorEntry {
+            request_id: request_id.to_string(),
+            key_hash: identity.key_hash.clone(),
+            key_alias: identity.key_alias.clone(),
+            model: model.to_string(),
+            api_path: api_path.to_string(),
+            is_stream,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            status_code: err.status_code(),
+            error_type: err.error_type().to_string(),
+            error_message: format!("rule '{}': {}", m.rule_name, m.action.message),
+            upstream_status: None,
+            upstream_body: None,
+            request_body: serde_json::to_string(&body).ok(),
+            block_rule: Some(serde_json::json!({
+                "rule": m.rule_name,
+                "conditions": m.matched,
+            })),
+        });
+    }
+
+    // Prompt log — forced full capture, bypasses key sampling.
+    let body_arc = Arc::new(body);
+    let header_snapshot = snapshot_prompt_log_headers(state, headers);
+    write_prompt_log_error(
+        state,
+        true,
+        Some(&body_arc),
+        None,
+        request_id,
+        identity,
+        model,
+        api_path,
+        is_stream,
+        client_ip,
+        header_snapshot.as_ref(),
+        &err,
+        None,
+        None,
+        start,
+        None,
+    );
+
+    Err(err)
+}
+
+/// Snapshot whitelisted request headers for the prompt log. Empty
+/// `record_headers` config = capture nothing (security default to avoid
+/// leaking Authorization/Cookie/etc). Header names lowercased on both sides.
+fn snapshot_prompt_log_headers(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+) -> Option<std::collections::HashMap<String, String>> {
+    let cfg = state.prompt_log_writer.config();
+    if cfg.record_headers.is_empty() {
+        return None;
+    }
+    let allow: std::collections::HashSet<&str> =
+        cfg.record_headers.iter().map(|s| s.as_str()).collect();
+    let mut map = std::collections::HashMap::new();
+    for (name, val) in headers.iter() {
+        let name_lower = name.as_str().to_lowercase();
+        if allow.contains(name_lower.as_str()) {
+            if let Ok(v) = val.to_str() {
+                map.insert(name_lower, v.to_string());
+            }
+        }
+    }
+    if map.is_empty() { None } else { Some(map) }
+}
 
 /// Check if an identity can access the given model, considering the gateway's
 /// configured deployments and model aliases.
@@ -2935,6 +3093,23 @@ pub async fn messages(
 
     tracing::info!(request_id = %request_id, model = %model, stream = is_stream, "messages request started");
 
+    // Client blocklist — before openai conversion, matching against the
+    // native Anthropic body (model / system / messages all addressable).
+    check_client_block_rules(
+        &state,
+        &identity,
+        &headers,
+        serde_json::to_value(&req).ok(),
+        &model,
+        "/v1/messages",
+        is_stream,
+        &request_id,
+        &client_ip,
+        user_tag.clone(),
+        start,
+    )
+    .map_err(|e| AnthropicErrorReply(e, is_stream))?;
+
     // Prompt log: check early to avoid unnecessary cloning.
     let prompt_log_should = state.prompt_log_writer.should_capture(
         &identity.key_hash,
@@ -2961,30 +3136,9 @@ pub async fn messages(
     // Clone request_id and model for prompt log (they get moved into RequestLog later).
     let prompt_log_rid = if prompt_log_should { Some(request_id.clone()) } else { None };
     let prompt_log_model = if prompt_log_should { Some(model.clone()) } else { None };
-    // Snapshot whitelisted request headers (only when configured). Empty
-    // record_headers = capture nothing (security default to avoid leaking
-    // Authorization/Cookie/etc). Header names lowercased on both sides.
+    // Snapshot whitelisted request headers (only when configured).
     let prompt_log_headers: Option<std::collections::HashMap<String, String>> = if prompt_log_should {
-        let cfg = state.prompt_log_writer.config();
-        if cfg.record_headers.is_empty() {
-            None
-        } else {
-            let allow: std::collections::HashSet<&str> = cfg
-                .record_headers
-                .iter()
-                .map(|s| s.as_str())
-                .collect();
-            let mut map = std::collections::HashMap::new();
-            for (name, val) in headers.iter() {
-                let name_lower = name.as_str().to_lowercase();
-                if allow.contains(name_lower.as_str()) {
-                    if let Ok(v) = val.to_str() {
-                        map.insert(name_lower, v.to_string());
-                    }
-                }
-            }
-            if map.is_empty() { None } else { Some(map) }
-        }
+        snapshot_prompt_log_headers(&state, &headers)
     } else {
         None
     };

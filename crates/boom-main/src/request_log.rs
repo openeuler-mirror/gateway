@@ -581,6 +581,7 @@ pub fn log_error_with_usage(
                     upstream_status,
                     upstream_body,
                     request_body,
+                    block_rule: None,
                 });
             }
         }

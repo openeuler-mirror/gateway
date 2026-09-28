@@ -323,3 +323,48 @@ hooks:
     # allowed_headers: [ucid]               # 业务方需要从 header 取的字段
     # config: '{"prefix":"sk-customer-"}'   # hook 自行解析
 
+# ──────────────────────────────────────────────────────────────────────
+# 客户端拦截规则（client_blocklist）
+#
+# 按"请求头 / 请求体字段 / 提示词内容"匹配并拒绝特定 agent 客户端的
+# 请求，拒绝理由（message / status / code）可配置。规则在认证之后、
+# 模型权限检查之前执行，被拒请求会记审计日志（boom_request_log，
+# error_type=client_blocked）并强制写 prompt log 全文（不受采样控制）。
+#
+# 定位：运维手段，不是安全边界 —— header 与 prompt 都可被客户端伪造，
+# 强边界仍是禁用 key / 模型权限。
+#
+# 字段寻址（conditions[].field）：
+#   header.<name>      请求头，name 大小写不敏感
+#   body.<json_pointer> 请求体字段，如 body.model / body.system /
+#                       body.messages.0.content / body.tools；
+#                       提取值字符串化（字符串原样，其余 JSON 编码）
+#   body               整个请求体序列化文本
+#
+# 操作符（op）：eq | contains | regex | prefix | exists
+# 规则内条件 AND；规则间先命中先生效。regex 在加载时预编译，
+# 编译失败的规则会被跳过并打 warn（Dashboard 创建/更新时会先校验）。
+#
+# 该 section 为 YAML 真相源；Dashboard 上的增删改写 DB（source='db'）
+# 并 best-effort 同步回此文件，与 model alias 同一套双源语义。
+# ──────────────────────────────────────────────────────────────────────
+client_blocklist:
+  enabled: true                            # 总开关，false 时热路径直接跳过
+  rules: []
+  # —— 示例 ——
+  # rules:
+  #   - name: block-cursor-agent           # 规则名，唯一（DB 主键）
+  #     enabled: true
+  #     conditions:                        # 规则内多条件 AND
+  #       - { field: header.user-agent, op: contains, value: "cursor" }
+  #       - { field: body.model, op: eq, value: "gpt-4o" }
+  #     action:
+  #       status: 403                      # 默认 403
+  #       message: "该客户端已被禁用，请联系 admin@example.com"
+  #       code: client_blocked             # 默认 client_blocked
+  #   - name: block-by-system-prompt
+  #     conditions:
+  #       - { field: body.messages.0.content, op: regex, value: "(?i)you are cursor" }
+  #     action:
+  #       message: "blocked by prompt signature"
+

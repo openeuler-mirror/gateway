@@ -64,6 +64,14 @@ pub enum GatewayError {
     #[error("Model not allowed: {0}")]
     ModelNotAllowed(String),
 
+    /// Rejected by a client-blocklist rule (boom-gatekeeper). `message` is the
+    /// rule's configurable rejection reason; `code` mirrors
+    /// `BlockAction::code` (default "client_blocked"); `status` mirrors
+    /// `BlockAction::status` (default 403, validated to 400-599 by the
+    /// gatekeeper's compile step).
+    #[error("{message}")]
+    ClientBlocked { status: u16, message: String, code: String },
+
     #[error("Upstream timeout")]
     UpstreamTimeout,
 
@@ -100,6 +108,7 @@ impl GatewayError {
             Self::KeyExpired => 401,
             Self::KeyBlocked => 403,
             Self::ModelNotAllowed(_) => 403,
+            Self::ClientBlocked { status, .. } => *status,
             Self::UpstreamTimeout => 504,
             Self::UpstreamError { .. } => 502,
             Self::NotSupported(_) => 404,
@@ -169,6 +178,7 @@ impl GatewayError {
             Self::KeyExpired => "key_expired",
             Self::KeyBlocked => "key_blocked",
             Self::ModelNotAllowed(_) => "model_not_allowed",
+            Self::ClientBlocked { .. } => "client_blocked",
             Self::UpstreamTimeout => "timeout",
             Self::UpstreamError { .. } => "upstream_error",
             Self::NotSupported(_) => "not_supported",
@@ -184,6 +194,16 @@ impl GatewayError {
     pub fn raw_upstream_body(&self) -> Option<&str> {
         match self {
             Self::UpstreamParseError { raw_body, .. } => Some(raw_body),
+            _ => None,
+        }
+    }
+
+    /// Custom error-body `code` for ClientBlocked (the rule's configured code,
+    /// e.g. "client_blocked" or "cursor_banned"). Other variants return None
+    /// and keep the numeric status as the code.
+    pub fn client_block_code(&self) -> Option<&str> {
+        match self {
+            Self::ClientBlocked { code, .. } => Some(code),
             _ => None,
         }
     }
@@ -228,6 +248,12 @@ mod tests {
 
         // Non-members — keep full per-request logging.
         assert!(!GatewayError::AuthError("bad key".into()).should_dedup_log());
+        assert!(!GatewayError::ClientBlocked {
+            status: 403,
+            message: "banned".into(),
+            code: "client_blocked".into()
+        }
+        .should_dedup_log());
         assert!(!GatewayError::ProviderError("upstream".into()).should_dedup_log());
         assert!(!GatewayError::UpstreamTimeout.should_dedup_log());
         assert!(!GatewayError::UpstreamError { status: 500, message: "x".into() }.should_dedup_log());
@@ -267,3 +293,19 @@ mod tests {
         }
     }
 }
+
+    #[test]
+    fn client_blocked_mappings() {
+        let e = GatewayError::ClientBlocked {
+            status: 451,
+            message: "该客户端已被禁用".into(),
+            code: "cursor_banned".into(),
+        };
+        assert_eq!(e.status_code(), 451);
+        assert_eq!(e.error_type(), "client_blocked");
+        assert_eq!(e.client_block_code(), Some("cursor_banned"));
+        assert_eq!(e.to_string(), "该客户端已被禁用");
+        assert!(e.should_log_to_db());
+        // Other variants keep numeric code semantics.
+        assert!(GatewayError::KeyBlocked.client_block_code().is_none());
+    }

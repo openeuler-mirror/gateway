@@ -34,6 +34,7 @@ boom-ctxaware = { path = "../boom-ctxaware" }
 boom-flowcontrol = { path = "../boom-flowcontrol" }
 boom-promptlog = { path = "../boom-promptlog" }
 boom-trace = { path = "../boom-trace" }
+boom-gatekeeper = { path = "../boom-gatekeeper" }
 boom-kvindex = { path = "../boom-kvindex" }
 boom-hooks-sdk = { path = "../boom-hooks-sdk" }
 boom-stressmon = { path = "../boom-stressmon" }

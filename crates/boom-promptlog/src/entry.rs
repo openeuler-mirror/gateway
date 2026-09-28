@@ -113,6 +113,7 @@ pub mod error_code {
     pub const UPSTREAM_ERROR: &str = "UPSTREAM_ERROR";
     pub const TIMEOUT: &str = "TIMEOUT";
     pub const MODEL_NOT_ALLOWED: &str = "MODEL_NOT_ALLOWED";
+    pub const CLIENT_BLOCKED: &str = "CLIENT_BLOCKED";
     pub const RATE_LIMITED: &str = "RATE_LIMITED";
     pub const AUTH_FAILED: &str = "AUTH_FAILED";
     pub const BAD_REQUEST: &str = "BAD_REQUEST";
