@@ -337,6 +337,17 @@ pub struct ChatCompletionRequest {
     pub raw_capture: Option<crate::provider::SharedRawCapture>,
 }
 
+impl ChatCompletionRequest {
+    /// Fold `"tools": []` to `None`. The two forms are semantically identical,
+    /// but some upstreams (vLLM, Gemini) reject the empty array, so protocol
+    /// entries canonicalize before routing.
+    pub fn normalize_empty_tools(&mut self) {
+        if self.tools.as_ref().is_some_and(|t| t.is_empty()) {
+            self.tools = None;
+        }
+    }
+}
+
 /// Header names/prefixes that must never be sourced from client input or
 /// deployment `headers` config — the single source of truth for the
 /// gateway's header-spoofing policy. Shared by the client-whitelist pass
@@ -1047,5 +1058,67 @@ mod header_policy_tests {
         for name in ["x-request-id", "user-agent", "anthropic-beta", "x-custom-header"] {
             assert!(!is_hard_blocked_header(name), "{name} must be allowed");
         }
+    }
+}
+
+#[cfg(test)]
+mod request_normalization_tests {
+    use super::*;
+
+    fn req_with_tools(tools: Option<Vec<Tool>>) -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: "m".to_string(),
+            messages: vec![],
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            max_completion_tokens: None,
+            stream: None,
+            stop: None,
+            n: None,
+            tools,
+            tool_choice: None,
+            response_format: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            user: None,
+            logprobs: None,
+            top_logprobs: None,
+            logit_bias: None,
+            extra: serde_json::Map::new(),
+            gateway_headers: HashMap::new(),
+            kv_cache_report_full: false,
+            raw_capture: None,
+        }
+    }
+
+    #[test]
+    fn empty_tools_fold_to_none() {
+        let mut req = req_with_tools(Some(vec![]));
+        req.normalize_empty_tools();
+        assert!(req.tools.is_none());
+    }
+
+    #[test]
+    fn nonempty_tools_untouched() {
+        let tools = vec![Tool {
+            tool_type: "function".to_string(),
+            function: ToolFunction {
+                name: "bash".to_string(),
+                description: None,
+                parameters: serde_json::json!({"type": "object"}),
+            },
+        }];
+        let mut req = req_with_tools(Some(tools));
+        req.normalize_empty_tools();
+        assert_eq!(req.tools.as_ref().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn absent_tools_stay_none() {
+        let mut req = req_with_tools(None);
+        req.normalize_empty_tools();
+        assert!(req.tools.is_none());
     }
 }

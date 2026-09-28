@@ -45,8 +45,10 @@ pub fn anthropic_request_to_openai(req: &AnthropicMessagesRequest) -> ChatComple
         }
     }
 
-    // 3. Tools: Anthropic input_schema → OpenAI parameters.
-    let tools = req.tools.as_ref().map(|ts| {
+    // 3. Tools: Anthropic input_schema → OpenAI parameters. An empty list is
+    // folded to None — `"tools": []` ≡ absent, and some upstreams (vLLM,
+    // Gemini) reject the empty array.
+    let tools = req.tools.as_ref().filter(|ts| !ts.is_empty()).map(|ts| {
         ts.iter()
             .map(|t| Tool {
                 tool_type: "function".to_string(),
@@ -821,6 +823,44 @@ fn generate_anthropic_message_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn anthropic_req_with_tools(tools: Option<Vec<AnthropicTool>>) -> AnthropicMessagesRequest {
+        AnthropicMessagesRequest {
+            model: "claude-test".to_string(),
+            system: None,
+            messages: vec![],
+            max_tokens: Some(16),
+            tools,
+            tool_choice: None,
+            thinking: None,
+            temperature: None,
+            top_p: None,
+            stop_sequences: None,
+            stream: None,
+            metadata: None,
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    #[test]
+    fn empty_anthropic_tools_fold_to_none() {
+        // `"tools": []` from Anthropic clients must not reach OpenAI-compatible
+        // upstreams (vLLM et al. reject the empty array).
+        let req = anthropic_req_with_tools(Some(vec![]));
+        let openai_req = anthropic_request_to_openai(&req);
+        assert!(openai_req.tools.is_none());
+    }
+
+    #[test]
+    fn nonempty_anthropic_tools_preserved() {
+        let req = anthropic_req_with_tools(Some(vec![AnthropicTool {
+            name: "bash".to_string(),
+            description: None,
+            input_schema: serde_json::json!({"type": "object"}),
+        }]));
+        let openai_req = anthropic_request_to_openai(&req);
+        assert_eq!(openai_req.tools.as_ref().unwrap().len(), 1);
+    }
 
     #[test]
     fn test_convert_user_message_image_url() {

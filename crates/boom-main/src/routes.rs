@@ -635,6 +635,11 @@ async fn chat_completions_inner(
             None
         };
 
+    // Fold `"tools": []` to None before any routing consumer sees it (vLLM
+    // and friends reject the empty array). Placed after the serialization
+    // above so the prompt log / blocklist keep the wire-faithful body.
+    req.normalize_empty_tools();
+
     // Client blocklist — before any routing/limit work. Fail-open on body
     // serialization failure (schema validation rejects the request anyway).
     check_client_block_rules(
