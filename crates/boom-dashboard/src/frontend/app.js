@@ -5078,6 +5078,7 @@
     }
     const btnResetAll = document.getElementById("btn-reset-all-limits");
     if (btnResetAll) btnResetAll.addEventListener("click", async () => {
+      if (!confirm(t("confirm.reset_all"))) return;
       const r = await api("/admin/limits/reset", { method: "POST" });
       alert(r.message || t("alert.done"));
     });

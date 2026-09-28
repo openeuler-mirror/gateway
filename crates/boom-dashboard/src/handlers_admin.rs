@@ -3510,12 +3510,14 @@ pub async fn reset_limits_for_key(
 }
 
 /// POST /admin/limits/reset — clear all rate limit windows for all keys.
+/// Only sliding windows; cumulative metering (spend / budget enforcement)
+/// is deliberately untouched.
 pub async fn reset_limits_all(
     _session: AdminSession,
     Extension(state): Extension<Arc<DashboardState>>,
 ) -> Json<Value> {
     tracing::info!("Admin resetting ALL rate limit windows");
-    let removed = state.limiter.clear_all();
+    let removed = state.limiter.clear_all_windows();
     Json(json!({
         "ok": true,
         "cleared": removed,

@@ -718,14 +718,15 @@ impl SlidingWindowLimiter {
         removed
     }
 
-    /// Clear all window + cumulative counters (memory only). Returns windows count.
-    pub fn clear_all(&self) -> usize {
+    /// Clear ALL window counters for every key/team (memory only). Returns
+    /// entry count. Cumulative metering (lifetime spend/tokens) is NOT
+    /// touched — it feeds the dashboard "spend" column and enforces plan
+    /// total_token_limit/total_cost_limit; resetting it is a deliberate
+    /// per-key quota operation (`clear_key_all`), not a limits reset.
+    pub fn clear_all_windows(&self) -> usize {
         let count = self.windows.len();
         self.windows.clear();
-        self.cumulative.clear();
-        // Best-effort: clear dirty sets too.
         self.dirty_windows.write().expect("dirty lock poisoned").clear();
-        self.dirty_cumulative.write().expect("dirty lock poisoned").clear();
         count
     }
 
