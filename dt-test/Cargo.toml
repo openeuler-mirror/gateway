@@ -40,3 +40,17 @@ serde_json = "1"
 serde_yaml = "0.9"
 tempfile = "3"
 wiremock = "0.6"
+# 与 boom-promptlog / boom-trace 同款 ArcSwap（FilePromptLogQuery 构造用）
+arc-swap = { workspace = true }
+# 与 boom-kvindex 同款的 xxhash3-64（测试构造 parent_hash 用）
+twox-hash = "2"
+# 与 boom-core 同款 Decimal（ProviderCost / WindowLimit.costs 构造用）
+rust_decimal = { workspace = true }
+# 与 boom-core 同款 chrono（AuthIdentity.expires_at 构造用）
+chrono = { workspace = true }
+# 与 boom-flowcontrol 同款 futures（noop_waker poll acquire future / FlowControlledStream）
+futures = { workspace = true }
+# 与 boom-fusion 同款 async-trait（实现 ModelInvoker / Workflow trait 所需）
+async-trait = { workspace = true }
+# 与 boom-trace 同款 opentelemetry-proto（断言 convert_span_to_resource_spans 映射用）
+opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic-messages", "trace", "with-serde"] }

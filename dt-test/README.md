@@ -3,15 +3,36 @@
 开发者测试（DT）工程：**直接调用 boom-\* lib crate 的 pub API**（path 依赖源码级
 链接、进程内执行），由 cargo-llvm-cov 统计功能源码覆盖率。不拉子进程、不测黑盒。
 
-## 范围与约定
+> **用例 ↔ AR 验收项映射**见 [AR_MAPPING.md](AR_MAPPING.md)（501 用例 → 5 条 AR，
+> 含 kvc 调度两 AR 的函数级清单与覆盖缺口说明）。
 
-- **覆盖对象**：workspace 里全部 lib crate（boom-core / config / auth / provider /
-  limiter / routing / audit / ctxaware / flowcontrol / fusion / kvindex /
-  promptlog / trace / stressmon / alert）。
-- **boom-main 不在 DT 覆盖范围**：它是纯 bin crate（组装层），外部无法进程内链接，
-  其逻辑由 crate 内已有单测覆盖（这是显式决策，不是遗漏）。
-- **boom-hooks-sdk 暂未纳入**：其 FFI raw-pointer API 在 clippy 1.95 有 6 个存量
-  lint，待修复后加回 `Cargo.toml` 即可。
+## 覆盖范围（如实三档）
+
+DT 的实际覆盖状态分三档（判定依据 = lcov 报告里出现且被用例驱动过的 crate）：
+
+1. **已覆盖（13 个 lib crate）**：boom-core / config / auth / provider / limiter /
+   routing / ctxaware / flowcontrol / fusion / kvindex / trace / stressmon / alert。
+2. **显式排除**：
+   - **boom-main** —— 纯 bin crate（组装层），外部无法进程内链接，逻辑由 crate
+     内已有单测覆盖（显式决策，不是遗漏）。
+   - **boom-hooks-sdk** —— FFI raw-pointer API 在 clippy 1.95 有 6 个存量 lint，
+     待修复后加回 `Cargo.toml` 即可。
+3. **待补（再议）**：boom-audit / boom-promptlog / boom-dashboard —— 尚无 DT
+   用例。它们虽在依赖清单里（dashboard 除外），但没有任何测试引用时链接器不会
+   把 crate 代码链进测试二进制，因此**不占覆盖率分母**，不虚增也不虚减。
+
+**DB 路径约定**：DT 环境不起 Postgres/GaussDB，routing / limiter / auth 的
+`*_db` 方法、DB 恢复/同步逻辑按约定跳过（无 Docker）。后果：
+
+- boom-limiter ~84%（漏的是 `sync_counters_to_db` 等纯 DB 函数）；
+- boom-auth ~41% —— 漏掉的 66 行**已逐行核对全部是 DB 分支**
+  （`lookup_token` 查询 / `token_to_identity` / `lookup_team` /
+  authenticate 中段的 team 解析与 blocked/expired/budget 校验），
+  无 DB 可达面（哈希、主密钥、check_model_access）已覆盖；
+- boom-routing 的缺口同理（`*_db` SQL 行）。
+
+## 其他约定
+
 - **本包是主 workspace 的成员**（否则 llvm-cov 不会对 boom-\* 插桩），但根
   `Cargo.toml` 的 `default-members` 不含它 —— 裸 `cargo build` / `cargo test`
   行为不变。原有单测仍走 `cargo test`，与 DT 互不影响。
@@ -22,8 +43,12 @@
 dt-test/
 ├── Cargo.toml        boom-dt 包（path 依赖全部被测 lib crate）
 ├── src/lib.rs        DT harness：MockUpstream / TestServer / chat_request / free_port
-└── tests/            DT 用例（按 testcase/cases/ 的域分文件）
-    └── smoke.rs        冒烟：配置解析 / provider 调用链 / 路由存储
+└── tests/            DT 用例（按被测 crate / testcase 域分文件，一个 crate 至少一个）
+    ├── smoke.rs        冒烟：配置解析 / provider 调用链 / 路由存储
+    ├── harness.rs      DT harness 自身（free_port / MockUpstream / TestServer）
+    ├── core.rs config.rs auth.rs provider.rs limiter.rs routing*.rs
+    ├── ctxaware.rs flowcontrol.rs fusion.rs kvindex.rs trace*.rs
+    ├── stressmon.rs alert.rs anthropic.rs azure.rs ml_service.rs …
 
 仓库根：
 ├── .config/nextest.toml   nextest 配置（ci profile 出 JUnit XML）
@@ -60,6 +85,8 @@ cargo nextest run -p boom-dt
 cargo llvm-cov nextest -p boom-dt
 cargo llvm-cov report --lcov --output-path dt-test/target/lcov.info   # lcov（流水线解析）
 cargo llvm-cov report --html --output-dir dt-test/target/html         # HTML（人工看）
+# 终端直接看全量总表（--summary-only 只出 TOTAL 行；排除 DT 脚手架自身）
+cargo llvm-cov report --summary-only --ignore-filename-regex 'dt-test/src'
 
 # DT 交付模式：JUnit XML（target/nextest/ci/junit.xml）
 cargo nextest run -p boom-dt --profile ci
@@ -81,10 +108,32 @@ cargo nextest run -p boom-dt --profile ci
   插桩、不出现在 lcov 数据里。（已实测验证：`ml_service_client.rs` 501 行中
   268 行起是测试模块，lcov 数据行号止于 265。）
 - **dt-test 自身的 harness/用例代码**（`dt-test/src/`、`dt-test/tests/`）也不应
-  计入功能覆盖率。统计时按路径过滤：只取 `SF:` 以 `/crates/boom-` 开头的条目。
-- 终端汇总表只显示 `-p boom-dt` 选中的包（即 harness 自己），不是功能代码覆盖率；
-  功能代码覆盖率看 lcov/HTML 报告里 `/crates/boom-` 条目的汇总。
+  计入功能覆盖率。统计时按路径过滤：只取 `SF:` 以 `/crates/boom-` 开头的条目；
+  终端表则用 `--ignore-filename-regex 'dt-test/src'` 排除。
+- **`cargo llvm-cov nextest -p boom-dt` 跑完打印的那张表不是总覆盖率**——它跟着
+  `-p` 过滤，只显示 boom-dt 包自己的源码（`dt-test/src/lib.rs` 这个 harness）。
+  boom-\* 的覆盖数据在同一份 profdata 里，第二步 `cargo llvm-cov report`（不带
+  `-p`）才展开全量表。harness 自身由 `tests/harness.rs` 的 `DT-HAR-*` 7 例覆盖
+  （98.77% lines，仅剩 1 行 `expect` 的 panic 分支）。
+- 当前基准（508 用例，2026-09）：终端全量表 TOTAL Lines 含脚手架 80.21%，
+  `--ignore-filename-regex 'dt-test/src'` 排除后 **80.06%**（达标口径 ≥80%）。
 - 增量覆盖率 = lcov 与 git 变更文件列表求交（流水线侧做）。
+
+### 报告表字段含义
+
+`cargo llvm-cov report` 的表有四个维度，各自带一个 Cover 百分比（所以有多个
+"Cover" 列——它们是**四个不同指标**，不是同一个数的重复）：
+
+| 列 | 含义 |
+| --- | --- |
+| Regions / Missed Regions / Cover | **区域覆盖**。region 是 llvm 源码覆盖的最小计数单元：一段没有分支跳进跳出的连续指令区间（类似基本块），每个 region 插一个计数器。一行代码可含多个 region（单行 `if/else`、`&&`/`\|\|` 短路、闭包），所以 region 覆盖通常 ≤ 行覆盖，对"行执行了但只走了一半"更敏感。 |
+| Functions / Missed Functions / Executed | **函数覆盖**（最粗粒度）。整个函数是否至少被调用过一次；Executed = 被调用过的函数个数，Cover = Executed / Functions。 |
+| Lines / Missed Lines / Cover | **行覆盖**——只统计可执行行（有指令映射的行；注释/空行/纯声明不计）。**80% 目标看的就是这一列**。 |
+| Branches / Missed Branches / Cover | **分支覆盖**：每个条件跳转的两个方向是否都执行过。当前恒为 0——stable 工具链未启用分支插桩（需 nightly `-Zcoverage-options=branch`），此维度无数据，忽略即可。 |
+
+Missed X = 该维度一次都没执行到的数量；四个维度粒度从粗到细：
+Functions（函数被调过吗）< Lines（行执行过吗）< Regions（行内的区间都走到过吗）
+< Branches（分支两边都走过吗，未启用）。
 
 ## 写新 DT 用例
 

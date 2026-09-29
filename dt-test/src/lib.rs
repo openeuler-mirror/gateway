@@ -89,7 +89,11 @@ impl MockUpstream {
     }
 
     /// 重新挂一个"正常回复" Mock（比如想覆盖前面挂的错误 Mock）。
+    ///
+    /// wiremock 0.6 同优先级下**先挂的 Mock 优先**，直接再挂一个无法覆盖；
+    /// 因此这里先 `reset()` 清空该 server 上的全部 Mock 再挂。
     pub async fn remount_chat_ok(&self, content: &str) {
+        self.server.reset().await;
         Self::mount_chat_ok(&self.server, content).await;
     }
 
