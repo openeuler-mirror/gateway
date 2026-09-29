@@ -59,6 +59,7 @@ fn text_message(role: MessageRole, content: &str) -> Message {
 fn request(with_tools: bool) -> ChatCompletionRequest {
     ChatCompletionRequest {
         model: "fusion".to_string(),
+        from_anthropic_protocol: false,
         messages: vec![text_message(MessageRole::User, "fix it")],
         max_tokens: Some(128),
         max_completion_tokens: None,

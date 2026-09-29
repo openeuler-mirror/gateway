@@ -37,6 +37,7 @@ fn provider(server_uri: &str) -> AzureProvider {
 fn request() -> ChatCompletionRequest {
     ChatCompletionRequest {
         model: "whatever-model".to_string(),
+        from_anthropic_protocol: false,
         messages: vec![Message {
             role: MessageRole::User,
             content: MessageContent::Text("hello".to_string()),

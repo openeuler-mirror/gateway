@@ -3,7 +3,7 @@
 开发者测试（DT）工程：**直接调用 boom-\* lib crate 的 pub API**（path 依赖源码级
 链接、进程内执行），由 cargo-llvm-cov 统计功能源码覆盖率。不拉子进程、不测黑盒。
 
-> **用例 ↔ AR 验收项映射**见 [AR_MAPPING.md](AR_MAPPING.md)（501 用例 → 5 条 AR，
+> **用例 ↔ AR 验收项映射**见 [AR_MAPPING.md](AR_MAPPING.md)（566 用例 → 5 条 AR，
 > 含 kvc 调度两 AR 的函数级清单与覆盖缺口说明）。
 
 ## 覆盖范围（如实三档）
@@ -25,10 +25,10 @@ DT 的实际覆盖状态分三档（判定依据 = lcov 报告里出现且被用
 `*_db` 方法、DB 恢复/同步逻辑按约定跳过（无 Docker）。后果：
 
 - boom-limiter ~84%（漏的是 `sync_counters_to_db` 等纯 DB 函数）；
-- boom-auth ~41% —— 漏掉的 66 行**已逐行核对全部是 DB 分支**
+- boom-auth ~44% —— 漏掉的 74 行**已逐行核对全部是 DB 分支**
   （`lookup_token` 查询 / `token_to_identity` / `lookup_team` /
   authenticate 中段的 team 解析与 blocked/expired/budget 校验），
-  无 DB 可达面（哈希、主密钥、check_model_access）已覆盖；
+  无 DB 可达面（哈希、主密钥、check_model_access、缓存失效钩子）已覆盖；
 - boom-routing 的缺口同理（`*_db` SQL 行）。
 
 ## 其他约定
@@ -95,6 +95,14 @@ cargo nextest run -p boom-dt --profile ci
 注意事项：
 
 - **从仓库根目录跑**（`-p boom-dt` 选择包）。在 dt-test 目录里裸跑会丢覆盖率。
+  **裸跑 `cargo llvm-cov nextest`（不带 `-p`）是错的**：它作用于 default-members
+  （全部 boom-\* 功能 crate），跑的是各 crate 原有单测而非 DT 用例，还会把
+  boom-main / dashboard 等未覆盖 crate 插桩编译进缓存，污染分母（见下条）。
+- **report 数字异常暴涨（分母翻数倍、出现整片 0.00% 的 boom-main/dashboard
+  文件）时**：说明 `target/llvm-cov-target` 里残留了裸跑编译的对象。自愈三连：
+  `rm -rf target/llvm-cov-target && cargo llvm-cov nextest -p boom-dt`，再出报告。
+  （另：裸跑还会撞上 boom-routing 存量失败单测
+  `auto_router::tests::code_request_routes_to_large`，属 master 已知问题。）
 - **报告必须用 `--lcov` / `--html` 输出**。cargo-llvm-cov 的终端汇总表只显示
   `-p` 选中的包（boom-dt 自己），boom-\* 的覆盖数据在 lcov/HTML 报告里才完整
   （当前版本工具的行为）。
@@ -115,8 +123,10 @@ cargo nextest run -p boom-dt --profile ci
   boom-\* 的覆盖数据在同一份 profdata 里，第二步 `cargo llvm-cov report`（不带
   `-p`）才展开全量表。harness 自身由 `tests/harness.rs` 的 `DT-HAR-*` 7 例覆盖
   （98.77% lines，仅剩 1 行 `expect` 的 panic 分支）。
-- 当前基准（508 用例，2026-09）：终端全量表 TOTAL Lines 含脚手架 80.21%，
-  `--ignore-filename-regex 'dt-test/src'` 排除后 **80.06%**（达标口径 ≥80%）。
+- 当前基准（566 用例，2026-09，已同步 master !101）：终端全量表 TOTAL Lines
+  含脚手架 85.87%，`--ignore-filename-regex 'dt-test/src'` 排除后 **85.77%**
+  （达标口径 ≥85%）。残余缺口分类见 AR_MAPPING.md"覆盖缺口"第 5 条
+  （gemini 硬编码 URL / DB 路径 / 纯竞态分支 / 防御性死代码，均经 lcov 逐行核对）。
 - 增量覆盖率 = lcov 与 git 变更文件列表求交（流水线侧做）。
 
 ### 报告表字段含义

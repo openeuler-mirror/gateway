@@ -5,7 +5,7 @@
 
 use boom_config::{
     is_secret_field, load_config, mask_secrets_in_place, read_raw_yaml, resolve_env_value,
-    set_yaml_path, write_yaml_atomic, KvcAwareSettings, ModelGroupAlias,
+    set_yaml_path, write_yaml_atomic, BlockOp, KvcAwareSettings, ModelGroupAlias,
     ProviderParams, RouterSettings,
 };
 use std::collections::HashMap;
@@ -705,4 +705,109 @@ workflow_settings:
     let config = config_from_yaml(yaml);
     let err = config.validate().unwrap_err().to_string();
     assert!(err.contains("resolves to a workflow model"), "got: {err}");
+}
+
+// ═════════════════════════════════════════════════════════════════
+// user_tag_header / client_blocklist — !98 新增配置段
+// ═════════════════════════════════════════════════════════════════
+
+/// 最小可解析配置（只保证 serde 通过，不跑 validate）。
+fn minimal_yaml(extra: &str) -> String {
+    format!(
+        r#"
+model_list:
+  - model_name: dt-mock
+    litellm_params:
+      model: openai/dt-mock
+      api_base: http://127.0.0.1:9/v1
+      api_key: sk-test
+general_settings:
+  master_key: sk-master
+{extra}"#
+    )
+}
+
+/// DT-CFG-38：general_settings.user_tag_header —— 审计 per-user 归因头配置：
+/// 显式设置 / 缺省 None / 空串（audit 侧按"空即关闭"处理）。
+#[test]
+fn user_tag_header_present_default_and_empty() {
+    // 显式设置
+    let config = config_from_yaml(&minimal_yaml("  user_tag_header: X-User-Tag\n"));
+    assert_eq!(config.general_settings.user_tag_header.as_deref(), Some("X-User-Tag"));
+
+    // 缺省 → None（归因关闭）；client_blocklist 整段缺省也是 None
+    let config = config_from_yaml(&minimal_yaml(""));
+    assert_eq!(config.general_settings.user_tag_header, None);
+    assert!(config.client_blocklist.is_none());
+
+    // 空串 → Some("")
+    let config = config_from_yaml(&minimal_yaml("  user_tag_header: \"\"\n"));
+    assert_eq!(config.general_settings.user_tag_header.as_deref(), Some(""));
+}
+
+/// DT-CFG-39：client_blocklist —— 客户端封禁规则配置解析：enabled / rule
+/// enabled / conditions 的 serde 默认值，BlockAction 的 status / code 默认
+/// （403 / client_blocked）与显式覆盖，五种匹配算子（exists 可省 value）。
+#[test]
+fn client_blocklist_rules_parsing_and_defaults() {
+    let yaml = minimal_yaml(
+        r#"
+client_blocklist:
+  rules:
+    - name: ban-bad-ua
+      conditions:
+        - field: header.user-agent
+          op: contains
+          value: curl
+        - field: body.model
+          op: eq
+          value: gpt-4
+        - field: prompt
+          op: regex
+          value: 'spam\d+'
+        - field: header.authorization
+          op: prefix
+          value: sk-bad
+        - field: body.tools
+          op: exists
+      action:
+        status: 451
+        message: banned by rule
+        code: bad-ua
+    - name: disabled-rule
+      enabled: false
+      action:
+        message: off
+"#,
+    );
+    let config = config_from_yaml(&yaml);
+    let bl = config.client_blocklist.expect("client_blocklist parsed");
+    // enabled 缺省 → true（主开关默认开）
+    assert!(bl.enabled);
+
+    let r = &bl.rules[0];
+    assert_eq!(r.name, "ban-bad-ua");
+    // rule enabled 缺省 → true；五条件全解析、算子一一对应
+    assert!(r.enabled);
+    assert_eq!(r.conditions.len(), 5);
+    assert_eq!(r.conditions[0].field, "header.user-agent");
+    assert_eq!(r.conditions[0].op, BlockOp::Contains);
+    assert_eq!(r.conditions[1].op, BlockOp::Eq);
+    assert_eq!(r.conditions[2].op, BlockOp::Regex);
+    assert_eq!(r.conditions[3].op, BlockOp::Prefix);
+    assert_eq!(r.conditions[4].op, BlockOp::Exists);
+    // exists 算子 value 可省略（serde default → 空串）
+    assert_eq!(r.conditions[4].value, "");
+    // 显式 action 覆盖默认
+    assert_eq!(r.action.effective_status(), 451);
+    assert_eq!(r.action.effective_code(), "bad-ua");
+    assert_eq!(r.action.message, "banned by rule");
+
+    let r2 = &bl.rules[1];
+    assert!(!r2.enabled);
+    // conditions 缺省 → 空
+    assert!(r2.conditions.is_empty());
+    // status / code 缺省 → 403 / client_blocked
+    assert_eq!(r2.action.effective_status(), 403);
+    assert_eq!(r2.action.effective_code(), "client_blocked");
 }

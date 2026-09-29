@@ -281,3 +281,159 @@ fn debug_dump_returns_populated_nodes() {
 fn hash_of(bytes: &[u8]) -> u64 {
     twox_hash::xxhash3_64::Hasher::oneshot(bytes)
 }
+
+/// 链式块 key：hash(parent_effective ‖ content_hash)，与 crate 内
+/// chain_block_hash 一致（第二块及以后的 EvictBlocks 需要它）。
+fn chain_hash(parent: u64, content: u64) -> u64 {
+    let mut buf = [0u8; 16];
+    buf[..8].copy_from_slice(&parent.to_le_bytes());
+    buf[8..].copy_from_slice(&content.to_le_bytes());
+    hash_of(&buf)
+}
+
+fn evict_event(model: &str, worker: &str, hashes: Vec<u64>) -> GatewayKvEvent {
+    GatewayKvEvent::EvictBlocks {
+        model: model.to_string(),
+        worker_id: worker.to_string(),
+        block_hashes: hashes,
+        storage_tier: None,
+    }
+}
+
+/// DT-KV-19：LRU 驱逐留下空壳节点，sweep_stale 自底向上回收。
+/// max_blocks=1 时记录第二个独立块 → 第一个块被 LRU 驱逐，
+/// 其节点变成无 worker 无子节点的 shell；sweep 后 node_count 回落。
+#[test]
+fn sweep_stale_reclaims_lru_shell() {
+    let idx = TokenPrefixIndex::new(BLOCK, 1);
+    idx.record_request_prefix("m", "w0", &[1, 2, 3, 4], StorageTier::Gpu);
+    assert_eq!(idx.block_count(), 1);
+    // root + 1 块节点
+    assert_eq!(idx.node_count(), 2);
+    // 记录第二个不同内容的块 → LRU 溢出驱逐第一个（claims=1，nodes=3：root+shell+新块）
+    idx.record_request_prefix("m", "w0", &[5, 6, 7, 8], StorageTier::Gpu);
+    assert_eq!(idx.block_count(), 1);
+    assert_eq!(idx.node_count(), 3);
+    // 首次 sweep：last_sweep_ms 为 sentinel → 立即执行，shell 被回收
+    idx.sweep_stale();
+    assert_eq!(idx.node_count(), 2, "LRU shell must be swept");
+    assert_eq!(idx.block_count(), 1, "live claim untouched");
+}
+
+/// DT-KV-20：sweep 门控——无驱逐事件时 sweep 直接跳过（不遍历），
+/// 驱逐后只跑一次，再次调用被 SWEEP_INTERVAL_MS 节流早退。
+#[test]
+fn sweep_stale_gate_and_throttle() {
+    let idx = TokenPrefixIndex::new(BLOCK, 1_000_000);
+    idx.record_request_prefix("m", "w0", &[1, 2, 3, 4], StorageTier::Gpu);
+    // 无驱逐 → 门控关闭，sweep 不动节点（覆盖 gate 早退分支）
+    idx.sweep_stale();
+    assert_eq!(idx.node_count(), 2);
+    // 驱逐 arm 门控（EvictBlocks 走 evict_single_block）
+    let h = hash_of(&[1, 2, 3, 4]);
+    idx.apply_event(&evict_event("m", "w0", vec![h]));
+    assert_eq!(idx.block_count(), 0);
+    // 第一次真实 sweep 运行并回收
+    idx.sweep_stale();
+    assert_eq!(idx.node_count(), 1);
+    // 紧接着再触发：节流窗口内 → 早退（覆盖 throttle 分支）
+    idx.sweep_stale();
+    assert_eq!(idx.node_count(), 1);
+}
+
+/// DT-KV-21：remove_worker 清空全部 claim 后，sweep 整链回收（自底向上）。
+#[test]
+fn sweep_stale_after_remove_worker_unwinds_chain() {
+    let idx = TokenPrefixIndex::new(BLOCK, 1_000_000);
+    idx.record_request_prefix("m", "w0", &[1, 2, 3, 4, 5, 6, 7, 8], StorageTier::Gpu);
+    assert_eq!(idx.block_count(), 2);
+    assert_eq!(idx.node_count(), 3);
+    idx.remove_worker("w0");
+    assert_eq!(idx.block_count(), 0);
+    // 链上所有节点都是空壳（父有子 → deepest-first 逐层回收）
+    idx.sweep_stale();
+    assert_eq!(idx.node_count(), 1, "whole chain swept, only root remains");
+}
+
+/// DT-KV-22：TTL prune 全量过期 + sweep 回收（wholesale expiry 路径）。
+#[test]
+fn sweep_stale_after_ttl_prune() {
+    let idx = TokenPrefixIndex::new(BLOCK, 1_000_000);
+    idx.record_request_prefix("m", "w0", &[1, 2, 3, 4, 5, 6, 7, 8], StorageTier::Gpu);
+    // 空索引 prune：expired 为空 → 早退分支
+    let empty = TokenPrefixIndex::new(BLOCK, 10);
+    empty.prune_expired(std::time::Duration::from_secs(60));
+    // TTL=0 → 全部过期（覆盖 PruneTimers::pop_expired 的到期循环）
+    idx.prune_expired(std::time::Duration::ZERO);
+    assert_eq!(idx.block_count(), 0);
+    idx.sweep_stale();
+    assert_eq!(idx.node_count(), 1);
+}
+
+/// DT-KV-23：EvictBlocks 带 hash=0（跳过）与未知 hash（block_lookup 未命中早退）；
+/// 链上第二块驱逐用 chain-scoped key。
+#[test]
+fn evict_blocks_zero_and_unknown_hash_noop() {
+    let idx = TokenPrefixIndex::new(BLOCK, 1_000_000);
+    idx.record_request_prefix("m", "w0", &[1, 2, 3, 4, 5, 6, 7, 8], StorageTier::Gpu);
+    // hash=0 → continue（两个循环各一次）；未知 hash → evict_single_block 早退
+    idx.apply_event(&evict_event("m", "w0", vec![0, 999_999]));
+    assert_eq!(idx.block_count(), 2, "no-op evictions must not drop claims");
+    // 第二块（链式 key）精确驱逐
+    let h1 = hash_of(&[1, 2, 3, 4]);
+    let h2 = chain_hash(h1, hash_of(&[5, 6, 7, 8]));
+    idx.apply_event(&evict_event("m", "w0", vec![h2]));
+    assert_eq!(idx.block_count(), 1);
+    // lru_evict_block 的 hash==0 早退
+    idx.apply_event(&evict_event("m", "w0", vec![0]));
+    assert_eq!(idx.block_count(), 1);
+}
+
+/// DT-KV-24：record 路径的边界——空前缀、小于一个 block 的前缀、
+/// find_matches 短前缀均安全返回。
+#[test]
+fn record_and_find_edge_inputs() {
+    let idx = TokenPrefixIndex::new(BLOCK, 1_000_000);
+    // 空前缀 → record 早退
+    idx.record_request_prefix("m", "w0", &[], StorageTier::Gpu);
+    assert_eq!(idx.block_count(), 0);
+    // 小于 block_size 的非空前缀 → n_full=0 → apply_prepared(空)
+    idx.record_request_prefix("m", "w0", &[1, 2], StorageTier::Gpu);
+    assert_eq!(idx.block_count(), 0);
+    // find_matches 短前缀 → 空
+    assert!(idx.find_matches("m", &[1], &["w0".to_string()]).is_empty());
+    // StoreBatch 空 blocks → 早退
+    idx.apply_event(&GatewayKvEvent::StoreBatch {
+        model: "m".to_string(),
+        worker_id: "w0".to_string(),
+        blocks: vec![],
+    });
+    assert_eq!(idx.block_count(), 0);
+}
+
+/// DT-KV-25：record 路径 LRU 溢出（apply_prepared 内的驱逐处理）——
+/// 记录超过 max_blocks 的链，旧块被驱逐且 node_count 被 sweep 收敛。
+#[test]
+fn record_path_lru_overflow_evicts_oldest() {
+    let idx = TokenPrefixIndex::new(BLOCK, 2);
+    // 4 块链，容量 2 → 记录过程中前两块被驱逐
+    idx.record_request_prefix("m", "w0", &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16], StorageTier::Gpu);
+    assert_eq!(idx.block_count(), 2);
+    // 命中只可能在后两块（前缀前两块已被驱逐 → 链在头部断开）
+    assert!(idx.find_matches("m", &[1, 2, 3, 4, 5, 6, 7, 8], &["w0".to_string()]).is_empty());
+    idx.sweep_stale();
+    // root + 未回收的链节点中，被驱逐块的后代若仍有 claim 则保留；
+    // 这里后两块有 claim → 至少 root+2 存活
+    assert!(idx.node_count() >= 3);
+}
+
+/// DT-KV-26：候选 worker 无命中（depth=0 continue）时结果只含有命中的 worker。
+#[test]
+fn find_matches_skips_zero_depth_workers() {
+    let idx = TokenPrefixIndex::new(BLOCK, 500_000);
+    idx.apply_event(&store_event("m", "w0", None, vec![1, 2, 3, 4]));
+    // w1 没有任何块 → depth 0 → 被 continue 跳过
+    let matches = idx.find_matches("m", &[1, 2, 3, 4], &["w0".to_string(), "w1".to_string()]);
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0].worker_id, "w0");
+}

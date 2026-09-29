@@ -22,20 +22,21 @@
 //! - build_gateway_headers：priority 开关 / vip 值 / client_type 分类
 //! - 非 FusionPromptTrace 的外来 trace → 各 helper 静默跳过
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
-use boom_config::Config;
+use boom_config::{Config, WorkflowSettings};
 use boom_core::provider::{
     Provider, ProviderBilling, ProviderCallContext, ProviderPromptTrace, ProviderProtocol,
     SharedProviderPromptTrace,
 };
 use boom_core::types::{
     ChatCompletionRequest, ChatCompletionResponse, ChatStream, ChatStreamChunk, Choice, Message,
-    MessageContent, MessageRole, StreamChoice, StreamDelta, StreamUsage, Usage,
+    MessageContent, MessageRole, PromptTokensDetails, StreamChoice, StreamDelta, StreamUsage,
+    Usage,
 };
 use boom_core::GatewayError;
 use boom_flowcontrol::{FlowControlConfig, FlowController};
@@ -83,6 +84,9 @@ struct FakeProvider {
     protocol: ProviderProtocol,
     kv: Option<String>,
     deployment: String,
+    /// 开启后 chat_stream 返回多 chunk、带 cached_tokens 的 usage 流
+    /// （驱动 usage_delta / update_usage_snapshot 的 cached 分支）。
+    rich_usage_stream: bool,
 }
 
 impl FakeProvider {
@@ -105,11 +109,22 @@ impl FakeProvider {
             protocol: ProviderProtocol::OpenAiCompatible,
             kv: None,
             deployment: "fake-deployment".to_string(),
+            rich_usage_stream: false,
         }
     }
 
     fn with_kv(mut self, kv: &str) -> Self {
         self.kv = Some(kv.to_string());
+        self
+    }
+
+    fn with_rich_usage_stream(mut self) -> Self {
+        self.rich_usage_stream = true;
+        self
+    }
+
+    fn with_rich_usage_stream_cond(mut self, on: bool) -> Self {
+        self.rich_usage_stream = on;
         self
     }
 
@@ -184,6 +199,34 @@ fn text_chunk(model: &str, content: &str, with_usage: bool) -> ChatStreamChunk {
     }
 }
 
+/// 带 cached_tokens 的多形态 usage chunk（驱动 usage_delta / snapshot 的 cached 分支）。
+/// usage = (prompt, completion, total, cached_tokens)；total=None 走 snapshot 的求和臂。
+fn rich_chunk(model: &str, content: &str, usage: Option<(i32, i32, Option<i32>, Option<u32>)>) -> ChatStreamChunk {
+    ChatStreamChunk {
+        id: format!("chatcmpl-rich-{}", model),
+        object: "chat.completion.chunk".to_string(),
+        created: 1,
+        model: model.to_string(),
+        choices: vec![StreamChoice {
+            index: 0,
+            delta: StreamDelta {
+                role: Some(MessageRole::Assistant),
+                content: Some(content.to_string()),
+                tool_calls: None,
+                reasoning_content: None,
+            },
+            finish_reason: None,
+        }],
+        usage: usage.map(|(p, c, t, cached)| StreamUsage {
+            prompt_tokens: Some(p),
+            completion_tokens: Some(c),
+            total_tokens: t,
+            prompt_tokens_details: cached.map(|n| PromptTokensDetails { cached_tokens: Some(n) }),
+        }),
+        raw_data: None,
+    }
+}
+
 #[async_trait]
 impl Provider for FakeProvider {
     async fn chat(&self, request: ChatCompletionRequest) -> Result<ChatCompletionResponse, GatewayError> {
@@ -206,6 +249,15 @@ impl Provider for FakeProvider {
                 status: 502,
                 message: "stream start failed".to_string(),
             });
+        }
+        if self.rich_usage_stream {
+            // chunk1: total 缺失（snapshot 求和臂）+ cached=1；chunk2: cached=2 → usage_delta
+            // 的 cached 差分；chunk3: 无 usage。
+            return Ok(Box::pin(futures::stream::iter([
+                Ok(rich_chunk(&request.model, "a", Some((2, 1, None, Some(1))))),
+                Ok(rich_chunk(&request.model, "b", Some((2, 2, Some(4), Some(2))))),
+                Ok(rich_chunk(&request.model, "c", None)),
+            ])));
         }
         if self.error_chunk_models.lock().unwrap().contains(&request.model) {
             return Ok(Box::pin(futures::stream::iter([
@@ -335,7 +387,7 @@ fn parse_config(yaml: &str) -> Config {
 }
 
 fn fixture() -> Fixture {
-    fixture_with(STANDARD_YAML, None, None, true, 1200)
+    fixture_with(STANDARD_YAML, None, None, true, 1200, false)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -345,6 +397,7 @@ fn fixture_with(
     kv_index: Option<Arc<TokenPrefixIndex>>,
     enable_priority_header: bool,
     queue_timeout_secs: u64,
+    rich_usage_stream: bool,
 ) -> Fixture {
     let config = parse_config(yaml);
     let deployment_store = Arc::new(DeploymentStore::new());
@@ -362,7 +415,8 @@ fn fixture_with(
             error_chunk_models.clone(),
             &["panel-a", "panel-b", "aggregator"],
         )
-        .with_kv("fake-deployment"),
+        .with_kv("fake-deployment")
+        .with_rich_usage_stream_cond(rich_usage_stream),
     );
     for model in ["panel-a", "panel-b", "aggregator"] {
         deployment_store.add_deployment(model, fake.clone());
@@ -972,7 +1026,7 @@ workflow_settings:
 /// DT-RF-17：队列超时——占满 inflight + queue_timeout=0 → FlowControlQueueTimeout。
 #[tokio::test]
 async fn fusion_child_flow_control_queue_timeout() {
-    let f = fixture_with(STANDARD_YAML, None, None, true, 0);
+    let f = fixture_with(STANDARD_YAML, None, None, true, 0, false);
     f.flow.ensure_slot(
         "fake-deployment",
         &FlowControlConfig { max_inflight: 1, max_context: 0 },
@@ -1036,7 +1090,7 @@ async fn fusion_records_request_prefix_into_kv_index() {
     let index = Arc::new(TokenPrefixIndex::new(8, 500_000));
     let tracker = Arc::new(InFlightTracker::new());
     let policy: Arc<dyn SchedulePolicy> = Arc::new(boom_routing::KvcAwarePolicy::new(index.clone(), tracker, None));
-    let f = fixture_with(STANDARD_YAML, Some(policy), Some(index.clone()), true, 1200);
+    let f = fixture_with(STANDARD_YAML, Some(policy), Some(index.clone()), true, 1200, false);
     // KVC 策略对单候选跳过查询（kv_match_attempted=false → 不记录），
     // 给 panel-a 加第二个同 kv worker 的候选使记录路径生效
     let panel_extra: Arc<dyn Provider> = Arc::new(
@@ -1103,4 +1157,264 @@ fn gateway_headers_combinations() {
     );
 
     assert!(build_gateway_headers(false, false, "/v1/x", false).is_empty());
+}
+
+// ═════════════════════════════════════════════════════════════════
+// trace 终结 / usage 细分 / 输入形态 / flow guard / 注册边界（覆盖率补齐）
+// ═════════════════════════════════════════════════════════════════
+
+/// DT-RF-22：finalize 对仍在消费中的流式子调用合并流内状态——
+/// 调用未到终态（routed）时，finalize 合并 stream_response（event_count/last_chunk）
+/// 并置 cancelled + duration；空 trace snapshot 返回 None。
+#[tokio::test]
+async fn finalize_merges_live_stream_state() {
+    let f = fixture();
+    let fusion = fusion_provider(&f);
+    let prompt_trace = fusion.create_prompt_trace().unwrap();
+
+    // 任何调用发生前 → snapshot None
+    assert!(prompt_trace.snapshot().is_none());
+
+    let mut stream = fusion
+        .chat_stream_with_context(request("fusion", "live"), ctx(ProviderBilling::default(), Some(prompt_trace.clone())))
+        .await
+        .expect("stream starts");
+    // 只消费一个 chunk，保持 GuardedFusionStream 存活（子调用处于非终态）
+    let _ = stream.next().await;
+
+    prompt_trace.finalize();
+    let snapshot = prompt_trace.snapshot().unwrap();
+    let calls = snapshot["calls"].as_array().unwrap();
+    // panel 两次 chat 已终态 succeeded；aggregator 流式调用被 finalize 关闭为 cancelled
+    let aggregator = calls.iter().find(|c| c["role"] == "aggregator").expect("aggregator call");
+    assert_eq!(aggregator["status"], "cancelled");
+    assert!(
+        aggregator["response"]["event_count"].as_u64().is_some_and(|n| n > 0),
+        "live stream state merged into the call: {}",
+        aggregator["response"]
+    );
+    assert!(aggregator.get("duration_ms").is_some());
+    // 流本身仍可继续消费（finalize 不影响运行中的流）
+    let _ = stream.collect::<Vec<_>>().await;
+}
+
+/// DT-RF-23：外来 prompt trace + 流式路径 → 各 trace helper 静默跳过，流照常工作。
+#[tokio::test]
+async fn fusion_stream_with_foreign_prompt_trace() {
+    let f = fixture();
+    let fusion = fusion_provider(&f);
+    let mut c = vip_ctx();
+    c.prompt_trace = Some(Arc::new(ForeignTrace));
+    let stream = fusion
+        .chat_stream_with_context(request("fusion", "foreign"), c)
+        .await
+        .expect("stream starts");
+    let chunks: Vec<_> = stream.collect().await;
+    assert!(chunks.iter().all(Result::is_ok));
+    assert!(chunks.iter().any(|c| {
+        c.as_ref().map(|c| c.choices.iter().any(|s| s.delta.content.as_deref() == Some("streamed answer")))
+            .unwrap_or(false)
+    }));
+}
+
+/// DT-RF-24：aggregator 流启动失败（UpstreamError）+ trace → 回退 panel0 流，
+/// 失败调用记录 error.upstream_status（fusion_call_error 的 UpstreamError 臂）。
+#[tokio::test]
+async fn stream_start_error_traced_records_upstream_status() {
+    let f = fixture();
+    f.stream_error_models.lock().unwrap().insert("aggregator".to_string());
+    let fusion = fusion_provider(&f);
+    let prompt_trace = fusion.create_prompt_trace().unwrap();
+    let stream = fusion
+        .chat_stream_with_context(request("fusion", "boom"), ctx(ProviderBilling::default(), Some(prompt_trace.clone())))
+        .await
+        .expect("stream starts (falls back to panel)");
+    let chunks: Vec<_> = stream.collect().await;
+    assert!(chunks.iter().all(Result::is_ok));
+    assert!(chunks.iter().any(|c| {
+        c.as_ref().map(|c| c.choices.iter().any(|s| s.delta.content.as_deref() == Some("answer from panel-a")))
+            .unwrap_or(false)
+    }));
+
+    let snapshot = prompt_trace.snapshot().unwrap();
+    let calls = snapshot["calls"].as_array().unwrap();
+    let aggregator = calls.iter().find(|c| c["role"] == "aggregator").expect("aggregator call");
+    assert_eq!(aggregator["status"], "failed");
+    assert_eq!(aggregator["error"]["upstream_status"], 502, "error: {}", aggregator["error"]);
+}
+
+/// DT-RF-25：流式 usage 细分——total 缺失走求和臂、cached_tokens 进
+/// usage_delta 差分与成本拆分（cached_input > 0）。
+#[tokio::test]
+async fn stream_usage_cached_tokens_and_delta() {
+    let f = fixture_with(STANDARD_YAML, None, None, true, 1200, true);
+    let fusion = fusion_provider(&f);
+    let billing = ProviderBilling::default();
+    let stream = fusion
+        .chat_stream_with_context(request("fusion", "rich"), ctx(billing.clone(), None))
+        .await
+        .expect("stream starts");
+    let chunks: Vec<_> = stream.collect().await;
+    assert!(chunks.iter().all(Result::is_ok), "{chunks:?}");
+    assert_eq!(chunks.len(), 3, "aggregator rich stream has 3 chunks");
+
+    // panels(chat) usage {2,1,3}×2 + aggregator 流差分 {2,1,3}+{0,1,1}
+    let usage = billing.actual_usage().unwrap();
+    assert_eq!(usage.prompt_tokens, 6);
+    assert_eq!(usage.completion_tokens, 4);
+    assert_eq!(usage.total_tokens, 10);
+    // aggregator 两个 usage chunk 的 cached(1→2) 差分进成本拆分
+    let cost = billing.actual_cost().unwrap();
+    assert!(cost.cached_input > 0.into(), "cached cost must be reported: {cost:?}");
+}
+
+/// DT-RF-26：请求带 tools + Parts/Null 内容——prefix 字节包含 tools 序列化、
+/// input_chars 只计 Text part（图片/Null 不计），链路照常工作。
+#[tokio::test]
+async fn request_tools_and_parts_content_flow_through() {
+    let f = fixture();
+    let fusion = fusion_provider(&f);
+    let req: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "fusion",
+        "messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "part one"},
+                {"type": "image_url", "image_url": {"url": "https://x/i.png"}}
+            ]},
+            {"role": "assistant", "content": "prior answer"},
+            {"role": "user", "content": null},
+            {"role": "user", "content": "solve it"}
+        ],
+        "tools": [{
+            "type": "function",
+            "function": {"name": "get_weather", "parameters": {"type": "object"}}
+        }]
+    }))
+    .expect("request parses");
+    let result = fusion.chat_with_context(req, vip_ctx()).await.expect("fusion chat ok");
+    assert_eq!(result.usage.unwrap().total_tokens, 9);
+    // 子调用收到 tools
+    let calls = f.calls.lock().unwrap();
+    assert!(calls.iter().all(|c| c.tools.as_ref().is_some_and(|t| !t.is_empty())));
+}
+
+/// DT-RF-27：flow controller 配置了槽位 → 子调用 acquire 成功持有 guard（Ok 分支），
+/// 调用结束释放，链路照常。
+#[tokio::test]
+async fn flow_slot_grant_guard_holds_and_releases() {
+    let f = fixture();
+    f.flow.ensure_slot("fake-deployment", &FlowControlConfig { max_inflight: 10, max_context: 0 });
+    let fusion = fusion_provider(&f);
+    let result = fusion.chat_with_context(request("fusion", "slotted"), vip_ctx()).await.expect("ok");
+    assert_eq!(result.usage.unwrap().total_tokens, 9);
+    // guard 已全部释放（inflight 归零）
+    let stats = f.flow.get_stats();
+    assert_eq!(stats[0].current_inflight, 0);
+    assert_eq!(stats[0].waiters, 0);
+}
+
+/// DT-RF-28：子 provider 无 deployment_id → flow guard / inflight 走无部署分支，
+/// 链路照常（panel-c 由 NoDeploymentProvider 提供）。
+#[tokio::test]
+async fn provider_without_deployment_id_flows_through() {
+    let yaml = r#"
+model_list:
+  - model_name: panel-a
+    litellm_params:
+      model: openai/panel-a
+  - model_name: panel-c
+    litellm_params:
+      model: openai/panel-c
+  - model_name: aggregator
+    litellm_params:
+      model: openai/aggregator
+workflow_settings:
+  models:
+    fusion: direct_synthesis
+  workflows:
+    direct_synthesis:
+      type: direct_synthesis
+      roles:
+        panel:
+          - model: panel-a
+            temperature: 0.3
+          - model: panel-c
+            temperature: 0.3
+        aggregator:
+          model: aggregator
+          temperature: 0
+"#;
+    let f = fixture_with(yaml, None, None, true, 1200, false);
+    f.deployment_store.add_deployment("panel-c", Arc::new(NoDeploymentProvider));
+    let fusion = fusion_provider(&f);
+    let result = fusion.chat_with_context(request("fusion", "nodepl"), vip_ctx()).await.expect("ok");
+    assert_eq!(result.usage.unwrap().total_tokens, 9);
+    // 父请求 1 次 + 3 个子调用（含 panel-c）都经过路由
+    let routed = f.key_hashes.lock().unwrap().clone();
+    assert_eq!(routed.len(), 4, "parent + 3 child routings (panel-c included)");
+}
+
+/// DT-RF-29：workflow model 指向未注册的 workflow → 注册期即报 ConfigError
+/// （build_registry → WorkflowRegistry 校验，早于逐模型注册循环；绕过 YAML validate 直构）。
+#[tokio::test]
+async fn register_unknown_workflow_errors() {
+    let deployment_store = Arc::new(DeploymentStore::new());
+    let alias_store = Arc::new(AliasStore::new());
+    let router = Arc::new(Router::new(
+        deployment_store.clone(),
+        alias_store.clone(),
+        Arc::new(RecordingPolicy { key_hashes: Arc::new(Mutex::new(Vec::new())) }),
+    ));
+    let kv_swap: Arc<ArcSwap<Option<Arc<dyn boom_core::kv_event::KvIndexBackend>>>> =
+        Arc::new(ArcSwap::from_pointee(None));
+    let runtime = FusionRuntime::new(
+        Arc::downgrade(&router),
+        deployment_store.clone(),
+        Arc::new(FlowController::new()),
+        Arc::new(InFlightTracker::new()),
+        Arc::new(RequestRateTracker::new()),
+        kv_swap,
+        true,
+        1200,
+    );
+    let settings = WorkflowSettings {
+        models: HashMap::from([("fusion".to_string(), "ghost_workflow".to_string())]),
+        workflows: HashMap::new(),
+    };
+    let err = register_fusion_providers(&settings, &deployment_store, &alias_store, runtime)
+        .err()
+        .expect("registration must fail");
+    assert!(
+        matches!(&err, GatewayError::ConfigError(m) if m.contains("unknown workflow")),
+        "unexpected error: {err:?}"
+    );
+}
+
+/// 无 deployment_id 的子 provider（覆盖 inflight/flow 的无部署分支）。
+struct NoDeploymentProvider;
+
+#[async_trait]
+impl Provider for NoDeploymentProvider {
+    async fn chat(&self, request: ChatCompletionRequest) -> Result<ChatCompletionResponse, GatewayError> {
+        Ok(text_response(&request.model, format!("answer from {}", request.model)))
+    }
+    async fn chat_stream(&self, request: ChatCompletionRequest) -> Result<ChatStream, GatewayError> {
+        Ok(Box::pin(futures::stream::iter([Ok(text_chunk(
+            &request.model,
+            "streamed answer",
+            true,
+        ))])))
+    }
+    fn name(&self) -> &str {
+        "no-deployment"
+    }
+    fn protocol(&self) -> ProviderProtocol {
+        ProviderProtocol::OpenAiCompatible
+    }
+    fn models(&self) -> &[String] {
+        &[]
+    }
+    fn deployment_id(&self) -> Option<&str> {
+        None
+    }
 }
