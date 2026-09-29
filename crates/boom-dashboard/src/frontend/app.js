@@ -6764,9 +6764,13 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
 
   function renderLogsPagination(data) {
     const el = document.getElementById("logs-pagination");
+    // total is a bounded exact count (min(real, 50k)); append "+" when the
+    // cap was hit so "1000+" reads as "at least", not an exact figure.
+    const suffix = data.total_capped ? "+" : "";
+    const pages = Math.max(1, Math.ceil(data.total / data.per_page));
     el.innerHTML = `
       <button ${data.page <= 1 ? "disabled" : ""} onclick="window._loadLogsPage(${data.page - 1})">&lt;</button>
-      <span>${t("common.page_only", { page: data.page })}</span>
+      <span>${t("common.page_of", { page: data.page, total: pages + suffix, count: data.total + suffix, unit: t("logs.title") })}</span>
       <button ${!data.has_next ? "disabled" : ""} onclick="window._loadLogsPage(${data.page + 1})">&gt;</button>
     `;
   }

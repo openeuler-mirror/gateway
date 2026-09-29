@@ -2405,6 +2405,11 @@ pub struct ListLogsQuery {
     pub range: Option<String>,
 }
 
+/// Upper bound for the bounded exact count behind the logs page total. The
+/// count subquery stops at this many matches, so cost is O(cap); totals at or
+/// above the cap are reported as `total_capped` and rendered "1000+ pages".
+const LOGS_COUNT_CAP: i64 = 50_000;
+
 /// Resolve the range param to a lower bound on created_at.
 /// Unknown values fall back to the 3d default.
 fn logs_range_from(range: &str) -> Option<chrono::DateTime<chrono::Utc>> {
@@ -2618,14 +2623,65 @@ pub async fn list_logs(
     // Fetch per_page + 1 to detect if there is a next page.
     q = q.bind(per_page + 1).bind(offset);
 
-    // Run inside a transaction with a 10s statement_timeout so a pathological
-    // "all time" + ILIKE scan is cancelled server-side by PG instead of
-    // hogging DB resources until it finishes.
-    let rows: Vec<LogRow> = match async {
+    // Bounded exact count for pagination display: same WHERE/JOIN as the data
+    // query, but the inner SELECT stops at LOGS_COUNT_CAP matches, so cost is
+    // O(cap) — an index walk at most — instead of O(all matching rows) like a
+    // bare COUNT(*) (that full count is what the LIMIT+1 design avoided).
+    // When the true total exceeds the cap the response reports total_capped
+    // so the UI can render "1000+ pages".
+    let count_sql = format!(
+        r#"SELECT COUNT(*) FROM (
+               SELECT 1 FROM boom_request_log rl
+               LEFT JOIN boom_team_table bt ON rl.team_id = bt.team_id
+               {where_sql}
+               LIMIT ${limit_idx}
+           ) t"#,
+    );
+    let mut cq = sqlx::query_scalar::<_, i64>(&count_sql);
+    if let Some(from) = range_from {
+        cq = cq.bind(from);
+    }
+    if let Some(ref v) = query.key_hash {
+        cq = cq.bind(v.clone());
+    }
+    if let Some(ref p) = model_pattern {
+        cq = cq.bind(p.clone());
+    }
+    if query.status.as_deref() == Some("error") {
+        cq = cq.bind(200i16);
+    }
+    if let Some(ref p) = request_id_pattern {
+        cq = cq.bind(p.clone());
+    }
+    if let Some(ref p) = key_alias_pattern {
+        cq = cq.bind(p.clone());
+    }
+    if let Some(ref p) = api_path_pattern {
+        cq = cq.bind(p.clone());
+    }
+    if let Some(v) = query.status_code {
+        cq = cq.bind(v);
+    }
+    if let Some(ref p) = error_pattern {
+        cq = cq.bind(p.clone());
+    }
+    if let Some(ref p) = team_alias_pattern {
+        cq = cq.bind(p.clone());
+    }
+    if let Some(ref p) = client_ip_pattern {
+        cq = cq.bind(p.clone());
+    }
+    cq = cq.bind(LOGS_COUNT_CAP);
+
+    // Run both queries inside a transaction with a 10s statement_timeout so a
+    // pathological "all time" + ILIKE scan is cancelled server-side by PG
+    // instead of hogging DB resources until it finishes.
+    let (rows, total): (Vec<LogRow>, i64) = match async {
         let mut tx = begin_with_timeout(db_pool).await?;
         let rows = q.fetch_all(&mut *tx).await?;
+        let total = cq.fetch_one(&mut *tx).await?;
         tx.commit().await?;
-        Ok::<_, sqlx::Error>(rows)
+        Ok::<_, sqlx::Error>((rows, total))
     }
     .await
     {
@@ -2648,7 +2704,10 @@ pub async fn list_logs(
         }
     };
 
-    let has_next = rows.len() > per_page as usize;
+    // total = min(real_matches, LOGS_COUNT_CAP), so total >= offset+per_page+1
+    // implies the real match count does too — a count-based next-page signal
+    // that also covers pages beyond the per_page+1 probe.
+    let has_next = rows.len() > per_page as usize || total >= offset + per_page + 1;
     let logs: Vec<Value> = rows
         .into_iter()
         .take(per_page as usize)
@@ -2706,6 +2765,8 @@ pub async fn list_logs(
         "page": page,
         "per_page": per_page,
         "has_next": has_next,
+        "total": total,
+        "total_capped": total >= LOGS_COUNT_CAP,
     }))
     .into_response()
 }
@@ -3627,7 +3688,7 @@ pub async fn toggle_debug(
     Json(req): Json<DebugToggleRequest>,
 ) -> Json<Value> {
     state.debug_store.set_enabled(req.enabled);
-    // Also toggle raw upstream response capture alongside debug mode.
+    // TEMP-RESTORE for commit split — re-applied in the fix commit.
     let new_cfg = state
         .prompt_log_query
         .full_config()
