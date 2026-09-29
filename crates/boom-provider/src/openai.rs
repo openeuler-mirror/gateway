@@ -222,8 +222,28 @@ impl OpenAIProvider {
                 }
             }
         }
-        // Serialize — skip_serializing on `extra` ensures non-standard fields
-        // (service_tier, store, etc.) are NOT forwarded to upstream providers.
+        // Anthropic-origin requests carry the `thinking` param in `extra`.
+        // The OpenAI protocol has no `thinking` field — translate it to
+        // `reasoning_effort` so OpenAI-compatible upstreams (vLLM et al.)
+        // honor the client's thinking intent instead of silently ignoring it.
+        // An explicitly set `reasoning_effort` always wins. `thinking` is
+        // removed either way: Anthropic vocabulary never goes on the wire here.
+        if req.from_anthropic_protocol {
+            if !req.extra.contains_key("reasoning_effort") {
+                if let Some(effort) = req
+                    .extra
+                    .get("thinking")
+                    .and_then(boom_core::anthropic::translate_anthropic_thinking_to_reasoning_effort)
+                {
+                    req.extra
+                        .insert("reasoning_effort".to_string(), serde_json::json!(effort));
+                }
+            }
+            req.extra.remove("thinking");
+        }
+        // Serialize — `extra` is flattened into the body, so non-standard
+        // fields (service_tier, store, reasoning_effort, ...) reach OpenAI-
+        // compatible upstreams as-is.
         let mut body = serde_json::to_value(&req).unwrap_or_default();
 
         // Inject vllm_xargs for KV cache full reporting when requested by gateway.
@@ -539,6 +559,7 @@ mod tests {
             extra: Default::default(),
             gateway_headers,
             kv_cache_report_full: false,
+            from_anthropic_protocol: false,
             raw_capture: None,
         }
     }
@@ -602,6 +623,130 @@ mod tests {
             serde_json::json!("pc-1"),
         );
         let _ = provider.chat(req).await.unwrap();
+    }
+
+    /// Matches a chat-completions body whose JSON contains `expect` and does
+    /// NOT contain `absent`. body_partial_json can only assert presence, but
+    /// the thinking translation must also prove the Anthropic field is gone.
+    struct BodyField {
+        expect: Option<(&'static str, serde_json::Value)>,
+        absent: Option<&'static str>,
+    }
+
+    impl wiremock::Match for BodyField {
+        fn matches(&self, request: &wiremock::Request) -> bool {
+            let body: serde_json::Value = match serde_json::from_slice(&request.body) {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+            if let Some((key, value)) = &self.expect {
+                if body.get(key) != Some(value) {
+                    return false;
+                }
+            }
+            if let Some(key) = self.absent {
+                if body.get(key).is_some() {
+                    return false;
+                }
+            }
+            true
+        }
+    }
+
+    async fn assert_upstream_body(
+        expect: Option<(&'static str, serde_json::Value)>,
+        absent: Option<&'static str>,
+        req: ChatCompletionRequest,
+    ) {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(BodyField { expect, absent })
+            .respond_with(ResponseTemplate::new(200).set_body_json(fake_completion_response()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider = provider_for(server.uri(), None);
+        let _ = provider.chat(req).await.unwrap();
+    }
+
+    /// Anthropic-origin request with thinking enabled: the `thinking` param
+    /// must arrive at the OpenAI-compatible upstream as `reasoning_effort`,
+    /// and the Anthropic field must not go on the wire.
+    #[tokio::test]
+    async fn anthropic_thinking_translated_to_reasoning_effort() {
+        let mut req = request_with_headers(&[]);
+        req.from_anthropic_protocol = true;
+        req.extra.insert(
+            "thinking".to_string(),
+            serde_json::json!({"type": "enabled", "budget_tokens": 10000}),
+        );
+        assert_upstream_body(
+            Some(("reasoning_effort", serde_json::json!("high"))),
+            Some("thinking"),
+            req,
+        )
+        .await;
+    }
+
+    /// An explicit client-side reasoning_effort wins over the translation;
+    /// `thinking` is still stripped.
+    #[tokio::test]
+    async fn explicit_reasoning_effort_wins_over_translation() {
+        let mut req = request_with_headers(&[]);
+        req.from_anthropic_protocol = true;
+        req.extra.insert(
+            "reasoning_effort".to_string(),
+            serde_json::json!("low"),
+        );
+        req.extra.insert(
+            "thinking".to_string(),
+            serde_json::json!({"type": "enabled", "budget_tokens": 10000}),
+        );
+        assert_upstream_body(
+            Some(("reasoning_effort", serde_json::json!("low"))),
+            Some("thinking"),
+            req,
+        )
+        .await;
+    }
+
+    /// thinking=disabled becomes reasoning_effort="none" — vLLM maps that to
+    /// enable_thinking=false, so Anthropic clients can switch thinking off.
+    #[tokio::test]
+    async fn anthropic_thinking_disabled_becomes_effort_none() {
+        let mut req = request_with_headers(&[]);
+        req.from_anthropic_protocol = true;
+        req.extra.insert(
+            "thinking".to_string(),
+            serde_json::json!({"type": "disabled"}),
+        );
+        assert_upstream_body(
+            Some(("reasoning_effort", serde_json::json!("none"))),
+            Some("thinking"),
+            req,
+        )
+        .await;
+    }
+
+    /// OpenAI-protocol origin keeps pure passthrough: a `thinking` field sent
+    /// by an OpenAI client still reaches the upstream body unchanged.
+    #[tokio::test]
+    async fn openai_origin_thinking_passthrough_unchanged() {
+        let mut req = request_with_headers(&[]);
+        req.extra.insert(
+            "thinking".to_string(),
+            serde_json::json!({"type": "enabled", "budget_tokens": 10000}),
+        );
+        assert_upstream_body(
+            Some((
+                "thinking",
+                serde_json::json!({"type": "enabled", "budget_tokens": 10000}),
+            )),
+            None,
+            req,
+        )
+        .await;
     }
 
     #[tokio::test]

@@ -327,6 +327,13 @@ pub struct ChatCompletionRequest {
     /// not in this core type. Not set by clients — set by the gateway after routing.
     #[serde(skip, default)]
     pub kv_cache_report_full: bool,
+    /// Internal flag: set when this request was converted from the Anthropic
+    /// `/v1/messages` protocol by `anthropic_request_to_openai`. Consumed by
+    /// the OpenAI provider to translate Anthropic-only params (`thinking`)
+    /// into their OpenAI equivalents (`reasoning_effort`). Never parsed from
+    /// client bodies, never serialized into the upstream JSON.
+    #[serde(skip, default)]
+    pub from_anthropic_protocol: bool,
     /// Raw capture side channel for prompt logging — set by the route layer
     /// when `prompt_log.capture_raw_upstream` is enabled, taken out by the
     /// provider at its send site to record the exact request/response bytes
@@ -449,6 +456,7 @@ impl CompletionRequest {
             extra: self.extra,
             gateway_headers: HashMap::new(),
             kv_cache_report_full: false,
+            from_anthropic_protocol: false,
             raw_capture: None,
         }
     }
@@ -1089,6 +1097,7 @@ mod request_normalization_tests {
             extra: serde_json::Map::new(),
             gateway_headers: HashMap::new(),
             kv_cache_report_full: false,
+            from_anthropic_protocol: false,
             raw_capture: None,
         }
     }
