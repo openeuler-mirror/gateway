@@ -80,6 +80,7 @@ fn debug_entry(request_id: &str, key_hash: &str) -> DebugErrorEntry {
         upstream_status: Some(500),
         upstream_body: Some("oops".to_string()),
         request_body: Some("{}".to_string()),
+        block_rule: None,
     }
 }
 
