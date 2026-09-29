@@ -3688,22 +3688,12 @@ pub async fn toggle_debug(
     Json(req): Json<DebugToggleRequest>,
 ) -> Json<Value> {
     state.debug_store.set_enabled(req.enabled);
-    // TEMP-RESTORE for commit split — re-applied in the fix commit.
-    let new_cfg = state
-        .prompt_log_query
-        .full_config()
-        .with_enabled(true)
-        .with_capture_raw_upstream(req.enabled);
-    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    let _ = state
-        .admin_tx
-        .send(crate::state::AdminCommand::UpdatePromptLogConfig {
-            config: new_cfg,
-            reply: reply_tx,
-        })
-        .await;
-    let _ = reply_rx.await;
-    tracing::info!(enabled = req.enabled, "Debug toggled (debug errors + raw upstream capture)");
+    // Debug mode only drives the in-memory DebugErrorStore (upstream error
+    // bodies + block-rule evidence, per-key FIFO). It must NOT touch the
+    // prompt-log config: raw upstream exchange recording is solely owned by
+    // `prompt_log.capture_raw_upstream` — coupling them here silently enabled
+    // full request-body capture for every request while debugging.
+    tracing::info!(enabled = req.enabled, "Debug toggled (debug error recording only)");
     Json(json!({
         "ok": true,
         "enabled": req.enabled,

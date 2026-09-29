@@ -932,7 +932,7 @@ curl -X POST $BASE/dashboard/api/admin/prompt-log/otlp-ping \
 
 ### 18.2 开关
 
-**POST** `/dashboard/api/admin/debug/toggle` · admin · body：`{enabled:bool}` — 同时切换 prompt-log 的 `capture_raw_upstream`。
+**POST** `/dashboard/api/admin/debug/toggle` · admin · body：`{enabled:bool}` — 只切换内存错误录制（DebugErrorStore）；不影响 prompt-log 配置，`capture_raw_upstream` 由 prompt-log 配置独立控制。
 
 ```bash
 curl -X POST $BASE/dashboard/api/admin/debug/toggle \
