@@ -2399,6 +2399,28 @@ pub struct ListLogsQuery {
     pub error: Option<String>,
     pub team_alias: Option<String>,
     pub client_ip: Option<String>,
+    /// Time window: "3d" (default) / "7d" / "30d" / "all". Bounds the scan to
+    /// the created_at index range so the ILIKE filters only apply within the
+    /// window instead of seq-scanning the whole ever-growing log table.
+    pub range: Option<String>,
+}
+
+/// Resolve the range param to a lower bound on created_at.
+/// Unknown values fall back to the 3d default.
+fn logs_range_from(range: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    let now = chrono::Utc::now();
+    match range {
+        "all" => None,
+        "7d" => Some(now - chrono::Duration::days(7)),
+        "30d" => Some(now - chrono::Duration::days(30)),
+        _ => Some(now - chrono::Duration::days(3)),
+    }
+}
+
+/// Escape LIKE/ILIKE metacharacters in user input so a literal "%" or "_"
+/// in a filter value can't widen the match to unrelated rows.
+fn escape_like(v: &str) -> String {
+    v.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -2459,6 +2481,9 @@ pub async fn list_logs(
         };
     }
 
+    let range = query.range.as_deref().unwrap_or("3d");
+    let range_from = logs_range_from(range);
+    let range_param = if range_from.is_some() { let i = param_idx; param_idx += 1; Some(i) } else { None };
     let key_hash_param   = slot!(query.key_hash);
     let model_param      = slot!(query.model);
     let status_param     = if query.status.as_deref() == Some("error") { let i = param_idx; param_idx += 1; Some(i) } else { None };
@@ -2471,6 +2496,9 @@ pub async fn list_logs(
     let team_alias_param = slot!(query.team_alias);
     let client_ip_param   = slot!(query.client_ip);
 
+    if let Some(i) = range_param {
+        where_clauses.push(format!("rl.created_at >= ${i}"));
+    }
     if query.key_hash.is_some() {
         where_clauses.push(format!("rl.key_hash = ${}", key_hash_param.unwrap()));
     }
@@ -2501,7 +2529,10 @@ pub async fn list_logs(
         }
     }
     if query.error.is_some() {
-        where_clauses.push(format!("rl.error_message ILIKE ${}", error_param.unwrap()));
+        // Match the error *type* (client_blocked, upstream_error, …), not the
+        // free-form error_message — a message like "upstream ... client ..."
+        // would otherwise surface unrelated error kinds for a "client" query.
+        where_clauses.push(format!("rl.error_type ILIKE ${}", error_param.unwrap()));
     }
     if query.team_alias.is_some() {
         where_clauses.push(format!("bt.team_alias ILIKE ${}", team_alias_param.unwrap()));
@@ -2538,16 +2569,20 @@ pub async fn list_logs(
 
     let mut q = sqlx::query_as::<_, LogRow>(&sql);
 
-    // Pre-build LIKE patterns so they outlive the bind chain.
-    let model_pattern      = query.model.as_ref().map(|v| format!("%{}%", v));
-    let request_id_pattern = query.request_id.as_ref().map(|v| format!("%{}%", v));
-    let key_alias_pattern  = query.key_alias.as_ref().map(|v| format!("%{}%", v));
-    let api_path_pattern   = query.api_path.as_ref().map(|v| format!("%{}%", v));
-    let error_pattern      = query.error.as_ref().map(|v| format!("%{}%", v));
-    let team_alias_pattern = query.team_alias.as_ref().map(|v| format!("%{}%", v));
-    let client_ip_pattern  = query.client_ip.as_ref().map(|v| format!("%{}%", v));
+    // Pre-build LIKE patterns so they outlive the bind chain. User input is
+    // escaped so literal %/_ match themselves instead of every row.
+    let model_pattern      = query.model.as_ref().map(|v| format!("%{}%", escape_like(v)));
+    let request_id_pattern = query.request_id.as_ref().map(|v| format!("%{}%", escape_like(v)));
+    let key_alias_pattern  = query.key_alias.as_ref().map(|v| format!("%{}%", escape_like(v)));
+    let api_path_pattern   = query.api_path.as_ref().map(|v| format!("%{}%", escape_like(v)));
+    let error_pattern      = query.error.as_ref().map(|v| format!("%{}%", escape_like(v)));
+    let team_alias_pattern = query.team_alias.as_ref().map(|v| format!("%{}%", escape_like(v)));
+    let client_ip_pattern  = query.client_ip.as_ref().map(|v| format!("%{}%", escape_like(v)));
 
     // Bind parameters (order must match slot allocation above).
+    if let Some(from) = range_from {
+        q = q.bind(from);
+    }
     if let Some(ref v) = query.key_hash {
         q = q.bind(v.clone());
     }
@@ -2583,10 +2618,28 @@ pub async fn list_logs(
     // Fetch per_page + 1 to detect if there is a next page.
     q = q.bind(per_page + 1).bind(offset);
 
-    let rows: Vec<LogRow> = match q.fetch_all(db_pool).await {
+    // Run inside a transaction with a 10s statement_timeout so a pathological
+    // "all time" + ILIKE scan is cancelled server-side by PG instead of
+    // hogging DB resources until it finishes.
+    let rows: Vec<LogRow> = match async {
+        let mut tx = begin_with_timeout(db_pool).await?;
+        let rows = q.fetch_all(&mut *tx).await?;
+        tx.commit().await?;
+        Ok::<_, sqlx::Error>(rows)
+    }
+    .await
+    {
         Ok(r) => r,
         Err(e) => {
-            tracing::error!("Dashboard list_logs query failed: {}", e);
+            let msg = e.to_string();
+            tracing::error!("Dashboard list_logs query failed: {}", msg);
+            if msg.contains("statement timeout") || msg.contains("canceling statement") {
+                return Json(json!({
+                    "error": "query timeout",
+                    "timeout_hint": true,
+                }))
+                .into_response();
+            }
             return (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 "Internal error",
@@ -2762,7 +2815,27 @@ pub async fn update_team(
     .await;
 
     match result {
-        Ok(r) if r.rows_affected() > 0 => Json(json!({"ok": true})).into_response(),
+        Ok(r) if r.rows_affected() > 0 => {
+            // Team models/alias are baked into each key's auth cache entry,
+            // so a team edit must evict every member key's cached entry.
+            // Single-table query on a small admin table, low-frequency path.
+            let member_tokens: Vec<String> = sqlx::query_scalar(
+                r#"SELECT token FROM "boom_verification_token" WHERE team_id = $1"#,
+            )
+            .bind(&team_id)
+            .fetch_all(db_pool)
+            .await
+            .unwrap_or_default();
+            if !member_tokens.is_empty() {
+                let _ = state
+                    .admin_tx
+                    .send(crate::state::AdminCommand::InvalidateAuthCache {
+                        token_hashes: member_tokens,
+                    })
+                    .await;
+            }
+            Json(json!({"ok": true})).into_response()
+        }
         Ok(_) => (axum::http::StatusCode::NOT_FOUND, "Team not found").into_response(),
         Err(e) => {
             tracing::error!("Dashboard update_team failed: {}", e);

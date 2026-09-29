@@ -108,6 +108,35 @@ pub async fn run_request_log_migration(conn: &mut sqlx::PgConnection) -> Result<
     // request when a key is shared by multiple users. NULL when the feature
     // is disabled or the request carried no such header.
     execute_alter(conn, r#"ALTER TABLE boom_request_log ADD COLUMN IF NOT EXISTS user_tag TEXT"#).await;
+    // Composite index for per-key log pagination (user dashboard logs page):
+    // WHERE key_hash = $1 ORDER BY created_at DESC LIMIT/OFFSET. Without it
+    // the planner fetches ALL of a busy key's rows and sorts them on every
+    // page view. CONCURRENTLY avoids blocking the batch INSERT writer while
+    // the index builds on a large table; fall back to a plain CREATE INDEX
+    // for PG-compatible backends that don't support it (some GaussDB builds).
+    // A failed CONCURRENTLY build can leave an INVALID index behind, so the
+    // fallback drops it first instead of relying on IF NOT EXISTS.
+    let concurrent = sqlx::query(
+        r#"CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_request_log_key_created
+           ON boom_request_log(key_hash, created_at DESC)"#,
+    )
+    .execute(&mut *conn)
+    .await;
+    if let Err(e) = concurrent {
+        tracing::warn!(
+            "CREATE INDEX CONCURRENTLY failed ({}), falling back to plain CREATE INDEX",
+            e
+        );
+        let _ = sqlx::query(r#"DROP INDEX IF EXISTS idx_request_log_key_created"#)
+            .execute(&mut *conn)
+            .await;
+        let _ = sqlx::query(
+            r#"CREATE INDEX IF NOT EXISTS idx_request_log_key_created
+               ON boom_request_log(key_hash, created_at DESC)"#,
+        )
+        .execute(&mut *conn)
+        .await;
+    }
     Ok(())
 }
 

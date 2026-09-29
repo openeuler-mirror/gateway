@@ -6595,6 +6595,12 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
   let logsFilters = {};
   let logsFiltersTimer = null;
   let logsFiltersSetup = false;
+  // Time window for the logs query: "3d" (default) / "7d" / "30d" / "all".
+  // Keeps the backend ILIKE filters bounded to an indexed created_at range
+  // instead of seq-scanning the whole log table.
+  let logsRange = "3d";
+  // AbortController for the in-flight logs request (Cancel button).
+  let logsAbort = null;
   // Monotonic token used by loadLogs to drop stale responses. Each call
   // bumps the token; when the awaited fetch returns, if its captured token
   // no longer equals the live one, the response is discarded — so a slow
@@ -6623,11 +6629,28 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
         loadLogs();
       }, 400);
     });
+    const rangeSelect = document.getElementById("logs-range");
+    if (rangeSelect) {
+      rangeSelect.value = logsRange;
+      rangeSelect.addEventListener("change", () => {
+        logsRange = rangeSelect.value;
+        logsPage = 1;
+        loadLogs();
+      });
+    }
+    const cancelBtn = document.getElementById("btn-logs-cancel");
+    if (cancelBtn) {
+      cancelBtn.addEventListener("click", () => {
+        if (logsAbort) logsAbort.abort();
+      });
+    }
     const resetBtn = document.getElementById("btn-reset-logs-filters");
     if (resetBtn) {
       resetBtn.addEventListener("click", () => {
         logsFilters = {};
         logsPage = 1;
+        logsRange = "3d";
+        if (rangeSelect) rangeSelect.value = logsRange;
         // Clear all filter input values.
         table.querySelectorAll(".col-filter").forEach((inp) => { inp.value = ""; });
         loadLogs();
@@ -6641,21 +6664,36 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
     // match the live token, a newer request has superseded this one — drop
     // the result on the floor so it can't clobber a fresher render.
     const myToken = ++logsLoadToken;
+    // Abort the previous in-flight request — user-initiated via the Cancel
+    // button, or implicitly superseded by this new one. Note the HTTP abort
+    // does NOT cancel the SQL on the server; the backend's 10s
+    // statement_timeout is what bounds DB work. This just frees the client.
+    if (logsAbort) logsAbort.abort();
+    logsAbort = new AbortController();
+    const cancelBtn = document.getElementById("btn-logs-cancel");
+    if (cancelBtn) cancelBtn.classList.remove("hidden");
     try {
-      let url = `/admin/logs?page=${logsPage}&per_page=50`;
+      let url = `/admin/logs?page=${logsPage}&per_page=50&range=${encodeURIComponent(logsRange)}`;
       for (const [k, v] of Object.entries(logsFilters)) {
         url += `&${encodeURIComponent(k)}=${encodeURIComponent(v)}`;
       }
-      const data = await api(url);
+      const data = await api(url, { signal: logsAbort.signal });
       if (myToken !== logsLoadToken) return;
       renderLogsTable(data.logs || []);
       renderLogsPagination(data);
     } catch (err) {
+      if (err && err.name === "AbortError") return;
       if (myToken !== logsLoadToken) return;
       const tbody = document.getElementById("logs-tbody");
-      if (tbody) tbody.innerHTML = `<tr><td colspan="15" class="no-results">${t("logs.failed", { message: esc(err.message) })}</td></tr>`;
+      // Backend statement_timeout (10s) fired — guide the user to narrow
+      // the window instead of retrying the same "all time" query.
+      const hint = String(err.message || "").includes("query timeout");
+      const msg = hint ? t("logs.timeout") : esc(err.message);
+      if (tbody) tbody.innerHTML = `<tr><td colspan="15" class="no-results">${hint ? msg : t("logs.failed", { message: msg })}</td></tr>`;
       const pg = document.getElementById("logs-pagination");
       if (pg) pg.innerHTML = "";
+    } finally {
+      if (myToken === logsLoadToken && cancelBtn) cancelBtn.classList.add("hidden");
     }
   }
 

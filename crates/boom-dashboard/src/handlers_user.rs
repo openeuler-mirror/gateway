@@ -332,20 +332,23 @@ pub async fn get_key_info(
 
     match row {
         Some((key_name, key_alias, _spend, expires, blocked, rpm_limit, tpm_limit, max_budget, budget_duration, metadata, created_at)) => {
-            // Query token usage from LiteLLM_SpendLogs (may not exist in all deployments).
-            let (input_tokens, output_tokens) = query_token_usage(db_pool, key_hash).await;
-
-            // Total cost across the key's lifetime — from limiter.cumulative
-            // (boom_rate_limit_cumulative backed), NOT boom_verification_token.spend
-            // (litellm legacy column we never write, always 0).
+            // Token totals and cost all come from limiter.cumulative
+            // (boom_rate_limit_cumulative backed, in-memory read) — NOT a
+            // SUM over boom_request_log, which scans every historical row of
+            // a busy key on each key-info page load. Note the semantic:
+            // cumulative counters reset on explicit quota reset.
+            let key_scope = boom_limiter::QuotaScope::Key {
+                key_hash: key_hash.to_string(),
+            };
+            let input_tokens = state
+                .limiter
+                .peek_cumulative(&key_scope, boom_limiter::CumulativeKind::TotalInputTokens);
+            let output_tokens = state
+                .limiter
+                .peek_cumulative(&key_scope, boom_limiter::CumulativeKind::TotalOutputTokens);
             let total_cost_micros = state
                 .limiter
-                .peek_cumulative(
-                    &boom_limiter::QuotaScope::Key {
-                        key_hash: key_hash.to_string(),
-                    },
-                    boom_limiter::CumulativeKind::TotalCost,
-                );
+                .peek_cumulative(&key_scope, boom_limiter::CumulativeKind::TotalCost);
             let total_cost = rust_decimal::Decimal::from(total_cost_micros)
                 / rust_decimal::Decimal::from(1_000_000);
 
@@ -369,25 +372,6 @@ pub async fn get_key_info(
         }
         None => Json(json!({"error": "Key not found"})),
     }
-}
-
-/// Query aggregated token usage from our own boom_request_log table.
-/// Returns (input, output) token counts.
-async fn query_token_usage(
-    pool: &sqlx::PgPool,
-    key_hash: &str,
-) -> (Option<i64>, Option<i64>) {
-    let row: (i64, i64) = sqlx::query_as(
-        r#"SELECT COALESCE(SUM(input_tokens), 0)::BIGINT,
-                  COALESCE(SUM(output_tokens), 0)::BIGINT
-           FROM boom_request_log WHERE key_hash = $1"#,
-    )
-    .bind(key_hash)
-    .fetch_one(pool)
-    .await
-    .unwrap_or((0, 0));
-
-    (Some(row.0), Some(row.1))
 }
 
 // ── GET /dashboard/api/user/logs ─────────────────────────
