@@ -2725,12 +2725,15 @@
   function renderUserLogsPagination(data) {
     const el = document.getElementById("user-logs-pagination");
     if (!el) return;
+    // total is a bounded exact count (min(real, 50k)); append "+" when the
+    // cap was hit. has_next (row probe) still enables ">" beyond the cap.
+    const suffix = data.total_capped ? "+" : "";
     const pages = Math.ceil(data.total / data.per_page);
-    if (pages <= 1) { el.innerHTML = ""; return; }
+    if (pages <= 1 && !data.has_next) { el.innerHTML = ""; return; }
     el.innerHTML = `
       <button ${data.page <= 1 ? "disabled" : ""} onclick="window._loadUserLogsPage(${data.page - 1})">&lt;</button>
-      <span>${t("common.page_of", { page: data.page, total: pages, count: data.total, unit: t("logs.title") })}</span>
-      <button ${data.page >= pages ? "disabled" : ""} onclick="window._loadUserLogsPage(${data.page + 1})">&gt;</button>
+      <span>${t("common.page_of", { page: data.page, total: Math.max(1, pages) + suffix, count: data.total + suffix, unit: t("logs.title") })}</span>
+      <button ${!data.has_next ? "disabled" : ""} onclick="window._loadUserLogsPage(${data.page + 1})">&gt;</button>
     `;
   }
 

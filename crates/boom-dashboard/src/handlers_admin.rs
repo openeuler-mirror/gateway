@@ -2408,7 +2408,8 @@ pub struct ListLogsQuery {
 /// Upper bound for the bounded exact count behind the logs page total. The
 /// count subquery stops at this many matches, so cost is O(cap); totals at or
 /// above the cap are reported as `total_capped` and rendered "1000+ pages".
-const LOGS_COUNT_CAP: i64 = 50_000;
+/// Shared by the admin and user logs pages.
+pub(crate) const LOGS_COUNT_CAP: i64 = 50_000;
 
 /// Resolve the range param to a lower bound on created_at.
 /// Unknown values fall back to the 3d default.
@@ -3251,7 +3252,7 @@ fn window_json(w: &TimeWindow) -> serde_json::Value {
 /// Begin a dashboard-query transaction with a hard `statement_timeout`.
 /// SET LOCAL scopes the timeout to this transaction only, so it never leaks
 /// into other queries sharing the dashboard pool.
-async fn begin_with_timeout(pool: &sqlx::PgPool) -> Result<sqlx::Transaction<'_, sqlx::Postgres>, sqlx::Error> {
+pub(crate) async fn begin_with_timeout(pool: &sqlx::PgPool) -> Result<sqlx::Transaction<'_, sqlx::Postgres>, sqlx::Error> {
     let mut tx = pool.begin().await?;
     sqlx::query("SET LOCAL statement_timeout = '10s'")
         .execute(&mut *tx)

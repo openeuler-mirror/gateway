@@ -321,7 +321,7 @@ curl $BASE/dashboard/api/user/key-info -H "Cookie: boom_session=$JWT"
 
 **GET** `/dashboard/api/user/logs?page=1&per_page=50`
 
-Query：`page`（默认 1）、`per_page`（默认 50）。返回 `logs[]`、`page`、`per_page`、`total`。每条含 `model`、`api_path`、`is_stream`、`status_code`、`input_tokens`、`output_tokens`、`duration_ms`、`error_*`、`created_at`、`client_ip`、`cached_tokens`。
+Query：`page`（默认 1）、`per_page`（默认 50，上限 1000）。返回 `logs[]`、`page`、`per_page`、`total`、`total_capped`、`has_next`。`total` 为有界精确计数（封顶 5 万条，触顶时 `total_capped=true`）。每条含 `model`、`api_path`、`is_stream`、`status_code`、`input_tokens`、`output_tokens`、`duration_ms`、`error_*`、`created_at`、`client_ip`、`cached_tokens`。
 
 ### 5.5 Request Status（在途请求）
 
