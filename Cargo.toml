@@ -21,7 +21,10 @@ members = [
     "crates/boom-trace",
     "crates/boom-gatekeeper",
     "crates/example-hooks",
+    "dt-test",
 ]
+# 裸 cargo build/test 仍只作用于原 18 个 crate；dt-test 需显式 -p boom-dt 触达
+default-members = ["crates/*"]
 
 [workspace.package]
 version = "0.1.0"

@@ -1,0 +1,56 @@
+# DT (developer test) 测试工程 — 进程内代码覆盖测试。
+#
+# 通过 path 依赖直接链接 boom-* lib crate 源码，用例调用真实代码路径，
+# 由 cargo-llvm-cov 统计功能源码覆盖率（boom-main 为纯 bin crate，不在覆盖范围）。
+#
+# 注意：本包是主 workspace 的成员（否则 llvm-cov 不会对 boom-* 插桩），
+# 但根 Cargo.toml 的 default-members 不含它 —— 裸 cargo build/test 不受影响，
+# 覆盖率统一从仓库根目录跑：cargo llvm-cov nextest -p boom-dt
+[package]
+name = "boom-dt"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# ── 被测对象：全部 lib crate（path 依赖 = 源码级覆盖） ──
+boom-core = { path = "../crates/boom-core" }
+boom-config = { path = "../crates/boom-config" }
+boom-auth = { path = "../crates/boom-auth" }
+boom-provider = { path = "../crates/boom-provider" }
+boom-limiter = { path = "../crates/boom-limiter" }
+boom-routing = { path = "../crates/boom-routing" }
+boom-audit = { path = "../crates/boom-audit" }
+boom-ctxaware = { path = "../crates/boom-ctxaware" }
+boom-flowcontrol = { path = "../crates/boom-flowcontrol" }
+boom-fusion = { path = "../crates/boom-fusion" }
+boom-kvindex = { path = "../crates/boom-kvindex" }
+boom-promptlog = { path = "../crates/boom-promptlog" }
+boom-trace = { path = "../crates/boom-trace" }
+boom-stressmon = { path = "../crates/boom-stressmon" }
+boom-alert = { path = "../crates/boom-alert" }
+# boom-hooks-sdk 暂不纳入：其 FFI raw-pointer API 在 clippy 1.95 有 6 个存量
+# lint（not_unsafe_ptr_arg_deref），待修复后再加回
+
+# ── DT harness 自身依赖 ──
+tokio = { version = "1", features = ["full"] }
+axum = "0.8"
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+tempfile = "3"
+wiremock = "0.6"
+# 与 boom-promptlog / boom-trace 同款 ArcSwap（FilePromptLogQuery 构造用）
+arc-swap = { workspace = true }
+# 与 boom-kvindex 同款的 xxhash3-64（测试构造 parent_hash 用）
+twox-hash = "2"
+# 与 boom-core 同款 Decimal（ProviderCost / WindowLimit.costs 构造用）
+rust_decimal = { workspace = true }
+# 与 boom-core 同款 chrono（AuthIdentity.expires_at 构造用）
+chrono = { workspace = true }
+# 与 boom-flowcontrol 同款 futures（noop_waker poll acquire future / FlowControlledStream）
+futures = { workspace = true }
+# 与 boom-fusion 同款 async-trait（实现 ModelInvoker / Workflow trait 所需）
+async-trait = { workspace = true }
+# 与 boom-trace 同款 opentelemetry-proto（断言 convert_span_to_resource_spans 映射用）
+opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic-messages", "trace", "with-serde"] }

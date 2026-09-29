@@ -103,3 +103,49 @@ jobs:
 
       - name: Build mock-backend
         run: cd test/mock-backend && cargo build --release
+
+  # ── Job 4: DT 测试（boom-dt，进程内覆盖测试 + llvm-cov 覆盖率） ──
+  dt-tests:
+    name: DT tests & coverage
+    runs-on: ubuntu-latest
+    needs: build-and-lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (with llvm-tools)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-dt-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-dt-${{ runner.os }}-
+
+      - name: Install cargo-nextest & cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest,cargo-llvm-cov
+
+      - name: Run DT tests (JUnit XML)
+        run: cargo nextest run -p boom-dt --profile ci
+
+      - name: Run DT coverage (lcov)
+        run: |
+          cargo llvm-cov nextest -p boom-dt
+          cargo llvm-cov report --lcov --output-path dt-test/target/lcov.info
+          cargo llvm-cov report --summary-only --show-missing-lines false 2>/dev/null | tail -5 || true
+
+      - name: Upload DT reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dt-reports
+          path: |
+            target/nextest/ci/junit.xml
+            dt-test/target/lcov.info
