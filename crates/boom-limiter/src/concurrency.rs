@@ -401,6 +401,37 @@ impl PlanStore {
             .map(|n| n.value().clone())
     }
 
+    /// Effective key plan with the SAME fallback semantics the request path
+    /// (`check_plan_limits`) applies:
+    /// - no assignment row → default plan
+    /// - explicit "no plan" → None (no default fallback)
+    /// - explicit name → that plan, EXCEPT type=team plans (cannot be assigned
+    ///   to individual keys) and deleted rows, which fall back to the default.
+    ///
+    /// This is what the runtime actually charges against; display surfaces
+    /// (dashboard window-usage column) must resolve through it to stay
+    /// consistent with enforcement.
+    pub fn resolve_effective_key_plan(&self, key_hash: &str) -> Option<RateLimitPlan> {
+        match self.get_plan_name_explicit(key_hash) {
+            None => self.get_default_plan(),
+            Some(None) => None,
+            Some(Some(plan_name)) => match self.plans.get(&plan_name) {
+                Some(p) if p.value().r#type == boom_core::types::PlanType::Team => {
+                    tracing::warn!(
+                        key_hash = %key_hash,
+                        plan = %plan_name,
+                        "Key is assigned a type=team plan — falling back to default_plan. \
+                         Team plans cannot be assigned to individual keys."
+                    );
+                    self.get_default_plan()
+                }
+                Some(p) => Some(p.value().clone()),
+                // Plan row was deleted out from under us — graceful fallback.
+                None => self.get_default_plan(),
+            },
+        }
+    }
+
     /// Back-comat shim: returns the explicit plan name when the user assigned
     /// one, otherwise None. Loses the "explicit no-plan" distinction — prefer
     /// `get_plan_name_explicit` for new code.

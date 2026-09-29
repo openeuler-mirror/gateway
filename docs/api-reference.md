@@ -321,7 +321,7 @@ curl $BASE/dashboard/api/user/key-info -H "Cookie: boom_session=$JWT"
 
 **GET** `/dashboard/api/user/logs?page=1&per_page=50`
 
-Query：`page`（默认 1）、`per_page`（默认 50）。返回 `logs[]`、`page`、`per_page`、`total`。每条含 `model`、`api_path`、`is_stream`、`status_code`、`input_tokens`、`output_tokens`、`duration_ms`、`error_*`、`created_at`、`client_ip`、`cached_tokens`。
+Query：`page`（默认 1）、`per_page`（默认 50，上限 1000）。返回 `logs[]`、`page`、`per_page`、`total`、`total_capped`、`has_next`。`total` 为有界精确计数（封顶 5 万条，触顶时 `total_capped=true`）。每条含 `model`、`api_path`、`is_stream`、`status_code`、`input_tokens`、`output_tokens`、`duration_ms`、`error_*`、`created_at`、`client_ip`、`cached_tokens`。
 
 ### 5.5 Request Status（在途请求）
 
@@ -932,7 +932,7 @@ curl -X POST $BASE/dashboard/api/admin/prompt-log/otlp-ping \
 
 ### 18.2 开关
 
-**POST** `/dashboard/api/admin/debug/toggle` · admin · body：`{enabled:bool}` — 同时切换 prompt-log 的 `capture_raw_upstream`。
+**POST** `/dashboard/api/admin/debug/toggle` · admin · body：`{enabled:bool}` — 只切换内存错误录制（DebugErrorStore）；不影响 prompt-log 配置，`capture_raw_upstream` 由 prompt-log 配置独立控制。
 
 ```bash
 curl -X POST $BASE/dashboard/api/admin/debug/toggle \

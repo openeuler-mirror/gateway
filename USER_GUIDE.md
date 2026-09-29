@@ -308,7 +308,7 @@ prompt_log:
 ### 1.10 请求审计与 Debug 录制
 
 - `boom_request_log` 表记录每次请求的 token 数、duration、状态。流式请求由 `LoggedStream` 包装，在 Drop 时写入真实 duration，避免在流开始时误记。
-- Dashboard Debug 页可一键开启"错误录制"：捕获上游返回错误时的响应体，按 `request_id` 查询，便于定位上游异常。开启时同步开启 `capture_raw_upstream`。
+- Dashboard Debug 页可一键开启"错误录制"：捕获上游返回错误时的响应体，按 `request_id` 查询，便于定位上游异常。该开关只驱动内存中的错误录制，不影响 prompt-log 配置；`capture_raw_upstream` 由 prompt-log 配置独立控制。
 
 ### 1.11 Web Dashboard
 
@@ -1076,7 +1076,7 @@ curl -X POST http://localhost:4000/dashboard/api/admin/limits/reset \
 
 ### 5.9 排查上游异常
 
-1. Dashboard → Debug → 开启"Debug"开关（同时开启 `capture_raw_upstream`）。
+1. Dashboard → Debug → 开启"Debug"开关（只开启错误录制；如需完整原始交换需单独开启 `prompt_log.capture_raw_upstream`）。
 2. 复现问题，记录失败请求的 `request_id`。
 3. Dashboard → Logs 按 `request_id` 查日志，或：
    ```bash

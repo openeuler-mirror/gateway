@@ -20,7 +20,7 @@ use boom_core::types::{LimitDimension, RateLimitDecision, RateLimitKey, WindowLi
 use dashmap::DashMap;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 
 // ═══════════════════════════════════════════════════════════
@@ -593,28 +593,6 @@ impl SlidingWindowLimiter {
             .collect()
     }
 
-    /// Single-pass aggregation of usage for ALL keys (counts dimension only).
-    /// Returns `HashMap<key_hash, (total_counts, max_remaining_secs)>`.
-    /// Skips team namespace entries (`__team__{tid}`) — those aren't real keys.
-    pub fn get_all_key_usage(&self) -> HashMap<String, (u64, u64)> {
-        let now = now_epoch_secs();
-        let mut result: HashMap<String, (u64, u64)> = HashMap::new();
-        for entry in self.windows.iter() {
-            // cache_key format: "{key_hash}:{model}:{window_secs}"
-            let key_hash = entry.key().split(':').next().unwrap_or("");
-            if key_hash.starts_with("__team__") {
-                continue;
-            }
-            let counter = entry.value();
-            let remaining =
-                counter.window_secs.saturating_sub(now.saturating_sub(counter.window_start));
-            let slot = result.entry(key_hash.to_string()).or_insert((0, 0));
-            slot.0 += counter.counts;
-            slot.1 = slot.1.max(remaining);
-        }
-        result
-    }
-
     /// List all non-expired token/cost window entries for a given key.
     /// Each non-zero dimension produces a separate `WindowInfo` (mirrors the
     /// old QuotaStore.peek_key_windows contract so the dashboard code stays
@@ -623,6 +601,34 @@ impl SlidingWindowLimiter {
     /// Cache_key layout: `{kh}:{model}:{secs}` — model may itself contain ':'.
     pub fn peek_key_windows(&self, key_hash: &str) -> Vec<WindowInfo> {
         self.scan_windows(&format!("{}:", key_hash))
+    }
+
+    /// Snapshot the key's plan-window counters — entries recorded under the
+    /// `__plan__` model namespace by `check_plan_limits` (boom-main). One
+    /// `WindowUsage` per distinct window_secs, carrying all three dimensions
+    /// (counts / tokens / costs). Used by the dashboard window-usage column.
+    pub fn peek_plan_window_usage(&self, key_hash: &str) -> Vec<WindowUsage> {
+        let now = now_epoch_secs();
+        let prefix = format!("{}:__plan__:", key_hash);
+        self.windows
+            .iter()
+            .filter(|entry| {
+                let ck = entry.key();
+                ck.starts_with(&prefix)
+                    && now.saturating_sub(entry.value().window_start) < entry.value().window_secs
+            })
+            .map(|entry| {
+                let counter = entry.value();
+                WindowUsage {
+                    cache_key: entry.key().clone(),
+                    counts: counter.counts,
+                    tokens: counter.tokens,
+                    costs_micros: counter.costs_micros,
+                    window_secs: counter.window_secs,
+                    elapsed_secs: now.saturating_sub(counter.window_start),
+                }
+            })
+            .collect()
     }
 
     /// List all non-expired token/cost window entries for a given team.
@@ -712,14 +718,15 @@ impl SlidingWindowLimiter {
         removed
     }
 
-    /// Clear all window + cumulative counters (memory only). Returns windows count.
-    pub fn clear_all(&self) -> usize {
+    /// Clear ALL window counters for every key/team (memory only). Returns
+    /// entry count. Cumulative metering (lifetime spend/tokens) is NOT
+    /// touched — it feeds the dashboard "spend" column and enforces plan
+    /// total_token_limit/total_cost_limit; resetting it is a deliberate
+    /// per-key quota operation (`clear_key_all`), not a limits reset.
+    pub fn clear_all_windows(&self) -> usize {
         let count = self.windows.len();
         self.windows.clear();
-        self.cumulative.clear();
-        // Best-effort: clear dirty sets too.
         self.dirty_windows.write().expect("dirty lock poisoned").clear();
-        self.dirty_cumulative.write().expect("dirty lock poisoned").clear();
         count
     }
 

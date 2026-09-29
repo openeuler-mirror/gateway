@@ -332,20 +332,23 @@ pub async fn get_key_info(
 
     match row {
         Some((key_name, key_alias, _spend, expires, blocked, rpm_limit, tpm_limit, max_budget, budget_duration, metadata, created_at)) => {
-            // Query token usage from LiteLLM_SpendLogs (may not exist in all deployments).
-            let (input_tokens, output_tokens) = query_token_usage(db_pool, key_hash).await;
-
-            // Total cost across the key's lifetime — from limiter.cumulative
-            // (boom_rate_limit_cumulative backed), NOT boom_verification_token.spend
-            // (litellm legacy column we never write, always 0).
+            // Token totals and cost all come from limiter.cumulative
+            // (boom_rate_limit_cumulative backed, in-memory read) — NOT a
+            // SUM over boom_request_log, which scans every historical row of
+            // a busy key on each key-info page load. Note the semantic:
+            // cumulative counters reset on explicit quota reset.
+            let key_scope = boom_limiter::QuotaScope::Key {
+                key_hash: key_hash.to_string(),
+            };
+            let input_tokens = state
+                .limiter
+                .peek_cumulative(&key_scope, boom_limiter::CumulativeKind::TotalInputTokens);
+            let output_tokens = state
+                .limiter
+                .peek_cumulative(&key_scope, boom_limiter::CumulativeKind::TotalOutputTokens);
             let total_cost_micros = state
                 .limiter
-                .peek_cumulative(
-                    &boom_limiter::QuotaScope::Key {
-                        key_hash: key_hash.to_string(),
-                    },
-                    boom_limiter::CumulativeKind::TotalCost,
-                );
+                .peek_cumulative(&key_scope, boom_limiter::CumulativeKind::TotalCost);
             let total_cost = rust_decimal::Decimal::from(total_cost_micros)
                 / rust_decimal::Decimal::from(1_000_000);
 
@@ -369,25 +372,6 @@ pub async fn get_key_info(
         }
         None => Json(json!({"error": "Key not found"})),
     }
-}
-
-/// Query aggregated token usage from our own boom_request_log table.
-/// Returns (input, output) token counts.
-async fn query_token_usage(
-    pool: &sqlx::PgPool,
-    key_hash: &str,
-) -> (Option<i64>, Option<i64>) {
-    let row: (i64, i64) = sqlx::query_as(
-        r#"SELECT COALESCE(SUM(input_tokens), 0)::BIGINT,
-                  COALESCE(SUM(output_tokens), 0)::BIGINT
-           FROM boom_request_log WHERE key_hash = $1"#,
-    )
-    .bind(key_hash)
-    .fetch_one(pool)
-    .await
-    .unwrap_or((0, 0));
-
-    (Some(row.0), Some(row.1))
 }
 
 // ── GET /dashboard/api/user/logs ─────────────────────────
@@ -431,22 +415,44 @@ pub async fn get_user_logs(
         None => return Json(json!({"error": "Database not available"})).into_response(),
     };
 
-    let offset = (query.page - 1).max(0) * query.per_page;
+    let page = query.page.max(1);
+    let per_page = query.per_page.clamp(1, 1000);
+    let offset = (page - 1) * per_page;
 
-    let rows: Vec<UserLogRow> = match sqlx::query_as(
-        r#"SELECT model, api_path, is_stream, status_code,
-                  input_tokens, output_tokens, duration_ms,
-                  error_type, error_message, created_at, client_ip,
-                  cached_tokens, queue_wait_ms
-           FROM boom_request_log
-           WHERE key_hash = $1
-           ORDER BY created_at DESC
-           LIMIT $2 OFFSET $3"#,
-    )
-    .bind(key_hash)
-    .bind(query.per_page)
-    .bind(offset)
-    .fetch_all(db_pool)
+    // Fetch per_page + 1 to detect if there is a next page (probe survives
+    // even when the count below hits its cap and can't tell anymore).
+    // The count is bounded the same way as the admin logs page: the inner
+    // SELECT stops at LOGS_COUNT_CAP matches, so a key whose history spans
+    // a huge table costs O(cap) — an index walk — not O(key rows).
+    let (rows, total): (Vec<UserLogRow>, i64) = match async {
+        let mut tx = crate::handlers_admin::begin_with_timeout(db_pool).await?;
+        let rows = sqlx::query_as(
+            r#"SELECT model, api_path, is_stream, status_code,
+                      input_tokens, output_tokens, duration_ms,
+                      error_type, error_message, created_at, client_ip,
+                      cached_tokens, queue_wait_ms
+               FROM boom_request_log
+               WHERE key_hash = $1
+               ORDER BY created_at DESC
+               LIMIT $2 OFFSET $3"#,
+        )
+        .bind(key_hash)
+        .bind(per_page + 1)
+        .bind(offset)
+        .fetch_all(&mut *tx)
+        .await?;
+        let total = sqlx::query_scalar(
+            r#"SELECT COUNT(*) FROM (
+                   SELECT 1 FROM boom_request_log WHERE key_hash = $1 LIMIT $2
+               ) t"#,
+        )
+        .bind(key_hash)
+        .bind(crate::handlers_admin::LOGS_COUNT_CAP)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok::<_, sqlx::Error>((rows, total))
+    }
     .await
     {
         Ok(r) => r,
@@ -456,16 +462,11 @@ pub async fn get_user_logs(
         }
     };
 
-    let total: i64 = sqlx::query_scalar(
-        r#"SELECT COUNT(*) FROM boom_request_log WHERE key_hash = $1"#,
-    )
-    .bind(key_hash)
-    .fetch_one(db_pool)
-    .await
-    .unwrap_or(0);
+    let has_next = rows.len() > per_page as usize || total >= offset + per_page + 1;
 
     let logs: Vec<Value> = rows
         .into_iter()
+        .take(per_page as usize)
         .map(|r| {
             json!({
                 "model": r.model,
@@ -487,9 +488,11 @@ pub async fn get_user_logs(
 
     Json(json!({
         "logs": logs,
-        "page": query.page,
-        "per_page": query.per_page,
+        "page": page,
+        "per_page": per_page,
+        "has_next": has_next,
         "total": total,
+        "total_capped": total >= crate::handlers_admin::LOGS_COUNT_CAP,
     }))
     .into_response()
 }

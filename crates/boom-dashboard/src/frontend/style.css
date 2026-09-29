@@ -3363,3 +3363,19 @@ input[list] {
   background: var(--success-bg); color: var(--success);
   font-size: 12px; font-weight: 700;
 }
+
+/* Logs page: time-range selector bar (below the table, above pagination) */
+.logs-toolbar {
+  display: flex; justify-content: flex-end;
+  margin-top: 14px;
+}
+.logs-range-bar {
+  display: flex; align-items: center; gap: 8px;
+}
+.logs-range-bar label { font-size: 13px; color: var(--text3); }
+.logs-range-bar select {
+  padding: 6px 10px; background: var(--surface); border: 1px solid var(--border);
+  color: var(--text2); border-radius: var(--radius-sm); font-size: 13px;
+  cursor: pointer;
+}
+.logs-range-bar select:hover { border-color: var(--primary); }

@@ -45,8 +45,10 @@ pub fn anthropic_request_to_openai(req: &AnthropicMessagesRequest) -> ChatComple
         }
     }
 
-    // 3. Tools: Anthropic input_schema → OpenAI parameters.
-    let tools = req.tools.as_ref().map(|ts| {
+    // 3. Tools: Anthropic input_schema → OpenAI parameters. An empty list is
+    // folded to None — `"tools": []` ≡ absent, and some upstreams (vLLM,
+    // Gemini) reject the empty array.
+    let tools = req.tools.as_ref().filter(|ts| !ts.is_empty()).map(|ts| {
         ts.iter()
             .map(|t| Tool {
                 tool_type: "function".to_string(),
@@ -103,7 +105,39 @@ pub fn anthropic_request_to_openai(req: &AnthropicMessagesRequest) -> ChatComple
         extra,
         gateway_headers: HashMap::new(),
         kv_cache_report_full: false,
+        from_anthropic_protocol: true,
         raw_capture: None,
+    }
+}
+
+/// Translate the Anthropic `thinking` param into an OpenAI `reasoning_effort`
+/// level. Bucketed mapping mirrors litellm
+/// (`translate_anthropic_thinking_to_reasoning_effort`); `disabled` maps to
+/// "none", which vLLM turns into `enable_thinking=false`. Unknown shapes
+/// (non-object, unrecognized type) return None — no translation.
+pub fn translate_anthropic_thinking_to_reasoning_effort(
+    thinking: &serde_json::Value,
+) -> Option<String> {
+    let obj = thinking.as_object()?;
+    match obj.get("type").and_then(|t| t.as_str())? {
+        "enabled" => {
+            let budget = obj
+                .get("budget_tokens")
+                .and_then(|b| b.as_u64())
+                .unwrap_or(0);
+            Some(if budget >= 10000 {
+                "high"
+            } else if budget >= 5000 {
+                "medium"
+            } else if budget >= 2000 {
+                "low"
+            } else {
+                "minimal"
+            }
+            .to_string())
+        }
+        "disabled" => Some("none".to_string()),
+        _ => None,
     }
 }
 
@@ -821,6 +855,103 @@ fn generate_anthropic_message_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn anthropic_req_with_tools(tools: Option<Vec<AnthropicTool>>) -> AnthropicMessagesRequest {
+        AnthropicMessagesRequest {
+            model: "claude-test".to_string(),
+            system: None,
+            messages: vec![],
+            max_tokens: Some(16),
+            tools,
+            tool_choice: None,
+            thinking: None,
+            temperature: None,
+            top_p: None,
+            stop_sequences: None,
+            stream: None,
+            metadata: None,
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    #[test]
+    fn empty_anthropic_tools_fold_to_none() {
+        // `"tools": []` from Anthropic clients must not reach OpenAI-compatible
+        // upstreams (vLLM et al. reject the empty array).
+        let req = anthropic_req_with_tools(Some(vec![]));
+        let openai_req = anthropic_request_to_openai(&req);
+        assert!(openai_req.tools.is_none());
+    }
+
+    #[test]
+    fn nonempty_anthropic_tools_preserved() {
+        let req = anthropic_req_with_tools(Some(vec![AnthropicTool {
+            name: "bash".to_string(),
+            description: None,
+            input_schema: serde_json::json!({"type": "object"}),
+        }]));
+        let openai_req = anthropic_request_to_openai(&req);
+        assert_eq!(openai_req.tools.as_ref().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn translated_request_is_flagged_as_anthropic_origin() {
+        let req = anthropic_req_with_tools(None);
+        let openai_req = anthropic_request_to_openai(&req);
+        assert!(openai_req.from_anthropic_protocol);
+    }
+
+    #[test]
+    fn thinking_budget_buckets() {
+        let effort = |budget: u64| {
+            translate_anthropic_thinking_to_reasoning_effort(&serde_json::json!({
+                "type": "enabled",
+                "budget_tokens": budget
+            }))
+            .unwrap()
+        };
+        assert_eq!(effort(0), "minimal");
+        assert_eq!(effort(1999), "minimal");
+        assert_eq!(effort(2000), "low");
+        assert_eq!(effort(4999), "low");
+        assert_eq!(effort(5000), "medium");
+        assert_eq!(effort(9999), "medium");
+        assert_eq!(effort(10000), "high");
+        assert_eq!(effort(100000), "high");
+    }
+
+    #[test]
+    fn thinking_missing_budget_maps_to_minimal() {
+        assert_eq!(
+            translate_anthropic_thinking_to_reasoning_effort(&serde_json::json!({
+                "type": "enabled"
+            })),
+            Some("minimal".to_string())
+        );
+    }
+
+    #[test]
+    fn thinking_disabled_maps_to_none_effort() {
+        // vLLM turns reasoning_effort="none" into enable_thinking=false,
+        // so Anthropic clients can actually switch thinking off.
+        assert_eq!(
+            translate_anthropic_thinking_to_reasoning_effort(&serde_json::json!({
+                "type": "disabled"
+            })),
+            Some("none".to_string())
+        );
+    }
+
+    #[test]
+    fn thinking_unknown_shapes_do_not_translate() {
+        assert_eq!(translate_anthropic_thinking_to_reasoning_effort(&serde_json::json!("enabled")), None);
+        assert_eq!(translate_anthropic_thinking_to_reasoning_effort(&serde_json::json!(null)), None);
+        assert_eq!(
+            translate_anthropic_thinking_to_reasoning_effort(&serde_json::json!({"type": "adaptive"})),
+            None
+        );
+        assert_eq!(translate_anthropic_thinking_to_reasoning_effort(&serde_json::json!({})), None);
+    }
 
     #[test]
     fn test_convert_user_message_image_url() {

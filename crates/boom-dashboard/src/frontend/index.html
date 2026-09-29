@@ -541,6 +541,7 @@
                     <td></td>
                     <td></td>
                     <td></td>
+                    <td></td>
                     <td><input class="col-filter" data-col="error" data-i18n-ph="logs.filter_placeholder" placeholder="filter"></td>
                     <td></td>
                   </tr>
@@ -564,6 +565,18 @@
                 </thead>
                 <tbody id="logs-tbody"><tr><td colspan="15" class="loading" data-i18n="common.loading">Loading...</td></tr></tbody>
               </table>
+            </div>
+            <div class="logs-toolbar">
+              <div id="logs-range-bar" class="logs-range-bar">
+                <label for="logs-range" data-i18n="logs.range_label">Time Range</label>
+                <select id="logs-range">
+                  <option value="3d" data-i18n="logs.range.3d">Last 3 days</option>
+                  <option value="7d" data-i18n="logs.range.7d">Last 7 days</option>
+                  <option value="30d" data-i18n="logs.range.30d">Last 30 days</option>
+                  <option value="all" data-i18n="logs.range.all">All time</option>
+                </select>
+                <button class="btn-small hidden" id="btn-logs-cancel" data-i18n="logs.cancel">Cancel</button>
+              </div>
             </div>
             <div id="logs-pagination" class="pagination"></div>
           </section>

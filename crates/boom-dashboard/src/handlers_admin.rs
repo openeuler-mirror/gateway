@@ -330,14 +330,10 @@ pub async fn list_keys(
 
     let _total_before_filter = rows.len() as i64;
 
-    // Single-pass limiter scan: aggregate usage for all keys at once.
-    let all_usage = state.limiter.get_all_key_usage();
-
     let mut keys: Vec<Value> = rows
         .into_iter()
         .map(|r| {
             let token_prefix = format!("{}...", &r.token[..8.min(r.token.len())]);
-            let (usage_count, usage_reset_secs) = all_usage.get(&r.token).copied().unwrap_or((0, 0));
             // Three-state plan assignment. The frontend distinguishes:
             //   - "default"   → no DB row (follows default_plan at runtime)
             //   - "no_plan"   → row with plan_name IS NULL (explicit opt-out)
@@ -356,38 +352,68 @@ pub async fn list_keys(
                 Some(None) => None,
             };
 
-            // Aggregate current-window tokens & cost from limiter. We pick
-            // the smallest window_secs per kind — that's the "tightest" current
-            // window (typically 60s) and matches what users expect in a usage
-            // snapshot column. Cross-window aggregation would mix limits.
-            let mut tokens_min_secs: Option<(u64, u64, u64)> = None; // (secs, count, remaining)
-            let mut cost_min_secs: Option<(u64, u64, u64)> = None; // (secs, micros, remaining)
-            for w in state.limiter.peek_key_windows(&r.token) {
-                match w.kind {
-                    boom_limiter::WindowKind::Tokens => {
-                        match tokens_min_secs {
-                            None => tokens_min_secs = Some((w.window_secs, w.count, w.remaining_secs)),
-                            Some((s, _, _)) if w.window_secs < s => {
-                                tokens_min_secs = Some((w.window_secs, w.count, w.remaining_secs));
+            // Window usage: all three metrics come from the key's EFFECTIVE
+            // plan windows — the same `__plan__` counters the request path
+            // charges (`{key_hash}:__plan__:{window_secs}`). No effective
+            // plan → nulls (frontend renders "-/-/-").
+            //
+            // Per dimension we report the LARGEST window that limits it (the
+            // primary quota window; smaller same-dimension windows are burst
+            // guards like the 60s rpm shorthand). If a dimension is not
+            // limited, we still report it from the largest plan window —
+            // every counter records all three dimensions, so this yields the
+            // actual usage inside the plan's window instead of a misleading 0.
+            let (usage_count, usage_tokens, usage_cost_micros, usage_reset_secs) =
+                match state.plan_store.resolve_effective_key_plan(&r.token) {
+                    None => (None, None, None, 0u64),
+                    Some(plan) => {
+                        let windows = state.limiter.peek_plan_window_usage(&r.token);
+                        let (_, effective, _) = plan.effective_limits();
+                        let mut dim_secs: [Option<u64>; 3] = [None, None, None]; // counts/tokens/cost
+                        let mut max_secs: Option<u64> = None;
+                        for w in &effective {
+                            if w.counts.is_some() {
+                                dim_secs[0] = Some(dim_secs[0].map_or(w.window_secs, |s| s.max(w.window_secs)));
                             }
-                            _ => {}
-                        }
-                    }
-                    boom_limiter::WindowKind::CostMicros => {
-                        match cost_min_secs {
-                            None => cost_min_secs = Some((w.window_secs, w.count, w.remaining_secs)),
-                            Some((s, _, _)) if w.window_secs < s => {
-                                cost_min_secs = Some((w.window_secs, w.count, w.remaining_secs));
+                            if w.tokens.is_some() {
+                                dim_secs[1] = Some(dim_secs[1].map_or(w.window_secs, |s| s.max(w.window_secs)));
                             }
-                            _ => {}
+                            if w.costs.is_some() {
+                                dim_secs[2] = Some(dim_secs[2].map_or(w.window_secs, |s| s.max(w.window_secs)));
+                            }
+                            max_secs = Some(max_secs.map_or(w.window_secs, |s| s.max(w.window_secs)));
                         }
+                        let fallback = max_secs;
+                        let pick = |secs: Option<u64>, dim: usize| -> (Option<u64>, u64) {
+                            let secs = match secs.or(fallback) {
+                                Some(s) => s,
+                                // Plan defines no windows at all (only
+                                // concurrency/total limits) — nothing is
+                                // recorded under __plan__.
+                                None => return (Some(0), 0),
+                            };
+                            match windows.iter().find(|w| w.window_secs == secs) {
+                                Some(w) => {
+                                    let v = match dim {
+                                        0 => w.counts,
+                                        1 => w.tokens,
+                                        _ => w.costs_micros,
+                                    };
+                                    (Some(v), w.window_secs.saturating_sub(w.elapsed_secs))
+                                }
+                                // Window never created (no traffic yet).
+                                None => (Some(0), 0),
+                            }
+                        };
+                        let (c, c_reset) = pick(dim_secs[0], 0);
+                        let (t, t_reset) = pick(dim_secs[1], 1);
+                        let (m, m_reset) = pick(dim_secs[2], 2);
+                        (c, t, m, c_reset.max(t_reset).max(m_reset))
                     }
-                }
-            }
-            let usage_tokens = tokens_min_secs.map(|(_, c, _)| c).unwrap_or(0);
-            let usage_cost_micros = cost_min_secs.map(|(_, c, _)| c).unwrap_or(0);
-            let usage_cost = rust_decimal::Decimal::from(usage_cost_micros)
-                / rust_decimal::Decimal::from(1_000_000);
+                };
+            let usage_cost = usage_cost_micros.map(|micros| {
+                rust_decimal::Decimal::from(micros) / rust_decimal::Decimal::from(1_000_000)
+            });
 
             // Cumulative total cost across the key's lifetime — comes from
             // limiter.cumulative (boom_rate_limit_cumulative backed), NOT
@@ -426,7 +452,7 @@ pub async fn list_keys(
                 "usage_count": usage_count,
                 "usage_reset_secs": usage_reset_secs,
                 "usage_tokens": usage_tokens,
-                "usage_cost": usage_cost.to_string(),
+                "usage_cost": usage_cost.map(|d| d.to_string()),
                 "plan_name": plan_name,
                 "plan_assignment_kind": plan_assignment_kind,
             })
@@ -2373,6 +2399,34 @@ pub struct ListLogsQuery {
     pub error: Option<String>,
     pub team_alias: Option<String>,
     pub client_ip: Option<String>,
+    /// Time window: "3d" (default) / "7d" / "30d" / "all". Bounds the scan to
+    /// the created_at index range so the ILIKE filters only apply within the
+    /// window instead of seq-scanning the whole ever-growing log table.
+    pub range: Option<String>,
+}
+
+/// Upper bound for the bounded exact count behind the logs page total. The
+/// count subquery stops at this many matches, so cost is O(cap); totals at or
+/// above the cap are reported as `total_capped` and rendered "1000+ pages".
+/// Shared by the admin and user logs pages.
+pub(crate) const LOGS_COUNT_CAP: i64 = 50_000;
+
+/// Resolve the range param to a lower bound on created_at.
+/// Unknown values fall back to the 3d default.
+fn logs_range_from(range: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    let now = chrono::Utc::now();
+    match range {
+        "all" => None,
+        "7d" => Some(now - chrono::Duration::days(7)),
+        "30d" => Some(now - chrono::Duration::days(30)),
+        _ => Some(now - chrono::Duration::days(3)),
+    }
+}
+
+/// Escape LIKE/ILIKE metacharacters in user input so a literal "%" or "_"
+/// in a filter value can't widen the match to unrelated rows.
+fn escape_like(v: &str) -> String {
+    v.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -2433,6 +2487,9 @@ pub async fn list_logs(
         };
     }
 
+    let range = query.range.as_deref().unwrap_or("3d");
+    let range_from = logs_range_from(range);
+    let range_param = if range_from.is_some() { let i = param_idx; param_idx += 1; Some(i) } else { None };
     let key_hash_param   = slot!(query.key_hash);
     let model_param      = slot!(query.model);
     let status_param     = if query.status.as_deref() == Some("error") { let i = param_idx; param_idx += 1; Some(i) } else { None };
@@ -2445,6 +2502,9 @@ pub async fn list_logs(
     let team_alias_param = slot!(query.team_alias);
     let client_ip_param   = slot!(query.client_ip);
 
+    if let Some(i) = range_param {
+        where_clauses.push(format!("rl.created_at >= ${i}"));
+    }
     if query.key_hash.is_some() {
         where_clauses.push(format!("rl.key_hash = ${}", key_hash_param.unwrap()));
     }
@@ -2475,7 +2535,10 @@ pub async fn list_logs(
         }
     }
     if query.error.is_some() {
-        where_clauses.push(format!("rl.error_message ILIKE ${}", error_param.unwrap()));
+        // Match the error *type* (client_blocked, upstream_error, …), not the
+        // free-form error_message — a message like "upstream ... client ..."
+        // would otherwise surface unrelated error kinds for a "client" query.
+        where_clauses.push(format!("rl.error_type ILIKE ${}", error_param.unwrap()));
     }
     if query.team_alias.is_some() {
         where_clauses.push(format!("bt.team_alias ILIKE ${}", team_alias_param.unwrap()));
@@ -2512,16 +2575,20 @@ pub async fn list_logs(
 
     let mut q = sqlx::query_as::<_, LogRow>(&sql);
 
-    // Pre-build LIKE patterns so they outlive the bind chain.
-    let model_pattern      = query.model.as_ref().map(|v| format!("%{}%", v));
-    let request_id_pattern = query.request_id.as_ref().map(|v| format!("%{}%", v));
-    let key_alias_pattern  = query.key_alias.as_ref().map(|v| format!("%{}%", v));
-    let api_path_pattern   = query.api_path.as_ref().map(|v| format!("%{}%", v));
-    let error_pattern      = query.error.as_ref().map(|v| format!("%{}%", v));
-    let team_alias_pattern = query.team_alias.as_ref().map(|v| format!("%{}%", v));
-    let client_ip_pattern  = query.client_ip.as_ref().map(|v| format!("%{}%", v));
+    // Pre-build LIKE patterns so they outlive the bind chain. User input is
+    // escaped so literal %/_ match themselves instead of every row.
+    let model_pattern      = query.model.as_ref().map(|v| format!("%{}%", escape_like(v)));
+    let request_id_pattern = query.request_id.as_ref().map(|v| format!("%{}%", escape_like(v)));
+    let key_alias_pattern  = query.key_alias.as_ref().map(|v| format!("%{}%", escape_like(v)));
+    let api_path_pattern   = query.api_path.as_ref().map(|v| format!("%{}%", escape_like(v)));
+    let error_pattern      = query.error.as_ref().map(|v| format!("%{}%", escape_like(v)));
+    let team_alias_pattern = query.team_alias.as_ref().map(|v| format!("%{}%", escape_like(v)));
+    let client_ip_pattern  = query.client_ip.as_ref().map(|v| format!("%{}%", escape_like(v)));
 
     // Bind parameters (order must match slot allocation above).
+    if let Some(from) = range_from {
+        q = q.bind(from);
+    }
     if let Some(ref v) = query.key_hash {
         q = q.bind(v.clone());
     }
@@ -2557,10 +2624,79 @@ pub async fn list_logs(
     // Fetch per_page + 1 to detect if there is a next page.
     q = q.bind(per_page + 1).bind(offset);
 
-    let rows: Vec<LogRow> = match q.fetch_all(db_pool).await {
+    // Bounded exact count for pagination display: same WHERE/JOIN as the data
+    // query, but the inner SELECT stops at LOGS_COUNT_CAP matches, so cost is
+    // O(cap) — an index walk at most — instead of O(all matching rows) like a
+    // bare COUNT(*) (that full count is what the LIMIT+1 design avoided).
+    // When the true total exceeds the cap the response reports total_capped
+    // so the UI can render "1000+ pages".
+    let count_sql = format!(
+        r#"SELECT COUNT(*) FROM (
+               SELECT 1 FROM boom_request_log rl
+               LEFT JOIN boom_team_table bt ON rl.team_id = bt.team_id
+               {where_sql}
+               LIMIT ${limit_idx}
+           ) t"#,
+    );
+    let mut cq = sqlx::query_scalar::<_, i64>(&count_sql);
+    if let Some(from) = range_from {
+        cq = cq.bind(from);
+    }
+    if let Some(ref v) = query.key_hash {
+        cq = cq.bind(v.clone());
+    }
+    if let Some(ref p) = model_pattern {
+        cq = cq.bind(p.clone());
+    }
+    if query.status.as_deref() == Some("error") {
+        cq = cq.bind(200i16);
+    }
+    if let Some(ref p) = request_id_pattern {
+        cq = cq.bind(p.clone());
+    }
+    if let Some(ref p) = key_alias_pattern {
+        cq = cq.bind(p.clone());
+    }
+    if let Some(ref p) = api_path_pattern {
+        cq = cq.bind(p.clone());
+    }
+    if let Some(v) = query.status_code {
+        cq = cq.bind(v);
+    }
+    if let Some(ref p) = error_pattern {
+        cq = cq.bind(p.clone());
+    }
+    if let Some(ref p) = team_alias_pattern {
+        cq = cq.bind(p.clone());
+    }
+    if let Some(ref p) = client_ip_pattern {
+        cq = cq.bind(p.clone());
+    }
+    cq = cq.bind(LOGS_COUNT_CAP);
+
+    // Run both queries inside a transaction with a 10s statement_timeout so a
+    // pathological "all time" + ILIKE scan is cancelled server-side by PG
+    // instead of hogging DB resources until it finishes.
+    let (rows, total): (Vec<LogRow>, i64) = match async {
+        let mut tx = begin_with_timeout(db_pool).await?;
+        let rows = q.fetch_all(&mut *tx).await?;
+        let total = cq.fetch_one(&mut *tx).await?;
+        tx.commit().await?;
+        Ok::<_, sqlx::Error>((rows, total))
+    }
+    .await
+    {
         Ok(r) => r,
         Err(e) => {
-            tracing::error!("Dashboard list_logs query failed: {}", e);
+            let msg = e.to_string();
+            tracing::error!("Dashboard list_logs query failed: {}", msg);
+            if msg.contains("statement timeout") || msg.contains("canceling statement") {
+                return Json(json!({
+                    "error": "query timeout",
+                    "timeout_hint": true,
+                }))
+                .into_response();
+            }
             return (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 "Internal error",
@@ -2569,7 +2705,10 @@ pub async fn list_logs(
         }
     };
 
-    let has_next = rows.len() > per_page as usize;
+    // total = min(real_matches, LOGS_COUNT_CAP), so total >= offset+per_page+1
+    // implies the real match count does too — a count-based next-page signal
+    // that also covers pages beyond the per_page+1 probe.
+    let has_next = rows.len() > per_page as usize || total >= offset + per_page + 1;
     let logs: Vec<Value> = rows
         .into_iter()
         .take(per_page as usize)
@@ -2627,6 +2766,8 @@ pub async fn list_logs(
         "page": page,
         "per_page": per_page,
         "has_next": has_next,
+        "total": total,
+        "total_capped": total >= LOGS_COUNT_CAP,
     }))
     .into_response()
 }
@@ -2736,7 +2877,27 @@ pub async fn update_team(
     .await;
 
     match result {
-        Ok(r) if r.rows_affected() > 0 => Json(json!({"ok": true})).into_response(),
+        Ok(r) if r.rows_affected() > 0 => {
+            // Team models/alias are baked into each key's auth cache entry,
+            // so a team edit must evict every member key's cached entry.
+            // Single-table query on a small admin table, low-frequency path.
+            let member_tokens: Vec<String> = sqlx::query_scalar(
+                r#"SELECT token FROM "boom_verification_token" WHERE team_id = $1"#,
+            )
+            .bind(&team_id)
+            .fetch_all(db_pool)
+            .await
+            .unwrap_or_default();
+            if !member_tokens.is_empty() {
+                let _ = state
+                    .admin_tx
+                    .send(crate::state::AdminCommand::InvalidateAuthCache {
+                        token_hashes: member_tokens,
+                    })
+                    .await;
+            }
+            Json(json!({"ok": true})).into_response()
+        }
         Ok(_) => (axum::http::StatusCode::NOT_FOUND, "Team not found").into_response(),
         Err(e) => {
             tracing::error!("Dashboard update_team failed: {}", e);
@@ -3091,7 +3252,7 @@ fn window_json(w: &TimeWindow) -> serde_json::Value {
 /// Begin a dashboard-query transaction with a hard `statement_timeout`.
 /// SET LOCAL scopes the timeout to this transaction only, so it never leaks
 /// into other queries sharing the dashboard pool.
-async fn begin_with_timeout(pool: &sqlx::PgPool) -> Result<sqlx::Transaction<'_, sqlx::Postgres>, sqlx::Error> {
+pub(crate) async fn begin_with_timeout(pool: &sqlx::PgPool) -> Result<sqlx::Transaction<'_, sqlx::Postgres>, sqlx::Error> {
     let mut tx = pool.begin().await?;
     sqlx::query("SET LOCAL statement_timeout = '10s'")
         .execute(&mut *tx)
@@ -3484,12 +3645,14 @@ pub async fn reset_limits_for_key(
 }
 
 /// POST /admin/limits/reset — clear all rate limit windows for all keys.
+/// Only sliding windows; cumulative metering (spend / budget enforcement)
+/// is deliberately untouched.
 pub async fn reset_limits_all(
     _session: AdminSession,
     Extension(state): Extension<Arc<DashboardState>>,
 ) -> Json<Value> {
     tracing::info!("Admin resetting ALL rate limit windows");
-    let removed = state.limiter.clear_all();
+    let removed = state.limiter.clear_all_windows();
     Json(json!({
         "ok": true,
         "cleared": removed,
@@ -3526,22 +3689,12 @@ pub async fn toggle_debug(
     Json(req): Json<DebugToggleRequest>,
 ) -> Json<Value> {
     state.debug_store.set_enabled(req.enabled);
-    // Also toggle raw upstream response capture alongside debug mode.
-    let new_cfg = state
-        .prompt_log_query
-        .full_config()
-        .with_enabled(true)
-        .with_capture_raw_upstream(req.enabled);
-    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    let _ = state
-        .admin_tx
-        .send(crate::state::AdminCommand::UpdatePromptLogConfig {
-            config: new_cfg,
-            reply: reply_tx,
-        })
-        .await;
-    let _ = reply_rx.await;
-    tracing::info!(enabled = req.enabled, "Debug toggled (debug errors + raw upstream capture)");
+    // Debug mode only drives the in-memory DebugErrorStore (upstream error
+    // bodies + block-rule evidence, per-key FIFO). It must NOT touch the
+    // prompt-log config: raw upstream exchange recording is solely owned by
+    // `prompt_log.capture_raw_upstream` — coupling them here silently enabled
+    // full request-body capture for every request while debugging.
+    tracing::info!(enabled = req.enabled, "Debug toggled (debug error recording only)");
     Json(json!({
         "ok": true,
         "enabled": req.enabled,

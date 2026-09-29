@@ -9,20 +9,33 @@ use std::collections::HashMap;
 use std::time::Duration;
 use tracing;
 
+/// Cache entry: the token row plus its resolved team info, so a cache hit
+/// serves the whole authentication without touching the DB. Team data is
+/// cached per-key (not per-team) so `invalidate_key` evicts it together with
+/// the token on any key/team edit, with no separate invalidation path.
+#[derive(Clone)]
+struct CachedToken {
+    token: VerificationToken,
+    /// Team's model list, with litellm special names already collapsed.
+    team_models: Vec<String>,
+    team_alias: Option<String>,
+}
+
 /// Database-backed authenticator compatible with litellm's schema.
 ///
 /// Flow:
 /// 1. Extract raw API key from request
 /// 2. SHA-256 hash it (for sk- prefixed keys)
-/// 3. Check in-memory cache first (moka)
-/// 4. Fall back to PostgreSQL query on `boom_verification_token`
+/// 3. Check in-memory cache first (moka) — hit returns token + team info
+/// 4. Fall back to PostgreSQL queries on `boom_verification_token` +
+///    `boom_team_table`, then cache the combined result
 /// 5. Validate: not blocked, not expired, budget OK
 pub struct DbAuthenticator {
     db: Option<PgPool>,
     /// Master key for admin access (plain text, compared with constant-time comparison).
     master_key: Option<String>,
-    /// Cache: hashed_token → VerificationToken.
-    cache: moka::future::Cache<String, VerificationToken>,
+    /// Cache: hashed_token → CachedToken (token row + resolved team).
+    cache: moka::future::Cache<String, CachedToken>,
 }
 
 impl DbAuthenticator {
@@ -70,7 +83,9 @@ impl DbAuthenticator {
     }
 
     /// Look up a token by its hash, checking cache first then DB.
-    async fn lookup_token(&self, hashed: &str) -> Result<Option<VerificationToken>, GatewayError> {
+    /// On a DB miss-path the team row is resolved too, so the cached entry
+    /// serves subsequent requests without any DB round-trip.
+    async fn lookup_token(&self, hashed: &str) -> Result<Option<CachedToken>, GatewayError> {
         // 1. Check cache
         if let Some(cached) = self.cache.get(hashed).await {
             tracing::debug!("Token cache hit: {}", &hashed[..8]);
@@ -104,12 +119,29 @@ impl DbAuthenticator {
             GatewayError::InternalError(format!("Database error: {}", e))
         })?;
 
-        // 3. Cache the result
-        if let Some(ref token) = result {
-            self.cache.insert(hashed.to_string(), token.clone()).await;
+        // 4. Resolve the team (models + alias) and cache the combined entry.
+        match result {
+            Some(token) => {
+                let (team_models, team_alias) = match &token.team_id {
+                    Some(team_id) => self
+                        .lookup_team(db, team_id)
+                        .await
+                        .unwrap_or_else(|e| {
+                            tracing::warn!("Failed to resolve team: {}", e);
+                            (vec![], None)
+                        }),
+                    None => (vec![], None),
+                };
+                let cached = CachedToken {
+                    team_models: Self::resolve_team_models(team_models),
+                    team_alias,
+                    token,
+                };
+                self.cache.insert(hashed.to_string(), cached.clone()).await;
+                Ok(Some(cached))
+            }
+            None => Ok(None),
         }
-
-        Ok(result)
     }
 
     /// Convert a DB token row into an AuthIdentity.
@@ -154,11 +186,12 @@ impl DbAuthenticator {
     }
 
     /// Query team's allowed models and alias from boom_team_table.
-    async fn lookup_team(&self, team_id: &str) -> Result<(Vec<String>, Option<String>), GatewayError> {
-        let db = match &self.db {
-            Some(pool) => pool,
-            None => return Ok((vec![], None)),
-        };
+    /// Called only on token-cache misses (results live in the CachedToken).
+    async fn lookup_team(
+        &self,
+        db: &PgPool,
+        team_id: &str,
+    ) -> Result<(Vec<String>, Option<String>), GatewayError> {
 
         let result = sqlx::query_as::<_, TeamRow>(
             r#"SELECT models, team_alias FROM "boom_team_table" WHERE team_id = $1"#,
@@ -210,35 +243,18 @@ impl Authenticator for DbAuthenticator {
         //    (including litellm-generated keys with embedded `-`) keep working.
         let hashed = Self::hash_token(raw_key);
 
-        // 3. Look up in cache / DB
-        let token = self
+        // 3. Look up in cache / DB (cache entry carries the resolved team too)
+        let cached = self
             .lookup_token(&hashed)
             .await?
             .ok_or_else(|| GatewayError::AuthError("Invalid API key".to_string()))?;
 
         // 4. Validate the token
-        let mut identity = self.token_to_identity(token);
+        let mut identity = self.token_to_identity(cached.token);
 
-        // 5. Resolve litellm special model names.
-        //    litellm stores special identifiers in key.models:
-        //    - "all-team-models" → use team's models (empty = all allowed)
-        //    - "all-proxy-models" → all models on this proxy (empty = all allowed)
-        if let Some(ref team_id) = identity.team_id {
-            match self.lookup_team(team_id).await {
-                Ok((team_models, team_alias)) => {
-                    let team_models = Self::resolve_team_models(team_models);
-                    tracing::debug!(
-                        "Resolved team for team {}: models={:?}, alias={:?}",
-                        team_id, team_models, team_alias
-                    );
-                    identity.team_models = team_models;
-                    identity.team_alias = team_alias;
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to resolve team: {}", e);
-                }
-            }
-        }
+        // 5. Team info comes from the cache entry — no DB round-trip here.
+        identity.team_models = cached.team_models;
+        identity.team_alias = cached.team_alias;
 
         // Resolve special model names: replace key.models with the expanded list.
         if identity.models.contains(&"all-team-models".to_string()) {
@@ -417,23 +433,27 @@ mod tests {
         assert_eq!(DbAuthenticator::resolve_team_models(vec![]), Vec::<String>::new());
     }
 
-    fn sample_token(token: &str, team_id: Option<&str>) -> VerificationToken {
-        serde_json::from_value(serde_json::json!({
-            "token": token, "key_name": null, "key_alias": null, "key_prefix": null,
-            "tag": null, "spend": 0.0, "expires": null, "models": [], "aliases": null,
-            "config": null, "user_id": null, "team_id": team_id,
-            "max_parallel_requests": null, "metadata": null, "blocked": false,
-            "tpm_limit": null, "rpm_limit": null, "max_budget": null,
-            "budget_duration": null, "budget_reset_at": null,
-            "allowed_cache_controls": null, "allowed_routes": null,
-            "model_spend": null, "model_max_budget": null, "budget_id": null,
-            "organization_id": null, "created_at": null, "created_by": null,
-            "updated_at": null
-        }))
-        .unwrap()
+    fn sample_cached(token: &str, team_id: Option<&str>) -> CachedToken {
+        CachedToken {
+            token: serde_json::from_value(serde_json::json!({
+                "token": token, "key_name": null, "key_alias": null, "key_prefix": null,
+                "tag": null, "spend": 0.0, "expires": null, "models": [], "aliases": null,
+                "config": null, "user_id": null, "team_id": team_id,
+                "max_parallel_requests": null, "metadata": null, "blocked": false,
+                "tpm_limit": null, "rpm_limit": null, "max_budget": null,
+                "budget_duration": null, "budget_reset_at": null,
+                "allowed_cache_controls": null, "allowed_routes": null,
+                "model_spend": null, "model_max_budget": null, "budget_id": null,
+                "organization_id": null, "created_at": null, "created_by": null,
+                "updated_at": null
+            }))
+            .unwrap(),
+            team_models: vec![],
+            team_alias: None,
+        }
     }
 
-    /// The cached token row (which carries team_id) must be evictable by key
+    /// The cached entry (token + resolved team) must be evictable by key
     /// hash — this is the hook the dashboard's update/block/unblock/delete
     /// handlers exercise via AdminCommand::InvalidateAuthCache so edits take
     /// effect on the next request instead of waiting out the TTL.
@@ -441,10 +461,10 @@ mod tests {
     async fn invalidate_key_evicts_single_cached_entry() {
         let auth = DbAuthenticator::new(None, None);
         auth.cache
-            .insert("hash-a".to_string(), sample_token("hash-a", Some("team-old")))
+            .insert("hash-a".to_string(), sample_cached("hash-a", Some("team-old")))
             .await;
         auth.cache
-            .insert("hash-b".to_string(), sample_token("hash-b", Some("team-x")))
+            .insert("hash-b".to_string(), sample_cached("hash-b", Some("team-x")))
             .await;
         assert!(auth.cache.get("hash-a").await.is_some());
 
@@ -458,10 +478,10 @@ mod tests {
     async fn invalidate_all_clears_cache() {
         let auth = DbAuthenticator::new(None, None);
         auth.cache
-            .insert("hash-a".to_string(), sample_token("hash-a", Some("t1")))
+            .insert("hash-a".to_string(), sample_cached("hash-a", Some("t1")))
             .await;
         auth.cache
-            .insert("hash-b".to_string(), sample_token("hash-b", Some("t2")))
+            .insert("hash-b".to_string(), sample_cached("hash-b", Some("t2")))
             .await;
 
         auth.invalidate_all().await;

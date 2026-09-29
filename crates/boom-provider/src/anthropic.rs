@@ -991,6 +991,7 @@ mod tests {
             extra: Default::default(),
             gateway_headers,
             kv_cache_report_full: false,
+            from_anthropic_protocol: false,
             raw_capture: None,
         }
     }

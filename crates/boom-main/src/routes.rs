@@ -635,6 +635,11 @@ async fn chat_completions_inner(
             None
         };
 
+    // Fold `"tools": []` to None before any routing consumer sees it (vLLM
+    // and friends reject the empty array). Placed after the serialization
+    // above so the prompt log / blocklist keep the wire-faithful body.
+    req.normalize_empty_tools();
+
     // Client blocklist — before any routing/limit work. Fail-open on body
     // serialization failure (schema validation rejects the request anyway).
     check_client_block_rules(
@@ -2645,24 +2650,7 @@ async fn check_plan_limits(
     //   None              → key never configured: follow default_plan
     //   Some(None)        → user explicitly chose "no plan": NO default fallback
     //   Some(Some(name))  → user explicitly assigned plan `name`
-    let key_plan: Option<RateLimitPlan> = match plan_store.get_plan_name_explicit(key_hash) {
-        None => plan_store.get_default_plan(),
-        Some(None) => None,
-        Some(Some(plan_name)) => match plan_store.get_plan(&plan_name) {
-            Some(p) if p.r#type == boom_core::types::PlanType::Team => {
-                tracing::warn!(
-                    key_hash = %key_hash,
-                    plan = %p.name,
-                    "Key is assigned a type=team plan — falling back to default_plan. \
-                     Team plans cannot be assigned to individual keys."
-                );
-                plan_store.get_default_plan()
-            }
-            Some(p) => Some(p),
-            // Plan row was deleted out from under us — graceful fallback.
-            None => plan_store.get_default_plan(),
-        },
-    };
+    let key_plan: Option<RateLimitPlan> = plan_store.resolve_effective_key_plan(key_hash);
 
     // ── Resolve team plan (if team_id is set) ──
     let team_plan: Option<RateLimitPlan> = team_id.and_then(|tid| plan_store.resolve_team_plan(tid));
