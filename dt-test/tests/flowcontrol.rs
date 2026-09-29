@@ -394,3 +394,114 @@ async fn flow_controlled_stream_passthrough_no_guard() {
     assert_eq!(s.next().await, Some("x"));
     assert_eq!(s.next().await, None);
 }
+
+/// DT-FC-21：FlowControlConfig::default() 全零（pass-through 语义），
+/// 用 default 配置 ensure_slot 等价于移除槽位。
+#[tokio::test]
+async fn flowcontrol_config_default_is_passthrough() {
+    let d = FlowControlConfig::default();
+    assert_eq!(d.max_inflight, 0);
+    assert_eq!(d.max_context, 0);
+
+    let fc = FlowController::new();
+    fc.ensure_slot("dep1", &cfg(5, 1000));
+    fc.ensure_slot("dep1", &d);
+    assert!(fc.get_stats().is_empty(), "default config removes the slot");
+}
+
+/// DT-FC-22：等待中的请求在槽位被移除后被唤醒为 NoSlot
+/// （oneshot sender 随槽位一起 drop → grant_rx 收到 Err）。
+#[tokio::test]
+async fn parked_waiter_wakes_no_slot_after_remove() {
+    let fc = FlowController::new();
+    fc.ensure_slot("dep1", &cfg(1, 0));
+    let g1 = fc.acquire("dep1", 100, Duration::from_secs(60), false, None, None, None).await.unwrap();
+
+    let mut w = Box::pin(fc.acquire("dep1", 100, Duration::from_secs(60), false, None, None, None));
+    poll_once(w.as_mut());
+    assert_eq!(fc.get_stats()[0].waiters, 1);
+
+    // 槽位移除 → 队列（含 grant sender）整体 drop → 等待者被唤醒为 NoSlot
+    fc.remove_slot("dep1");
+    let res = futures::FutureExt::now_or_never(w.as_mut());
+    assert!(
+        matches!(res, Some(Err(FlowControlError::NoSlot))),
+        "expected Err(NoSlot) after slot removal"
+    );
+    drop(g1);
+}
+
+/// DT-FC-23：上下文预算跳过派发（inflight 有余量但 used_ctx+req 超 max_context
+/// → dispatch 循环 continue 跳过）；槽位释放后重派发成功。
+/// 同测 remove_slot 后的 stale reverse-index 清理与 AcquireCleanup 的槽位缺失分支。
+#[tokio::test]
+async fn context_skip_dispatch_and_stale_index_cleanup() {
+    // Part A：context skip
+    let fc = FlowController::new();
+    fc.ensure_slot("dep1", &cfg(2, 100));
+    let g1 = fc.acquire("dep1", 60, Duration::from_secs(60), false, None, None, None).await.unwrap();
+    assert_eq!(fc.get_stats()[0].current_inflight, 1);
+
+    // inflight 1/2 有余量，但 60+50 > 100 → 被上下文预算挡住，保持等待
+    let mut w = Box::pin(fc.acquire("dep1", 50, Duration::from_secs(60), false, None, None, None));
+    poll_once(w.as_mut());
+    let stats = fc.get_stats();
+    assert_eq!(stats[0].waiters, 1, "context budget blocks dispatch despite free inflight slot");
+    assert_eq!(stats[0].current_context, 60);
+
+    // 释放 g1 → used_ctx 归零 → w 可派发
+    drop(g1);
+    let guard = futures::FutureExt::now_or_never(w.as_mut());
+    assert!(guard.is_some(), "waiter dispatched after context freed");
+    drop(w);
+
+    // Part B：remove_slot 后 reverse-index 残留 → 查询触发 stale 清理；
+    // 之后 drop 等待 future 走 AcquireCleanup 的槽位缺失分支。
+    fc.ensure_slot("dep2", &cfg(1, 100));
+    let g2 = fc.acquire("dep2", 60, Duration::from_secs(60), false, None, None, None).await.unwrap();
+    let mut w2 = Box::pin(
+        fc.acquire("dep2", 50, Duration::from_secs(60), false, Some("u".into()), Some("kh9".into()), None),
+    );
+    poll_once(w2.as_mut());
+
+    fc.remove_slot("dep2");
+    // kh9 的 index 项指向已删除的槽位 → stale 清理，返回空
+    assert!(fc.get_key_request_status("kh9").is_empty());
+    assert!(fc.get_key_request_status("kh9").is_empty(), "index entry removed after cleanup");
+    // drop 等待 future → AcquireCleanup::drop 发现槽位不存在 → 直接返回（不 panic）
+    drop(w2);
+    drop(g2);
+}
+
+/// DT-FC-24：position_for VIP 分支 —— 排队 VIP 的 ahead 只统计其前面的
+/// 未派发 VIP；普通请求的 ahead = 全部未派发 VIP + 前面未派发普通。
+#[tokio::test]
+async fn vip_position_counts_only_vip_ahead() {
+    let fc = FlowController::new();
+    fc.ensure_slot("dep1", &cfg(1, 0));
+    let g1 = fc.acquire("dep1", 100, Duration::from_secs(60), false, None, None, None).await.unwrap();
+
+    let mut vip1 = Box::pin(fc.acquire("dep1", 100, Duration::from_secs(60), true, Some("v1".into()), Some("kv1".into()), Some("m".into())));
+    let mut vip2 = Box::pin(fc.acquire("dep1", 100, Duration::from_secs(60), true, Some("v2".into()), Some("kv2".into()), None));
+    let mut n = Box::pin(fc.acquire("dep1", 100, Duration::from_secs(60), false, Some("n".into()), Some("kn".into()), None));
+    poll_once(vip1.as_mut());
+    poll_once(vip2.as_mut());
+    poll_once(n.as_mut());
+
+    // kv2（第 2 个 VIP）：前面只有 vip1 未派发 → ahead=1
+    let s2 = fc.get_key_request_status("kv2");
+    assert_eq!(s2.len(), 1);
+    assert!(s2[0].is_vip);
+    assert!(matches!(s2[0].status, UserRequestStage::Waiting { ahead: 1 }));
+
+    // kn（普通）：2 个未派发 VIP 全部在前 → ahead=2
+    let sn = fc.get_key_request_status("kn");
+    assert_eq!(sn.len(), 1);
+    assert!(!sn[0].is_vip);
+    assert!(matches!(sn[0].status, UserRequestStage::Waiting { ahead: 2 }));
+
+    drop(vip1);
+    drop(vip2);
+    drop(n);
+    drop(g1);
+}

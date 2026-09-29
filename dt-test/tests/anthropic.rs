@@ -740,3 +740,277 @@ fn transcoder_finish_tool_calls() {
     let delta = drained.iter().find(|e| e.event == "message_delta").map(|e| serde_json::from_str::<serde_json::Value>(&e.data).unwrap()).unwrap();
     assert_eq!(delta["delta"]["stop_reason"], "tool_use");
 }
+
+/// DT-ANT-41：transcode 边角分支集中覆盖 —— 空 reasoning/空 content 跳过、
+/// text 关闭 thinking 块、tool_call 无 id 续传（input_json_delta）、
+/// 无 id 且空 args 跳过、未知 index 丢弃、无 function 的 tool_call name 兜底空串。
+#[test]
+fn transcoder_edge_branches_gauntlet() {
+    let mut t = AnthropicStreamTranscoder::new("m".into());
+
+    // 1) reasoning 打开 thinking 块（idx 0）
+    let _ = t.transcode(&chunk_with(serde_json::json!({"reasoning_content":"think"}), None));
+    // 2) 空 reasoning → 跳过（不发任何事件）
+    assert!(t.transcode(&chunk_with(serde_json::json!({"reasoning_content":""}), None)).is_empty());
+    // 3) text 到来 → 关闭 thinking（content_block_stop idx0）+ 打开 text 块（idx 1）
+    let ev3 = t.transcode(&chunk_with(serde_json::json!({"content":"A"}), None));
+    let names3 = event_names(&ev3);
+    assert_eq!(names3, vec!["content_block_stop", "content_block_start", "content_block_delta"]);
+    let stop3 = serde_json::from_str::<serde_json::Value>(
+        &ev3.iter().find(|e| e.event == "content_block_stop").unwrap().data).unwrap();
+    assert_eq!(stop3["index"], 0, "thinking block closed before text");
+    // 4) 空 content → 跳过
+    assert!(t.transcode(&chunk_with(serde_json::json!({"content":""}), None)).is_empty());
+    // 5) tool_call 带 id 无 function → name 兜底空串；同时 close_open_block 关闭 text 块
+    let ev5 = t.transcode(&chunk_with(
+        serde_json::json!({"tool_calls":[{"index":0,"id":"c1","type":"function"}]}),
+        None,
+    ));
+    let start5 = serde_json::from_str::<serde_json::Value>(
+        &ev5.iter().find(|e| e.event == "content_block_start").unwrap().data).unwrap();
+    assert_eq!(start5["content_block"]["type"], "tool_use");
+    assert_eq!(start5["content_block"]["name"], "", "missing function name defaults to empty");
+    assert_eq!(start5["content_block"]["id"], "c1");
+    assert_eq!(start5["index"], 2);
+    // 6) 无 id 续传 args → input_json_delta 路由到已开 tool 块
+    let ev6 = t.transcode(&chunk_with(
+        serde_json::json!({"tool_calls":[{"index":0,"function":{"arguments":"{\"a\""}}]}),
+        None,
+    ));
+    let d6 = serde_json::from_str::<serde_json::Value>(&ev6[0].data).unwrap();
+    assert_eq!(d6["delta"]["type"], "input_json_delta");
+    assert_eq!(d6["delta"]["partial_json"], "{\"a\"");
+    assert_eq!(d6["index"], 2);
+    // 7) 无 id 且空 args → 跳过
+    assert!(t.transcode(&chunk_with(
+        serde_json::json!({"tool_calls":[{"index":0,"function":{"arguments":""}}]}),
+        None,
+    )).is_empty());
+    // 8) 无 id 有 args 但 index 未注册（先于 id chunk 到达的碎片）→ 丢弃
+    assert!(t.transcode(&chunk_with(
+        serde_json::json!({"tool_calls":[{"index":9,"function":{"arguments":"x"}}]}),
+        None,
+    )).is_empty());
+    // 9) finish=stop → 关闭 tool 块并持有；drain 释放 end_turn
+    let ev9 = t.transcode(&chunk_with(serde_json::json!({}), Some("stop")));
+    assert!(event_names(&ev9).contains(&"content_block_stop"));
+    let drained = t.drain();
+    let delta = drained.iter().find(|e| e.event == "message_delta")
+        .map(|e| serde_json::from_str::<serde_json::Value>(&e.data).unwrap()).unwrap();
+    assert_eq!(delta["delta"]["stop_reason"], "end_turn");
+}
+
+/// DT-ANT-42：user Blocks 深分支 —— Text/Image/Document 混排进 Parts，
+/// tool_result 的 content 三形态（Text / Blocks(Text+Image) / None）、
+/// is_error 前缀、Document title 空与非空、无 data 的 Document 跳过、
+/// 用户侧 Thinking 块被丢弃。
+#[test]
+fn anthropic_request_user_blocks_deep_branches() {
+    let r = req_with_messages(vec![AnthropicMessage {
+        role: "user".into(),
+        content: AnthropicContent::Blocks(vec![
+            AnthropicContentBlock::Text { text: "hello".into(), cache_control: None },
+            AnthropicContentBlock::Image {
+                source: serde_json::json!({"type":"url","url":"https://x/i.png"}),
+            },
+            AnthropicContentBlock::ToolResult {
+                tool_use_id: "t1".into(),
+                content: Some(AnthropicContent::Blocks(vec![
+                    AnthropicContentBlock::Text { text: "ok".into(), cache_control: None },
+                    AnthropicContentBlock::Image {
+                        source: serde_json::json!({"type":"base64","media_type":"image/png","data":"QUJD"}),
+                    },
+                ])),
+                is_error: None,
+            },
+            AnthropicContentBlock::ToolResult {
+                tool_use_id: "t2".into(),
+                content: Some(AnthropicContent::Text("plain".into())),
+                is_error: Some(true),
+            },
+            AnthropicContentBlock::ToolResult {
+                tool_use_id: "t3".into(),
+                content: None,
+                is_error: None,
+            },
+            AnthropicContentBlock::Document {
+                source: serde_json::json!({"type":"text","data":"doc body"}),
+                title: Some("T".into()),
+                context: None,
+                citations: None,
+            },
+            AnthropicContentBlock::Document {
+                source: serde_json::json!({"type":"text","data":"d2"}),
+                title: Some(String::new()),
+                context: None,
+                citations: None,
+            },
+            AnthropicContentBlock::Document {
+                source: serde_json::json!({"media_type":"application/pdf"}),
+                title: None,
+                context: None,
+                citations: None,
+            },
+            AnthropicContentBlock::Thinking { thinking: "user thought".into() },
+        ]),
+    }]);
+    let o = anthropic_request_to_openai(&r);
+    assert_eq!(o.messages.len(), 4, "user Parts + 3 tool messages");
+
+    // user 消息：Parts = [Text hello, ImageUrl, Text "T\ndoc body", Text "d2"]（无 data 的 Document 与 Thinking 不产生 part）
+    match &o.messages[0].content {
+        MessageContent::Parts(parts) => {
+            assert_eq!(parts.len(), 4);
+            assert!(matches!(&parts[0], ContentPart::Text { text } if text == "hello"));
+            assert!(matches!(&parts[1], ContentPart::ImageUrl { image_url } if image_url.url == "https://x/i.png"));
+            assert!(matches!(&parts[2], ContentPart::Text { text } if text == "T\ndoc body"));
+            assert!(matches!(&parts[3], ContentPart::Text { text } if text == "d2"));
+        }
+        other => panic!("expected Parts, got {other:?}"),
+    }
+
+    // t1: Blocks(Text + Image) → "ok[image: data:image/png;base64,QUJD]"
+    assert!(matches!(o.messages[1].role, MessageRole::Tool));
+    assert_eq!(o.messages[1].tool_call_id.as_deref(), Some("t1"));
+    assert!(matches!(&o.messages[1].content, MessageContent::Text(t) if t == "ok[image: data:image/png;base64,QUJD]"));
+    // t2: Text + is_error → "[ERROR] plain"
+    assert!(matches!(&o.messages[2].content, MessageContent::Text(t) if t == "[ERROR] plain"));
+    // t3: content None → 空串
+    assert!(matches!(&o.messages[3].content, MessageContent::Text(t) if t.is_empty()));
+}
+
+/// DT-ANT-43：assistant Blocks 深分支 —— 含 Thinking 走 Parts 路径
+/// （Reasoning 保留 + Text/Document 转 part + ToolUse 转 tool_calls）；
+/// RedactedThinking 不产出；无 Thinking 的 Document 并入纯文本。
+#[test]
+fn anthropic_request_assistant_blocks_thinking_document() {
+    let r = req_with_messages(vec![AnthropicMessage {
+        role: "assistant".into(),
+        content: AnthropicContent::Blocks(vec![
+            AnthropicContentBlock::Thinking { thinking: "R".into() },
+            AnthropicContentBlock::RedactedThinking { data: "opaque".into() },
+            AnthropicContentBlock::Document {
+                source: serde_json::json!({"type":"text","data":"DOC"}),
+                title: Some("Ti".into()),
+                context: None,
+                citations: None,
+            },
+            AnthropicContentBlock::Text { text: "A".into(), cache_control: None },
+            AnthropicContentBlock::ToolUse {
+                id: "u1".into(),
+                name: "tool".into(),
+                input: serde_json::json!({"k":1}),
+                cache_control: None,
+            },
+        ]),
+    }]);
+    let o = anthropic_request_to_openai(&r);
+    assert_eq!(o.messages.len(), 1);
+    let m = &o.messages[0];
+    assert!(matches!(m.role, MessageRole::Assistant));
+    match &m.content {
+        MessageContent::Parts(parts) => {
+            assert_eq!(parts.len(), 3, "Reasoning + Document-as-Text + Text");
+            assert!(matches!(&parts[0], ContentPart::Reasoning { reasoning } if reasoning == "R"));
+            assert!(matches!(&parts[1], ContentPart::Text { text } if text == "Ti\nDOC"));
+            assert!(matches!(&parts[2], ContentPart::Text { text } if text == "A"));
+        }
+        other => panic!("expected Parts, got {other:?}"),
+    }
+    let tcs = m.tool_calls.as_ref().expect("tool_calls present");
+    assert_eq!(tcs.len(), 1);
+    assert_eq!(tcs[0].id, "u1");
+    assert_eq!(tcs[0].call_type, "function");
+    assert_eq!(tcs[0].function.name, "tool");
+    assert_eq!(tcs[0].function.arguments, "{\"k\":1}");
+
+    // 无 Thinking：Document 并入 Text，ToolUse 仍转 tool_calls
+    let r2 = req_with_messages(vec![AnthropicMessage {
+        role: "assistant".into(),
+        content: AnthropicContent::Blocks(vec![
+            AnthropicContentBlock::Text { text: "a".into(), cache_control: None },
+            AnthropicContentBlock::Document {
+                source: serde_json::json!({"type":"text","data":"DOC2"}),
+                title: None,
+                context: None,
+                citations: None,
+            },
+            AnthropicContentBlock::ToolUse {
+                id: "u2".into(),
+                name: "g".into(),
+                input: serde_json::json!({}),
+                cache_control: None,
+            },
+        ]),
+    }]);
+    let o2 = anthropic_request_to_openai(&r2);
+    assert!(matches!(&o2.messages[0].content, MessageContent::Text(t) if t == "aDOC2"));
+    assert_eq!(o2.messages[0].tool_calls.as_ref().unwrap()[0].id, "u2");
+}
+
+/// DT-ANT-44：非 user/assistant 角色（如 system）走兜底 content_to_string ——
+/// Blocks 中 Text 与 Thinking 拼接、其余块（Image/ToolUse）丢弃。
+#[test]
+fn anthropic_request_other_role_falls_back_to_content_to_string() {
+    let r = req_with_messages(vec![AnthropicMessage {
+        role: "system".into(),
+        content: AnthropicContent::Blocks(vec![
+            AnthropicContentBlock::Text { text: "a".into(), cache_control: None },
+            AnthropicContentBlock::Thinking { thinking: "b".into() },
+            AnthropicContentBlock::Image { source: serde_json::json!({"type":"url","url":"https://x"}) },
+            AnthropicContentBlock::ToolUse {
+                id: "u".into(), name: "n".into(), input: serde_json::json!({}), cache_control: None,
+            },
+        ]),
+    }]);
+    let o = anthropic_request_to_openai(&r);
+    assert_eq!(o.messages.len(), 1);
+    assert!(matches!(o.messages[0].role, MessageRole::User), "fallback treats unknown role as user");
+    assert!(matches!(&o.messages[0].content, MessageContent::Text(t) if t == "ab"));
+}
+
+/// DT-ANT-45：!101 thinking→reasoning_effort 翻译矩阵 —— budget 分桶
+/// （≥10000 high / ≥5000 medium / ≥2000 low / 其余 minimal，缺 budget 按 0）、
+/// disabled→none（vLLM 转 enable_thinking=false）、非法形态（非对象/未知
+/// type/缺 type）不翻译返回 None；anthropic_request_to_openai 置
+/// from_anthropic_protocol 标记且 thinking 落 extra（由 OpenAI provider 的
+/// build_request 消费，端到端见 DT-PRV-OAI-30..33）。
+/// 另覆盖 thinking 块开着时到达 tool_call → close_open_block 补关块事件。
+#[test]
+fn anthropic_thinking_translation_and_open_block_close() {
+    use boom_core::anthropic::translate_anthropic_thinking_to_reasoning_effort as tr;
+
+    // budget 分桶（含边界）
+    assert_eq!(tr(&serde_json::json!({"type":"enabled","budget_tokens":12000})).as_deref(), Some("high"));
+    assert_eq!(tr(&serde_json::json!({"type":"enabled","budget_tokens":10000})).as_deref(), Some("high"));
+    assert_eq!(tr(&serde_json::json!({"type":"enabled","budget_tokens":5000})).as_deref(), Some("medium"));
+    assert_eq!(tr(&serde_json::json!({"type":"enabled","budget_tokens":2000})).as_deref(), Some("low"));
+    assert_eq!(tr(&serde_json::json!({"type":"enabled","budget_tokens":1999})).as_deref(), Some("minimal"));
+    assert_eq!(tr(&serde_json::json!({"type":"enabled"})).as_deref(), Some("minimal"), "缺 budget 按 0");
+    // disabled → none
+    assert_eq!(tr(&serde_json::json!({"type":"disabled"})).as_deref(), Some("none"));
+    // 非法形态不翻译
+    assert_eq!(tr(&serde_json::json!("enabled")), None);
+    assert_eq!(tr(&serde_json::json!(null)), None);
+    assert_eq!(tr(&serde_json::json!({"type":"adaptive"})), None);
+    assert_eq!(tr(&serde_json::json!({})), None);
+
+    // 请求转换：from_anthropic_protocol 标记 + thinking 落 extra
+    let mut r = req_with_messages(vec![]);
+    r.thinking = Some(serde_json::json!({"type":"enabled","budget_tokens":8000}));
+    let o = anthropic_request_to_openai(&r);
+    assert!(o.from_anthropic_protocol);
+    assert_eq!(tr(o.extra.get("thinking").unwrap()).as_deref(), Some("medium"));
+
+    // transcoder：thinking 块开着时来了 tool_call → close_open_block 关 thinking
+    let mut t = AnthropicStreamTranscoder::new("m".into());
+    let _ = t.transcode(&chunk_with(serde_json::json!({"reasoning_content":"ponder"}), None));
+    let ev = t.transcode(&chunk_with(
+        serde_json::json!({"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"f","arguments":""}}]}),
+        None,
+    ));
+    let names = event_names(&ev);
+    assert!(names.contains(&"content_block_stop"), "open thinking block closed for tool_call: {names:?}");
+    let stop_idx = names.iter().position(|n| *n == "content_block_stop").unwrap();
+    assert!(names.iter().position(|n| *n == "content_block_start").unwrap() > stop_idx, "tool block starts after close");
+}

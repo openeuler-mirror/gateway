@@ -9,7 +9,7 @@
 //! - 累计计数器：peek/reset（返回快照）/ 负值钳 0 / 缺席 0
 //! - 仪表盘查询：get_usage(_for_key)/get_all_key_units（跳过 __team__）/
 //!   peek_key_windows/peek_team_windows（model 含 ':'、畸形 cache_key 跳过）
-//! - 清理：clear_windows / clear_for_key / clear_all
+//! - 清理：clear_windows / clear_for_key / clear_all_windows
 //! - snapshot / restore_counter / restore_cumulative（过期跳过）
 //! - decimal_to_micros / micros_to_decimal
 //! - RateLimitPlan：effective_limits（rpm/tpm 简写合并到 60s 条目、
@@ -254,14 +254,15 @@ async fn cumulative_reset_returns_snapshot() {
 }
 
 /// DT-LM-06：仪表盘查询 —— get_usage / get_usage_for_key /
-/// get_all_key_usage（聚合 + 跳过 __team__）/ peek_key_windows /
-/// peek_team_windows（model 含 ':' 的 cache_key 解析）。
+/// peek_plan_window_usage（__plan__ 命名空间三维度快照，!826c045 dashboard
+/// window-usage 列）/ peek_key_windows / peek_team_windows（model 含 ':'
+/// 的 cache_key 解析）。
 #[tokio::test]
 async fn dashboard_listing_queries() {
     let l = SlidingWindowLimiter::new();
     assert!(l.get_usage("none:m:60").is_none());
     assert!(l.get_usage_for_key("nobody").is_empty());
-    assert!(l.get_all_key_usage().is_empty());
+    assert!(l.peek_plan_window_usage("nobody").is_empty());
 
     let wins = [wl(Some(10), Some(50), Some(dec("0.000003")), 60), wl(Some(100), None, None, 3600)];
     let key = rkey("khL", "gpt:4"); // model 含 ':' → 从右侧解析 window_secs
@@ -294,12 +295,18 @@ async fn dashboard_listing_queries() {
     assert_eq!(tinfos.len(), 1);
     assert_eq!(tinfos[0].count, 9);
 
-    // 全 key 聚合：khL（counts 1+1），team 项跳过
-    let all = l.get_all_key_usage();
-    let (counts, remaining) = all.get("khL").copied().expect("khL aggregated");
-    assert_eq!(counts, 2);
-    assert!((1..=3600).contains(&remaining), "remaining {remaining}");
-    assert!(!all.contains_key("__team__tL"));
+    // plan 命名空间窗口（dashboard window-usage 列）：__plan__ model 的
+    // 计数被 peek_plan_window_usage 快照，counts/tokens/costs 三维度携带
+    let pkey = rkey("khP", "__plan__");
+    l.commit_counts(&pkey, &[wl(Some(7), None, None, 120)], 2);
+    l.settle_usage(&pkey, &kscope("khP"), &[wl(Some(7), Some(80), Some(dec("0.000002")), 120)], 30, 10, 2, 0, 0);
+    let plan = l.peek_plan_window_usage("khP");
+    assert_eq!(plan.len(), 1);
+    let pu = &plan[0];
+    assert_eq!((pu.counts, pu.tokens, pu.costs_micros, pu.window_secs), (2, 40, 2, 120));
+    assert!(pu.elapsed_secs <= 120, "elapsed {}", pu.elapsed_secs);
+    // key 前缀精确匹配：khP2 不命中 khP 的 plan 窗口
+    assert!(l.peek_plan_window_usage("khP2").is_empty());
 }
 
 /// DT-LM-07：snapshot/restore —— 过期 restore 跳过、有效 restore 落位、
@@ -326,7 +333,8 @@ async fn snapshot_restore_and_scan_edge_keys() {
 }
 
 /// DT-LM-08：清理 —— clear_windows（命中/未命中）、clear_for_key 计数、
-/// clear_all 清窗口 + 累计。
+/// clear_all_windows 只清窗口、**保留累计计量**（!fb9dccd：累计供 dashboard
+/// spend 列与 plan total 限额，reset-all-limits 不再清零）。
 #[tokio::test]
 async fn clear_operations() {
     let l = SlidingWindowLimiter::new();
@@ -345,9 +353,10 @@ async fn clear_operations() {
     assert_eq!(l.clear_for_key("khC"), 1);
     assert!(l.get_usage("khC:m:300").is_none());
 
-    assert!(l.clear_all() >= 1);
+    assert!(l.clear_all_windows() >= 1);
     assert!(l.snapshot().is_empty());
-    assert_eq!(l.peek_cumulative(&kscope("khC"), CumulativeKind::TotalInputTokens), 0);
+    // 累计计量保留（settle 的 input_tokens=1 仍在）
+    assert_eq!(l.peek_cumulative(&kscope("khC"), CumulativeKind::TotalInputTokens), 1);
 }
 
 /// DT-LM-09：Decimal ↔ micros 换算（含负值钳 0）。

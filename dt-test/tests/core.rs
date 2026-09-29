@@ -320,6 +320,25 @@ fn error_type_rate_limit_passes_through_limit_type() {
     assert_eq!(e.error_type(), "team_tpm_limit");
 }
 
+/// DT-CORE-71：ClientBlocked（!98 客户端封禁变体）—— status_code 透传规则
+/// 配置的 HTTP 状态、error_type / client_block_code 映射、不进 dedup 白名单；
+/// 其他变体 client_block_code → None。
+#[test]
+fn error_client_blocked_variant_mapping() {
+    let e = GatewayError::ClientBlocked {
+        status: 451,
+        message: "banned by rule".into(),
+        code: "bad-ua".into(),
+    };
+    assert_eq!(e.status_code(), 451);
+    assert_eq!(e.error_type(), "client_blocked");
+    assert_eq!(e.client_block_code(), Some("bad-ua"));
+    assert!(!e.should_dedup_log());
+    // 非 ClientBlocked 变体无封禁码（响应体 code 走默认数字状态码路径）
+    assert!(GatewayError::AuthError("x".into()).client_block_code().is_none());
+    assert!(GatewayError::UpstreamTimeout.client_block_code().is_none());
+}
+
 // ── raw_upstream_body ──
 
 /// DT-CORE-09：raw_upstream_body 仅 UpstreamParseError 返回 Some，其余 None。
@@ -1403,4 +1422,79 @@ fn message_content_default_and_untagged() {
     // Null
     let c: MessageContent = serde_json::from_str(r#"null"#).unwrap();
     assert!(matches!(c, MessageContent::Null));
+}
+
+/// DT-CORE-73：deserialize_window_limit_vec 真正入口 —— 直接 `from_value::<Vec<WindowLimit>>`
+/// 走的是 WindowLimit 派生 impl（serde 结构体本身接受 seq/map 形式），只有挂在带
+/// `deserialize_with` 注解的字段上（如 RateLimitPlan.window_limits）才会进 helper。
+/// 同一列表内 Array/Object 两种形态可混用。
+#[test]
+fn window_limit_vec_via_annotated_field() {
+    let p: boom_limiter::RateLimitPlan = serde_json::from_str(
+        r#"{"name":"p","window_limits":[[5,100,"0.5",60],{"counts":7,"window_secs":120}]}"#,
+    )
+    .unwrap();
+    assert_eq!(p.window_limits.len(), 2);
+    assert_eq!(p.window_limits[0].counts, Some(5));
+    assert_eq!(p.window_limits[0].tokens, Some(100));
+    assert_eq!(p.window_limits[0].costs, Some(Decimal::try_from(0.5f64).unwrap()));
+    assert_eq!(p.window_limits[0].window_secs, 60);
+    assert_eq!(p.window_limits[1].counts, Some(7));
+    assert!(p.window_limits[1].tokens.is_none());
+    assert_eq!(p.window_limits[1].window_secs, 120);
+
+    // 两形态都不匹配（3 元数组）→ untagged 报错
+    let err = serde_json::from_str::<boom_limiter::RateLimitPlan>(
+        r#"{"name":"p","window_limits":[[1,2,3]]}"#,
+    );
+    assert!(err.is_err(), "3-element array matches neither Helper variant");
+}
+
+/// DT-CORE-72：lenient 反序列化的类型错误分支 —— 非数字/非字符串值报错
+/// 而不是静默吞掉（u32_lenient / u64_lenient / string_lenient 的 Err 臂）。
+#[test]
+fn lenient_deserialize_type_errors() {
+    // u32_lenient：Usage.prompt_tokens 传字符串
+    let e = serde_json::from_str::<Usage>(r#"{"prompt_tokens":"abc"}"#).unwrap_err();
+    assert!(e.to_string().contains("expected number"), "got: {e}");
+
+    // u64_lenient：ChatStreamChunk.created 传布尔
+    let e = serde_json::from_str::<boom_core::types::ChatStreamChunk>(
+        r#"{"id":"x","object":"o","created":true,"model":"m","choices":[]}"#,
+    )
+    .unwrap_err();
+    assert!(e.to_string().contains("expected number"), "got: {e}");
+
+    // string_lenient：ChatStreamChunk.id 传数字
+    let e = serde_json::from_str::<boom_core::types::ChatStreamChunk>(
+        r#"{"id":123,"object":"o","created":0,"model":"m","choices":[]}"#,
+    )
+    .unwrap_err();
+    assert!(e.to_string().contains("expected string"), "got: {e}");
+}
+
+/// DT-CORE-74：normalize_empty_tools（!2313091）—— `"tools": []` 折叠为
+/// 缺席（vLLM/Gemini 等上游拒绝空数组，协议入口在路由前归一化）；
+/// 非空数组与本来就缺席的保持不变。
+#[test]
+fn normalize_empty_tools_folds_empty_array_to_absent() {
+    let mut req: boom_core::types::ChatCompletionRequest = serde_json::from_value(
+        serde_json::json!({"model":"m","messages":[{"role":"user","content":"hi"}],"tools":[]}),
+    )
+    .unwrap();
+    assert!(req.tools.is_some(), "precondition: empty array present");
+    req.normalize_empty_tools();
+    assert!(req.tools.is_none(), "empty array folded to absent");
+
+    // 非空数组保持
+    req.tools = Some(vec![serde_json::from_value(serde_json::json!({
+        "type":"function","function":{"name":"f","parameters":{"type":"object"}}
+    })).unwrap()]);
+    req.normalize_empty_tools();
+    assert!(req.tools.as_ref().is_some_and(|t| t.len() == 1), "non-empty kept");
+
+    // 缺席保持缺席（不 panic）
+    req.tools = None;
+    req.normalize_empty_tools();
+    assert!(req.tools.is_none());
 }

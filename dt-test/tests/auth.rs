@@ -135,3 +135,22 @@ async fn lookup_key_aliases_without_db_returns_empty() {
     assert!(auth.lookup_key_aliases(&["hash-1", "hash-2"]).await.is_empty());
     assert!(auth.lookup_key_aliases(&[]).await.is_empty());
 }
+
+// ═════════════════════════════════════════════════════════════════
+// 缓存失效 — dashboard 编辑 key 后立即生效的钩子（!98）
+// ═════════════════════════════════════════════════════════════════
+
+/// DT-AU-06：invalidate_key / invalidate_all —— AdminCommand 编辑/清理 key 后
+/// 使认证缓存立即失效；无 DB、缓存无条目时是安全 no-op，不影响主密钥认证，
+/// 重复调用幂等。
+#[tokio::test]
+async fn cache_invalidate_key_and_all_safe_without_db() {
+    let auth = DbAuthenticator::new(None, Some("sk-master-1".to_string()));
+    auth.invalidate_key("1234567890abcdef1234").await;
+    auth.invalidate_all().await;
+    // 失效只清缓存条目，不波及主密钥认证
+    assert!(auth.authenticate("sk-master-1").await.is_ok());
+    // 幂等：重复失效同样安全
+    auth.invalidate_key("1234567890abcdef1234").await;
+    auth.invalidate_all().await;
+}
