@@ -5,6 +5,85 @@ use std::net::SocketAddr;
 use crate::client::parse_client_ip;
 use crate::config::{parse_addr, LbMode, RouteTimeouts};
 
+/// Nginx-style `proxy_pass` target, parsed from `scheme://ip[:port][/prefix]`.
+///
+/// Semantics follow nginx: when the URL carries a path, the route's matched
+/// path prefix is replaced by that path (`/osk1/foo` with target
+/// `http://h:52341/` becomes `/foo`); a bare authority leaves the request URI
+/// unchanged. The `Host` header is rewritten to the URL authority, and an
+/// `https` target upgrades this route only (independent of the global
+/// `upstream_tls` setting).
+#[derive(Debug, Clone)]
+pub(crate) struct ProxyPass {
+    pub(crate) addr: SocketAddr,
+    pub(crate) tls: bool,
+    /// SNI for https targets (the bare host of the URL).
+    pub(crate) sni: String,
+    /// Value for the upstream `Host` header (the URL authority as written).
+    pub(crate) host_header: String,
+    /// Path prefix from the URL; `None` means bare authority (URI unchanged).
+    pub(crate) path_prefix: Option<String>,
+}
+
+/// Parse a `proxy_pass` URL. Targets must be literal `ip[:port]` — the same
+/// rule as `backend`/`backends`: the LB does no DNS resolution, and `HttpPeer`
+/// needs a ready address. A missing port defaults to 80 (http) / 443 (https).
+pub(crate) fn parse_proxy_pass(s: &str) -> std::result::Result<ProxyPass, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("proxy_pass target must not be empty".into());
+    }
+    if s.contains(['\r', '\n']) {
+        return Err("proxy_pass target must not contain CR/LF".into());
+    }
+    let (scheme, rest) = s
+        .split_once("://")
+        .ok_or_else(|| "proxy_pass must look like http(s)://ip[:port][/path]".to_string())?;
+    let tls = match scheme.to_ascii_lowercase().as_str() {
+        "http" => false,
+        "https" => true,
+        other => {
+            return Err(format!(
+                "proxy_pass scheme must be http or https, got '{other}'"
+            ))
+        }
+    };
+    // Authority runs to the first '/'; everything after is the path prefix.
+    let (authority, path) = match rest.split_once('/') {
+        Some((a, p)) => (a, Some(format!("/{p}"))),
+        None => (rest, None),
+    };
+    if let Some(p) = &path {
+        if p.contains(['?', '#']) {
+            return Err("proxy_pass path prefix must not contain '?' or '#'".into());
+        }
+    }
+    let addr = if let Ok(a) = authority.parse::<SocketAddr>() {
+        a
+    } else {
+        // No explicit port (or bare bracketed IPv6): parse the IP and apply
+        // the scheme's default port.
+        let bare = authority
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(authority);
+        let ip = bare.parse::<std::net::IpAddr>().map_err(|_| {
+            format!(
+                "proxy_pass target must be a literal ip[:port] (DNS names are \
+                 not supported): '{authority}'"
+            )
+        })?;
+        SocketAddr::new(ip, if tls { 443 } else { 80 })
+    };
+    Ok(ProxyPass {
+        addr,
+        tls,
+        sni: if tls { addr.ip().to_string() } else { String::new() },
+        host_header: authority.to_string(),
+        path_prefix: path,
+    })
+}
+
 #[derive(Debug)]
 pub(crate) struct Route {
     pub(crate) host: Option<String>,
@@ -16,6 +95,9 @@ pub(crate) struct Route {
     pub(crate) redirect: Option<String>,
     /// Redirect status code (3xx). Defaults to 302.
     pub(crate) redirect_code: u16,
+    /// If set, requests are transparently proxied to this target (nginx
+    /// `proxy_pass` semantics) instead of using `backend`/`backends`.
+    pub(crate) proxy_pass: Option<ProxyPass>,
     pub(crate) mode: LbMode,
     /// Per-route timeout overrides (optional).
     pub(crate) timeouts: Option<RouteTimeouts>,
@@ -25,18 +107,19 @@ impl Route {
     pub(crate) fn from_raw(raw: RouteRaw) -> std::result::Result<Self, String> {
         let client_ip = raw.client_ip.as_deref().map(parse_client_ip).transpose()?;
 
-        // Exactly one of backend / backends / redirect must be set.
+        // Exactly one of backend / backends / redirect / proxy_pass must be set.
         let set_count = [
             raw.backend.is_some(),
             raw.backends.is_some(),
             raw.redirect.is_some(),
+            raw.proxy_pass.is_some(),
         ]
         .iter()
         .filter(|&&b| b)
         .count();
         if set_count != 1 {
             return Err(format!(
-                "route must set exactly one of `backend`, `backends`, `redirect` (found {set_count})"
+                "route must set exactly one of `backend`, `backends`, `redirect`, `proxy_pass` (found {set_count})"
             ));
         }
 
@@ -46,6 +129,12 @@ impl Route {
                 return Err("redirect target must not be empty".into());
             }
         }
+
+        let proxy_pass = raw
+            .proxy_pass
+            .as_deref()
+            .map(parse_proxy_pass)
+            .transpose()?;
 
         // redirect_code must be a standard 3xx redirect status when provided.
         let redirect_code = match raw.redirect_code {
@@ -70,7 +159,7 @@ impl Route {
                 }
                 (None, Some(addrs))
             }
-            // redirect-only route: neither backend nor backends.
+            // redirect-only / proxy_pass-only route: neither backend nor backends.
             (None, None) => (None, None),
             _ => unreachable!("set_count == 1 rules out both backend and backends"),
         };
@@ -83,6 +172,7 @@ impl Route {
             backends,
             redirect: raw.redirect,
             redirect_code,
+            proxy_pass,
             mode: raw.mode,
             timeouts: raw.timeouts,
         })
@@ -98,6 +188,7 @@ pub(crate) struct RouteRaw {
     pub(crate) backends: Option<Vec<String>>,
     pub(crate) redirect: Option<String>,
     pub(crate) redirect_code: Option<u16>,
+    pub(crate) proxy_pass: Option<String>,
     #[serde(default)]
     pub(crate) mode: LbMode,
     pub(crate) timeouts: Option<RouteTimeouts>,
@@ -230,5 +321,66 @@ mod tests {
         // Bare IPv6 (what `Uri::host()` yields) is left untouched.
         assert_eq!(strip_port("::1"), "::1");
         assert_eq!(strip_port("[2001:db8::1]"), "[2001:db8::1]");
+    }
+
+    #[test]
+    fn parse_proxy_pass_http_target_with_port_and_path() {
+        let t = parse_proxy_pass("http://7.150.1.218:52341/").unwrap();
+        assert_eq!(t.addr, "7.150.1.218:52341".parse().unwrap());
+        assert!(!t.tls);
+        assert_eq!(t.host_header, "7.150.1.218:52341");
+        assert_eq!(t.path_prefix.as_deref(), Some("/"));
+        assert!(t.sni.is_empty(), "SNI unused for http targets");
+
+        let t = parse_proxy_pass("http://10.0.0.4:90/api/v2").unwrap();
+        assert_eq!(t.addr, "10.0.0.4:90".parse().unwrap());
+        assert_eq!(t.path_prefix.as_deref(), Some("/api/v2"));
+    }
+
+    #[test]
+    fn parse_proxy_pass_bare_authority_means_uri_unchanged() {
+        let t = parse_proxy_pass("http://10.0.0.1:8080").unwrap();
+        assert!(t.path_prefix.is_none(), "no URL path => URI forwarded as-is");
+        assert_eq!(t.addr, "10.0.0.1:8080".parse().unwrap());
+    }
+
+    #[test]
+    fn parse_proxy_pass_https_defaults_port_and_sets_sni() {
+        let t = parse_proxy_pass("https://10.0.0.2").unwrap();
+        assert_eq!(t.addr, "10.0.0.2:443".parse().unwrap());
+        assert!(t.tls);
+        assert_eq!(t.sni, "10.0.0.2");
+        assert_eq!(t.host_header, "10.0.0.2");
+
+        // Scheme is case-insensitive; http without a port defaults to 80.
+        let t = parse_proxy_pass("HTTP://10.0.0.3").unwrap();
+        assert_eq!(t.addr, "10.0.0.3:80".parse().unwrap());
+        assert!(!t.tls);
+    }
+
+    #[test]
+    fn parse_proxy_pass_ipv6_forms() {
+        let t = parse_proxy_pass("http://[::1]:8080/x").unwrap();
+        assert_eq!(t.addr, "[::1]:8080".parse().unwrap());
+        assert_eq!(t.host_header, "[::1]:8080");
+        assert_eq!(t.path_prefix.as_deref(), Some("/x"));
+
+        // Bracketed IPv6 without a port gets the scheme default.
+        let t = parse_proxy_pass("http://[::1]").unwrap();
+        assert_eq!(t.addr, "[::1]:80".parse().unwrap());
+    }
+
+    #[test]
+    fn parse_proxy_pass_rejects_bad_targets() {
+        assert!(parse_proxy_pass("").is_err());
+        assert!(parse_proxy_pass("   ").is_err());
+        assert!(parse_proxy_pass("7.150.1.218:52341").is_err(), "no scheme");
+        assert!(parse_proxy_pass("ftp://1.2.3.4").is_err(), "scheme must be http(s)");
+        assert!(
+            parse_proxy_pass("http://example.com/").is_err(),
+            "DNS names unsupported (same rule as backend)"
+        );
+        assert!(parse_proxy_pass("http://1.2.3.4/\rX-Inject: 1").is_err(), "CR/LF rejected");
+        assert!(parse_proxy_pass("http://1.2.3.4:80/?a=1").is_err(), "query in target rejected");
     }
 }

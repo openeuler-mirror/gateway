@@ -19,7 +19,7 @@ use crate::client::effective_client_ip;
 use crate::config::{AccessLogConfig, Config, LbMode, UpstreamTimeouts};
 use crate::logging::{complete_line, dispatch_line, generate_request_id, redirect_line};
 use crate::metrics::Metrics;
-use crate::routes::request_host;
+use crate::routes::{request_host, ProxyPass};
 use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, Watcher};
 
 fn extract_api_key(
@@ -98,6 +98,12 @@ pub struct RoutingCtx {
     /// The backend chosen by the most recent `upstream_peer()` call, so a 5xx
     /// retry can exclude it from the next pick.
     last_backend: Option<SocketAddr>,
+    /// Nginx-style proxy_pass target for this request (per-route upstream
+    /// override); drives `upstream_peer` and the path/Host rewrite.
+    proxy_pass: Option<ProxyPass>,
+    /// The matched route's path rule, used to strip the prefix when the
+    /// proxy_pass URL carries its own path.
+    route_path: Option<String>,
 }
 
 impl Default for RoutingCtx {
@@ -114,6 +120,8 @@ impl Default for RoutingCtx {
             forwarded_proto: None,
             retry5xx_left: None,
             last_backend: None,
+            proxy_pass: None,
+            route_path: None,
         }
     }
 }
@@ -144,6 +152,25 @@ struct RouteCtx {
 /// internally too; this is an explicit second layer.
 fn smuggling_ambiguous(version: &http::Version, has_cl: bool, has_te: bool) -> bool {
     has_te && (has_cl || *version != http::Version::HTTP_11)
+}
+
+/// Nginx `proxy_pass` path rewrite: replace the matched route prefix of the
+/// request path with the target's path prefix. `pattern` is the route's path
+/// rule (trailing slashes normalized away, the same rule `path_matches`
+/// applies) and `target` the path part of the proxy_pass URL. The query string
+/// is handled by the caller (it is not part of the path).
+pub(crate) fn rewrite_proxy_path(req_path: &str, pattern: &str, target: &str) -> String {
+    let matched = pattern.trim_end_matches('/');
+    let rest = if matched.is_empty() {
+        req_path
+    } else {
+        req_path.strip_prefix(matched).unwrap_or(req_path)
+    };
+    let mut rewritten = format!("{}{}", target.trim_end_matches('/'), rest);
+    if rewritten.is_empty() {
+        rewritten.push('/');
+    }
+    rewritten
 }
 
 /// Log the dispatch line and remember the backend for the completion line in
@@ -311,8 +338,9 @@ impl ProxyHttp for Gateway {
             }
 
             match snap.config.resolve_route(host, path, client_ip) {
-                Some((idx, route)) => match &route.redirect {
-                    Some(location) => {
+                Some((idx, route)) => {
+                    // Redirect routes are answered by the LB itself with a 3xx.
+                    if let Some(location) = &route.redirect {
                         let code = route.redirect_code;
                         self.metrics.redirects_total.fetch_add(1, Ordering::Relaxed);
                         if snap
@@ -327,45 +355,19 @@ impl ProxyHttp for Gateway {
                         session.write_response_header(Box::new(resp), true).await?;
                         return Ok(true);
                     }
-                    None => {
-                        self.metrics.proxied_total.fetch_add(1, Ordering::Relaxed);
-                        // Affinity key is only needed for active-active rings.
-                        let key = match route.mode {
-                            LbMode::ActiveActive => extract_api_key(
-                                header
-                                    .headers
-                                    .get("authorization")
-                                    .and_then(|v| v.to_str().ok()),
-                                header
-                                    .headers
-                                    .get("x-api-key")
-                                    .and_then(|v| v.to_str().ok()),
-                                client_ip,
-                            ),
-                            LbMode::ActiveStandby => String::new(),
-                        };
-                        let addr = match &route.backends {
-                            Some(list) => match route.mode {
-                                LbMode::ActiveStandby => pick_primary(list, &unhealthy, &[]),
-                                LbMode::ActiveActive => pick_active_active(
-                                    idx,
-                                    list,
-                                    &snap.rings,
-                                    &key,
-                                    &unhealthy,
-                                    &[],
-                                ),
-                            },
-                            None => route
-                                .backend
-                                .expect("single-backend route must have backend"),
-                        };
-                        let route_ctx = route.backends.as_ref().map(|list| RouteCtx {
-                            idx: Some(idx),
-                            mode: route.mode,
-                            backends: Arc::new(list.clone()),
-                            key,
-                        });
+                    self.metrics.proxied_total.fetch_add(1, Ordering::Relaxed);
+                    // proxy_pass routes target their own upstream (nginx
+                    // semantics): remember the target here; `upstream_peer`
+                    // builds the peer with per-route TLS and
+                    // `upstream_request_filter` rewrites path + Host. Retries
+                    // always target it again — there is nowhere to fail over.
+                    if let Some(target) = &route.proxy_pass {
+                        ctx.proxy_pass = Some(target.clone());
+                        ctx.route_path = route.path.clone();
+                        ctx.backend = Some(target.addr);
+                        ctx.timeouts = route
+                            .timeouts
+                            .map_or(snap.config.timeouts, |rt| rt.merge(snap.config.timeouts));
                         log_dispatch(
                             &snap.config.access_log,
                             ctx,
@@ -373,16 +375,64 @@ impl ProxyHttp for Gateway {
                             host,
                             path,
                             client_ip,
-                            addr,
+                            target.addr,
                         );
-                        ctx.backend = Some(addr);
-                        ctx.route = route_ctx;
-                        ctx.timeouts = route
-                            .timeouts
-                            .map_or(snap.config.timeouts, |rt| rt.merge(snap.config.timeouts));
                         return Ok(false);
                     }
-                },
+                    // Regular backend route: pick via the configured mode.
+                    // Affinity key is only needed for active-active rings.
+                    let key = match route.mode {
+                        LbMode::ActiveActive => extract_api_key(
+                            header
+                                .headers
+                                .get("authorization")
+                                .and_then(|v| v.to_str().ok()),
+                            header
+                                .headers
+                                .get("x-api-key")
+                                .and_then(|v| v.to_str().ok()),
+                            client_ip,
+                        ),
+                        LbMode::ActiveStandby => String::new(),
+                    };
+                    let addr = match &route.backends {
+                        Some(list) => match route.mode {
+                            LbMode::ActiveStandby => pick_primary(list, &unhealthy, &[]),
+                            LbMode::ActiveActive => pick_active_active(
+                                idx,
+                                list,
+                                &snap.rings,
+                                &key,
+                                &unhealthy,
+                                &[],
+                            ),
+                        },
+                        None => route
+                            .backend
+                            .expect("single-backend route must have backend"),
+                    };
+                    let route_ctx = route.backends.as_ref().map(|list| RouteCtx {
+                        idx: Some(idx),
+                        mode: route.mode,
+                        backends: Arc::new(list.clone()),
+                        key,
+                    });
+                    log_dispatch(
+                        &snap.config.access_log,
+                        ctx,
+                        method,
+                        host,
+                        path,
+                        client_ip,
+                        addr,
+                    );
+                    ctx.backend = Some(addr);
+                    ctx.route = route_ctx;
+                    ctx.timeouts = route
+                        .timeouts
+                        .map_or(snap.config.timeouts, |rt| rt.merge(snap.config.timeouts));
+                    Ok(false)
+                }
                 None => {
                     self.metrics.proxied_total.fetch_add(1, Ordering::Relaxed);
                     let addr = pick_primary(&snap.config.default_backends, &unhealthy, &[]);
@@ -416,6 +466,24 @@ impl ProxyHttp for Gateway {
         _session: &mut Session,
         ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
+        // proxy_pass routes have a fixed upstream with per-route TLS taken
+        // from the URL scheme (https => TLS + SNI, independent of the global
+        // `upstream_tls` setting).
+        if let Some(target) = &ctx.proxy_pass {
+            let mut peer = HttpPeer::new(target.addr, target.tls, target.sni.clone());
+            if target.tls {
+                // Verify https targets, mirroring upstream_tls.verify=true.
+                peer.options.verify_cert = true;
+                peer.options.verify_hostname = true;
+            }
+            peer.options.connection_timeout = Some(ctx.timeouts.connect);
+            peer.options.total_connection_timeout = Some(ctx.timeouts.total_connect);
+            peer.options.read_timeout = Some(ctx.timeouts.read);
+            peer.options.idle_timeout = Some(ctx.timeouts.idle);
+            ctx.last_backend = Some(target.addr);
+            return Ok(Box::new(peer));
+        }
+
         // Normal path: reuse the route resolved once in `request_filter`.
         // Retry path (`attempted` non-empty): re-pick a backend that has not
         // been tried yet for this request, so pingora's retries actually
@@ -537,6 +605,34 @@ impl ProxyHttp for Gateway {
         upstream_request: &mut pingora_http::RequestHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
+        // Nginx-style proxy_pass rewrite: when the target URL carries a path,
+        // the route's matched path prefix is replaced by it; the Host header
+        // always points at the target authority. A bare-authority URL leaves
+        // the request URI untouched.
+        if let Some(target) = &ctx.proxy_pass {
+            if let Some(prefix) = &target.path_prefix {
+                let pq = upstream_request
+                    .uri
+                    .path_and_query()
+                    .map(|v| v.as_str().to_owned())
+                    .unwrap_or_default();
+                let (path, query) = match pq.split_once('?') {
+                    Some((p, q)) => (p.to_owned(), Some(q.to_owned())),
+                    None => (pq, None),
+                };
+                let pattern = ctx.route_path.as_deref().unwrap_or("");
+                let mut rewritten = rewrite_proxy_path(&path, pattern, prefix);
+                if let Some(q) = query {
+                    rewritten.push('?');
+                    rewritten.push_str(&q);
+                }
+                if let Ok(uri) = http::Uri::builder().path_and_query(rewritten.as_str()).build() {
+                    upstream_request.set_uri(uri);
+                }
+            }
+            let _ = upstream_request.insert_header("Host", &target.host_header);
+        }
+
         // X-Real-IP carries the effective client (trusted-proxy resolved).
         let real_ip = ctx
             .client_ip
@@ -912,5 +1008,24 @@ mod tests {
         // HTTP/2 with TE fails closed (spec forbids TE there anyway).
         assert!(smuggling_ambiguous(&Version::HTTP_2, false, true));
         assert!(!smuggling_ambiguous(&Version::HTTP_2, false, false));
+    }
+
+    #[test]
+    fn proxy_pass_path_rewrite_nginx_semantics() {
+        // Target with a path: the matched route prefix is replaced by it.
+        assert_eq!(rewrite_proxy_path("/osk1/foo", "/osk1", "/"), "/foo");
+        assert_eq!(rewrite_proxy_path("/osk1", "/osk1", "/"), "/");
+        assert_eq!(rewrite_proxy_path("/osk1/", "/osk1", "/"), "/");
+        assert_eq!(rewrite_proxy_path("/osk1/deep/x", "/osk1", "/"), "/deep/x");
+        assert_eq!(rewrite_proxy_path("/osk1/x", "/osk1", "/api/"), "/api/x");
+        assert_eq!(rewrite_proxy_path("/osk1/x", "/osk1", "/api"), "/api/x");
+        // Trailing slash on the route pattern is normalized away.
+        assert_eq!(rewrite_proxy_path("/osk1/x", "/osk1/", "/"), "/x");
+        // Root/absent pattern: the whole path lands under the target prefix.
+        assert_eq!(rewrite_proxy_path("/foo", "", "/api"), "/api/foo");
+        assert_eq!(rewrite_proxy_path("/foo", "/", "/api"), "/api/foo");
+        // A path that did not match the pattern is never partially stripped
+        // (defensive: resolve_route guarantees the prefix matched).
+        assert_eq!(rewrite_proxy_path("/other/x", "/osk1", "/"), "/other/x");
     }
 }
