@@ -122,3 +122,18 @@ routes:
     redirect_code: 301        # 永久重定向
   - path: "/legacy/"
     redirect: "https://new.example.com/"
+  # proxy_pass 路由（nginx 语义）：命中后不返回 3xx，而是把请求透明转发到目标。
+  # 目标必须是字面 ip[:port]（与 backend 一致，LB 不做 DNS 解析；缺省端口
+  # http→80 / https→443）。URL 带路径时，路由匹配到的路径前缀被替换为该路径
+  # （/osk1/foo -> 目标 /foo），不带路径则请求 URI 原样透传；Host 头改写为
+  # 目标 authority；https 目标仅对该路由启用 TLS（默认校验证书；自签/IP 证书
+  # 可加 proxy_ssl_verify: false 关闭，此时不发送 SNI，等同 curl -k）。
+  # proxy_pass 与 backend/backends/redirect 互斥，timeouts 等其余字段通用。
+  - host: "aigateway.example.com"
+    path: "/osk1"
+    proxy_pass: "http://10.0.0.30:52341/"
+  # https 自签上游示例：
+  # - host: "aigateway.example.com"
+  #   path: "/osk2"
+  #   proxy_pass: "https://10.0.0.31:52342/"
+  #   proxy_ssl_verify: false        # 接受自签/IP 证书（默认 true 校验）

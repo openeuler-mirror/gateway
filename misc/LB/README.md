@@ -97,7 +97,7 @@ CONFIG_PATH=/path/to/routes.yaml ./target/release/gateway-lb
 
 ### 路由表 `routes`
 
-每条路由必须且只能设置 `backend` / `backends` / `redirect` 之一:
+每条路由必须且只能设置 `backend` / `backends` / `redirect` / `proxy_pass` 之一:
 
 ```yaml
 routes:
@@ -118,7 +118,22 @@ routes:
   - host: "old.example.com"
     redirect: "https://new.example.com/"
     redirect_code: 301                 # 可选:301/302/303/307/308,默认 302
+  - host: "aigateway.example.com"      # nginx 式透明转发(不回 3xx)
+    path: "/osk1"
+    proxy_pass: "http://10.0.0.30:52341/"
+  - host: "aigateway.example.com"      # https 自签上游:可选关闭证书校验
+    path: "/osk2"
+    proxy_pass: "https://10.0.0.31:52342/"
+    proxy_ssl_verify: false            # 默认 true;false 接受自签/IP 证书
 ```
+
+`proxy_pass` 语义与 nginx 对齐:目标是字面 `ip[:port]`(与 `backend` 一致,不做
+DNS 解析,缺省端口 http→80 / https→443);URL 带路径时路由匹配的路径前缀被替换
+为该路径(`/osk1/foo` → 目标 `/foo`,query 保留),不带路径则请求 URI 原样透传;
+`Host` 头改写为目标 authority;`https` 目标仅对该路由启用上游 TLS(独立于全局
+`upstream_tls`,默认校验证书与主机名)。上游是自签/IP 证书时加
+`proxy_ssl_verify: false`(仅对 `https://` 目标合法):关闭校验且不发送 SNI,
+行为等同 `curl -k` 直连 IP。
 
 匹配顺序为首条命中生效;没有匹配的路由时使用 `default_backends`。多后端路由的
 API Key 亲和取自 `Authorization: Bearer`、`X-API-Key` 或客户端 IP(按此优先级)。

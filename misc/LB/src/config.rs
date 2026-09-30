@@ -777,6 +777,78 @@ routes:
     }
 
     #[test]
+    fn config_parses_proxy_pass_route() {
+        let yaml = r#"
+default_backend: "127.0.0.1:8080"
+routes:
+  - host: "aigateway.example.com"
+    path: "/osk1"
+    proxy_pass: "http://7.150.1.218:52341/"
+  - path: "/mirror"
+    proxy_pass: "https://10.0.0.2"
+"#;
+        let cfg = Config::from_str(yaml).unwrap();
+        let t = cfg.routes[0].proxy_pass.as_ref().unwrap();
+        assert_eq!(t.addr, "7.150.1.218:52341".parse().unwrap());
+        assert!(!t.tls);
+        assert_eq!(t.host_header, "7.150.1.218:52341");
+        assert_eq!(t.path_prefix.as_deref(), Some("/"));
+        assert!(
+            cfg.routes[0].backend.is_none()
+                && cfg.routes[0].backends.is_none()
+                && cfg.routes[0].redirect.is_none()
+        );
+        let t2 = cfg.routes[1].proxy_pass.as_ref().unwrap();
+        assert!(t2.tls);
+        assert_eq!(t2.addr, "10.0.0.2:443".parse().unwrap());
+        assert!(t2.verify, "https targets verify by default");
+        // resolve_route returns a proxy_pass route like any other.
+        let (_, route) = cfg
+            .resolve_route("aigateway.example.com", "/osk1/foo", None)
+            .unwrap();
+        assert!(route.proxy_pass.is_some());
+    }
+
+    #[test]
+    fn config_proxy_ssl_verify_opt_out() {
+        let yaml = r#"
+default_backend: "127.0.0.1:8080"
+routes:
+  - host: "aigateway.example.com"
+    path: "/osk1"
+    proxy_pass: "https://7.150.1.218:52341/"
+    proxy_ssl_verify: false
+"#;
+        let cfg = Config::from_str(yaml).unwrap();
+        let t = cfg.routes[0].proxy_pass.as_ref().unwrap();
+        assert!(t.tls);
+        assert!(!t.verify, "proxy_ssl_verify: false accepted");
+        assert!(t.sni.is_empty(), "opt-out clears SNI (no SNI + no verify)");
+
+        // The knob only makes sense for https targets.
+        let http_target = "default_backend: \"127.0.0.1:80\"\nroutes:\n  - host: a\n    proxy_pass: \"http://1.2.3.4:80/\"\n    proxy_ssl_verify: false\n";
+        assert!(
+            Config::from_str(http_target).is_err(),
+            "proxy_ssl_verify on an http target is rejected"
+        );
+    }
+
+    #[test]
+    fn config_proxy_pass_mutually_exclusive_with_other_actions() {
+        let with_backend = "default_backend: \"127.0.0.1:80\"\nroutes:\n  - host: a\n    backend: \"1.1.1.1:80\"\n    proxy_pass: \"http://2.2.2.2:80\"\n";
+        let with_redirect =
+            "default_backend: \"127.0.0.1:80\"\nroutes:\n  - host: a\n    redirect: \"https://x\"\n    proxy_pass: \"http://2.2.2.2:80\"\n";
+        let bad_target =
+            "default_backend: \"127.0.0.1:80\"\nroutes:\n  - host: a\n    proxy_pass: \"http://example.com/\"\n";
+        let empty_target =
+            "default_backend: \"127.0.0.1:80\"\nroutes:\n  - host: a\n    proxy_pass: \"\"\n";
+        assert!(Config::from_str(with_backend).is_err());
+        assert!(Config::from_str(with_redirect).is_err());
+        assert!(Config::from_str(bad_target).is_err(), "DNS target rejected");
+        assert!(Config::from_str(empty_target).is_err());
+    }
+
+    #[test]
     fn parse_addr_accepts_valid_and_rejects_invalid() {
         assert_eq!(
             parse_addr("127.0.0.1:8080").unwrap(),

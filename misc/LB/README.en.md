@@ -115,7 +115,8 @@ See [config.yaml](config.yaml) for a fully commented example. Top-level keys:
 
 ### Route table `routes`
 
-Each route must set exactly one of `backend` / `backends` / `redirect`:
+Each route must set exactly one of `backend` / `backends` / `redirect` /
+`proxy_pass`:
 
 ```yaml
 routes:
@@ -136,11 +137,29 @@ routes:
   - host: "old.example.com"
     redirect: "https://new.example.com/"
     redirect_code: 301                 # optional: 301/302/303/307/308, default 302
+  - host: "aigateway.example.com"      # nginx-style transparent forward (no 3xx)
+    path: "/osk1"
+    proxy_pass: "http://10.0.0.30:52341/"
+  - host: "aigateway.example.com"      # self-signed https upstream: optional verify opt-out
+    path: "/osk2"
+    proxy_pass: "https://10.0.0.31:52342/"
+    proxy_ssl_verify: false            # default true; false accepts self-signed/IP certs
 ```
 
 The first matching route wins; unmatched requests use `default_backends`. For
 multi-backend routes, the API-key affinity key is taken from `Authorization: Bearer`,
 `X-API-Key`, or the client IP, in that order.
+
+`proxy_pass` follows nginx semantics: the target must be a literal `ip[:port]`
+(the same rule as `backend` — no DNS resolution; the default port is 80 for http
+and 443 for https). When the URL carries a path, the route's matched path prefix
+is replaced by it (`/osk1/foo` → `/foo` on the target, query preserved); a bare
+authority forwards the request URI unchanged. The `Host` header is rewritten to
+the target authority, and an `https` target enables upstream TLS for that route
+only (independent of the global `upstream_tls`; certificates verified by
+default). For self-signed or IP certificates, set `proxy_ssl_verify: false`
+(only valid for `https://` targets): verification is skipped and no SNI is
+sent — equivalent to `curl -k` against an IP literal.
 
 ## Built-in endpoints
 
