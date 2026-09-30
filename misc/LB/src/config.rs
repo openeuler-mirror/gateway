@@ -801,11 +801,36 @@ routes:
         let t2 = cfg.routes[1].proxy_pass.as_ref().unwrap();
         assert!(t2.tls);
         assert_eq!(t2.addr, "10.0.0.2:443".parse().unwrap());
+        assert!(t2.verify, "https targets verify by default");
         // resolve_route returns a proxy_pass route like any other.
         let (_, route) = cfg
             .resolve_route("aigateway.example.com", "/osk1/foo", None)
             .unwrap();
         assert!(route.proxy_pass.is_some());
+    }
+
+    #[test]
+    fn config_proxy_ssl_verify_opt_out() {
+        let yaml = r#"
+default_backend: "127.0.0.1:8080"
+routes:
+  - host: "aigateway.example.com"
+    path: "/osk1"
+    proxy_pass: "https://7.150.1.218:52341/"
+    proxy_ssl_verify: false
+"#;
+        let cfg = Config::from_str(yaml).unwrap();
+        let t = cfg.routes[0].proxy_pass.as_ref().unwrap();
+        assert!(t.tls);
+        assert!(!t.verify, "proxy_ssl_verify: false accepted");
+        assert!(t.sni.is_empty(), "opt-out clears SNI (no SNI + no verify)");
+
+        // The knob only makes sense for https targets.
+        let http_target = "default_backend: \"127.0.0.1:80\"\nroutes:\n  - host: a\n    proxy_pass: \"http://1.2.3.4:80/\"\n    proxy_ssl_verify: false\n";
+        assert!(
+            Config::from_str(http_target).is_err(),
+            "proxy_ssl_verify on an http target is rejected"
+        );
     }
 
     #[test]

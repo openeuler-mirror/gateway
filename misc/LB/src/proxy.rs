@@ -468,11 +468,12 @@ impl ProxyHttp for Gateway {
     ) -> Result<Box<HttpPeer>> {
         // proxy_pass routes have a fixed upstream with per-route TLS taken
         // from the URL scheme (https => TLS + SNI, independent of the global
-        // `upstream_tls` setting).
+        // `upstream_tls` setting). Verification follows `proxy_ssl_verify`
+        // (default on); with it off, `target.sni` is empty, which also makes
+        // pingora skip verification entirely (curl -k equivalent).
         if let Some(target) = &ctx.proxy_pass {
             let mut peer = HttpPeer::new(target.addr, target.tls, target.sni.clone());
-            if target.tls {
-                // Verify https targets, mirroring upstream_tls.verify=true.
+            if target.tls && target.verify {
                 peer.options.verify_cert = true;
                 peer.options.verify_hostname = true;
             }

@@ -140,6 +140,10 @@ routes:
   - host: "aigateway.example.com"      # nginx-style transparent forward (no 3xx)
     path: "/osk1"
     proxy_pass: "http://10.0.0.30:52341/"
+  - host: "aigateway.example.com"      # self-signed https upstream: optional verify opt-out
+    path: "/osk2"
+    proxy_pass: "https://10.0.0.31:52342/"
+    proxy_ssl_verify: false            # default true; false accepts self-signed/IP certs
 ```
 
 The first matching route wins; unmatched requests use `default_backends`. For
@@ -152,7 +156,10 @@ and 443 for https). When the URL carries a path, the route's matched path prefix
 is replaced by it (`/osk1/foo` → `/foo` on the target, query preserved); a bare
 authority forwards the request URI unchanged. The `Host` header is rewritten to
 the target authority, and an `https` target enables upstream TLS for that route
-only (independent of the global `upstream_tls`; certificates verified).
+only (independent of the global `upstream_tls`; certificates verified by
+default). For self-signed or IP certificates, set `proxy_ssl_verify: false`
+(only valid for `https://` targets): verification is skipped and no SNI is
+sent — equivalent to `curl -k` against an IP literal.
 
 ## Built-in endpoints
 

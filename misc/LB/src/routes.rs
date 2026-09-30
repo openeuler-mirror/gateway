@@ -17,12 +17,18 @@ use crate::config::{parse_addr, LbMode, RouteTimeouts};
 pub(crate) struct ProxyPass {
     pub(crate) addr: SocketAddr,
     pub(crate) tls: bool,
-    /// SNI for https targets (the bare host of the URL).
+    /// SNI for https targets (the bare host of the URL). Empty when
+    /// `proxy_ssl_verify: false` — mirrors `curl -k` to an IP literal (no SNI;
+    /// RFC 6066 forbids IPs in SNI anyway) and makes pingora skip verification.
     pub(crate) sni: String,
     /// Value for the upstream `Host` header (the URL authority as written).
     pub(crate) host_header: String,
     /// Path prefix from the URL; `None` means bare authority (URI unchanged).
     pub(crate) path_prefix: Option<String>,
+    /// Verify the upstream certificate chain and hostname (https targets
+    /// only). Default true; `proxy_ssl_verify: false` accepts self-signed
+    /// and IP certificates.
+    pub(crate) verify: bool,
 }
 
 /// Parse a `proxy_pass` URL. Targets must be literal `ip[:port]` — the same
@@ -81,6 +87,7 @@ pub(crate) fn parse_proxy_pass(s: &str) -> std::result::Result<ProxyPass, String
         sni: if tls { addr.ip().to_string() } else { String::new() },
         host_header: authority.to_string(),
         path_prefix: path,
+        verify: true,
     })
 }
 
@@ -130,11 +137,24 @@ impl Route {
             }
         }
 
-        let proxy_pass = raw
+        let mut proxy_pass = raw
             .proxy_pass
             .as_deref()
             .map(parse_proxy_pass)
             .transpose()?;
+        // TLS verification opt-out for https targets (self-signed / IP certs).
+        // When disabled, SNI is cleared too: pingora skips verification on an
+        // empty SNI, and no SNI matches what `curl -k` sends to an IP literal.
+        if let Some(pp) = proxy_pass.as_mut() {
+            let verify = raw.proxy_ssl_verify.unwrap_or(true);
+            if raw.proxy_ssl_verify.is_some() && !pp.tls {
+                return Err("`proxy_ssl_verify` only applies to `https://` proxy_pass targets".into());
+            }
+            pp.verify = verify;
+            if pp.tls && !verify {
+                pp.sni = String::new();
+            }
+        }
 
         // redirect_code must be a standard 3xx redirect status when provided.
         let redirect_code = match raw.redirect_code {
@@ -189,6 +209,9 @@ pub(crate) struct RouteRaw {
     pub(crate) redirect: Option<String>,
     pub(crate) redirect_code: Option<u16>,
     pub(crate) proxy_pass: Option<String>,
+    /// Opt out of upstream TLS verification for `https://` proxy_pass targets
+    /// (self-signed / IP certificates). Default: verify.
+    pub(crate) proxy_ssl_verify: Option<bool>,
     #[serde(default)]
     pub(crate) mode: LbMode,
     pub(crate) timeouts: Option<RouteTimeouts>,
@@ -356,6 +379,54 @@ mod tests {
         let t = parse_proxy_pass("HTTP://10.0.0.3").unwrap();
         assert_eq!(t.addr, "10.0.0.3:80".parse().unwrap());
         assert!(!t.tls);
+    }
+
+    #[test]
+    fn proxy_ssl_verify_default_on_opt_out_clears_sni() {
+        fn raw_route(target: &str, verify: Option<bool>) -> RouteRaw {
+            RouteRaw {
+                host: Some("a.com".into()),
+                path: Some("/osk1".into()),
+                client_ip: None,
+                backend: None,
+                backends: None,
+                redirect: None,
+                redirect_code: None,
+                proxy_pass: Some(target.to_string()),
+                proxy_ssl_verify: verify,
+                mode: LbMode::default(),
+                timeouts: None,
+            }
+        }
+        // Default: https targets verify, SNI = target IP.
+        let pp = Route::from_raw(raw_route("https://7.150.1.218:52341/", None))
+            .unwrap()
+            .proxy_pass
+            .unwrap();
+        assert!(pp.verify, "verification defaults to on");
+        assert_eq!(pp.sni, "7.150.1.218");
+        // Explicit verify: true behaves the same.
+        let pp = Route::from_raw(raw_route("https://7.150.1.218:52341/", Some(true)))
+            .unwrap()
+            .proxy_pass
+            .unwrap();
+        assert!(pp.verify);
+        assert_eq!(pp.sni, "7.150.1.218");
+
+        // Opt-out: no verification, and SNI cleared — an empty SNI makes
+        // pingora send no SNI and skip verification (curl -k to an IP).
+        let pp = Route::from_raw(raw_route("https://7.150.1.218:52341/", Some(false)))
+            .unwrap()
+            .proxy_pass
+            .unwrap();
+        assert!(!pp.verify);
+        assert!(pp.sni.is_empty());
+
+        // proxy_ssl_verify on a plain-http target is a config mistake.
+        assert!(
+            Route::from_raw(raw_route("http://1.2.3.4:80/", Some(false))).is_err(),
+            "proxy_ssl_verify only applies to https targets"
+        );
     }
 
     #[test]
