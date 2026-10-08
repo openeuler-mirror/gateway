@@ -45,11 +45,10 @@ pub struct StressmonSample {
 pub struct StressmonSnapshot {
     pub num_workers: usize,
     pub samples: Vec<StressmonSample>,
-    /// Cumulative count of samples where process CPU exceeded
-    /// `num_workers × 80%` (the equivalent of the worker pool running at
-    /// 80% saturation). Lifetime of the process, survives range switches
-    /// (it's a counter, not a windowed value).
-    pub cpu_over_80_count: u64,
+    /// Seconds since the gateway process started. Same `started_at` origin
+    /// as `/health`'s `uptime_secs` (AppStateInner.health.started_at);
+    /// survives hot reloads and range switches.
+    pub uptime_secs: u64,
 }
 
 #[async_trait]

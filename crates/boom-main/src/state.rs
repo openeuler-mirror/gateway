@@ -335,7 +335,12 @@ impl AppState {
                 .await;
         }
 
-        let inner = Self::build_inner(config, &db_pool, chrono::Utc::now(), 0)?;
+        // Process start time — single origin shared by `/health`'s uptime_secs
+        // and the stressmon snapshot, so both tick in lockstep. The reload
+        // path (build_inner at the reload call site) passes `old_started_at`
+        // to preserve this origin across hot reloads.
+        let started_at = chrono::Utc::now();
+        let inner = Self::build_inner(config, &db_pool, started_at, 0)?;
 
         // Single shared Arc<ArcSwap> for kv_index — AppState and
         // KvcOrchestrator MUST observe the same swap. reload() stores a fresh
@@ -351,11 +356,13 @@ impl AppState {
         // runtime (we're already inside `runtime.block_on`), then cached on
         // the collector so the dashboard snapshot doesn't need the runtime
         // handle. The 1 Hz sampler task is spawned from main.rs::async_main.
+        // `started_at` is the same origin as health.started_at above, so the
+        // dashboard's uptime matches `/health`.
         let num_workers = tokio::runtime::Handle::current()
             .metrics()
             .num_workers()
             .max(1);
-        let stressmon = boom_stressmon::StressmonCollector::new(num_workers);
+        let stressmon = boom_stressmon::StressmonCollector::new(num_workers, started_at);
 
         let state = Self {
             config_path,

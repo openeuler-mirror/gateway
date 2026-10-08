@@ -477,6 +477,13 @@
   // 1Hz sample lands in its own second on the X axis.
   let stressTimer = null;
   let stressLastSampleTs = 0;
+  // Last uptime pulled by renderStress — kept so a language switch can
+  // re-format immediately instead of waiting for the next 1.5s poll.
+  let stressUptimeSecs = 0;
+  document.addEventListener("languagechange", () => {
+    const el = document.getElementById("stress-uptime-value");
+    if (el) el.textContent = formatUptime(stressUptimeSecs);
+  });
 
   function startStressPoll() {
     stopStressPoll();
@@ -658,8 +665,9 @@
     const latest = samples.length > 0 ? samples[samples.length - 1] : null;
     if (latest) stressLastSampleTs = latest.ts;
 
-    const cpuOver80El = document.getElementById("stress-info-cpu-over-80");
-    if (cpuOver80El) cpuOver80El.textContent = String(snap.cpu_over_80_count || 0);
+    stressUptimeSecs = snap.uptime_secs || 0;
+    const uptimeEl = document.getElementById("stress-uptime-value");
+    if (uptimeEl) uptimeEl.textContent = formatUptime(stressUptimeSecs);
 
     // CPU = process-level (utime+stime), not normalized. May go far past
     // num_workers × 100 because tokio's blocking pool runs threads outside
@@ -735,6 +743,23 @@
       formatValue: (v) => String(v),
       formatY: (v) => String(Math.round(v)),
     });
+  }
+
+  // Process uptime → "0天 1小时 30分钟 15秒" (zh) / "0d 1h 30m 15s" (en).
+  // All four units are always shown — fixed width means the 1.5s poll
+  // refresh never makes the value jump around. Deliberately NOT named
+  // `formatDuration`: a same-name declaration would hoist over the plan
+  // window formatter further below and silently win (that's how
+  // "1.5166666min" ended up on screen once).
+  function formatUptime(secs) {
+    const d = Math.floor(secs / 86400);
+    const h = Math.floor((secs % 86400) / 3600);
+    const m = Math.floor((secs % 3600) / 60);
+    const s = Math.floor(secs % 60);
+    if ((window.__i18n && window.__i18n.currentLang()) === "en") {
+      return d + "d " + h + "h " + m + "m " + s + "s";
+    }
+    return d + "天 " + h + "小时 " + m + "分钟 " + s + "秒";
   }
 
   // Bytes → "1.23 GiB" / "456 MiB". compact=true → short form for Y axis.
@@ -5057,7 +5082,6 @@
         tooltip.innerHTML = [
           ["stress.info.worker_queue", "stress.info.help.worker_queue"],
           ["stress.info.blocking_pool", "stress.info.help.blocking_pool"],
-          ["stress.info.cpu_over_80", "stress.info.help.cpu_over_80"],
           ["stress.info.sample_rate", "stress.info.help.sample_rate"],
         ]
           .map(
