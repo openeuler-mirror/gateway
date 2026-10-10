@@ -8,4 +8,5 @@ boom-core = { path = "../boom-core" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
+chrono = { workspace = true }
 async-trait = { workspace = true }

@@ -12,7 +12,6 @@
 
 use boom_core::{StressmonApi, StressmonSample, StressmonSnapshot};
 use async_trait::async_trait;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// 60 minutes × 1 Hz. Fixed cap → bounded memory (~140 KB worst case).
@@ -77,32 +76,26 @@ impl RingBuffer {
 pub struct StressmonCollector {
     samples: Mutex<RingBuffer>,
     num_workers: usize,
-    /// Lifetime counter of samples whose normalized CPU exceeds 80%.
-    /// Compared here (not in the sampler) so the rule stays with the data.
-    cpu_over_80_count: AtomicU64,
+    /// Process start time, passed in from boom-main (the same origin as
+    /// `AppStateInner.health.started_at`, which survives hot reloads) so the
+    /// dashboard's uptime stays consistent with `/health`'s `uptime_secs`.
+    started_at: chrono::DateTime<chrono::Utc>,
 }
 
 impl StressmonCollector {
-    pub fn new(num_workers: usize) -> Arc<Self> {
+    pub fn new(
+        num_workers: usize,
+        started_at: chrono::DateTime<chrono::Utc>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             samples: Mutex::new(RingBuffer::new()),
             num_workers,
-            cpu_over_80_count: AtomicU64::new(0),
+            started_at,
         })
     }
 
     /// Push one sample. Called from boom-main's sampler task at 1 Hz.
-    /// Also bumps the lifetime CPU-over-80% counter when this sample
-    /// crosses the worker-pool-80% threshold. `cpu_pct` is process-level
-    /// (not normalized), so "80% of the worker pool saturated" maps to the
-    /// absolute value `num_workers × 80`. Above that, the worker pool is
-    /// likely the bottleneck even though the process may also be spending
-    /// CPU in the blocking pool.
     pub fn record_sample(&self, sample: StressmonSample) {
-        let threshold = (self.num_workers as f32) * 80.0;
-        if sample.cpu_pct > threshold {
-            self.cpu_over_80_count.fetch_add(1, Ordering::Relaxed);
-        }
         if let Ok(mut buf) = self.samples.lock() {
             buf.push(sample);
         }
@@ -124,10 +117,14 @@ impl StressmonCollector {
 impl StressmonApi for StressmonCollector {
     async fn timeseries(&self, window_secs: i64) -> StressmonSnapshot {
         let samples = self.snapshot(window_secs);
+        let uptime_secs = chrono::Utc::now()
+            .signed_duration_since(self.started_at)
+            .num_seconds()
+            .max(0) as u64;
         StressmonSnapshot {
             num_workers: self.num_workers,
             samples,
-            cpu_over_80_count: self.cpu_over_80_count.load(Ordering::Relaxed),
+            uptime_secs,
         }
     }
 }
@@ -149,13 +146,13 @@ mod tests {
 
     #[test]
     fn empty_returns_empty() {
-        let c = StressmonCollector::new(4);
+        let c = StressmonCollector::new(4, chrono::Utc::now());
         assert!(c.snapshot(60).is_empty());
     }
 
     #[test]
     fn returns_recent_in_chronological_order() {
-        let c = StressmonCollector::new(4);
+        let c = StressmonCollector::new(4, chrono::Utc::now());
         for t in 1..=10 {
             c.record_sample(sample(t));
         }
@@ -168,7 +165,7 @@ mod tests {
 
     #[test]
     fn window_clamps_to_available() {
-        let c = StressmonCollector::new(4);
+        let c = StressmonCollector::new(4, chrono::Utc::now());
         for t in 1..=5 {
             c.record_sample(sample(t));
         }
@@ -180,7 +177,7 @@ mod tests {
 
     #[test]
     fn wraps_and_overwrites_oldest() {
-        let c = StressmonCollector::new(4);
+        let c = StressmonCollector::new(4, chrono::Utc::now());
         // Fill to capacity + 1.
         for t in 1..=CAPACITY + 1 {
             c.record_sample(sample(t as i64));
@@ -195,7 +192,7 @@ mod tests {
 
     #[test]
     fn window_clamps_to_capacity() {
-        let c = StressmonCollector::new(4);
+        let c = StressmonCollector::new(4, chrono::Utc::now());
         for t in 1..=10 {
             c.record_sample(sample(t));
         }
@@ -203,5 +200,21 @@ mod tests {
         // samples are populated.
         let out = c.snapshot(10000);
         assert_eq!(out.len(), 10);
+    }
+
+    #[tokio::test]
+    async fn uptime_counts_from_started_at() {
+        // Started 1h ago → uptime should be ~3600s (allow scheduling slack,
+        // but bounded above so a wildly wrong origin fails).
+        let started = chrono::Utc::now() - chrono::Duration::seconds(3600);
+        let c = StressmonCollector::new(4, started);
+        let snap = c.timeseries(60).await;
+        assert!(snap.uptime_secs >= 3600 && snap.uptime_secs <= 3610);
+
+        // Future origin (clock skew) must not panic — clamps to 0.
+        let future = chrono::Utc::now() + chrono::Duration::seconds(300);
+        let c = StressmonCollector::new(4, future);
+        let snap = c.timeseries(60).await;
+        assert_eq!(snap.uptime_secs, 0);
     }
 }

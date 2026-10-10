@@ -3121,6 +3121,30 @@ input[list] {
 
 
 /* ── System Pressure Page ─────────────────────────────────────────── */
+.stress-uptime {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 12px 16px;
+  margin-top: 8px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.stress-uptime__label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text3);
+  white-space: nowrap;
+}
+.stress-uptime__value {
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--text);
+  letter-spacing: .2px;
+  /* Fixed-width digits — the 1.5s poll refresh never makes the value jump. */
+  font-variant-numeric: tabular-nums;
+}
 .stress-info-bar {
   position: relative;
   display: flex;
