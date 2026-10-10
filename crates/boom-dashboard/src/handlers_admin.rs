@@ -3196,6 +3196,185 @@ pub async fn get_rebalance_moves(
 }
 
 // ═══════════════════════════════════════════════════════════
+// KVC Scheduler Stats (global counters, process lifetime)
+// ═══════════════════════════════════════════════════════════
+
+pub async fn get_kvc_scheduler_stats(
+    _session: AdminSession,
+    Extension(state): Extension<Arc<DashboardState>>,
+) -> Response {
+    // Snapshot serializes with field names total/affinity/cold/lowest_load/
+    // rebalance. Invariant: total == affinity + cold + lowest_load + rebalance
+    // (single-candidate short-circuits make no decision and are not counted).
+    Json(json!(state.kvc_stats.snapshot())).into_response()
+}
+
+// ═══════════════════════════════════════════════════════════
+// KVC Hit Calibration (predicted trie hit vs actual cached_tokens)
+// ═══════════════════════════════════════════════════════════
+
+/// One cell of the 10×10 joint distribution: requests whose predicted
+/// (trie) hit ratio fell into `pred_bin` and actual (backend cached_tokens)
+/// ratio into `actual_bin`. Bins are deciles — bin 0 = [0%,10%), bin 9 =
+/// [90%,100%].
+#[derive(Debug, sqlx::FromRow)]
+struct KvcCalibCell {
+    pred_bin: i32,
+    actual_bin: i32,
+    n: i64,
+}
+
+/// Exact aggregates over the same population as the grid. Ratios are kept as
+/// raw sums so the frontend gets precise averages (bin midpoints would lose
+/// precision). over/under use the ±10pt threshold on the exact per-request
+/// ratios; diag (|diff| ≤ 10pt) = n − over − under.
+#[derive(Debug, sqlx::FromRow)]
+struct KvcCalibAgg {
+    n: i64,
+    sum_pred_hit: Option<i64>,
+    sum_pred_input: Option<i64>,
+    sum_actual_hit: Option<i64>,
+    sum_actual_input: Option<i64>,
+    over_n: Option<i64>,
+    under_n: Option<i64>,
+}
+
+/// Count of kvc-decision requests excluded from the calibration (no usable
+/// backend token numbers — no response, or the backend reported no usage).
+/// Surfaced as a footnote so "n" is never silently smaller than expected.
+#[derive(Debug, sqlx::FromRow)]
+struct KvcCalibExcluded {
+    excluded: i64,
+}
+
+pub async fn get_kvc_calibration(
+    _session: AdminSession,
+    Extension(state): Extension<Arc<DashboardState>>,
+    Query(q): Query<StatsRangeQuery>,
+) -> Response {
+    let parsed = match ResolvedRange::parse(&q) {
+        Ok(p) => p,
+        Err(e) => return Json(json!({"error": e})).into_response(),
+    };
+    // Calibration is a DB aggregation — the 1h in-memory shortcut does not
+    // apply (logs live in boom_request_log only).
+    let window = parsed.resolved.to_window();
+    let pool = match &state.db_pool {
+        Some(p) => p,
+        None => return Json(json!({"error": "Database not available"})).into_response(),
+    };
+    let from = window.from;
+    let to = window.to;
+
+    let res = async {
+        let mut tx = begin_with_timeout(pool).await?;
+
+        // Joint 10×10 grid. kv_input_blocks > 0 selects exactly the requests
+        // where the kvc policy made a real decision with at least one prefix
+        // block (degraded/short-prefix requests have 0 and carry no
+        // comparable prediction).
+        let cells = sqlx::query_as::<_, KvcCalibCell>(
+            r#"SELECT
+                 LEAST(FLOOR(kv_hit_blocks::float * 10 / kv_input_blocks), 9)::int AS pred_bin,
+                 LEAST(FLOOR(cached_tokens::float * 10 / input_tokens), 9)::int AS actual_bin,
+                 COUNT(*)::bigint AS n
+               FROM boom_request_log
+               WHERE created_at >= $1 AND created_at < $2
+                 AND kv_input_blocks > 0
+                 AND input_tokens > 0
+                 AND cached_tokens IS NOT NULL
+               GROUP BY 1, 2"#,
+        )
+        .bind(from)
+        .bind(to)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        let agg = sqlx::query_as::<_, KvcCalibAgg>(
+            r#"SELECT
+                 COUNT(*)::bigint AS n,
+                 SUM(kv_hit_blocks)::bigint AS sum_pred_hit,
+                 SUM(kv_input_blocks)::bigint AS sum_pred_input,
+                 SUM(cached_tokens)::bigint AS sum_actual_hit,
+                 SUM(input_tokens)::bigint AS sum_actual_input,
+                 SUM(CASE WHEN kv_hit_blocks::float / kv_input_blocks
+                            - cached_tokens::float / input_tokens > 0.10
+                          THEN 1 ELSE 0 END)::bigint AS over_n,
+                 SUM(CASE WHEN cached_tokens::float / input_tokens
+                            - kv_hit_blocks::float / kv_input_blocks > 0.10
+                          THEN 1 ELSE 0 END)::bigint AS under_n
+               FROM boom_request_log
+               WHERE created_at >= $1 AND created_at < $2
+                 AND kv_input_blocks > 0
+                 AND input_tokens > 0
+                 AND cached_tokens IS NOT NULL"#,
+        )
+        .bind(from)
+        .bind(to)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        let excluded = sqlx::query_as::<_, KvcCalibExcluded>(
+            r#"SELECT COUNT(*)::bigint AS excluded
+               FROM boom_request_log
+               WHERE created_at >= $1 AND created_at < $2
+                 AND kv_input_blocks > 0
+                 AND (input_tokens IS NULL OR input_tokens = 0 OR cached_tokens IS NULL)"#,
+        )
+        .bind(from)
+        .bind(to)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok::<_, sqlx::Error>((cells, agg, excluded))
+    }
+    .await;
+
+    let (cells, agg, excluded) = match res {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("Failed to query kvc calibration: {}", e);
+            return Json(json!({"error": e.to_string()})).into_response();
+        }
+    };
+
+    let n = agg.n.max(0) as u64;
+    let avg_pred = if agg.sum_pred_input.unwrap_or(0) > 0 {
+        agg.sum_pred_hit.unwrap_or(0) as f64 / agg.sum_pred_input.unwrap() as f64
+    } else {
+        0.0
+    };
+    let avg_actual = if agg.sum_actual_input.unwrap_or(0) > 0 {
+        agg.sum_actual_hit.unwrap_or(0) as f64 / agg.sum_actual_input.unwrap() as f64
+    } else {
+        0.0
+    };
+    let over = agg.over_n.unwrap_or(0).max(0) as u64;
+    let under = agg.under_n.unwrap_or(0).max(0) as u64;
+    let diag = n.saturating_sub(over).saturating_sub(under);
+
+    Json(json!({
+        "window": window_json(&window),
+        "grid": cells.iter().map(|c| json!({
+            "pred_bin": c.pred_bin,
+            "actual_bin": c.actual_bin,
+            "n": c.n,
+        })).collect::<Vec<_>>(),
+        "summary": {
+            "n": n,
+            "avg_pred_ratio": avg_pred,
+            "avg_actual_ratio": avg_actual,
+            "over_n": over,
+            "under_n": under,
+            "diag_n": diag,
+        },
+        "excluded": excluded.excluded.max(0) as u64,
+    }))
+    .into_response()
+}
+
+// ═══════════════════════════════════════════════════════════
 // Audit Log Drop Counter (channel full or batch INSERT failures)
 // ═══════════════════════════════════════════════════════════
 

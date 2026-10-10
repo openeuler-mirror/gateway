@@ -159,6 +159,16 @@ pub fn build_router<S: Clone + Send + Sync + 'static>(state: DashboardState) -> 
             "/dashboard/api/admin/stats/rebalance-moves",
             get(handlers_admin::get_rebalance_moves),
         )
+        // Admin — KVC Scheduler Stats (global counters, process lifetime).
+        .route(
+            "/dashboard/api/admin/stats/kvc-scheduler",
+            get(handlers_admin::get_kvc_scheduler_stats),
+        )
+        // Admin — KVC Hit Calibration (predicted trie hit vs actual cached_tokens).
+        .route(
+            "/dashboard/api/admin/stats/kvc-calibration",
+            get(handlers_admin::get_kvc_calibration),
+        )
         // Admin — Audit Log Drop Counter (channel full / batch failures).
         .route(
             "/dashboard/api/admin/stats/audit-log",

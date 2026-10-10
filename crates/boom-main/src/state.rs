@@ -7,7 +7,7 @@ use boom_kvindex::{TokenPrefixIndex};
 use boom_core::kv_event::KvIndexBackend;
 use boom_limiter::{PlanStore, RateLimitPlan, ScheduleSlot, SlidingWindowLimiter};
 use boom_flowcontrol::{FlowControlConfig, FlowController};
-use boom_routing::{register_fusion_providers, AliasStore, DeploymentStore, FusionRuntime, AutoRouter, InFlightTracker, KeyAffinityPolicy, MlServiceClient, RebalanceMoveTracker, RequestRateTracker, Router, RoundRobinPolicy, SchedulePolicy, ShufflePolicy, StrategyRegistry, TierClassifier, VisibilityState, parse_allowed_teams, visibility_from_db};
+use boom_routing::{register_fusion_providers, AliasStore, DeploymentStore, FusionRuntime, AutoRouter, InFlightTracker, KeyAffinityPolicy, KvcSchedulerStats, MlServiceClient, RebalanceMoveTracker, RequestRateTracker, Router, RoundRobinPolicy, SchedulePolicy, ShufflePolicy, StrategyRegistry, TierClassifier, VisibilityState, parse_allowed_teams, visibility_from_db};
 use boom_ctxaware::AgentStatsTracker;
 use boom_promptlog::PromptLogWriter;
 use boom_provider;
@@ -75,6 +75,10 @@ pub struct AppState {
     pub prompt_log_query: Arc<dyn boom_promptlog::PromptLogQueryApi>,
     /// Per-deployment rebalance move tracker (in/out counts, survives reloads).
     pub rebalance_move_tracker: Arc<RebalanceMoveTracker>,
+    /// Global kvc_aware scheduling counters — total / affinity / cold /
+    /// lowest-load fallback / rebalance (debug page; survives reloads).
+    /// The policy is recreated on every reload, so the counters must live here.
+    pub kvc_stats: Arc<KvcSchedulerStats>,
     /// Per-deployment request rate tracker (survives reloads).
     pub request_rate: Arc<RequestRateTracker>,
     /// Agent (client-type) statistics tracker (survives reloads).
@@ -237,6 +241,9 @@ impl AppState {
 
         // Rebalance move tracker survives across reloads (lifetime cumulative).
         let rebalance_move_tracker = Arc::new(RebalanceMoveTracker::new());
+        // Global kvc scheduling counters survive across reloads (the policy is
+        // recreated on every reload — per-policy counters would reset).
+        let kvc_stats = Arc::new(KvcSchedulerStats::new());
         let request_rate = Arc::new(RequestRateTracker::new());
         let agent_stats = Arc::new(AgentStatsTracker::new());
 
@@ -247,7 +254,7 @@ impl AppState {
         let kv_index_val = Self::build_kvc_subsystems(&config);
 
         // Create scheduling policy from config (may reference inflight, rebalance_move_tracker, kv_index).
-        let policy = create_policy(&config, &inflight, &flow_controller, &rebalance_move_tracker, &kv_index_val);
+        let policy = create_policy(&config, &inflight, &flow_controller, &rebalance_move_tracker, &kvc_stats, &kv_index_val);
 
         // Build auto router classifier (optional, content-based model routing).
         let auto_classifier = build_auto_router(&config);
@@ -385,6 +392,7 @@ impl AppState {
             prompt_log_writer,
             prompt_log_query,
             rebalance_move_tracker,
+            kvc_stats,
             request_rate,
             agent_stats,
             kv_index,
@@ -564,11 +572,14 @@ impl AppState {
 
         // Recreate policy (fresh counters etc.) — router reuses same stores.
         // Policy reads the (possibly just-swapped) kv_index via the ArcSwap.
+        // kvc_stats is NOT recreated — it is AppState-owned so the global
+        // counters survive this reload.
         let new_policy = create_policy(
             &new_config,
             &self.inflight,
             &self.flow_controller,
             &self.rebalance_move_tracker,
+            &self.kvc_stats,
             &**self.kv_index.load(),
         );
         self.router.set_policy(new_policy);
@@ -1768,6 +1779,7 @@ fn create_policy(
     inflight: &Arc<InFlightTracker>,
     flow_controller: &Arc<FlowController>,
     rebalance_move_tracker: &Arc<RebalanceMoveTracker>,
+    kvc_stats: &Arc<KvcSchedulerStats>,
     kv_index: &Option<Arc<dyn KvIndexBackend>>,
 ) -> Arc<dyn SchedulePolicy> {
     match config.router_settings.schedule_policy.as_str() {
@@ -1806,6 +1818,7 @@ fn create_policy(
                 kv,
                 inflight.clone(),
                 Some(rebalance_move_tracker.clone()),
+                Some(kvc_stats.clone()),
             );
             policy.set_queue_info(flow_controller.clone());
             // Pure-affinity scoring (hit_ratio); the router-level

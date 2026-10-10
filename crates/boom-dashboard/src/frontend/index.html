@@ -266,16 +266,11 @@
               <button class="debug-subtab active" data-subtab="overview" data-i18n="debug.subtab.overview">Overview</button>
               <button class="debug-subtab" data-subtab="anomalies" data-i18n="debug.subtab.anomalies">Anomalies</button>
               <button class="debug-subtab" data-subtab="trace" data-i18n="debug.subtab.trace">OTEL Trace</button>
+              <button class="debug-subtab" data-subtab="kvc" data-i18n="debug.subtab.kvc">KVC AWARE</button>
             </div>
 
-            <!-- Overview pane: original debug content -->
+            <!-- Overview pane: audit writer + agent stats -->
             <div class="debug-pane active" data-pane="overview">
-              <div class="section-header" style="margin-top:1.5rem">
-                <h2 data-i18n="debug.rebalance_moves.title">Rebalance Moves (per deployment)</h2>
-                <span style="font-size:.85em;color:var(--text3)" data-i18n="debug.rebalance_moves.subtitle">Process lifetime cumulative</span>
-              </div>
-              <div id="rebalance-moves-wrap"><p class="loading" data-i18n="common.loading">Loading...</p></div>
-
               <div class="section-header" style="margin-top:1.5rem">
                 <h2 data-i18n="debug.audit_log.title">Audit Log Writer</h2>
                 <span style="font-size:.85em;color:var(--text3)" data-i18n="debug.audit_log.subtitle">Drop counter — process lifetime cumulative</span>
@@ -299,12 +294,6 @@
                 </div>
               </div>
               <div id="agent-stats-wrap"><p class="loading" data-i18n="common.loading">Loading...</p></div>
-
-              <div class="section-header" style="margin-top:2rem">
-                <h2>KVC DFX (per-request, latest 50)</h2>
-                <button class="btn-small" id="btn-reset-kvc-filters" data-i18n="logs.reset_filters">Reset Filters</button>
-              </div>
-              <div id="kvc-dfx-wrap"><p class="muted">Compile with --features boom-dashboard/debug-tools to enable.</p></div>
             </div>
 
             <!-- Anomalies pane: IQR-based outlier scan, manual refresh -->
@@ -373,6 +362,45 @@
                 <button class="btn-small" id="btn-trace-refresh" data-i18n="action.refresh">Refresh</button>
               </div>
               <div id="trace-recent-wrap"><p class="muted" data-i18n="debug.trace.empty">No spans.</p></div>
+            </div>
+
+            <!-- KVC AWARE pane: scheduler stats + rebalance moves + hit calibration + per-request DFX -->
+            <div class="debug-pane" data-pane="kvc">
+              <div class="section-header" style="margin-top:1.5rem">
+                <h2 data-i18n="debug.kvc_stats.title">KVC Scheduler Stats (global)</h2>
+                <span style="font-size:.85em;color:var(--text3)" data-i18n="debug.kvc_stats.subtitle">Process lifetime cumulative</span>
+              </div>
+              <div id="kvc-stats-wrap"><p class="loading" data-i18n="common.loading">Loading...</p></div>
+
+              <div class="section-header" style="margin-top:1.5rem">
+                <h2 data-i18n="debug.rebalance_moves.title">Rebalance Moves (per deployment)</h2>
+                <span style="font-size:.85em;color:var(--text3)" data-i18n="debug.rebalance_moves.subtitle">Process lifetime cumulative</span>
+              </div>
+              <div id="rebalance-moves-wrap"><p class="loading" data-i18n="common.loading">Loading...</p></div>
+
+              <div class="section-header" style="margin-top:1.5rem">
+                <h2 data-i18n="debug.calib.title">KVC Hit Calibration</h2>
+                <div class="range-controls" data-target="kvc">
+                  <button class="btn-range active" data-range="1h">1h</button>
+                  <button class="btn-range" data-range="4h">4h</button>
+                  <button class="btn-range" data-range="8h">8h</button>
+                  <button class="btn-range" data-range="24h">24h</button>
+                  <button class="btn-range" data-range="custom" data-i18n="range.custom">Custom</button>
+                  <span class="range-custom hidden">
+                    <input type="datetime-local" class="range-from">
+                    <input type="datetime-local" class="range-to">
+                    <button class="btn-tiny range-apply" data-i18n="action.apply">Apply</button>
+                  </span>
+                  <span class="range-note hidden"></span>
+                </div>
+              </div>
+              <div id="kvc-calib-wrap"><p class="loading" data-i18n="common.loading">Loading...</p></div>
+
+              <div class="section-header" style="margin-top:1.5rem">
+                <h2>KVC DFX (per-request, latest 50)</h2>
+                <button class="btn-small" id="btn-reset-kvc-filters" data-i18n="logs.reset_filters">Reset Filters</button>
+              </div>
+              <div id="kvc-dfx-wrap"><p class="muted">Compile with --features boom-dashboard/debug-tools to enable.</p></div>
             </div>
           </section>
 

@@ -153,6 +153,10 @@
       // Re-render visible dynamic content so t() picks up the new language.
       onRoute();
       onUserRoute();
+      // KVC AWARE pane blocks render their own labels via t() — reload
+      // them if the pane is visible so they aren't stuck in the old language.
+      const activePane = document.querySelector(".debug-pane.active");
+      if (activePane && activePane.dataset.pane === "kvc") loadKvcAwarePane();
       // User sidebar title is dynamic (key alias), not in the i18n dict —
       // re-apply after applyI18n() so it isn't stuck on the default label.
       applyUserSidebarTitle();
@@ -443,7 +447,14 @@
     else if (section === "admin-keys") { setupKeysSearch(); loadKeys(); }
     else if (section === "admin-quota") loadQuota();
     else if (section === "admin-logs") { setupLogsFilters(); loadLogs(); }
-    else if (section === "admin-debug") { setupDebugSubtabs(); setupAnomalyControls(); setupTracePane(); loadAgentStats(); loadRebalanceMoves(); loadKvcDfx(); loadAuditLogStats(); }
+    else if (section === "admin-debug") {
+      setupDebugSubtabs(); setupAnomalyControls(); setupTracePane();
+      loadAgentStats(); loadAuditLogStats();
+      // KVC AWARE pane content loads on pane entry; the active pane
+      // persists across section re-entries, so refresh it if visible.
+      const activePane = document.querySelector(".debug-pane.active");
+      if (activePane && activePane.dataset.pane === "kvc") loadKvcAwarePane();
+    }
     else if (section === "admin-config") loadConfigPage();
   }
 
@@ -1156,6 +1167,7 @@
   const rangeState = {
     agent: { range: "1h", from: null, to: null },
     rate:  { range: "1h", from: null, to: null },
+    kvc:   { range: "1h", from: null, to: null },
   };
 
   function buildStatsUrl(base, target) {
@@ -1201,6 +1213,7 @@
     });
     rangeState[target] = { range, from: null, to: null };
     if (target === "agent") loadAgentStats();
+    else if (target === "kvc") loadKvcCalibration();
     else loadRequestRateStats();
   }
 
@@ -1227,7 +1240,9 @@
     controls.querySelectorAll(".btn-range").forEach((b) => {
       b.classList.toggle("active", b.dataset.range === "custom");
     });
-    if (target === "agent") loadAgentStats(); else loadRequestRateStats();
+    if (target === "agent") loadAgentStats();
+    else if (target === "kvc") loadKvcCalibration();
+    else loadRequestRateStats();
   }
 
   function toLocalDatetimeLocal(d) {
@@ -1371,6 +1386,190 @@
     wrap.innerHTML = html || ("<p>" + t("common.no_records") + "</p>");
   }
 
+  // ── KVC Scheduler Stats (global counters, lifetime cumulative) ──
+  async function loadKvcStats() {
+    try {
+      const data = await api("/admin/stats/kvc-scheduler");
+      renderKvcStats(data || {});
+    } catch (err) {
+      console.error("loadKvcStats error:", err);
+    }
+  }
+
+  function renderKvcStats(data) {
+    const wrap = document.getElementById("kvc-stats-wrap");
+    if (!wrap) return;
+    const total = Number(data.total || 0);
+    const affinity = Number(data.affinity || 0);
+    const cold = Number(data.cold || 0);
+    const lowest = Number(data.lowest_load || 0);
+    const rebalance = Number(data.rebalance || 0);
+    if (!total) {
+      wrap.innerHTML = '<p class="muted">' + t("debug.kvc_stats.no_data") + '</p>';
+      return;
+    }
+    const fallback = cold + lowest;
+    const cell = (label, val, cls) =>
+      '<div class="kcs-cell' + (cls ? " " + cls : "") + '">' +
+        '<div class="kcs-value">' + val.toLocaleString() + '</div>' +
+        '<div class="kcs-label">' + esc(label) + '</div>' +
+      '</div>';
+    wrap.innerHTML =
+      '<div class="kcs-grid">' +
+        cell(t("debug.kvc_stats.total"), total) +
+        cell(t("debug.kvc_stats.fallback"), fallback, "kcs-warn") +
+        cell(t("debug.kvc_stats.rebalance"), rebalance, "kcs-warn") +
+      '</div>' +
+      '<p class="kcs-breakdown">' + t("debug.kvc_stats.breakdown", {
+        affinity: affinity.toLocaleString(),
+        cold: cold.toLocaleString(),
+        lowest: lowest.toLocaleString(),
+        fallback: fallback.toLocaleString(),
+      }) + '</p>';
+  }
+
+  // ── KVC Hit Calibration (predicted trie hit vs actual cached_tokens) ──
+  // Loads every block on the KVC AWARE pane. Called on pane entry and
+  // on language re-render while the pane is visible; nothing is polled.
+  function loadKvcAwarePane() {
+    loadKvcStats();
+    loadRebalanceMoves();
+    loadKvcCalibration();
+    loadKvcDfx();
+  }
+
+  async function loadKvcCalibration() {
+    const wrap = document.getElementById("kvc-calib-wrap");
+    if (!wrap) return; // pane not rendered
+    wrap.innerHTML = '<p class="loading">' + t("common.loading") + '</p>';
+    try {
+      const data = await api(buildStatsUrl("/admin/stats/kvc-calibration", "kvc"));
+      renderKvcCalibration(data || {});
+    } catch (err) {
+      console.error("loadKvcCalibration error:", err);
+    }
+  }
+
+  function renderKvcCalibration(data) {
+    const wrap = document.getElementById("kvc-calib-wrap");
+    if (!wrap) return;
+    const summary = data.summary || {};
+    const n = Number(summary.n || 0);
+    setRangeWindowNote("kvc", data.window && data.window.from, data.window && data.window.to);
+    if (!n) {
+      wrap.innerHTML = '<p class="muted">' + t("debug.calib.no_data") + '</p>';
+      return;
+    }
+
+    const predRatio = Number(summary.avg_pred_ratio || 0);
+    const actualRatio = Number(summary.avg_actual_ratio || 0);
+    const delta = actualRatio - predRatio;
+    const overN = Number(summary.over_n || 0);
+    const underN = Number(summary.under_n || 0);
+    const diagN = Number(summary.diag_n || 0);
+    const excluded = Number(data.excluded || 0);
+    const pct = (x) => (x * 100).toFixed(1) + "%";
+
+    const card = (label, value, hint, cls) =>
+      '<div class="agent-summary-card">' +
+        '<div class="agent-summary-label">' + esc(label) + '</div>' +
+        '<div class="agent-summary-value' + (cls ? " " + cls : "") + '">' + value + '</div>' +
+        (hint ? '<div class="calib-card-hint">' + hint + '</div>' : '') +
+      '</div>';
+    const deltaPt = (delta >= 0 ? "+" : "") + (delta * 100).toFixed(1) + "pt";
+    const deltaCls = Math.abs(delta) <= 0.10 ? "calib-ok" : "calib-warn";
+    const summaryHtml =
+      '<div class="agent-summary">' +
+        card(t("debug.calib.requests"), n.toLocaleString(),
+             excluded ? t("debug.calib.excluded_hint", { n: excluded.toLocaleString() }) : "") +
+        card(t("debug.calib.pred_avg"), pct(predRatio)) +
+        card(t("debug.calib.actual_avg"), pct(actualRatio)) +
+        card(t("debug.calib.delta"), deltaPt, null, deltaCls) +
+        card(t("debug.calib.in_band"), pct(diagN / n)) +
+        card(t("debug.calib.over_under"), pct(overN / n) + " / " + pct(underN / n)) +
+      '</div>';
+
+    // Joint grid → heatmap. x = pred_bin, y = actual_bin (top = high actual).
+    const grid = data.grid || [];
+    const cellN = new Map(); // key: actual_bin*10 + pred_bin
+    let maxN = 0;
+    const predMarg = new Array(10).fill(0);
+    const actualMarg = new Array(10).fill(0);
+    grid.forEach((c) => {
+      const cnt = Number(c.n || 0);
+      if (!cnt) return;
+      const pb = Math.min(9, Math.max(0, Number(c.pred_bin)));
+      const ab = Math.min(9, Math.max(0, Number(c.actual_bin)));
+      cellN.set(ab * 10 + pb, (cellN.get(ab * 10 + pb) || 0) + cnt);
+      predMarg[pb] += cnt;
+      actualMarg[ab] += cnt;
+      if (cnt > maxN) maxN = cnt;
+    });
+
+    const binLabel = (b) => (b < 9 ? b * 10 + "–" + (b * 10 + 10) + "%" : "90%+");
+    const heatCells = [];
+    for (let ab = 9; ab >= 0; ab--) {
+      const yLabel = '<div class="calib-ylabel">' + ab * 10 + "%" + '</div>';
+      const rowCells = [];
+      for (let pb = 0; pb < 10; pb++) {
+        const cnt = cellN.get(ab * 10 + pb) || 0;
+        let style = "";
+        let cls = "calib-cell";
+        if (cnt > 0) {
+          const alpha = 0.08 + 0.92 * (Math.log(1 + cnt) / Math.log(1 + maxN));
+          style = ' style="background:rgba(56,132,255,' + alpha.toFixed(3) + ')"';
+        }
+        if (ab === pb) cls += " calib-diag";
+        rowCells.push('<div class="' + cls + '"' + style +
+          ' title="pred ' + binLabel(pb) + ' × actual ' + binLabel(ab) + ': ' +
+          cnt.toLocaleString() + '"></div>');
+      }
+      heatCells.push(yLabel + rowCells.join(""));
+    }
+    heatCells.push('<div class="calib-corner"></div>');
+    for (let pb = 0; pb < 10; pb++) {
+      heatCells.push('<div class="calib-xlabel">' + pb * 10 + (pb === 9 ? "%+" : "%") + '</div>');
+    }
+    const heatHtml =
+      '<div class="section-header" style="margin-top:1.5rem"><h3 data-i18n="debug.calib.heat_title">' +
+      esc(t("debug.calib.heat_title")) + '</h3></div>' +
+      '<p class="calib-hint">' + esc(t("debug.calib.heat_hint")) + '</p>' +
+      '<div class="calib-heat">' + heatCells.join("") + '</div>' +
+      '<div class="calib-axis-note"><span>' + esc(t("debug.calib.y_axis")) +
+      ' ↑</span><span>' + esc(t("debug.calib.x_axis")) + ' →</span></div>';
+
+    // Marginals → paired histogram (share of requests per 10% bin).
+    const maxMarg = Math.max(1, ...predMarg, ...actualMarg);
+    const histPairs = predMarg.map((p, i) => {
+      const a = actualMarg[i];
+      const pPct = (p / maxMarg) * 100;
+      const aPct = (a / maxMarg) * 100;
+      return '<div class="calib-hist-pair" title="' + esc(t("debug.calib.legend_pred")) + ' ' + binLabel(i) + ': ' +
+        p.toLocaleString() + ' (' + pct(p / n) + ') / ' + esc(t("debug.calib.legend_actual")) + ': ' +
+        a.toLocaleString() + ' (' + pct(a / n) + ')">' +
+        '<div class="calib-bar calib-bar-pred" style="height:' + Math.max(pPct, p > 0 ? 1.5 : 0) + '%"></div>' +
+        '<div class="calib-bar calib-bar-actual" style="height:' + Math.max(aPct, a > 0 ? 1.5 : 0) + '%"></div>' +
+      '</div>';
+    }).join("");
+    const histXlabels = predMarg.map((p, i) =>
+      '<div class="calib-xlabel">' + i * 10 + (i === 9 ? "%+" : "%") + '</div>'
+    ).join("");
+    const histHtml =
+      '<div class="section-header" style="margin-top:1.5rem"><h3 data-i18n="debug.calib.hist_title">' +
+      esc(t("debug.calib.hist_title")) + '</h3></div>' +
+      '<p class="calib-hint">' + esc(t("debug.calib.hist_hint")) + '</p>' +
+      '<div class="calib-hist-plot">' + histPairs + '</div>' +
+      '<div class="calib-hist-xlabels">' + histXlabels + '</div>' +
+      '<div class="calib-legend">' +
+        '<span class="calib-swatch calib-swatch-pred"></span>' + esc(t("debug.calib.legend_pred")) +
+        '<span class="calib-swatch calib-swatch-actual"></span>' + esc(t("debug.calib.legend_actual")) +
+      '</div>';
+
+    wrap.innerHTML =
+      summaryHtml + heatHtml + histHtml +
+      '<p class="calib-caveat">' + esc(t("debug.calib.caveat")) + '</p>';
+  }
+
   // ── Rebalance Moves (per deployment, lifetime cumulative) ──
   async function loadRebalanceMoves() {
     try {
@@ -1465,9 +1664,11 @@
         });
         // Start the trace poll only while the trace pane is visible —
         // avoids unnecessary background requests when the user is on
-        // Overview / Anomalies.
+        // Overview / Anomalies. The KVC AWARE pane loads on entry;
+        // nothing there is polled.
         if (target === "trace") startTracePanePoll();
         else stopTracePanePoll();
+        if (target === "kvc") loadKvcAwarePane();
       });
     });
   }
