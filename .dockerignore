@@ -1,0 +1,12 @@
+# 构建上下文裁剪：只排除与容器构建无关的重物。
+# 注意：crates/、dt-test/（workspace member）、Cargo.lock、.cargo/config.toml
+# （tokio_unstable rustflag）必须留在上下文里，cargo 要加载整个 workspace 清单。
+target/
+.git/
+.github/
+docs/
+test/
+testcase/
+misc/
+hook/
+*.md
