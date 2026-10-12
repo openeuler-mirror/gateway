@@ -1,0 +1,21 @@
+# 最小冒烟测试配置：只验证 health 端点 + 崩溃/挂死自愈。
+# 正式使用请参照仓库根的 config.example.yaml 重写。
+#
+# 特意不配 database_url（DB 可选，/health/ready 在未配 DB 时返回 200）。
+# 兜底模型 "*" 的 api_base 指向本机 discard 端口：路由链路可用，
+# 真发请求会立刻连接失败 —— 测试环境无外网依赖、不产生真实上游调用。
+model_list:
+  - model_name: "*"
+    litellm_params:
+      model: openai/gpt-4o
+      api_key: sk-dummy-not-a-real-key
+      api_base: http://127.0.0.1:9/v1
+
+general_settings:
+  # 测试用 master key，health 端点无需鉴权，LLM 端点用它。
+  master_key: sk-master-test
+
+server:
+  host: 0.0.0.0
+  port: 4000
+  workers: 4
