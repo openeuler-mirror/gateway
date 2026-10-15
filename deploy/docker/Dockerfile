@@ -10,6 +10,7 @@
 #
 # 换底座（NPU 专属变体统一底座时）：--build-arg BASE_IMAGE=quay.io/ascend/vllm-ascend:v0.27.1rc1-a3-openeuler
 # 内网镜像源：--build-arg RUSTUP_DIST_SERVER=... --build-arg CRATES_MIRROR=...（见 deploy/docker/README.md）
+# 附加 cargo feature（如 debug-tools：Dashboard 的 L2 kvc_aware 选项 + Debug 页）：--build-arg BUILD_FEATURES=debug-tools
 
 # ── 全局构建参数（在每个 stage 内使用前需重新 ARG 声明）──────────
 # 基镜像：builder 与 runtime 用同一个 → glibc 完全一致，无兼容风险
@@ -22,6 +23,10 @@ ARG RUSTUP_DIST_SERVER=https://static.rust-lang.org
 ARG RUSTUP_UPDATE_ROOT=https://static.rust-lang.org/rustup
 # crates.io 镜像（如 https://rsproxy.cn/index/；留空 = 直连）
 ARG CRATES_MIRROR=
+# 追加到默认 features（otlp）之后的 cargo feature，空格分隔。目前唯一用途：
+# debug-tools——启用 Dashboard 的 L2 kvc_aware 选项与 Debug 页（window.__KVC_DEBUG
+# 编译期注入，release 默认隐藏）。留空 = 现状。
+ARG BUILD_FEATURES=
 
 # ── stage 1: builder（同基镜像内编译，产物与运行时 userspace 一致）──
 FROM ${BASE_IMAGE} AS builder
@@ -31,6 +36,7 @@ ARG RUSTUP_INSTALLER
 ARG RUSTUP_DIST_SERVER
 ARG RUSTUP_UPDATE_ROOT
 ARG CRATES_MIRROR
+ARG BUILD_FEATURES
 # 系统信任库合并产物路径（openEuler/RHEL 族标准位置；update-ca-trust 生成）
 ARG CA_BUNDLE=/etc/pki/tls/certs/ca-bundle.crt
 
@@ -101,9 +107,12 @@ COPY . .
 # --locked 用仓库 Cargo.lock 保证可复现；.cargo/config.toml（tokio_unstable）
 # 随源码带入，cargo 自动生效。cache mount 加速增量构建——注意 mount 里的
 # 文件不进镜像层，产物必须在本 RUN 内拷出到普通路径。
+# BUILD_FEATURES 非空时追加 --features（$FEAT 不加引号：空值展开为零个参数，
+# 不产生空串 flag）；debug-tools 是零依赖 feature，不动 Cargo.lock，--locked 仍成立。
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release --locked -p boom-main \
+    if [ -n "$BUILD_FEATURES" ]; then FEAT="--features $BUILD_FEATURES"; else FEAT=""; fi \
+ && cargo build --release --locked -p boom-main $FEAT \
  && cp target/release/boom-gateway /boom-gateway
 
 # ── stage 2: runtime ─────────────────────────────────────────────
