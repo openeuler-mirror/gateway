@@ -91,6 +91,22 @@ docker run -d --name boom-gateway -p 4000:4000 \
 curl http://127.0.0.1:4000/health/live    # 期望 200
 ```
 
+### 附加 cargo feature（BUILD_FEATURES）
+
+默认只带 release 默认 features（otlp）。需要试验性能力时用 `BUILD_FEATURES`
+追加（与其他环境变量同排法，多个用空格分隔）：
+
+```bash
+# debug-tools：Dashboard 可选 L2 kvc_aware 调度策略 + Debug 页
+# （release 默认隐藏，见 app.js buildPolicyOptions / handlers_static 注入
+#   window.__KVC_DEBUG）
+BUILD_FEATURES=debug-tools ./deploy/docker/build.sh
+```
+
+注意 `debug-tools` 同时会放开 Dashboard 的 Debug 页面，**不建议用于交付镜像**；
+后端对 `kvc_aware` 策略无 feature 门槛，YAML 直配 `schedule_policy: kvc_aware`
+同样生效（UI 中显示为禁用但选中）。
+
 ### 换基镜像版本
 
 `BASE_IMAGE` 重新赋值即可，两个 stage 一起换（glibc 一致性由设计保证）。

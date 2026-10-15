@@ -59,6 +59,8 @@ BUILD_ARGS=(--build-arg BASE_IMAGE="$BASE_IMAGE" --build-arg RUST_VERSION="$RUST
 [ -n "${RUSTUP_DIST_SERVER:-}" ] && BUILD_ARGS+=(--build-arg RUSTUP_DIST_SERVER="$RUSTUP_DIST_SERVER")
 [ -n "${RUSTUP_UPDATE_ROOT:-}" ] && BUILD_ARGS+=(--build-arg RUSTUP_UPDATE_ROOT="$RUSTUP_UPDATE_ROOT")
 [ -n "${CRATES_MIRROR:-}" ] && BUILD_ARGS+=(--build-arg CRATES_MIRROR="$CRATES_MIRROR")
+# 追加 cargo feature（如 debug-tools：Dashboard 的 L2 kvc_aware 选项 + Debug 页）
+[ -n "${BUILD_FEATURES:-}" ] && BUILD_ARGS+=(--build-arg BUILD_FEATURES="$BUILD_FEATURES")
 
 # 公司 MITM 代理的自签 CA：PROXY_CA 指向 PEM 文件，或含多个 PEM 的目录
 # （/etc/pki/ca-trust/source/anchors/ 就是目录形态，里面正是管理员手工装的
