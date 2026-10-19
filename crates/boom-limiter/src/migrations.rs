@@ -100,6 +100,11 @@ CREATE TABLE IF NOT EXISTS boom_team_plan_assignment (
 /// default-plan pointers must live in DB (not YAML) now that DB is the
 /// runtime authority for plans. Both use partial unique indexes so at most
 /// one row carries each flag.
+///
+/// The guard ALTER must run BEFORE `idx_boom_plan_default_team`: on an
+/// upgrade-path DB the CREATE TABLE is a no-op (table exists without the
+/// column), so without the ALTER the index creation fails with "column
+/// is_default_team does not exist" and aborts every later migration.
 pub fn plan_ddl() -> &'static str {
     r#"
 CREATE TABLE IF NOT EXISTS boom_rate_limit_plan (
@@ -113,6 +118,8 @@ CREATE TABLE IF NOT EXISTS boom_rate_limit_plan (
     source            TEXT    NOT NULL DEFAULT 'yaml',
     updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+ALTER TABLE boom_rate_limit_plan
+    ADD COLUMN IF NOT EXISTS is_default_team BOOLEAN NOT NULL DEFAULT false;
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_boom_plan_default
    ON boom_rate_limit_plan (is_default) WHERE is_default = true;

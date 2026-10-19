@@ -300,9 +300,14 @@ impl AppState {
             // Run migrations. boom_dashboard::run_migrations calls
             // boom_audit::run_request_log_migration internally (with
             // lock_timeout set on its connection).
-            if let Err(e) = boom_dashboard::migrations::run_migrations(pool).await {
-                tracing::error!("Failed to run migrations: {}", e);
-            }
+            //
+            // Failures are fatal: with the DB as the runtime authority,
+            // seed/reconcile below hard-depends on every table existing.
+            // Swallowing the error here would only resurface it later as an
+            // unrelated "relation does not exist" from the seed. Optional
+            // DDL (lock_timeout, DISTRIBUTE BY on GaussDB) already degrades
+            // to warn inside run_migrations.
+            boom_dashboard::migrations::run_migrations(pool).await?;
 
             crate::migrations::ensure_config_meta_table(pool).await?;
 
