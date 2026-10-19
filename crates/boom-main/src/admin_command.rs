@@ -593,10 +593,27 @@ async fn re_register_fusion(state: &AppState) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// Feature-parked gate for the workflow CRUD surface: while
+/// `router_settings.enable_workflow` is false (the default), writes are
+/// rejected instead of silently no-op'ing — a created binding would never
+/// route, so the caller deserves the error.
+fn ensure_workflow_enabled(state: &AppState) -> Result<(), String> {
+    if state.inner.load_full().config.router_settings.enable_workflow {
+        Ok(())
+    } else {
+        Err(
+            "workflow feature is disabled — set router_settings.enable_workflow=true \
+             in config.yaml and reload to activate it"
+                .to_string(),
+        )
+    }
+}
+
 async fn handle_upsert_workflow(
     state: &AppState,
     req: boom_dashboard::handlers_admin::UpsertWorkflowRequest,
 ) -> Result<Value, String> {
+    ensure_workflow_enabled(state)?;
     let db_pool = state.db_pool.as_ref().ok_or("Database not available")?;
 
     let definition: boom_config::WorkflowDefinitionConfig =
@@ -625,6 +642,7 @@ async fn handle_delete_workflow(
     state: &AppState,
     name: String,
 ) -> Result<Value, String> {
+    ensure_workflow_enabled(state)?;
     let db_pool = state.db_pool.as_ref().ok_or("Database not available")?;
 
     // Reject while bindings reference the definition — deleting it would
@@ -663,6 +681,7 @@ async fn handle_upsert_workflow_model(
     state: &AppState,
     req: boom_dashboard::handlers_admin::UpsertWorkflowModelRequest,
 ) -> Result<Value, String> {
+    ensure_workflow_enabled(state)?;
     let db_pool = state.db_pool.as_ref().ok_or("Database not available")?;
 
     if !state
@@ -704,6 +723,7 @@ async fn handle_delete_workflow_model(
     state: &AppState,
     model_name: String,
 ) -> Result<Value, String> {
+    ensure_workflow_enabled(state)?;
     let db_pool = state.db_pool.as_ref().ok_or("Database not available")?;
 
     let existed = state

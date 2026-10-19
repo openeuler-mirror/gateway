@@ -629,6 +629,14 @@ pub struct RouterSettings {
     /// rolling out downstream so that downstream schedulers can read request priority.
     #[serde(default)]
     pub enable_priority_header: bool,
+    /// Workflow (direct-synthesis fusion) feature switch. Default false — the
+    /// feature is parked and must not activate: no workflow virtual models are
+    /// registered, workflow CRUD is rejected, and the YAML `workflow_settings`
+    /// section is not seeded into the DB. Flip to true in config.yaml + reload
+    /// to activate (the Dashboard Workflows page wiring is also commented out —
+    /// see index.html).
+    #[serde(default)]
+    pub enable_workflow: bool,
     /// Maximum time a parent or workflow child request may wait in a
     /// deployment flow-control queue. Omitted configs retain the historical
     /// 1200-second behavior.
@@ -819,6 +827,7 @@ impl Default for RouterSettings {
             auto_router: None,
             kvc_aware: KvcAwareSettings::default(),
             enable_priority_header: false,
+            enable_workflow: false,
             flow_control_queue_timeout_secs: None,
             strip_claude_code_attribution: false,
             forward_client_headers: Vec::new(),

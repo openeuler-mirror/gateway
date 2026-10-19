@@ -443,7 +443,7 @@
       stopTraceOtlpStatusPoll();
     }
     if (section === "admin-models") loadModels();
-    else if (section === "admin-workflows") loadWorkflows();
+    // else if (section === "admin-workflows") loadWorkflows(); // workflow page disabled
     else if (section === "admin-plans") loadPlans();
     else if (section === "admin-keys") { setupKeysSearch(); loadKeys(); }
     else if (section === "admin-quota") loadQuota();
@@ -462,7 +462,7 @@
   function sectionFromHash(hash) {
     if (hash.includes("/admin/stats")) return "admin-stats";
     if (hash.includes("/admin/models")) return "admin-models";
-    if (hash.includes("/admin/workflows")) return "admin-workflows";
+    // if (hash.includes("/admin/workflows")) return "admin-workflows"; // workflow page disabled
     if (hash.includes("/admin/plans")) return "admin-plans";
     if (hash.includes("/admin/keys")) return "admin-keys";
     if (hash.includes("/admin/quota")) return "admin-quota";
@@ -3365,7 +3365,12 @@
     loadPlans();
   };
 
-  // ── Admin: Workflows (DB-authoritative) ───────────────
+  /* WORKFLOW PAGE DISABLED — feature parked (router_settings.enable_workflow
+     defaults to false on the backend; Workflows nav + section commented out in
+     index.html). Re-enable: uncomment this block, the index.html section +
+     nav link, the two bindings in setupAdminButtons, and the two section
+     router branches above (search "workflow page disabled").
+     ── Admin: Workflows (DB-authoritative) ───────────────
   // Two tables from one GET /admin/workflows response:
   //   models    = { virtual_model_name → workflow_name }   (bindings)
   //   workflows = { workflow_name → WorkflowDefinitionConfig } (definitions)
@@ -3584,6 +3589,7 @@
     if (!workflowsCache.models[modelName]) return;
     showWorkflowModelModal(modelName);
   };
+  ── end workflow page disabled ── */
 
   // ── Admin: Keys ───────────────────────────────────────
   let keysPage = 1;
@@ -4730,33 +4736,21 @@
     </div>`;
   }
 
-  // Schedule-policy options. L2 (kvc_aware) is only selectable in debug
-  // builds (window.__KVC_DEBUG, injected at serve time by handlers_static
-  // via the debug-tools cargo feature). In release builds the option stays
-  // hidden — EXCEPT when it is already the live value: then it renders
-  // disabled-but-selected so saving this card can't silently flip an
-  // existing L2 cluster back to round_robin.
-  function buildPolicyOptions(current) {
-    const opts = [
+  // Schedule-policy options. L2 (kvc_aware) is selectable in all builds.
+  function buildPolicyOptions() {
+    return [
       { value: "round_robin", label: "L0 round_robin" },
       { value: "shuffle", label: "L0 shuffle" },
       { value: "key_affinity", label: "L1 key_affinity" },
+      { value: "kvc_aware", label: "L2 kvc_aware" },
     ];
-    if (window.__KVC_DEBUG || current === "kvc_aware") {
-      opts.push({
-        value: "kvc_aware",
-        label: "L2 kvc_aware" + t("config.field.kvc_not_launched"),
-        disabled: !window.__KVC_DEBUG,
-      });
-    }
-    return opts;
   }
 
   function renderCardRouter(r) {
     return `<div class="form-card" data-section="router_settings">
       <div class="form-card-title">${t("config.section.router_settings")}</div>
       <div class="form-card-grid">
-        ${fieldSelect("cfg-rs-policy", t("config.field.schedule_policy"), buildPolicyOptions(r.schedule_policy),
+        ${fieldSelect("cfg-rs-policy", t("config.field.schedule_policy"), buildPolicyOptions(),
           r.schedule_policy || "round_robin", { tip: t("tip.config.schedule_policy") })}
         ${fieldNum("cfg-rs-affinity-ctx", t("config.field.key_affinity_context_threshold"), r.key_affinity_context_threshold || 0, { min: 0 })}
         ${fieldNum("cfg-rs-affinity-rebal", t("config.field.rebalance_threshold"), r.rebalance_threshold || 20, { min: 1, step: 1 })}
@@ -5290,13 +5284,15 @@
           // whole-section replace doesn't try to write it.
           // The backend replaces the whole router_settings section, so every
           // sub-tree must be re-submitted. kvc_aware reads the live inputs
-          // (its card shares this save button); auto_router has no editor and
-          // is passed through verbatim.
+          // (its card shares this save button); auto_router and
+          // enable_workflow (feature-parked switch, YAML-only) have no
+          // editor and are passed through verbatim.
           kvc_aware: {
             max_blocks: numOr($("cfg-kvc-max-blocks"), 500000),
             router_ttl_secs: numOr($("cfg-kvc-ttl"), 1200),
           },
           auto_router: cfg.router_settings.auto_router ?? null,
+          enable_workflow: cfg.router_settings.enable_workflow ?? false,
         };
         await saveConfigSection("router_settings", routerValue);
       }
@@ -5552,8 +5548,10 @@
   // ── Admin: Modals ─────────────────────────────────────
   function setupAdminButtons() {
     document.getElementById("btn-new-plan").addEventListener("click", showNewPlanModal);
-    document.getElementById("btn-new-workflow").addEventListener("click", () => showWorkflowModal(null));
-    document.getElementById("btn-new-workflow-model").addEventListener("click", () => showWorkflowModelModal(null));
+    // Workflow page disabled — the buttons are commented out in index.html, so
+    // these getElementById calls would return null and crash this setup fn.
+    // document.getElementById("btn-new-workflow").addEventListener("click", () => showWorkflowModal(null));
+    // document.getElementById("btn-new-workflow-model").addEventListener("click", () => showWorkflowModelModal(null));
     // Stress info-bar "?" tooltip — hover/focus reveals a glossary.
     const helpBtn = document.querySelector(".stress-info-help");
     const tooltip = document.getElementById("stress-info-tooltip");

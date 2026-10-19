@@ -131,6 +131,12 @@ router_settings:
   # 路由策略：round_robin（默认）/ shuffle（随机，litellm simple-shuffle）/ key_affinity（L1 会话亲和）/ kvc_aware（L2 前缀缓存亲和，详见下方 kvc_aware 注释块）
   routing_strategy: round_robin
 
+  # Workflow（direct-synthesis 融合编排）功能开关。默认 false——功能暂停：
+  # 不注册 workflow 虚拟模型、Dashboard Workflows 页隐藏、CRUD 一律拒绝、
+  # seed 跳过 workflow 表。启用：改为 true + reload（同时需要恢复
+  # Dashboard Workflows 页的前端接线，见 index.html 中被注释的段落）。
+  enable_workflow: false
+
   # 模型别名（seed-only；运行期经 Dashboard Models 页别名 CRUD 管理）
   model_group_alias:
     # 简单别名

@@ -198,19 +198,25 @@ pub async fn seed_if_empty(pool: &PgPool, config: &Config) -> anyhow::Result<See
     }
 
     // ── Workflows (definitions + model bindings) ──
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM boom_workflow_definition")
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|e| anyhow::anyhow!("seed: count workflow definitions: {}", e))?;
-    let binding_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM boom_workflow_model")
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|e| anyhow::anyhow!("seed: count workflow models: {}", e))?;
-    if count == 0 && binding_count == 0 {
-        let n = WorkflowStore::seed_rows_db(&mut tx, &config.workflow_settings)
+    // Skipped while the feature is parked (enable_workflow=false): seeding
+    // would write dead data. Note the seed marker below still lands — enabling
+    // the feature later on an already-seeded database means adding workflows
+    // via CRUD, not re-running the YAML import.
+    if config.router_settings.enable_workflow {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM boom_workflow_definition")
+            .fetch_one(&mut *tx)
             .await
-            .map_err(|e| anyhow::anyhow!("seed: workflows: {}", e))?;
-        outcome.imported |= n > 0;
+            .map_err(|e| anyhow::anyhow!("seed: count workflow definitions: {}", e))?;
+        let binding_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM boom_workflow_model")
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| anyhow::anyhow!("seed: count workflow models: {}", e))?;
+        if count == 0 && binding_count == 0 {
+            let n = WorkflowStore::seed_rows_db(&mut tx, &config.workflow_settings)
+                .await
+                .map_err(|e| anyhow::anyhow!("seed: workflows: {}", e))?;
+            outcome.imported |= n > 0;
+        }
     }
 
     // ── Cost templates ──

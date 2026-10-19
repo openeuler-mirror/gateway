@@ -160,9 +160,11 @@ pub fn general_settings_fields() -> &'static [FieldMeta] {
 }
 
 /// Manifest for `router_settings.*` editable from the dashboard config page.
-/// Excludes the `kvc_aware` sub-tree (it has its own card) and `model_group_alias`
+/// Excludes the `kvc_aware` sub-tree (it has its own card), `model_group_alias`
 /// (managed via the Models page alias CRUD — DB + AdminCommand, not the config
-/// editor). Fields marked `section: "general"` are surfaced on the General card
+/// editor), and `enable_workflow` (feature-parked switch, YAML-only: flipped in
+/// config.yaml + reload; no dashboard editor while the Workflows page is
+/// disabled). Fields marked `section: "general"` are surfaced on the General card
 /// but still live under `router_settings` in YAML — the frontend saves them
 /// via dotted sub-paths (`router_settings.<field>`).
 pub fn router_settings_fields() -> &'static [FieldMeta] {

@@ -910,6 +910,22 @@ impl AppState {
     /// the universe includes disabled models.
     pub(crate) async fn register_fusion_models(&self, config: &Config) -> Result<(), boom_core::GatewayError> {
         let settings = self.workflow_store.settings();
+        // Feature-parked gate (router_settings.enable_workflow, default false).
+        // When disabled we register an EMPTY set: the teardown pass inside
+        // register_fusion_providers then unregisters any previous fusion
+        // registrations, so flipping the flag off + reload deactivates
+        // cleanly instead of leaving stale virtual models routing.
+        let settings = if config.router_settings.enable_workflow {
+            settings
+        } else {
+            if !settings.models.is_empty() {
+                tracing::warn!(
+                    count = settings.models.len(),
+                    "workflow bindings present but router_settings.enable_workflow=false — workflow virtual models are disabled"
+                );
+            }
+            Default::default()
+        };
         let namespaces = self.workflow_validation_namespaces(config).await;
         settings.validate_with_namespaces(&namespaces)?;
 
