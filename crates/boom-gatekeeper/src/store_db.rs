@@ -206,6 +206,11 @@ impl BlockRuleStore {
     /// When the row is absent (fresh DB), insert it with the YAML-provided
     /// default — after that the DB is authoritative and the YAML section is
     /// only a seed. Called from the boot/reload reconcile path.
+    ///
+    /// No `ON CONFLICT` (GaussDB/openGauss don't support it): the insert
+    /// race with a concurrently-booting instance is handled by re-reading
+    /// the row when the insert loses — same tolerance philosophy as
+    /// `boom_core::gaussdb_upsert!`.
     pub async fn adopt_enabled_db(&self, pool: &PgPool, yaml_default: bool) -> Result<bool, sqlx::Error> {
         let current: Option<bool> = sqlx::query_scalar::<_, bool>(
             r#"SELECT enabled FROM boom_client_blocklist_state WHERE id = 1"#,
@@ -216,16 +221,27 @@ impl BlockRuleStore {
         let enabled = match current {
             Some(v) => v,
             None => {
-                sqlx::query(
+                let inserted = sqlx::query(
                     r#"INSERT INTO boom_client_blocklist_state (id, enabled)
-                       VALUES (1, $1)
-                       ON CONFLICT (id) DO NOTHING"#,
+                       VALUES (1, $1)"#,
                 )
                 .bind(yaml_default)
                 .execute(pool)
-                .await?;
-                tracing::info!(enabled = yaml_default, "Initialized blocklist state row from YAML default");
-                yaml_default
+                .await;
+                match inserted {
+                    Ok(_) => {
+                        tracing::info!(enabled = yaml_default, "Initialized blocklist state row from YAML default");
+                        yaml_default
+                    }
+                    // Lost the race to a concurrently-booting instance —
+                    // adopt whatever it wrote. Any non-race error resurfaces
+                    // through this read (row absent → fetch_one fails).
+                    Err(_) => sqlx::query_scalar::<_, bool>(
+                        r#"SELECT enabled FROM boom_client_blocklist_state WHERE id = 1"#,
+                    )
+                    .fetch_one(pool)
+                    .await?,
+                }
             }
         };
         self.set_enabled(enabled);
@@ -234,14 +250,20 @@ impl BlockRuleStore {
 
     /// Flip the global `enabled` switch in DB and memory.
     pub async fn set_enabled_db(&self, pool: &PgPool, enabled: bool) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            r#"INSERT INTO boom_client_blocklist_state (id, enabled)
-               VALUES (1, $1)
-               ON CONFLICT (id) DO UPDATE SET enabled = $1, updated_at = NOW()"#,
-        )
-        .bind(enabled)
-        .execute(pool)
-        .await?;
+        boom_core::gaussdb_upsert!(
+            pool,
+            || sqlx::query(
+                r#"UPDATE boom_client_blocklist_state
+                   SET enabled = $1, updated_at = NOW()
+                   WHERE id = 1"#,
+            )
+            .bind(enabled),
+            || sqlx::query(
+                r#"INSERT INTO boom_client_blocklist_state (id, enabled)
+                   VALUES (1, $1)"#,
+            )
+            .bind(enabled)
+        )?;
         self.set_enabled(enabled);
         Ok(())
     }
