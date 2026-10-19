@@ -145,8 +145,16 @@ impl TempConfig {
             .duration_since(UNIX_EPOCH)
             .expect("system clock is before Unix epoch")
             .as_nanos();
+        // The wall clock alone is NOT collision-proof: macOS SystemTime
+        // granularity under concurrent threads yields identical nanosecond
+        // readings (~1 dup pair per 15 concurrent calls, measured). Two tests
+        // sharing a directory overwrite each other's config.yaml and delete
+        // it mid-test via Drop → "exited before becoming ready". The counter
+        // makes directory names collision-free by construction.
+        static DIR_SEQ: AtomicUsize = AtomicUsize::new(0);
+        let seq = DIR_SEQ.fetch_add(1, Ordering::Relaxed);
         let directory = std::env::temp_dir().join(format!(
-            "boom-gateway-fusion-e2e-{}-{unique}",
+            "boom-gateway-fusion-e2e-{}-{unique}-{seq}",
             std::process::id()
         ));
         fs::create_dir_all(&directory).expect("failed to create temporary config directory");
@@ -299,11 +307,20 @@ impl TestGateway {
     }
 
     async fn start_with_config(config: TempConfig) -> Self {
+        // Serialize port pickup → spawn → readiness across the parallel tests.
+        // unused_port() has a TOCTOU window: the reserved port is freed before
+        // the child binds it, so two tests racing here can hand the same port
+        // to two gateways — one exits 1 before becoming ready. Holding this
+        // lock until /health answers closes the window; the lock is released
+        // once the port is actually bound by the OS.
+        static SPAWN_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _guard = SPAWN_LOCK.lock().await;
         let port = unused_port();
         let mut process = GatewayProcess::spawn(&config.path, port);
         let client = reqwest::Client::new();
         let base_url = format!("http://127.0.0.1:{port}");
         wait_until_ready(&client, &base_url, &mut process).await;
+        drop(_guard);
         Self {
             process,
             config,

@@ -1,7 +1,9 @@
-//! DB operations for `boom_client_block_rule` — the same dual-source pattern
-//! as `boom_routing::AliasStore`: `sync_yaml_to_db` (reload: YAML is truth),
-//! `load_db_only` (layer DB-only rows on top), and CRUD methods that write DB
-//! then update memory in place (dashboard path — no reload round-trip).
+//! DB operations for `boom_client_block_rule` and the blocklist's global
+//! `enabled` switch (`boom_client_blocklist_state`, single row) — the DB is
+//! the runtime authority: `seed_rows_db` (first-boot import from YAML into
+//! an empty table), CRUD methods that write DB then update memory in place
+//! (dashboard path — no reload round-trip), and `adopt_enabled_db` (boot:
+//! read the switch, seeding the row from the YAML default when absent).
 
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -80,15 +82,14 @@ impl From<&BlockRule> for BlockRuleInput {
 }
 
 impl BlockRuleStore {
-    /// Sync YAML rules to DB: delete `source='yaml'` rows, insert current YAML
-    /// rules, delete `source='db'` rows conflicting with YAML names. Mirrors
-    /// `AliasStore::sync_yaml_to_db`.
-    pub async fn sync_yaml_to_db(pool: &PgPool, yaml_rules: &[BlockRule]) -> Result<(), sqlx::Error> {
-        sqlx::query(r#"DELETE FROM boom_client_block_rule WHERE source = 'yaml'"#)
-            .execute(pool)
-            .await?;
-
-        for rule in yaml_rules {
+    /// Seed rules from YAML into an EMPTY boom_client_block_rule table (DB
+    /// first-boot import). Rows carry source='yaml' provenance. Runs on the
+    /// transaction connection held by the caller (`seed_if_empty`).
+    pub async fn seed_rows_db(
+        conn: &mut sqlx::PgConnection,
+        rules: &[BlockRule],
+    ) -> Result<usize, sqlx::Error> {
+        for rule in rules {
             sqlx::query(
                 r#"INSERT INTO boom_client_block_rule (rule_name, enabled, conditions, action, source)
                    VALUES ($1, $2, $3, $4, 'yaml')"#,
@@ -97,76 +98,12 @@ impl BlockRuleStore {
             .bind(rule.enabled)
             .bind(serde_json::to_value(&rule.conditions).unwrap_or(serde_json::Value::Array(vec![])))
             .bind(serde_json::to_value(&rule.action).unwrap_or(serde_json::Value::Null))
-            .execute(pool)
+            .execute(&mut *conn)
             .await?;
         }
 
-        if !yaml_rules.is_empty() {
-            let names: Vec<String> = yaml_rules.iter().map(|r| r.name.clone()).collect();
-            let result = sqlx::query(
-                r#"DELETE FROM boom_client_block_rule WHERE source = 'db' AND rule_name = ANY($1)"#,
-            )
-            .bind(&names)
-            .execute(pool)
-            .await?;
-            if result.rows_affected() > 0 {
-                tracing::info!(
-                    "Removed {} conflicting source='db' block rule(s)",
-                    result.rows_affected()
-                );
-            }
-        }
-
-        tracing::info!("Synced {} block rule(s) from YAML to DB", yaml_rules.len());
-        Ok(())
-    }
-
-    /// Load `source='db'` rules from DB, compile, and layer on top of the
-    /// YAML-seeded store. Broken rows are skipped with a warn — a corrupt row
-    /// must not take down rule loading.
-    pub async fn load_db_only(&self, pool: &PgPool) {
-        let rows: Vec<BlockRuleRow> = match sqlx::query_as::<_, BlockRuleRow>(
-            r#"SELECT rule_name, enabled, conditions, action, source, updated_at
-               FROM boom_client_block_rule WHERE source = 'db'"#,
-        )
-        .fetch_all(pool)
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!("Failed to load DB-only block rules: {}", e);
-                return;
-            }
-        };
-
-        let mut loaded = 0usize;
-        let mut skipped = 0usize;
-        for row in &rows {
-            let rule = match row.to_rule() {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!("Skip DB block rule: {}", e);
-                    skipped += 1;
-                    continue;
-                }
-            };
-            match self.insert_rule(&rule) {
-                Ok(()) => loaded += 1,
-                Err(e) => {
-                    tracing::warn!("Skip DB block rule '{}': {}", row.rule_name, e);
-                    skipped += 1;
-                }
-            }
-        }
-        tracing::info!(
-            "Loaded {} DB-only block rule(s){}",
-            loaded,
-            if skipped > 0 {
-                format!(", skipped {}", skipped)
-            } else {
-                String::new()
-            }
-        );
+        tracing::info!("Seeded {} block rule(s) from YAML into DB", rules.len());
+        Ok(rules.len())
     }
 
     /// List all rules from DB (dashboard table view).
@@ -263,5 +200,49 @@ impl BlockRuleStore {
         if let Err(e) = self.insert_rule(&rule) {
             tracing::warn!("Block rule '{}' written to DB but skipped in memory: {}", input.name, e);
         }
+    }
+
+    /// Adopt the global `enabled` flag from `boom_client_blocklist_state`.
+    /// When the row is absent (fresh DB), insert it with the YAML-provided
+    /// default — after that the DB is authoritative and the YAML section is
+    /// only a seed. Called from the boot/reload reconcile path.
+    pub async fn adopt_enabled_db(&self, pool: &PgPool, yaml_default: bool) -> Result<bool, sqlx::Error> {
+        let current: Option<bool> = sqlx::query_scalar::<_, bool>(
+            r#"SELECT enabled FROM boom_client_blocklist_state WHERE id = 1"#,
+        )
+        .fetch_optional(pool)
+        .await?;
+
+        let enabled = match current {
+            Some(v) => v,
+            None => {
+                sqlx::query(
+                    r#"INSERT INTO boom_client_blocklist_state (id, enabled)
+                       VALUES (1, $1)
+                       ON CONFLICT (id) DO NOTHING"#,
+                )
+                .bind(yaml_default)
+                .execute(pool)
+                .await?;
+                tracing::info!(enabled = yaml_default, "Initialized blocklist state row from YAML default");
+                yaml_default
+            }
+        };
+        self.set_enabled(enabled);
+        Ok(enabled)
+    }
+
+    /// Flip the global `enabled` switch in DB and memory.
+    pub async fn set_enabled_db(&self, pool: &PgPool, enabled: bool) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"INSERT INTO boom_client_blocklist_state (id, enabled)
+               VALUES (1, $1)
+               ON CONFLICT (id) DO UPDATE SET enabled = $1, updated_at = NOW()"#,
+        )
+        .bind(enabled)
+        .execute(pool)
+        .await?;
+        self.set_enabled(enabled);
+        Ok(())
     }
 }

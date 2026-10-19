@@ -205,10 +205,28 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
     run_ddl_on_conn(&mut conn, boom_gatekeeper::migrations::block_rule_ddl()).await?;
     tracing::info!("Migration 10: done");
 
+    // 8. Client blocklist global switch (boom-gatekeeper, single row).
+    tracing::info!("Migration 11: client_blocklist_state...");
+    run_ddl_on_conn(&mut conn, boom_gatekeeper::migrations::blocklist_state_ddl()).await?;
+    tracing::info!("Migration 11: done");
+
+    // 9. Workflow definitions + model bindings (boom-routing).
+    tracing::info!("Migration 12: workflow_definition...");
+    run_ddl_on_conn(&mut conn, boom_routing::migrations::workflow_definition_ddl()).await?;
+    tracing::info!("Migration 12: done");
+    tracing::info!("Migration 13: workflow_model...");
+    run_ddl_on_conn(&mut conn, boom_routing::migrations::workflow_model_ddl()).await?;
+    tracing::info!("Migration 13: done");
+
+    // 10. Cost templates (boom-routing).
+    tracing::info!("Migration 14: cost_template...");
+    run_ddl_on_conn(&mut conn, boom_routing::migrations::cost_template_ddl()).await?;
+    tracing::info!("Migration 14: done");
+
     // Connection returns to pool on drop.
     drop(conn);
 
-    tracing::info!("BooMGateway persistence tables ensured (10 tables)");
+    tracing::info!("BooMGateway persistence tables ensured (14 tables)");
     Ok(())
 }
 

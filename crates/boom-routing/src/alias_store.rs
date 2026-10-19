@@ -103,19 +103,14 @@ impl AliasStore {
 
     // ── DB operations (boom_routing owns boom_model_alias table) ──
 
-    /// Sync YAML aliases to DB: delete source='yaml' rows, insert current YAML aliases,
-    /// delete conflicting source='db' rows.
-    pub async fn sync_yaml_to_db(
-        pool: &PgPool,
-        yaml_aliases: &[(String, String, bool)],
-    ) -> Result<(), sqlx::Error> {
-        // 1. Delete all source='yaml' rows.
-        sqlx::query(r#"DELETE FROM boom_model_alias WHERE source = 'yaml'"#)
-            .execute(pool)
-            .await?;
-
-        // 2. Insert YAML aliases.
-        for (alias, target, is_hidden) in yaml_aliases {
+    /// Seed aliases from YAML into an EMPTY boom_model_alias table (DB
+    /// first-boot import). Rows carry source='yaml' provenance. Runs on the
+    /// transaction connection held by the caller (`seed_if_empty`).
+    pub async fn seed_rows_db(
+        conn: &mut sqlx::PgConnection,
+        aliases: &[(String, String, bool)],
+    ) -> Result<usize, sqlx::Error> {
+        for (alias, target, is_hidden) in aliases {
             sqlx::query(
                 r#"INSERT INTO boom_model_alias (alias_name, target_model, hidden, source)
                    VALUES ($1, $2, $3, 'yaml')"#,
@@ -123,62 +118,18 @@ impl AliasStore {
             .bind(alias)
             .bind(target)
             .bind(is_hidden)
-            .execute(pool)
+            .execute(&mut *conn)
             .await?;
         }
 
-        // 3. Delete source='db' aliases that conflict with YAML names.
-        if !yaml_aliases.is_empty() {
-            let yaml_names: Vec<String> = yaml_aliases.iter().map(|(a, _, _)| a.clone()).collect();
-            let result = sqlx::query(
-                r#"DELETE FROM boom_model_alias WHERE source = 'db' AND alias_name = ANY($1)"#,
-            )
-            .bind(&yaml_names)
-            .execute(pool)
-            .await?;
-            if result.rows_affected() > 0 {
-                tracing::info!(
-                    "Removed {} conflicting source='db' alias(es)",
-                    result.rows_affected()
-                );
-            }
-        }
-
-        tracing::info!(
-            "Synced {} alias(es) from YAML to DB",
-            yaml_aliases.len()
-        );
-        Ok(())
+        tracing::info!("Seeded {} alias(es) from YAML into DB", aliases.len());
+        Ok(aliases.len())
     }
 
-    /// Load source='db' aliases from DB into this store.
-    pub async fn load_db_only(&self, pool: &PgPool) {
-        let rows: Vec<AliasRow> = match sqlx::query_as::<_, AliasRow>(
-            r#"SELECT alias_name, target_model, hidden, source, updated_at
-               FROM boom_model_alias WHERE source = 'db'"#,
-        )
-        .fetch_all(pool)
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!("Failed to load DB-only aliases: {}", e);
-                return;
-            }
-        };
-
-        for row in &rows {
-            self.set_alias(
-                row.alias_name.clone(),
-                row.target_model.clone(),
-                row.hidden.unwrap_or(false),
-            );
-        }
-
-        tracing::info!("Loaded {} DB-only alias(es)", rows.len());
-    }
-
-    pub async fn db_only_name_conflicts(
+    /// Alias names from the given list that already exist in DB — workflow
+    /// namespace validation. The DB is the runtime authority, so every row
+    /// counts, regardless of source.
+    pub async fn alias_name_conflicts(
         pool: &PgPool,
         model_names: &[String],
     ) -> Result<Vec<String>, sqlx::Error> {
@@ -188,7 +139,7 @@ impl AliasStore {
         sqlx::query_scalar::<_, String>(
             r#"SELECT DISTINCT alias_name
                FROM boom_model_alias
-               WHERE source = 'db' AND alias_name = ANY($1)
+               WHERE alias_name = ANY($1)
                ORDER BY alias_name"#,
         )
         .bind(model_names)

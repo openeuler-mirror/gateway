@@ -7,7 +7,7 @@ mod workflow;
 
 pub use workflow::{
     DirectSynthesisRolesConfig, WorkflowDefinitionConfig, WorkflowModelInstanceConfig,
-    WorkflowSettings,
+    WorkflowNamespaces, WorkflowSettings,
 };
 
 /// Re-export of `boom_core::types::WindowLimit` — single source of truth.
@@ -592,7 +592,7 @@ impl ModelGroupAlias {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct RouterSettings {
     /// Scheduling policy: round_robin (default) or key_affinity.
     #[serde(default = "default_schedule_policy", alias = "routing_strategy")]
@@ -805,6 +805,27 @@ fn default_rebalance_threshold() -> u8 {
     20
 }
 
+/// Manual so the omitted-section path (`#[serde(default)]` on `Config`'s
+/// field, env bootstrap, `RouterSettings::default()` callers) gets the SAME
+/// values as the omitted-FIELD path — `derive(Default)` would ignore the
+/// `#[serde(default = "...")]` fns and yield `""` / 0.
+impl Default for RouterSettings {
+    fn default() -> Self {
+        Self {
+            schedule_policy: default_schedule_policy(),
+            model_group_alias: HashMap::new(),
+            key_affinity_context_threshold: 0,
+            rebalance_threshold: default_rebalance_threshold(),
+            auto_router: None,
+            kvc_aware: KvcAwareSettings::default(),
+            enable_priority_header: false,
+            flow_control_queue_timeout_secs: None,
+            strip_claude_code_attribution: false,
+            forward_client_headers: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ServerSettings {
     #[serde(default = "default_host")]
@@ -917,7 +938,11 @@ impl Config {
                     .to_string(),
             ));
         }
-        self.workflow_settings.validate(self)?;
+        // Workflow settings are NOT validated here: the check needs the
+        // routable model universe (deployments + aliases), which in DB mode
+        // diverges from this YAML document's (inert) model_list. Validation
+        // runs at fusion registration time against the live stores — see
+        // boom-main's register_fusion_models.
         Ok(())
     }
 
@@ -986,6 +1011,57 @@ pub fn load_config(path: &str) -> Result<Config, GatewayError> {
         config.router_settings.schedule_policy,
     );
 
+    Ok(config)
+}
+
+/// Build a minimal boot config from environment variables alone — the
+/// no-YAML startup path. Requires BOTH:
+///   - `BOOM_MASTER_KEY`   — admin/auth bootstrap
+///   - `BOOM_DATABASE_URL` — business config source (models/plans/workflows)
+///
+/// Without a YAML file these are the two things nothing else can supply:
+/// no way to authenticate and nowhere to load business config from. All
+/// other sections take their YAML-omitted defaults by deserializing a
+/// one-section document through the normal serde path (NOT
+/// `Config::default()`, which would bypass the `#[serde(default = "...")]`
+/// field functions and zero out numeric defaults like kvc max_blocks).
+pub fn bootstrap_from_env() -> Result<Config, GatewayError> {
+    let read_var = |name: &str| env::var(name).ok().filter(|v| !v.trim().is_empty());
+    let master_key = read_var("BOOM_MASTER_KEY");
+    let database_url = read_var("BOOM_DATABASE_URL");
+
+    if master_key.is_none() || database_url.is_none() {
+        return Err(GatewayError::ConfigError(
+            "no config file found and environment bootstrap incomplete: starting without \
+             a YAML file requires both BOOM_MASTER_KEY and BOOM_DATABASE_URL to be set \
+             (or pass --config <path>)"
+                .to_string(),
+        ));
+    }
+
+    let mut general = serde_yaml::Mapping::new();
+    general.insert(
+        "master_key".into(),
+        serde_yaml::Value::String(master_key.unwrap()),
+    );
+    general.insert(
+        "database_url".into(),
+        serde_yaml::Value::String(database_url.unwrap()),
+    );
+    let mut root = serde_yaml::Mapping::new();
+    root.insert(
+        "general_settings".into(),
+        serde_yaml::Value::Mapping(general),
+    );
+
+    let config: Config = serde_yaml::from_value(serde_yaml::Value::Mapping(root))
+        .map_err(|e| GatewayError::ConfigError(format!("Failed to build bootstrap config: {}", e)))?;
+    config.validate()?;
+
+    tracing::info!(
+        "Bootstrapped minimal config from environment (no YAML file): master key + \
+         database URL from BOOM_* env vars; business config will be loaded from the database"
+    );
     Ok(config)
 }
 
@@ -1099,7 +1175,15 @@ pub fn read_raw_yaml(path: &str) -> Result<serde_yaml::Value, GatewayError> {
 pub fn write_yaml_atomic(path: &str, value: &serde_yaml::Value) -> Result<(), GatewayError> {
     let yaml_str = serde_yaml::to_string(value)
         .map_err(|e| GatewayError::ConfigError(format!("Failed to serialize YAML: {}", e)))?;
+    write_yaml_string_atomic(path, &yaml_str)
+}
 
+/// String-serialized variant of [`write_yaml_atomic`] — same truncate →
+/// write → fsync strategy and the same bind-mount rationale. Used when the
+/// caller already holds the serialized document (e.g. the export/write-back
+/// pipeline composes the YAML text once and shares it between download and
+/// file write).
+pub fn write_yaml_string_atomic(path: &str, yaml_str: &str) -> Result<(), GatewayError> {
     // Open with truncate + create so we overwrite in place. O_TRUNC avoids
     // leaving stale tail bytes if the new content is shorter than the old
     // (config.yaml can shrink when a deployment is deleted).
@@ -1217,6 +1301,46 @@ pub fn mask_secrets_in_place(value: &mut serde_json::Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bootstrap_from_env_requires_both_vars_and_applies_serde_defaults() {
+        // One test fn on purpose: both parts mutate the same env vars, and
+        // tests within a crate run in parallel threads.
+        let key = "BOOM_MASTER_KEY";
+        let db = "BOOM_DATABASE_URL";
+
+        env::remove_var(key);
+        env::remove_var(db);
+        let err = bootstrap_from_env().unwrap_err();
+        let msg = format!("{}", err);
+        assert!(msg.contains("BOOM_MASTER_KEY"), "msg: {}", msg);
+        assert!(msg.contains("BOOM_DATABASE_URL"), "msg: {}", msg);
+
+        env::set_var(key, "sk-test");
+        assert!(bootstrap_from_env().is_err());
+        env::remove_var(key);
+
+        env::set_var(db, "postgres://u:p@h/db");
+        assert!(bootstrap_from_env().is_err());
+        env::remove_var(db);
+
+        env::set_var(key, "sk-test");
+        env::set_var(db, "postgres://u:p@h/db");
+        let cfg = bootstrap_from_env().expect("both vars set");
+        assert_eq!(cfg.general_settings.master_key.as_deref(), Some("sk-test"));
+        assert_eq!(
+            cfg.general_settings.database_url.as_deref(),
+            Some("postgres://u:p@h/db")
+        );
+        // Field-level `#[serde(default = "...")]` functions must run — this
+        // is why bootstrap parses a document instead of Config::default().
+        assert_eq!(cfg.router_settings.schedule_policy, "round_robin");
+        assert!(cfg.server.port > 0);
+        assert!(cfg.model_list.is_empty());
+
+        env::remove_var(key);
+        env::remove_var(db);
+    }
 
     #[test]
     fn test_mask_secrets_in_place_masks_known_fields() {

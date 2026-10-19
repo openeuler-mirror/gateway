@@ -362,6 +362,66 @@ impl PlanStore {
         self.plans.get(&name).map(|r| r.value().clone())
     }
 
+    /// Swap the `is_default` flag in DB + memory in one transaction: clear the
+    /// current flag holder, set the new one. The partial unique index
+    /// (`WHERE is_default`) makes the clear-then-set order mandatory — setting
+    /// first would collide. `None` clears the default without setting a new
+    /// one. Returns Ok(false) when the target plan does not exist.
+    pub async fn set_default_db(
+        pool: &sqlx::PgPool,
+        plan_store: &PlanStore,
+        name: Option<&str>,
+    ) -> Result<bool, sqlx::Error> {
+        Self::set_default_flag_db(pool, plan_store, name, false).await
+    }
+
+    /// Team-plan variant — swaps `is_default_team` the same way.
+    pub async fn set_default_team_db(
+        pool: &sqlx::PgPool,
+        plan_store: &PlanStore,
+        name: Option<&str>,
+    ) -> Result<bool, sqlx::Error> {
+        Self::set_default_flag_db(pool, plan_store, name, true).await
+    }
+
+    async fn set_default_flag_db(
+        pool: &sqlx::PgPool,
+        plan_store: &PlanStore,
+        name: Option<&str>,
+        team: bool,
+    ) -> Result<bool, sqlx::Error> {
+        let flag_col = if team { "is_default_team" } else { "is_default" };
+        let mut tx = pool.begin().await?;
+        if let Some(name) = name {
+            let exists: bool = sqlx::query_scalar::<_, bool>(
+                r#"SELECT EXISTS(SELECT 1 FROM boom_rate_limit_plan WHERE name = $1)"#,
+            )
+            .bind(name)
+            .fetch_one(&mut *tx)
+            .await?;
+            if !exists {
+                tx.rollback().await?;
+                return Ok(false);
+            }
+        }
+        let clear = format!("UPDATE boom_rate_limit_plan SET {flag_col} = false WHERE {flag_col}");
+        sqlx::query(&clear).execute(&mut *tx).await?;
+        if let Some(name) = name {
+            let set = format!(
+                "UPDATE boom_rate_limit_plan SET {flag_col} = true, updated_at = NOW() WHERE name = $1"
+            );
+            sqlx::query(&set).bind(name).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+
+        if team {
+            plan_store.set_default_team_plan(name.map(|s| s.to_string()));
+        } else {
+            plan_store.set_default_plan(name.map(|s| s.to_string()));
+        }
+        Ok(true)
+    }
+
     /// Resolve the **explicitly assigned** plan for a key.
     ///
     /// Returns `Some(plan)` only when the key has an explicit assignment *and*
@@ -746,36 +806,43 @@ pub struct PlanRow {
     pub total_cost_limit_micros: Option<i64>,
     pub schedule: serde_json::Value,
     pub is_default: Option<bool>,
+    pub is_default_team: Option<bool>,
 }
 
+/// Column list shared by the seed INSERT and the snapshot SELECT. Kept as a
+/// named const so the guard test (tests::plan_seed_and_snapshot_sql_cover_
+/// flag_columns) checks the SAME strings production code executes — a column
+/// dropped here fails the test instead of silently lossing the DB round-trip.
+pub(crate) const PLAN_SEED_INSERT_SQL: &str = r#"INSERT INTO boom_rate_limit_plan
+                   (name, type, member_plan,
+                    concurrency_limit, rpm_limit, tpm_limit,
+                    window_limits, total_token_limit, total_cost_limit_micros,
+                    schedule, is_default, is_default_team, source)
+                   VALUES ($1, $2, $3,
+                           $4, $5, $6,
+                           $7, $8, $9,
+                           $10, $11, $12, 'yaml')"#;
+
+pub(crate) const PLAN_SNAPSHOT_SELECT_SQL: &str = r#"SELECT name, type, member_plan,
+                      concurrency_limit, rpm_limit, tpm_limit,
+                      window_limits, total_token_limit, total_cost_limit_micros,
+                      schedule, is_default, is_default_team
+               FROM boom_rate_limit_plan ORDER BY name"#;
+
 impl PlanStore {
-    /// Sync YAML plans to DB: delete source='yaml', delete conflicts, insert, cleanup orphans.
-    pub async fn sync_yaml_to_db(
-        pool: &sqlx::PgPool,
-        yaml_plans: &[(String, &RateLimitPlan)],
+    /// Seed plans from YAML into an EMPTY boom_rate_limit_plan table (DB
+    /// first-boot import). Rows carry source='yaml' provenance; default-plan
+    /// pointers are materialized into the is_default / is_default_team flag
+    /// columns. Runs on a transaction connection held by the caller
+    /// (`seed_if_empty`) — the caller guarantees the table is empty and the
+    /// seed is serialized by an advisory lock.
+    pub async fn seed_plans_db(
+        conn: &mut sqlx::PgConnection,
+        plans: &[(String, &RateLimitPlan)],
         default_plan_name: Option<&str>,
-    ) -> Result<(), sqlx::Error> {
-        // 1. Delete all source='yaml' rows.
-        sqlx::query(r#"DELETE FROM boom_rate_limit_plan WHERE source = 'yaml'"#)
-            .execute(pool)
-            .await?;
-
-        // 2. Delete source='db' plans that conflict with YAML names.
-        if !yaml_plans.is_empty() {
-            let yaml_names: Vec<String> = yaml_plans.iter().map(|(n, _)| n.clone()).collect();
-            let result = sqlx::query(
-                r#"DELETE FROM boom_rate_limit_plan WHERE source = 'db' AND name = ANY($1)"#,
-            )
-            .bind(&yaml_names)
-            .execute(pool)
-            .await?;
-            if result.rows_affected() > 0 {
-                tracing::info!("Removed {} conflicting source='db' plan(s)", result.rows_affected());
-            }
-        }
-
-        // 3. Insert YAML plans.
-        for (name, pc) in yaml_plans {
+        default_team_plan_name: Option<&str>,
+    ) -> Result<usize, sqlx::Error> {
+        for (name, pc) in plans {
             let wl = serde_json::to_value(&pc.window_limits).unwrap_or(serde_json::json!([]));
             let schedule_json = serde_json::to_value(
                 pc.schedule.iter().map(|s| serde_json::json!({
@@ -787,19 +854,10 @@ impl PlanStore {
                 })).collect::<Vec<_>>(),
             ).unwrap_or(serde_json::json!([]));
             let is_default = default_plan_name == Some(name.as_str());
+            let is_default_team = default_team_plan_name == Some(name.as_str());
             let type_str = match pc.r#type { PlanType::Key => "key", PlanType::Team => "team" };
 
-            sqlx::query(
-                r#"INSERT INTO boom_rate_limit_plan
-                   (name, type, member_plan,
-                    concurrency_limit, rpm_limit, tpm_limit,
-                    window_limits, total_token_limit, total_cost_limit_micros,
-                    schedule, is_default, source)
-                   VALUES ($1, $2, $3,
-                           $4, $5, $6,
-                           $7, $8, $9,
-                           $10, $11, 'yaml')"#,
-            )
+            sqlx::query(PLAN_SEED_INSERT_SQL)
             .bind(name)
             .bind(type_str)
             .bind(&pc.member_plan)
@@ -811,54 +869,13 @@ impl PlanStore {
             .bind(pc.total_cost_limit.map(decimal_to_micros))
             .bind(&schedule_json)
             .bind(is_default)
-            .execute(pool)
+            .bind(is_default_team)
+            .execute(&mut *conn)
             .await?;
         }
 
-        tracing::info!("Synced {} plan(s) from YAML to DB", yaml_plans.len());
-
-        // 4. Clean up orphaned assignments (key + team).
-        sqlx::query(
-            r#"DELETE FROM boom_key_plan_assignment
-               WHERE plan_name NOT IN (SELECT name FROM boom_rate_limit_plan)"#,
-        )
-        .execute(pool)
-        .await?;
-        sqlx::query(
-            r#"DELETE FROM boom_team_plan_assignment
-               WHERE plan_name NOT IN (SELECT name FROM boom_rate_limit_plan)"#,
-        )
-        .execute(pool)
-        .await?;
-
-        Ok(())
-    }
-
-    /// Load source='db' plans from DB into memory.
-    pub async fn load_db_only_plans(&self, pool: &sqlx::PgPool) {
-        let rows: Vec<PlanRow> = match sqlx::query_as::<_, PlanRow>(
-            r#"SELECT name, type, member_plan,
-                      concurrency_limit, rpm_limit, tpm_limit,
-                      window_limits, total_token_limit, total_cost_limit_micros,
-                      schedule, is_default
-               FROM boom_rate_limit_plan WHERE source = 'db'"#,
-        )
-        .fetch_all(pool)
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!("Failed to load DB-only plans: {}", e);
-                return;
-            }
-        };
-
-        for row in &rows {
-            let plan = row_to_plan(row);
-            self.upsert_plan(plan);
-        }
-
-        tracing::info!("Loaded {} DB-only plan(s)", rows.len());
+        tracing::info!("Seeded {} plan(s) from YAML into DB", plans.len());
+        Ok(plans.len())
     }
 
     /// Restore key→plan assignments from DB.
@@ -968,7 +985,10 @@ impl PlanStore {
         Ok(())
     }
 
-    /// Delete a plan from DB and memory.
+    /// Delete a plan from DB and memory. Assignment rows (key + team)
+    /// referencing the plan are removed in the same call — orphaned
+    /// assignments must not survive the delete (they would resurrect as
+    /// silent default-plan followers on the next restore).
     pub async fn delete_plan_db(&self, pool: &sqlx::PgPool, name: &str) -> Result<bool, sqlx::Error> {
         let result = sqlx::query(r#"DELETE FROM boom_rate_limit_plan WHERE name = $1"#)
             .bind(name)
@@ -976,6 +996,14 @@ impl PlanStore {
             .await?;
 
         if result.rows_affected() > 0 {
+            sqlx::query(r#"DELETE FROM boom_key_plan_assignment WHERE plan_name = $1"#)
+                .bind(name)
+                .execute(pool)
+                .await?;
+            sqlx::query(r#"DELETE FROM boom_team_plan_assignment WHERE plan_name = $1"#)
+                .bind(name)
+                .execute(pool)
+                .await?;
             self.delete_plan(name);
             Ok(true)
         } else {
@@ -1200,22 +1228,16 @@ impl PlanStore {
 
     /// Snapshot all plans from DB (for config export).
     pub async fn snapshot_plans_db(pool: &sqlx::PgPool) -> Result<Vec<PlanRow>, sqlx::Error> {
-        sqlx::query_as::<_, PlanRow>(
-            r#"SELECT name, type, member_plan,
-                      concurrency_limit, rpm_limit, tpm_limit,
-                      window_limits, total_token_limit, total_cost_limit_micros,
-                      schedule, is_default
-               FROM boom_rate_limit_plan ORDER BY name"#,
-        )
-        .fetch_all(pool)
-        .await
+        sqlx::query_as::<_, PlanRow>(PLAN_SNAPSHOT_SELECT_SQL)
+            .fetch_all(pool)
+            .await
     }
 }
 
 /// Convert a DB plan row to a RateLimitPlan.
 ///
 /// Backward compat: if `type` column is NULL (pre-migration DB), defaults to `Key`.
-fn row_to_plan(row: &PlanRow) -> RateLimitPlan {
+pub fn row_to_plan(row: &PlanRow) -> RateLimitPlan {
     let plan_type = match row.r#type.as_deref() {
         Some("team") => PlanType::Team,
         _ => PlanType::Key,
@@ -1384,6 +1406,28 @@ impl<S: Stream + Unpin> Stream for GuardedStream<S> {
 mod tests {
     use super::*;
     use boom_core::types::{PlanType, WindowLimit};
+
+    /// Guard: every plan SQL write/read surface must carry the full column set
+    /// the PlanRow struct exposes (deployment_store.rs guard-test pattern).
+    /// A column present in the struct but missing from the seed INSERT or the
+    /// snapshot SELECT silently drops data on the DB round-trip — e.g. a
+    /// forgotten is_default_team turns every export/reconcile into a lossy one.
+    #[test]
+    fn plan_seed_and_snapshot_sql_cover_flag_columns() {
+        let flag_columns = ["is_default", "is_default_team"];
+        for sql in [PLAN_SEED_INSERT_SQL, PLAN_SNAPSHOT_SELECT_SQL] {
+            for col in flag_columns {
+                assert!(
+                    sql.contains(&format!(" {}", col))
+                        || sql.contains(&format!("({col}"))
+                        || sql.contains(&format!("({col},"))
+                        || sql.contains(&format!(", {col}")),
+                    "plan SQL is missing column `{col}` — keep seed INSERT and \
+                     snapshot SELECT in sync with the boom_rate_limit_plan DDL",
+                );
+            }
+        }
+    }
 
     /// Two YAML forms — `rpm_limit: 2` vs `window_limits: [[2, null, null, 60]]`
     /// — must produce equivalent effective_limits. This is the regression guard

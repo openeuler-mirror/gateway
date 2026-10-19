@@ -4,6 +4,7 @@ pub mod sliding_window;
 
 pub use concurrency::{
     ConcurrencyGuard, GuardedStream, PlanRow, PlanStore, PlanType, RateLimitPlan, ScheduleSlot,
+    row_to_plan,
 };
 pub use migrations::{
     assignment_alter_ddl, assignment_ddl, cumulative_ddl, plan_alter_ddl, plan_ddl,

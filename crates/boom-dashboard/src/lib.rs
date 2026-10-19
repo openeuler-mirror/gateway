@@ -68,6 +68,10 @@ pub fn build_router<S: Clone + Send + Sync + 'static>(state: DashboardState) -> 
             "/dashboard/api/admin/plans/{name}",
             delete(handlers_admin::delete_plan),
         )
+        .route(
+            "/dashboard/api/admin/plans/default",
+            put(handlers_admin::set_default_plan),
+        )
         // Admin — Key management.
         .route(
             "/dashboard/api/admin/keys",
@@ -125,6 +129,32 @@ pub fn build_router<S: Clone + Send + Sync + 'static>(state: DashboardState) -> 
             "/dashboard/api/admin/aliases/{alias_name}",
             put(handlers_admin::update_alias).delete(handlers_admin::delete_alias),
         )
+        // Admin — Workflow definition + model-binding CRUD (DB-authoritative).
+        .route(
+            "/dashboard/api/admin/workflows",
+            get(handlers_admin::list_workflows).post(handlers_admin::upsert_workflow),
+        )
+        .route(
+            "/dashboard/api/admin/workflows/{name}",
+            delete(handlers_admin::delete_workflow),
+        )
+        .route(
+            "/dashboard/api/admin/workflow-models",
+            post(handlers_admin::upsert_workflow_model),
+        )
+        .route(
+            "/dashboard/api/admin/workflow-models/{model_name}",
+            delete(handlers_admin::delete_workflow_model),
+        )
+        // Admin — Cost template CRUD (DB-authoritative).
+        .route(
+            "/dashboard/api/admin/cost-templates",
+            get(handlers_admin::list_cost_templates).post(handlers_admin::upsert_cost_template),
+        )
+        .route(
+            "/dashboard/api/admin/cost-templates/{name}",
+            delete(handlers_admin::delete_cost_template),
+        )
         // Admin — Client blocklist rule CRUD.
         .route(
             "/dashboard/api/admin/client-block-rules",
@@ -133,6 +163,10 @@ pub fn build_router<S: Clone + Send + Sync + 'static>(state: DashboardState) -> 
         .route(
             "/dashboard/api/admin/client-block-rules/{rule_name}",
             put(handlers_admin::update_client_block_rule).delete(handlers_admin::delete_client_block_rule),
+        )
+        .route(
+            "/dashboard/api/admin/blocklist/enabled",
+            put(handlers_admin::set_blocklist_enabled),
         )
         // Admin — Request Logs.
         .route(
@@ -331,6 +365,16 @@ pub fn build_router<S: Clone + Send + Sync + 'static>(state: DashboardState) -> 
         .route(
             "/dashboard/api/admin/config/schema",
             get(handlers_admin::get_config_schema),
+        )
+        // Admin — Full-config export (download) + manual write-back to the
+        // startup YAML (recovery snapshot, NOT a sync mechanism).
+        .route(
+            "/dashboard/api/admin/config/export",
+            get(handlers_admin::export_config),
+        )
+        .route(
+            "/dashboard/api/admin/config/writeback",
+            post(handlers_admin::writeback_config),
         )
         // SPA fallback — must be last.
         .route("/dashboard/{*path}", get(handlers_static::spa_fallback))

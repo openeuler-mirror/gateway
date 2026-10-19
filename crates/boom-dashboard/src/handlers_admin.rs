@@ -161,16 +161,9 @@ pub async fn upsert_plan(
         state.plan_store.upsert_plan(plan);
     }
 
-    // Best-effort YAML sync — surface failure as warning field (not error,
-    // since DB + in-memory state are already committed).
-    let yaml_warning = match state.persist_yaml_with_reply().await {
-        Ok(()) => None,
-        Err(e) => Some(e),
-    };
     Ok(Json(json!({
         "ok": true,
         "plan_name": req.name,
-        "warning": yaml_warning,
     })))
 }
 
@@ -191,20 +184,100 @@ pub async fn delete_plan(
         state.plan_store.delete_plan(&name)
     };
 
-    if deleted {
-        // Best-effort YAML sync — surface failure as warning field.
-        let yaml_warning = match state.persist_yaml_with_reply().await {
-            Ok(()) => None,
-            Err(e) => Some(e),
-        };
-        return Json(json!({
-            "ok": deleted,
-            "plan_name": name,
-            "warning": yaml_warning,
-        }));
-    }
-
     Json(json!({"ok": deleted, "plan_name": name}))
+}
+
+/// PUT /admin/plans/default — swap the default plan (key or team flavor).
+/// Body: `{ "plan_name": "name" | null, "team": false }`. `null` clears the
+/// flag without setting a new default. DB flag swap + in-memory pointer in
+/// one step (no reload round-trip).
+#[derive(Debug, Deserialize)]
+pub struct SetDefaultPlanRequest {
+    pub plan_name: Option<String>,
+    #[serde(default)]
+    pub team: bool,
+}
+
+pub async fn set_default_plan(
+    _session: AdminSession,
+    Extension(state): Extension<std::sync::Arc<DashboardState>>,
+    Json(req): Json<SetDefaultPlanRequest>,
+) -> Response {
+    let db_pool = match &state.db_pool {
+        Some(pool) => pool,
+        None => return Json(json!({"error": "Database not available"})).into_response(),
+    };
+    if let Some(ref name) = req.plan_name {
+        if !state.plan_store.list_plans().iter().any(|p| &p.name == name) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("plan '{}' not found", name)})),
+            )
+                .into_response();
+        }
+    }
+    let result = if req.team {
+        boom_limiter::PlanStore::set_default_team_db(db_pool, &state.plan_store, req.plan_name.as_deref()).await
+    } else {
+        boom_limiter::PlanStore::set_default_db(db_pool, &state.plan_store, req.plan_name.as_deref()).await
+    };
+    match result {
+        Ok(true) => Json(json!({
+            "ok": true,
+            "team": req.team,
+            "plan_name": req.plan_name,
+        }))
+        .into_response(),
+        Ok(false) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "plan not found"})),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!("set_default_plan failed: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "Internal error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// PUT /admin/blocklist/enabled — flip the global blocklist switch
+/// (`boom_client_blocklist_state` single row). Body: `{ "enabled": bool }`.
+#[derive(Debug, Deserialize)]
+pub struct SetBlocklistEnabledRequest {
+    pub enabled: bool,
+}
+
+pub async fn set_blocklist_enabled(
+    _session: AdminSession,
+    Extension(state): Extension<std::sync::Arc<DashboardState>>,
+    Json(req): Json<SetBlocklistEnabledRequest>,
+) -> Response {
+    let db_pool = match &state.db_pool {
+        Some(pool) => pool,
+        None => return Json(json!({"error": "Database not available"})).into_response(),
+    };
+    match state
+        .block_rule_store
+        .set_enabled_db(db_pool, req.enabled)
+        .await
+    {
+        Ok(()) => {
+            tracing::info!(enabled = req.enabled, "Blocklist switch updated");
+            Json(json!({"ok": true, "enabled": req.enabled})).into_response()
+        }
+        Err(e) => {
+            tracing::error!("set_blocklist_enabled failed: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "Internal error"})),
+            )
+                .into_response()
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -1076,33 +1149,23 @@ pub async fn assign_key(
         Some(None) => {
             if let Some(ref pool) = state.db_pool {
                 match state.plan_store.assign_key_no_plan_db(pool, &req.key_hash).await {
-                    Ok(()) => {
-                        let yaml_warning = state.persist_yaml_with_reply().await.err();
-                        Json(json!({"ok": true, "warning": yaml_warning})).into_response()
-                    }
+                    Ok(()) => Json(json!({"ok": true})).into_response(),
                     Err(e) => (axum::http::StatusCode::BAD_REQUEST, e).into_response(),
                 }
             } else {
                 state.plan_store.assign_key_no_plan(&req.key_hash);
-                let yaml_warning = state.persist_yaml_with_reply().await.err();
-                Json(json!({"ok": true, "warning": yaml_warning})).into_response()
+                Json(json!({"ok": true})).into_response()
             }
         }
         Some(Some(ref name)) => {
             if let Some(ref pool) = state.db_pool {
                 match state.plan_store.assign_key_db(pool, &req.key_hash, name).await {
-                    Ok(()) => {
-                        let yaml_warning = state.persist_yaml_with_reply().await.err();
-                        Json(json!({"ok": true, "warning": yaml_warning})).into_response()
-                    }
+                    Ok(()) => Json(json!({"ok": true})).into_response(),
                     Err(e) => (axum::http::StatusCode::BAD_REQUEST, e).into_response(),
                 }
             } else {
                 match state.plan_store.assign_key(&req.key_hash, name) {
-                    Ok(()) => {
-                        let yaml_warning = state.persist_yaml_with_reply().await.err();
-                        Json(json!({"ok": true, "warning": yaml_warning})).into_response()
-                    }
+                    Ok(()) => Json(json!({"ok": true})).into_response(),
                     Err(e) => (axum::http::StatusCode::BAD_REQUEST, e).into_response(),
                 }
             }
@@ -1132,11 +1195,6 @@ pub async fn unassign_key(
         state.plan_store.unassign_key(&key_hash)
     };
 
-    if removed {
-        let yaml_warning = state.persist_yaml_with_reply().await.err();
-        return Json(json!({"ok": removed, "warning": yaml_warning}));
-    }
-
     Json(json!({"ok": removed}))
 }
 
@@ -1157,10 +1215,7 @@ pub async fn assign_team_plan(
             .assign_team_db(pool, &req.team_id, &req.plan_name)
             .await
         {
-            Ok(()) => {
-                let yaml_warning = state.persist_yaml_with_reply().await.err();
-                Json(json!({"ok": true, "warning": yaml_warning})).into_response()
-            }
+            Ok(()) => Json(json!({"ok": true})).into_response(),
             Err(e) => (axum::http::StatusCode::BAD_REQUEST, e).into_response(),
         }
     } else {
@@ -1168,10 +1223,7 @@ pub async fn assign_team_plan(
             .plan_store
             .assign_team(&req.team_id, &req.plan_name)
         {
-            Ok(()) => {
-                let yaml_warning = state.persist_yaml_with_reply().await.err();
-                Json(json!({"ok": true, "warning": yaml_warning})).into_response()
-            }
+            Ok(()) => Json(json!({"ok": true})).into_response(),
             Err(e) => (axum::http::StatusCode::BAD_REQUEST, e).into_response(),
         }
     }
@@ -1197,11 +1249,6 @@ pub async fn unassign_team_plan(
     } else {
         state.plan_store.unassign_team(&team_id)
     };
-
-    if removed {
-        let yaml_warning = state.persist_yaml_with_reply().await.err();
-        return Json(json!({"ok": removed, "warning": yaml_warning})).into_response();
-    }
 
     Json(json!({"ok": removed})).into_response()
 }
@@ -2035,6 +2082,151 @@ pub async fn delete_model(
 }
 
 // ═══════════════════════════════════════════════════════════
+// Workflow + cost template management (DB-authoritative)
+// ═══════════════════════════════════════════════════════════
+
+#[derive(Debug, Deserialize)]
+pub struct UpsertWorkflowRequest {
+    pub name: String,
+    /// Raw workflow definition JSON (shape: `WorkflowDefinitionConfig`,
+    /// internally tagged `type: direct_synthesis`). Kept as raw JSON here so
+    /// boom-dashboard doesn't depend on boom-config; boom-main parses and
+    /// validates it against the live routable universe.
+    pub definition: Value,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpsertWorkflowModelRequest {
+    pub model_name: String,
+    pub workflow_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpsertCostTemplateRequest {
+    pub name: String,
+    #[serde(default)]
+    pub input_cost_per_million_tokens: Option<f64>,
+    #[serde(default)]
+    pub cached_input_cost_per_million_tokens: Option<f64>,
+    #[serde(default)]
+    pub output_cost_per_million_tokens: Option<f64>,
+}
+
+/// Send an AdminCommand carrying a `Result<Value, String>` oneshot reply and
+/// await the answer. Shared plumbing for all workflow/cost CRUD handlers.
+async fn exec_admin_json_cmd(
+    state: &std::sync::Arc<DashboardState>,
+    build: impl FnOnce(
+        tokio::sync::oneshot::Sender<Result<Value, String>>,
+    ) -> crate::state::AdminCommand,
+) -> Response {
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    if state.admin_tx.send(build(reply_tx)).await.is_err() {
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "Admin command handler unavailable",
+        )
+            .into_response();
+    }
+    match reply_rx.await {
+        Ok(Ok(value)) => Json(value).into_response(),
+        Ok(Err(msg)) => Json(json!({"error": msg})).into_response(),
+        Err(_) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "Admin command handler dropped reply",
+        )
+            .into_response(),
+    }
+}
+
+/// List workflows as `{"models": {...}, "workflows": {...}}` — the same
+/// `WorkflowSettings` shape the YAML section uses. Reads the in-memory store
+/// (the authoritative view the router registers from).
+pub async fn list_workflows(
+    _session: AdminSession,
+    Extension(state): Extension<std::sync::Arc<DashboardState>>,
+) -> Response {
+    match serde_json::to_value(state.workflow_store.settings()) {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => Json(json!({"error": e.to_string()})).into_response(),
+    }
+}
+
+/// List cost templates as a flat array sorted by name.
+pub async fn list_cost_templates(
+    _session: AdminSession,
+    Extension(state): Extension<std::sync::Arc<DashboardState>>,
+) -> Response {
+    Json(json!({"templates": state.cost_template_store.list()})).into_response()
+}
+
+pub async fn upsert_workflow(
+    _session: AdminSession,
+    Extension(state): Extension<std::sync::Arc<DashboardState>>,
+    Json(req): Json<UpsertWorkflowRequest>,
+) -> Response {
+    exec_admin_json_cmd(&state, |reply| {
+        crate::state::AdminCommand::UpsertWorkflow { req, reply }
+    })
+    .await
+}
+
+pub async fn delete_workflow(
+    _session: AdminSession,
+    Extension(state): Extension<std::sync::Arc<DashboardState>>,
+    Path(name): Path<String>,
+) -> Response {
+    exec_admin_json_cmd(&state, |reply| {
+        crate::state::AdminCommand::DeleteWorkflow { name, reply }
+    })
+    .await
+}
+
+pub async fn upsert_workflow_model(
+    _session: AdminSession,
+    Extension(state): Extension<std::sync::Arc<DashboardState>>,
+    Json(req): Json<UpsertWorkflowModelRequest>,
+) -> Response {
+    exec_admin_json_cmd(&state, |reply| {
+        crate::state::AdminCommand::UpsertWorkflowModel { req, reply }
+    })
+    .await
+}
+
+pub async fn delete_workflow_model(
+    _session: AdminSession,
+    Extension(state): Extension<std::sync::Arc<DashboardState>>,
+    Path(model_name): Path<String>,
+) -> Response {
+    exec_admin_json_cmd(&state, |reply| {
+        crate::state::AdminCommand::DeleteWorkflowModel { model_name, reply }
+    })
+    .await
+}
+
+pub async fn upsert_cost_template(
+    _session: AdminSession,
+    Extension(state): Extension<std::sync::Arc<DashboardState>>,
+    Json(req): Json<UpsertCostTemplateRequest>,
+) -> Response {
+    exec_admin_json_cmd(&state, |reply| {
+        crate::state::AdminCommand::UpsertCostTemplate { req, reply }
+    })
+    .await
+}
+
+pub async fn delete_cost_template(
+    _session: AdminSession,
+    Extension(state): Extension<std::sync::Arc<DashboardState>>,
+    Path(name): Path<String>,
+) -> Response {
+    exec_admin_json_cmd(&state, |reply| {
+        crate::state::AdminCommand::DeleteCostTemplate { name, reply }
+    })
+    .await
+}
+
+// ═══════════════════════════════════════════════════════════
 // Model alias management (DB + memory)
 // ═══════════════════════════════════════════════════════════
 
@@ -2114,11 +2306,9 @@ pub async fn create_alias(
     }
 
     tracing::info!(alias = %req.alias_name, target = %req.target_model, "Alias created");
-    let yaml_warning = state.persist_yaml_with_reply().await.err();
     Json(json!({
         "ok": true,
         "alias_name": req.alias_name,
-        "warning": yaml_warning,
     })).into_response()
 }
 
@@ -2151,10 +2341,7 @@ pub async fn update_alias(
     };
 
     match state.alias_store.update_db(db_pool, &alias_name, &input).await {
-        Ok(true) => {
-            let yaml_warning = state.persist_yaml_with_reply().await.err();
-            Json(json!({"ok": true, "warning": yaml_warning})).into_response()
-        }
+        Ok(true) => Json(json!({"ok": true})).into_response(),
         Ok(false) => Json(json!({"error": "Alias not found"})).into_response(),
         Err(e) => {
             tracing::error!("Dashboard update_alias failed: {}", e);
@@ -2175,14 +2362,27 @@ pub async fn delete_alias(
         }
     };
 
+    // Deleting an alias a workflow references as a panel/aggregator member
+    // would fail the next fusion re-registration ("model is not configured")
+    // and take every workflow down with it — reject up front.
+    let referencing = state.workflow_store.workflows_referencing(&alias_name);
+    if !referencing.is_empty() {
+        return Json(json!({
+            "error": format!(
+                "alias '{}' is referenced by workflow(s) [{}] — remove or edit the workflow(s) first",
+                alias_name,
+                referencing.join(", ")
+            ),
+        }))
+        .into_response();
+    }
+
     match state.alias_store.delete_db(db_pool, &alias_name).await {
         Ok(true) => {
             tracing::info!(alias = %alias_name, "Alias deleted");
-            let yaml_warning = state.persist_yaml_with_reply().await.err();
             Json(json!({
                 "ok": true,
                 "alias_name": alias_name,
-                "warning": yaml_warning,
             })).into_response()
         }
         Ok(false) => Json(json!({"error": "Alias not found"})).into_response(),
@@ -2294,12 +2494,10 @@ pub async fn create_client_block_rule(
     }
 
     tracing::info!(rule = %rule.name, "Client block rule created");
-    let yaml_warning = state.persist_yaml_with_reply().await.err();
     Json(json!({
         "ok": true,
         "name": rule.name,
         "blocklist_enabled": state.block_rule_store.is_enabled(),
-        "warning": yaml_warning,
     }))
     .into_response()
 }
@@ -2329,15 +2527,11 @@ pub async fn update_client_block_rule(
     }
 
     match state.block_rule_store.update_db(db_pool, &rule_name, &input).await {
-        Ok(true) => {
-            let yaml_warning = state.persist_yaml_with_reply().await.err();
-            Json(json!({
-                "ok": true,
-                "blocklist_enabled": state.block_rule_store.is_enabled(),
-                "warning": yaml_warning,
-            }))
-            .into_response()
-        }
+        Ok(true) => Json(json!({
+            "ok": true,
+            "blocklist_enabled": state.block_rule_store.is_enabled(),
+        }))
+        .into_response(),
         Ok(false) => Json(json!({"error": "Rule not found"})).into_response(),
         Err(e) => {
             tracing::error!("Dashboard update_client_block_rule failed: {}", e);
@@ -2361,11 +2555,9 @@ pub async fn delete_client_block_rule(
     match state.block_rule_store.delete_db(db_pool, &rule_name).await {
         Ok(true) => {
             tracing::info!(rule = %rule_name, "Client block rule deleted");
-            let yaml_warning = state.persist_yaml_with_reply().await.err();
             Json(json!({
                 "ok": true,
                 "name": rule_name,
-                "warning": yaml_warning,
             }))
             .into_response()
         }
@@ -3999,6 +4191,74 @@ pub async fn get_config_schema(
     }
 }
 
+/// GET /admin/config/export — download the full current config as YAML.
+/// The document carries real secrets (api_key, master_key) from the DB and
+/// the raw YAML — it is a recovery artifact, not a display view (that's
+/// GetConfig, which masks). Frontend turns it into a Blob download.
+pub async fn export_config(
+    _session: AdminSession,
+    Extension(state): Extension<Arc<DashboardState>>,
+) -> Response {
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    if state
+        .admin_tx
+        .send(crate::state::AdminCommand::ExportConfig { reply: reply_tx })
+        .await
+        .is_err()
+    {
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "Admin command handler unavailable",
+        )
+            .into_response();
+    }
+    match reply_rx.await {
+        Ok(Ok(yaml)) => Json(json!({
+            "filename": "config.yaml",
+            "content": yaml,
+            "mime": "application/yaml",
+        }))
+        .into_response(),
+        Ok(Err(msg)) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, msg).into_response(),
+        Err(_) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "Admin command handler dropped reply",
+        )
+            .into_response(),
+    }
+}
+
+/// POST /admin/config/writeback — write the full current config to the
+/// startup YAML file (rolls a `.bak` first). Manual snapshot refresh for
+/// rollback/disaster recovery; the file goes stale as soon as it returns.
+pub async fn writeback_config(
+    _session: AdminSession,
+    Extension(state): Extension<Arc<DashboardState>>,
+) -> Response {
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    if state
+        .admin_tx
+        .send(crate::state::AdminCommand::WriteBackConfig { reply: reply_tx })
+        .await
+        .is_err()
+    {
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "Admin command handler unavailable",
+        )
+            .into_response();
+    }
+    match reply_rx.await {
+        Ok(Ok(msg)) => Json(json!({"ok": true, "message": msg})).into_response(),
+        Ok(Err(msg)) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, msg).into_response(),
+        Err(_) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "Admin command handler dropped reply",
+        )
+            .into_response(),
+    }
+}
+
 /// PUT /admin/config — surgical section update.
 /// Body: `{ "path": "dotted.path", "value": <json value> }`.
 /// Triggers reload after writing.
@@ -5071,15 +5331,10 @@ pub async fn quota_reset_key(
     let limiter_cleared = state.limiter.clear_for_key(&key_hash);
     match state.limiter.clear_key_all(db_pool, &key_hash).await {
         Ok(snap) => {
-            // Best-effort YAML sync — quota reset itself does not change YAML
-            // sections (model_list/aliases/plans), but we still ping boom-main
-            // to keep behavior consistent with other admin mutations.
-            let yaml_warning = state.persist_yaml_with_reply().await.err();
             tracing::info!(key_hash = %key_hash, limiter_cleared, "Admin reset key quota");
             Json(json!({
                 "key_hash": key_hash,
                 "limiter_windows_cleared": limiter_cleared,
-                "warning": yaml_warning,
                 "previous": {
                     "total_input_tokens": snap.input_tokens,
                     "total_output_tokens": snap.output_tokens,
@@ -5142,13 +5397,11 @@ pub async fn quota_reset_team(
     let member_count = member_keys.len();
     match state.limiter.reset_team_all(db_pool, &team_id, &member_keys).await {
         Ok(()) => {
-            let yaml_warning = state.persist_yaml_with_reply().await.err();
             tracing::info!(team_id = %team_id, member_count, limiter_cleared, "Admin reset team quota");
             Json(json!({
                 "team_id": team_id,
                 "member_keys_reset": member_count,
                 "limiter_windows_cleared": limiter_cleared,
-                "warning": yaml_warning,
             }))
             .into_response()
         }
@@ -5201,13 +5454,11 @@ pub async fn quota_reset_key_cumulative(
         .await
     {
         Ok(snap) => {
-            let yaml_warning = state.persist_yaml_with_reply().await.err();
             tracing::info!(key_hash = %key_hash, team_id = ?team_id, "Admin reset key cumulative");
             Json(json!({
                 "key_hash": key_hash,
                 "team_id": team_id,
                 "scope": "cumulative",
-                "warning": yaml_warning,
                 "previous": {
                     "total_input_tokens": snap.input_tokens,
                     "total_output_tokens": snap.output_tokens,
@@ -5253,14 +5504,12 @@ pub async fn quota_reset_key_windows(
         .await
     {
         Ok(quota_windows_cleared) => {
-            let yaml_warning = state.persist_yaml_with_reply().await.err();
             tracing::info!(key_hash = %key_hash, limiter_cleared, quota_windows_cleared, "Admin reset key windows");
             Json(json!({
                 "key_hash": key_hash,
                 "scope": "windows",
                 "limiter_windows_cleared": limiter_cleared,
                 "quota_windows_cleared": quota_windows_cleared,
-                "warning": yaml_warning,
             }))
             .into_response()
         }
@@ -5310,13 +5559,11 @@ pub async fn quota_reset_team_cumulative(
         .await
     {
         Ok(_) => {
-            let yaml_warning = state.persist_yaml_with_reply().await.err();
             tracing::info!(team_id = %team_id, member_count, "Admin reset team cumulative");
             Json(json!({
                 "team_id": team_id,
                 "scope": "cumulative",
                 "member_keys_reset": member_count,
-                "warning": yaml_warning,
             }))
             .into_response()
         }
@@ -5374,7 +5621,6 @@ pub async fn quota_reset_team_windows(
         .await
     {
         Ok(quota_windows_cleared) => {
-            let yaml_warning = state.persist_yaml_with_reply().await.err();
             tracing::info!(team_id = %team_id, member_count, limiter_cleared, quota_windows_cleared, "Admin reset team windows");
             Json(json!({
                 "team_id": team_id,
@@ -5382,7 +5628,6 @@ pub async fn quota_reset_team_windows(
                 "member_keys_reset": member_count,
                 "limiter_windows_cleared": limiter_cleared,
                 "quota_windows_cleared": quota_windows_cleared,
-                "warning": yaml_warning,
             }))
             .into_response()
         }

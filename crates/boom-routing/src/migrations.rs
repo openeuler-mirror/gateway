@@ -72,3 +72,46 @@ CREATE TABLE IF NOT EXISTS boom_model_alias (
 );
 "#
 }
+
+/// DDL for boom_workflow_definition — one row per named workflow. The
+/// definition body is the serialized `WorkflowDefinitionConfig` (tagged
+/// enum: type + roles) stored as JSONB so new workflow kinds land without
+/// column churn.
+pub fn workflow_definition_ddl() -> &'static str {
+    r#"
+CREATE TABLE IF NOT EXISTS boom_workflow_definition (
+    name       TEXT PRIMARY KEY,
+    definition JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+"#
+}
+
+/// DDL for boom_workflow_model — virtual model name → workflow binding
+/// (the YAML `workflow_settings.models` map, one row per entry).
+pub fn workflow_model_ddl() -> &'static str {
+    r#"
+CREATE TABLE IF NOT EXISTS boom_workflow_model (
+    model_name    TEXT PRIMARY KEY,
+    workflow_name TEXT NOT NULL,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+"#
+}
+
+/// DDL for boom_cost_template — billing rate templates referenced by
+/// `boom_model_deployment.model_info->>'cost_template'`.
+pub fn cost_template_ddl() -> &'static str {
+    r#"
+CREATE TABLE IF NOT EXISTS boom_cost_template (
+    name                                 TEXT PRIMARY KEY,
+    input_cost_per_million_tokens        DOUBLE PRECISION,
+    cached_input_cost_per_million_tokens DOUBLE PRECISION,
+    output_cost_per_million_tokens       DOUBLE PRECISION,
+    created_at                           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at                           TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+"#
+}

@@ -4,7 +4,7 @@ use boom_flowcontrol::FlowController;
 use boom_limiter::{PlanStore, SlidingWindowLimiter};
 use boom_promptlog::PromptLogConfig;
 use boom_promptlog::PromptLogQueryApi;
-use boom_routing::{AliasStore, DeploymentStore, InFlightTracker, KvcSchedulerStats, RebalanceMoveTracker, RequestRateTracker};
+use boom_routing::{AliasStore, CostTemplateStore, DeploymentStore, InFlightTracker, KvcSchedulerStats, RebalanceMoveTracker, RequestRateTracker, WorkflowStore};
 use boom_ctxaware::AgentStatsTracker;
 use dashmap::DashMap;
 use serde_json::Value;
@@ -43,13 +43,42 @@ pub enum AdminCommand {
         id: Uuid,
         reply: oneshot::Sender<Result<Value, String>>,
     },
-    /// Persist runtime state to YAML in place. Reply carries Ok(()) on a
-    /// successful write, or Err(message) when YAML could not be persisted
-    /// (read-only file, disk full, etc.) so the caller can surface a warning
-    /// to the operator — the in-memory + DB state have already been updated
-    /// by the handler, so a YAML write failure must not block the operation.
-    ConfigChanged {
-        reply: oneshot::Sender<Result<(), String>>,
+    /// Save a workflow definition (create or replace). Boom-main parses the
+    /// raw definition JSON against `WorkflowDefinitionConfig`, validates the
+    /// resulting settings snapshot, writes DB, then re-registers fusion.
+    UpsertWorkflow {
+        req: crate::handlers_admin::UpsertWorkflowRequest,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
+    /// Delete a workflow definition. Rejected while model bindings still
+    /// reference it (boom-main checks the live store).
+    DeleteWorkflow {
+        name: String,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
+    /// Bind a virtual model name to a workflow (create or replace).
+    /// Validation runs against the scratch snapshot before any write.
+    UpsertWorkflowModel {
+        req: crate::handlers_admin::UpsertWorkflowModelRequest,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
+    /// Unbind a workflow model (tears down the exclusive deployment).
+    DeleteWorkflowModel {
+        model_name: String,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
+    /// Save a cost template and re-derive the cost rate of every model
+    /// bound to it (`model_info.cost_template = name`).
+    UpsertCostTemplate {
+        req: crate::handlers_admin::UpsertCostTemplateRequest,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
+    /// Delete a cost template. Affected models keep their
+    /// `model_info.cost_template` reference; their rates are re-derived
+    /// (lookup stops resolving → rate clears).
+    DeleteCostTemplate {
+        name: String,
+        reply: oneshot::Sender<Result<Value, String>>,
     },
     /// Hot-reload config.yaml. Reply contains summary message.
     ReloadConfig {
@@ -65,6 +94,21 @@ pub enum AdminCommand {
     /// auto-rendering frontend code.
     GetConfigSchema {
         reply: oneshot::Sender<Result<Value, String>>,
+    },
+    /// Compose the full current config as a YAML document (runtime sections
+    /// from the DB snapshot, everything else verbatim from the raw YAML on
+    /// disk — `${VAR}` references preserved). Reply carries the YAML text.
+    /// Backs the config page's export/download button.
+    ExportConfig {
+        reply: oneshot::Sender<Result<String, String>>,
+    },
+    /// Write the full current config to the startup YAML file (rolls a
+    /// `.bak` first). Manual recovery-snapshot refresh — a rollback seed for
+    /// older binaries and a disaster-recovery artifact, NOT a sync mechanism:
+    /// the file starts going stale the moment this returns. Backs the config
+    /// page's write-back button.
+    WriteBackConfig {
+        reply: oneshot::Sender<Result<String, String>>,
     },
     /// Update a singleton config section (e.g., `server`, `router_settings`)
     /// by replacing it wholesale in the live `config.yaml`. Path is dotted
@@ -153,6 +197,13 @@ pub struct DashboardState {
     pub deployment_store: Arc<DeploymentStore>,
     /// Alias store for alias reads.
     pub alias_store: Arc<AliasStore>,
+    /// Workflow store — list reads + alias-delete guards (workflows can
+    /// reference aliases as panel/aggregator members). Writes go through
+    /// `AdminCommand` (fusion re-registration needs boom-main).
+    pub workflow_store: Arc<WorkflowStore>,
+    /// Cost template store — list reads. Writes go through `AdminCommand`
+    /// (re-rating affected models needs boom-main).
+    pub cost_template_store: Arc<CostTemplateStore>,
     /// In-flight request tracker for real-time stats.
     pub inflight: Arc<InFlightTracker>,
     /// Per-deployment flow controller for real-time stats.
@@ -208,6 +259,8 @@ impl DashboardState {
         limiter: Arc<SlidingWindowLimiter>,
         deployment_store: Arc<DeploymentStore>,
         alias_store: Arc<AliasStore>,
+        workflow_store: Arc<WorkflowStore>,
+        cost_template_store: Arc<CostTemplateStore>,
         inflight: Arc<InFlightTracker>,
         flow_controller: Arc<FlowController>,
         admin_tx: AdminTx,
@@ -236,6 +289,8 @@ impl DashboardState {
             limiter,
             deployment_store,
             alias_store,
+            workflow_store,
+            cost_template_store,
             inflight,
             flow_controller,
             admin_tx,
@@ -255,116 +310,5 @@ impl DashboardState {
             trace,
             alerts,
         }
-    }
-
-    /// Send `ConfigChanged` to boom-main and await the YAML persist result
-    /// with a 5s timeout. Used by alias/plan/config CRUD handlers to surface
-    /// YAML write failures as warnings in the HTTP response — the YAML write
-    /// is best-effort and must not block the primary operation (DB write +
-    /// in-memory update have already succeeded by the time this is called).
-    /// Returns:
-    ///   - `Ok(())` if YAML was persisted successfully
-    ///   - `Err(message)` if YAML write failed (caller should attach warning)
-    ///   - `Err("YAML persist timed out after 5s")` if reply didn't arrive in 5s
-    pub async fn persist_yaml_with_reply(&self) -> Result<(), String> {
-        await_yaml_reply(&self.admin_tx, std::time::Duration::from_secs(5)).await
-    }
-}
-
-/// Free function form of the YAML-persist helper — testable without
-/// constructing a full `DashboardState` (which requires ~15 Arc<dyn> traits).
-/// The behavior under test (channel closed / reply dropped / timeout) is
-/// independent of the rest of `DashboardState`, so we test it at this layer.
-async fn await_yaml_reply(
-    admin_tx: &AdminTx,
-    timeout: std::time::Duration,
-) -> Result<(), String> {
-    let (reply_tx, reply_rx) = oneshot::channel();
-    let cmd = AdminCommand::ConfigChanged { reply: reply_tx };
-    // mpsc send failure means boom-main's admin_command_handler exited —
-    // surface as error so caller responds 500 instead of silent success.
-    if let Err(e) = admin_tx.send(cmd).await {
-        return Err(format!("admin_tx channel closed: {}", e));
-    }
-    match tokio::time::timeout(timeout, reply_rx).await {
-        Ok(Ok(result)) => result,
-        Ok(Err(_)) => Err("admin_command_handler dropped reply channel".to_string()),
-        Err(_) => Err(format!("YAML persist timed out after {}s", timeout.as_secs())),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// When boom-main's admin_command_handler has exited (channel closed),
-    /// `await_yaml_reply` must surface an error so the dashboard handler
-    /// responds 500 — NOT silent success. Otherwise a crash in boom-main
-    /// would let CRUD operations appear to succeed while YAML never syncs.
-    #[tokio::test]
-    async fn await_yaml_reply_returns_err_when_channel_closed() {
-        // Construct a sender whose receiver is immediately dropped. mpsc
-        // send on this returns `SendError` → await_yaml_reply surfaces it.
-        let (admin_tx, _admin_rx) = mpsc::channel::<AdminCommand>(1);
-        drop(_admin_rx);
-
-        let result = await_yaml_reply(&admin_tx, std::time::Duration::from_secs(1)).await;
-        assert!(result.is_err());
-        assert!(
-            result.unwrap_err().contains("channel closed"),
-            "closed-channel error must surface to caller"
-        );
-    }
-
-    /// When boom-main drops the reply channel without responding (e.g.
-    /// panics mid-dispatch), `await_yaml_reply` must surface a distinct
-    /// error so the operator can distinguish it from a YAML write failure.
-    #[tokio::test]
-    async fn await_yaml_reply_returns_err_when_reply_dropped() {
-        let (admin_tx, mut admin_rx) = mpsc::channel::<AdminCommand>(1);
-
-        // Spawn a fake handler that takes the command and drops the reply
-        // without sending — simulates a panic or unexpected early-return
-        // in boom-main's dispatcher arm.
-        tokio::spawn(async move {
-            let _cmd = admin_rx.recv().await;
-            // intentionally drop the oneshot::Sender without replying
-        });
-
-        let result = await_yaml_reply(&admin_tx, std::time::Duration::from_secs(1)).await;
-        assert!(result.is_err());
-        assert!(
-            result.unwrap_err().contains("dropped reply channel"),
-            "dropped-reply error must surface distinctly"
-        );
-    }
-
-    /// Normal path: boom-main responds Ok, await_yaml_reply forwards it.
-    #[tokio::test]
-    async fn await_yaml_reply_forwards_ok() {
-        let (admin_tx, mut admin_rx) = mpsc::channel::<AdminCommand>(1);
-        tokio::spawn(async move {
-            if let Some(AdminCommand::ConfigChanged { reply }) = admin_rx.recv().await {
-                let _ = reply.send(Ok(()));
-            }
-        });
-
-        let result = await_yaml_reply(&admin_tx, std::time::Duration::from_secs(1)).await;
-        assert_eq!(result, Ok(()));
-    }
-
-    /// YAML write failure path: boom-main responds Err(message), await_yaml_reply
-    /// forwards it so the handler can attach to warning field.
-    #[tokio::test]
-    async fn await_yaml_reply_forwards_err() {
-        let (admin_tx, mut admin_rx) = mpsc::channel::<AdminCommand>(1);
-        tokio::spawn(async move {
-            if let Some(AdminCommand::ConfigChanged { reply }) = admin_rx.recv().await {
-                let _ = reply.send(Err("write config: read-only filesystem".to_string()));
-            }
-        });
-
-        let result = await_yaml_reply(&admin_tx, std::time::Duration::from_secs(1)).await;
-        assert_eq!(result, Err("write config: read-only filesystem".to_string()));
     }
 }
