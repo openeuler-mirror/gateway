@@ -6,6 +6,27 @@
 
 ---
 
+## 0. 配置权威模型（先读）
+
+网关配置分两类，权威归属不同：
+
+| 类别 | 内容 | 权威 | 修改方式 |
+|------|------|------|----------|
+| **业务配置** | 模型部署（`model_list`）、模型别名、套餐（`plan_settings`）、默认套餐指针、客户端拦截规则（`client_blocklist`）、Workflow（`workflow_settings`）、计费模板（`cost_templates`） | **DB**（唯一运行时权威） | Dashboard CRUD——写 DB + 直改内存，**写完即生效**，无需 reload |
+| **进程级配置** | `server`、`general_settings`（master_key / database_url）、router 调度参数（`schedule_policy` / `kvc_aware` / `auto_router` 等）、`deployment_health_check`、`prompt_log`、`trace`、`hooks` | **YAML**（+ 热加载） | 改 YAML → SIGHUP / reload API / 面板按钮 |
+
+**YAML 中业务 section 的语义 = 首次 seed + 回滚工件**：
+
+- 只在「业务表全空且无 seed 标记」的全新库首次启动时导入（一次性）；此后完全 inert——手改 YAML + reload **不会生效**，Dashboard 删除的条目也不会被重启复活。
+- 灾备恢复：空库 + 回写按钮生成的 YAML 快照重启即可恢复全部配置。
+- 导出 / 回写按钮在 Dashboard Config 页；生成的文件含明文 secrets（0600），视同备份工件。
+
+**无 YAML 启动（env bootstrap）**：不带 `--config` 且 cwd 无 `config.yaml` 时，设 `BOOM_MASTER_KEY` + `BOOM_DATABASE_URL` 两个环境变量即可启动（业务配置全部来自 DB）。回写按钮可在 cwd 生成完整 `config.yaml`，重启即切换为文件模式。
+
+**无 DB 回退**：未配 `database_url` 时（master-key-only 模式），YAML 业务 section 恢复构建路径——这是部署形态选择（单机 / 无 DB 环境），不是第二权威。
+
+---
+
 ## 1. 功能特性模块说明
 
 本节只描述用户/客户端能直接感知到的能力，内部实现细节不展开。
@@ -69,7 +90,9 @@ model_list:
 | 策略 | 行为 |
 |------|------|
 | `round_robin`（默认） | 轮询，请求均匀分布到所有同名 deployment |
-| `key_affinity` | 会话亲和：同一 API key 的请求尽量固定到同一 deployment，命中本地 KV-cache；当偏好节点利用率比最低负载节点高出 `key_affinity_rebalance_threshold` 个百分点时迁移到最低负载节点；上下文小于 `key_affinity_context_threshold` 字符时跳过亲和、走最低负载（冷启动预热） |
+| `key_affinity` | 会话亲和：同一 API key 的请求尽量固定到同一 deployment，命中本地 KV-cache；当偏好节点利用率比最低负载节点高出 `rebalance_threshold` 个百分点时迁移到最低负载节点；上下文小于 `key_affinity_context_threshold` 字符时跳过亲和、走最低负载（冷启动预热） |
+| `kvc_aware` | 前缀缓存亲和：相同会话前缀（system+tools+messages）的请求路由到已学到该前缀的 worker，命中上游 KV-cache 降低 TTFT。网关侧自学习 trie（512B 块、LRU + TTL 老化），不依赖 vLLM 事件订阅、无需上游改造；冷请求由轮询摊开，过载干预由 `rebalance_threshold` 控制 |
+| `auto_router`（配合项） | 语义路由：客户端请求一个虚拟模型名（如 `model: "auto"`），网关按请求内容（推理链 / 代码 / 工具调用信号）分级 small / medium / large，路由到各档 `target_model`。内置启发式分类，也可外接 ML 分类服务，失败自动回落本地 |
 
 ```yaml
 # 同名多 deployment — 自动负载均衡
@@ -95,7 +118,13 @@ router_settings:
   # 或：会话亲和（自部署推理场景）
   # schedule_policy: key_affinity
   # key_affinity_context_threshold: 2000       # 低于 2000 字符先走最低负载预热
-  # key_affinity_rebalance_threshold: 20       # 偏好节点利用率高出 20% 时迁移
+  # rebalance_threshold: 20                    # 偏好节点利用率高出 20% 时迁移
+
+  # 或：前缀缓存亲和（vLLM 自部署场景，推荐）
+  # schedule_policy: kvc_aware
+  # kvc_aware:
+  #   max_blocks: 500000                       # trie 容量上限（块数），超出 LRU 淘汰
+  #   router_ttl_secs: 1200                    # 自学习块 TTL（秒），0 = 禁用后台扫描
 ```
 
 ### 1.3 模型别名
@@ -312,28 +341,32 @@ prompt_log:
 
 ### 1.11 Web Dashboard
 
-`http://<host>:<port>/dashboard` 提供单页管理面板，使用 master key 登录：
+`http://<host>:<port>/dashboard` 提供单页管理面板，使用 master key 登录（admin 视角，普通 key 登录看自助页）：
 
-- Keys：创建 / 批量创建 / 搜索 / VIP 过滤
+- Stats：请求量 / 成功率 / token 统计图表、实时在途与流控排队（In-Flight）、Agent 类型分布
 - Models：deployment CRUD、流控参数编辑
-- Aliases：别名 CRUD
-- Plans：套餐 CRUD
-- Teams：团队 CRUD 与模型访问控制
-- Assignments：key-plan 分配
+- Workflows：workflow 定义与模型绑定 CRUD（见 1.15）
+- Plans：套餐 CRUD、默认套餐指针
+- Keys：创建 / 批量创建 / 搜索 / VIP 过滤 / 文件导入
+- Quota：配额总览（team 组织）与多维重置
 - Logs：请求日志，支持列过滤
-- In-Flight：实时在途、流控排队
+- Config：进程级配置点路径编辑、客户端拦截规则卡片（见 1.14）、配置导出 / 回写按钮、Reload
+- Stress / Status：系统压力时序、进程状态
 - Debug：错误录制开关与查询
-- Config Reload：一键触发热加载
 
 ### 1.12 热加载（Hot Reload）
 
-修改 YAML 后，三种方式零停机触发热加载（基于 ArcSwap 原子交换）：
+修改 **YAML 进程级配置**（server / router 调度参数 / prompt_log / trace / hooks）后，三种方式零停机触发热加载（基于 ArcSwap 原子交换）：
 
 1. 信号：`kill -HUP <pid>`（仅 Unix）
 2. API：`POST /admin/config/reload`（需 master key）
 3. Dashboard：点击 "Reload Config"
 
+热加载同时与 DB 业务配置做**增量对账**（外部改库 / 多实例场景的收敛机制；面板 CRUD 本身写完即生效，不依赖 reload）。
+
 限流计数器、并发占用、key-plan 分配等运行时状态跨 reload 保留，不丢业务上下文。
+
+> 业务配置（模型 / 套餐 / 别名 / 拦截规则 / workflow / 计费模板）改 YAML **无效**——它们以 DB 为权威，走 Dashboard 管理（见 §0）。
 
 ### 1.13 客户端类型标识
 
@@ -347,6 +380,22 @@ model_list:
       model: anthropic/claude-sonnet-4-20250514
       api_key: ${ANTHROPIC_API_KEY}
 ```
+
+### 1.14 客户端拦截（Client Blocklist）
+
+按「请求头 / 请求体字段 / 提示词内容」匹配并拒绝特定 agent 客户端的请求（如封禁某个客户端版本）。规则与总开关在 Dashboard Config 页管理（DB 权威，写完即生效）；被拒请求记审计日志（`error_type=client_blocked`）并强制写 prompt log 全文。
+
+定位是**运维手段，不是安全边界**——header 与 prompt 都可被客户端伪造，强边界仍是禁用 key / 模型权限。
+
+（seed 配置格式见 §2.2.9）
+
+### 1.15 Direct Synthesis Workflow
+
+客户端请求一个 workflow 模型名（如 `model: "fusion"`），网关并行调用多个 panel 模型、再由 aggregator 合成标准 OpenAI 响应——对客户端表现为一个普通模型。workflow 定义与模型绑定在 Dashboard Workflows 页管理（DB 权威，写完即生效）。
+
+panel / aggregator 引用真实模型名或别名，受与普通模型一致的鉴权和套餐限制；子调用 token usage 聚合计入父请求。
+
+（seed 配置格式见 §2.2.10；设计详见 [docs/direct-synthesis-workflow-design.md](docs/direct-synthesis-workflow-design.md)）
 
 ---
 
@@ -376,6 +425,16 @@ general_settings:
 | `model_list[].litellm_params.api_key` | 顶级 | 上游 API key（OpenAI/Gemini/DeepSeek 等需要） |
 | `general_settings.master_key` | 顶级 | 管理 API 与 Dashboard 登录密钥 |
 
+> 上述 YAML 是**新装机形态**：业务 section 只在空库首次启动时 seed 进 DB（见 §0）。已运行网关的模型增删改走 Dashboard CRUD，不再改 YAML。
+>
+> 也可以完全不用 YAML 启动（业务配置全来自 DB）：
+>
+> ```bash
+> export BOOM_MASTER_KEY="sk-your-master-key"
+> export BOOM_DATABASE_URL="postgres://user:pass@localhost:5432/boom_gateway"
+> ./target/release/boom-gateway
+> ```
+
 > 数据库并非启动硬依赖：未配 `database_url` 时网关可启动，但 key 鉴权、套餐、审计、Dashboard 写操作都依赖 DB，生产环境强烈建议配置。
 
 ### 2.2 选配项
@@ -385,18 +444,18 @@ general_settings:
 | 字段 | 默认值 | 说明 |
 |------|--------|------|
 | `database_url` | `null` | PostgreSQL 连接串。不配则不持久化 key/套餐/日志，仅 master key 鉴权可用 |
-| `store_model_in_db` | `false` | `true` 时 DB 为权威数据源（模型/别名/套餐），YAML 仅首次 seed；`false` 时 YAML 为权威，DB 仅持久化限流状态与 key 分配 |
 | `public_models` | `[]` | 全员可访问的模型列表，绕过 key/team 白名单。不配则所有模型按白名单管控 |
 
 ```yaml
 general_settings:
   master_key: ${MASTER_KEY}             # 必配：管理 API 与 Dashboard 登录密钥
   database_url: ${DATABASE_URL}         # 选配：PostgreSQL 连接串
-  store_model_in_db: false              # 选配：DB 权威模式开关，默认 false
   public_models:                        # 选配：全员可访问模型，默认空
     - gpt-4o-mini
     - deepseek-chat
 ```
+
+> `store_model_in_db`（v2 双模式开关）已废弃：业务配置现在无条件 DB 权威。YAML 中残留该字段会被静默忽略。
 
 #### 2.2.2 server
 
@@ -427,7 +486,8 @@ server:
 | `litellm_params.temperature` | `null` | 温度覆盖 |
 | `litellm_params.max_tokens` | `null` | 最大输出 token 覆盖 |
 | `model_info.id` | `null` | deployment 标识。流控必须配 |
-| `model_info.input_cost_per_token` / `output_cost_per_token` | `null` | 成本统计 |
+| `model_info.input_cost_per_token` / `output_cost_per_token` | `null` | 成本统计（内联定价，一次性配置用） |
+| `model_info.cost_template` | `null` | 引用计费模板名（见 §2.2.11），同名模板覆盖内联价格。多模型共用定价时推荐 |
 | `model_info.quota_count_ratio` | `1` | 配额消耗倍率 |
 | `flow_control.model_queue_limit` | `null`(=无限制) | 最大在途请求数 |
 | `flow_control.model_context_limit` | `null`(=无限制) | 在途输入字符总量上限 |
@@ -483,26 +543,47 @@ model_list:
 
 | 字段 | 默认值 | 说明 |
 |------|--------|------|
-| `schedule_policy`（别名 `routing_strategy`） | `round_robin` | 调度策略：`round_robin` / `key_affinity` |
-| `model_group_alias` | `{}` | 别名映射 |
+| `schedule_policy`（别名 `routing_strategy`） | `round_robin` | 调度策略：`round_robin` / `key_affinity` / `kvc_aware` |
+| `model_group_alias` | `{}` | 别名映射（seed-only；运行期经 Dashboard Models 页别名 CRUD 管理） |
 | `key_affinity_context_threshold` | `0` | key_affinity 下上下文字符阈值，低于此值走最低负载。`0` 表示始终走亲和 |
-| `key_affinity_rebalance_threshold` | `20` | 再均衡阈值（百分比 1..=100），偏好节点利用率高出最低负载此百分比时迁移 |
+| `rebalance_threshold`（兼容旧名 `key_affinity_rebalance_threshold`） | `20` | 再均衡阈值（百分比 1..=100），key_affinity 与 kvc_aware 共用：优选/命中 worker 利用率比最低负载候选高出此百分比时改交最低负载 |
+| `kvc_aware.max_blocks` | `500000` | 前缀 trie 容量上限（块数），超出按 LRU 淘汰最久未访问块 |
+| `kvc_aware.router_ttl_secs` | `1200` | 自学习块 TTL（秒），到期由后台扫描删除。`0` = 禁用 TTL 扫描 |
+| `auto_router.model_name` | `null` | 语义路由虚拟模型名（如 `"auto"`），客户端请求此名触发内容分级 |
+| `auto_router.strategy` | `tier_classifier` | `tier_classifier`（内置启发式）或 `ml_service`（外部 HTTP 分类服务） |
+| `auto_router.default_tier` | `medium` | 分类不确定时的默认档位 |
+| `auto_router.tiers` | — | 档位到目标模型的映射（small / medium / large → `target_model`） |
+| `auto_router.ml_service` | — | `strategy: ml_service` 时的分类服务 `{url, timeout_ms(默认 100)}`；任何失败自动回落 tier_classifier |
 | `enable_priority_header` | `false` | 向上游注入 `X-Gateway-Priority` 头，供下游调度器识别优先级 |
 | `strip_claude_code_attribution` | `false` | 剥离 Claude Code 在 `/v1/messages` 注入的 `x-anthropic-billing-header` 块 |
 
 ```yaml
 router_settings:
   # 调度策略（别名 routing_strategy 也可用）
-  schedule_policy: key_affinity         # round_robin（默认）或 key_affinity
-  key_affinity_context_threshold: 0     # 低于此字符数走最低负载，0 = 始终走亲和
-  key_affinity_rebalance_threshold: 20  # 偏好节点利用率高出 20% 时迁移（1..=100）
+  schedule_policy: kvc_aware            # round_robin（默认）/ key_affinity / kvc_aware
+  rebalance_threshold: 20               # 偏好节点利用率高出 20% 时迁移（1..=100）
 
-  # 模型别名
+  # kvc_aware 参数（仅 schedule_policy: kvc_aware 时生效）
+  kvc_aware:
+    max_blocks: 500000                  # trie 容量上限（块数）
+    router_ttl_secs: 1200               # 自学习块 TTL（秒），0 = 禁用扫描
+
+  # 模型别名（seed-only；运行期走 Dashboard）
   model_group_alias:
     "gpt-4": "gpt-4o"
     "GPT-4o":
       model: "gpt-4o"
       hidden: true
+
+  # 语义路由（可选）：请求 "auto" 触发内容分级
+  # auto_router:
+  #   model_name: "auto"
+  #   strategy: "tier_classifier"       # 或 "ml_service" 外接分类
+  #   default_tier: "medium"
+  #   tiers:
+  #     small:  { target_model: "gpt-4o-mini" }
+  #     medium: { target_model: "gpt-4o" }
+  #     large:  { target_model: "gpt-4o" }
 
   # 向上游注入优先级头（默认 false）
   enable_priority_header: false
@@ -623,20 +704,156 @@ prompt_log:
   excluded_teams: []                    # 默认空：排除的 team_id 列表
 ```
 
+#### 2.2.9 client_blocklist（seed-only）
+
+按请求头 / 请求体字段 / 提示词内容匹配并拒绝特定客户端。规则与总开关运行期以 DB 为权威，经 Dashboard Config 页管理；本 section 仅在全新库首次启动时 seed。
+
+| 字段 | 默认值 | 说明 |
+|------|--------|------|
+| `enabled` | `false` | 总开关，`false` 时热路径直接跳过（运行期经 Dashboard / `PUT /admin/blocklist/enabled` 修改） |
+| `rules[].name` | — | 规则名，唯一（DB 主键） |
+| `rules[].enabled` | `true` | 单规则开关 |
+| `rules[].conditions[]` | — | `{field, op, value}`，规则内多条件 AND |
+| `rules[].action` | 403 | `{status, message, code}` 拒绝响应 |
+
+条件字段寻址：`header.<name>`（大小写不敏感）、`body.<json_pointer>`（如 `body.model`、`body.messages.0.content`，提取值字符串化）、`body`（整个请求体序列化文本）。操作符：`eq` / `contains` / `regex` / `prefix` / `exists`。
+
+```yaml
+client_blocklist:
+  enabled: true
+  rules:
+    - name: block-cursor-agent
+      enabled: true
+      conditions:                       # 规则内多条件 AND
+        - { field: header.user-agent, op: contains, value: "cursor" }
+        - { field: body.model, op: eq, value: "gpt-4o" }
+      action:
+        status: 403
+        message: "该客户端已被禁用，请联系 admin@example.com"
+        code: client_blocked
+```
+
+#### 2.2.10 workflow_settings（seed-only）
+
+Direct Synthesis Workflow 的定义与模型映射。运行期经 Dashboard Workflows 页管理（DB 权威）；本 section 仅首次 seed。
+
+| 字段 | 说明 |
+|------|------|
+| `models` | 客户端模型名 → workflow 名映射（如 `fusion: direct_synthesis`） |
+| `workflows.<name>.type` | workflow 类型，当前仅 `direct_synthesis` |
+| `workflows.<name>.roles.panel[]` | panel 实例列表（≥2 个），每项 `{model, temperature?}` |
+| `workflows.<name>.roles.aggregator` | aggregator 实例（恰 1 个），`{model, temperature?}` |
+| `workflows.<name>.panel_timeout_secs` | panel 调用超时（秒） |
+
+```yaml
+workflow_settings:
+  models:
+    fusion: direct_synthesis            # 客户端请求 model: "fusion" 即触发
+  workflows:
+    direct_synthesis:
+      type: direct_synthesis
+      roles:
+        panel:
+          - { model: gpt-4o-mini }
+          - { model: deepseek-chat, temperature: 0.3 }
+        aggregator: { model: gpt-4o }
+      panel_timeout_secs: 120
+```
+
+校验：panel / aggregator 引用的模型名或别名必须在当前可路由集合内，否则启动 / 保存被拒绝。
+
+#### 2.2.11 cost_templates（seed-only）
+
+计费模板：可复用的模型定价（USD / 1M tokens），由 `model_info.cost_template` 引用。运行期经 Dashboard Config 页管理（DB 权威，改模板会对引用方模型重算费率）；本 section 仅首次 seed。
+
+| 字段 | 说明 |
+|------|------|
+| `name` | 模板名，`model_info.cost_template` 引用此名 |
+| `input_cost_per_million_tokens` | 输入 token 单价（USD / 1M） |
+| `cached_input_cost_per_million_tokens` | KV-cache 命中输入单价（通常为输入价的 1/2） |
+| `output_cost_per_million_tokens` | 输出 token 单价（USD / 1M） |
+
+```yaml
+cost_templates:
+  - name: gpt-4o
+    input_cost_per_million_tokens: 2.5
+    cached_input_cost_per_million_tokens: 1.25
+    output_cost_per_million_tokens: 10.0
+```
+
+#### 2.2.12 hooks（进程级）
+
+pre_auth 钩子：把场景化定制逻辑（key 加前缀、删后缀、查表转换）从 gateway 主体剥离，由业务方自己写 `.so` 接入，网关二进制无需为定制逻辑重编。
+
+| 字段 | 默认值 | 说明 |
+|------|--------|------|
+| `pre_auth.enabled` | `false` | 总开关。整个字段不写等同关闭 |
+| `pre_auth.path` | `""` | `.so` / `.dylib` 绝对路径 |
+| `pre_auth.failure_mode` | `allow` | hook 调用失败（panic / 错误码）时：`allow` = 降级走原生认证；`deny` = 返回 500 |
+| `pre_auth.allowed_headers` | `[]` | 只把这些 header 传给 hook，默认不传 |
+| `pre_auth.config` | `""` | 自由文本，原样传给 hook_init |
+
+hook 返回三种 action：`continue`（原 key 走原生认证）/ `replace`（替换 key 后认证）/ `reject`（401）。编写示例见 `crates/example-hooks/` 与 `hook/README.md`。
+
+```yaml
+hooks:
+  pre_auth:
+    enabled: false
+    path: ""
+    failure_mode: allow
+    allowed_headers: []                 # 如业务需要从 header 取字段: [ucid]
+    config: ""                          # 如 '{"prefix":"sk-customer-"}'
+```
+
+#### 2.2.13 trace（进程级）
+
+OTel trace 链路与 OTLP traces 导出。与 `prompt_log` 相互独立（两通道四组合均支持）。
+
+| 字段 | 默认值 | 说明 |
+|------|--------|------|
+| `enabled` | `false` | 总开关。关闭时不建 span、不上报；`propagate_only` 控制是否仍透传 traceparent |
+| `otlp` | — | OTLP exporter 配置（与 `prompt_log.otlp` 同构）：`endpoint`、`service_name`、`timeout_secs`、`batch_size`、`flush_interval_secs`、`max_attribute_bytes` |
+| `capture_body` | `true` | span 属性包含请求 / 响应体（与 prompt log 共享 body Arc，零拷贝） |
+| `max_body_bytes` | `16384` | body 截断阈值（字节），超出截断并标记 |
+| `propagate_only` | `true` | `enabled=false` 时仍向上游透传 `traceparent` / `tracestate`（W3C proxy 最低义务） |
+| `report_filter` | — | 采样过滤：`{tracestate_keys: [], trace_id_regex: null}`，匹配任一才 trace；两者全空 = 全量 |
+
+```yaml
+trace:
+  enabled: true
+  capture_body: true
+  max_body_bytes: 16384
+  otlp:
+    endpoint: http://otlp-collector:4318
+    service_name: boom-gateway
+  report_filter:
+    tracestate_keys: []                 # 如只 trace 携带某 key 的流量
+    trace_id_regex: null
+```
+
 ---
 
 ## 3. 建议配置项
 
-### 3.1 调度策略建议用 key_affinity
+### 3.1 自部署推理场景建议用 kvc_aware（或 key_affinity）
 
 - **场景**：上游是 vLLM / Ollama 等自部署推理服务，且同一会话多次请求会复用上下文。
-- **收益**：会话粘到同一 worker，命中本地 KV-cache，降低 TTFT 与重算成本。
-- **建议参数**：
+- **收益**：相同会话前缀的请求命中同一 worker 的 KV-cache，降低 TTFT 与重算成本。
+- **建议参数**（前缀缓存亲和，推荐）：
+  ```yaml
+  router_settings:
+    schedule_policy: kvc_aware
+    rebalance_threshold: 20                # 默认即可
+    kvc_aware:
+      max_blocks: 500000                   # 默认即可
+      router_ttl_secs: 1200                # 默认即可
+  ```
+- **或**会话亲和（按 key 粒度粘住，实现更简单）：
   ```yaml
   router_settings:
     schedule_policy: key_affinity
     key_affinity_context_threshold: 2000   # 短上下文先走最低负载预热
-    key_affinity_rebalance_threshold: 20   # 默认即可
+    rebalance_threshold: 20                # 默认即可
   ```
 - **不适用**：上游是 OpenAI/Anthropic 官方 API（无本地 KV 概念），用 `round_robin` 即可。
 
@@ -789,21 +1006,15 @@ curl -X POST http://localhost:4000/dashboard/api/admin/keys \
   -d '{"key_alias": "full-access", "models": ["all-team-models"]}'
 ```
 
-### 4.3 store_model_in_db 模式差异
+### 4.3 YAML 业务 section 是 seed，不是日常配置入口
 
-- `false`（默认）：YAML 是权威，DB 仅持久化限流状态与 key-plan 分配。改配置直接改 YAML + 热加载。
-- `true`：DB 是权威（模型/别名/套餐），YAML 仅首次 seed。后续修改通过 Dashboard 或 Admin API 写 DB，YAML 不再覆盖。
-- 切换模式前确认数据来源，避免 YAML 与 DB 互相覆盖导致配置丢失。
+`model_list` / `plan_settings` / `client_blocklist` / `model_group_alias` / `workflow_settings` / `cost_templates` 在 YAML 中只用于**全新库首次启动导入**（业务表全空且无 seed 标记时一次性 seed，见 §0）。此后这些 section 完全 inert：
 
-```yaml
-# 默认模式：YAML 权威，改配置直接改 YAML + 热加载
-general_settings:
-  store_model_in_db: false
+- 手改 YAML + 热加载**不会生效**（日志会提示 inert，建议改用 Dashboard）；
+- Dashboard 删除的模型 / 套餐**不会**被重启复活（seed 标记防复活）；
+- 运行期的业务配置变更一律走 Dashboard CRUD（写 DB + 直改内存，立即生效）。
 
-# DB 权威模式：YAML 仅首次 seed，后续改 DB
-# general_settings:
-#   store_model_in_db: true
-```
+需要快照 / 灾备工件时用 Dashboard Config 页的「导出」/「回写」按钮；回写生成的 YAML 可用于空库恢复（重启即重新 seed）。
 
 ### 4.4 strip_claude_code_attribution 的反向风险
 
@@ -923,14 +1134,14 @@ CLI 参数：
 
 | 参数 | 说明 |
 |------|------|
-| `-c, --config <PATH>` | 配置文件路径，默认 `config.yaml` |
+| `-c, --config <PATH>` | 配置文件路径。缺省时依次回退：cwd 的 `config.yaml` → env bootstrap（`BOOM_MASTER_KEY` + `BOOM_DATABASE_URL`，两者必需）。指定的文件不存在时同样回退 env bootstrap 并打 warn |
 | `--host <HOST>` | 覆盖配置文件中的 host |
 | `--port <PORT>` | 覆盖配置文件中的 port |
 | `--reboot` | 启动前优雅停止已有实例（见 5.3） |
 
 ### 5.2 配置热加载
 
-修改 YAML 后任选其一：
+修改 YAML **进程级配置**（server / router 调度参数 / prompt_log / trace / hooks）后任选其一：
 
 ```bash
 # 方式 1：SIGHUP（仅 Unix）
@@ -945,12 +1156,12 @@ curl -X POST http://localhost:4000/admin/config/reload \
 
 热加载行为：
 
-- 重新读取 YAML，重建 provider HTTP client（开销低）。
+- 重新读取 YAML **进程级配置**，重建 provider HTTP client（开销低）。
+- 业务配置与 DB 做**增量对账**：内存有 DB 无 → 移除；DB 有内存无或有变化 → 应用；**永不清空 store**。对账失败则中止 reload，旧配置继续服务。
 - 复用 DB 连接池、限流计数器、并发占用、key-plan 分配，**无状态丢失**。
-- 套餐从配置重新加载，`plan_store` 跨 reload 存活。
-- `store_model_in_db: true` 模式：reload 只重新 seed `source='yaml'` 的 DB 行，`source='db'` 的行不动。
-- `store_model_in_db: false` 模式：从 YAML 重建所有 store，再叠加 DB 中 `source='db'` 的行。
 - 原子交换内部状态（ArcSwap），零停机。
+- env bootstrap 模式（无 YAML 启动）下 reload 只做 DB 对账，进程配置保持当前值。
+- YAML 中残留非空业务 section 时打 warn 提示 inert（该改走 Dashboard）。
 
 ### 5.3 --reboot：安全重启
 
@@ -970,14 +1181,12 @@ curl -X POST http://localhost:4000/admin/config/reload \
 
 硬上限 30 秒，正常情况不会触发强杀。适合脚本化部署/CI 滚动更新，避免端口占用与双实例并存。
 
-### 5.4 配置更改建议直接改 YAML
+### 5.4 业务配置走 Dashboard，进程配置走 YAML
 
-- **优先改 YAML + 热加载**，不要依赖 Dashboard 临时改 DB。理由：
-  - `store_model_in_db: false`（默认）模式下，Dashboard 写 DB 的修改在下次 reload 时会被 YAML 覆盖。
-  - YAML 是版本可控的配置源，便于审计与回滚。
-  - Dashboard 改的 `source='db'` 行虽不会被 YAML 覆盖，但分散两处难以维护。
-- `store_model_in_db: true` 模式下，DB 是权威，YAML 仅首次 seed——此时通过 Dashboard/Admin API 改 DB 才是正确路径，但要同步更新 YAML 以保持单点真相。
+- **业务配置**（模型 / 别名 / 套餐 / 默认套餐 / 拦截规则 / workflow / 计费模板）：一律通过 Dashboard（或对应 Admin API）修改。写 DB + 直改内存，**立即可路由**；不写 YAML、不依赖 reload。改 YAML 业务段是无效操作（见 §0 / 4.3）。
+- **进程级配置**（server / router 调度参数 / prompt_log / trace / hooks）：改 YAML + 热加载。YAML 是版本可控的配置源，便于审计与回滚。
 - 改完 YAML **务必热加载**，否则改动不生效。
+- 需要 YAML 形式的业务配置快照（回滚 / 灾备 / 审计）时，用 Dashboard Config 页「导出」下载或「回写」刷新启动文件——这是手动操作，不是同步机制；回退二进制版本前建议先回写一次。
 
 ### 5.5 创建 API Key
 
@@ -1100,14 +1309,34 @@ curl -X POST http://localhost:4000/dashboard/api/admin/limits/reset \
   2. 关闭 DB 连接池，释放连接与表锁。
 - 不要用 `SIGKILL` 强杀，会丢失未落盘的限流计数器（最多丢 10 分钟窗口）。
 
-### 5.12 常见问题速查
+### 5.12 配置快照导出与回写
+
+业务配置的 YAML 快照是**手动操作**（回滚种子 / 灾备工件），在 Dashboard Config 页：
+
+- **导出**（GET `/dashboard/api/admin/config/export`）：DB 全量业务配置 + 原始 YAML 未触碰 section（`${VAR}` 引用保留）→ 浏览器下载，不落盘。
+- **回写**（POST `/dashboard/api/admin/config/writeback`）：同一管道写回启动文件（先滚动 `.bak` 单槽备份）；env bootstrap 模式下在 cwd 生成新 `config.yaml`（0600，secrets 写成 `${BOOM_MASTER_KEY}` / `${BOOM_DATABASE_URL}` 引用），重启即切换为文件模式。
+
+```bash
+# 回写也可用 curl
+curl -X POST http://localhost:4000/dashboard/api/admin/config/writeback \
+  -H "Cookie: boom_session=$JWT"
+```
+
+注意：
+
+- 文件**含明文 secrets**（api_key、master_key），权限 0600，视同备份工件妥善保管。
+- 回写完的文件随即开始过期（业务配置继续在 DB 演进）——它不是同步机制。
+- **升级 / 回退二进制版本前建议先回写一次**：新版本回退老版本时，老二进制按 YAML 权威构建，需要新鲜快照。
+- 灾备恢复：空库 + 快照文件重启 → 自动重新 seed 全部配置。
+
+### 5.13 常见问题速查
 
 | 现象 | 可能原因 | 处理 |
 |------|----------|------|
 | 启动后 key 鉴权全失败 | `database_url` 未配或连不上 | 检查 DB 与连接串 |
-| 改了 YAML 不生效 | 未触发热加载 | `kill -HUP` 或调 reload API |
+| 改了 YAML 进程段不生效 | 未触发热加载 | `kill -HUP` 或调 reload API |
+| 改了 YAML 业务段（模型/套餐等）不生效 | DB 权威：业务段仅首次 seed，之后 inert | 走 Dashboard CRUD 修改 |
 | 同名多 deployment 不均衡 | 上游自身限流或 `key_affinity` 亲和导致 | 切 `round_robin` 验证 |
 | 流控不生效 | 缺 `model_info.id` | 给 deployment 配 id |
 | `--reboot` 找不到老进程 | 二进制名不是 `boom-gateway` | `pgrep -x boom-gateway` 验证 |
-| Dashboard 改的配置 reload 后消失 | `store_model_in_db: false` 模式下 YAML 覆盖 DB | 改 YAML 而非 Dashboard，或切 `true` 模式 |
 | 启动后 prompt 日志目录报错 | `dir` 路径无写权限 | 调整目录权限或换路径 |
