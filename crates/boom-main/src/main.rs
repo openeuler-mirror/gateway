@@ -237,10 +237,6 @@ fn build_router(state: AppState) -> Router {
         .route("/health/live", get(routes::liveness_check))
         .route("/health/ready", get(routes::readiness_check));
 
-    // Internal debug routes (no auth, for ops).
-    let internal_routes = Router::new()
-        .route("/internal/kv-index", get(routes::kv_index_status));
-
     // Admin routes (require master key).
     let admin_routes = Router::new()
         .route("/admin/config/reload", post(routes::admin_reload_config))
@@ -303,7 +299,6 @@ fn build_router(state: AppState) -> Router {
         .merge(llm_routes)
         .merge(api_routes)
         .merge(health_routes)
-        .merge(internal_routes)
         .merge(admin_routes)
         .merge(dashboard_router)
         .with_state(state)

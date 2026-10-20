@@ -14,7 +14,7 @@
 | `/dashboard/api/auth/*` | 无（登录端点） | 账号密码登录 |
 | `/dashboard/api/user/*` | JWT cookie（role=user 或 admin） | 用户自助（仅本人 key） |
 | `/dashboard/api/admin/*` | JWT cookie（必须 role=admin） | 控制面：Keys/Plans/Teams/Models/Aliases/Workflows/Cost-Templates/Blocklist/Logs/Stats/Quota/Config |
-| `/health*`、`/internal/*`、`/dashboard`、`/dashboard/*` 静态资源 | 无 | 健康检查/内部调试/前端 |
+| `/health*`、`/dashboard`、`/dashboard/*` 静态资源 | 无 | 健康检查/前端 |
 
 ### 0.2 环境变量约定
 
@@ -164,14 +164,6 @@ curl $BASE/health
 ### 2.3 Readiness
 
 **GET** `/health/ready` — DB 通则 200，否则 503。
-
-### 2.4 KV Index 调试
-
-**GET** `/internal/kv-index` — 查询 kvc_aware 路由器内部 trie 状态、block 数、model 列表、当前生效配置。
-
-```bash
-curl $BASE/internal/kv-index | jq .
-```
 
 ---
 
@@ -1208,7 +1200,7 @@ curl "$BASE/dashboard/api/admin/stats/agents?range=1h" -H "Cookie: boom_session=
 
 | 路由集合 | 源文件 | 关键函数 |
 |----------|--------|----------|
-| `/v1/*`、`/chat/*`、`/completions`、`/models`、`/admin/*`、`/health*`、`/internal/*` | `boom-main/src/main.rs::build_router` + `boom-main/src/routes.rs` | `chat_completions`、`messages`、`completions`、`list_models`、`get_model`、`health_check`、`admin_reload_config`、`admin_upsert_plan` 等 |
+| `/v1/*`、`/chat/*`、`/completions`、`/models`、`/admin/*`、`/health*` | `boom-main/src/main.rs::build_router` + `boom-main/src/routes.rs` | `chat_completions`、`messages`、`completions`、`list_models`、`get_model`、`health_check`、`admin_reload_config`、`admin_upsert_plan` 等 |
 | `/dashboard/api/auth/*` | `boom-dashboard/src/auth.rs` | `login`、`logout`、`me` |
 | `/dashboard/api/user/*` | `boom-dashboard/src/handlers_user.rs` | `get_plan`、`get_usage`、`get_key_info`、`get_user_logs`、`get_request_status` |
 | `/dashboard/api/admin/plans`、`keys*`、`assignments`、`team-assignments`、`models*`、`aliases*`、`logs`、`teams*`、`stats/*`、`limits/*`、`quota/*`、`config*`、`prompt-log/*`、`debug/*` | `boom-dashboard/src/handlers_admin.rs` | 见文件顶部函数表 |
