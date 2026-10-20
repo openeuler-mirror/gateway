@@ -309,7 +309,10 @@ mod tests {
     #[tokio::test]
     async fn code_request_routes_to_large() {
         let router = make_router();
-        let msgs = make_messages(vec![("user", "debug this code:\n```python\nprint(1)\n```")]);
+        // code block (+0.8) + two debug keywords (+1.0) = 1.8 ≥ 1.5 → large.
+        // A single debug keyword (1.3) lands in medium — that path is covered
+        // by `tool_request_routes_to_medium_or_higher`.
+        let msgs = make_messages(vec![("user", "debug this traceback:\n```python\nprint(1)\n```")]);
         let result = router.classify("auto", &msgs, &None).await;
         assert_eq!(result, Some("large-cup".to_string()));
     }

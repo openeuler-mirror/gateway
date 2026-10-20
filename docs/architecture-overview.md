@@ -158,8 +158,8 @@ PlanCharge::new()      ← check_plan_limits 创建，占用 concurrency 槽
 
 **热加载规则**：
 - SIGHUP / `POST /admin/config/reload` 触发
-- `store_model_in_db=true`：只重新 seed `source='yaml'` 的 DB 行
-- `store_model_in_db=false`：从 YAML 重建所有 store
+- **DB 模式（默认）**：重读 YAML 进程级配置（server / router 调度参数 / prompt_log / trace / hooks），业务配置（模型 / 别名 / 套餐 / 拦截规则 / workflow / 计费模板）与 DB 做**增量对账**（per-key diff：内存有 DB 无 → remove，DB 有内存无或有变化 → apply），永不清空 store；YAML 中的业务 section 完全 inert（手改 + reload 不生效）
+- **无 DB 模式**（master-key-only，未配 `database_url`）：从 YAML 重建 store（部署形态选择，非第二权威）
 - 不得清除运行时计数器（limiter、concurrency、assignment 不受影响）
 - kv_index 是例外（见 §2.3 第三种生命周期）
 
@@ -627,7 +627,7 @@ Trie 的查询是 O(prefix_length)，可以快速给出每个 candidate deployme
 - `boom_rate_limit_state` 通过 DB 共享（粗粒度限流可用）
 - `inflight` / `kv_index` 等内存状态**不共享**（细粒度限流会有误差）
 - `kv_subscriber` 每个 boom-main 实例独立订阅（都会建自己的 Trie）
-- Dashboard 配置变更通过 DB 传播（需配合 SIGHUP / `/admin/config/reload`）
+- 配置传播：单实例内 CRUD 直改内存立即生效；**跨实例**需等其他实例 reload 时与 DB 对账（reload 的增量对账原语即未来 NOTIFY handler 的函数体，全部配置表带 `updated_at` 供比对）
 
 ### 9.3 容器化
 

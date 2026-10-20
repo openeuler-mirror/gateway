@@ -13,7 +13,7 @@
 | `/admin/*`（boom-main 直挂） | API key，且必须等于 master_key | 旧式计划管理与配置热加载（兼容 curl） |
 | `/dashboard/api/auth/*` | 无（登录端点） | 账号密码登录 |
 | `/dashboard/api/user/*` | JWT cookie（role=user 或 admin） | 用户自助（仅本人 key） |
-| `/dashboard/api/admin/*` | JWT cookie（必须 role=admin） | 控制面：Keys/Plans/Teams/Models/Logs/Stats/Quota/Config |
+| `/dashboard/api/admin/*` | JWT cookie（必须 role=admin） | 控制面：Keys/Plans/Teams/Models/Aliases/Workflows/Cost-Templates/Blocklist/Logs/Stats/Quota/Config |
 | `/health*`、`/internal/*`、`/dashboard`、`/dashboard/*` 静态资源 | 无 | 健康检查/内部调试/前端 |
 
 ### 0.2 环境变量约定
@@ -182,7 +182,7 @@ curl $BASE/internal/kv-index | jq .
 
 ### 3.1 配置热加载
 
-**POST** `/admin/config/reload` — 重新读取 `config.yaml`，原子交换运行状态。SIGHUP 等价。
+**POST** `/admin/config/reload` — 重读 YAML 进程级配置（server / router 调度参数 / prompt_log / trace / hooks），并与 DB 业务配置做增量对账（per-key diff，永不清空 store），原子交换运行状态。SIGHUP 等价。注意：业务配置（模型 / 套餐 / 别名 / 拦截 / workflow / 计费模板）以 DB 为权威，Dashboard CRUD 写完即生效，不依赖本端点。
 
 ```bash
 curl -X POST $BASE/admin/config/reload -H "Authorization: Bearer $MASTER"
@@ -372,6 +372,26 @@ curl -X PUT $BASE/dashboard/api/admin/plans \
 
 ```bash
 curl -X DELETE $BASE/dashboard/api/admin/plans/pro -H "Cookie: boom_session=$JWT"
+```
+
+### 6.4 默认套餐指针（default_plan / default_team_plan）
+
+**PUT** `/dashboard/api/admin/plans/default` · admin · body：`{plan_name, team}`
+
+`team=false`（默认）设置 key 维度默认套餐（未显式分配套餐的 key 使用）；`team=true` 设置 team 维度默认套餐。`plan_name` 传 `null` 清除指针（回退无套餐 + `rate_limit.default_rpm`）。两个指针各带部分唯一索引，DB 权威（原 YAML `plan_settings.default_plan` / `default_team_plan` 已迁移至此）。
+
+```bash
+# key 默认套餐
+curl -X PUT $BASE/dashboard/api/admin/plans/default \
+  -H "Cookie: boom_session=$JWT" \
+  -H "Content-Type: application/json" \
+  -d '{"plan_name":"basic","team":false}'
+
+# team 默认套餐
+curl -X PUT $BASE/dashboard/api/admin/plans/default \
+  -H "Cookie: boom_session=$JWT" \
+  -H "Content-Type: application/json" \
+  -d '{"plan_name":"team_basic","team":true}'
 ```
 
 ---
@@ -623,7 +643,7 @@ curl -X POST $BASE/dashboard/api/admin/models \
 
 字段：`model_name`、`litellm_model`、`api_key?`、`api_key_env?(bool)`、`api_base?`、`api_version?`、`aws_region_name?`、`aws_access_key_id?`、`aws_secret_access_key?`、`rpm?`、`tpm?`、`timeout`（默认 1200）、`headers`（默认 `{}`）、`temperature?`、`max_tokens?`、`enabled`（默认 true）、`deployment_id?`、`quota_count_ratio?`、`max_inflight_queue_len?`、`max_context_len?`、`client_type_header`（默认 false）、`serve_not_match`（默认 false）、`model_info?`。
 
-> 写操作走 AdminCommand channel → boom-main 处理 → 写 DB → `persist_config_in_place` 同步 YAML 并触发热加载。响应可能带 `warning` 字段表示 DB 已写但 reload 失败。
+> 写操作走 AdminCommand channel → boom-main 处理：写 DB → 直改内存，立即可路由（不写 YAML、不触发 reload）。YAML 快照的刷新是手动操作（见 16.5 / 16.6 导出与回写）。
 
 ### 10.3 修改
 
@@ -841,13 +861,15 @@ curl $BASE/dashboard/api/admin/config -H "Cookie: boom_session=$JWT" | jq .
 
 ### 16.2 字段 manifest（声明式 UI schema）
 
-**GET** `/dashboard/api/admin/config/schema` · admin — 返回 `model_deployments`、`general_settings`、`router_settings` 三个 FieldMeta 数组（CLAUDE.md §9 单一真相源）。
+**GET** `/dashboard/api/admin/config/schema` · admin — 返回 `model_deployments`、`general_settings`、`router_settings`、`cost_templates`、`workflows` 五组 FieldMeta 数组（CLAUDE.md §9 单一真相源）。每个字段带 `home`（`yaml` / `db`）标注其权威归属——业务字段 home=db（Dashboard CRUD 管理），进程字段 home=yaml（本页 section editor 管理）。
 
 ### 16.3 局部更新（dotted path → 写 YAML → reload）
 
 **PUT** `/dashboard/api/admin/config` · admin · body：`{path, value}`
 
 `path` 为 dotted 路径，如 `router_settings.kvc_aware`、`general_settings.public_models`、`server.port`。`value` 为任意 JSON 可序列化值。会先备份 `config.yaml.bak`，原子写盘后触发热加载。
+
+**黑名单**：以下路径一律拒绝（400，指向 Dashboard CRUD）——`model_list`、`plan_settings`、`client_blocklist`、`router_settings.model_group_alias`、`workflow_settings`、`cost_templates`。这些是 DB 权威的业务配置。env bootstrap 模式（无 YAML 启动）下本端点报错，先用 16.6 回写生成 config.yaml 再重启。
 
 ```bash
 # 调整 kvc_aware 配置
@@ -865,10 +887,31 @@ curl -X PUT $BASE/dashboard/api/admin/config \
 
 ### 16.4 热加载
 
-**POST** `/dashboard/api/admin/config/reload` · admin — 等价于 SIGHUP / `/admin/config/reload`（旧式），走 AdminCommand channel。
+**POST** `/dashboard/api/admin/config/reload` · admin — 等价于 SIGHUP / `/admin/config/reload`（旧式），走 AdminCommand channel。语义：重读 YAML 进程级配置 + 与 DB 业务配置增量对账。
 
 ```bash
 curl -X POST $BASE/dashboard/api/admin/config/reload -H "Cookie: boom_session=$JWT"
+```
+
+### 16.5 导出全量配置（YAML 快照下载）
+
+**GET** `/dashboard/api/admin/config/export` · admin — DB 全量业务配置快照 + 原始 YAML 未触碰的 section（`${VAR}` 引用保留原文）→ JSON 包装 `{filename, content, mime}`，前端转 Blob 下载，不落盘。
+
+**内容含明文 secrets（api_key、master_key）**——下载文件视同备份工件妥善保管。
+
+```bash
+curl $BASE/dashboard/api/admin/config/export -H "Cookie: boom_session=$JWT" | jq -r .content > config.snapshot.yaml
+```
+
+### 16.6 回写配置（刷新启动 YAML）
+
+**POST** `/dashboard/api/admin/config/writeback` · admin — 与 16.5 同一序列化管道，写回启动用的 config.yaml（先滚动 `.bak` 单槽备份）。env bootstrap 模式（无 YAML 启动）下在 cwd 生成新 config.yaml（0600，secrets 写成 `${BOOM_MASTER_KEY}` / `${BOOM_DATABASE_URL}` 引用），重启即切换为文件模式。
+
+**用途 = 回滚种子 / 灾备工件，不是同步语义**：文件写完即开始过期，业务配置的日常变更走 Dashboard CRUD 即时生效。升级 / 回退二进制前建议先回写一次刷新快照。
+
+```bash
+curl -X POST $BASE/dashboard/api/admin/config/writeback -H "Cookie: boom_session=$JWT"
+# → {"ok": true, "message": "Config written back to /etc/boom/config.yaml"}
 ```
 
 ---
@@ -951,7 +994,139 @@ curl $BASE/dashboard/api/admin/debug/errors/$REQUEST_ID -H "Cookie: boom_session
 
 ---
 
-## 19. 静态资源与 SPA（无认证）
+## 19. Admin — Workflows（DB 权威）
+
+> workflow 定义与模型映射存于 `boom_workflow_definition` / `boom_workflow_model`，写操作走 AdminCommand（fusion registry 重建需要 boom-main 的跨模块状态）。写完即生效。
+
+### 19.1 列表
+
+**GET** `/dashboard/api/admin/workflows` · admin — 返回 `{"models": {...}, "workflows": {...}}`，与 YAML `workflow_settings` 同形状（models = 客户端模型名→workflow 名映射，workflows = 定义表）。
+
+```bash
+curl $BASE/dashboard/api/admin/workflows -H "Cookie: boom_session=$JWT"
+```
+
+### 19.2 Upsert 定义
+
+**POST** `/dashboard/api/admin/workflows` · admin · body：`{name, definition}`
+
+`definition` 为 workflow 定义 JSON（`type: direct_synthesis` 内部标签）：`roles.panel`（≥2 个实例，各 `{model, temperature?}`）、`roles.aggregator`（恰 1 个）、`panel_timeout_secs?`。校验：panel/aggregator 引用的模型名或别名必须在当前可路由集合内，否则 400。
+
+```bash
+curl -X POST $BASE/dashboard/api/admin/workflows \
+  -H "Cookie: boom_session=$JWT" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name":"direct_synthesis",
+    "definition":{
+      "type":"direct_synthesis",
+      "roles":{
+        "panel":[{"model":"gpt-4o-mini"},{"model":"deepseek-chat","temperature":0.3}],
+        "aggregator":{"model":"gpt-4o"}
+      },
+      "panel_timeout_secs":120
+    }
+  }'
+```
+
+### 19.3 删除定义
+
+**DELETE** `/dashboard/api/admin/workflows/{name}` · admin — 同时摘除该 workflow 的 fusion 虚拟 deployment。
+
+### 19.4 绑定模型名
+
+**POST** `/dashboard/api/admin/workflow-models` · admin · body：`{model_name, workflow_name}` — 客户端用 `model_name` 请求即触发该 workflow。
+
+```bash
+curl -X POST $BASE/dashboard/api/admin/workflow-models \
+  -H "Cookie: boom_session=$JWT" \
+  -H "Content-Type: application/json" \
+  -d '{"model_name":"fusion","workflow_name":"direct_synthesis"}'
+```
+
+### 19.5 解绑模型名
+
+**DELETE** `/dashboard/api/admin/workflow-models/{model_name}` · admin
+
+---
+
+## 20. Admin — Cost Templates（DB 权威）
+
+> 计费模板存于 `boom_cost_template`，价格单位 USD / 1M tokens。写操作走 AdminCommand：改模板会对其引用方（`model_info.cost_template = name` 的模型）逐个重算 cost_rate。
+
+### 20.1 列表
+
+**GET** `/dashboard/api/admin/cost-templates` · admin — `{"templates": [{name, input_cost_per_million_tokens, cached_input_cost_per_million_tokens, output_cost_per_million_tokens}]}`
+
+### 20.2 Upsert
+
+**POST** `/dashboard/api/admin/cost-templates` · admin · body：`{name, input_cost_per_million_tokens?, cached_input_cost_per_million_tokens?, output_cost_per_million_tokens?}` — 未设的维度不计费。
+
+```bash
+curl -X POST $BASE/dashboard/api/admin/cost-templates \
+  -H "Cookie: boom_session=$JWT" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"gpt-4o","input_cost_per_million_tokens":2.5,"cached_input_cost_per_million_tokens":1.25,"output_cost_per_million_tokens":10.0}'
+```
+
+### 20.3 删除
+
+**DELETE** `/dashboard/api/admin/cost-templates/{name}` · admin — 引用该模板的模型费率归零（不删除模型）。
+
+---
+
+## 21. Admin — Client Blocklist（DB 权威）
+
+> 客户端拦截规则存于 `boom_client_block_rule`，总开关存于 `boom_client_blocklist_state`（单行）。规则在认证之后、模型权限检查之前执行，被拒请求记审计日志并强制写 prompt log 全文。定位是运维手段而非安全边界（header 与 prompt 都可伪造）。
+
+### 21.1 规则列表
+
+**GET** `/dashboard/api/admin/client-block-rules` · admin — 返回规则数组 + `blocklist_enabled` 总开关状态。
+
+### 21.2 创建规则
+
+**POST** `/dashboard/api/admin/client-block-rules` · admin · body：`{name, enabled?, conditions, action}`
+
+- `conditions[]`：`{field, op, value}`。字段寻址：`header.<name>`（大小写不敏感）、`body.<json_pointer>`（如 `body.model` / `body.messages.0.content`）、`body`（整个请求体序列化文本）。操作符：`eq` / `contains` / `regex` / `prefix` / `exists`。规则内多条件 AND。
+- `action`：`{status?=403, message?, code?="client_blocked"}`。
+- 服务端先校验（regex 编译、字段语法、status 范围）再写库，非法规则 400。
+
+```bash
+curl -X POST $BASE/dashboard/api/admin/client-block-rules \
+  -H "Cookie: boom_session=$JWT" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name":"block-cursor-agent",
+    "enabled":true,
+    "conditions":[
+      {"field":"header.user-agent","op":"contains","value":"cursor"}
+    ],
+    "action":{"status":403,"message":"该客户端已被禁用，请联系 admin@example.com"}
+  }'
+```
+
+### 21.3 修改规则
+
+**PUT** `/dashboard/api/admin/client-block-rules/{rule_name}` · admin · body 同 21.2
+
+### 21.4 删除规则
+
+**DELETE** `/dashboard/api/admin/client-block-rules/{rule_name}` · admin
+
+### 21.5 总开关
+
+**PUT** `/dashboard/api/admin/blocklist/enabled` · admin · body：`{enabled: bool}` — 写 `boom_client_blocklist_state` 单行表，立即生效（原 YAML `client_blocklist.enabled` 已迁移至此）。
+
+```bash
+curl -X PUT $BASE/dashboard/api/admin/blocklist/enabled \
+  -H "Cookie: boom_session=$JWT" \
+  -H "Content-Type: application/json" \
+  -d '{"enabled":true}'
+```
+
+---
+
+## 22. 静态资源与 SPA（无认证）
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
@@ -966,9 +1141,9 @@ curl $BASE/dashboard/api/admin/debug/errors/$REQUEST_ID -H "Cookie: boom_session
 
 ---
 
-## 20. 速查 · 典型工作流
+## 23. 速查 · 典型工作流
 
-### 20.1 创建用户 key 并立即拿 JWT
+### 23.1 创建用户 key 并立即拿 JWT
 
 ```bash
 # 1) admin 登录拿 cookie
@@ -998,7 +1173,7 @@ USERJWT=$(curl -i -X POST $BASE/dashboard/api/auth/login \
 curl $BASE/dashboard/api/user/plan -H "Cookie: boom_session=$USERJWT"
 ```
 
-### 20.2 排查 429 / 限流
+### 23.2 排查 429 / 限流
 
 ```bash
 # 看某 key 当前窗口状态
@@ -1011,7 +1186,7 @@ curl -X POST $BASE/dashboard/api/admin/quota/reset/key/$KEYHASH/windows -H "Cook
 curl -X POST $BASE/dashboard/api/admin/quota/reset/key/$KEYHASH -H "Cookie: boom_session=$JWT"
 ```
 
-### 20.3 改路由策略并热加载
+### 23.3 改路由策略并热加载
 
 ```bash
 curl -X PUT $BASE/dashboard/api/admin/config \
@@ -1020,7 +1195,7 @@ curl -X PUT $BASE/dashboard/api/admin/config \
 # 内部自动 reload，无需额外触发
 ```
 
-### 20.4 看最近 1 小时请求分布
+### 23.4 看最近 1 小时请求分布
 
 ```bash
 curl "$BASE/dashboard/api/admin/stats/request_rate?range=1h" -H "Cookie: boom_session=$JWT" | jq .

@@ -9,6 +9,80 @@ use crate::rebalance::RebalanceMoveTracker;
 use super::load_helpers::{deployment_load, should_rebalance};
 use super::{SchedulePolicy, Selection};
 
+// ── Global scheduling counters (debug page) ───────────────────────────────
+
+/// Process-lifetime counters for kvc_aware scheduling decisions.
+///
+/// Held at AppState top level (survives config reloads — the policy itself is
+/// recreated on every reload, so per-policy fields would reset). The policy
+/// holds a clone of the Arc; `None` in unit tests.
+///
+/// Counted at every `select_with_context` exit that produces a real routing
+/// decision, so `total == affinity + cold + lowest_load + rebalance` always
+/// holds. Exits that make no decision are NOT counted: the single-candidate
+/// short-circuit and `select()` (no prefix context).
+#[derive(Default)]
+pub struct KvcSchedulerStats {
+    total: AtomicU64,
+    /// Final pick by prefix affinity score (hit > 0, no rebalance handoff).
+    affinity: AtomicU64,
+    /// All candidates cold (hit == 0) — spread by round-robin tie-break.
+    cold: AtomicU64,
+    /// Degraded: empty prefix or candidates without kv_worker_id →
+    /// lowest-load pick.
+    lowest_load: AtomicU64,
+    /// Winner handed off to the least-loaded candidate (rebalance_threshold
+    /// exceeded).
+    rebalance: AtomicU64,
+}
+
+/// Serializable point-in-time snapshot. Field names are the dashboard API
+/// contract (`GET /admin/stats/kvc-scheduler`).
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct KvcSchedulerStatsSnapshot {
+    pub total: u64,
+    pub affinity: u64,
+    pub cold: u64,
+    pub lowest_load: u64,
+    pub rebalance: u64,
+}
+
+impl KvcSchedulerStats {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn record_affinity(&self) {
+        self.total.fetch_add(1, Ordering::Relaxed);
+        self.affinity.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_cold(&self) {
+        self.total.fetch_add(1, Ordering::Relaxed);
+        self.cold.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_lowest_load(&self) {
+        self.total.fetch_add(1, Ordering::Relaxed);
+        self.lowest_load.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_rebalance(&self) {
+        self.total.fetch_add(1, Ordering::Relaxed);
+        self.rebalance.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> KvcSchedulerStatsSnapshot {
+        KvcSchedulerStatsSnapshot {
+            total: self.total.load(Ordering::Relaxed),
+            affinity: self.affinity.load(Ordering::Relaxed),
+            cold: self.cold.load(Ordering::Relaxed),
+            lowest_load: self.lowest_load.load(Ordering::Relaxed),
+            rebalance: self.rebalance.load(Ordering::Relaxed),
+        }
+    }
+}
+
 /// KV-cache aware scheduling policy (self-contained, no vLLM event dependency).
 ///
 /// Scores every candidate on ONE axis — prefix affinity:
@@ -42,6 +116,9 @@ pub struct KvcAwarePolicy {
     /// Optional tracker for rebalance-move counters (Debug page "Rebalance Moves").
     /// Records (from, to) deployment ids on each capacity rebalance handoff.
     rebalance_move_tracker: Option<Arc<RebalanceMoveTracker>>,
+    /// Global scheduling counters (Debug page "KVC Scheduler Stats").
+    /// AppState-owned Arc — survives reloads, unlike the policy itself.
+    stats: Option<Arc<KvcSchedulerStats>>,
 }
 
 impl KvcAwarePolicy {
@@ -49,6 +126,7 @@ impl KvcAwarePolicy {
         kv_index: Arc<dyn KvIndexBackend>,
         tracker: Arc<InFlightTracker>,
         rebalance_move_tracker: Option<Arc<RebalanceMoveTracker>>,
+        stats: Option<Arc<KvcSchedulerStats>>,
     ) -> Self {
         Self {
             kv_index,
@@ -57,6 +135,7 @@ impl KvcAwarePolicy {
             rebalance_threshold: 100,
             tie_counter: AtomicU64::new(0),
             rebalance_move_tracker,
+            stats,
         }
     }
 
@@ -120,6 +199,9 @@ impl SchedulePolicy for KvcAwarePolicy {
         // the trie being learned from prior requests; an empty prefix can't
         // learn or match, so load-balanced pick is the right call.
         if prefix_bytes.is_empty() {
+            if let Some(ref stats) = self.stats {
+                stats.record_lowest_load();
+            }
             let provider = select_lowest_load(&self.tracker, &self.queue_info, model, candidates);
             tracing::info!(
                 model,
@@ -138,6 +220,9 @@ impl SchedulePolicy for KvcAwarePolicy {
             .collect();
 
         if cand_worker_ids.is_empty() {
+            if let Some(ref stats) = self.stats {
+                stats.record_lowest_load();
+            }
             tracing::debug!(model, "no kv_worker_id on candidates, fallback to lowest-load");
             return select_lowest_load(&self.tracker, &self.queue_info, model, candidates)
                 .map(|provider| Selection { provider, kv_hit_ratio: 0.0, kv_hit_blocks: 0, kv_input_blocks: 0, kv_match_attempted: false, degraded: false });
@@ -279,6 +364,7 @@ impl SchedulePolicy for KvcAwarePolicy {
         // Disabled when rebalance_threshold >= 100. Only runs on the
         // non-degraded path (degraded = empty prefix → lowest_load, returns
         // early before this stage).
+        let mut rebalanced = false;
         let winner = if self.rebalance_threshold < 100 {
             let load_winner = winner.load_pct;
             let least_loaded = scored
@@ -286,6 +372,7 @@ impl SchedulePolicy for KvcAwarePolicy {
                 .min_by_key(|s| s.load_pct)
                 .expect("scored non-empty (overload fallback returns earlier)");
             if should_rebalance(load_winner, least_loaded.load_pct, self.rebalance_threshold) {
+                rebalanced = true;
                 if let Some(ref tracker) = self.rebalance_move_tracker {
                     tracker.record_move(
                         winner.provider.deployment_id(),
@@ -308,6 +395,20 @@ impl SchedulePolicy for KvcAwarePolicy {
         } else {
             winner
         };
+
+        // Global counters (debug page): classify the final pick. The invariant
+        // total == affinity + cold + lowest_load + rebalance holds because the
+        // two lowest-load exits above return early and each count exactly one
+        // category here.
+        if let Some(ref stats) = self.stats {
+            if rebalanced {
+                stats.record_rebalance();
+            } else if winner.hit > 0.0 {
+                stats.record_affinity();
+            } else {
+                stats.record_cold();
+            }
+        }
 
         // Distinguish an affinity pick (some prefix matched) from a cold/load
         // pick (no candidate had any cache for this request) — same selection
@@ -363,3 +464,178 @@ impl SchedulePolicy for KvcAwarePolicy {
 }
 
 use super::load_helpers::select_lowest_load;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::inflight::{InFlightGuard, InFlightTracker};
+    use crate::rebalance::RebalanceMoveTracker;
+    use async_trait::async_trait;
+    use boom_core::kv_event::{GatewayKvEvent, KvMatchResult};
+    use boom_core::types::{ChatCompletionRequest, ChatCompletionResponse};
+    use boom_core::GatewayError;
+    use std::collections::HashMap;
+
+    /// Minimal Provider fake — only the identity surface the policy reads.
+    struct FakeProvider {
+        dep: &'static str,
+        worker: &'static str,
+    }
+
+    #[async_trait]
+    impl Provider for FakeProvider {
+        async fn chat(
+            &self,
+            _request: ChatCompletionRequest,
+        ) -> Result<ChatCompletionResponse, GatewayError> {
+            unimplemented!("stats test only inspects counters")
+        }
+        async fn chat_stream(
+            &self,
+            _request: ChatCompletionRequest,
+        ) -> Result<boom_core::types::ChatStream, GatewayError> {
+            unimplemented!()
+        }
+        fn name(&self) -> &str {
+            "fake"
+        }
+        fn models(&self) -> &[String] {
+            &[]
+        }
+        fn deployment_id(&self) -> Option<&str> {
+            Some(self.dep)
+        }
+        fn kv_worker_id(&self) -> Option<&str> {
+            Some(self.worker)
+        }
+    }
+
+    /// Canned KV index: worker → (hit_ratio, match_depth) regardless of the
+    /// queried prefix. Only `find_matches` carries signal for these tests.
+    struct FakeIndex {
+        hits: HashMap<String, (f64, u64)>,
+    }
+
+    impl KvIndexBackend for FakeIndex {
+        fn apply_event(&self, _event: &GatewayKvEvent) {}
+        fn find_matches(
+            &self,
+            _model: &str,
+            _prefix_bytes: &[u8],
+            candidate_worker_ids: &[String],
+        ) -> Vec<KvMatchResult> {
+            candidate_worker_ids
+                .iter()
+                .filter_map(|w| {
+                    self.hits.get(w).map(|(hr, d)| KvMatchResult {
+                        worker_id: w.clone(),
+                        match_depth: *d,
+                        total_blocks: 4,
+                        hit_ratio: *hr,
+                        load_score: 0.0,
+                        combined_score: *hr,
+                    })
+                })
+                .collect()
+        }
+        fn remove_worker(&self, _worker_id: &str) {}
+        fn block_count(&self) -> usize {
+            0
+        }
+        fn model_names(&self) -> std::collections::HashSet<String> {
+            std::collections::HashSet::new()
+        }
+        fn debug_dump(
+            &self,
+        ) -> Vec<(String, u64, Vec<String>, boom_core::kv_event::StorageTier, u64)> {
+            Vec::new()
+        }
+    }
+
+    fn two_candidates() -> Vec<Arc<dyn Provider>> {
+        vec![
+            Arc::new(FakeProvider { dep: "d1", worker: "w1" }) as Arc<dyn Provider>,
+            Arc::new(FakeProvider { dep: "d2", worker: "w2" }) as Arc<dyn Provider>,
+        ]
+    }
+
+    fn make_policy(
+        hits: HashMap<String, (f64, u64)>,
+        threshold: u64,
+    ) -> (KvcAwarePolicy, Arc<InFlightTracker>, Arc<KvcSchedulerStats>) {
+        let stats = Arc::new(KvcSchedulerStats::new());
+        let tracker = Arc::new(InFlightTracker::new());
+        let mut policy = KvcAwarePolicy::new(
+            Arc::new(FakeIndex { hits }),
+            tracker.clone(),
+            Some(Arc::new(RebalanceMoveTracker::new())),
+            Some(stats.clone()),
+        );
+        policy.set_rebalance_threshold(threshold);
+        (policy, tracker, stats)
+    }
+
+    const PREFIX: &[u8] = b"0123456789abcdef";
+
+    #[test]
+    fn test_stats_affinity_pick() {
+        let (policy, _tracker, stats) = make_policy(HashMap::from([("w1".into(), (0.5, 2))]), 100);
+        let sel = policy
+            .select_with_context("m", &two_candidates(), None, 0, PREFIX)
+            .expect("selection");
+        assert_eq!(sel.kv_hit_ratio, 0.5);
+        assert_eq!(sel.kv_hit_blocks, 2);
+        let s = stats.snapshot();
+        assert_eq!((s.total, s.affinity, s.cold, s.lowest_load, s.rebalance), (1, 1, 0, 0, 0));
+    }
+
+    #[test]
+    fn test_stats_cold_pick() {
+        let (policy, _tracker, stats) = make_policy(HashMap::new(), 100);
+        let sel = policy
+            .select_with_context("m", &two_candidates(), None, 0, PREFIX)
+            .expect("selection");
+        assert_eq!(sel.kv_hit_ratio, 0.0);
+        assert!(sel.kv_match_attempted);
+        let s = stats.snapshot();
+        assert_eq!((s.total, s.affinity, s.cold, s.lowest_load, s.rebalance), (1, 0, 1, 0, 0));
+    }
+
+    #[test]
+    fn test_stats_empty_prefix_lowest_load() {
+        let (policy, _tracker, stats) = make_policy(HashMap::new(), 100);
+        let sel = policy
+            .select_with_context("m", &two_candidates(), None, 0, &[])
+            .expect("selection");
+        assert!(sel.degraded);
+        let s = stats.snapshot();
+        assert_eq!((s.total, s.affinity, s.cold, s.lowest_load, s.rebalance), (1, 0, 0, 1, 0));
+    }
+
+    #[test]
+    fn test_stats_rebalance_handoff() {
+        // w1 owns the prefix (affinity winner) but is loaded 30 vs w2's 0;
+        // threshold 20 → hand off to w2.
+        let (policy, tracker, stats) = make_policy(HashMap::from([("w1".into(), (0.5, 2))]), 20);
+        let _guards: Vec<_> = (0..30)
+            .map(|_| InFlightGuard::new_for_deployment(tracker.clone(), "m", "d1", 0))
+            .collect();
+        let sel = policy
+            .select_with_context("m", &two_candidates(), None, 0, PREFIX)
+            .expect("selection");
+        assert_eq!(sel.provider.deployment_id(), Some("d2"));
+        let s = stats.snapshot();
+        assert_eq!((s.total, s.affinity, s.cold, s.lowest_load, s.rebalance), (1, 0, 0, 0, 1));
+    }
+
+    #[test]
+    fn test_stats_single_candidate_not_counted() {
+        let (policy, _tracker, stats) = make_policy(HashMap::from([("w1".into(), (1.0, 4))]), 100);
+        let one = vec![Arc::new(FakeProvider { dep: "d1", worker: "w1" }) as Arc<dyn Provider>];
+        let sel = policy
+            .select_with_context("m", &one, None, 0, PREFIX)
+            .expect("selection");
+        assert!(!sel.kv_match_attempted);
+        assert_eq!(stats.snapshot().total, 0, "no decision made — not counted");
+    }
+}

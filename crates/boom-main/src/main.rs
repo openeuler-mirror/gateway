@@ -1,9 +1,11 @@
 mod admin_command;
 mod alert_reconciler;
+mod config_reconcile;
 mod extractor;
 mod health_monitor;
 mod hooks;
 mod kvc;
+mod migrations;
 mod request_log;
 mod rewrite;
 mod routes;
@@ -30,9 +32,13 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[derive(Parser, Debug)]
 #[command(name = "boom-gateway", about = "BooMGateway — High-performance LLM API Gateway")]
 struct Args {
-    /// Path to config YAML file.
-    #[arg(short, long, default_value = "config.yaml")]
-    config: String,
+    /// Path to config YAML file. When omitted (or when the file does not
+    /// exist), the gateway bootstraps from environment: BOOM_MASTER_KEY +
+    /// BOOM_DATABASE_URL are required and business config is loaded from
+    /// the database. A conventional ./config.yaml in the working directory
+    /// is still picked up when --config is not given.
+    #[arg(short, long)]
+    config: Option<String>,
 
     /// Bind host (overrides config file).
     #[arg(long)]
@@ -60,11 +66,34 @@ fn main() -> anyhow::Result<()> {
         graceful_restart(args.port)?;
     }
 
-    // Load config sync, before the runtime is built — `server.workers` is the
-    // single source of truth for the tokio worker thread count. Previously
-    // this was hardcoded to 32 via the `#[tokio::main(worker_threads = 32)]`
-    // attribute and the config field was a zombie.
-    let config = boom_config::load_config(&args.config)?;
+    // Resolve the config source, sync, before the runtime is built —
+    // `server.workers` is the single source of truth for the tokio worker
+    // thread count. Precedence: explicit --config path → conventional
+    // ./config.yaml → env-only bootstrap (no YAML file: BOOM_MASTER_KEY +
+    // BOOM_DATABASE_URL, business config from the database).
+    let config_path: Option<String> = match &args.config {
+        Some(p) if std::path::Path::new(p).exists() => Some(p.clone()),
+        Some(p) => {
+            tracing::warn!(
+                "Config file '{}' not found — falling back to environment bootstrap \
+                 (BOOM_MASTER_KEY / BOOM_DATABASE_URL)",
+                p
+            );
+            None
+        }
+        None => {
+            if std::path::Path::new("config.yaml").exists() {
+                Some("config.yaml".to_string())
+            } else {
+                None
+            }
+        }
+    };
+
+    let config = match &config_path {
+        Some(p) => boom_config::load_config(p)?,
+        None => boom_config::bootstrap_from_env()?,
+    };
     let worker_count = config.server.workers.max(1);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -73,16 +102,20 @@ fn main() -> anyhow::Result<()> {
         .build()
         .map_err(|e| anyhow::anyhow!("failed to build tokio runtime: {}", e))?;
 
-    runtime.block_on(async_main(args, config))
+    runtime.block_on(async_main(args, config, config_path))
 }
 
-async fn async_main(args: Args, config: boom_config::Config) -> anyhow::Result<()> {
+async fn async_main(
+    args: Args,
+    config: boom_config::Config,
+    config_path: Option<String>,
+) -> anyhow::Result<()> {
     // CLI overrides.
     let host = args.host.unwrap_or(config.server.host.clone());
     let port = args.port.unwrap_or(config.server.port);
 
     // Build state (connects DB, initializes providers).
-    let mut state = AppState::from_config(config, args.config.clone()).await?;
+    let mut state = AppState::from_config(config, config_path).await?;
 
     // Shutdown broadcast channel: send once to cancel all background tasks.
     let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
@@ -244,6 +277,8 @@ fn build_router(state: AppState) -> Router {
         state.limiter.clone(),
         state.deployment_store.clone(),
         state.alias_store.clone(),
+        state.workflow_store.clone(),
+        state.cost_template_store.clone(),
         state.inflight.clone(),
         state.flow_controller.clone(),
         admin_tx,
@@ -251,6 +286,7 @@ fn build_router(state: AppState) -> Router {
         state.debug_store.clone(),
         state.prompt_log_query.clone(),
         state.rebalance_move_tracker.clone(),
+        state.kvc_stats.clone(),
         state.request_rate.clone(),
         state.agent_stats.clone(),
         key_alias_lookup,

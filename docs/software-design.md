@@ -53,7 +53,7 @@
 | PlanCharge | 一次请求的配额占用状态机（peek→commit→settle） |
 | KVC | KV-cache 前缀亲和调度（kvc_aware），网关侧自学习前缀 trie |
 | fusion | 虚拟 Provider 编排（panel 多模型并行 + aggregator 聚合） |
-| 三数据源 | YAML（声明式真相源）/ DB（运行期权威）/ 内存（路由唯一来源） |
+| 三数据源 | DB（唯一运行时权威）/ YAML（进程级配置 + 首次 seed + 回滚工件）/ 内存（DB 的缓存，路由唯一来源） |
 
 ---
 
@@ -113,7 +113,7 @@ boom-trace      → leaf crate，Dashboard 经 boom-core::TraceApi（Arc<dyn Tra
 | 任务 | 周期 | 职责 |
 |------|------|------|
 | SIGHUP listener | 事件驱动 | 触发 reload（单槽 Mutex 防重入） |
-| admin_command_handler | channel 驱动 | 消费 AdminCommand（14 变体） |
+| admin_command_handler | channel 驱动 | 消费 AdminCommand（21 变体） |
 | 限流计数器/分配快照落库 | 600s | sync_counters_to_db / sync_assignments / cleanup_expired |
 | 请求量汇总日志 | 60s | request_count 分钟级摘要 |
 | FlowController 周期派发 | 1s | 防空闲容量滞留 |
@@ -265,29 +265,29 @@ boom-trace      → leaf crate，Dashboard 经 boom-core::TraceApi（Arc<dyn Tra
 | F9.4 | 管理端 — 密钥与团队 | 密钥 CRUD/批量/导入/block、团队 CRUD、plan 分配（key/team） | boom-dashboard | /admin/keys、/admin/teams、/admin/assignments |
 | F9.5 | 管理端 — 配额运维 | plan CRUD、配额总览四视图、7 个重置端点、用量查询 | boom-dashboard | /admin/plans、/admin/quota/* |
 | F9.6 | 管理端 — 可观测 | 统计图表（时间窗 1h/4h/8h/24h/custom，1h 走内存 tracker 其余 SQL 聚合，百分位 percentile_cont）、日志、异常检测、压力时序、trace snapshot、prompt-log 查询与 OTLP 探活 | boom-dashboard | /admin/stats、/admin/logs、/trace/*、/prompt-log/* |
-| F9.7 | 写操作解耦 | 模型/配置/promptlog 写经 AdminCommand（14 变体）mpsc → boom-main 执行；ConfigChanged 带 reply channel，YAML 写失败 surface 为响应 `warning` 字段（主操作已成功不转 error） | boom-dashboard / boom-main | AdminCommand enum + admin_command_handler |
-| F9.8 | 前端 SPA | 内嵌静态资源；用户页三视图（overview/chat 调试/logs）+ 管理页九区（stats/debug/models/plans/keys/config/stress/quota/logs，hash 路由）；en/zh 双语 i18n（data-i18n + localStorage）；统一写操作确认弹窗 | boom-dashboard | frontend/（index.html / app.js / i18n.js） |
+| F9.7 | 写操作解耦 | 模型/配置/workflow/计费模板/promptlog 写经 AdminCommand（21 变体）mpsc → boom-main 执行（fusion 重建、cost_rate 重算等需要跨模块状态的写操作只能在这里做）；无任何自动 YAML 回写 | boom-dashboard / boom-main | AdminCommand enum + admin_command_handler |
+| F9.8 | 前端 SPA | 内嵌静态资源；用户页三视图（overview/chat 调试/logs）+ 管理页十一区（stats/models/workflows/plans/keys/quota/logs/config/stress/status/debug，hash 路由；客户端拦截规则卡片在 Config 页内）；en/zh 双语 i18n（data-i18n + localStorage）；统一写操作确认弹窗 | boom-dashboard | frontend/（index.html / app.js / i18n.js） |
 | F9.9 | DB 池隔离 | Dashboard 专用 max=3 连接池，与转发主池（max=30）隔离，重型聚合查询不饿死转发 | boom-dashboard / boom-main | DashboardState.db_pool |
 
 ### F10 配置管理
 
 | 编号 | 子功能模块 | 功能描述 | 承载 | 关键实现 |
 |------|-----------|----------|------|----------|
-| F10.1 | YAML schema | 顶层：model_list / general_settings / router_settings / workflow_settings / server / rate_limit / plan_settings / cost_templates / deployment_health_check / prompt_log / trace / hooks（litellm proxy_server_config 格式兼容） | boom-config | Config（lib.rs:31-65） |
+| F10.1 | YAML schema | 顶层：model_list / general_settings / router_settings / workflow_settings / server / rate_limit / plan_settings / cost_templates / deployment_health_check / prompt_log / trace / hooks（litellm proxy_server_config 格式兼容）。其中 model_list / workflow_settings / plan_settings / cost_templates / client_blocklist / model_group_alias 为 **seed-only**（仅全新库首次导入，此后 inert）；general_settings.store_model_in_db 已废弃 | boom-config | Config（lib.rs:31-65） |
 | F10.2 | 环境变量展开 | 双语法 `${VAR}` / `os.environ/VAR`；解析前全文展开 + 解析后敏感字段二次展开；`read_raw_yaml` **不展开**（Web 读-改-写保留 secret 引用不泄露磁盘） | boom-config | resolve_env_vars |
 | F10.3 | Secret 保护 | 13 个敏感字段名脱敏 `****`（null 保留区分未配置）；`write_yaml_atomic` truncate 原地写 + fsync（兼容容器 bind mount） | boom-config | mask_secrets_in_place |
-| F10.4 | 三数据源模型 | YAML=声明式真相源 + 启动种子（reload 绝对胜出）；DB=运行期权威 + 多实例共享；内存=路由唯一来源 + 最大服务兜底（YAML/DB 均失败仍按内存服务） | 全局 | CLAUDE.md §7 |
-| F10.5 | 热加载 | 触发：SIGHUP / POST /admin/config/reload / Dashboard 按钮 / UpdateConfigSection 后自动；60s 总超时 + catch_unwind（失败旧 inner 继续路由）；流程：重读 YAML → 重连 DB（如 URL 变）→ 重建三 store → kv_index 签名比对（不变保留学习成果，变了重建空 trie）→ 重建调度策略 → sync_yaml_to_db（15s 超时）→ 叠加 DB-only 行 → 注册 fusion → 清孤儿分配 → promptlog/OTLP 热更 → ArcSwap 原子换入；**不清除任何运行时计数器** | boom-main | reload_inner（state.rs:446-642） |
-| F10.6 | CRUD 写路径（五步规范） | ① DB 写 → ② 直改内存（立即可路由，不依赖 YAML/reload）→ ③ best-effort 写 YAML（失败仅 warn）→ ④ 响应带 warning 字段提示运维修复 → ⑤ handler 不调 reload()（reload 是 YAML→内存单向覆盖，会中断路由） | boom-main / boom-dashboard | §5.4 详述 |
-| F10.7 | manifest 单一真相源 | FieldMeta（field/section/input_type/label_key/tip_key）登记 deployment/general/router 全部字段；`GET /admin/config/schema` 透出前端；编译期强制测试：结构体字段未注册 / SQL 漏列 / manifest 重复即编译失败 | boom-config / boom-routing | manifest.rs + deployment_store 测试 |
-| F10.8 | 配置快照回写 | build_config_snapshot_value：从 DB 读全量组装 JSON（含 normalize 旧 JSONB 形状），persist_config_in_place 先 .bak 备份只改运行时段落，保留 `${VAR}` 原文 | boom-main | state.rs:1655-1905 |
+| F10.4 | 配置权威模型 | **DB=唯一运行时权威**（模型/别名/套餐/拦截/workflow/计费模板，多实例共享面）；YAML=进程级配置 + 首次 seed 源 + 回滚工件（业务 section 标记存在即 inert）；内存=DB 的缓存（路由唯一来源 + 最大服务兜底）；无 DB 模式（master-key-only）YAML 构建路径保留（部署形态选择） | 全局 | CLAUDE.md §7 |
+| F10.5 | 热加载 | 触发：SIGHUP / POST /admin/config/reload / Dashboard 按钮 / UpdateConfigSection 后自动；60s 总超时 + catch_unwind（失败旧 inner 继续路由）；流程：重读 YAML 进程段（env bootstrap 模式保持当前进程配置）→ 重连 DB（如 URL 变）→ 业务配置**增量对账**（per-key diff，永不清空 store；对账失败中止 reload）→ kv_index 签名比对（不变保留学习成果，变了重建空 trie）→ 重建调度策略 → 注册 fusion → promptlog/OTLP 热更 → ArcSwap 原子换入；**不清除任何运行时计数器** | boom-main | reload_inner + config_reconcile.rs |
+| F10.6 | CRUD 写路径（两步规范） | ① DB 写 → ② 直改内存（reload_model_deployments / store 内存方法，立即可路由）；无 YAML 回写、无 warning 字段、handler 不调 reload()；YAML 快照刷新是手动操作（见 F10.8） | boom-main / boom-dashboard | §5.4 详述 |
+| F10.7 | manifest 单一真相源 | FieldMeta（field/section/input_type/label_key/tip_key/**home**）登记 deployment/general/router/cost-template/workflow 全部字段；`home`（yaml/db）是 §7 权威拆分的字段级登记；`GET /admin/config/schema` 透出前端；编译期强制测试：结构体字段未注册 / SQL 漏列 / manifest 重复 / home 与权威拆分不符即编译失败 | boom-config / boom-routing | manifest.rs + deployment_store 测试 |
+| F10.8 | 配置快照工具（手动） | 导出按钮（GET config/export）：DB 快照 + 原始 YAML 未触碰 section（保留 `${VAR}`）→ 下载不落盘；回写按钮（POST config/writeback）：同管道写回启动文件（先 .bak 单槽备份；env bootstrap 模式在 cwd 生成新 config.yaml，0600，secrets 写成 `${BOOM_*}` 引用）；用途=回滚种子/灾备工件，非同步语义 | boom-main | export_config_yaml + persist_config_in_place |
 | F10.9 | 配置校验 | 分节 validate（KvcAwareSettings 语义校验：权重 ∈[0,1] 且和 ≤1、overload 1..=100、ttl 防 Duration panic；workflow 引用闭环；rebalance_threshold 1..=100；schedule 重叠检测） | boom-config / boom-limiter | validate() 族 |
 
 ### F11 运行与运维
 
 | 编号 | 子功能模块 | 功能描述 | 承载 | 关键实现 |
 |------|-----------|----------|------|----------|
-| F11.1 | 启动 | clap：--config（默认 config.yaml）/ --host / --port / --reboot；config.server.workers 决定 tokio 线程数；DB 未配置进入 master-key-only 模式 | boom-main | main.rs:40-151 |
+| F11.1 | 启动 | clap：--config（可选；缺省用 cwd config.yaml，文件不存在时回退 env bootstrap——`BOOM_MASTER_KEY` + `BOOM_DATABASE_URL` 两 env 必需，业务配置全部来自 DB）/ --host / --port / --reboot；config.server.workers 决定 tokio 线程数；DB 未配置进入 master-key-only 模式 | boom-main | main.rs:40-151 |
 | F11.2 | 健康端点 | /health（版本/uptime/db 状态/模型数/reload 次数）、/health/live、/health/ready（DB 配置未连上 503） | boom-main | routes.rs:1277 |
 | F11.3 | 优雅停机 | CtrlC/SIGTERM → broadcast 通知全部后台任务 → 关 DB 池 → prompt-log OTLP best-effort flush | boom-main | main.rs:120-148 |
 | F11.4 | --reboot 自替换 | pgrep 旧进程 SIGTERM，用 /health 探测区分"优雅退出中"与"冻结"，冻结则 SIGKILL | boom-main | main.rs:692-778 |
@@ -300,7 +300,7 @@ boom-trace      → leaf crate，Dashboard 经 boom-core::TraceApi（Arc<dyn Tra
 
 ## 4. 数据设计
 
-### 4.1 数据库表总表（11 张）
+### 4.1 数据库表总表（17 张）
 
 | 表 | 所有者（DDL） | 用途 | 关键列 |
 |----|--------------|------|--------|
@@ -308,13 +308,19 @@ boom-trace      → leaf crate，Dashboard 经 boom-core::TraceApi（Arc<dyn Tra
 | boom_team_table | boom-dashboard | 团队 | team_id、team_alias、models |
 | boom_model_deployment | boom-routing | 模型部署 | DEPLOYMENT_CORE_COLUMNS 24 用户列 + id/source(yaml\|db)/auto_disabled/created_at/updated_at |
 | boom_model_alias | boom-routing | 模型别名 | alias_name(PK)、target_model、hidden、source |
-| boom_rate_limit_plan | boom-limiter | 套餐定义 | name、type、member_plan、concurrency/rpm/tpm、window_limits、total_*、schedule、is_default（唯一索引） |
+| boom_workflow_definition | boom-routing | workflow 定义（DB 权威） | name(PK)、definition(JSONB, WorkflowDefinitionConfig)、created_at/updated_at |
+| boom_workflow_model | boom-routing | 客户端模型名→workflow 映射 | model_name(PK)、workflow_name、created_at/updated_at |
+| boom_cost_template | boom-routing | 计费模板（USD/1M tokens） | name(PK)、input/cached_input/output_cost_per_million_tokens、created_at/updated_at |
+| boom_rate_limit_plan | boom-limiter | 套餐定义 | name、type、member_plan、concurrency/rpm/tpm、window_limits、total_*、schedule、is_default + is_default_team（各带部分唯一索引） |
 | boom_key_plan_assignment | boom-limiter | key→plan（三态：NULL=显式无） | key_hash、plan_name |
 | boom_team_plan_assignment | boom-limiter | team→plan | team_id、plan_name |
 | boom_rate_limit_state | boom-limiter | 滑窗计数器持久化 | cache_key、counts/tokens/costs_micros、window_start/secs |
 | boom_rate_limit_cumulative | boom-limiter | 累计配额（6 维） | scope/scope_id/kind/value_micros |
+| boom_client_block_rule | boom-gatekeeper | 客户端拦截规则 | name(PK)、enabled、conditions(JSONB)、action(JSONB) |
+| boom_client_blocklist_state | boom-gatekeeper | 拦截总开关（单行） | enabled |
 | boom_request_log | boom-audit | 请求审计（25 列） | request_id、key/team、model、deployment_id、status、tokens 三列、duration/ttft/queue_wait、kv 指标、client_ip |
 | boom_config | boom-dashboard | 通用 KV 配置（JSONB） | key、value |
+| boom_config_meta | boom-main | seed 幂等标记（唯一例外：表属启动编排层） | key(PK)、value(JSONB, seeded_by)、updated_at |
 
 ### 4.2 内存状态（三种生命周期）
 
@@ -323,6 +329,7 @@ AppState (Clone, 进程生命)
  ├─ inner: Arc<ArcSwap<AppStateInner>>     ① 热替换：config + auth + hooks + health
  ├─ db_pool(30) / dashboard_db_pool(3) / log_writer 池(8)   ② 跨 reload 存活
  ├─ deployment_store / alias_store / plan_store / limiter
+ ├─ workflow_store / cost_template_store / block_rule_store
  ├─ router / inflight / flow_controller / request_count
  ├─ debug_store / prompt_log_writer / rebalance_move_tracker
  ├─ request_rate / agent_stats / stressmon / trace
@@ -375,16 +382,16 @@ AppState (Clone, 进程生命)
 
 ### 5.3 热加载流程
 
-见 F10.5。安全保证：60s timeout + catch_unwind（SIGHUP 永不 hang 死进程）；早期 Err 不 swap 旧 inner 继续路由；慢 DB 步骤 15s 超时包装。已知权衡（场景 D）：YAML 只读时 CRUD 写 DB 成功但 reload 会以旧 YAML 覆盖删除 source='db' 新行——显式选择"YAML 绝对胜出"，经响应 warning 字段提示运维修复。
+见 F10.5。安全保证：60s timeout + catch_unwind（SIGHUP 永不 hang 死进程）；早期 Err 不 swap 旧 inner 继续路由；对账失败同样中止 reload（旧 inner 继续路由）。历史上的"场景 D"（YAML 只读时 CRUD 写 DB 被 reload 反杀）已随 DB 权威化消亡：reload 不再以 YAML 覆盖 DB，业务配置只做增量对账。
 
-### 5.4 CRUD 写路径（五步规范）
+### 5.4 CRUD 写路径（两步规范）
 
 ```
-DB 写（store.*_db）
- → 内存直改（reload_model_deployments / store 内存方法）★立即可路由，不依赖 YAML
- → best-effort 写 YAML（persist_yaml_with_reply，失败仅 warn）
- → 响应（YAML 失败 → warning 字段，不转 error）
- （handler 不调 reload()——reload 是 YAML→内存单向覆盖，会清 store 中断路由）
+DB 写（store.*_db / AdminCommand handler 内 SQL）
+ → 内存直改（reload_model_deployments / store 内存方法）★立即可路由
+ （无 YAML 回写、无 warning 字段、handler 不调 reload()——
+   reload 是对账 + 策略重建，CRUD 已直改内存再 reload 反而违反
+   "最大服务能力"原则；YAML 快照刷新是手动操作，见 F10.8）
 ```
 
 ### 5.5 健康自愈闭环
@@ -476,8 +483,8 @@ DB 写（store.*_db）
 | Dashboard 不依赖 provider/config | 写操作本质是意图声明，由 boom-main（拥有全部模块访问权）解释执行；保护编译边界与职责边界 |
 | boom-promptlog 零依赖 | 纯 IO 组件可独立复用、编译隔离 |
 | manifest + 编译期测试 | 字段 5 处同步靠人必然腐化，用编译失败当 forcing function |
-| CRUD 直改内存而非 reload | reload 是 YAML→内存单向覆盖会中断路由；"DB 写成功 → 立即可路由"是运行期权威语义 |
-| 场景 D 权衡（YAML 只读 + DB 写） | YAML 绝对胜出是显式选择，代价经 warning 字段透明化，不静默丢配置 |
+| CRUD 直改内存而非 reload | reload 是对账 + 策略重建而非写路径；"DB 写成功 → 立即可路由"是运行期权威语义 |
+| DB 权威而非 YAML 双权威 | 单一可写面（AdminCommand）+ 增量对账原语 + seed 幂等标记，为多实例演进留结构；YAML 降级为 seed 源 + 回滚工件，消除"reload 反杀 CRUD"（原场景 D）与双源漂移 |
 | 并发限制走 plan 而非 litellm 列 | boom_verification_token.max_parallel_requests 为兼容死列，实际并发由 plan.concurrency_limit 执行（单一执行体系避免双轨） |
 
 ---

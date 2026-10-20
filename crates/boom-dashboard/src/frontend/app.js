@@ -153,6 +153,10 @@
       // Re-render visible dynamic content so t() picks up the new language.
       onRoute();
       onUserRoute();
+      // KVC AWARE pane blocks render their own labels via t() — reload
+      // them if the pane is visible so they aren't stuck in the old language.
+      const activePane = document.querySelector(".debug-pane.active");
+      if (activePane && activePane.dataset.pane === "kvc") loadKvcAwarePane();
       // User sidebar title is dynamic (key alias), not in the i18n dict —
       // re-apply after applyI18n() so it isn't stuck on the default label.
       applyUserSidebarTitle();
@@ -439,17 +443,26 @@
       stopTraceOtlpStatusPoll();
     }
     if (section === "admin-models") loadModels();
+    // else if (section === "admin-workflows") loadWorkflows(); // workflow page disabled
     else if (section === "admin-plans") loadPlans();
     else if (section === "admin-keys") { setupKeysSearch(); loadKeys(); }
     else if (section === "admin-quota") loadQuota();
     else if (section === "admin-logs") { setupLogsFilters(); loadLogs(); }
-    else if (section === "admin-debug") { setupDebugSubtabs(); setupAnomalyControls(); setupTracePane(); loadAgentStats(); loadRebalanceMoves(); loadKvcDfx(); loadAuditLogStats(); }
+    else if (section === "admin-debug") {
+      setupDebugSubtabs(); setupAnomalyControls(); setupTracePane();
+      loadAgentStats(); loadAuditLogStats();
+      // KVC AWARE pane content loads on pane entry; the active pane
+      // persists across section re-entries, so refresh it if visible.
+      const activePane = document.querySelector(".debug-pane.active");
+      if (activePane && activePane.dataset.pane === "kvc") loadKvcAwarePane();
+    }
     else if (section === "admin-config") loadConfigPage();
   }
 
   function sectionFromHash(hash) {
     if (hash.includes("/admin/stats")) return "admin-stats";
     if (hash.includes("/admin/models")) return "admin-models";
+    // if (hash.includes("/admin/workflows")) return "admin-workflows"; // workflow page disabled
     if (hash.includes("/admin/plans")) return "admin-plans";
     if (hash.includes("/admin/keys")) return "admin-keys";
     if (hash.includes("/admin/quota")) return "admin-quota";
@@ -1156,6 +1169,7 @@
   const rangeState = {
     agent: { range: "1h", from: null, to: null },
     rate:  { range: "1h", from: null, to: null },
+    kvc:   { range: "1h", from: null, to: null },
   };
 
   function buildStatsUrl(base, target) {
@@ -1201,6 +1215,7 @@
     });
     rangeState[target] = { range, from: null, to: null };
     if (target === "agent") loadAgentStats();
+    else if (target === "kvc") loadKvcCalibration();
     else loadRequestRateStats();
   }
 
@@ -1227,7 +1242,9 @@
     controls.querySelectorAll(".btn-range").forEach((b) => {
       b.classList.toggle("active", b.dataset.range === "custom");
     });
-    if (target === "agent") loadAgentStats(); else loadRequestRateStats();
+    if (target === "agent") loadAgentStats();
+    else if (target === "kvc") loadKvcCalibration();
+    else loadRequestRateStats();
   }
 
   function toLocalDatetimeLocal(d) {
@@ -1371,6 +1388,190 @@
     wrap.innerHTML = html || ("<p>" + t("common.no_records") + "</p>");
   }
 
+  // ── KVC Scheduler Stats (global counters, lifetime cumulative) ──
+  async function loadKvcStats() {
+    try {
+      const data = await api("/admin/stats/kvc-scheduler");
+      renderKvcStats(data || {});
+    } catch (err) {
+      console.error("loadKvcStats error:", err);
+    }
+  }
+
+  function renderKvcStats(data) {
+    const wrap = document.getElementById("kvc-stats-wrap");
+    if (!wrap) return;
+    const total = Number(data.total || 0);
+    const affinity = Number(data.affinity || 0);
+    const cold = Number(data.cold || 0);
+    const lowest = Number(data.lowest_load || 0);
+    const rebalance = Number(data.rebalance || 0);
+    if (!total) {
+      wrap.innerHTML = '<p class="muted">' + t("debug.kvc_stats.no_data") + '</p>';
+      return;
+    }
+    const fallback = cold + lowest;
+    const cell = (label, val, cls) =>
+      '<div class="kcs-cell' + (cls ? " " + cls : "") + '">' +
+        '<div class="kcs-value">' + val.toLocaleString() + '</div>' +
+        '<div class="kcs-label">' + esc(label) + '</div>' +
+      '</div>';
+    wrap.innerHTML =
+      '<div class="kcs-grid">' +
+        cell(t("debug.kvc_stats.total"), total) +
+        cell(t("debug.kvc_stats.fallback"), fallback, "kcs-warn") +
+        cell(t("debug.kvc_stats.rebalance"), rebalance, "kcs-warn") +
+      '</div>' +
+      '<p class="kcs-breakdown">' + t("debug.kvc_stats.breakdown", {
+        affinity: affinity.toLocaleString(),
+        cold: cold.toLocaleString(),
+        lowest: lowest.toLocaleString(),
+        fallback: fallback.toLocaleString(),
+      }) + '</p>';
+  }
+
+  // ── KVC Hit Calibration (predicted trie hit vs actual cached_tokens) ──
+  // Loads every block on the KVC AWARE pane. Called on pane entry and
+  // on language re-render while the pane is visible; nothing is polled.
+  function loadKvcAwarePane() {
+    loadKvcStats();
+    loadRebalanceMoves();
+    loadKvcCalibration();
+    loadKvcDfx();
+  }
+
+  async function loadKvcCalibration() {
+    const wrap = document.getElementById("kvc-calib-wrap");
+    if (!wrap) return; // pane not rendered
+    wrap.innerHTML = '<p class="loading">' + t("common.loading") + '</p>';
+    try {
+      const data = await api(buildStatsUrl("/admin/stats/kvc-calibration", "kvc"));
+      renderKvcCalibration(data || {});
+    } catch (err) {
+      console.error("loadKvcCalibration error:", err);
+    }
+  }
+
+  function renderKvcCalibration(data) {
+    const wrap = document.getElementById("kvc-calib-wrap");
+    if (!wrap) return;
+    const summary = data.summary || {};
+    const n = Number(summary.n || 0);
+    setRangeWindowNote("kvc", data.window && data.window.from, data.window && data.window.to);
+    if (!n) {
+      wrap.innerHTML = '<p class="muted">' + t("debug.calib.no_data") + '</p>';
+      return;
+    }
+
+    const predRatio = Number(summary.avg_pred_ratio || 0);
+    const actualRatio = Number(summary.avg_actual_ratio || 0);
+    const delta = actualRatio - predRatio;
+    const overN = Number(summary.over_n || 0);
+    const underN = Number(summary.under_n || 0);
+    const diagN = Number(summary.diag_n || 0);
+    const excluded = Number(data.excluded || 0);
+    const pct = (x) => (x * 100).toFixed(1) + "%";
+
+    const card = (label, value, hint, cls) =>
+      '<div class="agent-summary-card">' +
+        '<div class="agent-summary-label">' + esc(label) + '</div>' +
+        '<div class="agent-summary-value' + (cls ? " " + cls : "") + '">' + value + '</div>' +
+        (hint ? '<div class="calib-card-hint">' + hint + '</div>' : '') +
+      '</div>';
+    const deltaPt = (delta >= 0 ? "+" : "") + (delta * 100).toFixed(1) + "pt";
+    const deltaCls = Math.abs(delta) <= 0.10 ? "calib-ok" : "calib-warn";
+    const summaryHtml =
+      '<div class="agent-summary">' +
+        card(t("debug.calib.requests"), n.toLocaleString(),
+             excluded ? t("debug.calib.excluded_hint", { n: excluded.toLocaleString() }) : "") +
+        card(t("debug.calib.pred_avg"), pct(predRatio)) +
+        card(t("debug.calib.actual_avg"), pct(actualRatio)) +
+        card(t("debug.calib.delta"), deltaPt, null, deltaCls) +
+        card(t("debug.calib.in_band"), pct(diagN / n)) +
+        card(t("debug.calib.over_under"), pct(overN / n) + " / " + pct(underN / n)) +
+      '</div>';
+
+    // Joint grid → heatmap. x = pred_bin, y = actual_bin (top = high actual).
+    const grid = data.grid || [];
+    const cellN = new Map(); // key: actual_bin*10 + pred_bin
+    let maxN = 0;
+    const predMarg = new Array(10).fill(0);
+    const actualMarg = new Array(10).fill(0);
+    grid.forEach((c) => {
+      const cnt = Number(c.n || 0);
+      if (!cnt) return;
+      const pb = Math.min(9, Math.max(0, Number(c.pred_bin)));
+      const ab = Math.min(9, Math.max(0, Number(c.actual_bin)));
+      cellN.set(ab * 10 + pb, (cellN.get(ab * 10 + pb) || 0) + cnt);
+      predMarg[pb] += cnt;
+      actualMarg[ab] += cnt;
+      if (cnt > maxN) maxN = cnt;
+    });
+
+    const binLabel = (b) => (b < 9 ? b * 10 + "–" + (b * 10 + 10) + "%" : "90%+");
+    const heatCells = [];
+    for (let ab = 9; ab >= 0; ab--) {
+      const yLabel = '<div class="calib-ylabel">' + ab * 10 + "%" + '</div>';
+      const rowCells = [];
+      for (let pb = 0; pb < 10; pb++) {
+        const cnt = cellN.get(ab * 10 + pb) || 0;
+        let style = "";
+        let cls = "calib-cell";
+        if (cnt > 0) {
+          const alpha = 0.08 + 0.92 * (Math.log(1 + cnt) / Math.log(1 + maxN));
+          style = ' style="background:rgba(56,132,255,' + alpha.toFixed(3) + ')"';
+        }
+        if (ab === pb) cls += " calib-diag";
+        rowCells.push('<div class="' + cls + '"' + style +
+          ' title="pred ' + binLabel(pb) + ' × actual ' + binLabel(ab) + ': ' +
+          cnt.toLocaleString() + '"></div>');
+      }
+      heatCells.push(yLabel + rowCells.join(""));
+    }
+    heatCells.push('<div class="calib-corner"></div>');
+    for (let pb = 0; pb < 10; pb++) {
+      heatCells.push('<div class="calib-xlabel">' + pb * 10 + (pb === 9 ? "%+" : "%") + '</div>');
+    }
+    const heatHtml =
+      '<div class="section-header" style="margin-top:1.5rem"><h3 data-i18n="debug.calib.heat_title">' +
+      esc(t("debug.calib.heat_title")) + '</h3></div>' +
+      '<p class="calib-hint">' + esc(t("debug.calib.heat_hint")) + '</p>' +
+      '<div class="calib-heat">' + heatCells.join("") + '</div>' +
+      '<div class="calib-axis-note"><span>' + esc(t("debug.calib.y_axis")) +
+      ' ↑</span><span>' + esc(t("debug.calib.x_axis")) + ' →</span></div>';
+
+    // Marginals → paired histogram (share of requests per 10% bin).
+    const maxMarg = Math.max(1, ...predMarg, ...actualMarg);
+    const histPairs = predMarg.map((p, i) => {
+      const a = actualMarg[i];
+      const pPct = (p / maxMarg) * 100;
+      const aPct = (a / maxMarg) * 100;
+      return '<div class="calib-hist-pair" title="' + esc(t("debug.calib.legend_pred")) + ' ' + binLabel(i) + ': ' +
+        p.toLocaleString() + ' (' + pct(p / n) + ') / ' + esc(t("debug.calib.legend_actual")) + ': ' +
+        a.toLocaleString() + ' (' + pct(a / n) + ')">' +
+        '<div class="calib-bar calib-bar-pred" style="height:' + Math.max(pPct, p > 0 ? 1.5 : 0) + '%"></div>' +
+        '<div class="calib-bar calib-bar-actual" style="height:' + Math.max(aPct, a > 0 ? 1.5 : 0) + '%"></div>' +
+      '</div>';
+    }).join("");
+    const histXlabels = predMarg.map((p, i) =>
+      '<div class="calib-xlabel">' + i * 10 + (i === 9 ? "%+" : "%") + '</div>'
+    ).join("");
+    const histHtml =
+      '<div class="section-header" style="margin-top:1.5rem"><h3 data-i18n="debug.calib.hist_title">' +
+      esc(t("debug.calib.hist_title")) + '</h3></div>' +
+      '<p class="calib-hint">' + esc(t("debug.calib.hist_hint")) + '</p>' +
+      '<div class="calib-hist-plot">' + histPairs + '</div>' +
+      '<div class="calib-hist-xlabels">' + histXlabels + '</div>' +
+      '<div class="calib-legend">' +
+        '<span class="calib-swatch calib-swatch-pred"></span>' + esc(t("debug.calib.legend_pred")) +
+        '<span class="calib-swatch calib-swatch-actual"></span>' + esc(t("debug.calib.legend_actual")) +
+      '</div>';
+
+    wrap.innerHTML =
+      summaryHtml + heatHtml + histHtml +
+      '<p class="calib-caveat">' + esc(t("debug.calib.caveat")) + '</p>';
+  }
+
   // ── Rebalance Moves (per deployment, lifetime cumulative) ──
   async function loadRebalanceMoves() {
     try {
@@ -1465,9 +1666,11 @@
         });
         // Start the trace poll only while the trace pane is visible —
         // avoids unnecessary background requests when the user is on
-        // Overview / Anomalies.
+        // Overview / Anomalies. The KVC AWARE pane loads on entry;
+        // nothing there is polled.
         if (target === "trace") startTracePanePoll();
         else stopTracePanePoll();
+        if (target === "kvc") loadKvcAwarePane();
       });
     });
   }
@@ -3162,6 +3365,232 @@
     loadPlans();
   };
 
+  /* WORKFLOW PAGE DISABLED — feature parked (router_settings.enable_workflow
+     defaults to false on the backend; Workflows nav + section commented out in
+     index.html). Re-enable: uncomment this block, the index.html section +
+     nav link, the two bindings in setupAdminButtons, and the two section
+     router branches above (search "workflow page disabled").
+     ── Admin: Workflows (DB-authoritative) ───────────────
+  // Two tables from one GET /admin/workflows response:
+  //   models    = { virtual_model_name → workflow_name }   (bindings)
+  //   workflows = { workflow_name → WorkflowDefinitionConfig } (definitions)
+  // CRUD goes to per-key endpoints (POST/DELETE), never to the YAML section.
+  let workflowsCache = { models: {}, workflows: {} };
+  let workflowChildNamesCache = [];
+
+  async function fetchWorkflowChildNames() {
+    // Routable universe for panel/aggregator pickers: deployment model names
+    // + alias names. Workflow models themselves are excluded server-side.
+    try {
+      const [modelsRes, aliasesRes] = await Promise.all([
+        api("/admin/models"),
+        api("/admin/aliases"),
+      ]);
+      const names = new Set();
+      (modelsRes.models || []).forEach((m) => names.add(m.model_name));
+      (aliasesRes.aliases || []).forEach((a) => names.add(a.alias_name));
+      workflowChildNamesCache = [...names].sort();
+    } catch {
+      workflowChildNamesCache = [];
+    }
+  }
+
+  async function loadWorkflows() {
+    try {
+      const data = await api("/admin/workflows");
+      workflowsCache = { models: data.models || {}, workflows: data.workflows || {} };
+      renderWorkflowModelsTable(workflowsCache.models, workflowsCache.workflows);
+      renderWorkflowsTable(workflowsCache.workflows);
+    } catch {}
+  }
+
+  function workflowPanelSummary(def) {
+    const members = (def.roles && def.roles.panel) || [];
+    return members.map((m) => esc(m.model) + (m.temperature != null ? ` (${m.temperature})` : "")).join(", ");
+  }
+
+  function renderWorkflowModelsTable(models, workflows) {
+    const wrap = document.getElementById("workflow-models-table-wrap");
+    if (!wrap) return;
+    const entries = Object.entries(models || {});
+    if (entries.length === 0) { wrap.innerHTML = "<p>" + t("workflows.empty_models") + "</p>"; return; }
+    wrap.innerHTML = `<table>
+      <tr><th>${t("workflows.col.model")}</th><th>${t("workflows.col.workflow")}</th><th>${t("common.actions")}</th></tr>
+      ${entries.map(([model, wf]) => `
+        <tr>
+          <td><strong>${esc(model)}</strong></td>
+          <td>${esc(wf)}${workflows[wf] ? "" : ` <span class="muted">(${t("workflows.missing_def")})</span>`}</td>
+          <td>
+            <button class="btn-small" onclick="window._editWorkflowModel('${esc(model)}')">${t("action.edit")}</button>
+            <button class="btn-small is-danger" onclick="window._deleteWorkflowModel('${esc(model)}')">${t("action.delete")}</button>
+          </td>
+        </tr>`).join("")}
+    </table>`;
+  }
+
+  function renderWorkflowsTable(workflows) {
+    const wrap = document.getElementById("workflows-table-wrap");
+    if (!wrap) return;
+    const entries = Object.entries(workflows || {});
+    if (entries.length === 0) { wrap.innerHTML = "<p>" + t("workflows.empty_defs") + "</p>"; return; }
+    wrap.innerHTML = `<table>
+      <tr><th>${t("workflows.col.name")}</th><th>${t("workflows.col.panel")}</th><th>${t("workflows.col.aggregator")}</th><th>${t("workflows.col.timeout")}</th><th>${t("common.actions")}</th></tr>
+      ${entries.map(([name, def]) => `
+        <tr>
+          <td><strong>${esc(name)}</strong></td>
+          <td>${workflowPanelSummary(def) || "-"}</td>
+          <td>${esc(def.roles && def.roles.aggregator ? def.roles.aggregator.model : "-")}</td>
+          <td>${def.panel_timeout_secs != null ? esc(def.panel_timeout_secs) + "s" : "-"}</td>
+          <td>
+            <button class="btn-small" onclick="window._editWorkflow('${esc(name)}')">${t("action.edit")}</button>
+            <button class="btn-small is-danger" onclick="window._deleteWorkflow('${esc(name)}')">${t("action.delete")}</button>
+          </td>
+        </tr>`).join("")}
+    </table>`;
+  }
+
+  window._deleteWorkflow = async (name) => {
+    try {
+      const res = await api(`/admin/workflows/${encodeURIComponent(name)}`, { method: "DELETE" });
+      if (res && Array.isArray(res.affected_models) && res.affected_models.length) {
+        // Currently impossible (delete is rejected while bindings exist), but
+        // keep the surface if the server ever soft-deletes.
+        alert(t("workflows.affected_models", { models: res.affected_models.join(", ") }));
+      }
+      loadWorkflows();
+    } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
+  };
+
+  window._deleteWorkflowModel = async (modelName) => {
+    try {
+      await api(`/admin/workflow-models/${encodeURIComponent(modelName)}`, { method: "DELETE" });
+      loadWorkflows();
+    } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
+  };
+
+  function workflowDefinitionRowHtml(id, member, removable) {
+    const options = (current) => workflowChildNamesCache
+      .map((n) => `<option value="${esc(n)}" ${n === current ? "selected" : ""}>${esc(n)}</option>`)
+      .join("");
+    return `<div class="wf-member" data-wf-member="${id}" style="display:flex;gap:8px;margin-bottom:6px;align-items:center">
+      <select class="wf-member-model" style="flex:1">
+        <option value="">${t("workflows.pick_model")}</option>
+        ${options(member && member.model)}
+      </select>
+      <input class="wf-member-temp" type="number" step="0.1" style="width:90px" placeholder="${t("workflows.temperature")}"
+        value="${member && member.temperature != null ? member.temperature : ""}">
+      ${removable ? `<button type="button" class="btn-small is-danger" onclick="window._wfRemoveMember(this)">✕</button>` : ""}
+    </div>`;
+  }
+
+  // Panel minimum is 2 members (server-side rule) — guard at click time
+  // instead of trying to keep remove-buttons in sync with list size.
+  window._wfRemoveMember = (btn) => {
+    const list = document.getElementById("wf-panel-list");
+    if (!list) return;
+    if (list.querySelectorAll("[data-wf-member]").length <= 2) return;
+    btn.closest("[data-wf-member]").remove();
+  };
+
+  async function showWorkflowModal(existingName) {
+    await fetchWorkflowChildNames();
+    const isEdit = !!existingName;
+    const def = isEdit ? workflowsCache.workflows[existingName] : null;
+    const panel = (def && def.roles && def.roles.panel) || [{ model: "", temperature: null }, { model: "", temperature: null }];
+    const aggregator = (def && def.roles && def.roles.aggregator) || { model: "", temperature: null };
+    showModal(`
+      <h3>${isEdit ? t("workflows.edit_def") : t("workflows.new_def")}</h3>
+      <div class="form-group"><label>${t("config.field.name")}</label><input id="wf-name" value="${esc(existingName || "")}" ${isEdit ? "readonly" : ""}></div>
+      <div class="form-group"><label>${t("workflows.panel_label")}</label>
+        <div id="wf-panel-list">
+          ${panel.map((m, i) => workflowDefinitionRowHtml("p" + i, m, true)).join("")}
+        </div>
+        <button type="button" class="btn-small" id="wf-add-panel">${t("workflows.add_panel_member")}</button>
+      </div>
+      <div class="form-group"><label>${t("workflows.aggregator_label")}</label>
+        ${workflowDefinitionRowHtml("agg", aggregator, false)}
+      </div>
+      <div class="form-group"><label>${t("workflows.panel_timeout")}</label><input id="wf-timeout" type="number" min="1" step="1" value="${def && def.panel_timeout_secs != null ? def.panel_timeout_secs : ""}" placeholder="-"></div>
+      <div class="modal-actions">
+        <button class="btn-secondary btn-inline" onclick="hideModal()">${t("action.cancel")}</button>
+        <button class="btn-primary" id="wf-save">${isEdit ? t("action.save") : t("action.create")}</button>
+      </div>
+    `, { wide: true });
+
+    document.getElementById("wf-add-panel").addEventListener("click", () => {
+      const list = document.getElementById("wf-panel-list");
+      const idx = list.querySelectorAll("[data-wf-member]").length;
+      list.insertAdjacentHTML("beforeend", workflowDefinitionRowHtml("p" + idx, null, true));
+    });
+
+    document.getElementById("wf-save").addEventListener("click", async () => {
+      const nameVal = document.getElementById("wf-name").value.trim();
+      if (!nameVal) { alert(t("common.error_prefix", { message: t("config.field.name") })); return; }
+      const readMember = (row) => ({
+        model: row.querySelector(".wf-member-model").value,
+        temperature: row.querySelector(".wf-member-temp").value === "" ? null : Number(row.querySelector(".wf-member-temp").value),
+      });
+      const panelRows = [...document.querySelectorAll("#wf-panel-list [data-wf-member]")].map(readMember);
+      const aggRow = readMember(document.querySelector('[data-wf-member="agg"]'));
+      const timeoutVal = document.getElementById("wf-timeout").value;
+      const body = {
+        name: nameVal,
+        definition: {
+          type: "direct_synthesis",
+          roles: { panel: panelRows, aggregator: aggRow },
+          ...(timeoutVal !== "" ? { panel_timeout_secs: Number(timeoutVal) } : {}),
+        },
+      };
+      try {
+        await api("/admin/workflows", { method: "POST", body: JSON.stringify(body) });
+        hideModal();
+        loadWorkflows();
+      } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
+    });
+  }
+
+  window._editWorkflow = (name) => {
+    if (!workflowsCache.workflows[name]) return;
+    showWorkflowModal(name);
+  };
+
+  function showWorkflowModelModal(existingModel) {
+    const isEdit = !!existingModel;
+    const currentWf = isEdit ? workflowsCache.models[existingModel] : "";
+    const wfOptions = Object.keys(workflowsCache.workflows || {})
+      .map((n) => `<option value="${esc(n)}" ${n === currentWf ? "selected" : ""}>${esc(n)}</option>`)
+      .join("");
+    showModal(`
+      <h3>${isEdit ? t("workflows.edit_model") : t("workflows.new_model")}</h3>
+      <div class="form-group"><label>${t("workflows.col.model")}</label><input id="wfm-model" value="${esc(existingModel || "")}" ${isEdit ? "readonly" : ""}></div>
+      <div class="form-group"><label>${t("workflows.col.workflow")}</label><select id="wfm-workflow">${wfOptions}</select></div>
+      <div class="modal-actions">
+        <button class="btn-secondary btn-inline" onclick="hideModal()">${t("action.cancel")}</button>
+        <button class="btn-primary" id="wfm-save">${isEdit ? t("action.save") : t("action.create")}</button>
+      </div>
+    `);
+    document.getElementById("wfm-save").addEventListener("click", async () => {
+      const modelName = document.getElementById("wfm-model").value.trim();
+      const workflowName = document.getElementById("wfm-workflow").value;
+      if (!modelName) { alert(t("common.error_prefix", { message: t("workflows.col.model") })); return; }
+      if (!workflowName) { alert(t("common.error_prefix", { message: t("workflows.col.workflow") })); return; }
+      try {
+        await api("/admin/workflow-models", {
+          method: "POST",
+          body: JSON.stringify({ model_name: modelName, workflow_name: workflowName }),
+        });
+        hideModal();
+        loadWorkflows();
+      } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
+    });
+  }
+
+  window._editWorkflowModel = (modelName) => {
+    if (!workflowsCache.models[modelName]) return;
+    showWorkflowModelModal(modelName);
+  };
+  ── end workflow page disabled ── */
+
   // ── Admin: Keys ───────────────────────────────────────
   let keysPage = 1;
   let keysSearch = "";
@@ -3848,6 +4277,13 @@
     try {
       const data = await api("/admin/client-block-rules");
       const rules = data.rules || [];
+      // The global switch checkbox lives on the config card, but its live
+      // value (memory store = DB row) arrives with this response — sync it
+      // so the checkbox reflects the DB, not the inert YAML section.
+      const blEnabled = document.getElementById("cfg-bl-enabled");
+      if (blEnabled && typeof data.blocklist_enabled === "boolean") {
+        blEnabled.checked = data.blocklist_enabled;
+      }
       if (rules.length === 0) {
         wrap.innerHTML = `<p class="muted">${t("blockrules.empty")}</p>`;
         return;
@@ -4300,33 +4736,21 @@
     </div>`;
   }
 
-  // Schedule-policy options. L2 (kvc_aware) is only selectable in debug
-  // builds (window.__KVC_DEBUG, injected at serve time by handlers_static
-  // via the debug-tools cargo feature). In release builds the option stays
-  // hidden — EXCEPT when it is already the live value: then it renders
-  // disabled-but-selected so saving this card can't silently flip an
-  // existing L2 cluster back to round_robin.
-  function buildPolicyOptions(current) {
-    const opts = [
+  // Schedule-policy options. L2 (kvc_aware) is selectable in all builds.
+  function buildPolicyOptions() {
+    return [
       { value: "round_robin", label: "L0 round_robin" },
       { value: "shuffle", label: "L0 shuffle" },
       { value: "key_affinity", label: "L1 key_affinity" },
+      { value: "kvc_aware", label: "L2 kvc_aware" },
     ];
-    if (window.__KVC_DEBUG || current === "kvc_aware") {
-      opts.push({
-        value: "kvc_aware",
-        label: "L2 kvc_aware" + t("config.field.kvc_not_launched"),
-        disabled: !window.__KVC_DEBUG,
-      });
-    }
-    return opts;
   }
 
   function renderCardRouter(r) {
     return `<div class="form-card" data-section="router_settings">
       <div class="form-card-title">${t("config.section.router_settings")}</div>
       <div class="form-card-grid">
-        ${fieldSelect("cfg-rs-policy", t("config.field.schedule_policy"), buildPolicyOptions(r.schedule_policy),
+        ${fieldSelect("cfg-rs-policy", t("config.field.schedule_policy"), buildPolicyOptions(),
           r.schedule_policy || "round_robin", { tip: t("tip.config.schedule_policy") })}
         ${fieldNum("cfg-rs-affinity-ctx", t("config.field.key_affinity_context_threshold"), r.key_affinity_context_threshold || 0, { min: 0 })}
         ${fieldNum("cfg-rs-affinity-rebal", t("config.field.rebalance_threshold"), r.rebalance_threshold || 20, { min: 1, step: 1 })}
@@ -4376,8 +4800,9 @@
   }
 
   function renderCardBlockRules(cb) {
-    // Match the backend exactly: an absent YAML section leaves the switch OFF
-    // (build_block_rules_from_config) — only an explicit enabled: true is ON.
+    // DB mode: `enabled` comes from boom_client_blocklist_state via the
+    // config snapshot. No-DB mode: it comes from the YAML section (absent
+    // section → OFF, matching build_block_rules_from_config).
     const enabled = !!cb && cb.enabled === true;
     return `<div class="form-card" data-section="client_blocklist">
       <div class="form-card-title">${t("config.section.client_blocklist")}</div>
@@ -4422,6 +4847,37 @@
     }
     const reloadBtn = document.getElementById("btn-reload-config-page");
     if (reloadBtn) reloadBtn.addEventListener("click", reloadConfigHandler);
+    const exportBtn = document.getElementById("btn-export-config");
+    if (exportBtn) exportBtn.addEventListener("click", async () => {
+      exportBtn.disabled = true;
+      try {
+        const dl = await api("/admin/config/export");
+        if (dl && dl.content) {
+          const blob = new Blob([dl.content], { type: dl.mime || "text/plain" });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url; a.download = dl.filename || "config.yaml";
+          document.body.appendChild(a); a.click();
+          document.body.removeChild(a); URL.revokeObjectURL(url);
+        }
+      } catch (err) {
+        alert(t("alert.export_config_failed", { message: err.message }));
+      } finally {
+        exportBtn.disabled = false;
+      }
+    });
+    const writebackBtn = document.getElementById("btn-writeback-config");
+    if (writebackBtn) writebackBtn.addEventListener("click", async () => {
+      writebackBtn.disabled = true;
+      try {
+        const data = await api("/admin/config/writeback", { method: "POST" });
+        alert(data.message || t("alert.writeback_done"));
+      } catch (err) {
+        alert(t("alert.writeback_failed", { message: err.message }));
+      } finally {
+        writebackBtn.disabled = false;
+      }
+    });
     wireConfigSidebar();
     wireDirtyTracking();
     const testBtn = document.getElementById("cfg-pl-otlp-test");
@@ -4729,15 +5185,31 @@
         });
       } else if (kind === "client_blocklist") {
         // Only the global switch is a config field here; rules are managed
-        // via the dedicated CRUD endpoints (immediate effect, DB + YAML).
-        await saveConfigSection("client_blocklist.enabled", $("cfg-bl-enabled").checked);
+        // via the dedicated CRUD endpoints. The switch itself is DB-backed
+        // (boom_client_blocklist_state) — immediate effect, no YAML write.
+        if (!confirm(t("common.confirm_write"))) throw new Error(t("common.canceled"));
+        await api("/admin/blocklist/enabled", {
+          method: "PUT", skipConfirm: true,
+          body: JSON.stringify({ enabled: $("cfg-bl-enabled").checked }),
+        });
+        showToast(t("config.saved"));
+        await loadConfigPage();
       } else if (kind === "plan_defaults") {
+        // default_plan / default_team_plan are DB flag columns on
+        // boom_rate_limit_plan — swapped via the dedicated endpoint, no YAML.
+        if (!confirm(t("common.confirm_write"))) throw new Error(t("common.canceled"));
         const dp = $("cfg-ps-default-plan").value;
         const dtp = $("cfg-ps-default-team-plan").value;
-        await saveConfigSections([
-          ["plan_settings.default_plan", dp || null],
-          ["plan_settings.default_team_plan", dtp || null],
-        ]);
+        await api("/admin/plans/default", {
+          method: "PUT", skipConfirm: true,
+          body: JSON.stringify({ plan_name: dp || null, team: false }),
+        });
+        await api("/admin/plans/default", {
+          method: "PUT", skipConfirm: true,
+          body: JSON.stringify({ plan_name: dtp || null, team: true }),
+        });
+        showToast(t("config.saved"));
+        await loadConfigPage();
       } else if (kind === "health_check") {
         await saveConfigSection("deployment_health_check", {
           auto_offline_enabled: $("cfg-hc-auto-off").checked,
@@ -4807,18 +5279,20 @@
           enable_priority_header: $("cfg-gen-priority-hdr").checked,
           strip_claude_code_attribution: $("cfg-gen-strip-cc").checked,
           forward_client_headers: parseListInput($("cfg-gen-forward-hdrs")),
-          // No editor here — managed on the Models page (alias CRUD writes
-          // DB + memory directly). Pass through verbatim like auto_router.
-          model_group_alias: cfg.router_settings.model_group_alias ?? {},
+          // model_group_alias is DB-owned (alias CRUD on the Models page);
+          // the update_config_section path rejects it. Strip the key so the
+          // whole-section replace doesn't try to write it.
           // The backend replaces the whole router_settings section, so every
           // sub-tree must be re-submitted. kvc_aware reads the live inputs
-          // (its card shares this save button); auto_router has no editor and
-          // is passed through verbatim.
+          // (its card shares this save button); auto_router and
+          // enable_workflow (feature-parked switch, YAML-only) have no
+          // editor and are passed through verbatim.
           kvc_aware: {
             max_blocks: numOr($("cfg-kvc-max-blocks"), 500000),
             router_ttl_secs: numOr($("cfg-kvc-ttl"), 1200),
           },
           auto_router: cfg.router_settings.auto_router ?? null,
+          enable_workflow: cfg.router_settings.enable_workflow ?? false,
         };
         await saveConfigSection("router_settings", routerValue);
       }
@@ -4867,15 +5341,13 @@
         cached_input_cost_per_million_tokens: Number(document.getElementById("ct-cached").value) || null,
         output_cost_per_million_tokens: Number(document.getElementById("ct-output").value) || null,
       };
-      const current = ((_configCache && _configCache.cost_templates) || []);
-      // Replace by name on edit; append on create. Name is the identity, so
-      // editing keeps the template at its original slot.
-      const next = isEdit
-        ? current.map((t) => (t.name === existing.name ? updated : t))
-        : current.concat([updated]);
       try {
-        await saveConfigSection("cost_templates", next);
+        // Per-key CRUD — the YAML section is blacklisted server-side (DB is
+        // the authority). The server re-rates every model bound to this
+        // template and returns them in affected_models.
+        await api("/admin/cost-templates", { method: "POST", body: JSON.stringify(updated) });
         hideModal();
+        await loadConfigPage();
       } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
     });
   }
@@ -4891,8 +5363,10 @@
   };
 
   window._deleteCostTemplate = async (name) => {
-    const current = ((_configCache && _configCache.cost_templates) || []).filter((t) => t.name !== name);
-    try { await saveConfigSection("cost_templates", current); } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
+    try {
+      await api(`/admin/cost-templates/${encodeURIComponent(name)}`, { method: "DELETE" });
+      await loadConfigPage();
+    } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
   };
 
   let debugEnabled = false;
@@ -5074,6 +5548,10 @@
   // ── Admin: Modals ─────────────────────────────────────
   function setupAdminButtons() {
     document.getElementById("btn-new-plan").addEventListener("click", showNewPlanModal);
+    // Workflow page disabled — the buttons are commented out in index.html, so
+    // these getElementById calls would return null and crash this setup fn.
+    // document.getElementById("btn-new-workflow").addEventListener("click", () => showWorkflowModal(null));
+    // document.getElementById("btn-new-workflow-model").addEventListener("click", () => showWorkflowModelModal(null));
     // Stress info-bar "?" tooltip — hover/focus reveals a glossary.
     const helpBtn = document.querySelector(".stress-info-help");
     const tooltip = document.getElementById("stress-info-tooltip");

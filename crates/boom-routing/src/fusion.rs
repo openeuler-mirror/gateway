@@ -73,7 +73,12 @@ impl FusionRuntime {
 /// Register configured workflow models as ordinary Provider deployments.
 ///
 /// Workflow models own an exclusive candidate set. Registration fails rather
-/// than replacing a YAML, DB-only, or dynamically-created resource.
+/// than replacing a YAML, DB-only, or dynamically-created resource — with one
+/// sanctioned exception: a model already registered exclusively by a previous
+/// fusion registration (reload in DB mode never clears the store, and CRUD
+/// re-registers after every workflow edit). Those are torn down and replaced
+/// by this call; all validation happens BEFORE the teardown so a rejected
+/// change leaves the previous registration routing.
 pub fn register_fusion_providers(
     settings: &WorkflowSettings,
     deployment_store: &Arc<DeploymentStore>,
@@ -83,6 +88,10 @@ pub fn register_fusion_providers(
     let registry = build_registry(settings)?;
     validate_available_fusion_child_provider_protocols(settings, deployment_store, alias_store)?;
     for model in settings.models.keys() {
+        // Our own previous registration — replaced by the teardown pass below.
+        if deployment_store.is_exclusive_model(model) {
+            continue;
+        }
         if deployment_store.contains(model) {
             return Err(GatewayError::ConfigError(format!(
                 "workflow model '{}' conflicts with an existing deployment",
@@ -96,6 +105,10 @@ pub fn register_fusion_providers(
             )));
         }
     }
+    // Teardown + register as one pass: every exclusive model is a workflow
+    // virtual model, so dropping them all and re-registering the desired set
+    // both replaces edited workflows and removes deleted ones.
+    deployment_store.clear_exclusive_deployments();
     for model in settings.models.keys() {
         let workflow = registry.workflow_for_model(model).ok_or_else(|| {
             GatewayError::ConfigError(format!(

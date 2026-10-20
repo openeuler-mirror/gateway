@@ -1,9 +1,26 @@
 # BooMGateway 配置文件
 # 兼容 litellm 的 proxy_server_config.yaml 格式
 # model 字段使用 litellm 的 provider/model-id 前缀约定
+#
+# ── 配置权威模型（DB 权威）──────────────────────────────────────────
+# 业务配置（model_list / cost_templates / model_group_alias /
+# plan_settings / client_blocklist / workflow_settings）以 DB 为唯一
+# 运行时权威，通过 Dashboard CRUD 管理。本文件中这些 section 只在
+# 「业务表全空且无 seed 标记」的全新库上作首次 seed（seed_if_empty，
+# 一次性）；此后完全 inert —— 手改 YAML + reload 不会生效，Dashboard
+# 的删除也不会被重启复活。灾备恢复 = 空库 + 回写按钮生成的 YAML
+# 快照重启。无 database_url 时（master-key-only 模式）退化为 YAML
+# 构建路径（Kong dbless 式部署形态）。
+#
+# ── 无 YAML 启动（env bootstrap）───────────────────────────────────
+# 不带 --config 且 cwd 无 config.yaml 时，可只用两个环境变量启动：
+#   BOOM_MASTER_KEY / BOOM_DATABASE_URL（均必需）
+# 进程级配置（server/router 等）取默认值；回写按钮可在 cwd 生成完整
+# config.yaml（0600，secrets 写成 ${BOOM_*} 引用），重启即切换为
+# 文件模式。
 
 # ──────────────────────────────────────────────
-# 模型部署列表
+# 模型部署列表（seed-only：全新库首次导入用，运行期经 Dashboard 管理）
 # ──────────────────────────────────────────────
 model_list:
   # OpenAI — 显式前缀
@@ -68,7 +85,7 @@ model_list:
   #     api_key: ${OPENAI_API_KEY}
 
 # ──────────────────────────────────────────────
-# 计费模板（可复用的定价表）
+# 计费模板（seed-only；运行期经 Dashboard Config 页管理）
 # ──────────────────────────────────────────────
 # 所有价格均为「USD per 1M tokens」。网关内部会换算成 per-token。
 # model_info.cost_template 引用这里的 name；同名时模板覆盖内联字段。
@@ -87,12 +104,11 @@ cost_templates:
 # 通用设置
 # ──────────────────────────────────────────────
 general_settings:
-  # Master key — 不走 DB 也能鉴权
+  # Master key — 不走 DB 也能鉴权（env bootstrap 模式取 BOOM_MASTER_KEY）
   master_key: os.environ/MASTER_KEY
-  # PostgreSQL 连接串（litellm DB）
+  # PostgreSQL 连接串（litellm DB；env bootstrap 模式取 BOOM_DATABASE_URL）
   database_url: os.environ/DATABASE_URL
-  # DB 权威模式：true 时 DB 是模型/别名/套餐的数据源，YAML 仅首次 seed
-  # store_model_in_db: false
+  # 已废弃：store_model_in_db（v2 双模式开关）不再有任何作用，残留值被忽略
 
 # ──────────────────────────────────────────────
 # 部署健康检查（自动离线/恢复）
@@ -115,7 +131,13 @@ router_settings:
   # 路由策略：round_robin（默认）/ shuffle（随机，litellm simple-shuffle）/ key_affinity（L1 会话亲和）/ kvc_aware（L2 前缀缓存亲和，详见下方 kvc_aware 注释块）
   routing_strategy: round_robin
 
-  # 模型别名：客户端用别名请求，实际路由到目标模型
+  # Workflow（direct-synthesis 融合编排）功能开关。默认 false——功能暂停：
+  # 不注册 workflow 虚拟模型、Dashboard Workflows 页隐藏、CRUD 一律拒绝、
+  # seed 跳过 workflow 表。启用：改为 true + reload（同时需要恢复
+  # Dashboard Workflows 页的前端接线，见 index.html 中被注释的段落）。
+  enable_workflow: false
+
+  # 模型别名（seed-only；运行期经 Dashboard Models 页别名 CRUD 管理）
   model_group_alias:
     # 简单别名
     "gpt-4": "gpt-4o"
@@ -205,7 +227,7 @@ rate_limit:
     - [100, 18000]                  # 100 次请求 / 5 小时
 
 # ──────────────────────────────────────────────
-# 套餐设置
+# 套餐设置（seed-only；运行期经 Dashboard Plans 页管理）
 # ──────────────────────────────────────────────
 # 套餐是「通用模板」——同一组限流字段对 key 和 team 都适用。
 # type=key 的套餐分配给单个 key（按 key 维度独立计数）；
@@ -345,8 +367,9 @@ hooks:
 # 规则内条件 AND；规则间先命中先生效。regex 在加载时预编译，
 # 编译失败的规则会被跳过并打 warn（Dashboard 创建/更新时会先校验）。
 #
-# 该 section 为 YAML 真相源；Dashboard 上的增删改写 DB（source='db'）
-# 并 best-effort 同步回此文件，与 model alias 同一套双源语义。
+# 该 section 为 seed-only：规则与 enabled 开关运行期以 DB 为权威
+# （boom_client_block_rule / boom_client_blocklist_state），经
+# Dashboard Blocklist 页管理；手改 YAML + reload 不生效。
 # ──────────────────────────────────────────────────────────────────────
 client_blocklist:
   enabled: true                            # 总开关，false 时热路径直接跳过

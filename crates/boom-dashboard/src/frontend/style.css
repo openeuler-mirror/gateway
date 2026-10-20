@@ -2359,6 +2359,100 @@ input[list] {
 .rbm-legend-item { display: flex; align-items: center; gap: 4px; }
 .rbm-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; }
 
+/* ── KVC Scheduler Stats strip ────────────────────────── */
+.kcs-grid {
+  display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px; max-width: 720px;
+}
+.kcs-cell {
+  background: var(--surface2); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); padding: 12px 16px;
+}
+.kcs-value {
+  font-size: 24px; font-weight: 700; color: var(--text); line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+}
+.kcs-label {
+  font-size: 11px; color: var(--text3);
+  text-transform: uppercase; letter-spacing: .04em; margin-top: 4px;
+}
+.kcs-warn .kcs-value { color: var(--warn, #e2a600); }
+.kcs-breakdown { font-size: 12px; color: var(--text3); margin: 8px 0 0; line-height: 1.5; }
+
+/* ── KVC Hit Calibration (heatmap + dual histogram) ───── */
+.calib-card-hint {
+  font-size: 11px; color: var(--text3); margin-top: 4px; line-height: 1.4;
+}
+.calib-ok   { color: var(--text); }
+.calib-warn { color: var(--warn, #e2a600); }
+.calib-hint { font-size: 12px; color: var(--text3); margin: 4px 0 10px; line-height: 1.5; max-width: 760px; }
+
+.calib-heat {
+  display: grid;
+  grid-template-columns: 44px repeat(10, minmax(0, 1fr));
+  gap: 2px;
+  max-width: 640px;
+}
+.calib-corner { height: 22px; }
+.calib-ylabel {
+  font-size: 10px; color: var(--text3);
+  display: flex; align-items: center; justify-content: flex-end;
+  padding-right: 6px;
+}
+.calib-xlabel {
+  font-size: 10px; color: var(--text3);
+  display: flex; align-items: center; justify-content: center;
+  height: 22px;
+}
+.calib-cell {
+  height: 26px; border-radius: 3px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+}
+.calib-diag { box-shadow: inset 0 0 0 1.5px #10b981; }
+.calib-axis-note {
+  display: flex; justify-content: space-between;
+  max-width: 640px; margin-top: 6px;
+  font-size: 11px; color: var(--text3);
+}
+
+.calib-hist-plot {
+  display: flex; align-items: flex-end;
+  gap: 10px; max-width: 640px;
+  border-bottom: 1px solid var(--border);
+  padding: 0 4px 0 48px;
+}
+.calib-hist-pair {
+  flex: 1; height: 140px;
+  display: flex; align-items: flex-end; justify-content: center;
+  gap: 3px;
+}
+.calib-hist-xlabels {
+  display: flex; gap: 10px; max-width: 640px;
+  padding: 4px 4px 0 48px;
+}
+.calib-hist-xlabels .calib-xlabel { flex: 1; }
+.calib-bar {
+  width: 38%; max-width: 22px; min-width: 8px;
+  border-radius: 3px 3px 0 0;
+}
+.calib-bar-pred   { background: linear-gradient(180deg, #cbd5e1, #94a3b8); } /* slate-300→400 */
+.calib-bar-actual { background: linear-gradient(180deg, #34d399, #10b981); } /* emerald-400→500 */
+.calib-legend {
+  display: flex; align-items: center; gap: 16px;
+  font-size: 12px; color: var(--text3);
+  margin: 10px 0 0; padding-left: 48px;
+}
+.calib-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; }
+.calib-swatch-pred   { background: #94a3b8; }
+.calib-swatch-actual { background: #10b981; }
+.calib-caveat {
+  font-size: 12px; color: var(--text3); line-height: 1.6;
+  margin: 16px 0 0; padding: 10px 12px;
+  background: var(--surface2); border-radius: var(--radius-sm);
+  max-width: 760px;
+}
+
 /* ── Audit Log Stats card ─────────────────────────────── */
 .audit-log-stats {
   display: flex; flex-direction: column; gap: 8px;

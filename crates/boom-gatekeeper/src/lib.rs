@@ -201,6 +201,17 @@ impl BlockRuleStore {
             .is_some()
     }
 
+    /// Names of all loaded rules (sorted — the backing map is a BTreeMap).
+    /// The reconcile removal diff compares these against DB rule names.
+    pub fn rule_names(&self) -> Vec<String> {
+        self.rules
+            .read()
+            .expect("block rule store lock")
+            .keys()
+            .cloned()
+            .collect()
+    }
+
     /// Evaluate all rules against a request. `header_lookup` must be
     /// case-insensitive on the header name (axum's `HeaderMap::get` is).
     /// Returns the first match in rule-name order, or None.

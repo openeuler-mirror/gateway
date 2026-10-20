@@ -1,5 +1,13 @@
 # Direct Synthesis Workflow 设计
 
+> **配置机制演进注记**：本文档写作时 workflow 通过 YAML `workflow_settings`
+> 配置。当前版本中业务配置已 DB 权威化——workflow 定义与模型映射存于
+> `boom_workflow_definition` / `boom_workflow_model` 表，运行期经 Dashboard
+> Workflows 页 CRUD 管理（写完即生效，走 AdminCommand 重建 fusion registry）；
+> YAML `workflow_settings` 仅在全新库首次启动时作一次性 seed。本文的配置
+> 格式描述对应 seed 格式与 DB 存储形状（`WorkflowDefinitionConfig`），
+> 编排原理、请求变换与失败语义不变。
+
 ## 1. 概述
 
 Direct Synthesis 是 BooMGateway 内置的多模型编排能力。客户端仍然使用标准

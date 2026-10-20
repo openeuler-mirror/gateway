@@ -140,13 +140,22 @@ impl TempConfig {
         panel_timeout_secs: Option<u64>,
         aggregator_enabled: bool,
         panel_a_serve_not_match: bool,
+        enable_workflow: bool,
     ) -> Self {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock is before Unix epoch")
             .as_nanos();
+        // The wall clock alone is NOT collision-proof: macOS SystemTime
+        // granularity under concurrent threads yields identical nanosecond
+        // readings (~1 dup pair per 15 concurrent calls, measured). Two tests
+        // sharing a directory overwrite each other's config.yaml and delete
+        // it mid-test via Drop → "exited before becoming ready". The counter
+        // makes directory names collision-free by construction.
+        static DIR_SEQ: AtomicUsize = AtomicUsize::new(0);
+        let seq = DIR_SEQ.fetch_add(1, Ordering::Relaxed);
         let directory = std::env::temp_dir().join(format!(
-            "boom-gateway-fusion-e2e-{}-{unique}",
+            "boom-gateway-fusion-e2e-{}-{unique}-{seq}",
             std::process::id()
         ));
         fs::create_dir_all(&directory).expect("failed to create temporary config directory");
@@ -207,6 +216,7 @@ general_settings:
 
 router_settings:
   routing_strategy: round_robin
+  enable_workflow: {enable_workflow}
 
 server:
   host: 127.0.0.1
@@ -278,6 +288,7 @@ impl TestGateway {
             panel_timeout_secs,
             true,
             false,
+            true,
         );
         Self::start_with_config(config).await
     }
@@ -294,16 +305,26 @@ impl TestGateway {
             None,
             false,
             true,
+            true,
         );
         Self::start_with_config(config).await
     }
 
     async fn start_with_config(config: TempConfig) -> Self {
+        // Serialize port pickup → spawn → readiness across the parallel tests.
+        // unused_port() has a TOCTOU window: the reserved port is freed before
+        // the child binds it, so two tests racing here can hand the same port
+        // to two gateways — one exits 1 before becoming ready. Holding this
+        // lock until /health answers closes the window; the lock is released
+        // once the port is actually bound by the OS.
+        static SPAWN_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _guard = SPAWN_LOCK.lock().await;
         let port = unused_port();
         let mut process = GatewayProcess::spawn(&config.path, port);
         let client = reqwest::Client::new();
         let base_url = format!("http://127.0.0.1:{port}");
         wait_until_ready(&client, &base_url, &mut process).await;
+        drop(_guard);
         Self {
             process,
             config,
@@ -1475,5 +1496,51 @@ async fn concurrent_requests_keep_prompt_traces_isolated() {
         for other in markers.iter().filter(|other| **other != marker) {
             assert!(!trace.contains(other));
         }
+    }
+}
+
+/// The feature-parked default: with `router_settings.enable_workflow` unset
+/// (false) the workflow virtual model must NOT register — a request to it
+/// fails and no child (panel/aggregator) is ever contacted, even though
+/// `workflow_settings` is fully configured in the YAML.
+#[tokio::test]
+async fn workflow_disabled_by_default_rejects_virtual_model_without_fanout() {
+    let panel_a = start_mock(MockBehavior::Success {
+        model: "panel-a-upstream",
+        content: "panel A answer",
+    })
+    .await;
+    let panel_b = start_mock(MockBehavior::Success {
+        model: "panel-b-upstream",
+        content: "panel B answer",
+    })
+    .await;
+    let aggregator = start_mock(MockBehavior::ToolAggregator).await;
+
+    let config = TempConfig::create_with_options(
+        panel_a.address,
+        panel_b.address,
+        aggregator.address,
+        None,
+        true,
+        false,
+        false,
+    );
+    let gateway = TestGateway::start_with_config(config).await;
+
+    let response = gateway
+        .post(&fusion_request("should not fan out", false, None))
+        .await;
+    assert_ne!(
+        response.status(),
+        StatusCode::OK,
+        "workflow virtual model must not be routable while enable_workflow=false"
+    );
+
+    for upstream in [&panel_a, &panel_b, &aggregator] {
+        assert!(
+            upstream.requests().is_empty(),
+            "disabled workflow must not contact any child upstream"
+        );
     }
 }

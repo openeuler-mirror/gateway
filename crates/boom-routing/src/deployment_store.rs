@@ -357,6 +357,16 @@ const DEPLOYMENT_ROW_SELECT_COLUMNS: &str = concat!(
     "created_at, updated_at"
 );
 
+/// Canonical SELECT column list for provider-building reads
+/// (`DeploymentProviderRow`). Shared by every loader that feeds
+/// `build_provider_from_row` — per-model, wildcard, and full reconcile loads.
+const PROVIDER_ROW_COLUMNS: &str = concat!(
+    "model_name, litellm_model, api_key, api_key_env, api_base, api_version, ",
+    "aws_region_name, timeout, headers, deployment_id, client_type_header, ",
+    "serve_not_match, quota_count_ratio, max_inflight_queue_len, ",
+    "max_context_len, model_info, allowed_teams, visibility"
+);
+
 /// SQL for `snapshot_db` — config export MUST include disabled rows.
 ///
 /// Extracted as a const so the `snapshot_db_includes_disabled_rows` test can
@@ -479,6 +489,20 @@ impl DeploymentStore {
         self.exclusive_providers.contains_key(model_name)
     }
 
+    /// Remove all exclusive (workflow-fusion) registrations: the provider
+    /// lists and the exclusivity markers. Only fusion uses
+    /// `set_exclusive_deployment`, so every exclusive model here is a
+    /// workflow virtual model being re-registered — `remove_deployments`
+    /// refuses them by design (they are not DB-managed) and a full `clear()`
+    /// would also drop the DB-backed deployments.
+    pub fn clear_exclusive_deployments(&self) {
+        for entry in self.exclusive_providers.iter() {
+            self.rr_counters.remove(entry.key());
+            self.deployments.remove(entry.key());
+        }
+        self.exclusive_providers.clear();
+    }
+
     /// Set the unified access-control state for a model. `Normal` clears the
     /// entry (absent = Normal is the default state).
     pub fn set_visibility(&self, model_name: &str, state: VisibilityState) {
@@ -524,8 +548,10 @@ impl DeploymentStore {
         }
     }
 
-    /// Remove all deployments for the given model name.
-    /// Returns true if the model existed.
+    /// Remove all state for the given model name: providers, round-robin
+    /// counter, visibility, quota ratio, and cost rate. Returns true if the
+    /// model existed. Flow-control slots and rate series are keyed by
+    /// deployment_id and are released by the caller.
     pub fn remove_deployments(&self, model_name: &str) -> bool {
         if let Some(expected) = self.exclusive_providers.get(model_name) {
             tracing::error!(
@@ -537,6 +563,8 @@ impl DeploymentStore {
         }
         self.rr_counters.remove(model_name);
         self.model_visibility.remove(model_name);
+        self.quota_ratios.remove(model_name);
+        self.cost_rates.remove(model_name);
         self.deployments.remove(model_name).is_some()
     }
 
@@ -661,37 +689,22 @@ impl DeploymentStore {
 
     // ── DB operations (boom_routing owns boom_model_deployment table) ──
 
-    /// Sync YAML deployments to DB: delete source='yaml' rows, insert current YAML,
-    /// delete conflicting source='db' rows.
-    pub async fn sync_yaml_to_db(
-        pool: &sqlx::PgPool,
-        yaml_model_names: &[String],
-        yaml_deployments: &[DeploymentInput],
-    ) -> Result<(), sqlx::Error> {
-        // 1. Delete all source='yaml' rows.
-        sqlx::query(r#"DELETE FROM boom_model_deployment WHERE source = 'yaml'"#)
-            .execute(pool)
-            .await?;
-
-        // 2. Delete source='db' deployments that conflict with YAML model_names.
-        if !yaml_model_names.is_empty() {
-            let result = sqlx::query(
-                r#"DELETE FROM boom_model_deployment WHERE source = 'db' AND model_name = ANY($1)"#,
-            )
-            .bind(yaml_model_names)
-            .execute(pool)
-            .await?;
-            if result.rows_affected() > 0 {
-                tracing::info!(
-                    "Removed {} conflicting source='db' deployment(s)",
-                    result.rows_affected()
-                );
-            }
-        }
-
-        // 3. Insert YAML deployments.
+    /// Seed deployments from YAML into an EMPTY boom_model_deployment table
+    /// (DB first-boot import). Rows carry source='yaml' provenance. Runs on
+    /// the transaction connection held by the caller (`seed_if_empty`) — the
+    /// caller guarantees the table is empty and the seed is serialized by an
+    /// advisory lock. deployment_id is auto-generated when missing, matching
+    /// `create_db` (FlowController requires a non-empty id to register a slot).
+    pub async fn seed_rows_db(
+        conn: &mut sqlx::PgConnection,
+        deployments: &[DeploymentInput],
+    ) -> Result<usize, sqlx::Error> {
         let insert_sql = deployment_insert_sql("yaml");
-        for d in yaml_deployments {
+        for d in deployments {
+            let deployment_id: String = match &d.deployment_id {
+                Some(id) if !id.is_empty() => id.clone(),
+                _ => uuid::Uuid::new_v4().to_string(),
+            };
             sqlx::query(&insert_sql)
                 .bind(&d.model_name)
                 .bind(&d.litellm_model)
@@ -709,7 +722,7 @@ impl DeploymentStore {
                 .bind(d.temperature)
                 .bind(d.max_tokens)
                 .bind(d.enabled)
-                .bind(&d.deployment_id)
+                .bind(&deployment_id)
                 .bind(d.quota_count_ratio)
                 .bind(d.max_inflight_queue_len)
                 .bind(d.max_context_len)
@@ -718,29 +731,43 @@ impl DeploymentStore {
                 .bind(d.model_info.as_ref().unwrap_or(&serde_json::Value::Null))
                 .bind(allowed_teams_json(&d.allowed_teams))
                 .bind(visibility_str(d.visibility))
-                .execute(pool)
+                .execute(&mut *conn)
                 .await?;
         }
 
-        tracing::info!("Synced {} deployment(s) from YAML to DB", yaml_deployments.len());
-        Ok(())
+        tracing::info!("Seeded {} deployment(s) from YAML into DB", deployments.len());
+        Ok(deployments.len())
     }
 
-    /// Load source='db' deployment rows from DB (provider creation happens in caller).
-    pub async fn load_db_only_rows(pool: &sqlx::PgPool) -> Result<Vec<DeploymentProviderRow>, sqlx::Error> {
-        sqlx::query_as::<_, DeploymentProviderRow>(
-            r#"SELECT model_name, litellm_model, api_key, api_key_env, api_base, api_version,
-                      aws_region_name, timeout, headers, deployment_id, client_type_header,
-                      allowed_teams, visibility
+    /// Load every enabled deployment row (provider creation happens in
+    /// caller). The DB is the runtime authority — no source filter.
+    pub async fn load_all_enabled_rows(pool: &sqlx::PgPool) -> Result<Vec<DeploymentProviderRow>, sqlx::Error> {
+        sqlx::query_as::<_, DeploymentProviderRow>(&format!(
+            r#"SELECT {PROVIDER_ROW_COLUMNS}
                FROM boom_model_deployment
-               WHERE source = 'db' AND enabled IS NOT FALSE
+               WHERE enabled IS NOT FALSE
                ORDER BY model_name, created_at"#,
+        ))
+        .fetch_all(pool)
+        .await
+    }
+
+    /// Distinct model names across ALL rows (enabled and disabled). The
+    /// reconcile removal diff uses this — a model whose rows are all disabled
+    /// must keep an EMPTY provider list ("configured but all down"), not be
+    /// removed from the store ("never configured" falls through to '*').
+    pub async fn distinct_model_names(pool: &sqlx::PgPool) -> Result<Vec<String>, sqlx::Error> {
+        sqlx::query_scalar::<_, String>(
+            r#"SELECT DISTINCT model_name FROM boom_model_deployment ORDER BY model_name"#,
         )
         .fetch_all(pool)
         .await
     }
 
-    pub async fn db_only_model_conflicts(
+    /// Model names from the given list that already exist as deployment rows
+    /// (enabled or not) — workflow namespace validation. The DB is the
+    /// runtime authority, so every row counts, regardless of source.
+    pub async fn model_name_conflicts(
         pool: &sqlx::PgPool,
         model_names: &[String],
     ) -> Result<Vec<String>, sqlx::Error> {
@@ -750,9 +777,7 @@ impl DeploymentStore {
         sqlx::query_scalar::<_, String>(
             r#"SELECT DISTINCT model_name
                FROM boom_model_deployment
-               WHERE source = 'db'
-                 AND enabled IS NOT FALSE
-                 AND model_name = ANY($1)
+               WHERE model_name = ANY($1)
                ORDER BY model_name"#,
         )
         .bind(model_names)
@@ -789,15 +814,12 @@ impl DeploymentStore {
 
     /// Load enabled deployment rows for a specific model (for reload after update/delete).
     pub async fn load_model_rows(pool: &sqlx::PgPool, model_name: &str) -> Result<Vec<DeploymentProviderRow>, sqlx::Error> {
-        sqlx::query_as::<_, DeploymentProviderRow>(
-            r#"SELECT model_name, litellm_model, api_key, api_key_env, api_base, api_version,
-                      aws_region_name, timeout, headers, deployment_id, client_type_header,
-                      serve_not_match, quota_count_ratio, max_inflight_queue_len,
-                      max_context_len, model_info, allowed_teams, visibility
+        sqlx::query_as::<_, DeploymentProviderRow>(&format!(
+            r#"SELECT {PROVIDER_ROW_COLUMNS}
                FROM boom_model_deployment
                WHERE model_name = $1 AND enabled IS NOT FALSE
                ORDER BY created_at"#,
-        )
+        ))
         .bind(model_name)
         .fetch_all(pool)
         .await
@@ -809,17 +831,44 @@ impl DeploymentStore {
     /// instead of leaving stale Arc<dyn Provider> entries pointing at removed
     /// deployments.
     pub async fn load_wildcard_rows(pool: &sqlx::PgPool) -> Result<Vec<DeploymentProviderRow>, sqlx::Error> {
-        sqlx::query_as::<_, DeploymentProviderRow>(
-            r#"SELECT model_name, litellm_model, api_key, api_key_env, api_base, api_version,
-                      aws_region_name, timeout, headers, deployment_id, client_type_header,
-                      serve_not_match, quota_count_ratio, max_inflight_queue_len,
-                      max_context_len, model_info, allowed_teams, visibility
+        sqlx::query_as::<_, DeploymentProviderRow>(&format!(
+            r#"SELECT {PROVIDER_ROW_COLUMNS}
                FROM boom_model_deployment
                WHERE serve_not_match = true AND enabled IS NOT FALSE
                ORDER BY created_at"#,
-        )
+        ))
         .fetch_all(pool)
         .await
+    }
+
+    /// Distinct model_names whose model_info references the given cost
+    /// template — the re-rate set after a template CRUD. Includes disabled
+    /// rows: cost metadata survives enable/disable flips.
+    pub async fn models_using_cost_template(
+        pool: &sqlx::PgPool,
+        template_name: &str,
+    ) -> Result<Vec<String>, sqlx::Error> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            r#"SELECT DISTINCT model_name FROM boom_model_deployment
+               WHERE model_info->>'cost_template' = $1"#,
+        )
+        .bind(template_name)
+        .fetch_all(pool)
+        .await?;
+        Ok(rows.into_iter().map(|(n,)| n).collect())
+    }
+
+    /// All distinct model_names in the DB, INCLUDING disabled rows — the
+    /// "known model universe" for workflow validation. A disabled panel /
+    /// aggregator is a runtime 502 by design (the fusion runtime resolves
+    /// children per request), not a boot-time config error, so validation
+    /// must see disabled names too.
+    pub async fn all_model_names_db(pool: &sqlx::PgPool) -> Result<Vec<String>, sqlx::Error> {
+        let rows: Vec<(String,)> =
+            sqlx::query_as(r#"SELECT DISTINCT model_name FROM boom_model_deployment"#)
+                .fetch_all(pool)
+                .await?;
+        Ok(rows.into_iter().map(|(n,)| n).collect())
     }
 
     /// Create a deployment in DB. Returns the new row ID.
@@ -939,6 +988,21 @@ impl DeploymentStore {
         Ok(result.map(|row| row.get::<Option<String>, _>("old_model_name")).flatten())
     }
 
+    /// Fetch only the model_name of a deployment row — pre-delete reference
+    /// checks (workflow child guard) use this to reject before mutating.
+    pub async fn peek_model_name(
+        pool: &sqlx::PgPool,
+        id: uuid::Uuid,
+    ) -> Result<Option<String>, sqlx::Error> {
+        let row: Option<(String,)> = sqlx::query_as(
+            r#"SELECT model_name FROM boom_model_deployment WHERE id = $1"#,
+        )
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+        Ok(row.map(|(name,)| name))
+    }
+
     /// Delete a deployment from DB by ID. Returns (model_name, deployment_id) of the deleted row.
     pub async fn delete_db(pool: &sqlx::PgPool, id: uuid::Uuid) -> Result<Option<(String, Option<String>)>, sqlx::Error> {
         // Get info before deleting.
@@ -1019,12 +1083,9 @@ impl DeploymentStore {
     /// Snapshot all deployments from DB (for config export).
     ///
     /// Includes disabled rows so YAML round-trip preserves `enabled: false`
-    /// state. The earlier `WHERE enabled IS NOT FALSE` filter caused
-    /// disabled deployments to vanish from YAML after `persist_config_in_place`,
-    /// and the subsequent `sync_yaml_to_db` would physically DELETE the
-    /// source='db' row — effectively turning "disable" into "delete". Routing
-    /// exclusion is handled separately by `load_db_only_rows`, which correctly
-    /// filters disabled rows for the in-memory routing table.
+    /// state — turning "disable" into "delete" on export/re-seed. Routing
+    /// exclusion is handled by the loader, which filters disabled rows for
+    /// the in-memory routing table.
     pub async fn snapshot_db(pool: &sqlx::PgPool) -> Result<Vec<DeploymentRow>, sqlx::Error> {
         sqlx::query_as::<_, DeploymentRow>(SNAPSHOT_DB_SQL)
             .fetch_all(pool)

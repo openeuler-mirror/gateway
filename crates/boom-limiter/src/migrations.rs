@@ -94,7 +94,17 @@ CREATE TABLE IF NOT EXISTS boom_team_plan_assignment (
 "#
 }
 
-/// DDL for boom_rate_limit_plan table + index.
+/// DDL for boom_rate_limit_plan table + indexes.
+///
+/// `is_default_team` is the team-plan counterpart of `is_default` — the
+/// default-plan pointers must live in DB (not YAML) now that DB is the
+/// runtime authority for plans. Both use partial unique indexes so at most
+/// one row carries each flag.
+///
+/// The guard ALTER must run BEFORE `idx_boom_plan_default_team`: on an
+/// upgrade-path DB the CREATE TABLE is a no-op (table exists without the
+/// column), so without the ALTER the index creation fails with "column
+/// is_default_team does not exist" and aborts every later migration.
 pub fn plan_ddl() -> &'static str {
     r#"
 CREATE TABLE IF NOT EXISTS boom_rate_limit_plan (
@@ -104,12 +114,17 @@ CREATE TABLE IF NOT EXISTS boom_rate_limit_plan (
     window_limits     JSONB  NOT NULL DEFAULT '[]',
     schedule          JSONB  NOT NULL DEFAULT '[]',
     is_default        BOOLEAN NOT NULL DEFAULT false,
+    is_default_team   BOOLEAN NOT NULL DEFAULT false,
     source            TEXT    NOT NULL DEFAULT 'yaml',
     updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+ALTER TABLE boom_rate_limit_plan
+    ADD COLUMN IF NOT EXISTS is_default_team BOOLEAN NOT NULL DEFAULT false;
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_boom_plan_default
    ON boom_rate_limit_plan (is_default) WHERE is_default = true;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_boom_plan_default_team
+   ON boom_rate_limit_plan (is_default_team) WHERE is_default_team = true;
 "#
 }
 
@@ -197,6 +212,14 @@ BEGIN
             DROP COLUMN IF EXISTS team_window_limits,
             DROP COLUMN IF EXISTS team_total_tpm_limit,
             DROP COLUMN IF EXISTS team_total_cost_limit_micros;
+    EXCEPTION WHEN OTHERS THEN NULL; END;
+
+    -- is_default_team: team-plan default pointer moved from YAML-only state
+    -- to a DB column (DB-authoritative config refactor). No-op on fresh DBs
+    -- whose base DDL already includes it.
+    BEGIN
+        ALTER TABLE boom_rate_limit_plan
+            ADD COLUMN IF NOT EXISTS is_default_team BOOLEAN NOT NULL DEFAULT false;
     EXCEPTION WHEN OTHERS THEN NULL; END;
 END $$;
 "#

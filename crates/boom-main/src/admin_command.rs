@@ -1,9 +1,6 @@
-use boom_core::provider::Provider;
 use boom_dashboard::state::AdminCommand;
-use boom_routing::{DeploymentStore, VisibilityState, visibility_from_db};
+use boom_routing::DeploymentStore;
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::state::AppState;
@@ -15,72 +12,39 @@ pub async fn admin_command_handler(mut rx: tokio::sync::mpsc::Receiver<AdminComm
     while let Some(cmd) = rx.recv().await {
         match cmd {
             AdminCommand::CreateModel { req, reply } => {
-                let mut result = handle_create_model(&state, req).await;
-                // Best-effort YAML sync AFTER DB write + in-memory update have
-                // succeeded (store.*_db + reload_model_deployments already ran
-                // inside the handler). A YAML write failure does NOT block
-                // routing — the deployment is already routable from the
-                // in-memory store. Surface the failure as a warning so the
-                // operator knows the DB↔YAML split exists; a subsequent reload
-                // will reload from the stale YAML and OVERWRITE this DB change
-                // (Scenario D — YAML absolutely wins on reload).
-                if result.is_ok() {
-                    if let Err(e) = state.persist_config_in_place().await {
-                        augment_with_warning(&mut result, format!(
-                            "DB write succeeded and the deployment is routable, \
-                             but YAML sync failed: {e}. The next reload will \
-                             rebuild the store from the stale YAML and overwrite \
-                             this DB change. Fix the YAML file's write \
-                             permissions, then re-apply this change."
-                        ));
-                    }
-                }
+                let result = handle_create_model(&state, req).await;
                 let _ = reply.send(result);
             }
             AdminCommand::UpdateModel { id, req, reply } => {
-                let mut result = handle_update_model(&state, id, req).await;
-                // Same best-effort YAML sync as CreateModel — see that arm for
-                // the Scenario D warning rationale.
-                if result.is_ok() {
-                    if let Err(e) = state.persist_config_in_place().await {
-                        augment_with_warning(&mut result, format!(
-                            "DB write succeeded and the deployment is routable, \
-                             but YAML sync failed: {e}. The next reload will \
-                             rebuild the store from the stale YAML and overwrite \
-                             this DB change. Fix the YAML file's write \
-                             permissions, then re-apply this change."
-                        ));
-                    }
-                }
+                let result = handle_update_model(&state, id, req).await;
                 let _ = reply.send(result);
             }
             AdminCommand::DeleteModel { id, reply } => {
-                let mut result = handle_delete_model(&state, id).await;
-                // Same best-effort YAML sync as CreateModel — see that arm for
-                // the Scenario D warning rationale.
-                if result.is_ok() {
-                    if let Err(e) = state.persist_config_in_place().await {
-                        augment_with_warning(&mut result, format!(
-                            "DB write succeeded and the deployment is removed \
-                             from routing, but YAML sync failed: {e}. The next \
-                             reload will rebuild the store from the stale YAML \
-                             and re-add this deployment. Fix the YAML file's \
-                             write permissions, then re-delete it."
-                        ));
-                    }
-                }
+                let result = handle_delete_model(&state, id).await;
                 let _ = reply.send(result);
             }
-            AdminCommand::ConfigChanged { reply } => {
-                // Best-effort YAML persistence. The caller (alias/plan CRUD)
-                // has already updated DB + in-memory state, so a YAML write
-                // failure must not block the operation. Surface the result
-                // back so the dashboard handler can attach a warning to the
-                // HTTP response instead of silently dropping it.
-                let result = state.persist_config_in_place().await;
-                if let Err(e) = &result {
-                    tracing::warn!("ConfigChanged YAML persist failed: {}", e);
-                }
+            AdminCommand::UpsertWorkflow { req, reply } => {
+                let result = handle_upsert_workflow(&state, req).await;
+                let _ = reply.send(result);
+            }
+            AdminCommand::DeleteWorkflow { name, reply } => {
+                let result = handle_delete_workflow(&state, name).await;
+                let _ = reply.send(result);
+            }
+            AdminCommand::UpsertWorkflowModel { req, reply } => {
+                let result = handle_upsert_workflow_model(&state, req).await;
+                let _ = reply.send(result);
+            }
+            AdminCommand::DeleteWorkflowModel { model_name, reply } => {
+                let result = handle_delete_workflow_model(&state, model_name).await;
+                let _ = reply.send(result);
+            }
+            AdminCommand::UpsertCostTemplate { req, reply } => {
+                let result = handle_upsert_cost_template(&state, req).await;
+                let _ = reply.send(result);
+            }
+            AdminCommand::DeleteCostTemplate { name, reply } => {
+                let result = handle_delete_cost_template(&state, name).await;
                 let _ = reply.send(result);
             }
             AdminCommand::ReloadConfig { reply } => {
@@ -100,10 +64,33 @@ pub async fn admin_command_handler(mut rx: tokio::sync::mpsc::Receiver<AdminComm
                 let _ = reply.send(result);
             }
             AdminCommand::GetConfig { reply } => {
-                let inner = state.inner.load();
-                let mut json = serde_json::to_value(&inner.config)
-                    .map_err(|e| format!("Serialize config: {}", e));
+                // Serialize + drop the inner guard BEFORE the DB await —
+                // holding an ArcSwap guard across .await pins the old config
+                // Arc for the whole query.
+                let mut json = {
+                    let inner = state.inner.load();
+                    serde_json::to_value(&inner.config)
+                        .map_err(|e| format!("Serialize config: {}", e))
+                };
                 if let Ok(ref mut v) = json {
+                    // DB mode: overlay the DB-owned runtime sections (models,
+                    // aliases, plans, blocklist switch+rules) on top of the
+                    // process-level config. The YAML runtime sections are
+                    // inert — showing them would be showing stale state.
+                    if let Some(ref pool) = state.db_pool {
+                        match crate::state::build_config_snapshot_value(pool).await {
+                            Ok(snapshot) => {
+                                overlay_db_owned_sections(v, &snapshot);
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "GetConfig DB snapshot overlay failed: {} \
+                                     (falling back to process config only)",
+                                    e
+                                );
+                            }
+                        }
+                    }
                     boom_config::mask_secrets_in_place(v);
                 }
                 let _ = reply.send(json);
@@ -113,8 +100,34 @@ pub async fn admin_command_handler(mut rx: tokio::sync::mpsc::Receiver<AdminComm
                     "model_deployments": boom_config::manifest::model_deployment_fields(),
                     "general_settings": boom_config::manifest::general_settings_fields(),
                     "router_settings": boom_config::manifest::router_settings_fields(),
+                    "cost_templates": boom_config::manifest::cost_template_fields(),
+                    "workflows": boom_config::manifest::workflow_fields(),
                 });
                 let _ = reply.send(Ok(schema));
+            }
+            AdminCommand::ExportConfig { reply } => {
+                let result = state.export_config_yaml().await;
+                if let Err(ref e) = result {
+                    tracing::warn!("Config export failed: {}", e);
+                }
+                let _ = reply.send(result);
+            }
+            AdminCommand::WriteBackConfig { reply } => {
+                let result = state.persist_config_in_place().await.map(|path| {
+                    if state.config_path.is_some() {
+                        format!("Config written back to {}", path)
+                    } else {
+                        format!(
+                            "Config generated at {} (mode 0600) — contains plaintext \
+                             secrets; restart with this file to adopt it as the boot config",
+                            path
+                        )
+                    }
+                });
+                if let Err(ref e) = result {
+                    tracing::warn!("Config write-back failed: {}", e);
+                }
+                let _ = reply.send(result);
             }
             AdminCommand::UpdatePromptLogConfig { config, reply } => {
                 // Hot-swap the live prompt-log config. The writer's
@@ -193,73 +206,38 @@ pub async fn admin_command_handler(mut rx: tokio::sync::mpsc::Receiver<AdminComm
     tracing::warn!("Admin command handler stopped (channel closed)");
 }
 
-/// Attach a `warning` field to a successful Result<Value, String> so the
-/// frontend can distinguish "fully applied" from "DB-only applied, reload
-/// pending". The Result stays Ok because the user's primary intent (DB
-/// write) succeeded; the warning surfaces the secondary failure.
-fn augment_with_warning(result: &mut Result<Value, String>, warning: String) {
-    if let Ok(json) = result {
-        if let Some(obj) = json.as_object_mut() {
-            obj.insert(
-                "warning".into(),
-                serde_json::Value::String(warning),
-            );
+/// Overlay the DB-owned runtime sections from a `build_config_snapshot_value`
+/// snapshot onto the serialized live config (GetConfig path). The snapshot
+/// keys replace their YAML counterparts wholesale — the DB is the authority;
+/// process-level sections (server, router policy, prompt log, ...) are kept
+/// from the live config.
+fn overlay_db_owned_sections(config: &mut Value, snapshot: &Value) {
+    let Some(cfg_obj) = config.as_object_mut() else { return };
+    let Some(snap_obj) = snapshot.as_object() else { return };
+
+    for key in [
+        "model_list",
+        "plan_settings",
+        "client_blocklist",
+        "workflow_settings",
+        "cost_templates",
+    ] {
+        if let Some(v) = snap_obj.get(key) {
+            cfg_obj.insert(key.to_string(), v.clone());
         }
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Warning attaches to a successful JSON-object Result. The Result
-    /// stays Ok because the primary DB write succeeded; the warning surfaces
-    /// the secondary YAML failure so the frontend can prompt the operator
-    /// to fix file permissions.
-    #[test]
-    fn augment_with_warning_attaches_to_ok_object() {
-        let mut result: Result<Value, String> = Ok(json!({"ok": true, "id": "abc"}));
-        augment_with_warning(
-            &mut result,
-            "YAML sync failed: read-only file system".to_string(),
-        );
-        let v = result.unwrap();
-        assert_eq!(v["ok"], true);
-        assert_eq!(v["id"], "abc");
-        assert_eq!(v["warning"], "YAML sync failed: read-only file system");
-    }
-
-    /// Warning does NOT downgrade Ok to Err — that would make the frontend
-    /// treat a routable deployment as a failed operation, undoing the whole
-    /// point of the best-effort YAML write refactor.
-    #[test]
-    fn augment_with_warning_keeps_result_ok() {
-        let mut result: Result<Value, String> = Ok(json!({"ok": true}));
-        augment_with_warning(&mut result, "any warning".to_string());
-        assert!(result.is_ok(), "augment_with_warning must not flip Ok → Err");
-    }
-
-    /// Warning on Err Result is a no-op — the error string already carries
-    /// the primary failure; layering a YAML warning on top would confuse the
-    /// operator about which step failed.
-    #[test]
-    fn augment_with_warning_no_op_on_err() {
-        let mut result: Result<Value, String> = Err("DB insert failed".to_string());
-        augment_with_warning(&mut result, "YAML also failed".to_string());
-        assert_eq!(result.unwrap_err(), "DB insert failed");
-    }
-
-    /// Warning on non-object JSON (e.g. `json!(true)`) is a no-op — there's
-    /// no object to insert the field into. The Result still stays Ok so the
-    /// operation succeeds (the primary write did succeed), but the warning
-    /// is lost. This matches the contract: handlers always return JSON
-    /// objects, so this branch is defensive only.
-    #[test]
-    fn augment_with_warning_no_op_on_non_object() {
-        let mut result: Result<Value, String> = Ok(json!(true));
-        augment_with_warning(&mut result, "warning".to_string());
-        let v = result.unwrap();
-        assert!(v.get("warning").is_none());
+    // Aliases live under router_settings.model_group_alias — merge at the
+    // sub-key so the rest of router_settings (process-level) stays intact.
+    if let Some(aliases) = snapshot
+        .get("router_settings")
+        .and_then(|r| r.get("model_group_alias"))
+    {
+        let router = cfg_obj
+            .entry("router_settings")
+            .or_insert_with(|| serde_json::json!({}));
+        if let Some(router_obj) = router.as_object_mut() {
+            router_obj.insert("model_group_alias".to_string(), aliases.clone());
+        }
     }
 }
 
@@ -401,20 +379,30 @@ async fn handle_update_model(
 }
 
 fn ensure_not_workflow_model(state: &AppState, model_name: &str) -> Result<(), String> {
-    if state
-        .inner
-        .load()
-        .config
-        .workflow_settings
-        .models
-        .contains_key(model_name)
-    {
+    if state.workflow_store.contains_model(model_name) {
         return Err(format!(
-            "model '{}' is reserved by workflow_settings",
+            "model '{}' is reserved by a workflow virtual model",
             model_name
         ));
     }
     Ok(())
+}
+
+/// Reject deleting a deployment name (or an alias target's model) still
+/// referenced by a workflow definition — the panel/aggregator would silently
+/// break at request time. Names the referencing workflow(s) so the operator
+/// knows what to fix first.
+fn ensure_not_workflow_child(state: &AppState, model_name: &str) -> Result<(), String> {
+    let referencing = state.workflow_store.workflows_referencing(model_name);
+    if referencing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "model '{}' is referenced by workflow(s) [{}] — remove or edit the workflow(s) first",
+            model_name,
+            referencing.join(", ")
+        ))
+    }
 }
 
 async fn handle_delete_model(
@@ -422,6 +410,16 @@ async fn handle_delete_model(
     id: Uuid,
 ) -> Result<Value, String> {
     let db_pool = state.db_pool.as_ref().ok_or("Database not available")?;
+
+    // Pre-check against the live workflow store (cheaper than post-delete
+    // repair: the row is gone from the DB the moment delete_db commits).
+    // Race window between check and delete is accepted — the workflow would
+    // degrade to a request-time child-routing error, never a boot failure.
+    match DeploymentStore::peek_model_name(db_pool, id).await {
+        Ok(Some(model_name)) => ensure_not_workflow_child(state, &model_name)?,
+        Ok(None) => {}
+        Err(e) => tracing::warn!("workflow child pre-check failed (proceeding): {}", e),
+    }
 
     let info = DeploymentStore::delete_db(db_pool, id)
         .await
@@ -453,149 +451,32 @@ async fn handle_delete_model(
 }
 
 /// Reload all deployments for a specific model_name from DB into the live
-/// stores — the single apply point for CRUD and auto-disable/enable changes.
-///
-/// Applies every in-memory consumer of a deployment row, not just the
-/// provider list: FlowController slots, per-model quota ratio, and the
-/// per-model cost rate. This is the CRUD-path counterpart of the YAML build
-/// path (build_deployments_from_config + seed_flow_controller_from_config);
-/// the two must stay behaviourally identical, or web edits end up "saved
-/// but not effective until manual reload".
+/// stores — the CRUD-path entry point. Delegates the per-model apply to
+/// `config_reconcile::apply_model_rows_from_db` (shared with the
+/// boot/reload reconciler so both stay behaviourally identical), then
+/// refreshes the "*" wildcard key so serve_not_match changes take effect.
 pub async fn reload_model_deployments(state: &AppState, model_name: &str) {
     let Some(pool) = state.db_pool.as_ref() else {
         tracing::error!(model = model_name, "reload_model_deployments: no DB pool available");
         return;
     };
 
-    let rows = match DeploymentStore::load_model_rows(pool, model_name).await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::error!("Failed to reload deployments for '{}': {}", model_name, e);
-            return;
-        }
-    };
-
-    // Snapshot live deployment_ids before the swap so flow-control slots of
-    // removed deployments (auto-disable, deployment_id change) get released.
-    let old_ids: HashSet<String> = state
-        .deployment_store
-        .get_providers(model_name)
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|p| p.deployment_id().map(str::to_string))
-        .collect();
-
-    let mut providers: Vec<Arc<dyn Provider>> = Vec::new();
-    for row in &rows {
-        if let Some(p) = build_provider_from_row(row) {
-            providers.push(p);
-        }
-    }
-
-    // Visibility at model_name granularity: the newest non-normal row wins
-    // (rows are ordered by created_at) — same convention as the quota-ratio
-    // derivation below.
-    let vis = rows
-        .iter()
-        .rev()
-        .find_map(|r| match visibility_from_db(&r.visibility, &r.allowed_teams) {
-            VisibilityState::Normal => None,
-            other => Some(other),
-        });
-    state
-        .deployment_store
-        .set_visibility(model_name, vis.unwrap_or(VisibilityState::Normal));
-
-    // Always set (even empty) so resolve_candidates can distinguish
-    // "configured but all down" from "never configured". An empty provider
-    // list prevents silent fallthrough to the wildcard catch-all.
-    if !state.deployment_store.set_deployments(model_name.to_string(), providers) {
-        tracing::error!(
-            model = model_name,
-            "refused to reload deployments for an exclusive model"
-        );
-    }
-
-    // FlowController slots: update-or-create for rows still present;
-    // ensure_slot removes the slot when both limits are 0, so clearing the
-    // limits via the web UI is honoured here too.
-    let mut new_ids: HashSet<String> = HashSet::new();
-    for row in &rows {
-        if let Some(did) = row.deployment_id.as_deref() {
-            state.flow_controller.ensure_slot(
-                did,
-                &boom_flowcontrol::FlowControlConfig {
-                    max_inflight: row.max_inflight_queue_len.unwrap_or(0).max(0) as u32,
-                    max_context: row.max_context_len.unwrap_or(0).max(0) as u64,
-                },
-            );
-            new_ids.insert(did.to_string());
-        }
-    }
-    for gone in old_ids.difference(&new_ids) {
-        state.flow_controller.remove_slot(gone);
-    }
-
-    // Per-model quota ratio (newest row wins; reset to 1 when no rows remain).
-    let ratio = rows
-        .last()
-        .and_then(|r| r.quota_count_ratio)
-        .unwrap_or(1)
-        .max(0) as u64;
-    state.deployment_store.set_quota_ratio(model_name, ratio);
-
-    // Per-model cost rate from model_info.cost_template — same shared
-    // derivation as the YAML build path. Clear any stale rate when no row
-    // yields one (set_cost_rate removes the entry on a zero rate).
-    let config_guard = state.inner.load_full();
-    let mut applied_cost = false;
-    for row in &rows {
-        let Some(info_value) = row.model_info.as_ref() else { continue };
-        let Ok(info) = serde_json::from_value::<boom_config::ModelInfo>(info_value.clone()) else {
-            tracing::warn!(model = model_name, "failed to parse model_info JSON on deployment row");
-            continue;
-        };
-        if let Some(rate) = crate::state::cost_rate_from_model_info(&config_guard.config, model_name, &info) {
-            state.deployment_store.set_cost_rate(model_name, rate);
-            applied_cost = true;
-        }
-    }
-    if !applied_cost {
-        state.deployment_store.set_cost_rate(model_name, Default::default());
-    }
+    crate::config_reconcile::apply_model_rows_from_db(
+        pool,
+        model_name,
+        &state.deployment_store,
+        &state.flow_controller,
+        &state.cost_template_store,
+    )
+    .await;
 
     // Reload the "*" wildcard key whenever the affected model contributes
     // catch-all providers, so auto-disable/enable and CRUD stay consistent
-    // with the YAML-seed path (which registers serve_not_match deployments
-    // under both their real model_name and "*" — see build_deployments_from_config).
-    // Skipping this leaves stale Arc<dyn Provider> entries in "*" that route
-    // to deployments already removed from their owning model.
-    reload_wildcard_deployments(pool, &state.deployment_store).await;
-}
-
-/// Rebuild the "*" wildcard key from every enabled serve_not_match deployment
-/// in DB. Called by `reload_model_deployments` after a per-model reload so the
-/// wildcard stays in sync without a full store clear+rebuild.
-async fn reload_wildcard_deployments(
-    pool: &sqlx::PgPool,
-    deployment_store: &Arc<DeploymentStore>,
-) {
-    let rows = match DeploymentStore::load_wildcard_rows(pool).await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::error!("Failed to reload wildcard deployments: {}", e);
-            return;
-        }
-    };
-    let mut providers: Vec<Arc<dyn Provider>> = Vec::new();
-    for row in &rows {
-        if let Some(p) = build_provider_from_row(row) {
-            providers.push(p);
-        }
-    }
-    if !deployment_store.set_deployments("*".to_string(), providers) {
-        tracing::error!("refused to reload wildcard '*' deployments (exclusive model conflict)");
-    }
+    // (serve_not_match deployments register under both their real model_name
+    // and "*" — see build_deployments_from_config). Skipping this leaves
+    // stale Arc<dyn Provider> entries in "*" that route to deployments
+    // already removed from their owning model.
+    crate::config_reconcile::reload_wildcard_deployments(pool, &state.deployment_store).await;
 }
 
 /// Auto-disable a faulty deployment: mark `enabled = false, auto_disabled = true` in DB,
@@ -682,46 +563,259 @@ pub async fn auto_enable_deployment(state: &AppState, deployment_id: &str) {
         .clear_alert(&format!("deployment:{deployment_id}"));
 }
 
-/// Build a Provider from a DB deployment row (from DeploymentStore::load_model_rows).
-fn build_provider_from_row(row: &boom_routing::DeploymentProviderRow) -> Option<Arc<dyn Provider>> {
-    let mut custom_headers = HashMap::new();
-    if let Some(obj) = row.headers.as_object() {
-        for (k, v) in obj {
-            if let Some(s) = v.as_str() {
-                custom_headers.insert(k.clone(), s.to_string());
-            }
-        }
+// ═══════════════════════════════════════════════════════════
+// Workflow + cost template CRUD (DB-authoritative, M4)
+// ═══════════════════════════════════════════════════════════
+
+/// Validate a (possibly modified) workflow settings snapshot against the
+/// live model universe. Shared by all workflow CRUD handlers: build the
+/// scratch settings, run this, only then touch DB + memory + registration.
+/// A rejected edit leaves the previous registration routing.
+async fn validate_workflow_snapshot(
+    state: &AppState,
+    scratch: &boom_config::WorkflowSettings,
+) -> Result<(), String> {
+    let config = state.inner.load_full();
+    let namespaces = state.workflow_validation_namespaces(&config.config).await;
+    scratch
+        .validate_with_namespaces(&namespaces)
+        .map_err(|e| e.to_string())
+}
+
+/// Re-register fusion virtual models from the (already updated) workflow
+/// store. Called by every workflow CRUD handler after its DB write + memory
+/// update — the same registration path boot/reload use.
+async fn re_register_fusion(state: &AppState) -> Result<(), String> {
+    let config = state.inner.load_full();
+    state
+        .register_fusion_models(&config.config)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Feature-parked gate for the workflow CRUD surface: while
+/// `router_settings.enable_workflow` is false (the default), writes are
+/// rejected instead of silently no-op'ing — a created binding would never
+/// route, so the caller deserves the error.
+fn ensure_workflow_enabled(state: &AppState) -> Result<(), String> {
+    if state.inner.load_full().config.router_settings.enable_workflow {
+        Ok(())
+    } else {
+        Err(
+            "workflow feature is disabled — set router_settings.enable_workflow=true \
+             in config.yaml and reload to activate it"
+                .to_string(),
+        )
     }
-    let mut extra = HashMap::new();
-    if let Some(ref v) = row.api_version {
-        extra.insert("api_version".to_string(), v.clone());
-    }
-    if let Some(ref r) = row.aws_region_name {
-        extra.insert("aws_region_name".to_string(), r.clone());
+}
+
+async fn handle_upsert_workflow(
+    state: &AppState,
+    req: boom_dashboard::handlers_admin::UpsertWorkflowRequest,
+) -> Result<Value, String> {
+    ensure_workflow_enabled(state)?;
+    let db_pool = state.db_pool.as_ref().ok_or("Database not available")?;
+
+    let definition: boom_config::WorkflowDefinitionConfig =
+        serde_json::from_value(req.definition.clone())
+            .map_err(|e| format!("invalid workflow definition: {}", e))?;
+
+    // Scratch settings = current + this upsert; validate before any mutation.
+    let mut scratch = state.workflow_store.settings();
+    scratch
+        .workflows
+        .insert(req.name.clone(), definition.clone());
+    validate_workflow_snapshot(state, &scratch).await?;
+
+    state
+        .workflow_store
+        .upsert_definition_db(db_pool, &req.name, &definition)
+        .await
+        .map_err(|e| format!("DB write failed: {}", e))?;
+
+    re_register_fusion(state).await?;
+    tracing::info!(workflow = %req.name, "Workflow definition saved");
+    Ok(json!({"ok": true}))
+}
+
+async fn handle_delete_workflow(
+    state: &AppState,
+    name: String,
+) -> Result<Value, String> {
+    ensure_workflow_enabled(state)?;
+    let db_pool = state.db_pool.as_ref().ok_or("Database not available")?;
+
+    // Reject while bindings reference the definition — deleting it would
+    // leave dangling rows that the reconciler then skips with warns.
+    let referencing: Vec<String> = state
+        .workflow_store
+        .settings()
+        .models
+        .iter()
+        .filter(|(_, w)| *w == &name)
+        .map(|(m, _)| m.clone())
+        .collect();
+    if !referencing.is_empty() {
+        return Err(format!(
+            "workflow '{}' is still bound to model(s) [{}] — delete the bindings first",
+            name,
+            referencing.join(", ")
+        ));
     }
 
-    let api_key = row.api_key.as_ref().map(|k| {
-        if row.api_key_env.unwrap_or(false) {
-            boom_config::resolve_env_value(k)
-        } else {
-            k.clone()
-        }
-    });
+    let existed = state
+        .workflow_store
+        .delete_definition_db(db_pool, &name)
+        .await
+        .map_err(|e| format!("DB delete failed: {}", e))?;
+    if !existed {
+        return Err(format!("workflow '{}' not found", name));
+    }
 
-    match boom_provider::create_provider(
-        &row.litellm_model,
-        api_key,
-        row.api_base.clone(),
-        row.timeout as u64,
-        &extra,
-        &custom_headers,
-        row.deployment_id.clone(),
-        row.client_type_header.unwrap_or(false),
-    ) {
-        Ok(provider) => Some(provider),
-        Err(e) => {
-            tracing::error!("Failed to build provider for '{}': {}", row.model_name, e);
-            None
+    // No bindings changed → no registration change needed.
+    tracing::info!(workflow = %name, "Workflow definition deleted");
+    Ok(json!({"ok": true}))
+}
+
+async fn handle_upsert_workflow_model(
+    state: &AppState,
+    req: boom_dashboard::handlers_admin::UpsertWorkflowModelRequest,
+) -> Result<Value, String> {
+    ensure_workflow_enabled(state)?;
+    let db_pool = state.db_pool.as_ref().ok_or("Database not available")?;
+
+    if !state
+        .workflow_store
+        .settings()
+        .workflows
+        .contains_key(&req.workflow_name)
+    {
+        return Err(format!(
+            "unknown workflow '{}' — create the definition first",
+            req.workflow_name
+        ));
+    }
+
+    // Scratch settings = current + this binding; validate before any
+    // mutation (catches name conflicts with deployments/aliases).
+    let mut scratch = state.workflow_store.settings();
+    scratch
+        .models
+        .insert(req.model_name.clone(), req.workflow_name.clone());
+    validate_workflow_snapshot(state, &scratch).await?;
+
+    state
+        .workflow_store
+        .upsert_model_db(db_pool, &req.model_name, &req.workflow_name)
+        .await
+        .map_err(|e| format!("DB write failed: {}", e))?;
+
+    re_register_fusion(state).await?;
+    tracing::info!(
+        model = %req.model_name,
+        workflow = %req.workflow_name,
+        "Workflow model binding saved"
+    );
+    Ok(json!({"ok": true}))
+}
+
+async fn handle_delete_workflow_model(
+    state: &AppState,
+    model_name: String,
+) -> Result<Value, String> {
+    ensure_workflow_enabled(state)?;
+    let db_pool = state.db_pool.as_ref().ok_or("Database not available")?;
+
+    let existed = state
+        .workflow_store
+        .delete_model_db(db_pool, &model_name)
+        .await
+        .map_err(|e| format!("DB delete failed: {}", e))?;
+    if !existed {
+        return Err(format!("workflow model '{}' not found", model_name));
+    }
+
+    // Registration teardown removes the exclusive deployment.
+    re_register_fusion(state).await?;
+    tracing::info!(model = %model_name, "Workflow model binding deleted");
+    Ok(json!({"ok": true}))
+}
+
+async fn handle_upsert_cost_template(
+    state: &AppState,
+    req: boom_dashboard::handlers_admin::UpsertCostTemplateRequest,
+) -> Result<Value, String> {
+    let db_pool = state.db_pool.as_ref().ok_or("Database not available")?;
+
+    if req.name.trim().is_empty() {
+        return Err("cost template name must not be empty".to_string());
+    }
+    for (field, value) in [
+        ("input_cost_per_million_tokens", req.input_cost_per_million_tokens),
+        (
+            "cached_input_cost_per_million_tokens",
+            req.cached_input_cost_per_million_tokens,
+        ),
+        ("output_cost_per_million_tokens", req.output_cost_per_million_tokens),
+    ] {
+        if value.is_some_and(|v| !v.is_finite() || v < 0.0) {
+            return Err(format!("{} must be a finite non-negative number", field));
         }
     }
+
+    let template = boom_config::CostTemplate {
+        name: req.name.clone(),
+        input_cost_per_million_tokens: req.input_cost_per_million_tokens,
+        cached_input_cost_per_million_tokens: req.cached_input_cost_per_million_tokens,
+        output_cost_per_million_tokens: req.output_cost_per_million_tokens,
+    };
+
+    state
+        .cost_template_store
+        .upsert_db(db_pool, &template)
+        .await
+        .map_err(|e| format!("DB write failed: {}", e))?;
+
+    // Re-derive the cost rate of every model bound to this template so the
+    // new rates take effect immediately (same primitive the CRUD model path
+    // uses).
+    let affected = DeploymentStore::models_using_cost_template(db_pool, &req.name)
+        .await
+        .unwrap_or_default();
+    for model in &affected {
+        reload_model_deployments(state, model).await;
+    }
+
+    tracing::info!(template = %req.name, models = affected.len(), "Cost template saved");
+    Ok(json!({"ok": true, "affected_models": affected}))
+}
+
+async fn handle_delete_cost_template(
+    state: &AppState,
+    name: String,
+) -> Result<Value, String> {
+    let db_pool = state.db_pool.as_ref().ok_or("Database not available")?;
+
+    // Models keep their model_info.cost_template reference; the lookup just
+    // stops resolving (rate clears). Re-rate them so the store drops the
+    // stale rate instead of billing at the old price.
+    let affected = DeploymentStore::models_using_cost_template(db_pool, &name)
+        .await
+        .unwrap_or_default();
+
+    let existed = state
+        .cost_template_store
+        .delete_db(db_pool, &name)
+        .await
+        .map_err(|e| format!("DB delete failed: {}", e))?;
+    if !existed {
+        return Err(format!("cost template '{}' not found", name));
+    }
+
+    for model in &affected {
+        reload_model_deployments(state, model).await;
+    }
+
+    tracing::info!(template = %name, models = affected.len(), "Cost template deleted");
+    Ok(json!({"ok": true, "affected_models": affected}))
 }

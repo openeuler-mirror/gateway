@@ -7,7 +7,7 @@ use boom_kvindex::{TokenPrefixIndex};
 use boom_core::kv_event::KvIndexBackend;
 use boom_limiter::{PlanStore, RateLimitPlan, ScheduleSlot, SlidingWindowLimiter};
 use boom_flowcontrol::{FlowControlConfig, FlowController};
-use boom_routing::{register_fusion_providers, AliasStore, DeploymentStore, FusionRuntime, AutoRouter, InFlightTracker, KeyAffinityPolicy, MlServiceClient, RebalanceMoveTracker, RequestRateTracker, Router, RoundRobinPolicy, SchedulePolicy, ShufflePolicy, StrategyRegistry, TierClassifier, VisibilityState, parse_allowed_teams, visibility_from_db};
+use boom_routing::{register_fusion_providers, AliasStore, CostTemplateStore, DeploymentStore, FusionRuntime, AutoRouter, InFlightTracker, KeyAffinityPolicy, KvcSchedulerStats, MlServiceClient, RebalanceMoveTracker, RequestRateTracker, Router, RoundRobinPolicy, SchedulePolicy, ShufflePolicy, StrategyRegistry, TierClassifier, VisibilityState, WorkflowStore, parse_allowed_teams};
 use boom_ctxaware::AgentStatsTracker;
 use boom_promptlog::PromptLogWriter;
 use boom_provider;
@@ -30,8 +30,13 @@ use crate::health_monitor::DeploymentHealthStore;
 /// rate-limit counters, deployments, and aliases are preserved.
 #[derive(Clone)]
 pub struct AppState {
-    /// Config file path (stored for reload).
-    pub config_path: String,
+    /// Config file path (stored for reload). `None` = env-bootstrap mode:
+    /// no YAML file exists; process config came from
+    /// `boom_config::bootstrap_from_env` and stays fixed across reloads
+    /// (SIGHUP still rebuilds policy/classifier and reconciles DB business
+    /// config). The write-back button generates `./config.yaml` from this
+    /// state; a restart with that file adopts file mode.
+    pub config_path: Option<String>,
     /// Hot-swappable inner state (config + auth + health only).
     pub inner: Arc<ArcSwap<AppStateInner>>,
     /// DB pool survives reloads (avoids reconnection).
@@ -50,6 +55,14 @@ pub struct AppState {
     pub deployment_store: Arc<DeploymentStore>,
     /// Alias store survives reloads (preserves model aliases).
     pub alias_store: Arc<AliasStore>,
+    /// Workflow definition + binding store survives reloads. Content is
+    /// DB-authoritative (DB mode) or YAML-seeded (no-DB mode); fusion
+    /// registration consumes its `settings()` snapshot.
+    pub workflow_store: Arc<WorkflowStore>,
+    /// Cost template store survives reloads. Resolves
+    /// `model_info.cost_template` references for rate derivation — never the
+    /// YAML config, which is only the bootstrap seed.
+    pub cost_template_store: Arc<CostTemplateStore>,
     /// Client blocklist store (boom-gatekeeper) survives reloads. Rules are
     /// rebuilt from YAML + DB on reload; dashboard CRUD updates it in place.
     pub block_rule_store: Arc<boom_gatekeeper::BlockRuleStore>,
@@ -75,6 +88,10 @@ pub struct AppState {
     pub prompt_log_query: Arc<dyn boom_promptlog::PromptLogQueryApi>,
     /// Per-deployment rebalance move tracker (in/out counts, survives reloads).
     pub rebalance_move_tracker: Arc<RebalanceMoveTracker>,
+    /// Global kvc_aware scheduling counters — total / affinity / cold /
+    /// lowest-load fallback / rebalance (debug page; survives reloads).
+    /// The policy is recreated on every reload, so the counters must live here.
+    pub kvc_stats: Arc<KvcSchedulerStats>,
     /// Per-deployment request rate tracker (survives reloads).
     pub request_rate: Arc<RequestRateTracker>,
     /// Agent (client-type) statistics tracker (survives reloads).
@@ -152,12 +169,16 @@ const KV_BLOCK_SIZE: usize = 512;
 impl AppState {
     /// Build state from config. Called once at startup.
     ///
-    /// Unified YAML-priority flow:
-    ///   1. Build deployments/aliases/plans from YAML → memory stores
-    ///   2. sync_yaml_to_db() → persist YAML to DB, handle same-name conflicts
-    ///   3. load_db_only_*() → load source='db' records from DB on top
-    ///   4. Restore runtime state (assignments, counters)
-    pub async fn from_config(config: Config, config_path: String) -> anyhow::Result<Self> {
+    /// Business-config sourcing depends on the deployment mode:
+    ///   - DB mode: run migrations, seed the DB from YAML runtime sections
+    ///     when the tables are fresh (marker-guarded, once ever), then build
+    ///     the stores entirely from the DB. YAML keeps only process-level
+    ///     sections (server, router policy, prompt log, trace, hooks).
+    ///   - No-DB mode (no database_url): build the stores from YAML — the
+    ///     Kong dbless-style deployment choice, not a dual-authority merge.
+    ///
+    /// Runtime state (assignments, counters) is restored on top in both modes.
+    pub async fn from_config(config: Config, config_path: Option<String>) -> anyhow::Result<Self> {
         // 1. Connect to database (optional).
         let db_pool = match &config.general_settings.database_url {
             Some(url) => {
@@ -223,6 +244,12 @@ impl AppState {
         let deployment_store = Arc::new(DeploymentStore::new());
         let alias_store = Arc::new(AliasStore::new());
 
+        // 4a. Workflow + cost template stores survive across reloads. Same
+        // lifecycle as the stores above: DB-authoritative content in DB mode,
+        // YAML-seeded in no-DB mode.
+        let workflow_store = Arc::new(WorkflowStore::new());
+        let cost_template_store = Arc::new(CostTemplateStore::new());
+
         // 4b. Client blocklist store survives across reloads.
         let block_rule_store = Arc::new(boom_gatekeeper::BlockRuleStore::new());
 
@@ -237,6 +264,9 @@ impl AppState {
 
         // Rebalance move tracker survives across reloads (lifetime cumulative).
         let rebalance_move_tracker = Arc::new(RebalanceMoveTracker::new());
+        // Global kvc scheduling counters survive across reloads (the policy is
+        // recreated on every reload — per-policy counters would reset).
+        let kvc_stats = Arc::new(KvcSchedulerStats::new());
         let request_rate = Arc::new(RequestRateTracker::new());
         let agent_stats = Arc::new(AgentStatsTracker::new());
 
@@ -247,7 +277,7 @@ impl AppState {
         let kv_index_val = Self::build_kvc_subsystems(&config);
 
         // Create scheduling policy from config (may reference inflight, rebalance_move_tracker, kv_index).
-        let policy = create_policy(&config, &inflight, &flow_controller, &rebalance_move_tracker, &kv_index_val);
+        let policy = create_policy(&config, &inflight, &flow_controller, &rebalance_move_tracker, &kvc_stats, &kv_index_val);
 
         // Build auto router classifier (optional, content-based model routing).
         let auto_classifier = build_auto_router(&config);
@@ -260,38 +290,62 @@ impl AppState {
             auto_classifier,
         ));
 
-        // 5. Build from YAML first, then layer DB-only records on top.
-        build_deployments_from_config(&config, &deployment_store);
-        build_aliases_from_config(&config, &alias_store, &deployment_store);
-        build_block_rules_from_config(&config, &block_rule_store);
-        load_plans_from_config(&plan_store, &config);
-        seed_flow_controller_from_config(&config, &flow_controller);
-
+        // 5. Build stores. With a DB, the DB is the single runtime authority
+        // for business config (models, aliases, plans, block rules): seed
+        // YAML runtime sections once into empty tables (fresh install), then
+        // load everything from the DB. YAML runtime sections are inert from
+        // then on. Without a DB, YAML remains the build source (master-key-
+        // only mode — a deployment form choice, not a second authority).
         if let Some(ref pool) = db_pool {
             // Run migrations. boom_dashboard::run_migrations calls
             // boom_audit::run_request_log_migration internally (with
             // lock_timeout set on its connection).
-            if let Err(e) = boom_dashboard::migrations::run_migrations(pool).await {
-                tracing::error!("Failed to run migrations: {}", e);
-            } else {
-                validate_db_workflow_namespace(pool, &config.workflow_settings).await?;
+            //
+            // Failures are fatal: with the DB as the runtime authority,
+            // seed/reconcile below hard-depends on every table existing.
+            // Swallowing the error here would only resurface it later as an
+            // unrelated "relation does not exist" from the seed. Optional
+            // DDL (lock_timeout, DISTRIBUTE BY on GaussDB) already degrades
+            // to warn inside run_migrations.
+            boom_dashboard::migrations::run_migrations(pool).await?;
+
+            crate::migrations::ensure_config_meta_table(pool).await?;
+
+            let seed = crate::config_reconcile::seed_if_empty(pool, &config).await?;
+            if !seed.imported {
+                crate::config_reconcile::warn_inert_yaml_runtime_sections(&config);
             }
 
-            // Sync YAML config to DB (upsert source='yaml', handle conflicts).
-            if let Err(e) = sync_yaml_to_db(pool, &config, &plan_store).await {
-                tracing::error!("Failed to sync YAML to DB: {}", e);
-            }
-
-            // Load source='db' records on top of YAML-built stores.
-            load_db_only_deployments(pool, &deployment_store, &flow_controller).await;
-            load_db_only_aliases(pool, &alias_store).await;
-            block_rule_store.load_db_only(pool).await;
-            plan_store.load_db_only_plans(pool).await;
+            crate::config_reconcile::reconcile_db_config(
+                &crate::config_reconcile::ReconcileDeps {
+                    pool,
+                    deployment_store: &deployment_store,
+                    alias_store: &alias_store,
+                    plan_store: &plan_store,
+                    block_rule_store: &block_rule_store,
+                    flow_controller: &flow_controller,
+                    request_rate: &request_rate,
+                    cost_template_store: &cost_template_store,
+                    workflow_store: &workflow_store,
+                },
+            )
+            .await?;
+            crate::config_reconcile::adopt_blocklist_enabled_db(pool, &block_rule_store, &config)
+                .await?;
 
             // Restore runtime state.
             plan_store.restore_assignments_from_db(pool).await;
             plan_store.restore_team_assignments_from_db(pool).await;
             limiter.restore_counters_from_db(pool).await;
+            plan_store.cleanup_assignments();
+        } else {
+            build_deployments_from_config(&config, &deployment_store, &cost_template_store);
+            build_aliases_from_config(&config, &alias_store, &deployment_store);
+            build_block_rules_from_config(&config, &block_rule_store);
+            load_plans_from_config(&plan_store, &config);
+            seed_flow_controller_from_config(&config, &flow_controller);
+            load_workflows_from_config(&config, &workflow_store);
+            load_cost_templates_from_config(&config, &cost_template_store);
         }
 
         // 6. Build inner state (config + auth + health).
@@ -374,6 +428,8 @@ impl AppState {
             plan_store,
             deployment_store,
             alias_store,
+            workflow_store,
+            cost_template_store,
             block_rule_store,
             router,
             inflight,
@@ -385,6 +441,7 @@ impl AppState {
             prompt_log_writer,
             prompt_log_query,
             rebalance_move_tracker,
+            kvc_stats,
             request_rate,
             agent_stats,
             kv_index,
@@ -394,7 +451,7 @@ impl AppState {
             trace: trace_registry,
             alerts: Arc::new(boom_alert::AlertManager::new()),
         };
-        state.register_fusion_models(&state.inner.load().config)?;
+        state.register_fusion_models(&state.inner.load().config).await?;
         Ok(state)
     }
 
@@ -461,23 +518,39 @@ impl AppState {
 
     /// Hot-reload implementation. See [`reload`] for the safety wrapper.
     ///
-    /// Unified YAML-priority flow (same as startup, minus DB reconnection):
-    ///   1. Rebuild deployments/aliases/plans from YAML → memory stores
-    ///   2. sync_yaml_to_db() → persist YAML to DB, handle conflicts
-    ///   3. load_db_only_*() → load source='db' records on top
-    ///   4. Clean up orphaned assignments
+    /// Both modes re-read YAML for process-level sections (server, router
+    /// policy, prompt log, trace) and rebuild the derived runtime objects
+    /// (policy, classifier, fusion). They differ on business config:
     ///
-    /// Failure window: once step 4's `deployment_store.clear()` runs, the
-    /// stores are mutable targets. Any later failure leaves them in a
+    ///   - DB mode: the DB is the runtime authority. YAML runtime sections
+    ///     (model_list / plans / blocklist rules / model_group_alias) are
+    ///     inert; stores are reconciled against the DB via a per-key diff —
+    ///     never cleared — so routing continues on the old state while the
+    ///     diff applies. A reconcile failure aborts the reload with the
+    ///     stores holding their pre-diff state.
+    ///   - No-DB mode: YAML is the build source — full clear + rebuild,
+    ///     same as a fresh boot.
+    ///
+    /// Failure window (no-DB mode only): once the clear+rebuild step runs,
+    /// the stores are mutable targets. Any later failure leaves them in a
     /// partially-built state while the old `inner` config still routes.
     /// Wrapping with timeout + catch_unwind (in `reload`) bounds *how long*
     /// this can take but does NOT roll back partial mutations — that requires
     /// shadow-build + atomic swap (tracked as TODO).
     async fn reload_inner(&self) -> anyhow::Result<String> {
-        tracing::info!("Hot-reloading config from {}...", self.config_path);
+        tracing::info!(
+            "Hot-reloading config from {}...",
+            self.config_path.as_deref().unwrap_or("<env bootstrap>")
+        );
 
-        // 1. Re-read config.
-        let new_config = boom_config::load_config(&self.config_path)?;
+        // 1. Re-read config. Env-bootstrap mode has no file to re-read:
+        // keep the current process config and let the reconcile step pull
+        // the DB business state (SIGHUP still rebuilds policy/classifier
+        // and reconciles the stores, so it remains useful in this mode).
+        let new_config = match &self.config_path {
+            Some(p) => boom_config::load_config(p)?,
+            None => self.inner.load().config.clone(),
+        };
 
         // 2. Snapshot old state to get counts.
         let old_guard = self.inner.load();
@@ -504,23 +577,30 @@ impl AppState {
         } else {
             self.db_pool.clone()
         };
-        if let Some(ref pool) = db_pool {
-            validate_db_workflow_namespace(pool, &new_config.workflow_settings).await?;
-        }
 
         let new_reload_count = old_reload_count + 1;
 
-        // 4. Rebuild stores: YAML first, then DB-only on top.
-        self.deployment_store.clear();
-        build_deployments_from_config(&new_config, &self.deployment_store);
+        // 4. Rebuild stores.
+        // No-DB mode: YAML is the build source — full clear+rebuild.
+        // DB mode: deferred to the reconcile step below (the DB is the
+        // runtime authority; a diff, not a clear+rebuild).
+        if db_pool.is_none() {
+            self.deployment_store.clear();
+            build_deployments_from_config(&new_config, &self.deployment_store, &self.cost_template_store);
 
-        self.alias_store.clear();
-        build_aliases_from_config(&new_config, &self.alias_store, &self.deployment_store);
-        build_block_rules_from_config(&new_config, &self.block_rule_store);
+            self.alias_store.clear();
+            build_aliases_from_config(&new_config, &self.alias_store, &self.deployment_store);
+            build_block_rules_from_config(&new_config, &self.block_rule_store);
 
-        self.plan_store.clear_plans();
-        load_plans_from_config(&self.plan_store, &new_config);
-        seed_flow_controller_from_config(&new_config, &self.flow_controller);
+            self.plan_store.clear_plans();
+            load_plans_from_config(&self.plan_store, &new_config);
+            seed_flow_controller_from_config(&new_config, &self.flow_controller);
+
+            self.workflow_store.clear();
+            load_workflows_from_config(&new_config, &self.workflow_store);
+            self.cost_template_store.clear();
+            load_cost_templates_from_config(&new_config, &self.cost_template_store);
+        }
 
         // Rebuild KV-cache subsystem (index + tokenizer pool + subscriber)
         // ONLY when the kvc-relevant config actually changed. The trie is a
@@ -564,11 +644,14 @@ impl AppState {
 
         // Recreate policy (fresh counters etc.) — router reuses same stores.
         // Policy reads the (possibly just-swapped) kv_index via the ArcSwap.
+        // kvc_stats is NOT recreated — it is AppState-owned so the global
+        // counters survive this reload.
         let new_policy = create_policy(
             &new_config,
             &self.inflight,
             &self.flow_controller,
             &self.rebalance_move_tracker,
+            &self.kvc_stats,
             &**self.kv_index.load(),
         );
         self.router.set_policy(new_policy);
@@ -577,40 +660,43 @@ impl AppState {
         self.router.set_classifier(build_auto_router(&new_config));
 
         if let Some(ref pool) = db_pool {
-            // Sync YAML config to DB (upsert source='yaml', handle conflicts).
-            // Errors are non-fatal — log and continue. The follow-up
-            // load_db_only_* steps still need to run against whatever DB
-            // state we have. Timeout bounds DB hangs from blocking reload.
-            if let Err(e) = with_db_timeout(
-                "sync_yaml_to_db",
-                sync_yaml_to_db(pool, &new_config, &self.plan_store),
-            ).await {
-                tracing::error!("Failed to sync YAML to DB: {}", e);
-            }
-
-            // Load source='db' records on top of YAML-built stores. Each step
-            // is independently timeout-bounded; failure aborts the reload
-            // (surfaces via reload's overall Err return), but the previous
-            // inner config still routes.
-            with_db_timeout_void(
-                "load_db_only_deployments",
-                load_db_only_deployments(pool, &self.deployment_store, &self.flow_controller),
-            ).await?;
-            with_db_timeout_void(
-                "load_db_only_aliases",
-                load_db_only_aliases(pool, &self.alias_store),
-            ).await?;
-            with_db_timeout_void(
-                "load_db_only_block_rules",
-                self.block_rule_store.load_db_only(pool),
-            ).await?;
-            with_db_timeout_void(
-                "load_db_only_plans",
-                self.plan_store.load_db_only_plans(pool),
-            ).await?;
+            // DB is the runtime authority: reconcile the live stores with DB
+            // state — a per-key diff, never a clear, so routing continues on
+            // the old state while the diff applies. YAML runtime sections are
+            // inert; warn when they still carry content. The seed check runs
+            // here too (marker-guarded, one SELECT when already seeded) so a
+            // reload that just gained a database_url imports YAML instead of
+            // reconciling against an empty DB. Timeout bounds DB hangs from
+            // blocking reload; failure aborts the reload (previous inner
+            // config still routes).
+            crate::config_reconcile::warn_inert_yaml_runtime_sections(&new_config);
+            crate::config_reconcile::seed_if_empty(pool, &new_config).await?;
+            with_db_timeout(
+                "reconcile_db_config",
+                crate::config_reconcile::reconcile_db_config(
+                    &crate::config_reconcile::ReconcileDeps {
+                        pool,
+                        deployment_store: &self.deployment_store,
+                        alias_store: &self.alias_store,
+                        plan_store: &self.plan_store,
+                        block_rule_store: &self.block_rule_store,
+                        flow_controller: &self.flow_controller,
+                        request_rate: &self.request_rate,
+                        cost_template_store: &self.cost_template_store,
+                        workflow_store: &self.workflow_store,
+                    },
+                ),
+            )
+            .await?;
+            crate::config_reconcile::adopt_blocklist_enabled_db(
+                pool,
+                &self.block_rule_store,
+                &new_config,
+            )
+            .await?;
         }
 
-        self.register_fusion_models(&new_config)?;
+        self.register_fusion_models(&new_config).await?;
 
         // Clean up assignments pointing to plans that no longer exist.
         self.plan_store.cleanup_assignments();
@@ -816,7 +902,33 @@ impl AppState {
         })
     }
 
-    fn register_fusion_models(&self, config: &Config) -> Result<(), boom_core::GatewayError> {
+    /// (Re-)register workflow virtual models from the WorkflowStore.
+    ///
+    /// The store is the authority (DB in DB mode, YAML in no-DB mode); the
+    /// YAML config's workflow_settings is only the bootstrap seed. Validation
+    /// runs here via `workflow_validation_namespaces` — see its doc for why
+    /// the universe includes disabled models.
+    pub(crate) async fn register_fusion_models(&self, config: &Config) -> Result<(), boom_core::GatewayError> {
+        let settings = self.workflow_store.settings();
+        // Feature-parked gate (router_settings.enable_workflow, default false).
+        // When disabled we register an EMPTY set: the teardown pass inside
+        // register_fusion_providers then unregisters any previous fusion
+        // registrations, so flipping the flag off + reload deactivates
+        // cleanly instead of leaving stale virtual models routing.
+        let settings = if config.router_settings.enable_workflow {
+            settings
+        } else {
+            if !settings.models.is_empty() {
+                tracing::warn!(
+                    count = settings.models.len(),
+                    "workflow bindings present but router_settings.enable_workflow=false — workflow virtual models are disabled"
+                );
+            }
+            Default::default()
+        };
+        let namespaces = self.workflow_validation_namespaces(config).await;
+        settings.validate_with_namespaces(&namespaces)?;
+
         let runtime = FusionRuntime::new(
             Arc::downgrade(&self.router),
             self.deployment_store.clone(),
@@ -830,60 +942,116 @@ impl AppState {
                 .flow_control_queue_timeout_secs(),
         );
         register_fusion_providers(
-            &config.workflow_settings,
+            &settings,
             &self.deployment_store,
             &self.alias_store,
             runtime,
         )
     }
 
-    /// Persist current runtime model/alias/plan state to the live `config.yaml`.
+    /// The model-name universe workflow settings validate against: every
+    /// KNOWN model — including disabled deployments — minus the workflow-
+    /// owned exclusive registrations (their own previous registrations must
+    /// not self-collide on re-registration).
     ///
-    /// v3 design: web edits mutate the live config file in place, replacing
-    /// the old "write to timestamped backup file" behavior. The live YAML is
-    /// the single source of truth — DB tables are runtime indexes, not the
-    /// authority.
+    /// Disabled models stay in the universe on purpose: a disabled panel or
+    /// aggregator is a runtime 502 by design (the fusion runtime resolves
+    /// children per request and reports `Model not found`), NOT a boot-time
+    /// config error — YAML-era validation checked `model_list`, which also
+    /// kept disabled entries. This also catches latent name collisions: a
+    /// workflow model named after a disabled deployment would shadow it the
+    /// moment it is re-enabled.
+    pub(crate) async fn workflow_validation_namespaces(
+        &self,
+        config: &Config,
+    ) -> boom_config::WorkflowNamespaces {
+        let names: Vec<String> = if let Some(pool) = &self.db_pool {
+            match DeploymentStore::all_model_names_db(pool).await {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::warn!(
+                        "workflow namespace assembly: all_model_names_db failed ({}); \
+                         falling back to routable store names",
+                        e
+                    );
+                    self.deployment_store.model_names()
+                }
+            }
+        } else {
+            config
+                .model_list
+                .iter()
+                .map(|m| m.model_name.clone())
+                .collect()
+        };
+        boom_config::WorkflowNamespaces {
+            deployment_names: names
+                .into_iter()
+                .filter(|n| !self.deployment_store.is_exclusive_model(n))
+                .collect(),
+            aliases: self.alias_store.all_aliases().into_iter().collect(),
+        }
+    }
+
+    /// Write the current DB snapshot + process config back to the YAML file
+    /// (the write-back button). Rolls a `.bak` of the previous file first —
+    /// serde_yaml serialization drops comments, so the `.bak` is also the
+    /// only record of pre-edit annotation. Untouched sections keep their
+    /// raw-file form (`${VAR}` secret references preserved; see
+    /// [`export_config_yaml`]).
     ///
-    /// Reads the raw YAML (preserving `${VAR}` references in untouched
-    /// sections — `load_config` resolves env vars at parse time, so dumping
-    /// the typed Config would leak real secrets to disk). Updates only the
-    /// sections owned by runtime tables:
-    ///   - `model_list` (from boom_model_deployment)
-    ///   - `router_settings.model_group_alias` (from boom_model_alias)
-    ///   - `plan_settings.plans` and optionally `plan_settings.default_plan`
-    ///     (from boom_rate_limit_plan)
+    /// Env-bootstrap mode (no startup file): generates a fresh
+    /// `./config.yaml` in the working directory instead — no `.bak` roll
+    /// (nothing to back up), mode 0600 (the document carries plaintext
+    /// upstream api keys). A restart with the generated file adopts it as
+    /// the boot config; until then the process keeps running env-bootstrapped.
     ///
-    /// Other singleton sections (`server`, `router_settings.schedule_policy`,
-    /// `general_settings`, etc.) are preserved verbatim.
+    /// Returns the path written, for the caller's response message.
+    pub async fn persist_config_in_place(&self) -> Result<String, String> {
+        let yaml = self.export_config_yaml().await?;
+        match &self.config_path {
+            Some(path) => {
+                backup_yaml(path);
+                boom_config::write_yaml_string_atomic(path, &yaml)
+                    .map_err(|e| format!("write config: {}", e))?;
+                tracing::info!(path = %path, "Config persisted in place");
+                Ok(path.clone())
+            }
+            None => {
+                let path = "config.yaml";
+                boom_config::write_yaml_string_atomic(path, &yaml)
+                    .map_err(|e| format!("write config: {}", e))?;
+                restrict_file_permissions(path);
+                tracing::info!(path = %path, "Config generated from env bootstrap + DB snapshot");
+                Ok(path.to_string())
+            }
+        }
+    }
+
+    /// Compose the full current config as a YAML document: runtime sections
+    /// (models/aliases/plans/block rules/workflows/cost templates) from the
+    /// DB snapshot, everything else preserved verbatim from the raw YAML on
+    /// disk (including `${VAR}` secret references — see `read_raw_yaml`).
     ///
-    /// Before writing, rolls a single `.bak` copy so a bad edit can be undone
-    /// by hand (serde_yaml serialization drops comments, so the .bak is also
-    /// the only record of pre-edit annotation).
+    /// Env-bootstrap mode has no file to preserve: the root is synthesized
+    /// from the live process config, with master_key/database_url written as
+    /// `${BOOM_*}` env references for a clean round-trip.
     ///
-    /// **Best-effort persistence (v4):** the caller (CRUD handlers) has
-    /// already written DB + updated in-memory state by the time this runs,
-    /// so a YAML write failure must NOT block the operation. Returns
-    /// `Err(message)` when YAML could not be persisted so the caller can
-    /// surface a warning to the operator — but the deployment is already
-    /// routable. A read-only YAML file therefore no longer causes
-    /// `model_not_found` for newly-created deployments.
-    ///
-    /// This function does NOT call `reload()` — the in-memory state has
-    /// already been updated by the store DB-write methods (or the handler
-    /// via `reload_model_deployments`). Calling reload here would clear + rebuild
-    /// the whole store, briefly taking routing offline and violating the
-    /// "maximize availability" principle.
-    pub async fn persist_config_in_place(&self) -> Result<(), String> {
+    /// Shared pipeline for the export button (returns the string, no file
+    /// touched) and the write-back button (writes it to the startup file
+    /// after a `.bak` roll).
+    pub async fn export_config_yaml(&self) -> Result<String, String> {
         let pool = match &self.db_pool {
             Some(p) => p,
             None => return Err("Database not available".to_string()),
         };
 
-        backup_yaml(&self.config_path);
-
-        let mut root: serde_yaml::Value = match boom_config::read_raw_yaml(&self.config_path) {
-            Ok(v) => v,
-            Err(e) => return Err(format!("read config: {}", e)),
+        let mut root: serde_yaml::Value = match &self.config_path {
+            Some(p) => match boom_config::read_raw_yaml(p) {
+                Ok(v) => v,
+                Err(e) => return Err(format!("read config: {}", e)),
+            },
+            None => synthesize_bootstrap_root(&self.inner.load().config)?,
         };
 
         let snapshot = match build_config_snapshot_value(pool).await {
@@ -891,17 +1059,7 @@ impl AppState {
             Err(e) => return Err(format!("build snapshot from DB: {}", e)),
         };
 
-        if let Err(e) = merge_runtime_sections(&mut root, &snapshot, self.block_rule_store.is_enabled()) {
-            return Err(format!("merge runtime sections: {}", e));
-        }
-
-        match boom_config::write_yaml_atomic(&self.config_path, &root) {
-            Ok(()) => {
-                tracing::info!(path = %self.config_path, "Config persisted in place");
-                Ok(())
-            }
-            Err(e) => Err(format!("write config: {}", e)),
-        }
+        compose_export_yaml(&mut root, &snapshot, self.block_rule_store.is_enabled())
     }
 
     /// Update a single config section in the live `config.yaml` and reload.
@@ -922,16 +1080,46 @@ impl AppState {
             return Err("Empty config path".to_string());
         }
 
-        backup_yaml(&self.config_path);
+        let Some(config_path) = &self.config_path else {
+            return Err(
+                "no config file to update — the gateway was bootstrapped from environment \
+                 variables; use the write-back button to generate config.yaml, then \
+                 restart to adopt it as the boot config"
+                    .to_string(),
+            );
+        };
 
-        let mut root: serde_yaml::Value = boom_config::read_raw_yaml(&self.config_path)
+        // Business config is DB-owned. Writing these sections to YAML would
+        // create a second authority that the reconcile path deliberately
+        // ignores (or, pre-M4, partially consumes for workflow/cost) — reject
+        // with a pointer to the right surface instead of silently doing the
+        // wrong thing on the next reload.
+        const DB_OWNED_PATHS: [&str; 6] = [
+            "model_list",
+            "plan_settings",
+            "client_blocklist",
+            "router_settings.model_group_alias",
+            "workflow_settings",
+            "cost_templates",
+        ];
+        if DB_OWNED_PATHS.contains(&path) {
+            return Err(format!(
+                "'{path}' is managed in the database (dashboard CRUD), not in \
+                 config.yaml; use the dashboard's export/write-back buttons to \
+                 refresh the YAML snapshot"
+            ));
+        }
+
+        backup_yaml(config_path);
+
+        let mut root: serde_yaml::Value = boom_config::read_raw_yaml(config_path)
             .map_err(|e| format!("Failed to read config: {}", e))?;
 
         let yaml_value = json_to_yaml(&value).map_err(|e| format!("JSON→YAML: {}", e))?;
         boom_config::set_yaml_path(&mut root, &segments, yaml_value)
             .map_err(|e| format!("Failed to set path: {}", e))?;
 
-        boom_config::write_yaml_atomic(&self.config_path, &root)
+        boom_config::write_yaml_atomic(config_path, &root)
             .map_err(|e| format!("Failed to write config: {}", e))?;
 
         tracing::info!(path = %path, "Config section updated");
@@ -944,9 +1132,9 @@ impl AppState {
 
 /// Merge runtime-derived sections (model_list, aliases, plans) from a JSON
 /// snapshot into the raw YAML value. Singleton sections are preserved as-is.
-/// `blocklist_enabled` is the running gateway's blocklist switch, materialized
-/// into the YAML when the section carries no explicit `enabled` (see the
-/// client_blocklist block below).
+/// `blocklist_enabled` is the running gateway's blocklist switch, used as a
+/// fallback when the snapshot carries no `enabled` (no-DB mode / missing
+/// state row).
 fn merge_runtime_sections(
     root: &mut serde_yaml::Value,
     snapshot: &serde_json::Value,
@@ -979,28 +1167,44 @@ fn merge_runtime_sections(
             boom_config::set_yaml_path(root, &["plan_settings", "default_plan"], yaml_val)
                 .map_err(|e| format!("set plan_settings.default_plan: {}", e))?;
         }
+        if let Some(default_team_plan) = plan_settings.get("default_team_plan") {
+            let yaml_val = json_to_yaml(default_team_plan)?;
+            boom_config::set_yaml_path(root, &["plan_settings", "default_team_plan"], yaml_val)
+                .map_err(|e| format!("set plan_settings.default_team_plan: {}", e))?;
+        }
     }
 
-    // Client blocklist: only the rules array is runtime state. An explicit
-    // `enabled` in the YAML is preserved (the operator may have edited it
-    // without a reload). But when this merge just created the section (web
-    // CRUD persist on a config that had none), materialize the running
-    // gateway's switch — otherwise the section would parse with the serde
-    // default (enabled: true) and a restart would silently activate rules
-    // the operator never turned on.
-    if let Some(rules) = obj.get("client_blocklist").and_then(|c| c.get("rules")) {
-        let yaml_val = json_to_yaml(rules)?;
-        boom_config::set_yaml_path(root, &["client_blocklist", "rules"], yaml_val)
-            .map_err(|e| format!("set client_blocklist.rules: {}", e))?;
-        if root
-            .get("client_blocklist")
-            .and_then(|c| c.get("enabled"))
-            .is_none()
-        {
-            let yaml_enabled = json_to_yaml(&serde_json::Value::Bool(blocklist_enabled))?;
+    // Client blocklist: rules and the `enabled` switch are DB-owned runtime
+    // state. The snapshot carries the DB switch when the state row exists;
+    // `blocklist_enabled` (the running gateway's value) covers the no-DB
+    // fallback and any transient where the row is missing.
+    if let Some(bl) = obj.get("client_blocklist") {
+        if let Some(rules) = bl.get("rules") {
+            let yaml_val = json_to_yaml(rules)?;
+            boom_config::set_yaml_path(root, &["client_blocklist", "rules"], yaml_val)
+                .map_err(|e| format!("set client_blocklist.rules: {}", e))?;
+        }
+        let enabled_value = bl.get("enabled").cloned().unwrap_or_else(|| {
+            serde_json::Value::Bool(blocklist_enabled)
+        });
+        if !enabled_value.is_null() {
+            let yaml_enabled = json_to_yaml(&enabled_value)?;
             boom_config::set_yaml_path(root, &["client_blocklist", "enabled"], yaml_enabled)
                 .map_err(|e| format!("set client_blocklist.enabled: {}", e))?;
         }
+    }
+
+    // Workflows + cost templates are DB-owned runtime state — same wholesale
+    // replacement as the other runtime sections.
+    if let Some(workflow_settings) = obj.get("workflow_settings") {
+        let yaml_val = json_to_yaml(workflow_settings)?;
+        boom_config::set_yaml_path(root, &["workflow_settings"], yaml_val)
+            .map_err(|e| format!("set workflow_settings: {}", e))?;
+    }
+    if let Some(cost_templates) = obj.get("cost_templates") {
+        let yaml_val = json_to_yaml(cost_templates)?;
+        boom_config::set_yaml_path(root, &["cost_templates"], yaml_val)
+            .map_err(|e| format!("set cost_templates: {}", e))?;
     }
 
     // Strip the deprecated general_settings.public_models list. Visibility is
@@ -1029,6 +1233,83 @@ fn json_to_yaml(value: &serde_json::Value) -> Result<serde_yaml::Value, String> 
     serde_yaml::from_str(&s).map_err(|e| format!("yaml deserialize: {}", e))
 }
 
+/// Compose the final export document: merge the DB runtime snapshot into the
+/// raw YAML value, then serialize to a YAML string. Pure (no I/O) so the
+/// merge semantics stay unit-testable — see `merge_runtime_sections_tests`.
+fn compose_export_yaml(
+    root: &mut serde_yaml::Value,
+    snapshot: &serde_json::Value,
+    blocklist_enabled: bool,
+) -> Result<String, String> {
+    merge_runtime_sections(root, snapshot, blocklist_enabled)?;
+    serde_yaml::to_string(root).map_err(|e| format!("serialize yaml: {}", e))
+}
+
+/// Build the export root document for env-bootstrap mode (no YAML file on
+/// disk). The live `Config` is the only source — but its secrets are already
+/// env-resolved, so master_key / database_url are written back as `${BOOM_*}`
+/// references instead of plaintext (load_config re-resolves them on the next
+/// start, giving a clean round-trip). Null top-level sections and the legacy
+/// serde alias field are dropped to keep the generated document clean.
+fn synthesize_bootstrap_root(config: &Config) -> Result<serde_yaml::Value, String> {
+    let mut root =
+        serde_yaml::to_value(config).map_err(|e| format!("serialize config: {}", e))?;
+
+    if let Some(gs) = root
+        .get_mut("general_settings")
+        .and_then(|g| g.as_mapping_mut())
+    {
+        if config.general_settings.master_key.is_some() {
+            gs.insert("master_key".into(), "${BOOM_MASTER_KEY}".into());
+        }
+        if config.general_settings.database_url.is_some() {
+            gs.insert("database_url".into(), "${BOOM_DATABASE_URL}".into());
+        }
+    }
+
+    if let Some(map) = root.as_mapping_mut() {
+        let noise: Vec<serde_yaml::Value> = map
+            .iter()
+            .filter(|(k, v)| {
+                v.is_null() || k.as_str() == Some("_legacy_store_model_in_db")
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in noise {
+            map.remove(&key);
+        }
+    }
+
+    // Same cleanup inside general_settings (user_tag_header: null, the
+    // legacy alias field) — the section serializes all fields, unlike a
+    // hand-written file that only carries what's set.
+    if let Some(gs) = root
+        .get_mut("general_settings")
+        .and_then(|g| g.as_mapping_mut())
+    {
+        let noise: Vec<serde_yaml::Value> = gs
+            .iter()
+            .filter(|(k, v)| {
+                v.is_null() || k.as_str() == Some("_legacy_store_model_in_db")
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in noise {
+            gs.remove(&key);
+        }
+    }
+    Ok(root)
+}
+
+/// Best-effort chmod 0600 for generated config files — the document carries
+/// plaintext upstream api keys. (Unix-only crate: jemalloc global allocator.)
+fn restrict_file_permissions(path: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+        tracing::warn!(path = %path, "chmod 600 failed: {}", e);
+    }
+}
+
 /// Copy `{path}` to `{path}.bak`, overwriting any prior backup. Single-slot
 /// rolling backup — the previous .bak is lost, but no timestamped files
 /// accumulate. Best-effort: a failed copy logs a warning but does not block
@@ -1050,273 +1331,19 @@ fn backup_yaml(path: &str) {
 /// Delegates SQL to owning modules (boom-routing, boom-limiter).
 /// Only plan sync remains here (will move to boom-limiter in Phase 1b).
 /// Wrap a Result-returning DB operation with a 15s timeout. Bounds each
-/// `sync_yaml_to_db` call so a slow DB can't hang the entire reload future.
+/// reload-time DB step so a slow DB can't hang the entire reload future.
 /// 15s leaves headroom for slow networks without letting a stuck query block
 /// reload indefinitely.
-async fn with_db_timeout<F, T>(op_name: &str, f: F) -> Result<T, anyhow::Error>
+async fn with_db_timeout<F, T, E>(op_name: &str, f: F) -> Result<T, anyhow::Error>
 where
-    F: std::future::Future<Output = Result<T, sqlx::Error>>,
+    F: std::future::Future<Output = Result<T, E>>,
+    E: std::fmt::Display,
 {
     match tokio::time::timeout(std::time::Duration::from_secs(15), f).await {
         Ok(Ok(v)) => Ok(v),
         Ok(Err(e)) => Err(anyhow::anyhow!("{}: {}", op_name, e)),
         Err(_) => Err(anyhow::anyhow!("{} timed out after 15s", op_name)),
     }
-}
-
-/// Wrap a `()`-returning DB operation with a 15s timeout. Used for the
-/// `load_db_only_*` helpers that swallow errors internally — we can't surface
-/// their internal failures, but we can at least bound their wall time.
-/// Returns `Err` only on timeout.
-async fn with_db_timeout_void<F>(op_name: &str, f: F) -> Result<(), anyhow::Error>
-where
-    F: std::future::Future<Output = ()>,
-{
-    match tokio::time::timeout(std::time::Duration::from_secs(15), f).await {
-        Ok(()) => Ok(()),
-        Err(_) => Err(anyhow::anyhow!("{} timed out after 15s", op_name)),
-    }
-}
-
-/// Effective visibility for a YAML model entry after legacy inference:
-/// `general_settings.public_models` membership forces Public; an
-/// `allowed_teams` list without an explicit visibility infers Private
-/// (pre-visibility YAML format).
-fn effective_yaml_visibility(
-    entry: &boom_config::ModelEntry,
-    legacy_public: &std::collections::HashSet<&str>,
-) -> boom_config::ModelVisibility {
-    if legacy_public.contains(entry.model_name.as_str()) {
-        boom_config::ModelVisibility::Public
-    } else if entry.visibility == boom_config::ModelVisibility::Normal
-        && entry.allowed_teams.is_some()
-    {
-        boom_config::ModelVisibility::Private
-    } else {
-        entry.visibility
-    }
-}
-
-async fn sync_yaml_to_db(pool: &PgPool, config: &Config, plan_store: &Arc<PlanStore>) -> Result<(), sqlx::Error> {
-    // ── Deployments (delegated to DeploymentStore) ──
-    let legacy_public: std::collections::HashSet<&str> = config
-        .general_settings
-        .public_models
-        .iter()
-        .map(|m| m.as_str())
-        .collect();
-    let yaml_model_names: Vec<String> = config.model_list.iter()
-        .map(|e| e.model_name.clone()).collect();
-    let mut yaml_deployments: Vec<boom_routing::DeploymentInput> = Vec::new();
-    for entry in &config.model_list {
-        let p = &entry.litellm_params;
-        let d = boom_routing::DeploymentInput {
-            model_name: entry.model_name.clone(),
-            litellm_model: p.model.clone(),
-            api_key: p.api_key.clone(),
-            // YAML path resolves env vars before this point — value is literal.
-            api_key_env: Some(false),
-            api_base: p.api_base.clone(),
-            api_version: p.api_version.clone(),
-            aws_region_name: p.aws_region_name.clone(),
-            aws_access_key_id: p.aws_access_key_id.clone(),
-            aws_secret_access_key: p.aws_secret_access_key.clone(),
-            rpm: p.rpm.map(|v| v as i64),
-            tpm: p.tpm.map(|v| v as i64),
-            timeout: p.timeout as i64,
-            headers: serde_json::to_value(&p.headers).unwrap_or(serde_json::json!({})),
-            temperature: p.temperature,
-            max_tokens: p.max_tokens.map(|v| v as i32),
-            deployment_id: entry.model_info.as_ref().and_then(|mi| mi.id.clone()),
-            quota_count_ratio: entry.model_info.as_ref()
-                .and_then(|mi| mi.quota_count_ratio)
-                .map(|v| v as i64)
-                .unwrap_or(1),
-            max_inflight_queue_len: entry.flow_control.as_ref()
-                .and_then(|fc| fc.model_queue_limit).map(|v| v as i32),
-            max_context_len: entry.flow_control.as_ref()
-                .and_then(|fc| fc.model_context_limit).map(|v| v as i64),
-            enabled: entry.enabled,
-            client_type_header: entry.client_type_header,
-            serve_not_match: entry.serve_not_match,
-            model_info: entry.model_info.as_ref().map(|mi| {
-                serde_json::to_value(mi).unwrap_or(serde_json::Value::Null)
-            }),
-            allowed_teams: entry.allowed_teams.clone(),
-            visibility: effective_yaml_visibility(entry, &legacy_public),
-        };
-        yaml_deployments.push(d);
-
-        // serve_not_match: also write a wildcard "*" record to DB.
-        if entry.serve_not_match && !yaml_model_names.contains(&"*".to_string()) {
-            let mut wildcard = yaml_deployments.last().unwrap().clone();
-            wildcard.model_name = "*".to_string();
-            yaml_deployments.push(wildcard);
-        }
-    }
-    // Add "*" to yaml_model_names if any entry uses serve_not_match,
-    // so sync_yaml_to_db cleans up conflicting source='db' rows.
-    let mut all_model_names = yaml_model_names;
-    if config.model_list.iter().any(|e| e.serve_not_match) {
-        if !all_model_names.contains(&"*".to_string()) {
-            all_model_names.push("*".to_string());
-        }
-    }
-    DeploymentStore::sync_yaml_to_db(pool, &all_model_names, &yaml_deployments).await?;
-
-    // ── Aliases (delegated to AliasStore) ──
-    let yaml_aliases: Vec<(String, String, bool)> = config.router_settings.model_group_alias.iter()
-        .map(|(alias, cfg)| (alias.clone(), cfg.target_model().to_string(), cfg.is_hidden()))
-        .collect();
-    AliasStore::sync_yaml_to_db(pool, &yaml_aliases).await?;
-
-    // ── Client block rules (delegated to BlockRuleStore) ──
-    let yaml_block_rules: Vec<boom_config::BlockRule> = config
-        .client_blocklist
-        .as_ref()
-        .map(|bl| bl.rules.clone())
-        .unwrap_or_default();
-    boom_gatekeeper::BlockRuleStore::sync_yaml_to_db(pool, &yaml_block_rules).await?;
-
-    // ── Plans (delegated to PlanStore) ──
-    // plan_store already has RateLimitPlan objects loaded by load_plans_from_config.
-    let all_plans = plan_store.list_plans();
-    let yaml_plans: Vec<(String, &RateLimitPlan)> = all_plans.iter()
-        .map(|p| (p.name.clone(), p))
-        .collect();
-    let default_plan = config.plan_settings.default_plan.as_deref();
-    PlanStore::sync_yaml_to_db(pool, &yaml_plans, default_plan).await?;
-
-    Ok(())
-}
-
-// ═══════════════════════════════════════════════════════════
-// DB-only loading (source='db' records on top of YAML stores)
-// ═══════════════════════════════════════════════════════════
-
-
-/// Build providers from DB deployment rows and add to DeploymentStore.
-/// Uses DeploymentStore::load_db_only_rows() for SQL, creates providers here
-/// (because creating Arc<dyn Provider> requires boom-provider which boom-routing doesn't depend on).
-async fn load_db_only_deployments(
-    pool: &PgPool,
-    deployment_store: &Arc<DeploymentStore>,
-    flow_controller: &Arc<FlowController>,
-) {
-    let rows = match DeploymentStore::load_db_only_rows(pool).await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::error!("Failed to load DB-only deployments: {}", e);
-            return;
-        }
-    };
-
-    let mut deployment_count = 0;
-    for row in &rows {
-        // Visibility: newest non-normal row wins (rows are ordered by
-        // model_name, created_at). Normal clears the entry, so models whose
-        // visibility was switched back reset correctly.
-        let state = visibility_from_db(&row.visibility, &row.allowed_teams);
-        deployment_store.set_visibility(&row.model_name, state);
-
-        let mut custom_headers = std::collections::HashMap::new();
-        if let Some(obj) = row.headers.as_object() {
-            for (k, v) in obj {
-                if let Some(s) = v.as_str() {
-                    custom_headers.insert(k.clone(), s.to_string());
-                }
-            }
-        }
-        let mut extra = std::collections::HashMap::new();
-        if let Some(ref v) = row.api_version {
-            extra.insert("api_version".to_string(), v.clone());
-        }
-        if let Some(ref r) = row.aws_region_name {
-            extra.insert("aws_region_name".to_string(), r.clone());
-        }
-
-        let api_key = row.api_key.as_ref().map(|k| {
-            if row.api_key_env.unwrap_or(false) {
-                boom_config::resolve_env_value(k)
-            } else {
-                k.clone()
-            }
-        });
-
-        match boom_provider::create_provider(
-            &row.litellm_model,
-            api_key,
-            row.api_base.clone(),
-            row.timeout as u64,
-            &extra,
-            &custom_headers,
-            row.deployment_id.clone(),
-            row.client_type_header.unwrap_or(false),
-        ) {
-            Ok(provider) => {
-                deployment_store.add_deployment(&row.model_name, provider);
-                deployment_count += 1;
-            }
-            Err(e) => {
-                tracing::error!("Failed to create provider for model '{}': {}", row.model_name, e);
-            }
-        }
-    }
-
-    // Seed flow control for DB-only deployments using full rows.
-    let fc_rows = match DeploymentStore::list_all_db(pool).await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::error!("Failed to load DB deployments for flow control: {}", e);
-            tracing::info!("Loaded {} DB-only deployment(s)", deployment_count);
-            return;
-        }
-    };
-    for row in &fc_rows {
-        if row.source.as_deref() != Some("db") {
-            continue;
-        }
-        if let Some(ref did) = row.deployment_id {
-            let max_inflight = row.max_inflight_queue_len.unwrap_or(0) as u32;
-            let max_context = row.max_context_len.unwrap_or(0) as u64;
-            if max_inflight > 0 || max_context > 0 {
-                flow_controller.ensure_slot(did, &FlowControlConfig {
-                    max_inflight,
-                    max_context,
-                });
-            }
-        }
-    }
-
-    tracing::info!("Loaded {} DB-only deployment(s)", deployment_count);
-}
-
-/// Load source='db' aliases from DB (delegated to AliasStore).
-async fn load_db_only_aliases(pool: &PgPool, alias_store: &Arc<AliasStore>) {
-    alias_store.load_db_only(pool).await;
-}
-
-async fn validate_db_workflow_namespace(
-    pool: &PgPool,
-    settings: &boom_config::WorkflowSettings,
-) -> anyhow::Result<()> {
-    let workflow_models = settings.models.keys().cloned().collect::<Vec<_>>();
-    if workflow_models.is_empty() {
-        return Ok(());
-    }
-
-    let deployment_conflicts =
-        DeploymentStore::db_only_model_conflicts(pool, &workflow_models).await?;
-    let alias_conflicts = AliasStore::db_only_name_conflicts(pool, &workflow_models).await?;
-    if deployment_conflicts.is_empty() && alias_conflicts.is_empty() {
-        return Ok(());
-    }
-
-    Err(anyhow::anyhow!(
-        "workflow model namespace conflicts with DB-only resources: deployments=[{}], aliases=[{}]",
-        deployment_conflicts.join(", "),
-        alias_conflicts.join(", ")
-    ))
 }
 
 
@@ -1326,17 +1353,19 @@ async fn validate_db_workflow_namespace(
 
 /// Derive a model's cost rate from its `model_info.cost_template`.
 ///
-/// Pricing is sourced exclusively from `cost_templates` — model_info no longer
-/// carries inline cost fields (v3 single-source-of-truth refactor). The
+/// Pricing is sourced exclusively from the CostTemplateStore (DB-authoritative
+/// in DB mode, YAML-seeded in no-DB mode) — model_info no longer carries
+/// inline cost fields (v3 single-source-of-truth refactor). The
 /// `cost_template` name selects which template applies; missing template =
-/// no rate. YAML/DB rates are CNY per million tokens (e.g. `0.27` = ¥0.27/1M
-/// tokens), converted to per-token Decimal internally for accurate accounting
-/// on small requests.
+/// no rate. Rates are per million tokens in the operator's billing currency
+/// (see `boom_config::CostTemplate`), converted to per-token Decimal
+/// internally for accurate accounting on small requests.
 ///
-/// Shared by the YAML build path (`build_deployments_from_config`) and the
-/// CRUD apply path (`reload_model_deployments`) so both stay identical.
+/// Shared by the YAML build path (`build_deployments_from_config`), the
+/// reconciler (`apply_model_rows_from_db`), and the CRUD apply path
+/// (`reload_model_deployments`) so all three stay identical.
 pub(crate) fn cost_rate_from_model_info(
-    config: &Config,
+    templates: &CostTemplateStore,
     model_name: &str,
     info: &boom_config::ModelInfo,
 ) -> Option<boom_routing::ModelCostRate> {
@@ -1348,7 +1377,7 @@ pub(crate) fn cost_rate_from_model_info(
 
     // Template lookup is the only source of rates now.
     let template_rates = info.cost_template.as_ref().and_then(|tn| {
-        config.lookup_cost_template(tn).map(|t| {
+        templates.lookup(tn).map(|t| {
             (
                 t.input_cost_per_million_tokens,
                 t.cached_input_cost_per_million_tokens,
@@ -1361,7 +1390,7 @@ pub(crate) fn cost_rate_from_model_info(
         tracing::warn!(
             model = %model_name,
             template = %tn,
-            "cost_template not found in cost_templates — no rate registered"
+            "cost_template not found — no rate registered"
         );
     }
 
@@ -1377,7 +1406,7 @@ pub(crate) fn cost_rate_from_model_info(
             input_per_1m = src_input.unwrap_or(0.0),
             cached_per_1m = src_cached.unwrap_or(0.0),
             output_per_1m = src_output.unwrap_or(0.0),
-            "Registered cost rate (CNY per million tokens)"
+            "Registered cost rate (per million tokens)"
         );
         Some(boom_routing::ModelCostRate::with_cached(
             input_rate.unwrap_or_default(),
@@ -1390,7 +1419,12 @@ pub(crate) fn cost_rate_from_model_info(
 }
 
 /// Build deployments directly from YAML config into DeploymentStore.
-fn build_deployments_from_config(config: &Config, deployment_store: &Arc<DeploymentStore>) {
+/// Cost rates resolve through the CostTemplateStore (YAML-seeded in this mode).
+fn build_deployments_from_config(
+    config: &Config,
+    deployment_store: &Arc<DeploymentStore>,
+    cost_template_store: &Arc<CostTemplateStore>,
+) {
     deployment_store.clear();
 
     // Legacy general_settings.public_models: merge into the unified
@@ -1432,7 +1466,7 @@ fn build_deployments_from_config(config: &Config, deployment_store: &Arc<Deploym
         // before the enabled check so a disabled-but-public/private model
         // keeps its status — visibility filtering (list_models) consults
         // the state even when no provider is routable.
-        let vis = effective_yaml_visibility(entry, &legacy_public);
+        let vis = crate::config_reconcile::effective_yaml_visibility(entry, &legacy_public);
         deployment_store.set_visibility(
             &entry.model_name,
             VisibilityState::from((vis, entry.allowed_teams.clone())),
@@ -1476,7 +1510,9 @@ fn build_deployments_from_config(config: &Config, deployment_store: &Arc<Deploym
                 // Derivation lives in `cost_rate_from_model_info` so the YAML
                 // build path and the CRUD apply path stay identical.
                 if let Some(info) = entry.model_info.as_ref() {
-                    if let Some(rate) = cost_rate_from_model_info(config, &entry.model_name, info) {
+                    if let Some(rate) =
+                        cost_rate_from_model_info(cost_template_store, &entry.model_name, info)
+                    {
                         deployment_store.set_cost_rate(&entry.model_name, rate);
                     }
                 }
@@ -1496,6 +1532,36 @@ fn build_deployments_from_config(config: &Config, deployment_store: &Arc<Deploym
         deployment_store.len(),
         deployment_store.total_deployments(),
     );
+}
+
+/// Load workflow definitions + bindings from YAML into the WorkflowStore
+/// (no-DB mode build path; DB mode seeds the tables from the same section
+/// once and is authoritative afterwards).
+fn load_workflows_from_config(config: &Config, workflow_store: &Arc<WorkflowStore>) {
+    for (name, definition) in &config.workflow_settings.workflows {
+        workflow_store.upsert_definition(name, definition.clone());
+    }
+    for (model, workflow_name) in &config.workflow_settings.models {
+        workflow_store.upsert_model(model, workflow_name);
+    }
+    let n = config.workflow_settings.models.len();
+    if n > 0 {
+        tracing::info!("Loaded {n} workflow virtual model(s) from YAML");
+    }
+}
+
+/// Load cost templates from YAML into the CostTemplateStore (no-DB mode
+/// build path; DB mode seeds the table from the same list once).
+fn load_cost_templates_from_config(
+    config: &Config,
+    cost_template_store: &Arc<CostTemplateStore>,
+) {
+    for template in &config.cost_templates {
+        cost_template_store.upsert(template.clone());
+    }
+    if !config.cost_templates.is_empty() {
+        tracing::info!("Loaded {} cost template(s) from YAML", config.cost_templates.len());
+    }
 }
 
 /// Build aliases directly from YAML config into AliasStore.
@@ -1596,7 +1662,7 @@ fn seed_flow_controller_from_config(config: &Config, flow_controller: &Arc<FlowC
 }
 
 /// Load plans from YAML config into PlanStore.
-fn load_plans_from_config(plan_store: &Arc<PlanStore>, config: &Config) {
+pub(crate) fn load_plans_from_config(plan_store: &Arc<PlanStore>, config: &Config) {
     for (name, pc) in &config.plan_settings.plans {
         // `window_limits` is already a multi-dim `Vec<WindowLimit>` in the
         // config struct — pass through as-is. A plan is a generic template;
@@ -1768,6 +1834,7 @@ fn create_policy(
     inflight: &Arc<InFlightTracker>,
     flow_controller: &Arc<FlowController>,
     rebalance_move_tracker: &Arc<RebalanceMoveTracker>,
+    kvc_stats: &Arc<KvcSchedulerStats>,
     kv_index: &Option<Arc<dyn KvIndexBackend>>,
 ) -> Arc<dyn SchedulePolicy> {
     match config.router_settings.schedule_policy.as_str() {
@@ -1806,6 +1873,7 @@ fn create_policy(
                 kv,
                 inflight.clone(),
                 Some(rebalance_move_tracker.clone()),
+                Some(kvc_stats.clone()),
             );
             policy.set_queue_info(flow_controller.clone());
             // Pure-affinity scoring (hit_ratio); the router-level
@@ -1878,7 +1946,7 @@ fn normalize_window_limits(raw: &serde_json::Value) -> Vec<serde_json::Value> {
 }
 
 /// (model_list, router_settings.model_group_alias, plan_settings).
-async fn build_config_snapshot_value(pool: &PgPool) -> Result<serde_json::Value, sqlx::Error> {
+pub(crate) async fn build_config_snapshot_value(pool: &PgPool) -> Result<serde_json::Value, sqlx::Error> {
     // ── Model list (delegated to DeploymentStore) ──
     let model_rows = DeploymentStore::snapshot_db(pool).await?;
 
@@ -2065,11 +2133,15 @@ async fn build_config_snapshot_value(pool: &PgPool) -> Result<serde_json::Value,
     let plan_rows = PlanStore::snapshot_plans_db(pool).await?;
 
     let mut default_plan: Option<String> = None;
+    let mut default_team_plan: Option<String> = None;
     let mut plans_map = serde_json::Map::new();
 
     for r in &plan_rows {
         if r.is_default.unwrap_or(false) && default_plan.is_none() {
             default_plan = Some(r.name.clone());
+        }
+        if r.is_default_team.unwrap_or(false) && default_team_plan.is_none() {
+            default_team_plan = Some(r.name.clone());
         }
 
         let window_limits = normalize_window_limits(&r.window_limits);
@@ -2140,9 +2212,9 @@ async fn build_config_snapshot_value(pool: &PgPool) -> Result<serde_json::Value,
     }
 
     // ── Client blocklist rules (delegated to BlockRuleStore) ──
-    // Only the rules array is rebuilt from DB. `enabled` is not part of the
-    // snapshot: merge_runtime_sections preserves an explicit YAML value and
-    // materializes the running switch when the YAML has none.
+    // Rules are rebuilt from DB; the `enabled` switch now lives in
+    // boom_client_blocklist_state and is part of the snapshot too (the
+    // config page toggle and the export/write-back both read it here).
     let block_rule_rows = boom_gatekeeper::BlockRuleStore::list_all_db(pool).await?;
     let block_rules: Vec<serde_json::Value> = block_rule_rows
         .iter()
@@ -2154,11 +2226,60 @@ async fn build_config_snapshot_value(pool: &PgPool) -> Result<serde_json::Value,
             }
         })
         .collect();
+    let blocklist_enabled: Option<bool> = sqlx::query_scalar::<_, bool>(
+        r#"SELECT enabled FROM boom_client_blocklist_state WHERE id = 1"#,
+    )
+    .fetch_optional(pool)
+    .await?;
+
+    // ── Workflows (delegated to WorkflowStore tables) ──
+    let definition_rows = boom_routing::WorkflowStore::list_definitions_db(pool).await?;
+    let model_binding_rows = boom_routing::WorkflowStore::list_models_db(pool).await?;
+    let mut workflows_map = serde_json::Map::new();
+    for row in &definition_rows {
+        workflows_map.insert(row.name.clone(), row.definition.clone());
+    }
+    let models_map: serde_json::Map<String, serde_json::Value> = model_binding_rows
+        .into_iter()
+        .map(|r| (r.model_name, serde_json::Value::String(r.workflow_name)))
+        .collect();
+
+    // ── Cost templates (delegated to CostTemplateStore table) ──
+    let cost_template_rows = boom_routing::CostTemplateStore::list_all_db(pool).await?;
+    let cost_templates: Vec<serde_json::Value> = cost_template_rows
+        .into_iter()
+        .map(|r| {
+            let mut obj = serde_json::Map::new();
+            obj.insert("name".into(), serde_json::Value::String(r.name));
+            if let Some(v) = r.input_cost_per_million_tokens {
+                obj.insert(
+                    "input_cost_per_million_tokens".into(),
+                    serde_json::Value::from(v),
+                );
+            }
+            if let Some(v) = r.cached_input_cost_per_million_tokens {
+                obj.insert(
+                    "cached_input_cost_per_million_tokens".into(),
+                    serde_json::Value::from(v),
+                );
+            }
+            if let Some(v) = r.output_cost_per_million_tokens {
+                obj.insert(
+                    "output_cost_per_million_tokens".into(),
+                    serde_json::Value::from(v),
+                );
+            }
+            serde_json::Value::Object(obj)
+        })
+        .collect();
 
     // ── Assemble top-level ──
     let mut plan_settings = serde_json::Map::new();
     if let Some(dp) = default_plan {
         plan_settings.insert("default_plan".into(), serde_json::Value::String(dp));
+    }
+    if let Some(dtp) = default_team_plan {
+        plan_settings.insert("default_team_plan".into(), serde_json::Value::String(dtp));
     }
     plan_settings.insert("plans".into(), serde_json::Value::Object(plans_map));
 
@@ -2169,8 +2290,14 @@ async fn build_config_snapshot_value(pool: &PgPool) -> Result<serde_json::Value,
         },
         "plan_settings": plan_settings,
         "client_blocklist": {
+            "enabled": blocklist_enabled,
             "rules": block_rules,
         },
+        "workflow_settings": {
+            "models": models_map,
+            "workflows": workflows_map,
+        },
+        "cost_templates": cost_templates,
     }))
 }
 
@@ -2198,11 +2325,11 @@ mod merge_runtime_sections_tests {
     }
 
     #[test]
-    fn materializes_enabled_when_merge_creates_the_section() {
-        // Config had no client_blocklist section; a web CRUD persist is about
-        // to create it. The running switch is off — the YAML must record
-        // that, or a restart would parse the new section with the serde
-        // default (true) and silently activate the rules.
+    fn materializes_enabled_fallback_when_snapshot_lacks_it() {
+        // No-DB mode / missing state row: the snapshot carries no `enabled`,
+        // so the running switch (here: off) is materialized. A restart would
+        // otherwise parse the section with the serde default (true) and
+        // silently activate rules the operator never turned on.
         let mut root = parse("model_list: []\n");
         merge_runtime_sections(&mut root, &snapshot_with_rules(), false).expect("merge");
         let bl = root.get("client_blocklist").expect("section created");
@@ -2211,12 +2338,112 @@ mod merge_runtime_sections_tests {
     }
 
     #[test]
-    fn preserves_explicit_enabled_in_yaml() {
-        // Operator wrote enabled: true by hand (no reload yet). The merge must
-        // not stomp it with the (stale) running switch value.
+    fn snapshot_enabled_overrides_stale_yaml_value() {
+        // The DB state row says enabled: false; a stale hand-edited YAML says
+        // true. The DB is the authority — the merged document records false.
         let mut root = parse("client_blocklist:\n  enabled: true\n");
-        merge_runtime_sections(&mut root, &snapshot_with_rules(), false).expect("merge");
+        let mut snapshot = snapshot_with_rules();
+        snapshot["client_blocklist"]["enabled"] = serde_json::Value::Bool(false);
+        merge_runtime_sections(&mut root, &snapshot, true).expect("merge");
         let bl = root.get("client_blocklist").expect("section kept");
-        assert_eq!(bl.get("enabled"), Some(&serde_yaml::Value::Bool(true)));
+        assert_eq!(bl.get("enabled"), Some(&serde_yaml::Value::Bool(false)));
+    }
+
+    #[test]
+    fn compose_export_yaml_serializes_merged_document() {
+        // The export pipeline must return a parseable YAML document that
+        // carries both the merged runtime sections and the untouched
+        // singleton sections (with ${VAR} references intact).
+        use super::compose_export_yaml;
+        let mut root = parse("server:\n  host: 0.0.0.0\n\ngeneral_settings:\n  master_key: ${MASTER}\n");
+        let snapshot = serde_json::json!({
+            "model_list": [
+                {"model_name": "m1", "litellm_params": {"model": "gpt", "timeout": 30}}
+            ],
+            "client_blocklist": {"rules": []},
+        });
+        let yaml = compose_export_yaml(&mut root, &snapshot, true).expect("compose");
+        let reparsed = parse(&yaml);
+        assert!(reparsed.get("server").is_some(), "singleton section preserved");
+        assert_eq!(
+            reparsed
+                .get("general_settings")
+                .and_then(|g| g.get("master_key"))
+                .and_then(|v| v.as_str()),
+            Some("${MASTER}"),
+            "env reference must survive the round-trip unexpanded"
+        );
+        let model_list = reparsed
+            .get("model_list")
+            .and_then(|v| v.as_sequence())
+            .expect("model_list merged in");
+        assert_eq!(model_list.len(), 1);
+        assert_eq!(
+            reparsed
+                .get("client_blocklist")
+                .and_then(|c| c.get("enabled"))
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn synthesize_bootstrap_root_writes_env_references_and_drops_noise() {
+        // Env-bootstrap export: the live config's resolved secrets must come
+        // out as ${BOOM_*} references (clean round-trip through
+        // load_config's env resolution), and null sections / the legacy
+        // alias field must not appear in the generated document.
+        use super::synthesize_bootstrap_root;
+        use serde_yaml::Value;
+
+        // Built the same way bootstrap_from_env builds it — via the serde
+        // path, so field defaults match the real env-bootstrap state.
+        let config: boom_config::Config = serde_yaml::from_str(
+            "general_settings:\n  master_key: sk-live\n  database_url: postgres://u:p@h/db\n",
+        )
+        .expect("parse config");
+
+        let root = synthesize_bootstrap_root(&config).expect("synthesize");
+        let gs = root.get("general_settings").and_then(|g| g.as_mapping());
+        let gs = gs.expect("general_settings mapping");
+        assert_eq!(
+            gs.get(&Value::String("master_key".into())),
+            Some(&Value::String("${BOOM_MASTER_KEY}".into()))
+        );
+        assert_eq!(
+            gs.get(&Value::String("database_url".into())),
+            Some(&Value::String("${BOOM_DATABASE_URL}".into()))
+        );
+        assert!(
+            !root
+                .as_mapping()
+                .unwrap()
+                .contains_key(&Value::String("_legacy_store_model_in_db".into())),
+            "legacy alias field must not be exported"
+        );
+        assert!(
+            !root
+                .as_mapping()
+                .unwrap()
+                .contains_key(&Value::String("prompt_log".into())),
+            "null section must be dropped"
+        );
+        assert!(
+            root.as_mapping().unwrap().contains_key(&Value::String("server".into())),
+            "non-null sections survive"
+        );
+        // Nested cleanup inside general_settings.
+        let gs = root
+            .get("general_settings")
+            .and_then(|g| g.as_mapping())
+            .expect("general_settings mapping");
+        assert!(
+            !gs.contains_key(&Value::String("_legacy_store_model_in_db".into())),
+            "legacy alias field must not leak into general_settings"
+        );
+        assert!(
+            !gs.contains_key(&Value::String("user_tag_header".into())),
+            "null field must not leak into general_settings"
+        );
     }
 }

@@ -1194,13 +1194,13 @@ AgentPoolFilter 的池饱和判定会复用 §3.5 描述的负载信号(InFlight
                         │           .periodic_dispatch()     │
                         │         (防止空闲容量滞留)          │
                         │                                    │
-                        │   ⑤ ZMQ KV event subscriber        │
-                        │      (boom-kvindex::spawn_kv_      │
-                        │       subscriber)                  │
-                        │      ├─ tmq::subscribe *N endpoints│
-                        │      ├─ select_all merge           │
-                        │      ├─ 解析 msgpack 3-frame       │
-                        │      └─▶ kv_index.insert_blocks    │
+                        │   ⑤ KV trie TTL prune task         │
+                        │      (router_ttl_secs > 0 时)       │
+                        │      ├─ 周期扫描自学习块            │
+                        │      └─ 到期删除 (LRU 另有淘汰)     │
+                        │      * trie 由 KvcOrchestrator 在   │
+                        │        每次路由后自学习记录前缀块,  │
+                        │        不订阅上游事件               │
                         │                                    │
                         │   ⑥ Deployment health monitor      │
                         │      ├─ 定期探测 (DB deployments)   │
@@ -1208,12 +1208,18 @@ AgentPoolFilter 的池饱和判定会复用 §3.5 描述的负载信号(InFlight
                         │      └─ 恢复 → 清 auto_disable     │
                         │                                    │
                         │   ⑦ admin_command_handler          │
-                        │      (mpsc::Receiver)              │
-                        │      ├─ CreateModel                │
-                        │      ├─ UpdateModel                │
-                        │      ├─ DeleteModel                │
-                        │      ├─ ConfigChanged (snapshot)   │
-                        │      └─ ReloadConfig               │
+                        │      (mpsc::Receiver, 21 变体)      │
+                        │      ├─ CreateModel / Update /     │
+                        │      │  DeleteModel                │
+                        │      ├─ UpsertWorkflow(Model) /    │
+                        │      │  Delete...                  │
+                        │      ├─ Upsert/DeleteCostTemplate  │
+                        │      ├─ ReloadConfig / GetConfig / │
+                        │      │  GetConfigSchema            │
+                        │      ├─ ExportConfig /             │
+                        │      │  WriteBackConfig            │
+                        │      └─ UpdateConfigSection /      │
+                        │         promptlog / OTLP / auth... │
                         │                                    │
                         │   ⑧ PromptLog writer task          │
                         │      (boom-promptlog::spawn)       │
@@ -1276,7 +1282,12 @@ AgentPoolFilter 的池饱和判定会复用 §3.5 描述的负载信号(InFlight
 │                                                                │
 │    boom_config                ◀── boom-dashboard               │
 │      (key, value JSONB, updated_at)                            │
-│      (存 db_seeded / prompt_log 配置 / 杂项 KV)                │
+│      (存 prompt_log 配置 / 杂项 KV)                            │
+│                                                                │
+│    boom_config_meta          ◀── boom-main                     │
+│      (key TEXT PK, value JSONB, updated_at)                    │
+│      (seed 幂等标记: 业务表首次从 YAML 导入后写入,            │
+│       存在则永不再 seed)                                       │
 │                                                                │
 └────────────────────────────────────────────────────────────────┘
 ```
@@ -1296,9 +1307,11 @@ AgentPoolFilter 的池饱和判定会复用 §3.5 描述的负载信号(InFlight
    │  (config + auth)     │   ArcSwap 原子交换              │
    ├────────────────────────────────────────────────────────┤
    │  Stores / Trackers   │   跨 reload 保留(顶层 Arc)     │
-   │  (limiter / FC /     │   仅 YAML 模式 reload 时        │
-   │   deployment /       │   rebuild 内容                  │
-   │   alias / inflight)  │                                 │
+   │  (limiter / FC /     │   DB 模式 reload 时对账:       │
+   │   deployment /       │   per-key diff(增/改/删),      │
+   │   alias / inflight)  │   永不清空;                     │
+   │                      │   仅无 DB 模式 reload 时        │
+   │                      │   从 YAML 整体重build          │
    ├────────────────────────────────────────────────────────┤
    │  kv_index (Trie)     │   kvc_aware 配置变化时          │
    │                      │   重建空 trie (清缓存语义)      │
