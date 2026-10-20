@@ -3969,66 +3969,6 @@ fn sse_anthropic_extractor() -> impl FnMut(&Result<SseItem, Infallible>) -> Opti
     }
 }
 
-// ═══════════════════════════════════════════════════════════
-// KV Index debug endpoint (internal)
-// ═══════════════════════════════════════════════════════════
-
-/// GET /internal/kv-index — dump KV index status with hash details (pretty-printed).
-pub async fn kv_index_status(
-    State(state): State<AppState>,
-) -> impl IntoResponse {
-    // Debug snapshot of the kvc_aware config currently in effect (helps verify
-    // that reload picked up the latest settings).
-    let cfg = &state.inner.load().config.router_settings;
-    let kvc_cfg = &cfg.kvc_aware;
-    let config_snapshot = serde_json::json!({
-        "schedule_policy": cfg.schedule_policy,
-        "max_blocks": kvc_cfg.max_blocks,
-        "router_ttl_secs": kvc_cfg.router_ttl_secs,
-    });
-
-    let kv_index_guard = state.kv_index.load();
-    let body = match &**kv_index_guard {
-        Some(kv_index) => {
-            let block_count = kv_index.block_count();
-            let models: Vec<String> = kv_index.model_names().into_iter().collect();
-            let dump = kv_index.debug_dump();
-            let blocks: Vec<serde_json::Value> = dump
-                .into_iter()
-                .map(|(model, trie_key, workers, tier, depth)| {
-                    serde_json::json!({
-                        "model": model,
-                        "trie_key": trie_key,
-                        "workers": workers,
-                        "tier": serde_json::to_value(tier).unwrap_or_default(),
-                        "depth": depth,
-                    })
-                })
-                .collect();
-            serde_json::json!({
-                "status": "active",
-                "block_count": block_count,
-                "models": models,
-                "blocks": blocks,
-                "config": config_snapshot,
-            })
-        }
-        None => serde_json::json!({
-            "status": "disabled",
-            "block_count": 0,
-            "models": [],
-            "blocks": [],
-            "config": config_snapshot,
-        }),
-    };
-    let pretty = serde_json::to_string_pretty(&body).unwrap_or_default();
-    (
-        axum::http::StatusCode::OK,
-        [(axum::http::header::CONTENT_TYPE, "application/json")],
-        pretty,
-    ).into_response()
-}
-
 #[cfg(test)]
 mod tests {
     use super::{

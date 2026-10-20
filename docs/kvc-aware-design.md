@@ -348,15 +348,7 @@ Frame 2 (body):  msgpack payload
 # 日志中应包含:
 #   "openai tokenized" first_8=[...] text_preview="..."
 
-# 2. 查看 kv-index 端点
-curl http://gateway:4000/internal/kv-index | jq '.blocks[0]'
-# 应包含 token_sample 和 workers
-
-# 3. 对比 token_sample 和 gateway first_8 是否一致
-# 一致 → 对齐成功
-# 不一致 → 检查 model_name、tokenizer 版本、block_size
-
-# 4. 确认路由命中
+# 2. 确认路由命中
 # 日志中应出现 "KVC selected" 而非 "no KV match, fallback to lowest-load"
 ```
 
@@ -364,9 +356,9 @@ curl http://gateway:4000/internal/kv-index | jq '.blocks[0]'
 
 | 现象 | 可能原因 | 排查方法 |
 |------|---------|---------|
-| `no KV match, fallback to lowest-load` | model_name 不一致 | 对比 kv-index 中的 model 与 gateway 日志中的 model |
-| 同上 | worker_id 不一致 | 对比 kv-index 中的 workers 与 YAML 中 model_info.id |
-| 同上 | block_size 不一致 | 对比 kv-index token_count 与 gateway block_size |
+| `no KV match, fallback to lowest-load` | model_name 不一致 | 对比 vLLM `--served-model-name` 与 gateway 日志中的 model |
+| 同上 | worker_id 不一致 | 对比 vLLM worker 标识与 YAML 中 model_info.id |
+| 同上 | block_size 不一致 | 对比 vLLM `--block-size` 与 gateway block_size |
 | `chat_template render failed` | 模板语法不兼容 | 检查 tokenizer_config.json 或 chat_template.jinja |
 | `tokenizer not found at ...` | tokenizer 文件缺失 | 检查 `{tokenizer_dir}/{model}/tokenizer.json` 是否存在 |
 | ZMQ 无事件 | vLLM 未开启 KV events | 确认 `--enable-kv-events` 参数 |
@@ -387,7 +379,7 @@ curl http://gateway:4000/internal/kv-index | jq '.blocks[0]'
 | boom-routing | `router.rs` | `select_provider_with_prefix()` 路由入口 |
 | boom-main | `state.rs` | 组装 kv_index、tokenizer_pool、policy |
 | boom-main | `main.rs` | ZMQ subscriber 启动 |
-| boom-main | `routes.rs` | 请求 tokenization 调用 + `/internal/kv-index` 端点 |
+| boom-main | `routes.rs` | 请求 tokenization 调用 |
 
 ## 监控与调试
 
@@ -401,27 +393,6 @@ curl http://gateway:4000/internal/kv-index | jq '.blocks[0]'
 | DEBUG | `KV event batch processed` | stored/removed/cleared 计数 |
 | INFO | `loaded chat_template` | 模板长度、bos/eos token |
 | WARN | `chat_template render failed, falling back to simple format` | 渲染错误信息 |
-
-### API 端点
-
-`GET /internal/kv-index` — KV 索引状态:
-
-```json
-{
-  "status": "active",
-  "block_count": 1024,
-  "models": ["MiniMax-M2.7"],
-  "blocks": [
-    {
-      "model": "MiniMax-M2.7",
-      "tier": "gpu",
-      "token_count": 128,
-      "token_sample": [200034, 200019, 28463, 10, 2985, 457, 2610, 3689],
-      "workers": ["10.0.0.1"]
-    }
-  ]
-}
-```
 
 ## 部署依赖
 

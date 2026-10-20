@@ -293,7 +293,6 @@ boom-trace      → leaf crate，Dashboard 经 boom-core::TraceApi（Arc<dyn Tra
 | F11.4 | --reboot 自替换 | pgrep 旧进程 SIGTERM，用 /health 探测区分"优雅退出中"与"冻结"，冻结则 SIGKILL | boom-main | main.rs:692-778 |
 | F11.5 | DB 迁移 | 启动时统一执行（boom_dashboard::migrations::run_migrations，幂等 CREATE/ALTER IF NOT EXISTS，单连接 + lock_timeout 10s；GaussDB 兼容：无 ON CONFLICT 走 UPDATE→INSERT 宏、REPLICATION 分布） | boom-dashboard | migrations.rs |
 | F11.6 | Admin API（master key） | /admin/config/reload、/admin/plans CRUD + assign + assignments 查询 | boom-main | routes.rs:1322+ |
-| F11.7 | 内部调试端点 | GET /internal/kv-index：dump trie 块数与生效 kvc 配置 | boom-main | routes.rs:3724 |
 | F11.8 | 安全头过滤 | forward_client_headers 白名单透传客户端头；硬封禁 13 类（authorization/cookie/x-gateway-*/x-boom-* 等）防伪造网关内部头 | boom-config / boom-main | lib.rs:610-630 |
 
 ---
