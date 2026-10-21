@@ -49,14 +49,20 @@ ALTER TABLE boom_model_deployment ADD COLUMN IF NOT EXISTS allowed_teams JSONB;
 }
 
 /// Migration: add the unified `visibility` column ('normal' | 'public' |
-/// 'private', default 'normal') and normalize legacy rows — deployments
-/// marked private via the pre-visibility `allowed_teams` marker are flipped
-/// to visibility='private'. Idempotent: the UPDATE's WHERE guard only
-/// matches rows that still need it.
+/// 'private', default 'normal').
+///
+/// Deliberately NO data-migration UPDATE here. The original
+/// `UPDATE ... SET visibility='private' WHERE allowed_teams IS NOT NULL AND
+/// visibility='normal'` re-ran on every boot and could never match a real
+/// row: `allowed_teams` was introduced by the same commit as this column
+/// (so pre-existing rows are NULL), and every write path since (CRUD,
+/// seed, legacy sync) persists a non-NULL ACL only together with
+/// visibility='private'. It only ever fired on accidental normal+ACL
+/// states, silently re-privatizing models on each restart. Read paths
+/// (visibility_from_db) already fail safe to Normal on stale combos.
 pub fn migration_add_visibility() -> &'static str {
     r#"
 ALTER TABLE boom_model_deployment ADD COLUMN IF NOT EXISTS visibility TEXT NOT NULL DEFAULT 'normal';
-UPDATE boom_model_deployment SET visibility = 'private' WHERE allowed_teams IS NOT NULL AND visibility = 'normal';
 "#
 }
 

@@ -663,9 +663,11 @@ async fn reconcile_workflows(deps: &ReconcileDeps<'_>) -> anyhow::Result<()> {
 // ═══════════════════════════════════════════════════════════
 
 /// Effective visibility for a YAML model entry after legacy inference:
-/// `general_settings.public_models` membership forces Public; an
+/// `general_settings.public_models` membership forces Public; a NON-EMPTY
 /// `allowed_teams` list without an explicit visibility infers Private
-/// (pre-visibility YAML format).
+/// (pre-visibility YAML format). An EMPTY list (`[]`) is treated as config
+/// residue — it must not privatize the model, or a stale marker left in
+/// YAML by an older export silently locks every model on the next seed.
 pub(crate) fn effective_yaml_visibility(
     entry: &boom_config::ModelEntry,
     legacy_public: &std::collections::HashSet<&str>,
@@ -673,7 +675,10 @@ pub(crate) fn effective_yaml_visibility(
     if legacy_public.contains(entry.model_name.as_str()) {
         boom_config::ModelVisibility::Public
     } else if entry.visibility == boom_config::ModelVisibility::Normal
-        && entry.allowed_teams.is_some()
+        && entry
+            .allowed_teams
+            .as_ref()
+            .is_some_and(|teams| !teams.is_empty())
     {
         boom_config::ModelVisibility::Private
     } else {
@@ -700,6 +705,12 @@ pub(crate) fn deployment_inputs_from_config(config: &Config) -> Vec<DeploymentIn
     let mut inputs: Vec<DeploymentInput> = Vec::new();
     for entry in &config.model_list {
         let p = &entry.litellm_params;
+        // Effective visibility once, shared by the row fields below — the
+        // ACL is persisted only when it is actually in force, mirroring the
+        // CRUD path. Otherwise a leftover `allowed_teams` on a normal entry
+        // lands in the DB and re-privatizes the model on every boot via the
+        // legacy-marker migration UPDATE.
+        let vis = effective_yaml_visibility(entry, &legacy_public);
         let d = DeploymentInput {
             model_name: entry.model_name.clone(),
             litellm_model: p.model.clone(),
@@ -741,8 +752,12 @@ pub(crate) fn deployment_inputs_from_config(config: &Config) -> Vec<DeploymentIn
                 .model_info
                 .as_ref()
                 .map(|mi| serde_json::to_value(mi).unwrap_or(serde_json::Value::Null)),
-            allowed_teams: entry.allowed_teams.clone(),
-            visibility: effective_yaml_visibility(entry, &legacy_public),
+            allowed_teams: if vis == boom_config::ModelVisibility::Private {
+                entry.allowed_teams.clone()
+            } else {
+                None
+            },
+            visibility: vis,
         };
         let serve_not_match = entry.serve_not_match;
         inputs.push(d);
@@ -879,6 +894,94 @@ pub(crate) fn build_provider_from_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use boom_config::ModelVisibility;
+
+    fn entry(allowed_teams: Option<Vec<String>>, visibility: ModelVisibility) -> boom_config::ModelEntry {
+        let mut e: boom_config::ModelEntry = serde_yaml::from_str(
+            "model_name: m\nlitellm_params:\n  model: openai/gpt-4",
+        )
+        .expect("parse entry");
+        e.allowed_teams = allowed_teams;
+        e.visibility = visibility;
+        e
+    }
+
+    #[test]
+    fn effective_yaml_visibility_empty_acl_is_residue_not_private() {
+        let no_legacy = std::collections::HashSet::new();
+        // Empty ACL list without an explicit visibility: config residue from
+        // older exports — must stay Normal, not privatize the model.
+        assert_eq!(
+            effective_yaml_visibility(&entry(Some(Vec::new()), ModelVisibility::Normal), &no_legacy),
+            ModelVisibility::Normal
+        );
+    }
+
+    #[test]
+    fn effective_yaml_visibility_nonempty_acl_infers_private() {
+        let no_legacy = std::collections::HashSet::new();
+        assert_eq!(
+            effective_yaml_visibility(
+                &entry(Some(vec!["t1".to_string()]), ModelVisibility::Normal),
+                &no_legacy
+            ),
+            ModelVisibility::Private
+        );
+        // An explicit private stays private even with an empty list.
+        assert_eq!(
+            effective_yaml_visibility(&entry(Some(Vec::new()), ModelVisibility::Private), &no_legacy),
+            ModelVisibility::Private
+        );
+        // Explicit public wins over a stale ACL.
+        assert_eq!(
+            effective_yaml_visibility(
+                &entry(Some(vec!["t1".to_string()]), ModelVisibility::Public),
+                &no_legacy
+            ),
+            ModelVisibility::Public
+        );
+    }
+
+    #[test]
+    fn seed_inputs_drop_acl_on_non_private_entries() {
+        let yaml = r#"
+model_list:
+  - model_name: m-empty-acl
+    litellm_params:
+      model: openai/gpt-4
+    allowed_teams: []
+  - model_name: m-real-acl
+    litellm_params:
+      model: openai/gpt-4
+    allowed_teams: [team-1]
+  - model_name: m-clean
+    litellm_params:
+      model: openai/gpt-4
+"#;
+        let config: Config = serde_yaml::from_str(yaml).expect("parse yaml");
+        let inputs = deployment_inputs_from_config(&config);
+        let by_name = |n: &str| {
+            inputs
+                .iter()
+                .find(|d| d.model_name == n)
+                .unwrap_or_else(|| panic!("missing {}", n))
+        };
+
+        let empty_acl = by_name("m-empty-acl");
+        assert_eq!(empty_acl.visibility, ModelVisibility::Normal);
+        assert!(
+            empty_acl.allowed_teams.is_none(),
+            "empty ACL must not be persisted — it re-privatizes the model via the legacy marker"
+        );
+
+        let real_acl = by_name("m-real-acl");
+        assert_eq!(real_acl.visibility, ModelVisibility::Private);
+        assert_eq!(real_acl.allowed_teams, Some(vec!["team-1".to_string()]));
+
+        let clean = by_name("m-clean");
+        assert_eq!(clean.visibility, ModelVisibility::Normal);
+        assert!(clean.allowed_teams.is_none());
+    }
 
     #[test]
     fn keys_to_remove_returns_disjoint_current() {
