@@ -2081,6 +2081,20 @@ pub async fn delete_model(
     }
 }
 
+/// POST /dashboard/api/admin/models/import-from-yaml — import model
+/// deployments that exist in the YAML model_list but are missing from the DB
+/// (matched by model_name; existing models are never overwritten). Reply
+/// reports `{imported, skipped, failed}` name lists.
+pub async fn import_models_from_yaml(
+    _session: AdminSession,
+    Extension(state): Extension<std::sync::Arc<DashboardState>>,
+) -> Response {
+    exec_admin_json_cmd(&state, |reply| {
+        crate::state::AdminCommand::ImportModelsFromYaml { reply }
+    })
+    .await
+}
+
 // ═══════════════════════════════════════════════════════════
 // Workflow + cost template management (DB-authoritative)
 // ═══════════════════════════════════════════════════════════

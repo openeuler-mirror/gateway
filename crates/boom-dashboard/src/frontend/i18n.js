@@ -317,6 +317,10 @@
 
       "models.title": "Model Deployments",
       "models.add": "+ Add Model",
+      "models.import_yaml": "Import from YAML",
+      "models.import_yaml_confirm": "Import model deployments that exist in the YAML config but are missing from the DB?\n\nOnly missing models are imported (matched by model name); existing models are NOT overwritten or modified. Re-running imports nothing new.",
+      "models.imported_toast": "Imported {imported}, skipped {skipped} (already in DB), failed {failed}",
+      "models.import_none": "Nothing to import — every YAML model already exists in the DB ({skipped} skipped).",
       "models.search_placeholder": "Search model or deployment...",
       "models.col.model": "Model",
       "models.col.deployment": "Deployment ID",
@@ -1353,6 +1357,10 @@
 
       "models.title": "模型部署",
       "models.add": "+ 新增模型",
+      "models.import_yaml": "从 YAML 导入",
+      "models.import_yaml_confirm": "将 YAML 配置中存在、但 DB 中缺失的模型部署导入 DB？\n\n只补齐缺失的模型（按模型名匹配）；DB 中已有的模型不会被覆盖或修改。重复执行不会导入新内容。",
+      "models.imported_toast": "导入 {imported} 个，跳过 {skipped} 个（DB 已存在），失败 {failed} 个",
+      "models.import_none": "无可导入模型 — YAML 中的模型均已存在于 DB（跳过 {skipped} 个）。",
       "models.search_placeholder": "搜索模型或部署 ID...",
       "models.col.model": "模型",
       "models.col.deployment": "部署 ID",

@@ -120,6 +120,10 @@ pub fn build_router<S: Clone + Send + Sync + 'static>(state: DashboardState) -> 
             "/dashboard/api/admin/models/{id}",
             put(handlers_admin::update_model).delete(handlers_admin::delete_model),
         )
+        .route(
+            "/dashboard/api/admin/models/import-from-yaml",
+            post(handlers_admin::import_models_from_yaml),
+        )
         // Admin — Model alias CRUD (new).
         .route(
             "/dashboard/api/admin/aliases",
