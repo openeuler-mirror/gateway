@@ -328,10 +328,9 @@ fn parse_visibility_str(s: &Option<String>) -> boom_config::ModelVisibility {
 }
 
 /// Combine the `visibility` + `allowed_teams` DB columns into the in-memory
-/// state. Strictly trusts the visibility column — legacy rows written before
-/// the column existed are normalized by the DB migration instead, so a stale
-/// non-NULL allowed_teams on a 'normal' row cannot silently re-privatize a
-/// model the operator switched back to normal.
+/// state. Strictly trusts the visibility column, so a stale non-NULL
+/// allowed_teams on a 'normal' row cannot silently re-privatize a model the
+/// operator switched back to normal.
 pub fn visibility_from_db(
     vis: &Option<String>,
     allowed_teams: &Option<serde_json::Value>,
@@ -914,6 +913,50 @@ impl DeploymentStore {
         Ok(row.get("id"))
     }
 
+    /// Insert a deployment row tagged source='yaml' — the explicit
+    /// "import from YAML" path (Dashboard button). Same shape as
+    /// [`Self::create_db`] but keeps the yaml provenance so imported rows are
+    /// distinguishable from web-CRUD rows, matching what the boot seed writes.
+    pub async fn insert_yaml_source_db(
+        pool: &sqlx::PgPool,
+        input: &DeploymentInput,
+    ) -> Result<uuid::Uuid, sqlx::Error> {
+        let deployment_id: String = match &input.deployment_id {
+            Some(d) if !d.is_empty() => d.clone(),
+            _ => uuid::Uuid::new_v4().to_string(),
+        };
+        let row = sqlx::query(&deployment_insert_sql("yaml"))
+            .bind(&input.model_name)
+            .bind(&input.litellm_model)
+            .bind(&input.api_key)
+            .bind(input.api_key_env.unwrap_or(false))
+            .bind(&input.api_base)
+            .bind(&input.api_version)
+            .bind(&input.aws_region_name)
+            .bind(&input.aws_access_key_id)
+            .bind(&input.aws_secret_access_key)
+            .bind(input.rpm)
+            .bind(input.tpm)
+            .bind(input.timeout)
+            .bind(&input.headers)
+            .bind(&input.temperature)
+            .bind(&input.max_tokens)
+            .bind(&input.enabled)
+            .bind(&deployment_id)
+            .bind(input.quota_count_ratio)
+            .bind(input.max_inflight_queue_len)
+            .bind(input.max_context_len)
+            .bind(input.client_type_header)
+            .bind(input.serve_not_match)
+            .bind(input.model_info.as_ref().unwrap_or(&serde_json::Value::Null))
+            .bind(allowed_teams_json(&input.allowed_teams))
+            .bind(visibility_str(input.visibility))
+            .fetch_one(pool)
+            .await?;
+
+        Ok(row.get("id"))
+    }
+
     /// Update a deployment in DB by ID. Returns the row's previous
     /// model_name (None = row not found) so callers can converge the old
     /// model group in memory when the update renamed it — otherwise the old
@@ -1242,8 +1285,8 @@ mod tests {
     }
 
     /// visibility + allowed_teams columns combine into the in-memory state.
-    /// The DB loader strictly trusts the visibility column (legacy rows are
-    /// fixed by migration_add_visibility, not by inference here).
+    /// The DB loader strictly trusts the visibility column; a stale ACL on a
+    /// 'normal' row is ignored, not inferred.
     #[test]
     fn visibility_from_db_combines_columns() {
         use boom_config::ModelVisibility;

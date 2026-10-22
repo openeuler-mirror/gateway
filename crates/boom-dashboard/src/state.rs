@@ -43,6 +43,13 @@ pub enum AdminCommand {
         id: Uuid,
         reply: oneshot::Sender<Result<Value, String>>,
     },
+    /// Explicit "import from YAML" pass: import model deployments present in
+    /// the YAML model_list but missing from the DB (matched by model_name;
+    /// existing models are never overwritten). Boom-main owns the YAML
+    /// parsing; the reply reports imported / skipped / failed model names.
+    ImportModelsFromYaml {
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
     /// Save a workflow definition (create or replace). Boom-main parses the
     /// raw definition JSON against `WorkflowDefinitionConfig`, validates the
     /// resulting settings snapshot, writes DB, then re-registers fusion.

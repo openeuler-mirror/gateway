@@ -5607,6 +5607,34 @@
     });
     const btnModel = document.getElementById("btn-new-model");
     if (btnModel) btnModel.addEventListener("click", showNewModelModal);
+    const btnImportYamlModels = document.getElementById("btn-import-yaml-models");
+    if (btnImportYamlModels) btnImportYamlModels.addEventListener("click", async () => {
+      if (!confirm(t("models.import_yaml_confirm"))) return;
+      btnImportYamlModels.disabled = true;
+      try {
+        const data = await api("/admin/models/import-from-yaml", { method: "POST", skipConfirm: true });
+        // api() only throws on non-2xx; the admin-command reply carries
+        // errors as 200 {"error": ...} — surface them explicitly.
+        if (data && data.error) { alert(t("common.error_prefix", { message: data.error })); return; }
+        const imported = (data && data.imported) || [];
+        const skipped = (data && data.skipped) || [];
+        const failed = (data && data.failed) || [];
+        if (imported.length === 0 && failed.length === 0) {
+          showToast(t("models.import_none", { skipped: skipped.length }));
+        } else {
+          showToast(t("models.imported_toast", {
+            imported: imported.length,
+            skipped: skipped.length,
+            failed: failed.length,
+          }), 5000);
+        }
+        if (imported.length > 0) { invalidateCaches(); loadModels(); }
+      } catch (err) {
+        alert(t("common.error_prefix", { message: err.message }));
+      } finally {
+        btnImportYamlModels.disabled = false;
+      }
+    });
     const btnReload = document.getElementById("btn-reload-config");
     if (btnReload) btnReload.addEventListener("click", async () => {
       btnReload.disabled = true;

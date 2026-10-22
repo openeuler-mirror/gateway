@@ -23,6 +23,10 @@ pub async fn admin_command_handler(mut rx: tokio::sync::mpsc::Receiver<AdminComm
                 let result = handle_delete_model(&state, id).await;
                 let _ = reply.send(result);
             }
+            AdminCommand::ImportModelsFromYaml { reply } => {
+                let result = handle_import_models_from_yaml(&state).await;
+                let _ = reply.send(result);
+            }
             AdminCommand::UpsertWorkflow { req, reply } => {
                 let result = handle_upsert_workflow(&state, req).await;
                 let _ = reply.send(result);
@@ -450,6 +454,112 @@ async fn handle_delete_model(
     Ok(json!({"ok": true, "model_name": model_name}))
 }
 
+/// Split YAML deployment inputs into (missing groups, skipped names) against
+/// the DB model universe. Grouping is by model_name (first-appearance order)
+/// so a model with several YAML entries — replicas — is imported or skipped
+/// as a whole: never import half a model group.
+fn partition_import_groups<'a>(
+    inputs: &'a [boom_routing::DeploymentInput],
+    db_names: &std::collections::HashSet<String>,
+) -> (
+    Vec<(String, Vec<&'a boom_routing::DeploymentInput>)>,
+    Vec<String>,
+) {
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: std::collections::HashMap<String, Vec<&'a boom_routing::DeploymentInput>> =
+        std::collections::HashMap::new();
+    for input in inputs {
+        if !groups.contains_key(&input.model_name) {
+            order.push(input.model_name.clone());
+        }
+        groups.entry(input.model_name.clone()).or_default().push(input);
+    }
+
+    let mut missing = Vec::new();
+    let mut skipped = Vec::new();
+    for name in order {
+        let entries = groups.remove(&name).unwrap_or_default();
+        if db_names.contains(&name) {
+            skipped.push(name);
+        } else {
+            missing.push((name, entries));
+        }
+    }
+    (missing, skipped)
+}
+
+/// Explicit "import from YAML" pass (Dashboard button): import model
+/// deployments present in the YAML model_list but missing from the DB,
+/// matched by model_name. Existing models are never overwritten — deletion
+/// stays authoritative. Idempotent: a second run skips everything.
+async fn handle_import_models_from_yaml(state: &AppState) -> Result<Value, String> {
+    let db_pool = state.db_pool.as_ref().ok_or("Database not available")?;
+
+    // The ArcSwap guard must not cross an await — computing the inputs is
+    // pure and synchronous, so scope the guard to this block.
+    let inputs = {
+        let inner = state.inner.load();
+        crate::config_reconcile::deployment_inputs_from_config(&inner.config)
+    };
+
+    let db_names: std::collections::HashSet<String> =
+        DeploymentStore::distinct_model_names(db_pool)
+            .await
+            .map_err(|e| format!("DB query failed: {}", e))?
+            .into_iter()
+            .collect();
+
+    let (missing, skipped) = partition_import_groups(&inputs, &db_names);
+
+    let mut imported: Vec<String> = Vec::new();
+    let mut failed: Vec<Value> = Vec::new();
+    for (name, entries) in &missing {
+        if let Err(e) = ensure_not_workflow_model(state, name) {
+            failed.push(json!({"model": name, "error": e}));
+            continue;
+        }
+        let mut inserted = 0usize;
+        for entry in entries {
+            match DeploymentStore::insert_yaml_source_db(db_pool, entry).await {
+                Ok(_) => inserted += 1,
+                Err(e) => failed.push(json!({
+                    "model": name,
+                    "error": format!("DB insert failed: {}", e)
+                })),
+            }
+        }
+        if inserted > 0 {
+            imported.push(name.clone());
+        }
+    }
+
+    // Activate in memory with the reconciler's batch primitives: per-model
+    // apply + one wildcard rebuild at the end (§10: direct memory update,
+    // no reload(), no YAML write-back).
+    if !imported.is_empty() {
+        for name in &imported {
+            crate::config_reconcile::apply_model_rows_from_db(
+                db_pool,
+                name,
+                &state.deployment_store,
+                &state.flow_controller,
+                &state.cost_template_store,
+            )
+            .await;
+        }
+        crate::config_reconcile::reload_wildcard_deployments(db_pool, &state.deployment_store)
+            .await;
+        tracing::info!(count = imported.len(), "Imported model deployments from YAML");
+    }
+
+    Ok(json!({
+        "ok": true,
+        "imported": imported,
+        "skipped": skipped,
+        "failed": failed,
+    }))
+}
+
 /// Reload all deployments for a specific model_name from DB into the live
 /// stores — the CRUD-path entry point. Delegates the per-model apply to
 /// `config_reconcile::apply_model_rows_from_db` (shared with the
@@ -818,4 +928,86 @@ async fn handle_delete_cost_template(
 
     tracing::info!(template = %name, models = affected.len(), "Cost template deleted");
     Ok(json!({"ok": true, "affected_models": affected}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn yaml_inputs(yaml: &str) -> Vec<boom_routing::DeploymentInput> {
+        let config: boom_config::Config = serde_yaml::from_str(yaml).expect("parse yaml");
+        crate::config_reconcile::deployment_inputs_from_config(&config)
+    }
+
+    fn names<'a>(groups: &'a [(String, Vec<&boom_routing::DeploymentInput>)]) -> Vec<&'a str> {
+        groups.iter().map(|(n, _)| n.as_str()).collect()
+    }
+
+    #[test]
+    fn partition_import_groups_imports_only_missing_models() {
+        let inputs = yaml_inputs(
+            r#"
+model_list:
+  - model_name: m-a
+    litellm_params: {model: openai/gpt-4}
+  - model_name: m-b
+    litellm_params: {model: openai/gpt-4}
+"#,
+        );
+        let db: HashSet<String> = ["m-b".to_string()].into_iter().collect();
+
+        let (missing, skipped) = partition_import_groups(&inputs, &db);
+        assert_eq!(names(&missing), vec!["m-a"]);
+        assert_eq!(skipped, vec!["m-b"]);
+        assert_eq!(missing[0].1.len(), 1);
+    }
+
+    #[test]
+    fn partition_import_groups_keeps_replicas_together() {
+        // Two YAML entries for the same model (replicas) must land in one
+        // group — a model is imported or skipped as a whole.
+        let inputs = yaml_inputs(
+            r#"
+model_list:
+  - model_name: m-a
+    litellm_params: {model: openai/gpt-4}
+  - model_name: m-a
+    litellm_params: {model: openai/gpt-4, api_base: "http://second"}
+"#,
+        );
+        let (missing, skipped) = partition_import_groups(&inputs, &HashSet::new());
+        assert_eq!(names(&missing), vec!["m-a"]);
+        assert_eq!(missing[0].1.len(), 2);
+        assert!(skipped.is_empty());
+    }
+
+    #[test]
+    fn partition_import_groups_wildcard_copy_follows_db_presence() {
+        // serve_not_match generates a "*" copy; when the DB already has any
+        // "*" row the copy is skipped, otherwise it is imported.
+        let inputs = yaml_inputs(
+            r#"
+model_list:
+  - model_name: m-c
+    litellm_params: {model: openai/gpt-4}
+    serve_not_match: true
+"#,
+        );
+        let with_star: HashSet<String> = ["*".to_string()].into_iter().collect();
+        let (missing, skipped) = partition_import_groups(&inputs, &with_star);
+        assert_eq!(names(&missing), vec!["m-c"]);
+        assert_eq!(skipped, vec!["*"]);
+
+        let (missing, skipped) = partition_import_groups(&inputs, &HashSet::new());
+        assert_eq!(names(&missing), vec!["m-c", "*"]);
+        assert!(skipped.is_empty());
+    }
+
+    #[test]
+    fn partition_import_groups_empty_yaml_imports_nothing() {
+        let (missing, skipped) = partition_import_groups(&[], &HashSet::new());
+        assert!(missing.is_empty());
+        assert!(skipped.is_empty());
+    }
 }

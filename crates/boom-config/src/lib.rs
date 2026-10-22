@@ -397,8 +397,9 @@ pub struct ModelEntry {
     /// Unified access-control state. See [`ModelVisibility`].
     ///
     /// Backward compatibility: entries written before this field existed that
-    /// carry `allowed_teams: [...]` but no `visibility` are inferred as
-    /// `Private` by the loader (the old semantic of that marker).
+    /// carry a non-empty `allowed_teams` list but no `visibility` are inferred
+    /// as `Private` by the loader (the old semantic of that marker). An empty
+    /// `allowed_teams: []` is treated as residue and keeps `Normal`.
     #[serde(default)]
     pub visibility: ModelVisibility,
     /// Team ACL — meaningful only when `visibility: private`. `Some(teams)`
