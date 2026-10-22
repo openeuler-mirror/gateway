@@ -103,7 +103,7 @@ fn sse_mock(body: String) -> wiremock::Mock {
 // 访问器
 // ═════════════════════════════════════════════════════════════════
 
-/// DT-AZ-01：访问器 + 默认 api-version + kv_worker_id 派生自 api_base host。
+/// DT-AZ-01：访问器 + 默认 api-version + kv_worker_id = deployment_id 优先。
 #[tokio::test]
 async fn azure_accessors() {
     let server = MockServer::start().await;
@@ -112,9 +112,8 @@ async fn azure_accessors() {
     assert_eq!(p.protocol(), boom_core::provider::ProviderProtocol::OpenAiCompatible);
     assert_eq!(p.models(), &[DEP.to_string()]);
     assert_eq!(p.deployment_id(), Some("dep-id-1"));
-    // kv_worker_id 派生自 api_base（去 scheme 的 host[:port]）
-    let kv = p.kv_worker_id().expect("kv from api_base");
-    assert!(kv.contains("127.0.0.1"), "{kv}");
+    // kv_worker_id：deployment_id 优先（id 替换 api_base host 派生）
+    assert_eq!(p.kv_worker_id(), Some("dep-id-1"));
     assert!(p.client_type_header());
     assert!(p.custom_headers().is_empty());
 

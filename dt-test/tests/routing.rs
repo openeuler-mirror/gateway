@@ -993,7 +993,7 @@ fn key_affinity_rebalance_migrates() {
 fn kvc_aware_empty_and_single() {
     let idx = fresh_index();
     let tracker = Arc::new(InFlightTracker::new());
-    let pol = KvcAwarePolicy::new(idx, tracker, None);
+    let pol = KvcAwarePolicy::new(idx, tracker, None, None);
     assert_eq!(pol.name(), "kvc_aware");
     assert!(pol.select_with_context("m", &[], None, 0, &[1, 2]).is_none());
     let single = vec![p("a", "d1")];
@@ -1007,7 +1007,7 @@ fn kvc_aware_empty_and_single() {
 fn kvc_aware_empty_prefix_degraded() {
     let idx = fresh_index();
     let tracker = Arc::new(InFlightTracker::new());
-    let pol = KvcAwarePolicy::new(idx, tracker, None);
+    let pol = KvcAwarePolicy::new(idx, tracker, None, None);
     let cands = vec![p("a", "d1"), p("a", "d2")];
     let sel = pol.select_with_context("m", &cands, None, 0, &[]).unwrap();
     assert!(sel.degraded);
@@ -1019,7 +1019,7 @@ fn kvc_aware_empty_prefix_degraded() {
 fn kvc_aware_no_kv_worker_id_falls_back() {
     let idx = fresh_index();
     let tracker = Arc::new(InFlightTracker::new());
-    let pol = KvcAwarePolicy::new(idx, tracker, None);
+    let pol = KvcAwarePolicy::new(idx, tracker, None, None);
     let cands = vec![p_no_kv("a", "d1"), p_no_kv("a", "d2")];
     let sel = pol.select_with_context("m", &cands, None, 0, &[1, 2, 3, 4]).unwrap();
     assert!(!sel.kv_match_attempted);
@@ -1032,7 +1032,7 @@ fn kvc_aware_no_kv_worker_id_falls_back() {
 fn kvc_aware_cold_round_robin() {
     let idx = fresh_index();
     let tracker = Arc::new(InFlightTracker::new());
-    let pol = KvcAwarePolicy::new(idx, tracker, None);
+    let pol = KvcAwarePolicy::new(idx, tracker, None, None);
     let cands = vec![p("a", "d1"), p("a", "d2")];
     // trie 为空 → 全 0 分 → round-robin 在 d1/d2 间轮换
     let s1 = pol.select_with_context("m", &cands, None, 0, &[1, 2, 3, 4]).unwrap();
@@ -1052,7 +1052,7 @@ fn kvc_aware_affinity_hit() {
     // 在 d1 的 trie 下记录前缀 [1,2,3,4]
     idx.apply_event(&store_event("m", "d1", None, vec![1, 2, 3, 4]));
     let tracker = Arc::new(InFlightTracker::new());
-    let pol = KvcAwarePolicy::new(idx, tracker, None);
+    let pol = KvcAwarePolicy::new(idx, tracker, None, None);
     let cands = vec![p("a", "d1"), p("a", "d2")];
     let sel = pol.select_with_context("m", &cands, None, 0, &[1, 2, 3, 4]).unwrap();
     assert!(sel.kv_match_attempted);
@@ -1068,7 +1068,7 @@ fn kvc_aware_rebalance_when_winner_overloaded() {
     idx.apply_event(&store_event("m", "d1", None, vec![1, 2, 3, 4])); // d1 有命中
     let tracker = Arc::new(InFlightTracker::new());
     let move_t = Arc::new(RebalanceMoveTracker::new());
-    let mut pol = KvcAwarePolicy::new(idx, tracker, Some(move_t.clone()));
+    let mut pol = KvcAwarePolicy::new(idx, tracker, Some(move_t.clone()), None);
     pol.set_rebalance_threshold(10);
     let qi = Arc::new(MockQueueInfo::new());
     qi.set("d1", 80, 100); // winner d1 load=80%
@@ -1303,7 +1303,15 @@ fn migrations_ddl_content() {
 
     let av = migration_add_visibility();
     assert!(av.contains("visibility"));
-    assert!(av.contains("private")); // 旧数据归一化
+    assert!(av.contains("DEFAULT 'normal'"));
+    // 有意无回填 UPDATE：旧回填永不命中且会每次重启静默重新私有化（见 migrations.rs 注释）
+    assert!(!av.to_uppercase().contains("UPDATE"));
+
+    // 存量 NULL/'' deployment_id 行回填 UUID（幂等：填后不再命中；区别于被移除的
+    // visibility 回填——那个 WHERE 永不命中真实行）。
+    let bf = migration_backfill_deployment_id();
+    assert!(bf.contains("gen_random_uuid"));
+    assert!(bf.contains("IS NULL"));
 
     let al = alias_ddl();
     assert!(al.contains("boom_model_alias"));

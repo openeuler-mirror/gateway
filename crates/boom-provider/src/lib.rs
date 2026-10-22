@@ -297,19 +297,39 @@ fn auto_detect_provider(model: &str) -> &'static str {
     }
 }
 
-/// Extract the KV worker ID from an `api_base` URL string.
+/// Derive the KV worker identity for a deployment: the deployment id
+/// (`model_info.id`), or nothing — there is deliberately NO api_base-derived
+/// fallback.
 ///
-/// Returns the pure host (IP or hostname) with scheme, port, and path
-/// stripped, so it matches the `worker_id` vLLM publishes in its ZMQ
-/// topic. Returns None when `api_base` is missing or empty.
+/// Tier 1 — participation gate: no usable `api_base` → `None`. Hosted
+/// endpoints without an api_base (Bedrock/Gemini form) never join kvc, so
+/// the participant set stays identical to the old api_base-only derivation.
+/// Tier 2 — deployment id: a non-empty (trimmed) id is used verbatim as the
+/// worker identity, keying the trie in the same domain as load / flow
+/// control / logging (`deployment_id`), and distinguishing deployments that
+/// share an api_base host (same IP different port, or path-routed inference
+/// gateways). **Id uniqueness is assumed, not enforced** — duplicate-id
+/// validation is future work.
+///
+/// No id → `None` (not a kvc participant). Every DB insert path (seed /
+/// create / import) auto-generates a UUID for an empty deployment_id, so a
+/// gateway running against the DB never sees one; an entry that still has
+/// none simply degrades to non-participation (load-based routing) rather
+/// than a wrong identity — a host-derived id would silently merge distinct
+/// instances behind the same host.
 ///
 /// Examples:
-///   `http://10.0.0.5:8000/v1` → `10.0.0.5`
-///   `https://worker-0/v1`     → `worker-0`
-///   `10.0.0.5:8000`           → `10.0.0.5`
-pub fn kv_worker_id_from_api_base(api_base: Option<&str>) -> Option<String> {
-    // Delegate to the shared boom-core implementation (IPv6-correct).
-    boom_core::normalize::host_of_api_base(api_base?)
+///   (`dep-1`, `http://10.0.0.5:8000/v1`) → `dep-1`
+///   (None,    `http://10.0.0.5:8000/v1`) → `None` (no id → not a participant)
+///   (`dep-1`, None)                      → `None` (gate: no api_base)
+pub fn kv_worker_id_for(deployment_id: Option<&str>, api_base: Option<&str>) -> Option<String> {
+    if api_base.map(str::trim).filter(|s| !s.is_empty()).is_none() {
+        return None;
+    }
+    deployment_id
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 /// Helper: build a default OpenAI-compatible response ID.

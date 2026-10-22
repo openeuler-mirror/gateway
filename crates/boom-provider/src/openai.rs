@@ -186,7 +186,7 @@ impl OpenAIProvider {
         deployment_id: Option<String>,
         client_type_header: bool,
     ) -> Self {
-        let kv_worker_id = crate::kv_worker_id_from_api_base(api_base.as_deref());
+        let kv_worker_id = crate::kv_worker_id_for(deployment_id.as_deref(), api_base.as_deref());
         Self {
             client,
             api_key,
