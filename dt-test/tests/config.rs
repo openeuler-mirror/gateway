@@ -408,6 +408,33 @@ fn config_from_yaml(yaml: &str) -> Config {
     serde_yaml::from_str(yaml).expect("parse")
 }
 
+/// Workflow 校验命名空间：从 YAML 文档自身的 model_list + model_group_alias 组装。
+/// `Config::validate` 已不再校验 workflow（DB 权威模式下 YAML model_list 是 inert
+/// 的，校验挪到 fusion 注册 / workflow CRUD 时对着活 store 跑，见 boom-main
+/// state.rs / admin_command.rs）；此处按 `validate_with_namespaces` 文档的
+/// "caller's own namespace assembly" 用法复现 YAML 加载时的同等校验。
+fn workflow_namespaces_from(config: &Config) -> boom_config::WorkflowNamespaces {
+    boom_config::WorkflowNamespaces {
+        deployment_names: config
+            .model_list
+            .iter()
+            .map(|e| e.model_name.clone())
+            .collect(),
+        aliases: config
+            .router_settings
+            .model_group_alias
+            .iter()
+            .map(|(alias, cfg)| (alias.clone(), cfg.target_model().to_string()))
+            .collect(),
+    }
+}
+
+fn validate_workflow(config: &Config) -> Result<(), boom_core::GatewayError> {
+    config
+        .workflow_settings
+        .validate_with_namespaces(&workflow_namespaces_from(config))
+}
+
 fn valid_workflow_yaml() -> &'static str {
     r#"
 model_list:
@@ -433,7 +460,7 @@ workflow_settings:
 #[test]
 fn workflow_direct_synthesis_valid() {
     let config = config_from_yaml(valid_workflow_yaml());
-    assert!(config.validate().is_ok());
+    assert!(validate_workflow(&config).is_ok());
 }
 
 /// DT-CFG-27：workflow model 与已配置 model/alias 冲突时校验失败。
@@ -458,7 +485,7 @@ workflow_settings:
           model: other
 "#;
     let config = config_from_yaml(yaml);
-    assert!(config.validate().is_err());
+    assert!(validate_workflow(&config).is_err());
 }
 
 /// DT-CFG-28：workflow model 引用不存在的 workflow 定义时失败。
@@ -483,7 +510,7 @@ workflow_settings:
           model: real-model
 "#;
     let config = config_from_yaml(yaml);
-    let err = config.validate().unwrap_err().to_string();
+    let err = validate_workflow(&config).unwrap_err().to_string();
     assert!(err.contains("unknown workflow"), "got: {err}");
 }
 
@@ -508,7 +535,7 @@ workflow_settings:
           model: real-model
 "#;
     let config = config_from_yaml(yaml);
-    let err = config.validate().unwrap_err().to_string();
+    let err = validate_workflow(&config).unwrap_err().to_string();
     assert!(err.contains("at least two panel"), "got: {err}");
 }
 
@@ -534,7 +561,7 @@ workflow_settings:
           model: real-model
 "#;
     let config = config_from_yaml(yaml);
-    let err = config.validate().unwrap_err().to_string();
+    let err = validate_workflow(&config).unwrap_err().to_string();
     assert!(err.contains("must not be empty"), "got: {err}");
 }
 
@@ -560,7 +587,7 @@ workflow_settings:
           model: real-model
 "#;
     let config = config_from_yaml(yaml);
-    let err = config.validate().unwrap_err().to_string();
+    let err = validate_workflow(&config).unwrap_err().to_string();
     assert!(err.contains("not configured"), "got: {err}");
 }
 
@@ -577,7 +604,7 @@ fn workflow_role_temperature_nan_rejected() {
     } else {
         panic!("expected DirectSynthesis workflow");
     }
-    let err = config.validate().unwrap_err().to_string();
+    let err = validate_workflow(&config).unwrap_err().to_string();
     assert!(err.contains("temperature must be finite"), "got: {err}");
 }
 
@@ -603,7 +630,7 @@ workflow_settings:
           model: real-model
 "#;
     let config = config_from_yaml(yaml);
-    let err = config.validate().unwrap_err().to_string();
+    let err = validate_workflow(&config).unwrap_err().to_string();
     assert!(err.contains("empty model name"), "got: {err}");
 }
 
@@ -629,7 +656,7 @@ workflow_settings:
           model: real-model
 "#;
     let config = config_from_yaml(yaml);
-    let err = config.validate().unwrap_err().to_string();
+    let err = validate_workflow(&config).unwrap_err().to_string();
     assert!(err.contains("empty workflow id"), "got: {err}");
 }
 
@@ -656,7 +683,7 @@ workflow_settings:
           model: real-model
 "#;
     let config = config_from_yaml(yaml);
-    let err = config.validate().unwrap_err().to_string();
+    let err = validate_workflow(&config).unwrap_err().to_string();
     assert!(err.contains("panel_timeout_secs must be greater than zero"), "got: {err}");
 }
 
@@ -678,7 +705,7 @@ workflow_settings:
           model: fusion
 "#;
     let config = config_from_yaml(yaml);
-    let err = config.validate().unwrap_err().to_string();
+    let err = validate_workflow(&config).unwrap_err().to_string();
     assert!(err.contains("references a workflow model"), "got: {err}");
 }
 
@@ -703,7 +730,7 @@ workflow_settings:
           model: panel-alias
 "#;
     let config = config_from_yaml(yaml);
-    let err = config.validate().unwrap_err().to_string();
+    let err = validate_workflow(&config).unwrap_err().to_string();
     assert!(err.contains("resolves to a workflow model"), "got: {err}");
 }
 

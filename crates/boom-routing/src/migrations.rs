@@ -66,6 +66,26 @@ ALTER TABLE boom_model_deployment ADD COLUMN IF NOT EXISTS visibility TEXT NOT N
 "#
 }
 
+/// Migration: backfill deployment_id for legacy rows (NULL or '').
+///
+/// All insert paths (seed_rows_db / create_db / insert_yaml_source_db)
+/// auto-generate a UUID when deployment_id is missing — FlowController
+/// requires a non-empty id to register a slot. Rows written before that
+/// behavior existed (or via direct SQL) can still carry NULL/'': those rows
+/// lose their flow-control slot and fall back to host-derived kv identity.
+///
+/// Unlike the removed visibility backfill (whose WHERE could never match a
+/// real row and silently re-privatized on every boot), this UPDATE only
+/// matches identity-less rows, and the fill makes them non-matching —
+/// genuinely idempotent, fires at most once per row.
+pub fn migration_backfill_deployment_id() -> &'static str {
+    r#"
+UPDATE boom_model_deployment
+SET deployment_id = gen_random_uuid()::text, updated_at = NOW()
+WHERE deployment_id IS NULL OR deployment_id = '';
+"#
+}
+
 /// DDL for boom_model_alias table.
 pub fn alias_ddl() -> &'static str {
     r#"

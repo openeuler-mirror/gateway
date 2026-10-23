@@ -105,6 +105,29 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
     // it ("visibility" does not exist). Propagates with `?` — startup
     // should fail loudly when a hard-required column can't be added.
     run_ddl_on_conn(&mut conn, boom_routing::migrations::migration_add_visibility()).await?;
+    // Backfill deployment_id for legacy rows written before insert-path
+    // auto-generation (NULL/''): gives them a stable persisted identity for
+    // flow-control slots and kv affinity. Idempotent — fires at most once
+    // per row. Warn-and-continue: a failed backfill only degrades those rows
+    // to host-derived kv identity, it must not block startup.
+    match sqlx::query(boom_routing::migrations::migration_backfill_deployment_id())
+        .execute(&mut *conn)
+        .await
+    {
+        Ok(res) => {
+            let n = res.rows_affected();
+            if n > 0 {
+                tracing::info!(
+                    "Migration 2: backfilled deployment_id for {} legacy row(s)",
+                    n
+                );
+            }
+        }
+        Err(e) => tracing::warn!(
+            "Migration 2: deployment_id backfill failed (continuing): {}",
+            e
+        ),
+    }
     tracing::info!("Migration 2/7: done");
     tracing::info!("Migration 3/7: alias...");
     run_ddl_on_conn(&mut conn, boom_routing::migrations::alias_ddl()).await?;

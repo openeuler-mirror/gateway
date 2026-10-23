@@ -31,7 +31,7 @@ impl AzureProvider {
         client_type_header: bool,
     ) -> Self {
         let base = api_base.unwrap_or_default();
-        let kv_worker_id = crate::kv_worker_id_from_api_base(Some(base.as_str()));
+        let kv_worker_id = crate::kv_worker_id_for(deployment_id.as_deref(), Some(base.as_str()));
         Self {
             client,
             api_key,

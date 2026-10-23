@@ -208,7 +208,7 @@ boom-trace      → leaf crate，Dashboard 经 boom-core::TraceApi（Arc<dyn Tra
 | F5.8 | 负载信号总线 | InFlightTracker（model 与 model\0deployment 双维原子计数 + RAII guard）；load_pct = max(inflight, FC queued)/capacity 归一化（防双计）；FlowController 队列深度；RequestRateTracker（per-deployment 成功速率） | boom-routing / boom-flowcontrol | load_helpers.rs |
 | F5.9 | 再平衡可观测 | RebalanceMoveTracker：60min 环形桶统计迁移次数，Dashboard 展示 | boom-routing | rebalance.rs |
 | F5.10 | KV 全量上报请求 | kv_match_attempted 且命中率低于阈值时，向上游请求全量 cache report | boom-routing / boom-core | policy/mod.rs:22-32 |
-| F5.11 | kv_worker_id 派生 | 从上游 api_base host 派生 worker 标识，用于 trie 命中归属 | boom-core | Provider::kv_worker_id |
+| F5.11 | kv_worker_id 派生 | **仅 `model_info.id`（deployment_id），无 api_base 兜底**——与负载/流控/日志同域，可区分同 api_base host 的多实例（同 IP 不同 port、路径路由推理网关）；空 id（NULL/''/空白）→ `None`，不参与 kvc（身份缺失降级为负载路由，而非错误身份合并实例）。DB 模式三条插入路径均对空 id 生成 UUID 落库（存量 NULL/'' 行由幂等回填迁移补齐，update 的 '' 不清空既有 id），故正常运行不出现空 id；无 api_base（Bedrock/Gemini 形态）亦不参与 kvc。**id 唯一性暂为假设，入口校验未做**（重复 id 会退化为恒平轮询） | boom-provider | kv_worker_id_for → Provider::kv_worker_id |
 
 ### F6 配额限流与计费
 

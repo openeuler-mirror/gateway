@@ -5,7 +5,8 @@
 //!   data: 无空格、event 字段、注释/未知字段、BOM、UTF-8 跨段、finish、空事件、raw、take_pending_raw）
 //! - lib.rs create_provider：各 provider 类型 protocol、未知 provider 错误、
 //!   custom_headers sanitization（reserved/hard-blocked/transport/invalid）、
-//!   reserved key 配置 anthropic_version、auto_detect、kv_worker_id_from_api_base
+//!   reserved key 配置 anthropic_version、auto_detect、kv_worker_id_for
+//!   （参与门 + id 优先，无 api_base 兜底）
 //! - openai.rs chat/chat_stream（wiremock）：成功/usage 缺失/解析错误/raw body/BOM/
 //!   SSE 装配/部分 usage/null identity/未知 role/未知 content part/流式 CRLF/无空格 data/
 //!   未知 role 流式/tool_call 无 index/gateway_headers 注入/bearer auth/extra 透传
@@ -18,7 +19,7 @@ use std::sync::Arc;
 use boom_core::provider::{Provider, ProviderProtocol};
 use boom_core::types::*;
 use boom_core::GatewayError;
-use boom_provider::{create_provider, kv_worker_id_from_api_base, sse::SseParser};
+use boom_provider::{create_provider, kv_worker_id_for, sse::SseParser};
 use futures::StreamExt;
 use reqwest::Client;
 use wiremock::matchers::{body_partial_json, header, method, path};
@@ -348,12 +349,13 @@ fn provider_trait_accessors() {
     assert_eq!(p.models().len(), 1);
     assert_eq!(p.models()[0], "gpt-4");
     assert_eq!(p.deployment_id(), None);
-    assert_eq!(p.kv_worker_id(), Some("10.0.0.5"));
+    // 无 id 不再从 api_base 兜底派生 → 不参与 kvc（身份缺失可降级，身份错误会合并实例）。
+    assert_eq!(p.kv_worker_id(), None);
     assert!(!p.client_type_header());
     assert!(p.custom_headers().is_empty());
 }
 
-/// DT-PRV-LIB-11：deployment_id 透传。
+/// DT-PRV-LIB-11：deployment_id 透传（同时作为 kv_worker_id 优先来源）。
 #[test]
 fn deployment_id_passed_through() {
     let p = create_provider(
@@ -361,6 +363,8 @@ fn deployment_id_passed_through() {
         &HashMap::new(), &HashMap::new(), Some("dep-42".into()), false,
     ).unwrap();
     assert_eq!(p.deployment_id(), Some("dep-42"));
+    // id 优先：有 deployment_id 时 kv_worker_id 不再从 api_base 派生。
+    assert_eq!(p.kv_worker_id(), Some("dep-42"));
 }
 
 /// DT-PRV-LIB-12：client_type_header=true 透传。
@@ -373,13 +377,23 @@ fn client_type_header_flag_passed() {
     assert!(p.client_type_header());
 }
 
-/// DT-PRV-LIB-13：kv_worker_id_from_api_base 各形态。
+/// DT-PRV-LIB-15：kv_worker_id_for 两级语义——参与门 / id。
+/// 空 id 不兜底 api_base，直接不参与 kvc（DB insert 路径已保证生成 UUID）。
+/// id 唯一性目前是假设（校验后续做），此处只锁身份派生行为。
 #[test]
-fn kv_worker_id_from_api_base_variants() {
-    assert_eq!(kv_worker_id_from_api_base(Some("http://10.0.0.5:8000/v1")), Some("10.0.0.5".into()));
-    assert_eq!(kv_worker_id_from_api_base(Some("https://worker-0/v1")), Some("worker-0".into()));
-    assert_eq!(kv_worker_id_from_api_base(Some("10.0.0.5:8000")), Some("10.0.0.5".into()));
-    assert_eq!(kv_worker_id_from_api_base(None), None);
+fn kv_worker_id_for_id_only_semantics() {
+    // id 优先：有 id 时直接作为 worker 标识（与负载/流控/日志同域）。
+    assert_eq!(kv_worker_id_for(Some("dep-1"), Some("http://10.0.0.5:8000/v1")), Some("dep-1".into()));
+    // id trim 后非空才生效，键取 trim 后的值。
+    assert_eq!(kv_worker_id_for(Some("  dep-1  "), Some("http://10.0.0.5:8000/v1")), Some("dep-1".into()));
+    // 空白 id 视为未填 → 不参与（无 host 兜底）。
+    assert_eq!(kv_worker_id_for(Some("   "), Some("http://10.0.0.5:8000/v1")), None);
+    // 参与门：无 api_base（Bedrock/Gemini 形态）即使有 id 也不参与 kvc。
+    assert_eq!(kv_worker_id_for(Some("dep-1"), None), None);
+    assert_eq!(kv_worker_id_for(Some("dep-1"), Some("  ")), None);
+    // 无 id → 不参与（身份缺失降级为负载路由，而非错误身份合并实例）。
+    assert_eq!(kv_worker_id_for(None, Some("http://10.0.0.5:8000/v1")), None);
+    assert_eq!(kv_worker_id_for(None, None), None);
 }
 
 /// DT-PRV-LIB-14：timeout=0 被 max(1) 兜底，仍能构造 client。
@@ -1306,7 +1320,8 @@ fn openai_provider_direct_construct_with_headers() {
     let p = OpenAIProvider::new(Client::new(), Some("k".into()), Some("http://x/v1".into()), "m", None, false)
         .with_custom_headers(vec![("X-Custom".into(), "v".into())]);
     assert_eq!(p.custom_headers().len(), 1);
-    assert_eq!(p.kv_worker_id(), Some("x"));
+    // 直连构造未带 deployment_id → 不参与 kvc（无 host 兜底）。
+    assert_eq!(p.kv_worker_id(), None);
 }
 
 /// DT-PRV-ANT-07：direct AnthropicProvider::new + with_api_version + with_custom_headers。
@@ -1317,7 +1332,8 @@ fn anthropic_provider_direct_construct() {
         .with_api_version("2023-01-01".into())
         .with_custom_headers(vec![("X-Custom".into(), "v".into())]);
     assert_eq!(p.protocol(), ProviderProtocol::Native);
-    assert_eq!(p.kv_worker_id(), Some("host"));
+    // 直连构造未带 deployment_id → 不参与 kvc（无 host 兜底）。
+    assert_eq!(p.kv_worker_id(), None);
     assert_eq!(p.custom_headers().len(), 1);
 }
 
