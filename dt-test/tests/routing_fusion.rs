@@ -535,13 +535,47 @@ fn fusion_registration_is_exclusive() {
     assert!(!f.deployment_store.add_deployment("fusion", probe));
 }
 
-/// DT-RF-03：workflow model 名与运行时已有 deployment 冲突 → ConfigError。
-/// （"fusion" 已由 fixture 注册为 fusion deployment；重复注册同名被拒。
-/// 注意 config.validate 只查 config 内部的 model_list/alias 冲突，查不到运行时 store。）
+/// DT-RF-03：workflow model 名与运行时已有普通 deployment 冲突 → ConfigError。
+/// （fixture 已把 "fusion" 注册为 fusion 独占 deployment——同名重注册是
+/// 合法的 teardown+replace 路径，不是冲突；真冲突 = 名字被普通
+/// （非独占）deployment 占用。注意 config.validate 只查 config 内部的
+/// model_list/alias 冲突，查不到运行时 store。）
 #[test]
 fn registration_rejects_deployment_conflict() {
     let f = fixture();
-    let config = parse_config(STANDARD_YAML);
+    // 新 workflow model 名 "fusion2"：不在 store、config 内部合法；
+    // 预先用普通 deployment 占住名字 → 撞上注册检查
+    let probe: Arc<dyn Provider> = Arc::new(KvProbe {
+        deployment: "fusion2".into(),
+        kv: "fusion2".into(),
+    });
+    assert!(f.deployment_store.add_deployment("fusion2", probe));
+    let config = parse_config(
+        r#"
+model_list:
+  - model_name: panel-a
+    litellm_params:
+      model: openai/panel-a
+  - model_name: panel-b
+    litellm_params:
+      model: openai/panel-b
+  - model_name: aggregator
+    litellm_params:
+      model: openai/aggregator
+workflow_settings:
+  models:
+    fusion2: direct_synthesis
+  workflows:
+    direct_synthesis:
+      type: direct_synthesis
+      roles:
+        panel:
+          - model: panel-a
+          - model: panel-b
+        aggregator:
+          model: aggregator
+"#,
+    );
     let err = register_fusion_providers(&config.workflow_settings, &f.deployment_store, &f.alias_store, f.runtime.clone())
         .err()
         .expect("conflict rejected");
@@ -1089,7 +1123,7 @@ async fn fusion_records_request_prefix_into_kv_index() {
     // 块大小 8B：消息序列化远超一块，保证 record/查询都产生完整块
     let index = Arc::new(TokenPrefixIndex::new(8, 500_000));
     let tracker = Arc::new(InFlightTracker::new());
-    let policy: Arc<dyn SchedulePolicy> = Arc::new(boom_routing::KvcAwarePolicy::new(index.clone(), tracker, None));
+    let policy: Arc<dyn SchedulePolicy> = Arc::new(boom_routing::KvcAwarePolicy::new(index.clone(), tracker, None, None));
     let f = fixture_with(STANDARD_YAML, Some(policy), Some(index.clone()), true, 1200, false);
     // KVC 策略对单候选跳过查询（kv_match_attempted=false → 不记录），
     // 给 panel-a 加第二个同 kv worker 的候选使记录路径生效
@@ -1124,7 +1158,7 @@ async fn fusion_records_request_prefix_into_kv_index() {
     let probe_hit: Arc<dyn Provider> = Arc::new(KvProbe { deployment: "d1".into(), kv: "fake-deployment".into() });
     let probe_miss: Arc<dyn Provider> = Arc::new(KvProbe { deployment: "d2".into(), kv: "other-worker".into() });
     let cands = vec![probe_miss, probe_hit];
-    let pol = boom_routing::KvcAwarePolicy::new(index, Arc::new(InFlightTracker::new()), None);
+    let pol = boom_routing::KvcAwarePolicy::new(index, Arc::new(InFlightTracker::new()), None, None);
     let sel = pol.select_with_context("panel-a", &cands, None, 0, &prefix).expect("selection");
     assert!(sel.kv_match_attempted);
     assert!(sel.kv_hit_ratio > 0.0, "learned prefix must hit the recorded worker");
