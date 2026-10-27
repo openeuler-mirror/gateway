@@ -111,6 +111,8 @@ pub struct AppState {
     /// Handle to the running TTL prune task (sweeps expired approximate blocks).
     /// None when kvc_aware disabled. Held so reload can abort before respawning.
     pub kv_prune_handle: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Response store for /v1/responses continuation (previous_response_id).
+    pub response_store: Arc<boom_responses::ResponseStore>,
     /// kvc-aware routing orchestrator (prefix-serialize + route + DFX + record).
     /// Handler calls kvc_orchestrator.route() — all kvc business logic is here,
     /// not in routes.rs. Returns None when kvc is disabled.
@@ -308,6 +310,10 @@ impl AppState {
             // DDL (lock_timeout, DISTRIBUTE BY on GaussDB) already degrades
             // to warn inside run_migrations.
             boom_dashboard::migrations::run_migrations(pool).await?;
+            // Response store DDL (boom-responses owns boom_response* tables).
+            if let Err(e) = boom_responses::migrations::run(pool).await {
+                tracing::error!("Failed to run responses-store migration: {}", e);
+            }
 
             crate::migrations::ensure_config_meta_table(pool).await?;
 
@@ -418,7 +424,10 @@ impl AppState {
             .max(1);
         let stressmon = boom_stressmon::StressmonCollector::new(num_workers, started_at);
 
+        let response_store =
+            Arc::new(boom_responses::ResponseStore::new(db_pool.clone()));
         let state = Self {
+            response_store,
             config_path,
             inner: Arc::new(ArcSwap::from_pointee(inner)),
             db_pool,

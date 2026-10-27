@@ -12,6 +12,11 @@ use boom_core::provider::{
     ProviderBilling, ProviderCallContext, ProviderCost, SharedProviderPromptTrace,
 };
 use boom_core::types::*;
+use boom_core::responses::{
+    normalize_input_items, openai_chat_to_responses_with_custom_tools,
+    previous_response_id_without_store, responses_request_to_openai_with_history,
+    ResponsesRequest, ResponsesStreamTranscoder,
+};
 use boom_core::GatewayError;
 use boom_ctxaware::AgentStatsTracker;
 use boom_flowcontrol::{FlowControlError, FlowControlledStream};
@@ -3095,29 +3100,13 @@ pub async fn messages(
 
     tracing::info!(request_id = %request_id, model = %model, stream = is_stream, "messages request started");
 
-    // Shared request-body Value — ONE serialization of the native Anthropic
-    // body serves the blocklist check and the prompt log; zero when neither
-    // is armed. See the chat_completions path for the rationale.
-    let prompt_log_should = state.prompt_log_writer.should_capture(
-        &identity.key_hash,
-        identity.team_id.as_deref(),
-    );
-    let blocklist_armed =
-        state.block_rule_store.is_enabled() && !state.block_rule_store.is_empty();
-    let req_body_value: Option<Arc<serde_json::Value>> =
-        if blocklist_armed || prompt_log_should {
-            serde_json::to_value(&req).ok().map(Arc::new)
-        } else {
-            None
-        };
-
-    // Client blocklist — matching against the native Anthropic body
-    // (model / system / messages all addressable).
-    check_client_block_rules(
+    // Shared edge prep (blocklist + prompt-log capture) — dedup'd with the
+    // responses handler; field-level changes land in prepare_edge_request.
+    let prep = prepare_edge_request(
         &state,
-        &identity,
+        identity,
         &headers,
-        if blocklist_armed { req_body_value.clone() } else { None },
+        &req,
         &model,
         "/v1/messages",
         is_stream,
@@ -3127,43 +3116,14 @@ pub async fn messages(
         start,
     )
     .map_err(|e| AnthropicErrorReply(e, is_stream))?;
-
-    let prompt_log_capture_raw = prompt_log_should && state.prompt_log_writer.config().capture_raw_upstream;
-    let prompt_log_raw_capture = if prompt_log_capture_raw {
-        Some(std::sync::Arc::new(
-            boom_core::provider::RawCaptureChannel::default(),
-        ))
-    } else {
-        None
-    };
-    let prompt_log_req_body = if prompt_log_should {
-        req_body_value
-    } else {
-        None
-    };
-    let prompt_log_sender = if prompt_log_should {
-        Some(state.prompt_log_writer.sender())
-    } else {
-        None
-    };
-    // Clone request_id and model for prompt log (they get moved into RequestLog later).
-    let prompt_log_rid = if prompt_log_should { Some(request_id.clone()) } else { None };
-    let prompt_log_model = if prompt_log_should { Some(model.clone()) } else { None };
-    // Snapshot whitelisted request headers (only when configured).
-    let prompt_log_headers: Option<std::collections::HashMap<String, String>> = if prompt_log_should {
-        snapshot_prompt_log_headers(&state, &headers)
-    } else {
-        None
-    };
-    // Extract W3C traceparent — same shape/caveats as the chat_completions path.
-    let prompt_log_trace_id: Option<String> = if prompt_log_should {
-        headers
-            .get("traceparent")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string())
-    } else {
-        None
-    };
+    let prompt_log_should = prep.prompt_log_should;
+    let prompt_log_raw_capture = prep.raw_capture;
+    let prompt_log_req_body = prep.req_body;
+    let prompt_log_sender = prep.sender;
+    let prompt_log_rid = prep.rid;
+    let prompt_log_model = prep.model;
+    let prompt_log_headers = prep.headers;
+    let prompt_log_trace_id = prep.trace_id;
 
     // Trace channel: parse W3C context, run filter, open a TraceGuard if the
     // request qualifies. See the chat_completions path for the long-form
@@ -3784,6 +3744,942 @@ impl IntoResponse for AnthropicErrorReply {
 impl From<GatewayError> for AnthropicErrorReply {
     fn from(e: GatewayError) -> Self {
         AnthropicErrorReply(e, false)
+    }
+}
+
+// ============================================================
+// OpenAI Responses API (/v1/responses)
+// ============================================================
+
+/// Entry point mirroring `messages`: protocol conversion at the edge, the
+/// whole middle of the pipeline (auth → limits → routing → provider →
+/// audit/计费 wrappers) is the shared chat machinery (Response.md §6.6).
+/// Edge-request observability prep shared by the protocol-edge handlers
+/// (messages / responses): ONE body serialization feeds the blocklist check
+/// and the prompt log; prompt-log capture fields are gathered once. This is
+/// the dedup point the three-pipeline review asked for — field-level changes
+/// land HERE, not per-handler.
+struct EdgeRequestPrep {
+    req_body_value: Option<Arc<serde_json::Value>>,
+    prompt_log_should: bool,
+    raw_capture: Option<Arc<boom_core::provider::RawCaptureChannel>>,
+    req_body: Option<Arc<serde_json::Value>>,
+    sender: Option<tokio::sync::mpsc::UnboundedSender<boom_promptlog::PromptLogEntry>>,
+    rid: Option<String>,
+    model: Option<String>,
+    headers: Option<std::collections::HashMap<String, String>>,
+    trace_id: Option<String>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_edge_request<T: serde::Serialize>(
+    state: &AppState,
+    identity: &boom_core::types::AuthIdentity,
+    headers: &axum::http::HeaderMap,
+    req: &T,
+    model: &str,
+    api_path: &str,
+    is_stream: bool,
+    request_id: &str,
+    client_ip: &str,
+    user_tag: Option<String>,
+    start: std::time::Instant,
+) -> Result<EdgeRequestPrep, GatewayError> {
+    let prompt_log_should = state.prompt_log_writer.should_capture(
+        &identity.key_hash,
+        identity.team_id.as_deref(),
+    );
+    let blocklist_armed =
+        state.block_rule_store.is_enabled() && !state.block_rule_store.is_empty();
+    let req_body_value: Option<Arc<serde_json::Value>> =
+        if blocklist_armed || prompt_log_should {
+            serde_json::to_value(req).ok().map(Arc::new)
+        } else {
+            None
+        };
+
+    check_client_block_rules(
+        state,
+        identity,
+        headers,
+        if blocklist_armed { req_body_value.clone() } else { None },
+        model,
+        api_path,
+        is_stream,
+        request_id,
+        client_ip,
+        user_tag,
+        start,
+    )?;
+
+    let capture_raw =
+        prompt_log_should && state.prompt_log_writer.config().capture_raw_upstream;
+    let pl_req_body = if prompt_log_should { req_body_value.clone() } else { None };
+    Ok(EdgeRequestPrep {
+        req_body_value,
+        prompt_log_should,
+        raw_capture: if capture_raw {
+            Some(Arc::new(boom_core::provider::RawCaptureChannel::default()))
+        } else {
+            None
+        },
+        req_body: pl_req_body,
+        sender: if prompt_log_should { Some(state.prompt_log_writer.sender()) } else { None },
+        rid: if prompt_log_should { Some(request_id.to_string()) } else { None },
+        model: if prompt_log_should { Some(model.to_string()) } else { None },
+        headers: if prompt_log_should {
+            snapshot_prompt_log_headers(state, headers)
+        } else {
+            None
+        },
+        trace_id: if prompt_log_should {
+            headers.get("traceparent").and_then(|v| v.to_str().ok()).map(String::from)
+        } else {
+            None
+        },
+    })
+}
+
+pub async fn responses(
+    State(state): State<AppState>,
+    mut auth: RequiredAuth,
+    headers: axum::http::HeaderMap,
+    ConnectInfo(remote_addr): ConnectInfo<std::net::SocketAddr>,
+    CachedJson(mut req): CachedJson<ResponsesRequest>,
+) -> Result<axum::response::Response, ResponsesErrorReply> {
+    let start = Instant::now();
+    let request_id = new_request_id();
+    let client_ip = extract_client_ip(&headers, Some(remote_addr));
+    let inner = state.inner.load();
+    let user_tag = extract_user_tag(&inner.config.general_settings, &headers);
+
+    // pre_auth hook model rewrite — same position as the messages path so the
+    // converted request inherits the new model everywhere downstream.
+    if let Some(new_model) = auth.take_new_model() {
+        req.model = new_model;
+    }
+    let identity = auth.identity();
+
+    // P1: response-store policy. previous_response_id is honored when the
+    // store is available (DB + responses_store.enabled); otherwise it fails
+    // fast — silent-ignore hands the client a wrong semantic (Response.md R8).
+    let store_cfg = inner
+        .config
+        .general_settings
+        .responses_store
+        .clone()
+        .unwrap_or_default();
+    let store_available = state.response_store.is_enabled() && store_cfg.enabled;
+    let mut effective_req = req.clone();
+    let mut history_items: Vec<serde_json::Value> = Vec::new();
+    if let Some(prev_id) = req.previous_response_id.clone() {
+        if !store_available {
+            let e = previous_response_id_without_store();
+            log_error(&state, &identity, &req.model, "/v1/responses", req.stream.unwrap_or(false), start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()), user_tag.clone());
+            return Err(ResponsesErrorReply(e));
+        }
+        // Rehydrate BEFORE routing: the rebuilt full history participates in
+        // KV-prefix affinity scoring, so continuations naturally stick to the
+        // previous turn's worker (Response.md §6.8).
+        match state.response_store.rehydrate(&prev_id, &identity.key_hash).await {
+            Ok(turn) => {
+                history_items = turn.items;
+                // Tools inheritance when the client omits them; instructions
+                // are NOT auto-inherited (OpenAI semantics).
+                if effective_req.tools.is_none() {
+                    effective_req.tools = turn.tools;
+                }
+            }
+            Err(boom_responses::ResponseStoreError::NotFound) => {
+                // Uniform 404: missing, expired, or another key's id.
+                let e = GatewayError::ResponseNotFound(prev_id.clone());
+                log_error(&state, &identity, &req.model, "/v1/responses", req.stream.unwrap_or(false), start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()), user_tag.clone());
+                return Err(ResponsesErrorReply(e));
+            }
+            Err(other) => {
+                let e = GatewayError::InternalError(format!("response store: {other}"));
+                log_error(&state, &identity, &req.model, "/v1/responses", req.stream.unwrap_or(false), start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()), user_tag.clone());
+                return Err(ResponsesErrorReply(e));
+            }
+        }
+    }
+
+    // Guards (conversation / background / built-in tools / unsupported input
+    // items) + conversion into the chat kernel, rehydrated history prepended.
+    let mut openai_req = responses_request_to_openai_with_history(&effective_req, &history_items).map_err(|e| {
+        log_error(&state, &identity, &req.model, "/v1/responses", req.stream.unwrap_or(false), start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()), user_tag.clone());
+        ResponsesErrorReply(e)
+    })?;
+    let model = openai_req.model.clone();
+    let is_stream = openai_req.stream.unwrap_or(false);
+
+    tracing::info!(request_id = %request_id, model = %model, stream = is_stream, "responses request started");
+
+    // Response identity minted by the gateway (LiteLLM-style id ownership).
+    let response_id = format!("resp_{}", uuid::Uuid::new_v4().simple());
+    let created_at = chrono::Utc::now().timestamp().max(0) as u64;
+
+    // P1 persistence: `store` defaults to true; skipped for store:false and
+    // P0.5: names declared type:"custom" — tool calls for them restore the
+    // custom_tool_call contract on the way out (Codex depends on it).
+    let custom_tool_names: std::collections::HashSet<String> = req
+        .tools
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .filter(|t| t.get("type").and_then(|v| v.as_str()) == Some("custom"))
+        .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(String::from))
+        .collect();
+
+    // when the response store is unavailable. Only completed/incomplete turns
+    // are checkpointed (failed turns are not retrievable continuations).
+    let persist_ctx = if store_available && req.store != Some(false) {
+        Some(ResponsesPersistCtx {
+            response_id: response_id.clone(),
+            previous_response_id: req.previous_response_id.clone(),
+            key_hash: identity.key_hash.clone(),
+            model: req.model.clone(),
+            instructions: req.instructions.clone(),
+            tools: effective_req.tools.clone(),
+            history_items: history_items.clone(),
+            input_items: normalize_input_items(&req),
+            ttl_secs: store_cfg.ttl_secs,
+            max_history_items: store_cfg.max_history_items,
+        })
+    } else {
+        None
+    };
+
+    // Shared edge prep (blocklist + prompt-log capture) — dedup'd with the
+    // messages handler; field-level changes land in prepare_edge_request.
+    let prep = prepare_edge_request(
+        &state,
+        identity,
+        &headers,
+        &req,
+        &model,
+        "/v1/responses",
+        is_stream,
+        &request_id,
+        &client_ip,
+        user_tag.clone(),
+        start,
+    )
+    .map_err(ResponsesErrorReply)?;
+    let prompt_log_should = prep.prompt_log_should;
+    let prompt_log_raw_capture = prep.raw_capture;
+    let prompt_log_req_body = prep.req_body;
+    let prompt_log_sender = prep.sender;
+    let prompt_log_rid = prep.rid;
+    let prompt_log_model = prep.model;
+    let prompt_log_headers = prep.headers;
+    let prompt_log_trace_id = prep.trace_id;
+
+    // Trace channel — same shape as the chat/messages paths.
+    let trace_cfg = inner.config.trace.clone().unwrap_or_default();
+    let w3c_ctx: Option<W3cContext> = headers
+        .get("traceparent")
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_traceparent);
+    let should_trace = trace_cfg.enabled
+        && w3c_ctx
+            .as_ref()
+            .map(|w| boom_trace::trace_filter_matches(&trace_cfg.report_filter.tracestate_keys, &trace_cfg.report_filter.trace_id_regex, w))
+            .unwrap_or(false);
+    let mut trace_guard = if let Some(w3c) = w3c_ctx.as_ref() {
+        TraceGuard::start(
+            state.trace.clone(),
+            request_id.clone(),
+            w3c,
+            model.clone(),
+            "/v1/responses".to_string(),
+            is_stream,
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64,
+            should_trace,
+        )
+    } else {
+        None
+    };
+    if let (Some(g), Some(body)) = (trace_guard.as_ref(), prompt_log_req_body.as_ref()) {
+        if trace_cfg.capture_body {
+            g.set_llm_request(body.clone());
+        }
+    }
+
+    // 1. Model access check (deployment-aware, alias-aware).
+    check_model_access(identity, &openai_req.model, &state.router).map_err(|e| {
+        log_error(&state, &identity, &model, "/v1/responses", is_stream, start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()), user_tag.clone());
+        ResponsesErrorReply(e)
+    })?;
+
+    // 1b. Content-aware model resolution (auto router).
+    let resolved_model = state.router.resolve_request_model(
+        &openai_req.model, &openai_req.messages, &openai_req.tools,
+    ).await;
+
+    // 2. Plan-based or default rate limiting.
+    let rate_limit_cfg = &inner.config.rate_limit;
+    let window_limits = effective_window_limits(&rate_limit_cfg.window_limits, rate_limit_cfg);
+    let weight = resolve_quota_weight(&openai_req.model, &state);
+    let resolved_model_for_quota = resolve_model_name(&openai_req.model, &state);
+    let (effective_rpm, effective_tpm) = effective_key_limits(identity, rate_limit_cfg);
+
+    let mut plan_charge = check_plan_limits(
+        &state,
+        &state.plan_store,
+        &state.limiter,
+        &identity.key_hash,
+        identity.team_id.as_deref(),
+        &openai_req.model,
+        &resolved_model_for_quota,
+        effective_rpm,
+        effective_tpm,
+        &window_limits,
+        weight,
+    )
+    .await
+    .map_err(|e| {
+        log_error(&state, &identity, &model, "/v1/responses", is_stream, start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()), user_tag.clone());
+        ResponsesErrorReply(e)
+    })?;
+
+    let input_chars: usize = openai_req.messages.iter().map(|m| match &m.content {
+        MessageContent::Text(t) => t.len(),
+        MessageContent::Parts(parts) => parts
+            .iter()
+            .map(|p| match p {
+                ContentPart::Text { text } => text.len(),
+                _ => 0,
+            })
+            .sum(),
+        MessageContent::Null => 0,
+    }).sum();
+    log_request_summary(
+        &request_id, identity, &model, input_chars, is_stream,
+        "/v1/responses", &plan_charge,
+    );
+
+    // 3. Route (kvc-aware or default).
+    let candidates = state.router.candidates_for(&resolved_model);
+    let kvc_route = state.kvc_orchestrator.route(
+        &inner.config, &resolved_model, &identity.key_hash, input_chars as u64,
+        &openai_req, candidates.as_ref().map(|c| c.as_slice()).unwrap_or(&[]),
+    )
+    .await;
+
+    let (provider, deployment_id, inflight_model,
+        schedule_policy, kv_hit_blocks, kv_input_blocks,
+        trie_blocks, trie_max_blocks, request_bytes) = match kvc_route {
+        Some(r) => {
+            (r.provider, r.deployment_id, r.inflight_model.unwrap_or_default(),
+             r.schedule_policy, r.kv_hit_blocks, r.kv_input_blocks,
+             r.trie_blocks, r.trie_max_blocks, r.request_bytes)
+        }
+        None => {
+            let selection = state.router.select_provider_with_prefix(
+                &resolved_model, Some(&identity.key_hash), input_chars as u64, &[],
+            ).ok_or_else(|| {
+                let e = GatewayError::ModelNotFound(resolved_model.clone());
+                log_error(&state, &identity, &model, "/v1/responses", is_stream, start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()), user_tag.clone());
+                ResponsesErrorReply(e)
+            })?;
+            let did = selection.provider.deployment_id().map(|s| s.to_string());
+            let im = state.router.resolve_model_name(&resolved_model);
+            (selection.provider, did, im, None, None, None, None, None, None)
+        }
+    };
+
+    // 3.5. Flow control — queue if per-deployment limits exceeded.
+    let is_vip = is_vip_key(&identity.metadata);
+    let fc_guard = if let Some(ref did) = deployment_id {
+        acquire_fc_guard(
+            &state, did, input_chars as u64,
+            std::time::Duration::from_secs(
+                inner.config.router_settings.flow_control_queue_timeout_secs()
+            ),
+            is_vip,
+            identity.key_alias.clone(), Some(identity.key_hash.clone()),
+            Some(inflight_model.clone()),
+            "/v1/responses", &identity, &model,
+            is_stream, start, &request_id, Some(client_ip.clone()), user_tag.clone(),
+            |e, _is_stream| ResponsesErrorReply(e),
+        ).await?
+    } else {
+        None
+    };
+    let queue_wait_ms: Option<i32> = fc_guard.as_ref().map(|g| {
+        g.wait_duration().as_millis().min(i32::MAX as u128) as i32
+    });
+
+    if let Some(g) = trace_guard.as_ref() {
+        use boom_core::trace::SpanAttributeValue;
+        g.set_attribute("boom-gateway.request.id", SpanAttributeValue::String(request_id.clone()));
+        if let Some(qw) = queue_wait_ms {
+            g.set_attribute("boom-gateway.time_in_queue", SpanAttributeValue::Int(qw as i64));
+        }
+        if let Some(w3c) = w3c_ctx.as_ref() {
+            if let Some(uid) = w3c.tracestate_value("opencode_user_id") {
+                g.set_attribute("boom-gateway.user.id", SpanAttributeValue::String(uid));
+            }
+        }
+    }
+
+    // Gateway-internal + deployment custom + client-whitelisted headers.
+    openai_req.gateway_headers = compose_gateway_headers(
+        &headers,
+        &inner.config.router_settings.forward_client_headers,
+        provider.custom_headers(),
+        is_vip,
+        inner.config.router_settings.enable_priority_header,
+        "/v1/responses",
+        provider.client_type_header(),
+    );
+    if let Some(w3c) = w3c_ctx.as_ref() {
+        if let Some(g) = trace_guard.as_ref() {
+            let child_tp = boom_trace::build_child_traceparent(
+                w3c.trace_id,
+                g.child_parent_span_id(),
+                w3c.sampled,
+            );
+            insert_header_ci(&mut openai_req.gateway_headers, "traceparent", child_tp);
+            if !w3c.trace_state.is_empty() {
+                insert_header_ci(&mut openai_req.gateway_headers, "tracestate", w3c.trace_state.clone());
+            }
+        } else if trace_cfg.propagate_only {
+            if let Some(raw) = headers.get("traceparent").and_then(|v| v.to_str().ok()) {
+                insert_header_ci(&mut openai_req.gateway_headers, "traceparent", raw.to_string());
+            }
+            if let Some(raw) = headers.get("tracestate").and_then(|v| v.to_str().ok()) {
+                insert_header_ci(&mut openai_req.gateway_headers, "tracestate", raw.to_string());
+            }
+        }
+    }
+
+    let debug_req_body = if state.debug_store.is_enabled() {
+        serde_json::to_string(&req).ok()
+    } else {
+        None
+    };
+    openai_req.raw_capture = prompt_log_raw_capture.clone();
+
+    // P2 native passthrough (Response.md §6.9): a `protocol: responses`
+    // deployment receives the ORIGINAL Responses body (gateway-side fields
+    // stripped, rehydrated history inlined) via the side channel; the chat
+    // conversion above still drove routing/limits/audit. Chat requests to
+    // this deployment are unaffected — they carry no passthrough body.
+    if true {
+        // Strict chat-expressibility check, POST-routing (R2): a conversion
+        // deployment must reject native-only tools/items; a passthrough
+        // deployment skips this so they reach the upstream natively. The
+        // lenient conversion above already dropped them from the chat view.
+        boom_core::responses::validate_conversion_supported(&effective_req).map_err(|e| {
+            log_error(&state, &identity, &req.model, "/v1/responses", req.stream.unwrap_or(false), start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()), user_tag.clone());
+            ResponsesErrorReply(e)
+        })?;
+    }
+
+
+    // 4. Route to provider.
+    if is_stream {
+        let stream = match provider.chat_stream(openai_req).await {
+            Ok(s) => s,
+            Err(e) => {
+                log_error(&state, &identity, &model, "/v1/responses", true, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()), user_tag.clone());
+                write_prompt_log_error(
+                    &state,
+                    prompt_log_should,
+                    prompt_log_req_body.as_ref(),
+                    prompt_log_trace_id.clone(),
+                    &request_id,
+                    &identity,
+                    &model,
+                    "/v1/responses",
+                    true,
+                    &client_ip,
+                    prompt_log_headers.as_ref(),
+                    &e,
+                    None,
+                    prompt_log_raw_capture.as_ref(),
+                    start,
+                    trace_guard.as_mut(),
+                );
+                crate::health_monitor::record_request_failure(&state, &deployment_id, &e);
+                // plan_charge drops here without commit — no quota consumed.
+                // response.created was already promised on the wire (Response.md
+                // §6.5 rule 2), so the failure is delivered in-stream.
+                return Ok(responses_failed_sse_response(&model, &response_id, created_at, &e));
+            }
+        };
+        let _decision = plan_charge.commit();
+        crate::health_monitor::reset_request_failure(&state, &deployment_id);
+        let usage = UsageTracker::default();
+        let sse_stream = sse_stream_from_responses_chat_stream(
+            stream, model.clone(), response_id.clone(), created_at, usage.clone(),
+            persist_ctx, state.response_store.clone(), custom_tool_names,
+        );
+        let inflight_guard = if let Some(ref did) = deployment_id {
+            InFlightGuard::new_for_deployment(state.inflight.clone(), &inflight_model, did, input_chars as u64)
+        } else {
+            InFlightGuard::new(state.inflight.clone(), &inflight_model, input_chars as u64)
+        };
+        let tracked = InFlightStream::new(sse_stream, inflight_guard);
+        let flow_controlled = match fc_guard {
+            Some(g) => FlowControlledStream::new(tracked, g),
+            None => FlowControlledStream::passthrough(tracked),
+        };
+        let guarded = GuardedStream::new(flow_controlled, plan_charge.take_concurrency_guard());
+
+        state.agent_stats.record("/v1/responses");
+        if let Some(ref did) = deployment_id {
+            state.request_rate.record(did, &inflight_model);
+        }
+
+        let logged = LoggedStream::new(guarded, state.log_writer.clone(), RequestLog {
+            request_id: Some(request_id),
+            key_hash: identity.key_hash.clone(),
+            key_name: identity.key_name.clone(),
+            key_alias: identity.key_alias.clone(),
+            team_id: identity.team_id.clone(),
+            model,
+            model_name: Some(inflight_model.clone()),
+            api_path: "/v1/responses".to_string(),
+            is_stream: true,
+            status_code: 200,
+            error_type: None,
+            error_message: None,
+            input_tokens: None,
+            output_tokens: None,
+            duration_ms: None, // filled by LoggedStream::drop
+            ttft_ms: None,
+            deployment_id,
+            client_ip: Some(client_ip.clone()),
+            cached_tokens: None,
+            schedule_policy: schedule_policy.clone(),
+            kv_hit_blocks,
+            kv_input_blocks,
+            trie_blocks,
+            trie_max_blocks,
+            request_tokens: request_bytes,
+            queue_wait_ms,
+            user_tag: user_tag.clone(),
+        }, start, usage, Some(state.agent_stats.clone()))
+        .with_plan_charge(plan_charge);
+        let logged = match trace_guard.take() {
+            Some(g) => logged.with_trace_guard(g),
+            None => logged,
+        };
+
+        if let Some(sender) = prompt_log_sender {
+            if let Some(req_body) = prompt_log_req_body {
+                let prompt_entry = PromptLogEntry::new_request(
+                    prompt_log_rid.as_deref().unwrap_or_default(),
+                    prompt_log_trace_id.clone(),
+                    &identity.key_hash,
+                    identity.key_alias.as_deref(),
+                    identity.team_alias.as_deref(),
+                    prompt_log_model.as_deref().unwrap_or_default(),
+                    "/v1/responses",
+                    true,
+                    req_body,
+                    Some(&client_ip.as_str()),
+                    prompt_log_headers.clone(),
+                );
+                let _ = sender.send(prompt_entry.clone());
+                let mut prompt_logged = PromptLogStream::new(logged, sender, prompt_entry, sse_responses_extractor());
+                if let Some(cap) = prompt_log_raw_capture.clone() {
+                    prompt_logged = prompt_logged.with_entry_enricher(Arc::new(move |entry| {
+                        entry.set_raw_exchange(cap.take_request_body(), cap.take_response_body());
+                    }));
+                }
+                let response = Sse::new(sse_item_to_event(prompt_logged)).keep_alive(KeepAlive::default());
+                return Ok(response.into_response());
+            }
+        }
+        let response = Sse::new(sse_item_to_event(logged)).keep_alive(KeepAlive::default());
+        Ok(response.into_response())
+    } else {
+        let _inflight = if let Some(ref did) = deployment_id {
+            InFlightGuard::new_for_deployment(state.inflight.clone(), &inflight_model, did, input_chars as u64)
+        } else {
+            InFlightGuard::new(state.inflight.clone(), &inflight_model, input_chars as u64)
+        };
+        let mut response = match provider.chat(openai_req).await {
+            Ok(r) => r,
+            Err(e) => {
+                log_error(&state, &identity, &model, "/v1/responses", false, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()), user_tag.clone());
+                write_prompt_log_error(
+                    &state,
+                    prompt_log_should,
+                    prompt_log_req_body.as_ref(),
+                    prompt_log_trace_id.clone(),
+                    &request_id,
+                    &identity,
+                    &model,
+                    "/v1/responses",
+                    false,
+                    &client_ip,
+                    prompt_log_headers.as_ref(),
+                    &e,
+                    None,
+                    prompt_log_raw_capture.as_ref(),
+                    start,
+                    trace_guard.as_mut(),
+                );
+                crate::health_monitor::record_request_failure(&state, &deployment_id, &e);
+                return Err(ResponsesErrorReply(e));
+            }
+        };
+        let _decision = plan_charge.commit();
+        drop(plan_charge.take_concurrency_guard());
+        crate::health_monitor::reset_request_failure(&state, &deployment_id);
+
+        let duration_ms = start.elapsed().as_millis() as i32;
+        let usage = response.usage.as_ref();
+        let input_tokens = usage.map(|u| u.prompt_tokens as i32);
+        let output_tokens = usage.map(|u| u.completion_tokens as i32);
+        let provider_cached = usage
+            .and_then(|u| u.prompt_tokens_details.as_ref())
+            .and_then(|d| d.cached_tokens);
+        plan_charge.settle(
+            input_tokens.unwrap_or(0) as u64,
+            provider_cached.unwrap_or(0).max(0) as u64,
+            output_tokens.unwrap_or(0) as u64,
+            None,
+        );
+        let cached_tokens = provider_cached.map(|c| c as i64);
+
+        state.agent_stats.record("/v1/responses");
+        if let Some(ref did) = deployment_id {
+            state.request_rate.record(did, &inflight_model);
+        }
+
+        log_request(
+            state.log_writer.as_deref(),
+            RequestLog {
+                request_id: Some(request_id),
+                key_hash: identity.key_hash.clone(),
+                key_name: identity.key_name.clone(),
+                key_alias: identity.key_alias.clone(),
+                team_id: identity.team_id.clone(),
+                model: model.clone(),
+                model_name: Some(inflight_model.clone()),
+                api_path: "/v1/responses".to_string(),
+                is_stream: false,
+                status_code: 200,
+                error_type: None,
+                error_message: None,
+                input_tokens,
+                output_tokens,
+                duration_ms: Some(duration_ms),
+                ttft_ms: None,
+                deployment_id,
+                client_ip: Some(client_ip.clone()),
+                cached_tokens,
+                schedule_policy: schedule_policy.clone(),
+                kv_hit_blocks,
+                kv_input_blocks,
+                trie_blocks,
+                trie_max_blocks,
+                request_tokens: request_bytes,
+                queue_wait_ms,
+                user_tag: user_tag.clone(),
+            },
+        );
+        state.agent_stats.record_tokens(
+            "/v1/responses",
+            input_tokens.unwrap_or(0) as u64,
+            output_tokens.unwrap_or(0) as u64,
+        );
+
+        // Conversion path returns our typed ResponseObject.
+        let responses_value: serde_json::Value = serde_json::to_value(
+            &openai_chat_to_responses_with_custom_tools(
+                &response, &model, &response_id, created_at, &custom_tool_names,
+            ),
+        )
+        .unwrap_or(serde_json::Value::Null);
+
+        // P1 persist (non-stream): awaited on purpose — the OpenAI contract
+        // makes the id retrievable/continuable as soon as POST returns.
+        if let Some(ctx) = persist_ctx {
+            let status = responses_value["status"].as_str().unwrap_or_default().to_string();
+            if status == "completed" || status == "incomplete" {
+                let turn = ctx.into_turn(
+                    &status,
+                    responses_value["output"].as_array().cloned().unwrap_or_default(),
+                    responses_value.clone(),
+                );
+                if let Err(e) = state.response_store.persist_turn(turn).await {
+                    tracing::warn!("responses store persist failed: {e}");
+                }
+            }
+        }
+
+        Ok(Json(responses_value).into_response())
+    }
+}
+
+/// Convert an OpenAI stream into Responses SSE events via the transcoder +
+/// channel. Sends response.created/in_progress first (the wire contract
+/// promises them before any upstream token), then one event batch per chunk;
+/// upstream errors become in-stream response.failed; the stream always ends
+/// on a terminal event with no `[DONE]` sentinel.
+///
+/// P1: after the terminal event the completed turn is checkpointed (the
+/// transcoder owns the final output items). A client disconnect before the
+/// terminal event returns early — a cancelled generation is not persisted.
+fn sse_stream_from_responses_chat_stream(
+    stream: ChatStream,
+    model: String,
+    response_id: String,
+    created_at: u64,
+    usage: UsageTracker,
+    persist: Option<ResponsesPersistCtx>,
+    store: Arc<boom_responses::ResponseStore>,
+    custom_tools: std::collections::HashSet<String>,
+) -> impl futures::Stream<Item = Result<SseItem, Infallible>> {
+    let (tx, rx) = tokio::sync::mpsc::channel::<SseItem>(64);
+
+    tokio::spawn(async move {
+        let mut transcoder = ResponsesStreamTranscoder::new(&model, &response_id, created_at);
+        let mut stream = std::pin::pin!(stream);
+
+        for ev in transcoder.begin() {
+            let item = SseItem {
+                event: Event::default().event(&ev.event).data(&ev.data),
+                json_data: ev.data,
+            };
+            if tx.send(item).await.is_err() {
+                return;
+            }
+        }
+
+        while let Some(result) = stream.next().await {
+            match result {
+                Ok(chunk) => {
+                    if let Some(ref u) = chunk.usage {
+                        if let Ok(mut g) = usage.lock() {
+                            g.prompt_tokens = u.prompt_tokens;
+                            g.completion_tokens = u.completion_tokens;
+                            g.cached_tokens = u
+                                .prompt_tokens_details
+                                .as_ref()
+                                .and_then(|d| d.cached_tokens)
+                                .map(|c| c as i32);
+                        }
+                    }
+                    for ev in transcoder.transcode(&chunk) {
+                        let item = SseItem {
+                            event: Event::default().event(&ev.event).data(&ev.data),
+                            json_data: ev.data,
+                        };
+                        if tx.send(item).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("SSE stream error (Responses): {}", e);
+                    for ev in transcoder.fail(&e) {
+                        let item = SseItem {
+                            event: Event::default().event(&ev.event).data(&ev.data),
+                            json_data: ev.data,
+                        };
+                        let _ = tx.send(item).await;
+                    }
+                    return;
+                }
+            }
+        }
+
+        for ev in transcoder.drain() {
+            let item = SseItem {
+                event: Event::default().event(&ev.event).data(&ev.data),
+                json_data: ev.data,
+            };
+            if tx.send(item).await.is_err() {
+                return;
+            }
+        }
+
+        // Terminal event sent — checkpoint the turn (completed/incomplete only).
+        if let (Some(ctx), Some(final_obj)) = (persist, transcoder.final_response_object()) {
+            let status = final_obj["status"].as_str().unwrap_or_default().to_string();
+            if status == "completed" || status == "incomplete" {
+                let output_items = final_obj["output"].as_array().cloned().unwrap_or_default();
+                let turn = ctx.into_turn(&status, output_items, final_obj.clone());
+                if let Err(e) = store.persist_turn(turn).await {
+                    tracing::warn!("responses store persist failed (stream): {e}");
+                }
+            }
+        }
+    });
+
+    tokio_stream::wrappers::ReceiverStream::new(rx).map(Ok)
+}
+
+/// Full SSE body for "created already promised, upstream call failed": an
+/// in-stream response.failed per Response.md §6.5 rule 2. HTTP 200 — the SSE
+/// stream has started, so the failure must not surface as a late HTTP error.
+fn responses_failed_sse_response(
+    model: &str,
+    response_id: &str,
+    created_at: u64,
+    e: &GatewayError,
+) -> axum::response::Response {
+    let mut transcoder = ResponsesStreamTranscoder::new(model, response_id, created_at);
+    let mut body = String::new();
+    for ev in transcoder.begin().into_iter().chain(transcoder.fail(e)) {
+        body.push_str(&format!("event: {}\ndata: {}\n\n", ev.event, ev.data));
+    }
+    let mut response = body.into_response();
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        "text/event-stream".parse().unwrap(),
+    );
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        "no-cache".parse().unwrap(),
+    );
+    response
+}
+
+// ============================================================
+// Responses Error Response (OpenAI error shape)
+// ============================================================
+
+pub struct ResponsesErrorReply(pub GatewayError);
+
+impl IntoResponse for ResponsesErrorReply {
+    fn into_response(self) -> axum::response::Response {
+        let status = axum::http::StatusCode::from_u16(self.0.status_code())
+            .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        let body = openai_error_body(&self.0);
+        let mut response = (status, Json(body)).into_response();
+        if let GatewayError::RateLimitExceeded {
+            retry_after_secs: Some(secs),
+            ..
+        } = self.0
+        {
+            response.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                secs.to_string().parse().unwrap(),
+            );
+        }
+        response
+    }
+}
+
+impl From<GatewayError> for ResponsesErrorReply {
+    fn from(e: GatewayError) -> Self {
+        ResponsesErrorReply(e)
+    }
+}
+
+// ============================================================
+// Responses P1: persistence context + retrieval
+// ============================================================
+
+/// Everything needed to checkpoint one completed turn. Assembled at handler
+/// start (when the store is enabled and `store != false`), consumed at
+/// completion: non-stream after the response is built, stream after the
+/// terminal event (the transcoder owns the final output items).
+struct ResponsesPersistCtx {
+    response_id: String,
+    previous_response_id: Option<String>,
+    key_hash: String,
+    model: String,
+    instructions: Option<String>,
+    tools: Option<Vec<serde_json::Value>>,
+    /// Rehydrated prior-turn items (empty without previous_response_id).
+    history_items: Vec<serde_json::Value>,
+    /// The current turn's input items (normalized Responses shape).
+    input_items: Vec<serde_json::Value>,
+    ttl_secs: u64,
+    max_history_items: usize,
+}
+
+impl ResponsesPersistCtx {
+    /// Next-turn checkpoint = prior history ‖ current input ‖ current output.
+    fn into_turn(
+        self,
+        status: &str,
+        output_items: Vec<serde_json::Value>,
+        response_json: serde_json::Value,
+    ) -> boom_responses::PersistTurn {
+        let mut items = self.history_items;
+        items.extend(self.input_items);
+        items.extend(output_items);
+        boom_responses::PersistTurn {
+            response_id: self.response_id,
+            previous_response_id: self.previous_response_id,
+            key_hash: self.key_hash,
+            model: self.model,
+            instructions: self.instructions,
+            tools: self.tools,
+            items,
+            status: status.to_string(),
+            response_json,
+            ttl_secs: self.ttl_secs,
+            max_history_items: self.max_history_items,
+        }
+    }
+}
+
+/// GET /v1/responses/{id} — retrieve a stored response. Scoped to the
+/// requesting key: missing, expired, `store:false`, and cross-key ids are one
+/// uniform 404 (no existence leak). Store disabled → also 404.
+pub async fn get_response(
+    State(state): State<AppState>,
+    auth: RequiredAuth,
+    axum::extract::Path(response_id): axum::extract::Path<String>,
+) -> Result<axum::response::Response, ResponsesErrorReply> {
+    let identity = auth.identity();
+    match state.response_store.get(&response_id, &identity.key_hash).await {
+        Ok(Some(json)) => Ok(Json(json).into_response()),
+        Ok(None) => Err(ResponsesErrorReply(GatewayError::ResponseNotFound(response_id))),
+        Err(e) => Err(ResponsesErrorReply(GatewayError::InternalError(format!(
+            "response store: {e}"
+        )))),
+    }
+}
+
+/// Prompt-log extractor for Responses SSE events: captures text deltas (and
+/// tool-call argument deltas as content) from the event stream.
+fn sse_responses_extractor() -> impl FnMut(&Result<SseItem, Infallible>) -> Option<boom_promptlog::ChunkDelta> + Unpin {
+    use boom_promptlog::ChunkDelta;
+    move |item: &Result<SseItem, Infallible>| match item {
+        Ok(sse_item) => {
+            let raw = sse_item.json_data.as_str();
+            if raw.is_empty() || raw == "[DONE]" {
+                return None;
+            }
+            let v: serde_json::Value = match serde_json::from_str(raw) {
+                Ok(v) => v,
+                Err(_) => return None,
+            };
+            match v.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+                "response.output_text.delta" => Some(ChunkDelta {
+                    content: v.get("delta").and_then(|d| d.as_str()).map(String::from),
+                    finish_reason: None,
+                    usage: None,
+                }),
+                "response.function_call_arguments.delta" => Some(ChunkDelta {
+                    content: v.get("delta").and_then(|d| d.as_str()).map(String::from),
+                    finish_reason: None,
+                    usage: None,
+                }),
+                "response.completed" | "response.incomplete" => {
+                    let usage = v
+                        .pointer("/response/usage")
+                        .cloned()
+                        .filter(|u| !u.is_null());
+                    Some(ChunkDelta { content: None, finish_reason: None, usage })
+                }
+                _ => None,
+            }
+        }
+        Err(_) => None,
     }
 }
 

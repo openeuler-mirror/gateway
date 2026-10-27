@@ -1,0 +1,25 @@
+[package]
+name = "responses-agent"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal Responses API (/v1/responses) test agent for Boom Gateway. Independent project, like misc/LB — not part of the gateway workspace."
+license = "Apache-2.0"
+
+# Isolate from the gateway root workspace (same pattern as misc/LB).
+[workspace]
+
+[[bin]]
+name = "agent"
+path = "src/main.rs"
+
+[[bin]]
+name = "mock-upstream"
+path = "src/bin/mock_upstream.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures-util = "0.3"
+tiny_http = "0.12"

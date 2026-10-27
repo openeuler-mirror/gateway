@@ -547,6 +547,33 @@ pub struct GeneralSettings {
     /// instead.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub public_models: Vec<String>,
+    /// Response store for `/v1/responses` stateful continuation
+    /// (`previous_response_id`). None ≡ defaults (enabled, 30-day TTL).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub responses_store: Option<ResponsesStoreSettings>,
+}
+
+/// Response store tunables.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResponsesStoreSettings {
+    #[serde(default = "default_responses_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_responses_ttl_secs")]
+    pub ttl_secs: u64,
+    #[serde(default = "default_responses_max_history_items")]
+    pub max_history_items: usize,
+}
+fn default_responses_enabled() -> bool { true }
+fn default_responses_ttl_secs() -> u64 { 2_592_000 }
+fn default_responses_max_history_items() -> usize { 1000 }
+impl Default for ResponsesStoreSettings {
+    fn default() -> Self {
+        Self {
+            enabled: default_responses_enabled(),
+            ttl_secs: default_responses_ttl_secs(),
+            max_history_items: default_responses_max_history_items(),
+        }
+    }
 }
 
 impl Default for GeneralSettings {
@@ -557,6 +584,7 @@ impl Default for GeneralSettings {
             _legacy_store_model_in_db: false,
             user_tag_header: None,
             public_models: Vec::new(),
+            responses_store: None,
         }
     }
 }

@@ -4467,6 +4467,7 @@
       { group: "routing", section: "routing-router",      label: t("config.section.router_settings"),       icon: "router",        html: renderCardRouter(cfg.router_settings || {}) },
       { group: "routing", section: "routing-cost",        label: t("config.section.cost_templates"),        icon: "cost",          html: renderCardCostTemplates(cfg.cost_templates || []) },
       { group: "routing", section: "routing-model-list",  label: t("config.section.model_list"),            icon: "model-list",    html: renderCardModelList(cfg.model_list || []) },
+      { group: "routing", section: "routing-responses",  label: t("config.section.responses"),              icon: "trace",         html: renderCardResponses(cfg.general_settings || {}) },
     ];
     const groupLabels = {
       runtime: t("config.group.runtime"),
@@ -4640,6 +4641,23 @@
       </div>
       <div class="form-card-actions">
         <button class="btn-primary btn-small" data-save="health_check">${t("action.save")}</button>
+      </div>
+    </div>`;
+  }
+
+  function renderCardResponses(g) {
+    // general_settings.responses_store (Response.md §6.8): persisted
+    // continuation for /v1/responses. Absent block ≡ defaults.
+    const rs = (g.responses_store = g.responses_store || {});
+    return `<div class="form-card" data-section="responses_store">
+      <div class="form-card-title">${t("config.section.responses")}</div>
+      <div class="form-card-grid">
+        ${fieldCheckbox("cfg-resp-enabled", t("responses.enabled"), rs.enabled !== false, { tip: t("tip.responses.enabled") })}
+        ${fieldNum("cfg-resp-ttl", t("responses.ttl"), rs.ttl_secs ?? 2592000, { min: 60, tip: t("tip.responses.ttl") })}
+        ${fieldNum("cfg-resp-max-items", t("responses.max_items"), rs.max_history_items ?? 1000, { min: 1, tip: t("tip.responses.max_items") })}
+      </div>
+      <div class="form-card-actions">
+        <button class="btn-primary btn-small" data-save="responses">${t("action.save")}</button>
       </div>
     </div>`;
   }
@@ -5174,6 +5192,14 @@
           ["router_settings.strip_claude_code_attribution", $("cfg-gen-strip-cc").checked],
           ["router_settings.forward_client_headers", parseListInput($("cfg-gen-forward-hdrs"))],
           ["general_settings.user_tag_header", $("cfg-gen-user-tag-hdr").value.trim() || null],
+        ]);
+      } else if (kind === "responses") {
+        await saveConfigSections([
+          ["general_settings.responses_store", {
+            enabled: document.getElementById("cfg-resp-enabled").checked,
+            ttl_secs: numOr(document.getElementById("cfg-resp-ttl"), 2592000),
+            max_history_items: numOr(document.getElementById("cfg-resp-max-items"), 1000),
+          }],
         ]);
       } else if (kind === "rate_limit") {
         const tpmRaw = $("cfg-rl-default-tpm").value;

@@ -8,6 +8,7 @@ pub mod kv_event;
 pub mod normalize;
 pub mod otlp_config;
 pub mod provider;
+pub mod responses;
 pub mod stressmon;
 pub mod trace;
 pub mod types;

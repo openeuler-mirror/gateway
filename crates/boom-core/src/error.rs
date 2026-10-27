@@ -84,6 +84,11 @@ pub enum GatewayError {
     #[error("Unsupported mode: {0}")]
     UnsupportedMode(String),
 
+    /// Stored response not found — nonexistent id, expired, `store:false`, or
+    /// owned by a different key (uniform 404: no existence leak, Response.md §6.7).
+    #[error("Response not found: {0}")]
+    ResponseNotFound(String),
+
     #[error("Flow control queue timeout: {message}")]
     FlowControlQueueTimeout {
         deployment_id: String,
@@ -112,6 +117,7 @@ impl GatewayError {
             Self::UpstreamTimeout => 504,
             Self::UpstreamError { .. } => 502,
             Self::NotSupported(_) => 404,
+            Self::ResponseNotFound(_) => 404,
             Self::UnsupportedMode(_) => 400,
             Self::FlowControlQueueTimeout { .. } => 503,
             Self::InternalError(_) => 500,
@@ -182,6 +188,7 @@ impl GatewayError {
             Self::UpstreamTimeout => "timeout",
             Self::UpstreamError { .. } => "upstream_error",
             Self::NotSupported(_) => "not_supported",
+            Self::ResponseNotFound(_) => "response_not_found",
             Self::UnsupportedMode(_) => "unsupported_mode_error",
             Self::ProviderError(_) => "provider_error",
             Self::UpstreamParseError { .. } => "upstream_parse_error",
@@ -293,6 +300,14 @@ mod tests {
         }
     }
 }
+
+    #[test]
+    fn response_not_found_mappings() {
+        let e = GatewayError::ResponseNotFound("resp_x".into());
+        assert_eq!(e.status_code(), 404);
+        assert_eq!(e.error_type(), "response_not_found");
+        assert!(e.should_log_to_db());
+    }
 
     #[test]
     fn client_blocked_mappings() {
