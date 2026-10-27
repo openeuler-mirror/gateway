@@ -155,6 +155,17 @@ impl ResponseStore {
             items.drain(..drop);
         }
 
+        // (response_id, id) pkey guard: the assembled turn can carry the
+        // same item id twice — clients echo prior-turn items in `input`
+        // alongside `previous_response_id`, or repeat an id within the
+        // input itself. Keep the first occurrence (history order; later
+        // copies are the same item by id).
+        let mut seen_ids = std::collections::HashSet::new();
+        items.retain(|item| {
+            let id = item.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+            id.is_empty() || seen_ids.insert(id.to_string())
+        });
+
         let mut history_ids: Vec<Value> = Vec::with_capacity(items.len());
         for item in &mut items {
             if item.get("id").and_then(|v| v.as_str()).unwrap_or_default().is_empty() {
@@ -321,6 +332,34 @@ mod tests {
 
         let got = store.get(&id, "key-a").await.unwrap().unwrap();
         assert_eq!(got["id"], json!(id));
+    }
+
+    /// The assembled turn may carry an item id twice (client echoes
+    /// prior-turn items in `input` alongside `previous_response_id`, or
+    /// repeats an id within the input) — the (response_id, id) pkey used
+    /// to abort the whole persist with a duplicate-key error. The store
+    /// must dedupe, keeping the first occurrence.
+    #[tokio::test]
+    async fn duplicate_item_ids_within_turn_dedupe_to_one() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("skipping (no BOOM_RESPONSES_TEST_DATABASE_URL)");
+            return;
+        };
+        let store = ResponseStore::new(Some(pool));
+        let id = format!("resp_test_{}", uuid::Uuid::new_v4().simple());
+        store
+            .persist_turn(turn(&id, "key-dup", vec![
+                json!({ "type": "message", "id": "m1", "role": "user", "content": "q" }),
+                json!({ "type": "message", "id": "m1", "role": "user", "content": "q" }),
+                json!({ "type": "message", "role": "assistant", "content": "a" }),
+            ]))
+            .await
+            .unwrap();
+
+        let hydrated = store.rehydrate(&id, "key-dup").await.unwrap();
+        let m1_count = hydrated.items.iter().filter(|i| i["id"] == "m1").count();
+        assert_eq!(m1_count, 1, "duplicate id must be stored exactly once");
+        assert_eq!(hydrated.items.len(), 2);
     }
 
     #[tokio::test]
