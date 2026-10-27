@@ -4219,8 +4219,23 @@ pub async fn responses(
                 crate::health_monitor::record_request_failure(&state, &deployment_id, &e);
                 // plan_charge drops here without commit — no quota consumed.
                 // response.created was already promised on the wire (Response.md
-                // §6.5 rule 2), so the failure is delivered in-stream.
-                return Ok(responses_failed_sse_response(&model, &response_id, created_at, &e));
+                // §6.5 rule 2), so the failure is delivered in-stream. The
+                // failed turn is STILL checkpointed — the client chains on the
+                // id carried by response.failed (real-LLM chain-break trap:
+                // an unpersisted id makes the next previous_response_id 404).
+                let (failed_resp, final_obj) =
+                    responses_failed_sse(&model, &response_id, created_at, &e);
+                if let Some(ctx) = persist_ctx {
+                    let turn = ctx.into_turn("failed", Vec::new(), final_obj);
+                    if let Err(persist_err) = state.response_store.persist_turn(turn).await {
+                        tracing::warn!(
+                            response_id = %response_id,
+                            error = %persist_err,
+                            "responses store persist failed (failed turn) — next previous_response_id will 404"
+                        );
+                    }
+                }
+                return Ok(failed_resp);
             }
         };
         let _decision = plan_charge.commit();
@@ -4553,14 +4568,23 @@ fn sse_stream_from_responses_chat_stream(
             }
         }
 
-        // Terminal event sent — checkpoint the turn (completed/incomplete only).
+        // Terminal event sent — checkpoint the turn. Failed turns are
+        // checkpointed too: the client was handed this round's id in the
+        // response.failed event, so the id MUST stay resolvable — otherwise
+        // the next previous_response_id 404s with an id the gateway itself
+        // returned (the real-LLM chain-break trap).
         if let (Some(ctx), Some(final_obj)) = (persist, transcoder.final_response_object()) {
             let status = final_obj["status"].as_str().unwrap_or_default().to_string();
-            if status == "completed" || status == "incomplete" {
+            if status == "completed" || status == "incomplete" || status == "failed" {
+                let response_id = ctx.response_id.clone();
                 let output_items = final_obj["output"].as_array().cloned().unwrap_or_default();
                 let turn = ctx.into_turn(&status, output_items, final_obj.clone());
                 if let Err(e) = store.persist_turn(turn).await {
-                    tracing::warn!("responses store persist failed (stream): {e}");
+                    tracing::warn!(
+                        response_id = %response_id,
+                        error = %e,
+                        "responses store persist failed (stream) — next previous_response_id will 404"
+                    );
                 }
             }
         }
@@ -4572,17 +4596,23 @@ fn sse_stream_from_responses_chat_stream(
 /// Full SSE body for "created already promised, upstream call failed": an
 /// in-stream response.failed per Response.md §6.5 rule 2. HTTP 200 — the SSE
 /// stream has started, so the failure must not surface as a late HTTP error.
-fn responses_failed_sse_response(
+/// Also returns the final failed Response object so the caller can checkpoint
+/// the turn (the client chains on this id).
+fn responses_failed_sse(
     model: &str,
     response_id: &str,
     created_at: u64,
     e: &GatewayError,
-) -> axum::response::Response {
+) -> (axum::response::Response, serde_json::Value) {
     let mut transcoder = ResponsesStreamTranscoder::new(model, response_id, created_at);
     let mut body = String::new();
     for ev in transcoder.begin().into_iter().chain(transcoder.fail(e)) {
         body.push_str(&format!("event: {}\ndata: {}\n\n", ev.event, ev.data));
     }
+    let final_obj = transcoder
+        .final_response_object()
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({ "id": response_id, "status": "failed" }));
     let mut response = body.into_response();
     response.headers_mut().insert(
         axum::http::header::CONTENT_TYPE,
@@ -4592,7 +4622,7 @@ fn responses_failed_sse_response(
         axum::http::header::CACHE_CONTROL,
         "no-cache".parse().unwrap(),
     );
-    response
+    (response, final_obj)
 }
 
 // ============================================================
