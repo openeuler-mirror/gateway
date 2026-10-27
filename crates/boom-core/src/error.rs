@@ -145,10 +145,13 @@ impl GatewayError {
     /// clients hitting the same wall retry repeatedly, so logging every
     /// attempt produces log spam and DB bloat without adding signal.
     ///
-    /// `AuthError` (401) is NOT here: failed auth is a security signal we
-    /// want in full. `UpstreamError` / `ProviderError` / `ConfigError` /
-    /// `InternalError` are not here either — they reflect per-request
-    /// upstream behavior, not repeated client rejections.
+    /// Also covers `AuthError` / `UpstreamError` / `ProviderError` /
+    /// `UpstreamTimeout`: all four can fire at full request QPS (upstream
+    /// outage, credential brute-force), so they are sampled at one record
+    /// per (type, key, model) per 60s window. Trade-off: `boom_request_log`
+    /// is the only per-request record for these classes, so error-rate
+    /// dashboards and auth-failure density become sampled. The client still
+    /// receives every error response — only logging is suppressed.
     pub fn should_dedup_log(&self) -> bool {
         matches!(
             self,
@@ -160,6 +163,10 @@ impl GatewayError {
                 | Self::ModelNotAllowed(_)
                 | Self::KeyExpired
                 | Self::KeyBlocked
+                | Self::AuthError(_)
+                | Self::UpstreamError { .. }
+                | Self::ProviderError(_)
+                | Self::UpstreamTimeout
         )
     }
 
@@ -243,7 +250,7 @@ mod tests {
 
     #[test]
     fn should_dedup_log_membership() {
-        // Dedup members — repeated client rejections.
+        // Dedup members — repeated client rejections + sampled upstream/auth failures.
         assert!(rl().should_dedup_log());
         assert!(cc().should_dedup_log());
         assert!(GatewayError::BudgetExceeded.should_dedup_log());
@@ -252,18 +259,18 @@ mod tests {
         assert!(GatewayError::ModelNotAllowed("gpt-x".into()).should_dedup_log());
         assert!(GatewayError::KeyExpired.should_dedup_log());
         assert!(GatewayError::KeyBlocked.should_dedup_log());
+        assert!(GatewayError::AuthError("bad key".into()).should_dedup_log());
+        assert!(GatewayError::ProviderError("upstream".into()).should_dedup_log());
+        assert!(GatewayError::UpstreamTimeout.should_dedup_log());
+        assert!(GatewayError::UpstreamError { status: 500, message: "x".into() }.should_dedup_log());
 
         // Non-members — keep full per-request logging.
-        assert!(!GatewayError::AuthError("bad key".into()).should_dedup_log());
         assert!(!GatewayError::ClientBlocked {
             status: 403,
             message: "banned".into(),
             code: "client_blocked".into()
         }
         .should_dedup_log());
-        assert!(!GatewayError::ProviderError("upstream".into()).should_dedup_log());
-        assert!(!GatewayError::UpstreamTimeout.should_dedup_log());
-        assert!(!GatewayError::UpstreamError { status: 500, message: "x".into() }.should_dedup_log());
         assert!(!GatewayError::ConfigError("cfg".into()).should_dedup_log());
         assert!(!GatewayError::InternalError("boom".into()).should_dedup_log());
         assert!(!GatewayError::NotSupported("embeddings".into()).should_dedup_log());
@@ -290,6 +297,10 @@ mod tests {
             GatewayError::ModelNotAllowed("gpt-x".into()),
             GatewayError::KeyExpired,
             GatewayError::KeyBlocked,
+            GatewayError::AuthError("bad key".into()),
+            GatewayError::ProviderError("upstream".into()),
+            GatewayError::UpstreamTimeout,
+            GatewayError::UpstreamError { status: 500, message: "x".into() },
         ];
         for e in new_dedup {
             assert!(e.should_dedup_log(), "{:?} should be deduped", e);

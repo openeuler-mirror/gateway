@@ -20,9 +20,11 @@ const LOG_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 /// Per-batch INSERT timeout. 2000-row INSERT can take ~1s under load.
 const LOG_INSERT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Dedup cache for expected rejections (rate-limit, concurrency, budget).
+/// Dedup cache for log suppression (expected rejections, model/key access
+/// errors, upstream failures, auth failures).
 /// Key: "{error_type}:{key_hash}:{model}", auto-expires after 60 s.
-/// Within the window, only the first rejection per (type, key, model) is written to DB.
+/// Within the window, only the first error per (type, key, model) is written
+/// to DB and console; subsequent occurrences are silently dropped.
 static REJECTION_DEDUP: LazyLock<moka::sync::Cache<String, ()>> = LazyLock::new(|| {
     moka::sync::Cache::builder()
         .time_to_live(Duration::from_secs(60))
@@ -64,9 +66,10 @@ pub struct RequestLog {
     /// (ms). NULL on pass-through deployments (no slot configured) and
     /// on error paths that fire before acquire() returns.
     pub queue_wait_ms: Option<i32>,
-    /// "{header}:{value}" extracted from the configured
-    /// general_settings.user_tag_header — per-user attribution when one key
-    /// is shared by multiple users. NULL when unconfigured or absent.
+    /// Header values extracted from the configured
+    /// general_settings.user_tag_headers (up to 3, joined with ';') —
+    /// per-user attribution when one key is shared by multiple users.
+    /// NULL when unconfigured or absent.
     pub user_tag: Option<String>,
 }
 
@@ -403,11 +406,11 @@ pub fn log_error_with_queue_wait(
 ///
 /// Constructs a minimal identity keyed by `hash_token(raw_key)` — enough to
 /// populate `boom_request_log` (whose `key_hash` column is NOT NULL) and to
-/// drive `REJECTION_DEDUP` for `KeyExpired` / `KeyBlocked` / `BudgetExceeded`.
+/// drive `REJECTION_DEDUP` for `KeyExpired` / `KeyBlocked` / `AuthError`.
 ///
-/// `AuthError` (401) is **not** deduped — every auth failure is logged in
-/// full for security visibility. The `model` column is filled with the
-/// placeholder `"<auth>"` because the request hasn't been routed yet and
+/// `AuthError` (401) is deduped like the other members — one console + DB
+/// record per (type, key) per 60s window. The `model` column is filled with
+/// the placeholder `"<auth>"` because the request hasn't been routed yet and
 /// the real model is unknown.
 ///
 /// `raw_key` is the original key string the client sent (before any
@@ -460,18 +463,6 @@ pub fn log_auth_error(
         None,
     );
 
-    // AuthError (401) is not a dedup member, so log_error_with_usage does
-    // not emit a tracing line for it — emit one here so failed auth shows
-    // up in the console log unconditionally.
-    if matches!(error, GatewayError::AuthError(_)) {
-        tracing::warn!(
-            status_code = error.status_code(),
-            error_type = error.error_type(),
-            key_hash = %identity.key_hash,
-            "{:.80}",
-            error.to_string()
-        );
-    }
 }
 
 /// Error logging variant for composite providers that may have completed
