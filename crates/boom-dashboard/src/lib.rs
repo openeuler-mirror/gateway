@@ -172,6 +172,11 @@ pub fn build_router<S: Clone + Send + Sync + 'static>(state: DashboardState) -> 
             "/dashboard/api/admin/blocklist/enabled",
             put(handlers_admin::set_blocklist_enabled),
         )
+        // Admin — User tag attribution headers (DB-authoritative list).
+        .route(
+            "/dashboard/api/admin/user-tag-headers",
+            put(handlers_admin::set_user_tag_headers),
+        )
         // Admin — Request Logs.
         .route(
             "/dashboard/api/admin/logs",

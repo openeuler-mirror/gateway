@@ -791,6 +791,21 @@ pub async fn adopt_blocklist_enabled_db(
     Ok(())
 }
 
+/// DB-backed user_tag header list: read `boom_user_tag_config`, seeding the
+/// row from the YAML `general_settings.user_tag_headers` value on first
+/// contact (fresh DB). After that the row is authoritative — the YAML value
+/// only provides the initial seed.
+pub async fn adopt_user_tag_headers_db(
+    pool: &PgPool,
+    store: &boom_audit::UserTagStore,
+    config: &Config,
+) -> Result<(), sqlx::Error> {
+    store
+        .adopt_headers_db(pool, config.general_settings.user_tag_headers.clone())
+        .await?;
+    Ok(())
+}
+
 /// 防呆: warn when YAML still carries runtime-section content that is now
 /// inert (DB is the authority). Called on boot (when the DB already carried
 /// config) and on every reload in DB mode.
@@ -820,6 +835,14 @@ pub fn warn_inert_yaml_runtime_sections(config: &Config) {
             count = config.router_settings.model_group_alias.len(),
             "router_settings.model_group_alias in YAML is inert — aliases are managed in the DB via the Dashboard"
         );
+    }
+    if let Some(headers) = &config.general_settings.user_tag_headers {
+        if !headers.is_empty() {
+            tracing::warn!(
+                count = headers.len(),
+                "general_settings.user_tag_headers in YAML is inert — the header list is managed in the DB via the Dashboard"
+            );
+        }
     }
 }
 

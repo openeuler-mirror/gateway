@@ -149,7 +149,7 @@ impl FromRequestParts<AppState> for RequiredAuth {
         // every path, including auth failures (a 401 from a shared key
         // still shows which user sent it). No-op when user_tag_headers is
         // unconfigured.
-        let user_tag = extract_user_tag(&inner.config.general_settings, &parts.headers);
+        let user_tag = extract_user_tag(&state.user_tag_store.get(), &parts.headers);
 
         let mut new_model_opt: Option<String> = None;
         let effective_key = match hook_result.outcome {

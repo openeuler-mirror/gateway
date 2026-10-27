@@ -3,6 +3,12 @@ use dashmap::DashSet;
 use serde::Serialize;
 use sqlx::PgPool;
 
+/// Column list for the alias upsert INSERT. Kept as a named const so the
+/// manifest cross-check test (tests::alias_sql_columns_match_manifest_fields)
+/// checks the SAME string production code executes. See CLAUDE.md §9.
+const ALIAS_UPSERT_INSERT_SQL: &str = r#"INSERT INTO boom_model_alias (alias_name, target_model, hidden, source)
+                   VALUES ($1, $2, $3, 'db')"#;
+
 /// In-memory store for model aliases.
 /// Survives config reloads — updated incrementally via DB or YAML seed.
 #[derive(Debug)]
@@ -169,10 +175,7 @@ impl AliasStore {
             .bind(&input.alias_name)
             .bind(&input.target_model)
             .bind(input.hidden),
-            || sqlx::query(
-                r#"INSERT INTO boom_model_alias (alias_name, target_model, hidden, source)
-                   VALUES ($1, $2, $3, 'db')"#,
-            )
+            || sqlx::query(ALIAS_UPSERT_INSERT_SQL)
             .bind(&input.alias_name)
             .bind(&input.target_model)
             .bind(input.hidden)
@@ -243,5 +246,53 @@ impl AliasStore {
 impl Default for AliasStore {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Cross-crate half of the CLAUDE.md §9 single-source-of-truth contract:
+    /// the operator-facing `boom_model_alias` columns and
+    /// `boom_config::manifest::alias_fields()` must describe the same field
+    /// set. Bookkeeping columns (`source`, `updated_at`) are store-managed
+    /// and intentionally unregistered. The manifest side lives in
+    /// boom-config (leaf crate, cannot see this store); this test closes the
+    /// loop from the SQL side, in both directions:
+    /// - manifest field missing from SQL → the dashboard edits a column
+    ///   that never persists;
+    /// - SQL column missing from manifest → dead config, invisible on the
+    ///   dashboard.
+    #[test]
+    fn alias_sql_columns_match_manifest_fields() {
+        fn sql_tokens(sql: &str) -> std::collections::HashSet<&str> {
+            sql.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .collect()
+        }
+
+        let tokens = sql_tokens(ALIAS_UPSERT_INSERT_SQL);
+        let manifest_fields: Vec<&str> = boom_config::manifest::alias_fields()
+            .iter()
+            .map(|m| m.field)
+            .collect();
+        for f in &manifest_fields {
+            assert!(
+                tokens.contains(f),
+                "manifest alias field `{}` is not a boom_model_alias column — \
+                 either the manifest is wrong or the store SQL is missing it. \
+                 See CLAUDE.md §9.",
+                f
+            );
+        }
+        for col in ["alias_name", "target_model", "hidden"] {
+            assert!(
+                manifest_fields.contains(&col),
+                "boom_model_alias column `{}` is missing from \
+                 manifest::alias_fields() — it is dead config (invisible on \
+                 the dashboard). See CLAUDE.md §9.",
+                col
+            );
+        }
     }
 }

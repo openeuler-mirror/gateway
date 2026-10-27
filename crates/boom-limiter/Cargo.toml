@@ -16,3 +16,8 @@ serde_json = { workspace = true }
 futures = { workspace = true }
 sqlx = { workspace = true }
 rust_decimal = { workspace = true }
+
+[dev-dependencies]
+# dev-only: manifest cross-check test (plan SQL columns vs field registry).
+# boom-config is a leaf crate, so this adds no cycle.
+boom-config = { path = "../boom-config" }

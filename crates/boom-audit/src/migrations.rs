@@ -140,6 +140,20 @@ pub async fn run_request_log_migration(conn: &mut sqlx::PgConnection) -> Result<
     Ok(())
 }
 
+/// DDL for the `boom_user_tag_config` single-row table: the DB-authoritative
+/// copy of the `user_tag_headers` list (header names whose values are joined
+/// into `boom_request_log.user_tag` for per-user attribution on shared keys).
+/// The row is absent on fresh databases — the boot path adopts the YAML
+/// `general_settings.user_tag_headers` value as the seed, after which the DB
+/// is authoritative and the YAML section is inert.
+pub fn user_tag_config_ddl() -> &'static str {
+    r#"CREATE TABLE IF NOT EXISTS boom_user_tag_config (
+    id         INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    headers    JSONB NOT NULL DEFAULT '[]',
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)"#
+}
+
 /// Run an idempotent `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` best-effort:
 /// returns Ok even if the DB refuses the statement (some PG-compatible
 /// backends reject `IF NOT EXISTS`). Errors on the base `CREATE TABLE`

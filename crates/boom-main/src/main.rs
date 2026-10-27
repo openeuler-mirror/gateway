@@ -289,6 +289,7 @@ fn build_router(state: AppState) -> Router {
         state.agent_stats.clone(),
         key_alias_lookup,
         state.block_rule_store.clone(),
+        state.user_tag_store.clone(),
         state.log_writer.clone().map(|w| w as Arc<dyn boom_core::LogDroppedCounter>),
         state.stressmon.clone(),
         state.trace.clone() as Arc<dyn boom_core::TraceApi>,

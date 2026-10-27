@@ -106,6 +106,9 @@ pub async fn admin_command_handler(mut rx: tokio::sync::mpsc::Receiver<AdminComm
                     "router_settings": boom_config::manifest::router_settings_fields(),
                     "cost_templates": boom_config::manifest::cost_template_fields(),
                     "workflows": boom_config::manifest::workflow_fields(),
+                    "aliases": boom_config::manifest::alias_fields(),
+                    "rate_limit_plans": boom_config::manifest::rate_limit_plan_fields(),
+                    "block_rules": boom_config::manifest::block_rule_fields(),
                 });
                 let _ = reply.send(Ok(schema));
             }
@@ -241,6 +244,19 @@ fn overlay_db_owned_sections(config: &mut Value, snapshot: &Value) {
             .or_insert_with(|| serde_json::json!({}));
         if let Some(router_obj) = router.as_object_mut() {
             router_obj.insert("model_group_alias".to_string(), aliases.clone());
+        }
+    }
+    // user_tag_headers lives under general_settings — same sub-key merge so
+    // master_key / database_url (process-level, secret) stay untouched.
+    if let Some(headers) = snapshot
+        .get("general_settings")
+        .and_then(|g| g.get("user_tag_headers"))
+    {
+        let gs = cfg_obj
+            .entry("general_settings")
+            .or_insert_with(|| serde_json::json!({}));
+        if let Some(gs_obj) = gs.as_object_mut() {
+            gs_obj.insert("user_tag_headers".to_string(), headers.clone());
         }
     }
 }

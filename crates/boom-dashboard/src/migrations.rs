@@ -246,10 +246,15 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
     run_ddl_on_conn(&mut conn, boom_routing::migrations::cost_template_ddl()).await?;
     tracing::info!("Migration 14: done");
 
+    // 11. User tag header config (boom-audit, single row).
+    tracing::info!("Migration 15: user_tag_config...");
+    run_ddl_on_conn(&mut conn, boom_audit::migrations::user_tag_config_ddl()).await?;
+    tracing::info!("Migration 15: done");
+
     // Connection returns to pool on drop.
     drop(conn);
 
-    tracing::info!("BooMGateway persistence tables ensured (14 tables)");
+    tracing::info!("BooMGateway persistence tables ensured (15 tables)");
     Ok(())
 }
 

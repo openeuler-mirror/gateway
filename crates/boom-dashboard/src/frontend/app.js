@@ -3967,6 +3967,7 @@
             <div class="form-group"><label>${t("form.model.provider")} * ${tip(t("tip.model.provider"))}</label><select id="m-model-provider"><option value="">${t("common.select_placeholder")}</option><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option><option value="azure">Azure OpenAI</option><option value="gemini">Google Gemini</option><option value="bedrock">AWS Bedrock</option></select></div>
             <div class="form-group"><label>${t("form.model.id")} * ${tip(t("tip.model.id"))}</label><input id="m-model-id" value="${esc((p.litellm_model || "").includes("/") ? p.litellm_model.split("/").slice(1).join("/") : p.litellm_model || "")}" required></div>
             <div class="form-group field-full"><label>${t("form.model.base")} ${tip(t("tip.model.base"))}</label><input id="m-model-base" value="${esc(p.api_base || "")}" placeholder="https://api.openai.com/v1"></div>
+            <div class="form-group field-full"><label>${t("form.model.version")} ${tip(t("tip.model.version"))}</label><input id="m-model-api-version" value="${esc(p.api_version || "")}" placeholder="2024-02-01 (Azure)"></div>
             <div class="form-group"><label>${t("form.model.timeout")} ${tip(t("tip.model.timeout"))}</label><input id="m-model-timeout" type="number" value="${p.timeout || 1200}"></div>
             <div class="form-group"><label>${t("form.model.temp")} ${tip(t("tip.model.temp"))}</label><input id="m-model-temp" type="number" step="0.1" value="${p.temperature || ""}"></div>
             <div class="form-group"><label>${t("form.model.maxtok")} ${tip(t("tip.model.maxtok"))}</label><input id="m-model-maxtok" type="number" value="${p.max_tokens || ""}"></div>
@@ -4093,6 +4094,7 @@
           api_key: document.getElementById("m-model-key").value || null,
           api_key_env: document.getElementById("m-model-key-env").checked,
           api_base: document.getElementById("m-model-base").value || null,
+          api_version: document.getElementById("m-model-api-version").value.trim() || null,
           aws_region_name: document.getElementById("m-model-aws-region").value || null,
           aws_access_key_id: document.getElementById("m-model-aws-key").value || null,
           aws_secret_access_key: document.getElementById("m-model-aws-secret").value || null,
@@ -5182,23 +5184,31 @@
           workers: numOr($("cfg-server-workers"), 4),
         });
       } else if (kind === "general") {
-        // These three live under router_settings in YAML but are surfaced on
-        // the General card. Sub-path writes avoid replacing the whole
-        // router_settings section (which would clobber scheduling fields).
-        // user_tag_headers is a true general_settings field; comma-separated
-        // input → array (validated ≤3); empty input saves null = extraction
-        // disabled.
+        // user_tag_headers is DB-authoritative (boom_user_tag_config) — direct
+        // PUT to the dedicated endpoint, immediate effect, no YAML write.
+        // Comma-separated input → array (validated ≤3); empty = disabled.
+        // The three router_settings sub-paths stay on the YAML channel
+        // (process-level config) — sub-path writes avoid replacing the whole
+        // router_settings section. One confirm covers both channels.
         const tagHeaders = $("cfg-gen-user-tag-hdr").value
           .split(",").map(s => s.trim()).filter(Boolean);
         if (tagHeaders.length > 3) {
           throw new Error(t("config.error.user_tag_max_headers"));
         }
-        await saveConfigSections([
+        if (!confirm(t("common.confirm_write"))) throw new Error(t("common.canceled"));
+        await api("/admin/user-tag-headers", {
+          method: "PUT", skipConfirm: true,
+          body: JSON.stringify({ headers: tagHeaders }),
+        });
+        for (const [path, value] of [
           ["router_settings.enable_priority_header", $("cfg-gen-priority-hdr").checked],
           ["router_settings.strip_claude_code_attribution", $("cfg-gen-strip-cc").checked],
           ["router_settings.forward_client_headers", parseListInput($("cfg-gen-forward-hdrs"))],
-          ["general_settings.user_tag_headers", tagHeaders.length ? tagHeaders : null],
-        ]);
+        ]) {
+          await api("/admin/config", { method: "PUT", skipConfirm: true, body: JSON.stringify({ path, value }) });
+        }
+        showToast(t("config.saved"));
+        await loadConfigPage();
       } else if (kind === "responses") {
         await saveConfigSections([
           ["general_settings.responses_store", {

@@ -161,8 +161,8 @@ pub(crate) fn extract_client_ip(headers: &axum::http::HeaderMap, remote_addr: Op
 
 /// Extract the per-user attribution tag from the configured headers.
 ///
-/// Reads `general_settings.user_tag_headers` (hot-reloadable, up to 3
-/// entries) and joins the captured header *values* with ';' in configured
+/// `configured` is the DB-authoritative header-name list (UserTagStore, up
+/// to 3 entries); joins the captured header *values* with ';' in configured
 /// order (e.g. `x-user-tag: hello` + `x-request-id: 321` → `hello;321`).
 /// Per header, repeated occurrences are joined with ','; a missing or
 /// whitespace-only header is skipped; entries beyond the 3rd are ignored.
@@ -171,13 +171,15 @@ pub(crate) fn extract_client_ip(headers: &axum::http::HeaderMap, remote_addr: Op
 /// unconfigured or no header produced a value — display-only attribution,
 /// never used for auth/routing decisions.
 pub(crate) fn extract_user_tag(
-    settings: &boom_config::GeneralSettings,
+    configured: &[String],
     headers: &axum::http::HeaderMap,
 ) -> Option<String> {
     const USER_TAG_MAX_BYTES: usize = 256;
     const USER_TAG_MAX_HEADERS: usize = 3;
 
-    let configured = settings.user_tag_headers.as_ref()?;
+    if configured.is_empty() {
+        return None;
+    }
     let mut parts: Vec<String> = Vec::new();
     for raw in configured.iter().take(USER_TAG_MAX_HEADERS) {
         let raw = raw.trim();
@@ -621,7 +623,7 @@ async fn chat_completions_inner(
     let request_id = new_request_id();
     let client_ip = extract_client_ip(headers, remote_addr);
     let inner = state.inner.load();
-    let user_tag = extract_user_tag(&inner.config.general_settings, headers);
+    let user_tag = extract_user_tag(&state.user_tag_store.get(), headers);
     // pre_auth hook may have decided to rewrite the request's model (along
     // with the key). Apply before any downstream consumer — check_model_access
     // will then verify the rewritten model is in the key's whitelist.
@@ -3081,7 +3083,7 @@ pub async fn messages(
     let request_id = new_request_id();
     let client_ip = extract_client_ip(&headers, Some(remote_addr));
     let inner = state.inner.load();
-    let user_tag = extract_user_tag(&inner.config.general_settings, &headers);
+    let user_tag = extract_user_tag(&state.user_tag_store.get(), &headers);
 
     // pre_auth hook may have decided to rewrite the request's model (along
     // with the key). Apply before anthropic_request_to_openai so the
@@ -3862,7 +3864,7 @@ pub async fn responses(
     let request_id = new_request_id();
     let client_ip = extract_client_ip(&headers, Some(remote_addr));
     let inner = state.inner.load();
-    let user_tag = extract_user_tag(&inner.config.general_settings, &headers);
+    let user_tag = extract_user_tag(&state.user_tag_store.get(), &headers);
 
     // pre_auth hook model rewrite — same position as the messages path so the
     // converted request inherits the new model everywhere downstream.
@@ -4905,11 +4907,8 @@ mod tests {
         assert!(!is_vip_key(&meta));
     }
 
-    fn user_tag_settings(headers: &[&str]) -> boom_config::GeneralSettings {
-        let mut s = boom_config::GeneralSettings::default();
-        s.user_tag_headers = (!headers.is_empty())
-            .then(|| headers.iter().map(|h| h.to_string()).collect());
-        s
+    fn user_tag_settings(headers: &[&str]) -> Vec<String> {
+        headers.iter().map(|h| h.to_string()).collect()
     }
 
     fn headers_with(pairs: &[(&str, &str)]) -> HeaderMap {
