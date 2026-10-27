@@ -172,7 +172,7 @@ impl ResponseStore {
             "INSERT INTO boom_response \
              (id, previous_response_id, key_hash, model, instructions, tools_json, \
               history_item_ids, status, response_json, expires_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW() + make_interval(secs => $10::bigint))",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW() + ($10::bigint * INTERVAL '1 second'))",
         )
         .bind(&turn.response_id)
         .bind(&turn.previous_response_id)
@@ -230,6 +230,33 @@ impl ResponseStore {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// GaussDB runs a PG 9.2 kernel: SQL written against modern PostgreSQL
+    /// compiles fine on a local native PG and then fails at runtime in
+    /// production (fd97457: the upsert conflict clause; 2026-10: the PG 9.4
+    /// interval-builder function in the persist INSERT). This self-scan
+    /// fails the build if any construct the 9.2 kernel lacks is
+    /// reintroduced. Upserts must use `boom_core::gaussdb_upsert!`; interval
+    /// math must use `INTERVAL '..'` literals.
+    #[test]
+    fn sql_avoids_gaussdb_missing_constructs() {
+        let src = include_str!("lib.rs");
+        // Assembled at runtime so this test's own source doesn't trip the scan.
+        let banned: [String; 4] = [
+            ["make_", "interval"].concat(),
+            ["ON ", "CONFLICT"].concat(),
+            ["to_", "jsonb("].concat(),
+            ["gen_", "random_uuid"].concat(),
+        ];
+        for b in &banned {
+            assert!(
+                !src.contains(b.as_str()),
+                "SQL construct `{b}` is not available on the GaussDB (PG 9.2) \
+                 deployment target — use boom_core::gaussdb_upsert! for upserts \
+                 and `INTERVAL '..'` literals for interval math",
+            );
+        }
+    }
 
     /// DB-backed tests run only when a test database is provided; otherwise
     /// they soft-skip (local runs without PG stay green).
