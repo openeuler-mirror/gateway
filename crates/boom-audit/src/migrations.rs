@@ -103,10 +103,10 @@ pub async fn run_request_log_migration(conn: &mut sqlx::PgConnection) -> Result<
     // deployment has no flow control slot (pass-through) or on the
     // error paths that fire before acquire() returns.
     execute_alter(conn, r#"ALTER TABLE boom_request_log ADD COLUMN IF NOT EXISTS queue_wait_ms INTEGER"#).await;
-    // user_tag: "header:value" extracted from the configured
-    // general_settings.user_tag_header — identifies which end user made the
-    // request when a key is shared by multiple users. NULL when the feature
-    // is disabled or the request carried no such header.
+    // user_tag: values of the configured general_settings.user_tag_headers
+    // (up to 3 headers, ';' joined, values only) — identifies which end user
+    // made the request when a key is shared by multiple users. NULL when the
+    // feature is disabled or the request carried none of the headers.
     execute_alter(conn, r#"ALTER TABLE boom_request_log ADD COLUMN IF NOT EXISTS user_tag TEXT"#).await;
     // Composite index for per-key log pagination (user dashboard logs page):
     // WHERE key_hash = $1 ORDER BY created_at DESC LIMIT/OFFSET. Without it
@@ -138,6 +138,20 @@ pub async fn run_request_log_migration(conn: &mut sqlx::PgConnection) -> Result<
         .await;
     }
     Ok(())
+}
+
+/// DDL for the `boom_user_tag_config` single-row table: the DB-authoritative
+/// copy of the `user_tag_headers` list (header names whose values are joined
+/// into `boom_request_log.user_tag` for per-user attribution on shared keys).
+/// The row is absent on fresh databases — the boot path adopts the YAML
+/// `general_settings.user_tag_headers` value as the seed, after which the DB
+/// is authoritative and the YAML section is inert.
+pub fn user_tag_config_ddl() -> &'static str {
+    r#"CREATE TABLE IF NOT EXISTS boom_user_tag_config (
+    id         INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    headers    JSONB NOT NULL DEFAULT '[]',
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)"#
 }
 
 /// Run an idempotent `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` best-effort:

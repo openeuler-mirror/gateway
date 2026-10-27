@@ -242,6 +242,9 @@ pub struct DashboardState {
     /// Client blocklist store (boom-gatekeeper) — rule CRUD + hot-path check
     /// share the same compiled rules.
     pub block_rule_store: Arc<boom_gatekeeper::BlockRuleStore>,
+    /// User tag header list (boom-audit) — DB-authoritative; the PUT endpoint
+    /// writes DB + memory in one step, the request path reads the same list.
+    pub user_tag_store: Arc<boom_audit::UserTagStore>,
     /// Audit-log drop counter (channel full or batch INSERT failures).
     /// None when DB not configured (no LogWriter). Surfaced on the debug page.
     pub log_dropped: Option<Arc<dyn boom_core::LogDroppedCounter>>,
@@ -280,6 +283,7 @@ impl DashboardState {
         agent_stats: Arc<AgentStatsTracker>,
         auth: Arc<dyn KeyAliasLookup>,
         block_rule_store: Arc<boom_gatekeeper::BlockRuleStore>,
+        user_tag_store: Arc<boom_audit::UserTagStore>,
         log_dropped: Option<Arc<dyn boom_core::LogDroppedCounter>>,
         stressmon: Arc<dyn boom_core::StressmonApi>,
         trace: Arc<dyn boom_core::TraceApi>,
@@ -312,6 +316,7 @@ impl DashboardState {
             agent_stats,
             auth,
             block_rule_store,
+            user_tag_store,
             log_dropped,
             stressmon,
             trace,

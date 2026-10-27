@@ -590,6 +590,54 @@ pub fn normalize_input_items(req: &ResponsesRequest) -> Vec<serde_json::Value> {
     }
 }
 
+/// P2 native passthrough: build the upstream body from a Responses request.
+/// Gateway-owned storage/continuation fields (`store` / `previous_response_id`
+/// / `conversation` / `background`) are stripped — the gateway owns storage,
+/// so they must not reach a native-Responses upstream. Rehydrated history is
+/// inlined ahead of the current input (same "prior context + new input"
+/// ordering as the conversion path), and `stream` is set explicitly. Native
+/// fields (tools / reasoning / instructions / unknown extras) survive
+/// verbatim — that is the fidelity point of passthrough.
+pub fn build_responses_passthrough_body(
+    req: &ResponsesRequest,
+    history: &[serde_json::Value],
+    stream: bool,
+) -> serde_json::Value {
+    let mut body = serde_json::to_value(req).expect("ResponsesRequest is JSON-serializable");
+    let obj = body
+        .as_object_mut()
+        .expect("serialized ResponsesRequest is a JSON object");
+    for field in ["store", "previous_response_id", "conversation", "background", "stream"] {
+        obj.remove(field);
+    }
+    let mut input: Vec<serde_json::Value> = history.to_vec();
+    input.extend(normalize_input_items(req));
+    obj.insert("input".into(), serde_json::Value::Array(input));
+    obj.insert("stream".into(), serde_json::Value::Bool(stream));
+    body
+}
+
+/// P2 native passthrough: rewrite the upstream's response id to the gateway's
+/// in one SSE event, or in a bare non-stream Response object (top-level `id`
+/// with `"object": "response"`). Item ids inside `output` stay native — they
+/// round-trip to the upstream verbatim. Events without a response object pass
+/// through untouched. A missing id is injected (gateway-synthesized
+/// `response.failed`): clients id-address every response object they see.
+pub fn rewrite_passthrough_response_id(event: &mut serde_json::Value, response_id: &str) {
+    let is_bare_response = event.get("object").and_then(|o| o.as_str()) == Some("response");
+    let target: &mut serde_json::Value = if is_bare_response {
+        event
+    } else {
+        match event.get_mut("response") {
+            Some(resp) => resp,
+            None => return,
+        }
+    };
+    if let Some(obj) = target.as_object_mut() {
+        obj.insert("id".into(), serde_json::Value::String(response_id.to_string()));
+    }
+}
+
 fn convert_request(
     req: &ResponsesRequest,
     history: &[serde_json::Value],

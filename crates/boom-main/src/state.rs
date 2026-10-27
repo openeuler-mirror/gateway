@@ -66,6 +66,10 @@ pub struct AppState {
     /// Client blocklist store (boom-gatekeeper) survives reloads. Rules are
     /// rebuilt from YAML + DB on reload; dashboard CRUD updates it in place.
     pub block_rule_store: Arc<boom_gatekeeper::BlockRuleStore>,
+    /// DB-authoritative user_tag header list (boom-audit) survives reloads.
+    /// Seeded from YAML on first boot (adopt), then DB-only; dashboard PUT
+    /// updates it in place. Read per-request by `extract_user_tag`.
+    pub user_tag_store: Arc<boom_audit::UserTagStore>,
     /// Router owns deployment + alias stores for routing decisions.
     pub router: Arc<Router>,
     /// In-flight request tracker (per-model count + input chars).
@@ -255,6 +259,10 @@ impl AppState {
         // 4b. Client blocklist store survives across reloads.
         let block_rule_store = Arc::new(boom_gatekeeper::BlockRuleStore::new());
 
+        // 4c. User tag header store survives across reloads (DB-authoritative
+        // after first-boot adopt; see config_reconcile::adopt_user_tag_headers_db).
+        let user_tag_store = Arc::new(boom_audit::UserTagStore::new());
+
         // In-flight tracker survives across reloads — must be created before policy.
         let inflight = Arc::new(InFlightTracker::new());
 
@@ -338,6 +346,12 @@ impl AppState {
             .await?;
             crate::config_reconcile::adopt_blocklist_enabled_db(pool, &block_rule_store, &config)
                 .await?;
+            crate::config_reconcile::adopt_user_tag_headers_db(
+                pool,
+                &user_tag_store,
+                &config,
+            )
+            .await?;
 
             // Restore runtime state.
             plan_store.restore_assignments_from_db(pool).await;
@@ -440,6 +454,7 @@ impl AppState {
             workflow_store,
             cost_template_store,
             block_rule_store,
+            user_tag_store,
             router,
             inflight,
             request_count: Arc::new(AtomicU64::new(0)),
@@ -700,6 +715,12 @@ impl AppState {
             crate::config_reconcile::adopt_blocklist_enabled_db(
                 pool,
                 &self.block_rule_store,
+                &new_config,
+            )
+            .await?;
+            crate::config_reconcile::adopt_user_tag_headers_db(
+                pool,
+                &self.user_tag_store,
                 &new_config,
             )
             .await?;
@@ -1068,7 +1089,12 @@ impl AppState {
             Err(e) => return Err(format!("build snapshot from DB: {}", e)),
         };
 
-        compose_export_yaml(&mut root, &snapshot, self.block_rule_store.is_enabled())
+        compose_export_yaml(
+            &mut root,
+            &snapshot,
+            self.block_rule_store.is_enabled(),
+            &self.user_tag_store.get(),
+        )
     }
 
     /// Update a single config section in the live `config.yaml` and reload.
@@ -1103,13 +1129,14 @@ impl AppState {
         // ignores (or, pre-M4, partially consumes for workflow/cost) — reject
         // with a pointer to the right surface instead of silently doing the
         // wrong thing on the next reload.
-        const DB_OWNED_PATHS: [&str; 6] = [
+        const DB_OWNED_PATHS: [&str; 7] = [
             "model_list",
             "plan_settings",
             "client_blocklist",
             "router_settings.model_group_alias",
             "workflow_settings",
             "cost_templates",
+            "general_settings.user_tag_headers",
         ];
         if DB_OWNED_PATHS.contains(&path) {
             return Err(format!(
@@ -1143,11 +1170,13 @@ impl AppState {
 /// snapshot into the raw YAML value. Singleton sections are preserved as-is.
 /// `blocklist_enabled` is the running gateway's blocklist switch, used as a
 /// fallback when the snapshot carries no `enabled` (no-DB mode / missing
-/// state row).
+/// state row). `user_tag_headers` is the running UserTagStore list, same
+/// fallback role for `general_settings.user_tag_headers`.
 fn merge_runtime_sections(
     root: &mut serde_yaml::Value,
     snapshot: &serde_json::Value,
     blocklist_enabled: bool,
+    user_tag_headers: &[String],
 ) -> Result<(), String> {
     let obj = snapshot
         .as_object()
@@ -1216,6 +1245,46 @@ fn merge_runtime_sections(
             .map_err(|e| format!("set cost_templates: {}", e))?;
     }
 
+    // user_tag_headers is DB-owned runtime state. The snapshot carries the DB
+    // row when it exists; the running store value covers the missing-row
+    // transient. An empty list REMOVES the key: leaving a stale YAML value
+    // would resurrect the old config as the seed on a fresh-DB restore.
+    let ut_value = obj
+        .get("general_settings")
+        .and_then(|g| g.get("user_tag_headers"))
+        .cloned()
+        .filter(|v| !v.is_null())
+        .unwrap_or_else(|| serde_json::json!(user_tag_headers));
+    if let serde_json::Value::Array(arr) = &ut_value {
+        if arr.is_empty() {
+            if let Some(gs) = root
+                .get_mut("general_settings")
+                .and_then(|g| g.as_mapping_mut())
+            {
+                gs.remove("user_tag_headers");
+            }
+        } else {
+            let yaml_val = json_to_yaml(&ut_value)?;
+            boom_config::set_yaml_path(root, &["general_settings", "user_tag_headers"], yaml_val)
+                .map_err(|e| format!("set general_settings.user_tag_headers: {}", e))?;
+        }
+    }
+
+    // Strip the legacy singular alias. The field now lives in the DB; a stale
+    // `user_tag_header:` key left in the file would re-seed the OLD value on a
+    // fresh-DB restore even after the operator cleared the list (the empty
+    // branch above only removes the plural key).
+    if let Some(gs) = root
+        .get_mut("general_settings")
+        .and_then(|g| g.as_mapping_mut())
+    {
+        if gs.remove("user_tag_header").is_some() {
+            tracing::info!(
+                "Stripped legacy general_settings.user_tag_header from YAML (superseded by the DB-owned user_tag_headers list)"
+            );
+        }
+    }
+
     // Strip the deprecated general_settings.public_models list. Visibility is
     // exported per-model (model_list above) and the DB rows already carry
     // visibility=public from the startup sync_yaml_to_db, so removing the
@@ -1249,8 +1318,9 @@ fn compose_export_yaml(
     root: &mut serde_yaml::Value,
     snapshot: &serde_json::Value,
     blocklist_enabled: bool,
+    user_tag_headers: &[String],
 ) -> Result<String, String> {
-    merge_runtime_sections(root, snapshot, blocklist_enabled)?;
+    merge_runtime_sections(root, snapshot, blocklist_enabled, user_tag_headers)?;
     serde_yaml::to_string(root).map_err(|e| format!("serialize yaml: {}", e))
 }
 
@@ -1289,7 +1359,7 @@ fn synthesize_bootstrap_root(config: &Config) -> Result<serde_yaml::Value, Strin
         }
     }
 
-    // Same cleanup inside general_settings (user_tag_header: null, the
+    // Same cleanup inside general_settings (user_tag_headers: null, the
     // legacy alias field) — the section serializes all fields, unlike a
     // hand-written file that only carries what's set.
     if let Some(gs) = root
@@ -2241,6 +2311,14 @@ pub(crate) async fn build_config_snapshot_value(pool: &PgPool) -> Result<serde_j
     .fetch_optional(pool)
     .await?;
 
+    // ── User tag headers (boom-audit, single-row config) ──
+    let user_tag_headers: Option<serde_json::Value> =
+        sqlx::query_scalar::<_, serde_json::Value>(
+            r#"SELECT headers FROM boom_user_tag_config WHERE id = 1"#,
+        )
+        .fetch_optional(pool)
+        .await?;
+
     // ── Workflows (delegated to WorkflowStore tables) ──
     let definition_rows = boom_routing::WorkflowStore::list_definitions_db(pool).await?;
     let model_binding_rows = boom_routing::WorkflowStore::list_models_db(pool).await?;
@@ -2307,6 +2385,9 @@ pub(crate) async fn build_config_snapshot_value(pool: &PgPool) -> Result<serde_j
             "workflows": workflows_map,
         },
         "cost_templates": cost_templates,
+        "general_settings": {
+            "user_tag_headers": user_tag_headers,
+        },
     }))
 }
 
@@ -2340,7 +2421,7 @@ mod merge_runtime_sections_tests {
         // otherwise parse the section with the serde default (true) and
         // silently activate rules the operator never turned on.
         let mut root = parse("model_list: []\n");
-        merge_runtime_sections(&mut root, &snapshot_with_rules(), false).expect("merge");
+        merge_runtime_sections(&mut root, &snapshot_with_rules(), false, &[]).expect("merge");
         let bl = root.get("client_blocklist").expect("section created");
         assert_eq!(bl.get("enabled"), Some(&serde_yaml::Value::Bool(false)));
         assert!(bl.get("rules").is_some());
@@ -2353,7 +2434,7 @@ mod merge_runtime_sections_tests {
         let mut root = parse("client_blocklist:\n  enabled: true\n");
         let mut snapshot = snapshot_with_rules();
         snapshot["client_blocklist"]["enabled"] = serde_json::Value::Bool(false);
-        merge_runtime_sections(&mut root, &snapshot, true).expect("merge");
+        merge_runtime_sections(&mut root, &snapshot, true, &[]).expect("merge");
         let bl = root.get("client_blocklist").expect("section kept");
         assert_eq!(bl.get("enabled"), Some(&serde_yaml::Value::Bool(false)));
     }
@@ -2371,7 +2452,7 @@ mod merge_runtime_sections_tests {
             ],
             "client_blocklist": {"rules": []},
         });
-        let yaml = compose_export_yaml(&mut root, &snapshot, true).expect("compose");
+        let yaml = compose_export_yaml(&mut root, &snapshot, true, &[]).expect("compose");
         let reparsed = parse(&yaml);
         assert!(reparsed.get("server").is_some(), "singleton section preserved");
         assert_eq!(
@@ -2393,6 +2474,82 @@ mod merge_runtime_sections_tests {
                 .and_then(|c| c.get("enabled"))
                 .and_then(|v| v.as_bool()),
             Some(true)
+        );
+    }
+
+    #[test]
+    fn user_tag_headers_snapshot_value_overrides_and_empty_removes_stale_key() {
+        // DB says [x-user-id]; a stale YAML key says otherwise — the merged
+        // document must carry the DB list. An empty DB list must REMOVE the
+        // key entirely: exporting the stale value would resurrect it as the
+        // fresh-DB restore seed.
+        let mut root = parse("general_settings:\n  user_tag_headers: [x-old]\n");
+        let snapshot = serde_json::json!({
+            "general_settings": {"user_tag_headers": ["x-user-id"]}
+        });
+        merge_runtime_sections(&mut root, &snapshot, true, &[]).expect("merge");
+        let got = root
+            .get("general_settings")
+            .and_then(|g| g.get("user_tag_headers"))
+            .and_then(|v| v.as_sequence())
+            .expect("user_tag_headers merged");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].as_str(), Some("x-user-id"));
+
+        let mut root = parse("general_settings:\n  user_tag_headers: [x-old]\n");
+        let snapshot = serde_json::json!({
+            "general_settings": {"user_tag_headers": []}
+        });
+        merge_runtime_sections(&mut root, &snapshot, true, &[]).expect("merge");
+        let gs = root
+            .get("general_settings")
+            .and_then(|g| g.as_mapping())
+            .expect("general_settings mapping");
+        assert!(
+            !gs.contains_key(&serde_yaml::Value::String("user_tag_headers".into())),
+            "empty DB list must drop the stale YAML key"
+        );
+        assert!(
+            !gs.contains_key(&serde_yaml::Value::String("user_tag_header".into())),
+            "the legacy singular alias must be stripped too — it would re-seed \
+             the old value on a fresh-DB restore"
+        );
+
+        // Legacy singular alias present alongside the plural key, with an
+        // empty DB list: BOTH must be stripped — a surviving singular key
+        // would re-seed the old value on a fresh-DB restore.
+        let mut root = parse(
+            "general_settings:\n  user_tag_header: x-old\n  user_tag_headers: [x-old]\n",
+        );
+        merge_runtime_sections(&mut root, &snapshot, true, &[]).expect("merge");
+        let gs = root
+            .get("general_settings")
+            .and_then(|g| g.as_mapping())
+            .expect("general_settings mapping");
+        assert!(
+            !gs.contains_key(&serde_yaml::Value::String("user_tag_header".into())),
+            "legacy singular key must not survive the merge"
+        );
+        assert!(
+            !gs.contains_key(&serde_yaml::Value::String("user_tag_headers".into())),
+            "empty DB list must drop the plural key as well"
+        );
+    }
+
+    #[test]
+    fn user_tag_headers_falls_back_to_running_store_when_snapshot_lacks_it() {
+        // Missing row / null snapshot value: the running store value is the
+        // fallback (no-DB transient).
+        let mut root = parse("general_settings:\n  master_key: ${MASTER}\n");
+        let snapshot = serde_json::json!({"general_settings": {}});
+        merge_runtime_sections(&mut root, &snapshot, true, &["x-user-tag".to_string()])
+            .expect("merge");
+        assert_eq!(
+            root.get("general_settings")
+                .and_then(|g| g.get("user_tag_headers"))
+                .and_then(|v| v.as_sequence())
+                .map(|s| s.len()),
+            Some(1)
         );
     }
 
@@ -2451,7 +2608,7 @@ mod merge_runtime_sections_tests {
             "legacy alias field must not leak into general_settings"
         );
         assert!(
-            !gs.contains_key(&Value::String("user_tag_header".into())),
+            !gs.contains_key(&Value::String("user_tag_headers".into())),
             "null field must not leak into general_settings"
         );
     }

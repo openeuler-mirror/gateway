@@ -172,6 +172,11 @@ pub fn build_router<S: Clone + Send + Sync + 'static>(state: DashboardState) -> 
             "/dashboard/api/admin/blocklist/enabled",
             put(handlers_admin::set_blocklist_enabled),
         )
+        // Admin — User tag attribution headers (DB-authoritative list).
+        .route(
+            "/dashboard/api/admin/user-tag-headers",
+            put(handlers_admin::set_user_tag_headers),
+        )
         // Admin — Request Logs.
         .route(
             "/dashboard/api/admin/logs",
@@ -417,4 +422,58 @@ fn debug_router<S: Clone + Send + Sync + 'static>(
             get(handlers_admin::get_debug_error),
         )
         .layer(axum::Extension(state))
+}
+
+#[cfg(test)]
+mod i18n_guard_tests {
+    /// CLAUDE.md §9 guard, frontend half: every `label_key` / non-empty
+    /// `tip_key` registered in `boom-config/src/manifest.rs` must exist in
+    /// `frontend/i18n.js` exactly twice (en + zh sections). A manifest field
+    /// without a translation is a half-built registration — the dashboard
+    /// would render the raw key. A key defined more than twice is a
+    /// shadowed duplicate (later definition silently wins), which is how
+    /// tip.model.rpm drifted before this guard existed.
+    ///
+    /// This test reads source files instead of adding a boom-config crate
+    /// dependency (forbidden: dashboard must not depend on boom-config).
+    #[test]
+    fn manifest_i18n_keys_exist_in_both_languages() {
+        let manifest_src = include_str!("../../boom-config/src/manifest.rs");
+        let i18n_src = include_str!("frontend/i18n.js");
+
+        let mut keys: Vec<&str> = Vec::new();
+        for marker in ["label_key: \"", "tip_key: \""] {
+            let mut from = 0;
+            while let Some(pos) = manifest_src[from..].find(marker) {
+                let start = from + pos + marker.len();
+                let rest = &manifest_src[start..];
+                if let Some(end) = rest.find('"') {
+                    let key = &rest[..end];
+                    if !key.is_empty() {
+                        keys.push(key);
+                    }
+                }
+                from = start;
+            }
+        }
+        assert!(
+            keys.len() >= 100,
+            "expected the full manifest registry, extracted only {} keys — \
+             parsing drifted from the FieldMeta literal format",
+            keys.len()
+        );
+        keys.sort_unstable();
+        keys.dedup();
+
+        for key in keys {
+            let needle = format!("\"{}\":", key);
+            let count = i18n_src.matches(&needle).count();
+            assert_eq!(
+                count, 2,
+                "manifest key `{key}` appears {count}x in i18n.js (expected exactly 2: \
+                 en + zh). 0 = missing translation (dashboard renders the raw key); \
+                 1 = one language missing; >2 = shadowed duplicate. See CLAUDE.md §9."
+            );
+        }
+    }
 }

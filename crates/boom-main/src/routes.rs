@@ -159,43 +159,56 @@ pub(crate) fn extract_client_ip(headers: &axum::http::HeaderMap, remote_addr: Op
     "unknown".to_string()
 }
 
-/// Extract the per-user attribution tag from the configured header.
+/// Extract the per-user attribution tag from the configured headers.
 ///
-/// Reads `general_settings.user_tag_header` (hot-reloadable), pulls the
-/// matching request header, and formats it as `"{lowercase_name}:{value}"`
-/// (e.g. `x-user-tag: alice`) so the audit row is self-describing even if
-/// the configured header name changes later. Repeated headers are joined
-/// with ','; a whitespace-only value counts as absent; the value is
-/// truncated to 256 bytes (header values can legally reach 8 KiB).
-/// Returns None when the feature is unconfigured or the header is absent —
-/// display-only attribution, never used for auth/routing decisions.
+/// `configured` is the DB-authoritative header-name list (UserTagStore, up
+/// to 3 entries); joins the captured header *values* with ';' in configured
+/// order (e.g. `x-user-tag: hello` + `x-request-id: 321` → `hello;321`).
+/// Per header, repeated occurrences are joined with ','; a missing or
+/// whitespace-only header is skipped; entries beyond the 3rd are ignored.
+/// The joined string is truncated to 256 bytes at a char boundary (header
+/// values can legally reach 8 KiB). Returns None when the feature is
+/// unconfigured or no header produced a value — display-only attribution,
+/// never used for auth/routing decisions.
 pub(crate) fn extract_user_tag(
-    settings: &boom_config::GeneralSettings,
+    configured: &[String],
     headers: &axum::http::HeaderMap,
 ) -> Option<String> {
     const USER_TAG_MAX_BYTES: usize = 256;
+    const USER_TAG_MAX_HEADERS: usize = 3;
 
-    let raw = settings.user_tag_header.as_deref()?.trim();
-    if raw.is_empty() {
+    if configured.is_empty() {
         return None;
     }
-    // Normalize to lowercase so config edits that only change case don't
-    // split GROUP BY groups. from_bytes also rejects invalid header names.
-    let name = axum::http::HeaderName::from_bytes(raw.to_ascii_lowercase().as_bytes()).ok()?;
-    // from_utf8_lossy, not to_str(): header values may legally carry
-    // non-ASCII bytes (obs-text), and dropping them would lose attribution
-    // for e.g. non-ASCII usernames.
-    let values: Vec<String> = headers
-        .get_all(&name)
-        .iter()
-        .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
-        .collect();
-    let joined = values.join(",");
-    let value = joined.trim();
-    if value.is_empty() {
+    let mut parts: Vec<String> = Vec::new();
+    for raw in configured.iter().take(USER_TAG_MAX_HEADERS) {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        // Normalize to lowercase so config edits that only change case
+        // still hit the same header. from_bytes also rejects invalid names.
+        let Ok(name) = axum::http::HeaderName::from_bytes(raw.to_ascii_lowercase().as_bytes())
+        else {
+            continue;
+        };
+        // from_utf8_lossy, not to_str(): header values may legally carry
+        // non-ASCII bytes (obs-text), and dropping them would lose
+        // attribution for e.g. non-ASCII usernames.
+        let values: Vec<String> = headers
+            .get_all(&name)
+            .iter()
+            .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
+            .collect();
+        let joined = values.join(",").trim().to_string();
+        if !joined.is_empty() {
+            parts.push(joined);
+        }
+    }
+    if parts.is_empty() {
         return None;
     }
-    let mut value = value.to_string();
+    let mut value = parts.join(";");
     if value.len() > USER_TAG_MAX_BYTES {
         let mut end = USER_TAG_MAX_BYTES;
         while end > 0 && !value.is_char_boundary(end) {
@@ -203,7 +216,7 @@ pub(crate) fn extract_user_tag(
         }
         value.truncate(end);
     }
-    Some(format!("{}:{}", name.as_str(), value))
+    Some(value)
 }
 
 /// Acquire flow control guard for a deployment.
@@ -610,7 +623,7 @@ async fn chat_completions_inner(
     let request_id = new_request_id();
     let client_ip = extract_client_ip(headers, remote_addr);
     let inner = state.inner.load();
-    let user_tag = extract_user_tag(&inner.config.general_settings, headers);
+    let user_tag = extract_user_tag(&state.user_tag_store.get(), headers);
     // pre_auth hook may have decided to rewrite the request's model (along
     // with the key). Apply before any downstream consumer — check_model_access
     // will then verify the rewritten model is in the key's whitelist.
@@ -3070,7 +3083,7 @@ pub async fn messages(
     let request_id = new_request_id();
     let client_ip = extract_client_ip(&headers, Some(remote_addr));
     let inner = state.inner.load();
-    let user_tag = extract_user_tag(&inner.config.general_settings, &headers);
+    let user_tag = extract_user_tag(&state.user_tag_store.get(), &headers);
 
     // pre_auth hook may have decided to rewrite the request's model (along
     // with the key). Apply before anthropic_request_to_openai so the
@@ -3851,7 +3864,7 @@ pub async fn responses(
     let request_id = new_request_id();
     let client_ip = extract_client_ip(&headers, Some(remote_addr));
     let inner = state.inner.load();
-    let user_tag = extract_user_tag(&inner.config.general_settings, &headers);
+    let user_tag = extract_user_tag(&state.user_tag_store.get(), &headers);
 
     // pre_auth hook model rewrite — same position as the messages path so the
     // converted request inherits the new model everywhere downstream.
@@ -4399,6 +4412,44 @@ pub async fn responses(
         )
         .unwrap_or(serde_json::Value::Null);
 
+        // Prompt log (non-stream): emit Request-phase then Response-phase
+        // with the assembled ResponseObject — mirrors the chat-completions
+        // non-stream path. Stream requests are wrapped by PromptLogStream in
+        // the branch above; without this, non-stream /v1/responses requests
+        // produced zero prompt-log entries.
+        if let Some(sender) = prompt_log_sender {
+            if let Some(req_body) = prompt_log_req_body {
+                let request_entry = PromptLogEntry::new_request(
+                    prompt_log_rid.as_deref().unwrap_or_default(),
+                    prompt_log_trace_id.clone(),
+                    &identity.key_hash,
+                    identity.key_alias.as_deref(),
+                    identity.team_alias.as_deref(),
+                    prompt_log_model.as_deref().unwrap_or_default(),
+                    "/v1/responses",
+                    false,
+                    req_body,
+                    Some(client_ip.as_str()),
+                    prompt_log_headers.clone(),
+                );
+                let _ = sender.send(request_entry.clone());
+                let mut response_entry = PromptLogEntry::new_response_from(&request_entry);
+                let resp_arc = Arc::new(responses_value.clone());
+                response_entry.set_response(resp_arc.clone());
+                if let Some(g) = trace_guard.as_ref() {
+                    if trace_cfg.capture_body {
+                        g.set_llm_response(resp_arc);
+                    }
+                }
+                if let Some(cap) = prompt_log_raw_capture.as_ref() {
+                    response_entry
+                        .set_raw_exchange(cap.take_request_body(), cap.take_response_body());
+                }
+                response_entry.set_status(200, duration_ms as u64);
+                let _ = sender.send(response_entry);
+            }
+        }
+
         // P1 persist (non-stream): awaited on purpose — the OpenAI contract
         // makes the id retrievable/continuable as soon as POST returns.
         if let Some(ctx) = persist_ctx {
@@ -4894,10 +4945,8 @@ mod tests {
         assert!(!is_vip_key(&meta));
     }
 
-    fn user_tag_settings(header: Option<&str>) -> boom_config::GeneralSettings {
-        let mut s = boom_config::GeneralSettings::default();
-        s.user_tag_header = header.map(String::from);
-        s
+    fn user_tag_settings(headers: &[&str]) -> Vec<String> {
+        headers.iter().map(|h| h.to_string()).collect()
     }
 
     fn headers_with(pairs: &[(&str, &str)]) -> HeaderMap {
@@ -4914,81 +4963,106 @@ mod tests {
     #[test]
     fn user_tag_unconfigured_returns_none() {
         let headers = headers_with(&[("x-user-tag", "alice")]);
-        assert_eq!(extract_user_tag(&user_tag_settings(None), &headers), None);
+        assert_eq!(extract_user_tag(&user_tag_settings(&[]), &headers), None);
     }
 
     #[test]
-    fn user_tag_extracts_and_lowercases_header_name() {
+    fn user_tag_lookup_is_case_insensitive() {
         // Config in canonical case, request header in another case — HTTP
-        // header lookup is case-insensitive and the recorded name is the
-        // lowercased config value. Stored as "name:value" with no space so
-        // split_once(':') recovers the exact value.
-        let settings = user_tag_settings(Some("X-User-Tag"));
+        // header lookup is case-insensitive. Only the value is stored.
+        let settings = user_tag_settings(&["X-User-Tag"]);
         let headers = headers_with(&[("x-USER-TAG", "alice")]);
-        assert_eq!(
-            extract_user_tag(&settings, &headers),
-            Some("x-user-tag:alice".to_string())
-        );
+        assert_eq!(extract_user_tag(&settings, &headers), Some("alice".to_string()));
     }
 
     #[test]
     fn user_tag_missing_header_returns_none() {
-        let settings = user_tag_settings(Some("X-User-Tag"));
+        let settings = user_tag_settings(&["X-User-Tag"]);
         let headers = headers_with(&[("x-other", "bob")]);
         assert_eq!(extract_user_tag(&settings, &headers), None);
     }
 
     #[test]
     fn user_tag_blank_value_returns_none() {
-        let settings = user_tag_settings(Some("X-User-Tag"));
+        let settings = user_tag_settings(&["X-User-Tag"]);
         let headers = headers_with(&[("x-user-tag", "   ")]);
         assert_eq!(extract_user_tag(&settings, &headers), None);
     }
 
     #[test]
     fn user_tag_empty_config_string_returns_none() {
-        let settings = user_tag_settings(Some("  "));
+        let settings = user_tag_settings(&["  "]);
         let headers = headers_with(&[("x-user-tag", "alice")]);
         assert_eq!(extract_user_tag(&settings, &headers), None);
     }
 
     #[test]
     fn user_tag_joins_repeated_headers_with_comma() {
-        let settings = user_tag_settings(Some("X-User-Tag"));
+        let settings = user_tag_settings(&["X-User-Tag"]);
         let headers = headers_with(&[
             ("x-user-tag", "alice"),
             ("x-user-tag", "bob"),
         ]);
+        assert_eq!(extract_user_tag(&settings, &headers), Some("alice,bob".to_string()));
+    }
+
+    #[test]
+    fn user_tag_multi_header_joins_values_with_semicolon_in_config_order() {
+        // Storage order is strictly the configured header order, regardless
+        // of header arrival order.
+        let settings = user_tag_settings(&["X-User-Tag", "X-Request-Id", "X-Trace-Id"]);
+        let headers = headers_with(&[
+            ("x-trace-id", "world"),
+            ("x-user-tag", "hello"),
+            ("x-request-id", "321"),
+        ]);
         assert_eq!(
             extract_user_tag(&settings, &headers),
-            Some("x-user-tag:alice,bob".to_string())
+            Some("hello;321;world".to_string())
         );
     }
 
     #[test]
+    fn user_tag_caps_at_three_configured_headers() {
+        let settings = user_tag_settings(&["A-Hdr", "B-Hdr", "C-Hdr", "D-Hdr"]);
+        let headers = headers_with(&[
+            ("a-hdr", "1"),
+            ("b-hdr", "2"),
+            ("c-hdr", "3"),
+            ("d-hdr", "4"),
+        ]);
+        assert_eq!(extract_user_tag(&settings, &headers), Some("1;2;3".to_string()));
+    }
+
+    #[test]
+    fn user_tag_skips_missing_middle_header() {
+        let settings = user_tag_settings(&["A-Hdr", "B-Hdr", "C-Hdr"]);
+        let headers = headers_with(&[("a-hdr", "1"), ("c-hdr", "3")]);
+        assert_eq!(extract_user_tag(&settings, &headers), Some("1;3".to_string()));
+    }
+
+    #[test]
     fn user_tag_truncates_long_value_at_256_bytes() {
-        let settings = user_tag_settings(Some("X-User-Tag"));
+        let settings = user_tag_settings(&["X-User-Tag"]);
         let long = "a".repeat(300);
         let headers = headers_with(&[("x-user-tag", long.as_str())]);
-        let got = extract_user_tag(&settings, &headers).unwrap();
-        assert_eq!(got, format!("x-user-tag:{}", "a".repeat(256)));
+        assert_eq!(extract_user_tag(&settings, &headers), Some("a".repeat(256)));
     }
 
     #[test]
     fn user_tag_truncation_respects_char_boundary() {
         // 3-byte CJK chars: 86 chars = 258 bytes → truncate to ≤256 at a
         // char boundary → 85 chars = 255 bytes.
-        let settings = user_tag_settings(Some("X-User-Tag"));
+        let settings = user_tag_settings(&["X-User-Tag"]);
         let long = "中".repeat(86);
         let headers = headers_with(&[("x-user-tag", long.as_str())]);
-        let got = extract_user_tag(&settings, &headers).unwrap();
-        assert_eq!(got, format!("x-user-tag:{}", "中".repeat(85)));
+        assert_eq!(extract_user_tag(&settings, &headers), Some("中".repeat(85)));
     }
 
     #[test]
     fn user_tag_invalid_config_header_name_returns_none() {
         // Spaces make an invalid header name — from_bytes rejects it.
-        let settings = user_tag_settings(Some("Bad Header Name"));
+        let settings = user_tag_settings(&["Bad Header Name"]);
         let headers = headers_with(&[("x-user-tag", "alice")]);
         assert_eq!(extract_user_tag(&settings, &headers), None);
     }

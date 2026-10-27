@@ -520,6 +520,24 @@ fn auto_detect_provider(model: &str) -> String {
     "openai".to_string()
 }
 
+/// Accepts the legacy singular `user_tag_header: "X-Header"` string as a
+/// 1-element list alongside the current `user_tag_headers: [..]` form.
+fn string_or_vec_opt<'de, D>(d: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum StringOrVec {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(Option::<StringOrVec>::deserialize(d)?.map(|v| match v {
+        StringOrVec::One(s) => vec![s],
+        StringOrVec::Many(v) => v,
+    }))
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct GeneralSettings {
     /// Master key for admin access.
@@ -532,13 +550,14 @@ pub struct GeneralSettings {
     /// set `store_model_in_db: true|false` parse without error.
     #[serde(default, alias = "store_model_in_db")]
     _legacy_store_model_in_db: bool,
-    /// HTTP header whose "name:value" is recorded into `boom_request_log.user_tag`
-    /// for per-user attribution when one key is shared by multiple users
-    /// (e.g. `user_tag_header: "X-User-Tag"` → `x-user-tag: alice`).
+    /// Up to 3 HTTP headers whose values are recorded (values only, joined
+    /// with ';' in configured order, e.g. `user_tag_headers: [X-User-Tag,
+    /// X-User-Id]` → `alice;7f3a`) into `boom_request_log.user_tag` for
+    /// per-user attribution when one key is shared by multiple users.
     /// None/empty disables extraction. Display-only attribution — must never
     /// participate in auth/routing decisions.
-    #[serde(default)]
-    pub user_tag_header: Option<String>,
+    #[serde(default, alias = "user_tag_header", deserialize_with = "string_or_vec_opt")]
+    pub user_tag_headers: Option<Vec<String>>,
     /// DEPRECATED — superseded by per-model `visibility: public`
     /// (see [`ModelVisibility`]). Kept for YAML backward compatibility: on
     /// load, names here are merged into the matching deployments' Public
@@ -582,7 +601,7 @@ impl Default for GeneralSettings {
             master_key: None,
             database_url: None,
             _legacy_store_model_in_db: false,
-            user_tag_header: None,
+            user_tag_headers: None,
             public_models: Vec::new(),
             responses_store: None,
         }
@@ -1582,27 +1601,38 @@ plan_settings:
     }
 
     #[test]
-    fn test_general_settings_user_tag_header() {
-        // Explicit header name parses through.
+    fn test_general_settings_user_tag_headers() {
+        // Explicit list parses through, order preserved.
         let yaml = r#"
 general_settings:
-  user_tag_header: "X-User-Tag"
+  user_tag_headers: ["X-User-Tag", "X-Request-Id"]
 "#;
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(
-            config.general_settings.user_tag_header.as_deref(),
-            Some("X-User-Tag")
+            config.general_settings.user_tag_headers,
+            Some(vec!["X-User-Tag".to_string(), "X-Request-Id".to_string()])
+        );
+
+        // Legacy singular key with a plain string → 1-element list.
+        let yaml = "general_settings:\n  user_tag_header: \"X-User-Tag\"\n";
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            config.general_settings.user_tag_headers,
+            Some(vec!["X-User-Tag".to_string()])
         );
 
         // Absent → None (feature disabled).
         let config: Config = serde_yaml::from_str("model_list: []").unwrap();
-        assert!(config.general_settings.user_tag_header.is_none());
+        assert!(config.general_settings.user_tag_headers.is_none());
 
-        // Empty string → None-like disabled state after trim at use site;
-        // keep the raw empty string out of the parsed value.
+        // Empty string entry → kept as-is; trim-and-skip happens at the
+        // extraction use site.
         let yaml = "general_settings:\n  user_tag_header: \"\"\n";
         let config: Config = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(config.general_settings.user_tag_header.as_deref(), Some(""));
+        assert_eq!(
+            config.general_settings.user_tag_headers,
+            Some(vec![String::new()])
+        );
     }
 
     #[test]

@@ -501,6 +501,7 @@ name = "boom-limiter"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "boom-config",
  "boom-core",
  "chrono",
  "dashmap",

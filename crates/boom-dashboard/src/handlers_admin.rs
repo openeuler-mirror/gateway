@@ -280,6 +280,60 @@ pub async fn set_blocklist_enabled(
     }
 }
 
+/// PUT /admin/user-tag-headers — set the DB-authoritative user_tag header
+/// list (`boom_user_tag_config` single row). Body: `{ "headers": ["h1", ...] }`.
+/// Up to 3 non-empty entries; empty list disables the feature. DB write
+/// first, memory second — a DB failure returns 500 and leaves the running
+/// list untouched.
+#[derive(Debug, Deserialize)]
+pub struct SetUserTagHeadersRequest {
+    pub headers: Vec<String>,
+}
+
+pub async fn set_user_tag_headers(
+    _session: AdminSession,
+    Extension(state): Extension<std::sync::Arc<DashboardState>>,
+    Json(req): Json<SetUserTagHeadersRequest>,
+) -> Response {
+    const MAX_USER_TAG_HEADERS: usize = 3;
+    let headers: Vec<String> = req
+        .headers
+        .into_iter()
+        .map(|h| h.trim().to_string())
+        .filter(|h| !h.is_empty())
+        .collect();
+    if headers.len() > MAX_USER_TAG_HEADERS {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!("at most {MAX_USER_TAG_HEADERS} user_tag headers are supported")
+            })),
+        )
+            .into_response();
+    }
+    let db_pool = match &state.db_pool {
+        Some(pool) => pool,
+        None => return Json(json!({"error": "Database not available"})).into_response(),
+    };
+    match state.user_tag_store.set_headers_db(db_pool, headers).await {
+        Ok(()) => {
+            tracing::info!(
+                headers = ?state.user_tag_store.get(),
+                "user_tag header list updated"
+            );
+            Json(json!({"ok": true, "headers": state.user_tag_store.get()})).into_response()
+        }
+        Err(e) => {
+            tracing::error!("set_user_tag_headers failed: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "Internal error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
 // ═══════════════════════════════════════════════════════════
 // Key management (DB operations)
 // ═══════════════════════════════════════════════════════════

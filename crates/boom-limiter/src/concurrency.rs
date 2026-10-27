@@ -1429,6 +1429,71 @@ mod tests {
         }
     }
 
+    /// Cross-crate half of the CLAUDE.md §9 single-source-of-truth contract:
+    /// the operator-facing `boom_rate_limit_plan` columns and
+    /// `boom_config::manifest::rate_limit_plan_fields()` must describe the
+    /// same field set, with the single name mapping
+    /// `total_cost_limit` (struct/manifest, Decimal) ↔
+    /// `total_cost_limit_micros` (DB column, i64). Bookkeeping columns
+    /// (`is_default`, `is_default_team`, `source`, `updated_at`) are
+    /// store-managed and intentionally unregistered. Bidirectional:
+    /// - manifest field missing from SQL → dashboard edits a column that
+    ///   never persists;
+    /// - SQL column missing from manifest → dead config, invisible on the
+    ///   dashboard.
+    #[test]
+    fn plan_sql_columns_match_manifest_fields() {
+        fn sql_tokens(sql: &str) -> std::collections::HashSet<&str> {
+            sql.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .collect()
+        }
+
+        let manifest_fields: Vec<&str> = boom_config::manifest::rate_limit_plan_fields()
+            .iter()
+            .map(|m| m.field)
+            .collect();
+        fn to_column(f: &str) -> &str {
+            if f == "total_cost_limit" { "total_cost_limit_micros" } else { f }
+        }
+
+        for sql in [PLAN_SEED_INSERT_SQL, PLAN_SNAPSHOT_SELECT_SQL] {
+            let tokens = sql_tokens(sql);
+            for f in &manifest_fields {
+                let col = to_column(f);
+                assert!(
+                    tokens.contains(col),
+                    "manifest plan field `{}` (column `{col}`) is missing from \
+                     the plan SQL — either the manifest is wrong or the store \
+                     SQL lost a column. See CLAUDE.md §9.",
+                    f
+                );
+            }
+        }
+
+        let operator_columns = [
+            "name",
+            "type",
+            "member_plan",
+            "concurrency_limit",
+            "rpm_limit",
+            "tpm_limit",
+            "window_limits",
+            "total_token_limit",
+            "total_cost_limit_micros",
+            "schedule",
+        ];
+        for col in operator_columns {
+            let field = if col == "total_cost_limit_micros" { "total_cost_limit" } else { col };
+            assert!(
+                manifest_fields.contains(&field),
+                "boom_rate_limit_plan column `{}` is missing from \
+                 manifest::rate_limit_plan_fields() — it is dead config \
+                 (invisible on the dashboard). See CLAUDE.md §9.",
+                col
+            );
+        }
+    }
+
     /// Two YAML forms — `rpm_limit: 2` vs `window_limits: [[2, null, null, 60]]`
     /// — must produce equivalent effective_limits. This is the regression guard
     /// for the boss-reported bug where commit counts were doubled when both

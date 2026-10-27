@@ -39,7 +39,10 @@ pub struct FieldMeta {
     /// UI grouping — corresponds to a `.form-card-title` section in the modal.
     pub section: &'static str,
     /// Input control type: `text` | `number` | `bool` | `password` | `select`
-    /// | `json` | `kv` | `list`.
+    /// | `json` | `kv` | `list` | `window_limits` | `schedule` | `conditions`
+    /// | `block_action`. The structured types (last four) name dedicated
+    /// sub-editors on the plan / blocklist forms — the frontend renders them
+    /// with purpose-built widgets, not generic JSON textareas.
     pub input_type: &'static str,
     /// i18n key for the field label.
     pub label_key: &'static str,
@@ -153,8 +156,8 @@ pub fn general_settings_fields() -> &'static [FieldMeta] {
         // field still parses for backward compatibility but has no UI.
         // `master_key` and `database_url` are read-only on the UI (masked);
         // not exposed in the manifest of *editable* fields.
-        FieldMeta { field: "user_tag_header", section: "general", input_type: "text",
-                    label_key: "config.field.user_tag_header", tip_key: "tip.config.user_tag_header",
+        FieldMeta { field: "user_tag_headers", section: "general", input_type: "list",
+                    label_key: "config.field.user_tag_headers", tip_key: "tip.config.user_tag_headers",
                     home: ConfigHome::Yaml },
     ]
 }
@@ -173,7 +176,7 @@ pub fn router_settings_fields() -> &'static [FieldMeta] {
                     label_key: "config.field.schedule_policy", tip_key: "tip.config.schedule_policy",
                     home: ConfigHome::Yaml },
         FieldMeta { field: "key_affinity_context_threshold", section: "router", input_type: "number",
-                    label_key: "config.field.affinity_context_threshold", tip_key: "tip.config.affinity_context_threshold",
+                    label_key: "config.field.key_affinity_context_threshold", tip_key: "tip.config.affinity_context_threshold",
                     home: ConfigHome::Yaml },
         FieldMeta { field: "rebalance_threshold", section: "router", input_type: "number",
                     label_key: "config.field.rebalance_threshold", tip_key: "tip.config.rebalance_threshold",
@@ -241,6 +244,88 @@ pub fn workflow_fields() -> &'static [FieldMeta] {
                     home: ConfigHome::Db },
         FieldMeta { field: "panel_timeout_secs", section: "workflow_def", input_type: "number",
                     label_key: "workflows.panel_timeout", tip_key: "",
+                    home: ConfigHome::Db },
+    ]
+}
+
+/// Manifest for model aliases (`boom_model_alias`, DB-owned). Edited via the
+/// alias card embedded in the model edit dialog (`AliasInput` shape).
+/// `source` / `updated_at` are provenance columns — same exclusion as the
+/// deployment manifest.
+pub fn alias_fields() -> &'static [FieldMeta] {
+    &[
+        FieldMeta { field: "alias_name", section: "alias", input_type: "text",
+                    label_key: "form.alias.name", tip_key: "tip.alias.name",
+                    home: ConfigHome::Db },
+        FieldMeta { field: "target_model", section: "alias", input_type: "text",
+                    label_key: "form.alias.target", tip_key: "tip.alias.target",
+                    home: ConfigHome::Db },
+        FieldMeta { field: "hidden", section: "alias", input_type: "bool",
+                    label_key: "form.alias.hidden", tip_key: "tip.alias.hidden",
+                    home: ConfigHome::Db },
+    ]
+}
+
+/// Manifest for rate-limit plans (`boom_rate_limit_plan`, DB-owned). Maps the
+/// `RateLimitPlan` struct field-for-field (10 fields). The `is_default` /
+/// `is_default_team` flag columns are intentionally excluded — they are the
+/// default-plan pointers, swapped via the dedicated `PUT /admin/plans/default`
+/// endpoint, not plan-definition fields. `source` / `updated_at` are
+/// provenance columns.
+pub fn rate_limit_plan_fields() -> &'static [FieldMeta] {
+    &[
+        FieldMeta { field: "name", section: "plan", input_type: "text",
+                    label_key: "form.plan.name", tip_key: "tip.plan.name",
+                    home: ConfigHome::Db },
+        FieldMeta { field: "type", section: "plan", input_type: "select",
+                    label_key: "form.plan.type", tip_key: "tip.plan.type",
+                    home: ConfigHome::Db },
+        FieldMeta { field: "member_plan", section: "plan", input_type: "text",
+                    label_key: "form.plan.member_plan", tip_key: "tip.plan.member_plan",
+                    home: ConfigHome::Db },
+        FieldMeta { field: "concurrency_limit", section: "plan", input_type: "number",
+                    label_key: "form.plan.concurrency", tip_key: "tip.plan.concurrency",
+                    home: ConfigHome::Db },
+        FieldMeta { field: "rpm_limit", section: "plan", input_type: "number",
+                    label_key: "form.plan.rpm", tip_key: "tip.plan.rpm",
+                    home: ConfigHome::Db },
+        FieldMeta { field: "tpm_limit", section: "plan", input_type: "number",
+                    label_key: "form.plan.tpm", tip_key: "tip.plan.tpm",
+                    home: ConfigHome::Db },
+        FieldMeta { field: "window_limits", section: "plan", input_type: "window_limits",
+                    label_key: "form.plan.windows", tip_key: "tip.plan.windows",
+                    home: ConfigHome::Db },
+        FieldMeta { field: "total_token_limit", section: "plan", input_type: "number",
+                    label_key: "form.plan.total_token", tip_key: "tip.plan.total_token",
+                    home: ConfigHome::Db },
+        FieldMeta { field: "total_cost_limit", section: "plan", input_type: "number",
+                    label_key: "form.plan.total_cost", tip_key: "tip.plan.total_cost",
+                    home: ConfigHome::Db },
+        FieldMeta { field: "schedule", section: "plan", input_type: "schedule",
+                    label_key: "form.plan.schedule", tip_key: "tip.plan.schedule",
+                    home: ConfigHome::Db },
+    ]
+}
+
+/// Manifest for client block rules (`boom_client_block_rule`, DB-owned).
+/// Maps the `BlockRule` struct: `conditions` is a list of
+/// `{field, op, value}` matchers (op ∈ eq/contains/regex/prefix/exists),
+/// `action` is `{message, status, code}`. The global blocklist switch lives
+/// in `boom_client_blocklist_state` and is toggled via
+/// `PUT /admin/blocklist/enabled` — not a rule field.
+pub fn block_rule_fields() -> &'static [FieldMeta] {
+    &[
+        FieldMeta { field: "name", section: "block_rule", input_type: "text",
+                    label_key: "blockrules.form.name", tip_key: "",
+                    home: ConfigHome::Db },
+        FieldMeta { field: "enabled", section: "block_rule", input_type: "bool",
+                    label_key: "blockrules.form.enabled", tip_key: "",
+                    home: ConfigHome::Db },
+        FieldMeta { field: "conditions", section: "block_rule", input_type: "conditions",
+                    label_key: "blockrules.form.conditions", tip_key: "blockrules.form.conditions_hint",
+                    home: ConfigHome::Db },
+        FieldMeta { field: "action", section: "block_rule", input_type: "block_action",
+                    label_key: "blockrules.form.action_title", tip_key: "",
                     home: ConfigHome::Db },
     ]
 }
@@ -325,6 +410,9 @@ mod tests {
             router_settings_fields(),
             cost_template_fields(),
             workflow_fields(),
+            alias_fields(),
+            rate_limit_plan_fields(),
+            block_rule_fields(),
         ];
         let mut total = 0;
         for manifest in all_manifests {
@@ -357,6 +445,9 @@ mod tests {
             .iter()
             .chain(cost_template_fields())
             .chain(workflow_fields())
+            .chain(alias_fields())
+            .chain(rate_limit_plan_fields())
+            .chain(block_rule_fields())
         {
             assert_eq!(
                 m.home,
@@ -418,6 +509,83 @@ mod tests {
                 manifest_fields.contains(f),
                 "field `{}` is missing from `router_settings_fields()` manifest.\n\
                  This breaks the frontend auto-render contract (CLAUDE.md §9).\n\
+                 Add a FieldMeta entry in `boom-config/src/manifest.rs`.",
+                f
+            );
+        }
+    }
+
+    /// `BlockRule` lives in this crate (lib.rs), so this is a real
+    /// struct-coverage test. The global blocklist switch is NOT a rule field
+    /// (it lives in `boom_client_blocklist_state`, see `block_rule_fields`
+    /// docs).
+    #[test]
+    fn block_rule_manifest_covers_struct_fields() {
+        let manifest_fields: Vec<&str> = block_rule_fields()
+            .iter()
+            .map(|m| m.field)
+            .collect();
+        let required_fields = ["name", "enabled", "conditions", "action"];
+        for f in &required_fields {
+            assert!(
+                manifest_fields.contains(f),
+                "field `{}` is missing from `block_rule_fields()` manifest.\n\
+                 Add a FieldMeta entry in `boom-config/src/manifest.rs`.",
+                f
+            );
+        }
+    }
+
+    /// boom-config is a leaf crate and cannot reflect boom-routing's alias
+    /// store struct, so the required set is handwritten here (mirrors the
+    /// `boom_model_alias` columns). The real anti-drift guard is the
+    /// cross-check test in `boom-routing/src/alias_store.rs` asserting the
+    /// SQL columns cover this manifest — if either side changes without the
+    /// other, that test fails.
+    #[test]
+    fn alias_manifest_covers_store_fields() {
+        let manifest_fields: Vec<&str> = alias_fields()
+            .iter()
+            .map(|m| m.field)
+            .collect();
+        let required_fields = ["alias_name", "target_model", "hidden"];
+        for f in &required_fields {
+            assert!(
+                manifest_fields.contains(f),
+                "field `{}` is missing from `alias_fields()` manifest.\n\
+                 Add a FieldMeta entry in `boom-config/src/manifest.rs`.",
+                f
+            );
+        }
+    }
+
+    /// Handwritten set mirroring boom-limiter's `RateLimitPlan` columns
+    /// (is_default / is_default_team / source / updated_at are store-managed
+    /// bookkeeping, not operator-editable fields). Anti-drift guard is the
+    /// cross-check test in `boom-limiter/src/concurrency.rs` asserting the
+    /// plan SQL covers this manifest.
+    #[test]
+    fn rate_limit_plan_manifest_covers_struct_fields() {
+        let manifest_fields: Vec<&str> = rate_limit_plan_fields()
+            .iter()
+            .map(|m| m.field)
+            .collect();
+        let required_fields = [
+            "name",
+            "type",
+            "member_plan",
+            "concurrency_limit",
+            "rpm_limit",
+            "tpm_limit",
+            "window_limits",
+            "total_token_limit",
+            "total_cost_limit",
+            "schedule",
+        ];
+        for f in &required_fields {
+            assert!(
+                manifest_fields.contains(f),
+                "field `{}` is missing from `rate_limit_plan_fields()` manifest.\n\
                  Add a FieldMeta entry in `boom-config/src/manifest.rs`.",
                 f
             );

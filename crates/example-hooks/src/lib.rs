@@ -31,8 +31,8 @@
 //!
 //! hook 返回的 `headers` 字段（`PreAuthResponse::headers`）可以让 hook
 //! 为请求构造自定义 HTTP header。本 demo 把 key 场景标记写入
-//! `X-User-Tag`——配合审计日志的 `general_settings.user_tag_header:
-//! "X-User-Tag"` 配置，即可实现"hook 动态计算归因标记 + 审计日志按标记
+//! `X-User-Tag`——配合审计日志的 `general_settings.user_tag_headers:
+//! ["X-User-Tag"]` 配置，即可实现"hook 动态计算归因标记 + 审计日志按标记
 //! 统计用量"（比如这里从 key 推场景，生产环境可换成解 JWT / 查内部表）。
 //!
 //! 网关把这些 header **当成普通请求头**处理：

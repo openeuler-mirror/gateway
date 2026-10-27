@@ -3967,6 +3967,7 @@
             <div class="form-group"><label>${t("form.model.provider")} * ${tip(t("tip.model.provider"))}</label><select id="m-model-provider"><option value="">${t("common.select_placeholder")}</option><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option><option value="azure">Azure OpenAI</option><option value="gemini">Google Gemini</option><option value="bedrock">AWS Bedrock</option></select></div>
             <div class="form-group"><label>${t("form.model.id")} * ${tip(t("tip.model.id"))}</label><input id="m-model-id" value="${esc((p.litellm_model || "").includes("/") ? p.litellm_model.split("/").slice(1).join("/") : p.litellm_model || "")}" required></div>
             <div class="form-group field-full"><label>${t("form.model.base")} ${tip(t("tip.model.base"))}</label><input id="m-model-base" value="${esc(p.api_base || "")}" placeholder="https://api.openai.com/v1"></div>
+            <div class="form-group field-full"><label>${t("form.model.version")} ${tip(t("tip.model.version"))}</label><input id="m-model-api-version" value="${esc(p.api_version || "")}" placeholder="2024-02-01 (Azure)"></div>
             <div class="form-group"><label>${t("form.model.timeout")} ${tip(t("tip.model.timeout"))}</label><input id="m-model-timeout" type="number" value="${p.timeout || 1200}"></div>
             <div class="form-group"><label>${t("form.model.temp")} ${tip(t("tip.model.temp"))}</label><input id="m-model-temp" type="number" step="0.1" value="${p.temperature || ""}"></div>
             <div class="form-group"><label>${t("form.model.maxtok")} ${tip(t("tip.model.maxtok"))}</label><input id="m-model-maxtok" type="number" value="${p.max_tokens || ""}"></div>
@@ -4093,6 +4094,7 @@
           api_key: document.getElementById("m-model-key").value || null,
           api_key_env: document.getElementById("m-model-key-env").checked,
           api_base: document.getElementById("m-model-base").value || null,
+          api_version: document.getElementById("m-model-api-version").value.trim() || null,
           aws_region_name: document.getElementById("m-model-aws-region").value || null,
           aws_access_key_id: document.getElementById("m-model-aws-key").value || null,
           aws_secret_access_key: document.getElementById("m-model-aws-secret").value || null,
@@ -4575,9 +4577,9 @@
       <div class="form-card-grid">
         <div class="form-group"><label>${t("config.field.master_key")}</label><input value="${esc(masked(g.master_key))}" readonly style="opacity:.6"></div>
         <div class="form-group"><label>${t("config.field.database_url")}</label><input value="${esc(masked(g.database_url))}" readonly style="opacity:.6"></div>
-        <div class="form-group field-full"><label for="cfg-gen-user-tag-hdr">${t("config.field.user_tag_header")} ${tip(t("tip.config.user_tag_header"))}</label><input id="cfg-gen-user-tag-hdr" value="${esc(g.user_tag_header || "")}" placeholder="X-User-Tag"></div>
-        ${fieldCheckbox("cfg-gen-priority-hdr", t("config.field.enable_priority_header"), router.enable_priority_header)}
-        ${fieldCheckbox("cfg-gen-strip-cc", t("config.field.strip_claude_code_attribution"), router.strip_claude_code_attribution)}
+        <div class="form-group field-full"><label for="cfg-gen-user-tag-hdr">${t("config.field.user_tag_headers")} ${tip(t("tip.config.user_tag_headers"))}</label><input id="cfg-gen-user-tag-hdr" value="${esc((g.user_tag_headers || []).join(", "))}" placeholder="X-User-Tag, X-Request-Id, X-Trace-Id"></div>
+        ${fieldCheckbox("cfg-gen-priority-hdr", t("config.field.enable_priority_header"), router.enable_priority_header, { tip: t("tip.config.enable_priority_header") })}
+        ${fieldCheckbox("cfg-gen-strip-cc", t("config.field.strip_claude_code_attribution"), router.strip_claude_code_attribution, { tip: t("tip.config.strip_claude_code_attribution") })}
         ${fieldFullList("cfg-gen-forward-hdrs", t("config.field.forward_client_headers"), router.forward_client_headers || [])}
       </div>
       <p class="modal-hint">${t("config.tip.master_key_readonly")}</p>
@@ -4770,9 +4772,9 @@
       <div class="form-card-grid">
         ${fieldSelect("cfg-rs-policy", t("config.field.schedule_policy"), buildPolicyOptions(),
           r.schedule_policy || "round_robin", { tip: t("tip.config.schedule_policy") })}
-        ${fieldNum("cfg-rs-affinity-ctx", t("config.field.key_affinity_context_threshold"), r.key_affinity_context_threshold || 0, { min: 0 })}
-        ${fieldNum("cfg-rs-affinity-rebal", t("config.field.rebalance_threshold"), r.rebalance_threshold || 20, { min: 1, step: 1 })}
-        ${fieldNum("cfg-rs-flow-timeout", t("config.field.flow_control_queue_timeout_secs"), r.flow_control_queue_timeout_secs || 1200, { min: 1, step: 1 })}
+        ${fieldNum("cfg-rs-affinity-ctx", t("config.field.key_affinity_context_threshold"), r.key_affinity_context_threshold || 0, { min: 0, tip: t("tip.config.affinity_context_threshold") })}
+        ${fieldNum("cfg-rs-affinity-rebal", t("config.field.rebalance_threshold"), r.rebalance_threshold || 20, { min: 1, step: 1, tip: t("tip.config.rebalance_threshold") })}
+        ${fieldNum("cfg-rs-flow-timeout", t("config.field.flow_control_queue_timeout_secs"), r.flow_control_queue_timeout_secs || 1200, { min: 1, step: 1, tip: t("tip.config.flow_control_queue_timeout_secs") })}
       </div>
       <details class="form-card-collapsible" id="cfg-kvc-details">
         <summary>
@@ -5182,17 +5184,31 @@
           workers: numOr($("cfg-server-workers"), 4),
         });
       } else if (kind === "general") {
-        // These three live under router_settings in YAML but are surfaced on
-        // the General card. Sub-path writes avoid replacing the whole
-        // router_settings section (which would clobber scheduling fields).
-        // user_tag_header is a true general_settings field; empty input saves
-        // null = extraction disabled.
-        await saveConfigSections([
+        // user_tag_headers is DB-authoritative (boom_user_tag_config) — direct
+        // PUT to the dedicated endpoint, immediate effect, no YAML write.
+        // Comma-separated input → array (validated ≤3); empty = disabled.
+        // The three router_settings sub-paths stay on the YAML channel
+        // (process-level config) — sub-path writes avoid replacing the whole
+        // router_settings section. One confirm covers both channels.
+        const tagHeaders = $("cfg-gen-user-tag-hdr").value
+          .split(",").map(s => s.trim()).filter(Boolean);
+        if (tagHeaders.length > 3) {
+          throw new Error(t("config.error.user_tag_max_headers"));
+        }
+        if (!confirm(t("common.confirm_write"))) throw new Error(t("common.canceled"));
+        await api("/admin/user-tag-headers", {
+          method: "PUT", skipConfirm: true,
+          body: JSON.stringify({ headers: tagHeaders }),
+        });
+        for (const [path, value] of [
           ["router_settings.enable_priority_header", $("cfg-gen-priority-hdr").checked],
           ["router_settings.strip_claude_code_attribution", $("cfg-gen-strip-cc").checked],
           ["router_settings.forward_client_headers", parseListInput($("cfg-gen-forward-hdrs"))],
-          ["general_settings.user_tag_header", $("cfg-gen-user-tag-hdr").value.trim() || null],
-        ]);
+        ]) {
+          await api("/admin/config", { method: "PUT", skipConfirm: true, body: JSON.stringify({ path, value }) });
+        }
+        showToast(t("config.saved"));
+        await loadConfigPage();
       } else if (kind === "responses") {
         await saveConfigSections([
           ["general_settings.responses_store", {

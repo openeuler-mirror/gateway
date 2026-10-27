@@ -11,6 +11,13 @@ use sqlx::PgPool;
 use crate::BlockRuleStore;
 use boom_config::{BlockAction, BlockRule, MatchCondition};
 
+/// Column list for the block-rule upsert INSERT. Kept as a named const so
+/// the manifest cross-check test (tests::block_rule_sql_columns_match_
+/// manifest_fields) checks the SAME string production code executes. See
+/// CLAUDE.md §9.
+const BLOCK_RULE_UPSERT_INSERT_SQL: &str = r#"INSERT INTO boom_client_block_rule (rule_name, enabled, conditions, action, source)
+                   VALUES ($1, $2, $3, $4, 'db')"#;
+
 /// Row from `boom_client_block_rule`.
 #[derive(Debug, sqlx::FromRow, Serialize)]
 pub struct BlockRuleRow {
@@ -132,10 +139,7 @@ impl BlockRuleStore {
             .bind(input.enabled)
             .bind(serde_json::to_value(&input.conditions).unwrap_or(serde_json::Value::Array(vec![])))
             .bind(serde_json::to_value(&input.action).unwrap_or(serde_json::Value::Null)),
-            || sqlx::query(
-                r#"INSERT INTO boom_client_block_rule (rule_name, enabled, conditions, action, source)
-                   VALUES ($1, $2, $3, $4, 'db')"#,
-            )
+            || sqlx::query(BLOCK_RULE_UPSERT_INSERT_SQL)
             .bind(&input.name)
             .bind(input.enabled)
             .bind(serde_json::to_value(&input.conditions).unwrap_or(serde_json::Value::Array(vec![])))
@@ -266,5 +270,57 @@ impl BlockRuleStore {
         )?;
         self.set_enabled(enabled);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Cross-crate half of the CLAUDE.md §9 single-source-of-truth contract:
+    /// the operator-facing `boom_client_block_rule` columns and
+    /// `boom_config::manifest::block_rule_fields()` must describe the same
+    /// field set, with the single name mapping `name` (struct/manifest) ↔
+    /// `rule_name` (DB column). Bookkeeping columns (`source`,
+    /// `updated_at`) are store-managed and intentionally unregistered. The
+    /// global blocklist switch is NOT a rule field — it lives in
+    /// `boom_client_blocklist_state` behind `PUT /admin/blocklist/enabled`.
+    /// Bidirectional: manifest field missing from SQL → the dashboard edits
+    /// a column that never persists; SQL column missing from manifest →
+    /// dead config, invisible on the dashboard.
+    #[test]
+    fn block_rule_sql_columns_match_manifest_fields() {
+        fn sql_tokens(sql: &str) -> std::collections::HashSet<&str> {
+            sql.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .collect()
+        }
+
+        let tokens = sql_tokens(super::BLOCK_RULE_UPSERT_INSERT_SQL);
+        fn to_column(f: &str) -> &str {
+            if f == "name" { "rule_name" } else { f }
+        }
+
+        let manifest_fields: Vec<&str> = boom_config::manifest::block_rule_fields()
+            .iter()
+            .map(|m| m.field)
+            .collect();
+        for f in &manifest_fields {
+            let col = to_column(f);
+            assert!(
+                tokens.contains(col),
+                "manifest block-rule field `{}` (column `{col}`) is not a \
+                 boom_client_block_rule column — either the manifest is wrong \
+                 or the store SQL is missing it. See CLAUDE.md §9.",
+                f
+            );
+        }
+        for col in ["rule_name", "enabled", "conditions", "action"] {
+            let field = if col == "rule_name" { "name" } else { col };
+            assert!(
+                manifest_fields.contains(&field),
+                "boom_client_block_rule column `{}` is missing from \
+                 manifest::block_rule_fields() — it is dead config (invisible \
+                 on the dashboard). See CLAUDE.md §9.",
+                col
+            );
+        }
     }
 }

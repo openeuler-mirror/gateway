@@ -735,7 +735,7 @@ workflow_settings:
 }
 
 // ═════════════════════════════════════════════════════════════════
-// user_tag_header / client_blocklist — !98 新增配置段
+// user_tag_headers / client_blocklist — !98 新增配置段
 // ═════════════════════════════════════════════════════════════════
 
 /// 最小可解析配置（只保证 serde 通过，不跑 validate）。
@@ -754,22 +754,31 @@ general_settings:
     )
 }
 
-/// DT-CFG-38：general_settings.user_tag_header —— 审计 per-user 归因头配置：
-/// 显式设置 / 缺省 None / 空串（audit 侧按"空即关闭"处理）。
+/// DT-CFG-38：general_settings.user_tag_headers —— 审计 per-user 归因头配置：
+/// 列表形式 / 旧 YAML 单数 key 字符串兼容 / 缺省 None（audit 侧按
+/// "空即关闭"处理）。
 #[test]
-fn user_tag_header_present_default_and_empty() {
-    // 显式设置
+fn user_tag_headers_present_default_and_legacy_string() {
+    // 列表形式（多 header，顺序即存储顺序）
+    let config = config_from_yaml(&minimal_yaml(
+        "  user_tag_headers: [X-User-Tag, X-Request-Id]\n",
+    ));
+    assert_eq!(
+        config.general_settings.user_tag_headers,
+        Some(vec!["X-User-Tag".to_string(), "X-Request-Id".to_string()])
+    );
+
+    // 旧 YAML 单数 key + 字符串 → serde alias 兼容为单元素列表
     let config = config_from_yaml(&minimal_yaml("  user_tag_header: X-User-Tag\n"));
-    assert_eq!(config.general_settings.user_tag_header.as_deref(), Some("X-User-Tag"));
+    assert_eq!(
+        config.general_settings.user_tag_headers,
+        Some(vec!["X-User-Tag".to_string()])
+    );
 
     // 缺省 → None（归因关闭）；client_blocklist 整段缺省也是 None
     let config = config_from_yaml(&minimal_yaml(""));
-    assert_eq!(config.general_settings.user_tag_header, None);
+    assert_eq!(config.general_settings.user_tag_headers, None);
     assert!(config.client_blocklist.is_none());
-
-    // 空串 → Some("")
-    let config = config_from_yaml(&minimal_yaml("  user_tag_header: \"\"\n"));
-    assert_eq!(config.general_settings.user_tag_header.as_deref(), Some(""));
 }
 
 /// DT-CFG-39：client_blocklist —— 客户端封禁规则配置解析：enabled / rule

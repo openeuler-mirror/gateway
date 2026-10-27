@@ -116,8 +116,16 @@ Dashboard 需要执行写操作（创建模型、修改配置等）时：
 
 ### 7. 热加载（Hot Reload）与配置权威模型
 
+**配置归属三判据**——新增配置项时先过这三个测试，决定它进 YAML 还是 DB：
+
+1. **自举测试**：读取它是否必须先于"能连上 DB"？是 → 本地（db_url、master_key、监听地址必须本地，否则鸡生蛋）。
+2. **本地性测试**：语义是否绑定本机环境（文件路径、线程数、连接池大小、OTLP endpoint）？是 → 本地。多实例共用一个值恰恰是坏味道（两台机器不该共享同一个路径）。
+3. **生效方式测试**：改动它是否需要重启进程才生效？是 → 本地。热生效（reload/直改内存）的配置适合 DB。
+
+三个测试都不过 → 进 DB，且**必须在看板上可见可编辑**（否则就是死配置）。配套角色分界：**YAML = 部署者的环境参数，DB = 运营者的业务参数**。
+
 - SIGHUP / `POST /admin/config/reload` 触发热加载。
-- **DB 是唯一运行时权威（业务配置）**：model_list、alias、plan、client_blocklist、workflow_settings、cost 模板全部以 DB 为准。YAML 中的这些 runtime section **完全 inert**（reload 忽略、启动只作 seed）。
+- **DB 是唯一运行时权威（业务配置）**：model_list、alias、plan、client_blocklist（含 enabled 开关与规则）、workflow_settings、cost 模板、`general_settings.user_tag_headers`（业务观测配置，唯一从 general_settings 迁出的例外）全部以 DB 为准。YAML 中的这些 runtime section / 字段 **完全 inert**（reload 忽略、启动只作 seed）。
 - **YAML 只保留进程/主机级配置**：server、general_settings（master_key/database_url）、router 调度参数、prompt_log、trace、hooks、deployment_health_check。自举链（db_url/master_key/监听地址）永远来自 YAML 或环境变量。
 - **seed 幂等**：启动时若业务表全空且 `boom_config_meta` 无 seed 标记，才从 YAML runtime section 导入（`seed_if_empty`，单事务 + advisory lock，GaussDB 不支持时 warn 降级）。标记存在则跳过——"删光模型后重启被 YAML 复活"不会发生。灾备恢复 = 空库 + 回写生成的 YAML 快照重启。
 - **无 DB 回退模式**（`general_settings.database_url` 缺失，master-key-only/e2e fixture）：保留 YAML 构建路径（clear+rebuild），这是部署形态选择（Kong dbless 模式），不是双权威合并。
@@ -171,7 +179,7 @@ CRUD handler（model/alias/plan/quota/blocklist/workflow/cost template 等）的
 - **回写按钮**（`POST /dashboard/api/admin/config/writeback`）：同上管道 → 写回启动文件（先 `.bak` 单槽备份）。env bootstrap 模式下则在 cwd 生成新 `config.yaml`（0600）。用途 = 回滚种子/灾备工件，**不是**恢复同步语义。
 - 文件含明文 secrets（api_key 等）——0600、视同备份工件。
 
-**进程级配置写路径不变**：Config 页 section editor 走 `update_config_section`（读 YAML → 改单 section → 写回 → reload），但带**黑名单**：`model_list` / `plan_settings` / `client_blocklist` / `router_settings.model_group_alias` / `workflow_settings` / `cost_templates` 一律拒绝并指向 Dashboard CRUD。env bootstrap 模式（无文件）下 section editor 报错指向回写按钮。
+**进程级配置写路径不变**：Config 页 section editor 走 `update_config_section`（读 YAML → 改单 section → 写回 → reload），但带**黑名单**（`DB_OWNED_PATHS`，与 state.rs 保持同步）：`model_list` / `plan_settings` / `client_blocklist` / `router_settings.model_group_alias` / `workflow_settings` / `cost_templates` / `general_settings.user_tag_headers` 一律拒绝并指向 Dashboard CRUD（最后一项走 `PUT /admin/user-tag-headers`）。env bootstrap 模式（无文件）下 section editor 报错指向回写按钮。
 
 **plan_settings.default_plan / default_team_plan / client_blocklist.enabled 三个原 YAML 项**已 DB 化（`boom_rate_limit_plan.is_default_team` 部分唯一索引 + `boom_client_blocklist_state` 单行表），各有专属 Dashboard 端点。
 

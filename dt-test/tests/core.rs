@@ -174,7 +174,7 @@ fn error_should_log_to_db_excludes_expected_rejections() {
 
 // ── should_dedup_log ──
 
-/// DT-CORE-04：should_dedup_log 8 变体白名单返回 true，其余 false。
+/// DT-CORE-04：should_dedup_log 12 变体白名单返回 true，其余 false。
 #[test]
 fn error_should_dedup_log_whitelist() {
     // 白名单成员
@@ -191,14 +191,14 @@ fn error_should_dedup_log_whitelist() {
     assert!(GatewayError::ModelNotAllowed("gpt-x".into()).should_dedup_log());
     assert!(GatewayError::KeyExpired.should_dedup_log());
     assert!(GatewayError::KeyBlocked.should_dedup_log());
+    assert!(GatewayError::AuthError("bad key".into()).should_dedup_log());
+    assert!(GatewayError::ProviderError("upstream".into()).should_dedup_log());
+    assert!(GatewayError::UpstreamTimeout.should_dedup_log());
+    assert!(GatewayError::UpstreamError { status: 500, message: "x".into() }.should_dedup_log());
 
     // 非白名单 — 保留全量日志
-    assert!(!GatewayError::AuthError("bad key".into()).should_dedup_log());
-    assert!(!GatewayError::ProviderError("upstream".into()).should_dedup_log());
     assert!(!GatewayError::UpstreamParseError { parse_error: "e".into(), raw_body: "b".into() }
         .should_dedup_log());
-    assert!(!GatewayError::UpstreamTimeout.should_dedup_log());
-    assert!(!GatewayError::UpstreamError { status: 500, message: "x".into() }.should_dedup_log());
     assert!(!GatewayError::ConfigError("cfg".into()).should_dedup_log());
     assert!(!GatewayError::InternalError("boom".into()).should_dedup_log());
     assert!(!GatewayError::NotSupported("embeddings".into()).should_dedup_log());
@@ -206,8 +206,8 @@ fn error_should_dedup_log_whitelist() {
 }
 
 /// DT-CORE-05：should_dedup_log 是 !should_log_to_db 的超集——
-/// 不进 DB 的 4 类必然 dedup，额外 4 类（NotFound/NotAllowed/Expired/Blocked）
-/// dedup 但仍进 DB（窗口内首条写库）。
+/// 不进 DB 的 4 类必然 dedup，其余 dedup 成员（NotFound/NotAllowed/Expired/
+/// Blocked/AuthError/Upstream 三类）dedup 但仍进 DB（窗口内首条写库）。
 #[test]
 fn error_dedup_superset_of_non_db() {
     let non_db = [
@@ -229,6 +229,10 @@ fn error_dedup_superset_of_non_db() {
         GatewayError::ModelNotAllowed("gpt-x".into()),
         GatewayError::KeyExpired,
         GatewayError::KeyBlocked,
+        GatewayError::AuthError("bad key".into()),
+        GatewayError::ProviderError("upstream".into()),
+        GatewayError::UpstreamTimeout,
+        GatewayError::UpstreamError { status: 500, message: "x".into() },
     ];
     for e in &dedup_but_db {
         assert!(e.should_dedup_log());

@@ -155,6 +155,17 @@ impl ResponseStore {
             items.drain(..drop);
         }
 
+        // (response_id, id) pkey guard: the assembled turn can carry the
+        // same item id twice — clients echo prior-turn items in `input`
+        // alongside `previous_response_id`, or repeat an id within the
+        // input itself. Keep the first occurrence (history order; later
+        // copies are the same item by id).
+        let mut seen_ids = std::collections::HashSet::new();
+        items.retain(|item| {
+            let id = item.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+            id.is_empty() || seen_ids.insert(id.to_string())
+        });
+
         let mut history_ids: Vec<Value> = Vec::with_capacity(items.len());
         for item in &mut items {
             if item.get("id").and_then(|v| v.as_str()).unwrap_or_default().is_empty() {
@@ -172,7 +183,7 @@ impl ResponseStore {
             "INSERT INTO boom_response \
              (id, previous_response_id, key_hash, model, instructions, tools_json, \
               history_item_ids, status, response_json, expires_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW() + make_interval(secs => $10::bigint))",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW() + ($10::bigint * INTERVAL '1 second'))",
         )
         .bind(&turn.response_id)
         .bind(&turn.previous_response_id)
@@ -230,6 +241,33 @@ impl ResponseStore {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// GaussDB runs a PG 9.2 kernel: SQL written against modern PostgreSQL
+    /// compiles fine on a local native PG and then fails at runtime in
+    /// production (fd97457: the upsert conflict clause; 2026-10: the PG 9.4
+    /// interval-builder function in the persist INSERT). This self-scan
+    /// fails the build if any construct the 9.2 kernel lacks is
+    /// reintroduced. Upserts must use `boom_core::gaussdb_upsert!`; interval
+    /// math must use `INTERVAL '..'` literals.
+    #[test]
+    fn sql_avoids_gaussdb_missing_constructs() {
+        let src = include_str!("lib.rs");
+        // Assembled at runtime so this test's own source doesn't trip the scan.
+        let banned: [String; 4] = [
+            ["make_", "interval"].concat(),
+            ["ON ", "CONFLICT"].concat(),
+            ["to_", "jsonb("].concat(),
+            ["gen_", "random_uuid"].concat(),
+        ];
+        for b in &banned {
+            assert!(
+                !src.contains(b.as_str()),
+                "SQL construct `{b}` is not available on the GaussDB (PG 9.2) \
+                 deployment target — use boom_core::gaussdb_upsert! for upserts \
+                 and `INTERVAL '..'` literals for interval math",
+            );
+        }
+    }
 
     /// DB-backed tests run only when a test database is provided; otherwise
     /// they soft-skip (local runs without PG stay green).
@@ -294,6 +332,34 @@ mod tests {
 
         let got = store.get(&id, "key-a").await.unwrap().unwrap();
         assert_eq!(got["id"], json!(id));
+    }
+
+    /// The assembled turn may carry an item id twice (client echoes
+    /// prior-turn items in `input` alongside `previous_response_id`, or
+    /// repeats an id within the input) — the (response_id, id) pkey used
+    /// to abort the whole persist with a duplicate-key error. The store
+    /// must dedupe, keeping the first occurrence.
+    #[tokio::test]
+    async fn duplicate_item_ids_within_turn_dedupe_to_one() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("skipping (no BOOM_RESPONSES_TEST_DATABASE_URL)");
+            return;
+        };
+        let store = ResponseStore::new(Some(pool));
+        let id = format!("resp_test_{}", uuid::Uuid::new_v4().simple());
+        store
+            .persist_turn(turn(&id, "key-dup", vec![
+                json!({ "type": "message", "id": "m1", "role": "user", "content": "q" }),
+                json!({ "type": "message", "id": "m1", "role": "user", "content": "q" }),
+                json!({ "type": "message", "role": "assistant", "content": "a" }),
+            ]))
+            .await
+            .unwrap();
+
+        let hydrated = store.rehydrate(&id, "key-dup").await.unwrap();
+        let m1_count = hydrated.items.iter().filter(|i| i["id"] == "m1").count();
+        assert_eq!(m1_count, 1, "duplicate id must be stored exactly once");
+        assert_eq!(hydrated.items.len(), 2);
     }
 
     #[tokio::test]
