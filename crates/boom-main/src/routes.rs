@@ -4412,6 +4412,44 @@ pub async fn responses(
         )
         .unwrap_or(serde_json::Value::Null);
 
+        // Prompt log (non-stream): emit Request-phase then Response-phase
+        // with the assembled ResponseObject — mirrors the chat-completions
+        // non-stream path. Stream requests are wrapped by PromptLogStream in
+        // the branch above; without this, non-stream /v1/responses requests
+        // produced zero prompt-log entries.
+        if let Some(sender) = prompt_log_sender {
+            if let Some(req_body) = prompt_log_req_body {
+                let request_entry = PromptLogEntry::new_request(
+                    prompt_log_rid.as_deref().unwrap_or_default(),
+                    prompt_log_trace_id.clone(),
+                    &identity.key_hash,
+                    identity.key_alias.as_deref(),
+                    identity.team_alias.as_deref(),
+                    prompt_log_model.as_deref().unwrap_or_default(),
+                    "/v1/responses",
+                    false,
+                    req_body,
+                    Some(client_ip.as_str()),
+                    prompt_log_headers.clone(),
+                );
+                let _ = sender.send(request_entry.clone());
+                let mut response_entry = PromptLogEntry::new_response_from(&request_entry);
+                let resp_arc = Arc::new(responses_value.clone());
+                response_entry.set_response(resp_arc.clone());
+                if let Some(g) = trace_guard.as_ref() {
+                    if trace_cfg.capture_body {
+                        g.set_llm_response(resp_arc);
+                    }
+                }
+                if let Some(cap) = prompt_log_raw_capture.as_ref() {
+                    response_entry
+                        .set_raw_exchange(cap.take_request_body(), cap.take_response_body());
+                }
+                response_entry.set_status(200, duration_ms as u64);
+                let _ = sender.send(response_entry);
+            }
+        }
+
         // P1 persist (non-stream): awaited on purpose — the OpenAI contract
         // makes the id retrievable/continuable as soon as POST returns.
         if let Some(ctx) = persist_ctx {
