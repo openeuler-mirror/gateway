@@ -144,10 +144,10 @@ impl FromRequestParts<AppState> for RequiredAuth {
         // for upstream forwarding all apply unchanged.
         apply_hook_headers(&mut parts.headers, &hook_result.headers);
 
-        // Per-user attribution tag (configured header) — extracted AFTER
+        // Per-user attribution tag (configured headers) — extracted AFTER
         // hook header injection so hook-constructed tags are attributed on
         // every path, including auth failures (a 401 from a shared key
-        // still shows which user sent it). No-op when user_tag_header is
+        // still shows which user sent it). No-op when user_tag_headers is
         // unconfigured.
         let user_tag = extract_user_tag(&inner.config.general_settings, &parts.headers);
 

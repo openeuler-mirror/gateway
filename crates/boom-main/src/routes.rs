@@ -159,43 +159,54 @@ pub(crate) fn extract_client_ip(headers: &axum::http::HeaderMap, remote_addr: Op
     "unknown".to_string()
 }
 
-/// Extract the per-user attribution tag from the configured header.
+/// Extract the per-user attribution tag from the configured headers.
 ///
-/// Reads `general_settings.user_tag_header` (hot-reloadable), pulls the
-/// matching request header, and formats it as `"{lowercase_name}:{value}"`
-/// (e.g. `x-user-tag: alice`) so the audit row is self-describing even if
-/// the configured header name changes later. Repeated headers are joined
-/// with ','; a whitespace-only value counts as absent; the value is
-/// truncated to 256 bytes (header values can legally reach 8 KiB).
-/// Returns None when the feature is unconfigured or the header is absent —
-/// display-only attribution, never used for auth/routing decisions.
+/// Reads `general_settings.user_tag_headers` (hot-reloadable, up to 3
+/// entries) and joins the captured header *values* with ';' in configured
+/// order (e.g. `x-user-tag: hello` + `x-request-id: 321` → `hello;321`).
+/// Per header, repeated occurrences are joined with ','; a missing or
+/// whitespace-only header is skipped; entries beyond the 3rd are ignored.
+/// The joined string is truncated to 256 bytes at a char boundary (header
+/// values can legally reach 8 KiB). Returns None when the feature is
+/// unconfigured or no header produced a value — display-only attribution,
+/// never used for auth/routing decisions.
 pub(crate) fn extract_user_tag(
     settings: &boom_config::GeneralSettings,
     headers: &axum::http::HeaderMap,
 ) -> Option<String> {
     const USER_TAG_MAX_BYTES: usize = 256;
+    const USER_TAG_MAX_HEADERS: usize = 3;
 
-    let raw = settings.user_tag_header.as_deref()?.trim();
-    if raw.is_empty() {
+    let configured = settings.user_tag_headers.as_ref()?;
+    let mut parts: Vec<String> = Vec::new();
+    for raw in configured.iter().take(USER_TAG_MAX_HEADERS) {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        // Normalize to lowercase so config edits that only change case
+        // still hit the same header. from_bytes also rejects invalid names.
+        let Ok(name) = axum::http::HeaderName::from_bytes(raw.to_ascii_lowercase().as_bytes())
+        else {
+            continue;
+        };
+        // from_utf8_lossy, not to_str(): header values may legally carry
+        // non-ASCII bytes (obs-text), and dropping them would lose
+        // attribution for e.g. non-ASCII usernames.
+        let values: Vec<String> = headers
+            .get_all(&name)
+            .iter()
+            .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
+            .collect();
+        let joined = values.join(",").trim().to_string();
+        if !joined.is_empty() {
+            parts.push(joined);
+        }
+    }
+    if parts.is_empty() {
         return None;
     }
-    // Normalize to lowercase so config edits that only change case don't
-    // split GROUP BY groups. from_bytes also rejects invalid header names.
-    let name = axum::http::HeaderName::from_bytes(raw.to_ascii_lowercase().as_bytes()).ok()?;
-    // from_utf8_lossy, not to_str(): header values may legally carry
-    // non-ASCII bytes (obs-text), and dropping them would lose attribution
-    // for e.g. non-ASCII usernames.
-    let values: Vec<String> = headers
-        .get_all(&name)
-        .iter()
-        .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
-        .collect();
-    let joined = values.join(",");
-    let value = joined.trim();
-    if value.is_empty() {
-        return None;
-    }
-    let mut value = value.to_string();
+    let mut value = parts.join(";");
     if value.len() > USER_TAG_MAX_BYTES {
         let mut end = USER_TAG_MAX_BYTES;
         while end > 0 && !value.is_char_boundary(end) {
@@ -203,7 +214,7 @@ pub(crate) fn extract_user_tag(
         }
         value.truncate(end);
     }
-    Some(format!("{}:{}", name.as_str(), value))
+    Some(value)
 }
 
 /// Acquire flow control guard for a deployment.
@@ -4894,9 +4905,10 @@ mod tests {
         assert!(!is_vip_key(&meta));
     }
 
-    fn user_tag_settings(header: Option<&str>) -> boom_config::GeneralSettings {
+    fn user_tag_settings(headers: &[&str]) -> boom_config::GeneralSettings {
         let mut s = boom_config::GeneralSettings::default();
-        s.user_tag_header = header.map(String::from);
+        s.user_tag_headers = (!headers.is_empty())
+            .then(|| headers.iter().map(|h| h.to_string()).collect());
         s
     }
 
@@ -4914,81 +4926,106 @@ mod tests {
     #[test]
     fn user_tag_unconfigured_returns_none() {
         let headers = headers_with(&[("x-user-tag", "alice")]);
-        assert_eq!(extract_user_tag(&user_tag_settings(None), &headers), None);
+        assert_eq!(extract_user_tag(&user_tag_settings(&[]), &headers), None);
     }
 
     #[test]
-    fn user_tag_extracts_and_lowercases_header_name() {
+    fn user_tag_lookup_is_case_insensitive() {
         // Config in canonical case, request header in another case — HTTP
-        // header lookup is case-insensitive and the recorded name is the
-        // lowercased config value. Stored as "name:value" with no space so
-        // split_once(':') recovers the exact value.
-        let settings = user_tag_settings(Some("X-User-Tag"));
+        // header lookup is case-insensitive. Only the value is stored.
+        let settings = user_tag_settings(&["X-User-Tag"]);
         let headers = headers_with(&[("x-USER-TAG", "alice")]);
-        assert_eq!(
-            extract_user_tag(&settings, &headers),
-            Some("x-user-tag:alice".to_string())
-        );
+        assert_eq!(extract_user_tag(&settings, &headers), Some("alice".to_string()));
     }
 
     #[test]
     fn user_tag_missing_header_returns_none() {
-        let settings = user_tag_settings(Some("X-User-Tag"));
+        let settings = user_tag_settings(&["X-User-Tag"]);
         let headers = headers_with(&[("x-other", "bob")]);
         assert_eq!(extract_user_tag(&settings, &headers), None);
     }
 
     #[test]
     fn user_tag_blank_value_returns_none() {
-        let settings = user_tag_settings(Some("X-User-Tag"));
+        let settings = user_tag_settings(&["X-User-Tag"]);
         let headers = headers_with(&[("x-user-tag", "   ")]);
         assert_eq!(extract_user_tag(&settings, &headers), None);
     }
 
     #[test]
     fn user_tag_empty_config_string_returns_none() {
-        let settings = user_tag_settings(Some("  "));
+        let settings = user_tag_settings(&["  "]);
         let headers = headers_with(&[("x-user-tag", "alice")]);
         assert_eq!(extract_user_tag(&settings, &headers), None);
     }
 
     #[test]
     fn user_tag_joins_repeated_headers_with_comma() {
-        let settings = user_tag_settings(Some("X-User-Tag"));
+        let settings = user_tag_settings(&["X-User-Tag"]);
         let headers = headers_with(&[
             ("x-user-tag", "alice"),
             ("x-user-tag", "bob"),
         ]);
+        assert_eq!(extract_user_tag(&settings, &headers), Some("alice,bob".to_string()));
+    }
+
+    #[test]
+    fn user_tag_multi_header_joins_values_with_semicolon_in_config_order() {
+        // Storage order is strictly the configured header order, regardless
+        // of header arrival order.
+        let settings = user_tag_settings(&["X-User-Tag", "X-Request-Id", "X-Trace-Id"]);
+        let headers = headers_with(&[
+            ("x-trace-id", "world"),
+            ("x-user-tag", "hello"),
+            ("x-request-id", "321"),
+        ]);
         assert_eq!(
             extract_user_tag(&settings, &headers),
-            Some("x-user-tag:alice,bob".to_string())
+            Some("hello;321;world".to_string())
         );
     }
 
     #[test]
+    fn user_tag_caps_at_three_configured_headers() {
+        let settings = user_tag_settings(&["A-Hdr", "B-Hdr", "C-Hdr", "D-Hdr"]);
+        let headers = headers_with(&[
+            ("a-hdr", "1"),
+            ("b-hdr", "2"),
+            ("c-hdr", "3"),
+            ("d-hdr", "4"),
+        ]);
+        assert_eq!(extract_user_tag(&settings, &headers), Some("1;2;3".to_string()));
+    }
+
+    #[test]
+    fn user_tag_skips_missing_middle_header() {
+        let settings = user_tag_settings(&["A-Hdr", "B-Hdr", "C-Hdr"]);
+        let headers = headers_with(&[("a-hdr", "1"), ("c-hdr", "3")]);
+        assert_eq!(extract_user_tag(&settings, &headers), Some("1;3".to_string()));
+    }
+
+    #[test]
     fn user_tag_truncates_long_value_at_256_bytes() {
-        let settings = user_tag_settings(Some("X-User-Tag"));
+        let settings = user_tag_settings(&["X-User-Tag"]);
         let long = "a".repeat(300);
         let headers = headers_with(&[("x-user-tag", long.as_str())]);
-        let got = extract_user_tag(&settings, &headers).unwrap();
-        assert_eq!(got, format!("x-user-tag:{}", "a".repeat(256)));
+        assert_eq!(extract_user_tag(&settings, &headers), Some("a".repeat(256)));
     }
 
     #[test]
     fn user_tag_truncation_respects_char_boundary() {
         // 3-byte CJK chars: 86 chars = 258 bytes → truncate to ≤256 at a
         // char boundary → 85 chars = 255 bytes.
-        let settings = user_tag_settings(Some("X-User-Tag"));
+        let settings = user_tag_settings(&["X-User-Tag"]);
         let long = "中".repeat(86);
         let headers = headers_with(&[("x-user-tag", long.as_str())]);
-        let got = extract_user_tag(&settings, &headers).unwrap();
-        assert_eq!(got, format!("x-user-tag:{}", "中".repeat(85)));
+        assert_eq!(extract_user_tag(&settings, &headers), Some("中".repeat(85)));
     }
 
     #[test]
     fn user_tag_invalid_config_header_name_returns_none() {
         // Spaces make an invalid header name — from_bytes rejects it.
-        let settings = user_tag_settings(Some("Bad Header Name"));
+        let settings = user_tag_settings(&["Bad Header Name"]);
         let headers = headers_with(&[("x-user-tag", "alice")]);
         assert_eq!(extract_user_tag(&settings, &headers), None);
     }

@@ -32,7 +32,7 @@
 | `raw_capture_request_body_first_writer_wins` / `raw_capture_response_frames_join`（core.rs） | DT-CORE-43..44 | **详细 prompt 上下文**：raw_capture 原始请求体 + 响应帧记录 |
 | `request_rate_record_and_snapshot` / `request_rate_rename_updates_label` / `request_rate_remove` / `mlstats_counters` / `mlstats_min_max_latency` / `mlstats_min_sentinel_when_no_success` / `mlstats_maybe_emit_summary_window`（routing.rs） | DT-RT-36..42 | 调用可观测：每模型/部署请求量、成败、时延 min/max、汇总发射窗口 |
 | `record_buckets_by_path_and_aggregates_summary` / `cold_start_has_zero_ratio` / `record_tokens_accumulates_by_path` / `record_tokens_without_record_bumps_tokens_only` / `default_equals_new_and_event_labels` / `mixed_record_and_tokens_both_counted`（ctxaware.rs） | DT-CTX-04..09 | anthropic/openai 流量占比统计（关联 AR3 的协议识别） |
-| `user_tag_header_present_default_and_empty`（config.rs） | DT-CFG-38 | **审计归因配置**：general_settings.user_tag_header 设置/缺省/空串（audit 的 per-user 归因头，空即关闭） |
+| `user_tag_headers_present_default_and_legacy_string`（config.rs） | DT-CFG-38 | **审计归因配置**：general_settings.user_tag_headers 列表 / 旧单数 key 字符串兼容 / 缺省（audit 的 per-user 归因头，最多 3 个、值以分号拼接，空即关闭） |
 | `finalize_merges_live_stream_state` / `stream_start_error_traced_records_upstream_status`（routing_fusion.rs） | DT-RF-22, 24 | fusion 请求 trace：流仍在写时 finalize 合并流状态（cancelled + 响应事件数 + duration）；流式起始错误把 upstream_status 记入 trace 聚合 |
 
 关联（计入其他 AR）：`DT-PRV-OAI-21` raw_capture 端到端（AR3）、`DT-PRV-OAI-22`

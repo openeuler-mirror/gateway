@@ -1289,7 +1289,7 @@ fn synthesize_bootstrap_root(config: &Config) -> Result<serde_yaml::Value, Strin
         }
     }
 
-    // Same cleanup inside general_settings (user_tag_header: null, the
+    // Same cleanup inside general_settings (user_tag_headers: null, the
     // legacy alias field) — the section serializes all fields, unlike a
     // hand-written file that only carries what's set.
     if let Some(gs) = root
@@ -2451,7 +2451,7 @@ mod merge_runtime_sections_tests {
             "legacy alias field must not leak into general_settings"
         );
         assert!(
-            !gs.contains_key(&Value::String("user_tag_header".into())),
+            !gs.contains_key(&Value::String("user_tag_headers".into())),
             "null field must not leak into general_settings"
         );
     }

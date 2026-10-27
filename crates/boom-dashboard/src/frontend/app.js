@@ -4575,7 +4575,7 @@
       <div class="form-card-grid">
         <div class="form-group"><label>${t("config.field.master_key")}</label><input value="${esc(masked(g.master_key))}" readonly style="opacity:.6"></div>
         <div class="form-group"><label>${t("config.field.database_url")}</label><input value="${esc(masked(g.database_url))}" readonly style="opacity:.6"></div>
-        <div class="form-group field-full"><label for="cfg-gen-user-tag-hdr">${t("config.field.user_tag_header")} ${tip(t("tip.config.user_tag_header"))}</label><input id="cfg-gen-user-tag-hdr" value="${esc(g.user_tag_header || "")}" placeholder="X-User-Tag"></div>
+        <div class="form-group field-full"><label for="cfg-gen-user-tag-hdr">${t("config.field.user_tag_headers")} ${tip(t("tip.config.user_tag_headers"))}</label><input id="cfg-gen-user-tag-hdr" value="${esc((g.user_tag_headers || []).join(", "))}" placeholder="X-User-Tag, X-Request-Id, X-Trace-Id"></div>
         ${fieldCheckbox("cfg-gen-priority-hdr", t("config.field.enable_priority_header"), router.enable_priority_header)}
         ${fieldCheckbox("cfg-gen-strip-cc", t("config.field.strip_claude_code_attribution"), router.strip_claude_code_attribution)}
         ${fieldFullList("cfg-gen-forward-hdrs", t("config.field.forward_client_headers"), router.forward_client_headers || [])}
@@ -5185,13 +5185,19 @@
         // These three live under router_settings in YAML but are surfaced on
         // the General card. Sub-path writes avoid replacing the whole
         // router_settings section (which would clobber scheduling fields).
-        // user_tag_header is a true general_settings field; empty input saves
-        // null = extraction disabled.
+        // user_tag_headers is a true general_settings field; comma-separated
+        // input → array (validated ≤3); empty input saves null = extraction
+        // disabled.
+        const tagHeaders = $("cfg-gen-user-tag-hdr").value
+          .split(",").map(s => s.trim()).filter(Boolean);
+        if (tagHeaders.length > 3) {
+          throw new Error(t("config.error.user_tag_max_headers"));
+        }
         await saveConfigSections([
           ["router_settings.enable_priority_header", $("cfg-gen-priority-hdr").checked],
           ["router_settings.strip_claude_code_attribution", $("cfg-gen-strip-cc").checked],
           ["router_settings.forward_client_headers", parseListInput($("cfg-gen-forward-hdrs"))],
-          ["general_settings.user_tag_header", $("cfg-gen-user-tag-hdr").value.trim() || null],
+          ["general_settings.user_tag_headers", tagHeaders.length ? tagHeaders : null],
         ]);
       } else if (kind === "responses") {
         await saveConfigSections([
