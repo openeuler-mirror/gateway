@@ -4578,8 +4578,8 @@
         <div class="form-group"><label>${t("config.field.master_key")}</label><input value="${esc(masked(g.master_key))}" readonly style="opacity:.6"></div>
         <div class="form-group"><label>${t("config.field.database_url")}</label><input value="${esc(masked(g.database_url))}" readonly style="opacity:.6"></div>
         <div class="form-group field-full"><label for="cfg-gen-user-tag-hdr">${t("config.field.user_tag_headers")} ${tip(t("tip.config.user_tag_headers"))}</label><input id="cfg-gen-user-tag-hdr" value="${esc((g.user_tag_headers || []).join(", "))}" placeholder="X-User-Tag, X-Request-Id, X-Trace-Id"></div>
-        ${fieldCheckbox("cfg-gen-priority-hdr", t("config.field.enable_priority_header"), router.enable_priority_header)}
-        ${fieldCheckbox("cfg-gen-strip-cc", t("config.field.strip_claude_code_attribution"), router.strip_claude_code_attribution)}
+        ${fieldCheckbox("cfg-gen-priority-hdr", t("config.field.enable_priority_header"), router.enable_priority_header, { tip: t("tip.config.enable_priority_header") })}
+        ${fieldCheckbox("cfg-gen-strip-cc", t("config.field.strip_claude_code_attribution"), router.strip_claude_code_attribution, { tip: t("tip.config.strip_claude_code_attribution") })}
         ${fieldFullList("cfg-gen-forward-hdrs", t("config.field.forward_client_headers"), router.forward_client_headers || [])}
       </div>
       <p class="modal-hint">${t("config.tip.master_key_readonly")}</p>
@@ -4772,9 +4772,9 @@
       <div class="form-card-grid">
         ${fieldSelect("cfg-rs-policy", t("config.field.schedule_policy"), buildPolicyOptions(),
           r.schedule_policy || "round_robin", { tip: t("tip.config.schedule_policy") })}
-        ${fieldNum("cfg-rs-affinity-ctx", t("config.field.key_affinity_context_threshold"), r.key_affinity_context_threshold || 0, { min: 0 })}
-        ${fieldNum("cfg-rs-affinity-rebal", t("config.field.rebalance_threshold"), r.rebalance_threshold || 20, { min: 1, step: 1 })}
-        ${fieldNum("cfg-rs-flow-timeout", t("config.field.flow_control_queue_timeout_secs"), r.flow_control_queue_timeout_secs || 1200, { min: 1, step: 1 })}
+        ${fieldNum("cfg-rs-affinity-ctx", t("config.field.key_affinity_context_threshold"), r.key_affinity_context_threshold || 0, { min: 0, tip: t("tip.config.affinity_context_threshold") })}
+        ${fieldNum("cfg-rs-affinity-rebal", t("config.field.rebalance_threshold"), r.rebalance_threshold || 20, { min: 1, step: 1, tip: t("tip.config.rebalance_threshold") })}
+        ${fieldNum("cfg-rs-flow-timeout", t("config.field.flow_control_queue_timeout_secs"), r.flow_control_queue_timeout_secs || 1200, { min: 1, step: 1, tip: t("tip.config.flow_control_queue_timeout_secs") })}
       </div>
       <details class="form-card-collapsible" id="cfg-kvc-details">
         <summary>

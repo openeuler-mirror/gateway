@@ -582,11 +582,8 @@
       "form.name": "Name",
       "form.alias": "Alias",
 
-      "tip.model.rpm": "Maximum requests per minute. Leave empty for unlimited.",
-      "tip.model.tpm": "Maximum tokens per minute. Leave empty for unlimited.",
       "tip.model.max_inflight": "Max concurrent in-flight requests for this deployment. 0 or empty = unlimited.",
       "tip.key.rpm": "Per-key RPM override. Leave empty to use plan limits.",
-      "tip.plan.rpm": "Maximum requests per minute per key. Leave empty for unlimited.",
 
       "toast.copied": "Copied",
       "toast.saved": "Saved",
@@ -1636,11 +1633,8 @@
       "form.name": "名称",
       "form.alias": "别名",
 
-      "tip.model.rpm": "每分钟最大请求数，留空则不限。",
-      "tip.model.tpm": "每分钟最大 Token 数，留空则不限。",
       "tip.model.max_inflight": "该部署最大在途请求数。0 或留空表示不限。",
       "tip.key.rpm": "单密钥 RPM 覆盖值。留空则使用套餐限制。",
-      "tip.plan.rpm": "每密钥每分钟最大请求数。留空则不限。",
 
       "toast.copied": "已复制",
       "toast.saved": "已保存",
