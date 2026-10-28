@@ -1,5 +1,5 @@
 //! DB-authoritative store for the `user_tag_headers` list (which HTTP header
-//! names to record into `boom_request_log.user_tag`). Owned by boom-audit
+//! names to record into `boom_request_log.user_tag1/2/3`). Owned by boom-audit
 //! because user_tag attribution is part of the request-log pipeline.
 //!
 //! Lifecycle mirrors `boom_client_blocklist_state`: single-row table, adopted

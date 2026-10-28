@@ -550,12 +550,13 @@ pub struct GeneralSettings {
     /// set `store_model_in_db: true|false` parse without error.
     #[serde(default, alias = "store_model_in_db")]
     _legacy_store_model_in_db: bool,
-    /// Up to 3 HTTP headers whose values are recorded (values only, joined
-    /// with ';' in configured order, e.g. `user_tag_headers: [X-User-Tag,
-    /// X-User-Id]` → `alice;7f3a`) into `boom_request_log.user_tag` for
-    /// per-user attribution when one key is shared by multiple users.
-    /// None/empty disables extraction. Display-only attribution — must never
-    /// participate in auth/routing decisions.
+    /// Up to 3 HTTP headers whose values are recorded (values only, one
+    /// independent `boom_request_log.user_tagN` column per header in list
+    /// order, e.g. `user_tag_headers: [X-User-Tag, X-User-Id]` →
+    /// user_tag1=alice, user_tag2=7f3a) for per-user attribution when one
+    /// key is shared by multiple users. None/empty disables extraction.
+    /// Display-only attribution — must never participate in auth/routing
+    /// decisions.
     #[serde(default, alias = "user_tag_header", deserialize_with = "string_or_vec_opt")]
     pub user_tag_headers: Option<Vec<String>>,
     /// DEPRECATED — superseded by per-model `visibility: public`

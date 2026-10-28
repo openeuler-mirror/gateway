@@ -7317,11 +7317,15 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
           ? formatNumber(l.input_tokens) + " / " + formatNumber(l.output_tokens)
           : "- / -";
         var kvCell = '<span class="mono">' + esc(pct) + "</span>";
+        // User tag: up to 3 attribution slots, non-empty ones joined " / ".
+        var tagParts = [l.user_tag1, l.user_tag2, l.user_tag3].filter(Boolean);
+        var tagCell = tagParts.length ? esc(tagParts.join(" / ")) : "-";
         return `<tr>
         <td>${tsCell}</td>
         <td>${ipCell}</td>
         <td>${esc(l.team_alias || l.team_id || "-")}</td>
         <td>${esc(l.key_alias || l.key_name || "-")}</td>
+        <td class="mono" title="${esc(tagParts.join("\n"))}">${tagCell}</td>
         <td>${modelCell}</td>
         <td class="mono">${esc(l.api_path)}</td>
         <td>${l.status_code >= 400 ? '<span style="color:var(--danger)">' + l.status_code + '</span>' : l.status_code}</td>

@@ -103,11 +103,37 @@ pub async fn run_request_log_migration(conn: &mut sqlx::PgConnection) -> Result<
     // deployment has no flow control slot (pass-through) or on the
     // error paths that fire before acquire() returns.
     execute_alter(conn, r#"ALTER TABLE boom_request_log ADD COLUMN IF NOT EXISTS queue_wait_ms INTEGER"#).await;
-    // user_tag: values of the configured general_settings.user_tag_headers
-    // (up to 3 headers, ';' joined, values only) — identifies which end user
-    // made the request when a key is shared by multiple users. NULL when the
-    // feature is disabled or the request carried none of the headers.
+    // Legacy user_tag: same values ';' joined into one column. No longer
+    // written; the column is still created so the backfill UPDATE below is
+    // valid on fresh databases (and rollback binaries keep working).
     execute_alter(conn, r#"ALTER TABLE boom_request_log ADD COLUMN IF NOT EXISTS user_tag TEXT"#).await;
+    // user_tag1/2/3: values of the configured user_tag_headers (up to 3),
+    // one independent column per configured header in list order — identifies
+    // which end user made the request when a key is shared by multiple users.
+    // NULL slot = header unconfigured or absent on the request.
+    execute_alter(conn, r#"ALTER TABLE boom_request_log ADD COLUMN IF NOT EXISTS user_tag1 TEXT"#).await;
+    execute_alter(conn, r#"ALTER TABLE boom_request_log ADD COLUMN IF NOT EXISTS user_tag2 TEXT"#).await;
+    execute_alter(conn, r#"ALTER TABLE boom_request_log ADD COLUMN IF NOT EXISTS user_tag3 TEXT"#).await;
+    // Backfill: split legacy joined values into the new columns. Idempotent
+    // via the user_tag1 IS NULL guard; NULLIF keeps empty segments NULL. A
+    // ';' inside a truncated legacy value can mis-split one row — acceptable
+    // for attribution data.
+    let backfill = sqlx::query(
+        r#"UPDATE boom_request_log SET
+               user_tag1 = NULLIF(split_part(user_tag, ';', 1), ''),
+               user_tag2 = NULLIF(split_part(user_tag, ';', 2), ''),
+               user_tag3 = NULLIF(split_part(user_tag, ';', 3), '')
+           WHERE user_tag IS NOT NULL AND user_tag1 IS NULL"#,
+    )
+    .execute(&mut *conn)
+    .await;
+    if let Ok(res) = &backfill {
+        if res.rows_affected() > 0 {
+            tracing::info!(rows = res.rows_affected(), "split legacy user_tag into user_tag1/2/3");
+        }
+    } else if let Err(e) = backfill {
+        tracing::warn!("user_tag backfill failed (legacy values stay in user_tag): {e}");
+    }
     // Composite index for per-key log pagination (user dashboard logs page):
     // WHERE key_hash = $1 ORDER BY created_at DESC LIMIT/OFFSET. Without it
     // the planner fetches ALL of a busy key's rows and sorts them on every
@@ -141,8 +167,9 @@ pub async fn run_request_log_migration(conn: &mut sqlx::PgConnection) -> Result<
 }
 
 /// DDL for the `boom_user_tag_config` single-row table: the DB-authoritative
-/// copy of the `user_tag_headers` list (header names whose values are joined
-/// into `boom_request_log.user_tag` for per-user attribution on shared keys).
+/// copy of the `user_tag_headers` list (header names whose values are recorded
+/// into `boom_request_log.user_tag1/2/3` for per-user attribution on shared
+/// keys).
 /// The row is absent on fresh databases — the boot path adopts the YAML
 /// `general_settings.user_tag_headers` value as the seed, after which the DB
 /// is authoritative and the YAML section is inert.
