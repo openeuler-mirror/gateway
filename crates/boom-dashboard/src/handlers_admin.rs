@@ -4684,9 +4684,27 @@ pub async fn get_prompt_log_entry(
 
 // ═══════════════════════════════════════════════════════════
 // Quota management — team-organized view of cumulative / window
-// counters across all keys & teams. Reads boom_rate_limit_cumulative
-// via SQL JOIN (avoids scanning the whole limiter DashMap).
+// counters across all keys & teams. Cumulative counters are read
+// from the live in-memory limiter (same source as /admin/keys);
+// boom_rate_limit_cumulative is only a 600s snapshot and would lag.
 // ═══════════════════════════════════════════════════════════
+
+/// Live cumulative counters for one quota scope, ordered
+/// `(input tokens, output tokens, total cost micros)`.
+///
+/// Dashboard cumulative views must all use this — reading
+/// `boom_rate_limit_cumulative` directly yields a stale (up to 600s old)
+/// value that disagrees with /admin/keys' `spend` for the same key.
+fn live_cumulative(
+    limiter: &boom_limiter::SlidingWindowLimiter,
+    scope: &boom_limiter::QuotaScope,
+) -> (i64, i64, i64) {
+    (
+        limiter.peek_cumulative(scope, boom_limiter::CumulativeKind::TotalInputTokens) as i64,
+        limiter.peek_cumulative(scope, boom_limiter::CumulativeKind::TotalOutputTokens) as i64,
+        limiter.peek_cumulative(scope, boom_limiter::CumulativeKind::TotalCost) as i64,
+    )
+}
 
 #[derive(Debug, sqlx::FromRow)]
 struct QuotaKeyRow {
@@ -4699,10 +4717,9 @@ struct QuotaKeyRow {
 }
 /// totals, plus a synthetic "no_team" entry for keys without a team.
 ///
-/// GaussDB distributed note: each SELECT is a single-table query. Cross-table
-/// JOINs against `boom_rate_limit_cumulative` fail with "relation does not
-/// exist on datanode" because that table is not distributed. We aggregate in
-/// application memory instead.
+/// GaussDB distributed note: each SELECT is a single-table query (no
+/// cross-table JOINs). Cumulative counters come from the live limiter
+/// rather than `boom_rate_limit_cumulative`, which is a 600s snapshot.
 pub async fn quota_overview(
     _session: AdminSession,
     Extension(state): Extension<std::sync::Arc<DashboardState>>,
@@ -4766,55 +4783,20 @@ pub async fn quota_overview(
         }
     };
 
-    // 4. All cumulative rows. Single-table scan — safe under GaussDB distributed.
-    let cum_rows: Vec<(String, i64)> = match sqlx::query_as(
-        "SELECT cache_key, value FROM boom_rate_limit_cumulative",
-    )
-    .fetch_all(db_pool)
-    .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::error!("quota_overview cumulative query failed: {}", e);
-            return (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                format!("quota_overview cumulative query failed: {e}"),
-            )
-                .into_response();
-        }
-    };
-
-    // Aggregate cumulative by (scope, id) → (tin, tout, tcost).
-    // cache_key format: 'kc:{token}:{kind}' or 'tc:{team_id}:{kind}'.
-    let mut team_cum: std::collections::HashMap<String, (i64, i64, i64)> =
-        std::collections::HashMap::new();
-    let mut key_cum: std::collections::HashMap<String, (i64, i64, i64)> =
-        std::collections::HashMap::new();
-    for (cache_key, value) in &cum_rows {
-        if let Some(rest) = cache_key.strip_prefix("tc:") {
-            if let Some((id, kind)) = rest.rsplit_once(':') {
-                let e = team_cum.entry(id.to_string()).or_insert((0, 0, 0));
-                match kind {
-                    "tin" => e.0 = *value,
-                    "tout" => e.1 = *value,
-                    "tcost" => e.2 = *value,
-                    _ => {}
-                }
-            }
-            continue;
-        }
-        if let Some(rest) = cache_key.strip_prefix("kc:") {
-            if let Some((id, kind)) = rest.rsplit_once(':') {
-                let e = key_cum.entry(id.to_string()).or_insert((0, 0, 0));
-                match kind {
-                    "tin" => e.0 = *value,
-                    "tout" => e.1 = *value,
-                    "tcost" => e.2 = *value,
-                    _ => {}
-                }
-            }
-        }
-    }
+    // 4. Cumulative counters come from the live in-memory limiter (team
+    // scope for team totals, key scope for the no-team rollup) — same source
+    // as /admin/keys and /admin/quota/{team,unassigned}. The DB table
+    // boom_rate_limit_cumulative is only a periodic (600s) snapshot, so
+    // reading it here made overview totals lag the per-key views.
+    let team_cum: std::collections::HashMap<String, (i64, i64, i64)> = team_rows
+        .iter()
+        .map(|(team_id, _, _)| {
+            let scope = boom_limiter::QuotaScope::Team {
+                team_id: team_id.clone(),
+            };
+            (team_id.clone(), live_cumulative(&state.limiter, &scope))
+        })
+        .collect();
 
     // team_id → key_count.
     let mut team_key_count: std::collections::HashMap<String, i64> =
@@ -4835,14 +4817,17 @@ pub async fn quota_overview(
         .cloned()
         .collect();
 
-    // No-team cumulative: sum key_cum for tokens whose team_id IS NULL.
+    // No-team cumulative: sum the live key counters of tokens whose
+    // team_id IS NULL.
     let mut no_team_cum = (0i64, 0i64, 0i64);
     for (token, _) in token_team_rows.iter().filter(|(_, t)| t.is_none()) {
-        if let Some(c) = key_cum.get(token) {
-            no_team_cum.0 += c.0;
-            no_team_cum.1 += c.1;
-            no_team_cum.2 += c.2;
-        }
+        let scope = boom_limiter::QuotaScope::Key {
+            key_hash: token.clone(),
+        };
+        let c = live_cumulative(&state.limiter, &scope);
+        no_team_cum.0 += c.0;
+        no_team_cum.1 += c.1;
+        no_team_cum.2 += c.2;
     }
 
     // team → plan_name lookup (explicit assignments only).
@@ -5014,9 +4999,7 @@ async fn quota_keys_inner(
     // ── Branch on sort mode ──
     // For alias / created_at: SQL-side sort + pagination (cheap, scalable).
     // For cost / tokens: fetch full result set (capped at 5000), look up
-    // cumulative via IN-list single-table query, then sort + slice in memory.
-    // GaussDB distributed mode forbids cross-table JOINs, so the cumulative
-    // lookup has to happen as a separate single-table SELECT regardless.
+    // cumulative from the in-memory limiter, then sort + slice in memory.
     let in_memory_sort = matches!(q.sort.as_deref(), Some("cost") | Some("tokens"));
 
     let mut sort_truncated = false;
@@ -5119,53 +5102,20 @@ async fn quota_keys_inner(
         }
     };
 
-    // Cumulative lookup for these tokens via IN list.
-    // In in-memory-sort mode rows may be up to 5000, so up to 15000 cache_keys.
-    let mut key_cum: std::collections::HashMap<String, (i64, i64, i64)> =
-        std::collections::HashMap::new();
-    if !rows.is_empty() {
-        let cache_keys: Vec<String> = rows
-            .iter()
-            .flat_map(|r| {
-                vec![
-                    format!("kc:{}:tin", r.token),
-                    format!("kc:{}:tout", r.token),
-                    format!("kc:{}:tcost", r.token),
-                ]
-            })
-            .collect();
-        let placeholders: Vec<String> =
-            (1..=cache_keys.len()).map(|i| format!("${i}")).collect();
-        let cum_sql = format!(
-            "SELECT cache_key, value FROM boom_rate_limit_cumulative WHERE cache_key IN ({})",
-            placeholders.join(", ")
-        );
-        let mut cum_query = sqlx::query_as::<_, (String, i64)>(&cum_sql);
-        for ck in &cache_keys {
-            cum_query = cum_query.bind(ck);
-        }
-        match cum_query.fetch_all(db_pool).await {
-            Ok(cum_rows) => {
-                for (cache_key, value) in cum_rows {
-                    if let Some(rest) = cache_key.strip_prefix("kc:") {
-                        if let Some((token, kind)) = rest.rsplit_once(':') {
-                            let e = key_cum.entry(token.to_string()).or_insert((0, 0, 0));
-                            match kind {
-                                "tin" => e.0 = value,
-                                "tout" => e.1 = value,
-                                "tcost" => e.2 = value,
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!("quota_keys_inner cumulative fetch failed: {}", e);
-                // Non-fatal: proceed with zeroed cumulative.
-            }
-        }
-    }
+    // Cumulative counters come from the live in-memory limiter — the same
+    // source /admin/keys and /admin/quota/key/{hash}/windows use. The DB
+    // table boom_rate_limit_cumulative is only a periodic (600s) snapshot,
+    // so reading it here made the quota list report a stale total_cost that
+    // disagreed with /admin/keys' spend for the same key.
+    let key_cum: std::collections::HashMap<String, (i64, i64, i64)> = rows
+        .iter()
+        .map(|r| {
+            let scope = boom_limiter::QuotaScope::Key {
+                key_hash: r.token.clone(),
+            };
+            (r.token.clone(), live_cumulative(&state.limiter, &scope))
+        })
+        .collect();
 
     // In-memory sort + page slice (only for cost/tokens mode).
     let page_rows: Vec<QuotaKeyRow> = if in_memory_sort {
