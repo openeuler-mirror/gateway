@@ -5498,14 +5498,16 @@ pub async fn quota_reset_key_cumulative(
     };
 
     // Look up the key's team (for rollup subtraction). None if no team.
-    let team_id: Option<String> = match sqlx::query_scalar::<_, String>(
+    // team_id is a nullable column, so decode as Option<String> — otherwise a
+    // NULL value fails to decode into String and the handler returns 500.
+    let team_id: Option<String> = match sqlx::query_scalar::<_, Option<String>>(
         r#"SELECT team_id FROM boom_verification_token WHERE token = $1"#,
     )
     .bind(&key_hash)
     .fetch_optional(db_pool)
     .await
     {
-        Ok(v) => v,
+        Ok(v) => v.flatten(),
         Err(e) => {
             tracing::error!("quota_reset_key_cumulative team lookup failed: {}", e);
             return (
