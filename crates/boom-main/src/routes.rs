@@ -3771,7 +3771,6 @@ impl From<GatewayError> for AnthropicErrorReply {
 /// the dedup point the three-pipeline review asked for — field-level changes
 /// land HERE, not per-handler.
 struct EdgeRequestPrep {
-    req_body_value: Option<Arc<serde_json::Value>>,
     prompt_log_should: bool,
     raw_capture: Option<Arc<boom_core::provider::RawCaptureChannel>>,
     req_body: Option<Arc<serde_json::Value>>,
@@ -3825,9 +3824,8 @@ fn prepare_edge_request<T: serde::Serialize>(
 
     let capture_raw =
         prompt_log_should && state.prompt_log_writer.config().capture_raw_upstream;
-    let pl_req_body = if prompt_log_should { req_body_value.clone() } else { None };
+    let pl_req_body = if prompt_log_should { req_body_value } else { None };
     Ok(EdgeRequestPrep {
-        req_body_value,
         prompt_log_should,
         raw_capture: if capture_raw {
             Some(Arc::new(boom_core::provider::RawCaptureChannel::default()))
@@ -4226,7 +4224,7 @@ pub async fn responses(
         let usage = UsageTracker::default();
         let sse_stream = sse_stream_from_responses_chat_stream(
             stream, model.clone(), response_id.clone(), created_at, usage.clone(),
-            persist_ctx, state.response_store.clone(), custom_tool_names,
+            persist_ctx, state.response_store.clone(),
         );
         let inflight_guard = if let Some(ref did) = deployment_id {
             InFlightGuard::new_for_deployment(state.inflight.clone(), &inflight_model, did, input_chars as u64)
@@ -4314,7 +4312,7 @@ pub async fn responses(
         } else {
             InFlightGuard::new(state.inflight.clone(), &inflight_model, input_chars as u64)
         };
-        let mut response = match provider.chat(openai_req).await {
+        let response = match provider.chat(openai_req).await {
             Ok(r) => r,
             Err(e) => {
                 log_error(&state, &identity, &model, "/v1/responses", false, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()), user_tags.clone());
@@ -4485,7 +4483,6 @@ fn sse_stream_from_responses_chat_stream(
     usage: UsageTracker,
     persist: Option<ResponsesPersistCtx>,
     store: Arc<boom_responses::ResponseStore>,
-    custom_tools: std::collections::HashSet<String>,
 ) -> impl futures::Stream<Item = Result<SseItem, Infallible>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<SseItem>(64);
 
