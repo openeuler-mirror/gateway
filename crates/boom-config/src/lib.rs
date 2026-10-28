@@ -544,6 +544,15 @@ pub struct GeneralSettings {
     pub master_key: Option<String>,
     /// PostgreSQL database URL (compatible with litellm schema).
     pub database_url: Option<String>,
+    /// Signing key for dashboard session JWTs (HS256). Intentionally NOT
+    /// derived from `master_key`: anyone who knows the master key (API
+    /// clients, a leaked config file) must not be able to forge arbitrary
+    /// dashboard sessions, including admin-role ones. Pin this to an
+    /// independent random value when sessions must survive restarts or be
+    /// shared across replicas; when unset, boom-main generates a random
+    /// per-process key and sessions end on restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dashboard_session_secret: Option<String>,
     /// Legacy v2 toggle. Removed in v3: the gateway now always uses YAML as
     /// the declarative truth source and DB as the runtime authority — see
     /// CLAUDE.md §7. Kept as a silent serde alias so old YAMLs that still
@@ -600,6 +609,7 @@ impl Default for GeneralSettings {
         Self {
             master_key: None,
             database_url: None,
+            dashboard_session_secret: None,
             _legacy_store_model_in_db: false,
             user_tag_headers: None,
             public_models: Vec::new(),
@@ -1038,6 +1048,11 @@ pub fn load_config(path: &str) -> Result<Config, GatewayError> {
         .database_url
         .take()
         .map(|v| resolve_env_value(&v));
+    config.general_settings.dashboard_session_secret = config
+        .general_settings
+        .dashboard_session_secret
+        .take()
+        .map(|v| resolve_env_value(&v));
 
     for entry in &mut config.model_list {
         let p = &mut entry.litellm_params;
@@ -1076,6 +1091,10 @@ pub fn load_config(path: &str) -> Result<Config, GatewayError> {
 ///   - `BOOM_MASTER_KEY`   — admin/auth bootstrap
 ///   - `BOOM_DATABASE_URL` — business config source (models/plans/workflows)
 ///
+/// Optional: `BOOM_DASHBOARD_SESSION_SECRET` pins the dashboard session JWT
+/// signing key (must NOT be the master key); when absent the dashboard
+/// generates a random per-process key.
+///
 /// Without a YAML file these are the two things nothing else can supply:
 /// no way to authenticate and nowhere to load business config from. All
 /// other sections take their YAML-omitted defaults by deserializing a
@@ -1086,6 +1105,7 @@ pub fn bootstrap_from_env() -> Result<Config, GatewayError> {
     let read_var = |name: &str| env::var(name).ok().filter(|v| !v.trim().is_empty());
     let master_key = read_var("BOOM_MASTER_KEY");
     let database_url = read_var("BOOM_DATABASE_URL");
+    let dashboard_session_secret = read_var("BOOM_DASHBOARD_SESSION_SECRET");
 
     if master_key.is_none() || database_url.is_none() {
         return Err(GatewayError::ConfigError(
@@ -1105,6 +1125,12 @@ pub fn bootstrap_from_env() -> Result<Config, GatewayError> {
         "database_url".into(),
         serde_yaml::Value::String(database_url.unwrap()),
     );
+    if let Some(secret) = dashboard_session_secret {
+        general.insert(
+            "dashboard_session_secret".into(),
+            serde_yaml::Value::String(secret),
+        );
+    }
     let mut root = serde_yaml::Mapping::new();
     root.insert(
         "general_settings".into(),
@@ -1312,6 +1338,7 @@ pub fn set_yaml_path(
 /// accept a free-form `headers` map.
 const SECRET_FIELD_NAMES: &[&str] = &[
     "master_key",
+    "dashboard_session_secret",
     "database_url",
     "api_key",
     "aws_access_key_id",

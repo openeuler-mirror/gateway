@@ -21,7 +21,7 @@
 - 灾备恢复：空库 + 回写按钮生成的 YAML 快照重启即可恢复全部配置。
 - 导出 / 回写按钮在 Dashboard Config 页；生成的文件含明文 secrets（0600），视同备份工件。
 
-**无 YAML 启动（env bootstrap）**：不带 `--config` 且 cwd 无 `config.yaml` 时，设 `BOOM_MASTER_KEY` + `BOOM_DATABASE_URL` 两个环境变量即可启动（业务配置全部来自 DB）。回写按钮可在 cwd 生成完整 `config.yaml`，重启即切换为文件模式。
+**无 YAML 启动（env bootstrap）**：不带 `--config` 且 cwd 无 `config.yaml` 时，设 `BOOM_MASTER_KEY` + `BOOM_DATABASE_URL` 两个环境变量即可启动（业务配置全部来自 DB）；可选 `BOOM_DASHBOARD_SESSION_SECRET` 固定 Dashboard 会话签名密钥。回写按钮可在 cwd 生成完整 `config.yaml`，重启即切换为文件模式。
 
 **无 DB 回退**：未配 `database_url` 时（master-key-only 模式），YAML 业务 section 恢复构建路径——这是部署形态选择（单机 / 无 DB 环境），不是第二权威。
 
@@ -444,12 +444,14 @@ general_settings:
 | 字段 | 默认值 | 说明 |
 |------|--------|------|
 | `database_url` | `null` | PostgreSQL 连接串。不配则不持久化 key/套餐/日志，仅 master key 鉴权可用 |
+| `dashboard_session_secret` | `null` | Dashboard 会话 JWT 签名密钥（可选）。必须独立于 `master_key`（与 `master_key` 相同时打 warn，但不阻断启动），建议 ≥32 字符（不足仅打 warn）；不配则每次启动随机生成，重启后会话失效、多副本之间不共享。env bootstrap 模式取 `BOOM_DASHBOARD_SESSION_SECRET` |
 | `public_models` | `[]` | 全员可访问的模型列表，绕过 key/team 白名单。不配则所有模型按白名单管控 |
 
 ```yaml
 general_settings:
   master_key: ${MASTER_KEY}             # 必配：管理 API 与 Dashboard 登录密钥
   database_url: ${DATABASE_URL}         # 选配：PostgreSQL 连接串
+  dashboard_session_secret: ${DASHBOARD_SESSION_SECRET}  # 选配：Dashboard 会话签名密钥
   public_models:                        # 选配：全员可访问模型，默认空
     - gpt-4o-mini
     - deepseek-chat
@@ -1314,7 +1316,7 @@ curl -X POST http://localhost:4000/dashboard/api/admin/limits/reset \
 业务配置的 YAML 快照是**手动操作**（回滚种子 / 灾备工件），在 Dashboard Config 页：
 
 - **导出**（GET `/dashboard/api/admin/config/export`）：DB 全量业务配置 + 原始 YAML 未触碰 section（`${VAR}` 引用保留）→ 浏览器下载，不落盘。
-- **回写**（POST `/dashboard/api/admin/config/writeback`）：同一管道写回启动文件（先滚动 `.bak` 单槽备份）；env bootstrap 模式下在 cwd 生成新 `config.yaml`（0600，secrets 写成 `${BOOM_MASTER_KEY}` / `${BOOM_DATABASE_URL}` 引用），重启即切换为文件模式。
+- **回写**（POST `/dashboard/api/admin/config/writeback`）：同一管道写回启动文件（先滚动 `.bak` 单槽备份）；env bootstrap 模式下在 cwd 生成新 `config.yaml`（0600，secrets 写成 `${BOOM_MASTER_KEY}` / `${BOOM_DATABASE_URL}` / `${BOOM_DASHBOARD_SESSION_SECRET}` 引用），重启即切换为文件模式。
 
 ```bash
 # 回写也可用 curl
