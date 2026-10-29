@@ -440,6 +440,7 @@ pub fn log_auth_error(
         rpm_limit: None,
         tpm_limit: None,
         max_budget: None,
+        budget_period_secs: None,
         spend: 0.0,
         blocked: false,
         expires_at: None,

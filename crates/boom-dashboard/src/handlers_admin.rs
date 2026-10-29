@@ -89,6 +89,49 @@ fn validate_prefix_and_tag(req: &CreateKeyRequest) -> Option<Response> {
     None
 }
 
+/// Validate the numeric limit fields shared by the create/update/batch paths.
+///
+/// Negative RPM/TPM are nonsensical and get silently cast to a huge `u64` at
+/// auth time (effectively disabling the limit), while a negative or non-finite
+/// `max_budget` can never be a meaningful spend cap. A malformed
+/// `budget_duration` would silently degrade to a lifetime budget at auth time.
+/// Reject all of them up front so bad admin input is a 400 instead of corrupt
+/// or silently-ignored quota state.
+fn validate_key_limits(
+    rpm_limit: Option<i64>,
+    tpm_limit: Option<i64>,
+    max_budget: Option<f64>,
+    budget_duration: Option<&str>,
+) -> Result<(), String> {
+    if let Some(v) = rpm_limit {
+        if v < 0 {
+            return Err("Invalid rpm_limit: must be >= 0".to_string());
+        }
+    }
+    if let Some(v) = tpm_limit {
+        if v < 0 {
+            return Err("Invalid tpm_limit: must be >= 0".to_string());
+        }
+    }
+    if let Some(v) = max_budget {
+        if !v.is_finite() || v < 0.0 {
+            return Err("Invalid max_budget: must be a finite number >= 0".to_string());
+        }
+    }
+    // An empty string is the dashboard's "clear this field" signal, so only
+    // non-blank values are format-checked.
+    if let Some(raw) = budget_duration {
+        if !raw.trim().is_empty()
+            && boom_core::types::parse_budget_duration_secs(raw).is_none()
+        {
+            return Err(
+                "Invalid budget_duration: expected <n><s|m|h|d|w>, e.g. 30d".to_string()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Best-effort rollback for a token row inserted during creation when the
 /// follow-up plan assignment fails. Keeping the row would leave the key with
 /// no rate-limiting plan while the API reports an error — the silently
@@ -716,6 +759,16 @@ pub async fn create_key(
         return resp;
     }
 
+    // 0a. Reject negative / non-finite numeric limits and malformed durations.
+    if let Err(msg) = validate_key_limits(
+        req.rpm_limit,
+        req.tpm_limit,
+        req.max_budget,
+        req.budget_duration.as_deref(),
+    ) {
+        return (StatusCode::BAD_REQUEST, msg).into_response();
+    }
+
     // 1. Generate raw key + token hash + optional prefix metadata.
     //    Prefixed keys hash only the secret portion; legacy keys hash the
     //    whole raw_key so old DB rows remain matchable.
@@ -944,6 +997,17 @@ pub async fn update_key(
             )
                 .into_response();
         }
+    }
+
+    // Reject negative / non-finite numeric limits and malformed durations
+    // (same rule as create).
+    if let Err(msg) = validate_key_limits(
+        req.rpm_limit,
+        req.tpm_limit,
+        req.max_budget,
+        req.budget_duration.as_deref(),
+    ) {
+        return (StatusCode::BAD_REQUEST, msg).into_response();
     }
 
     let models_list: Option<Vec<String>> = req.models.as_ref().map(|v| {
@@ -1504,6 +1568,19 @@ async fn insert_single_key(
                 reason: "invalid_tag",
             };
         }
+    }
+    if validate_key_limits(
+        req.rpm_limit,
+        req.tpm_limit,
+        req.max_budget,
+        req.budget_duration.as_deref(),
+    )
+    .is_err()
+    {
+        return CreateOutcome::Skipped {
+            key_alias: req.key_alias,
+            reason: "invalid_limits",
+        };
     }
     // Dedup check on key_alias.
     if let Some(ref alias) = req.key_alias {
@@ -6418,7 +6495,34 @@ pub async fn ping_trace_otlp_endpoint(
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_pagination, CreateKeyRequest};
+    use super::{normalize_pagination, validate_key_limits, CreateKeyRequest};
+
+    /// Numeric limits must reject negatives / non-finite budgets but accept
+    /// absent values (unlimited) and zero.
+    #[test]
+    fn validate_key_limits_rejects_invalid_values() {
+        assert!(validate_key_limits(None, None, None, None).is_ok());
+        assert!(validate_key_limits(Some(0), Some(0), Some(0.0), None).is_ok());
+        assert!(validate_key_limits(Some(60), Some(1000), Some(12.5), Some("30d")).is_ok());
+        // Empty/blank duration means "clear the field", not invalid input.
+        assert!(validate_key_limits(None, None, None, Some("")).is_ok());
+        assert!(validate_key_limits(None, None, None, Some("   ")).is_ok());
+
+        assert!(validate_key_limits(Some(-1), None, None, None).is_err());
+        assert!(validate_key_limits(None, Some(-1), None, None).is_err());
+        assert!(validate_key_limits(None, None, Some(-0.01), None).is_err());
+        assert!(validate_key_limits(None, None, Some(f64::NAN), None).is_err());
+        assert!(validate_key_limits(None, None, Some(f64::INFINITY), None).is_err());
+
+        // Malformed durations must fail here instead of silently becoming a
+        // lifetime budget at auth time.
+        for raw in ["1mo", "30", "d", "0d", "1.5d"] {
+            assert!(
+                validate_key_limits(None, None, None, Some(raw)).is_err(),
+                "{raw:?} must be rejected"
+            );
+        }
+    }
 
     #[test]
     fn normalize_pagination_clamps_invalid_values() {
