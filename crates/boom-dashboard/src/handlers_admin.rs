@@ -89,6 +89,33 @@ fn validate_prefix_and_tag(req: &CreateKeyRequest) -> Option<Response> {
     None
 }
 
+/// Best-effort rollback for a token row inserted during creation when the
+/// follow-up plan assignment fails. Keeping the row would leave the key with
+/// no rate-limiting plan while the API reports an error — the silently
+/// unlimited state this module must not produce.
+///
+/// Returns `true` when the row is gone (deleted now or already absent) and
+/// `false` when the DELETE failed. Callers must surface the `false` case:
+/// the orphan token is still a valid, unlimited key and needs manual cleanup.
+async fn rollback_inserted_key(pool: &sqlx::PgPool, token_hash: &str) -> bool {
+    match sqlx::query(r#"DELETE FROM "boom_verification_token" WHERE token = $1"#)
+        .bind(token_hash)
+        .execute(pool)
+        .await
+    {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::error!(
+                token_hash = %token_hash,
+                "Failed to roll back key after plan assignment failure — \
+                 an orphan token remains and must be deleted manually: {}",
+                e
+            );
+            false
+        }
+    }
+}
+
 // ═══════════════════════════════════════════════════════════
 // Plan management (delegated to PlanStore)
 // ═══════════════════════════════════════════════════════════
@@ -694,7 +721,17 @@ pub async fn create_key(
     //    whole raw_key so old DB rows remain matchable.
     let (raw_key, token_hash, key_prefix) = generate_key_material(req.key_prefix.as_deref());
 
-    // 1b. Check key_alias dedup (if provided).
+    // 1b. Validate the requested plan BEFORE the INSERT using the exact same
+    //     rules the assignment path applies (plan exists + not type=team).
+    //     Delegating to PlanStore prevents this pre-check from drifting out
+    //     of sync when assignment-side rules change.
+    if let Some(Some(ref plan_name)) = req.plan_name {
+        if let Err(msg) = state.plan_store.validate_plan_for_key(plan_name, &token_hash) {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response();
+        }
+    }
+
+    // 1c. Check key_alias dedup (if provided).
     if let Some(ref alias) = req.key_alias {
         let exists: bool = sqlx::query_scalar(
             r#"SELECT EXISTS(SELECT 1 FROM "boom_verification_token" WHERE key_alias = $1)"#,
@@ -764,6 +801,11 @@ pub async fn create_key(
     //    - Some(Some(name))→ row with plan_name = name
     //    Skip DB write when the explicit assignment is the same as default_plan:
     //    no row needed; default fallback already yields the right plan at runtime.
+    //
+    //    The token row is already committed at this point. Any assignment
+    //    failure (e.g. the plan was deleted between validation and here, or a
+    //    DB error) must NOT be left as a warning: roll the token back so we
+    //    never hand out a key without the requested rate-limiting plan.
     match req.plan_name {
         None => {}
         Some(None) => {
@@ -772,7 +814,24 @@ pub async fn create_key(
                 .assign_key_no_plan_db(db_pool, &token_hash)
                 .await
             {
-                tracing::warn!("Key created but 'no plan' assignment failed: {}", e);
+                tracing::error!("'No plan' assignment failed, rolling back key: {}", e);
+                let rolled_back = rollback_inserted_key(db_pool, &token_hash).await;
+                let msg = if rolled_back {
+                    format!(
+                        "Key creation failed: could not persist 'no plan' assignment: {}", e
+                    )
+                } else {
+                    format!(
+                        "Key creation failed: could not persist 'no plan' assignment: {}; \
+                         rollback failed, orphan token '{}' must be deleted manually",
+                        e, token_hash
+                    )
+                };
+                let mut body = json!({ "error": msg });
+                if !rolled_back {
+                    body["rollback_failed"] = json!(true);
+                }
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response();
             }
         }
         Some(Some(ref plan_name)) => {
@@ -784,7 +843,28 @@ pub async fn create_key(
                 state.plan_store.assign_key_db(db_pool, &token_hash, plan_name).await
             };
             if let Err(e) = result {
-                tracing::warn!("Key created but plan assignment failed: {}", e);
+                tracing::error!(
+                    plan = %plan_name,
+                    "Plan assignment failed, rolling back key: {}",
+                    e
+                );
+                let rolled_back = rollback_inserted_key(db_pool, &token_hash).await;
+                let msg = if rolled_back {
+                    format!(
+                        "Key creation failed: could not assign plan '{}': {}", plan_name, e
+                    )
+                } else {
+                    format!(
+                        "Key creation failed: could not assign plan '{}': {}; \
+                         rollback failed, orphan token '{}' must be deleted manually",
+                        plan_name, e, token_hash
+                    )
+                };
+                let mut body = json!({ "error": msg });
+                if !rolled_back {
+                    body["rollback_failed"] = json!(true);
+                }
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response();
             }
         }
     }
@@ -1425,7 +1505,6 @@ async fn insert_single_key(
             };
         }
     }
-
     // Dedup check on key_alias.
     if let Some(ref alias) = req.key_alias {
         let exists: bool = sqlx::query_scalar(
@@ -1445,6 +1524,18 @@ async fn insert_single_key(
     }
 
     let (raw_key, token_hash, key_prefix) = generate_key_material(req.key_prefix.as_deref());
+
+    // Reject plans that cannot be assigned to a key (missing or type=team)
+    // before inserting — same rule the assignment path enforces, via the
+    // shared PlanStore validation so the two stay in lockstep.
+    if let Some(Some(ref plan_name)) = req.plan_name {
+        if state.plan_store.validate_plan_for_key(plan_name, &token_hash).is_err() {
+            return CreateOutcome::Skipped {
+                key_alias: req.key_alias,
+                reason: "invalid_plan",
+            };
+        }
+    }
 
     let expires: Option<NaiveDateTime> = req
         .expires
@@ -1484,6 +1575,9 @@ async fn insert_single_key(
     match result {
         Ok(_) => {
             // Plan assignment — 3 states (see CreateKeyRequest::plan_name).
+            // Any failure here must roll the token back: a key without the
+            // requested plan would be silently unlimited, and the row was
+            // already reported as created otherwise.
             match req.plan_name {
                 None => {}
                 Some(None) => {
@@ -1492,7 +1586,12 @@ async fn insert_single_key(
                         .assign_key_no_plan_db(db_pool, &token_hash)
                         .await
                     {
-                        tracing::warn!("Key created but 'no plan' assignment failed: {}", e);
+                        tracing::error!("'No plan' assignment failed, rolling back key: {}", e);
+                        let rolled_back = rollback_inserted_key(db_pool, &token_hash).await;
+                        return CreateOutcome::Skipped {
+                            key_alias: req.key_alias,
+                            reason: if rolled_back { "assignment_failed" } else { "rollback_failed" },
+                        };
                     }
                 }
                 Some(Some(ref plan_name)) => {
@@ -1504,7 +1603,16 @@ async fn insert_single_key(
                         state.plan_store.assign_key_db(db_pool, &token_hash, plan_name).await
                     };
                     if let Err(e) = result {
-                        tracing::warn!("Key created but plan assignment failed: {}", e);
+                        tracing::error!(
+                            plan = %plan_name,
+                            "Plan assignment failed, rolling back key: {}",
+                            e
+                        );
+                        let rolled_back = rollback_inserted_key(db_pool, &token_hash).await;
+                        return CreateOutcome::Skipped {
+                            key_alias: req.key_alias,
+                            reason: if rolled_back { "assignment_failed" } else { "rollback_failed" },
+                        };
                     }
                 }
             }
@@ -1617,7 +1725,6 @@ pub async fn import_keys(
     //    explicit flag in the response noting that the rest were dropped.
     let truncated = parsed_reqs.len() > IMPORT_MAX_ROWS;
     let parsed_total = parsed_reqs.len();
-    let inserted_count = if truncated { IMPORT_MAX_ROWS } else { parsed_total };
     let parsed_reqs = if truncated {
         parsed_reqs.into_iter().take(IMPORT_MAX_ROWS).collect::<Vec<_>>()
     } else {
@@ -1659,7 +1766,7 @@ pub async fn import_keys(
         "file_name": name,
         "format": ext,
         "parsed": parsed_total,
-        "inserted": inserted_count,
+        "inserted": created.len(),
         "truncated": truncated,
         "max_rows": IMPORT_MAX_ROWS,
         "parse_errors": parse_errors,
