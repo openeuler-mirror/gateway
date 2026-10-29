@@ -238,6 +238,8 @@ curl -X DELETE $BASE/admin/plans/assign/$KEYHASH -H "Authorization: Bearer $MAST
 
 ## 4. Dashboard 认证（JWT Cookie）
 
+> 会话 JWT 用独立于 `master_key` 的密钥签名（`general_settings.dashboard_session_secret`，建议 ≥32 字符，不足或与 `master_key` 相同时仅打 warn；env bootstrap 取 `BOOM_DASHBOARD_SESSION_SECRET`）。未配置时每次启动随机生成：重启后旧会话失效，多副本之间不共享。
+
 ### 4.1 Login
 
 **POST** `/dashboard/api/auth/login` — body：`{user_id, api_key}`
@@ -845,7 +847,7 @@ curl -X POST $BASE/dashboard/api/admin/limits/reset -H "Cookie: boom_session=$JW
 
 ### 16.1 读取全量配置
 
-**GET** `/dashboard/api/admin/config` · admin — 返回内存中的 `Config` 序列化，敏感字段（`master_key`、`database_url`、`api_key`、`aws_*_key`）被 `mask_secrets_in_place` 抹成 null。
+**GET** `/dashboard/api/admin/config` · admin — 返回内存中的 `Config` 序列化，敏感字段（`master_key`、`dashboard_session_secret`、`database_url`、`api_key`、`aws_*_key`）被 `mask_secrets_in_place` 抹成 null。
 
 ```bash
 curl $BASE/dashboard/api/admin/config -H "Cookie: boom_session=$JWT" | jq .
@@ -897,7 +899,7 @@ curl $BASE/dashboard/api/admin/config/export -H "Cookie: boom_session=$JWT" | jq
 
 ### 16.6 回写配置（刷新启动 YAML）
 
-**POST** `/dashboard/api/admin/config/writeback` · admin — 与 16.5 同一序列化管道，写回启动用的 config.yaml（先滚动 `.bak` 单槽备份）。env bootstrap 模式（无 YAML 启动）下在 cwd 生成新 config.yaml（0600，secrets 写成 `${BOOM_MASTER_KEY}` / `${BOOM_DATABASE_URL}` 引用），重启即切换为文件模式。
+**POST** `/dashboard/api/admin/config/writeback` · admin — 与 16.5 同一序列化管道，写回启动用的 config.yaml（先滚动 `.bak` 单槽备份）。env bootstrap 模式（无 YAML 启动）下在 cwd 生成新 config.yaml（0600，secrets 写成 `${BOOM_MASTER_KEY}` / `${BOOM_DATABASE_URL}` / `${BOOM_DASHBOARD_SESSION_SECRET}` 引用），重启即切换为文件模式。
 
 **用途 = 回滚种子 / 灾备工件，不是同步语义**：文件写完即开始过期，业务配置的日常变更走 Dashboard CRUD 即时生效。升级 / 回退二进制前建议先回写一次刷新快照。
 

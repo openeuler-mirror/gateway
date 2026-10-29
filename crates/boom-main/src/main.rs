@@ -262,6 +262,11 @@ fn build_router(state: AppState) -> Router {
     // Returns Router<()> — state injected via Extension<Arc<DashboardState>>.
     let inner = state.inner.load();
     let master_key = inner.config.general_settings.master_key.clone();
+    let dashboard_session_secret = inner
+        .config
+        .general_settings
+        .dashboard_session_secret
+        .clone();
     let key_alias_lookup = inner.key_alias_lookup.clone();
     drop(inner);
 
@@ -281,6 +286,7 @@ fn build_router(state: AppState) -> Router {
         state.flow_controller.clone(),
         admin_tx,
         master_key,
+        dashboard_session_secret,
         state.debug_store.clone(),
         state.prompt_log_query.clone(),
         state.rebalance_move_tracker.clone(),

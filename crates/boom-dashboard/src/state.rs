@@ -217,7 +217,9 @@ pub struct DashboardState {
     pub flow_controller: Arc<FlowController>,
     /// Channel for model write operations (handled by boom-main).
     pub admin_tx: AdminTx,
-    /// JWT signing key (derived from master_key at startup).
+    /// Session JWT signing key — independent of `master_key` (configured
+    /// `dashboard_session_secret` or a random per-process key; see
+    /// `resolve_jwt_secret`).
     pub jwt_secret: String,
     /// Master key for admin login (constant-time comparison).
     pub master_key: Option<String>,
@@ -275,6 +277,7 @@ impl DashboardState {
         flow_controller: Arc<FlowController>,
         admin_tx: AdminTx,
         master_key: Option<String>,
+        session_secret: Option<String>,
         debug_store: Arc<DebugErrorStore>,
         prompt_log_query: Arc<dyn PromptLogQueryApi>,
         rebalance_move_tracker: Arc<RebalanceMoveTracker>,
@@ -289,11 +292,12 @@ impl DashboardState {
         trace: Arc<dyn boom_core::TraceApi>,
         alerts: Arc<dyn boom_core::AlertApi>,
     ) -> Self {
-        // Derive JWT secret from master_key, or use a random fallback.
-        let jwt_secret = master_key
-            .as_deref()
-            .unwrap_or("boom-dashboard-default-secret")
-            .to_string();
+        // The session signing key must NOT be derived from the master key:
+        // anyone who knows the master key (API clients, a leaked config file)
+        // could otherwise forge arbitrary admin-role session JWTs offline.
+        // Operators may pin an independent secret for stable sessions across
+        // restarts / replicas; otherwise generate a random per-process key.
+        let jwt_secret = resolve_jwt_secret(session_secret, master_key.as_deref());
         Self {
             db_pool,
             plan_store,
@@ -322,5 +326,97 @@ impl DashboardState {
             trace,
             alerts,
         }
+    }
+}
+
+/// Minimum length (characters) for an operator-supplied session signing key.
+const MIN_SESSION_SECRET_CHARS: usize = 32;
+
+/// Resolve the dashboard session JWT signing key.
+///
+/// Deliberately independent of the master key: dashboard sessions must stay
+/// unforgeable for anyone who merely knows the master key. When the operator
+/// does not pin a dedicated secret, a random 256-bit key is generated for this
+/// process — sessions then end on restart and are not shared across replicas.
+fn resolve_jwt_secret(configured: Option<String>, master_key: Option<&str>) -> String {
+    match configured.filter(|s| !s.trim().is_empty()) {
+        Some(secret) => {
+            if master_key.is_some_and(|mk| !mk.is_empty() && mk == secret) {
+                tracing::warn!(
+                    "general_settings.dashboard_session_secret is identical to \
+                     general_settings.master_key: anyone holding the master key can forge \
+                     admin session JWTs — set dashboard_session_secret to an independent \
+                     random value of at least {} characters",
+                    MIN_SESSION_SECRET_CHARS
+                );
+            }
+            let len = secret.chars().count();
+            if len < MIN_SESSION_SECRET_CHARS {
+                tracing::warn!(
+                    len,
+                    min = MIN_SESSION_SECRET_CHARS,
+                    "general_settings.dashboard_session_secret is shorter than {} characters: \
+                     weak HMAC key — use an independent random value of at least {} characters",
+                    MIN_SESSION_SECRET_CHARS,
+                    MIN_SESSION_SECRET_CHARS
+                );
+            }
+            secret
+        }
+        None => {
+            tracing::warn!(
+                "general_settings.dashboard_session_secret is not set: using a random \
+                 per-process session signing key — dashboard sessions are dropped on \
+                 restart and not shared across replicas"
+            );
+            random_session_secret()
+        }
+    }
+}
+
+/// 256-bit random key (two UUIDv4 values, 122 random bits each).
+fn random_session_secret() -> String {
+    format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configured_session_secret_is_used_verbatim() {
+        let secret = "0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            resolve_jwt_secret(Some(secret.to_string()), None),
+            secret
+        );
+    }
+
+    #[test]
+    fn session_secret_equal_to_master_key_is_kept() {
+        // Equality only produces a warn — the configured value is still used.
+        let master = "sk-master-shared-value";
+        assert_eq!(
+            resolve_jwt_secret(Some(master.to_string()), Some(master)),
+            master
+        );
+    }
+
+    #[test]
+    fn short_session_secret_is_kept_but_warned() {
+        // Too-short secrets only produce a warn — they are not rejected.
+        assert_eq!(
+            resolve_jwt_secret(Some("short-secret".to_string()), None),
+            "short-secret"
+        );
+    }
+
+    #[test]
+    fn missing_session_secret_yields_independent_random_key() {
+        let from_none = resolve_jwt_secret(None, None);
+        let from_blank = resolve_jwt_secret(Some("   ".to_string()), None);
+        assert_eq!(from_none.len(), 64);
+        assert_eq!(from_blank.len(), 64);
+        assert_ne!(from_none, from_blank);
     }
 }

@@ -259,7 +259,7 @@ boom-trace      → leaf crate，Dashboard 经 boom-core::TraceApi（Arc<dyn Tra
 
 | 编号 | 子功能模块 | 功能描述 | 承载 | 关键实现 |
 |------|-----------|----------|------|----------|
-| F9.1 | 面板认证 | JWT HS256（secret 由 master_key 派生），boom_session HttpOnly cookie 2h；admin 登录 = master key 常量时间比较；user 登录 = SHA-256(api_key) 查表 + blocked 校验；角色仅 admin/user 两级；per-IP 防爆破（5 次锁 10s，之后每次 +30s） | boom-dashboard | auth.rs |
+| F9.1 | 面板认证 | JWT HS256（secret 独立于 master_key：优先取配置 `general_settings.dashboard_session_secret`（建议 ≥32 字符，不足或与 master_key 相同均打 warn；env bootstrap 取 `BOOM_DASHBOARD_SESSION_SECRET`），未配置则启动时随机生成，避免持有 master_key 者离线伪造 admin 会话），boom_session HttpOnly cookie 2h；admin 登录 = master key 常量时间比较；user 登录 = SHA-256(api_key) 查表 + blocked 校验；角色仅 admin/user 两级；per-IP 防爆破（5 次锁 10s，之后每次 +30s） | boom-dashboard | auth.rs |
 | F9.2 | 用户端 | plan 解析（三态）+ 有效限制展示、个人用量、key 信息、个人日志、实时排队状态（自己前面还有几位） | boom-dashboard | /user/* 端点 |
 | F9.3 | 管理端 — 模型配置 | 模型 CRUD、别名 CRUD、配置查看/点路径编辑、config schema 拉取、热加载按钮 | boom-dashboard | /admin/models、/admin/aliases、/admin/config* |
 | F9.4 | 管理端 — 密钥与团队 | 密钥 CRUD/批量/导入/block、团队 CRUD、plan 分配（key/team） | boom-dashboard | /admin/keys、/admin/teams、/admin/assignments |
@@ -275,7 +275,7 @@ boom-trace      → leaf crate，Dashboard 经 boom-core::TraceApi（Arc<dyn Tra
 |------|-----------|----------|------|----------|
 | F10.1 | YAML schema | 顶层：model_list / general_settings / router_settings / workflow_settings / server / rate_limit / plan_settings / cost_templates / deployment_health_check / prompt_log / trace / hooks（litellm proxy_server_config 格式兼容）。其中 model_list / workflow_settings / plan_settings / cost_templates / client_blocklist / model_group_alias 为 **seed-only**（仅全新库首次导入，此后 inert）；general_settings.store_model_in_db 已废弃 | boom-config | Config（lib.rs:31-65） |
 | F10.2 | 环境变量展开 | 双语法 `${VAR}` / `os.environ/VAR`；解析前全文展开 + 解析后敏感字段二次展开；`read_raw_yaml` **不展开**（Web 读-改-写保留 secret 引用不泄露磁盘） | boom-config | resolve_env_vars |
-| F10.3 | Secret 保护 | 13 个敏感字段名脱敏 `****`（null 保留区分未配置）；`write_yaml_atomic` truncate 原地写 + fsync（兼容容器 bind mount） | boom-config | mask_secrets_in_place |
+| F10.3 | Secret 保护 | 14 个敏感字段名脱敏 `****`（null 保留区分未配置）；`write_yaml_atomic` truncate 原地写 + fsync（兼容容器 bind mount） | boom-config | mask_secrets_in_place |
 | F10.4 | 配置权威模型 | **DB=唯一运行时权威**（模型/别名/套餐/拦截/workflow/计费模板，多实例共享面）；YAML=进程级配置 + 首次 seed 源 + 回滚工件（业务 section 标记存在即 inert）；内存=DB 的缓存（路由唯一来源 + 最大服务兜底）；无 DB 模式（master-key-only）YAML 构建路径保留（部署形态选择） | 全局 | CLAUDE.md §7 |
 | F10.5 | 热加载 | 触发：SIGHUP / POST /admin/config/reload / Dashboard 按钮 / UpdateConfigSection 后自动；60s 总超时 + catch_unwind（失败旧 inner 继续路由）；流程：重读 YAML 进程段（env bootstrap 模式保持当前进程配置）→ 重连 DB（如 URL 变）→ 业务配置**增量对账**（per-key diff，永不清空 store；对账失败中止 reload）→ kv_index 签名比对（不变保留学习成果，变了重建空 trie）→ 重建调度策略 → 注册 fusion → promptlog/OTLP 热更 → ArcSwap 原子换入；**不清除任何运行时计数器** | boom-main | reload_inner + config_reconcile.rs |
 | F10.6 | CRUD 写路径（两步规范） | ① DB 写 → ② 直改内存（reload_model_deployments / store 内存方法，立即可路由）；无 YAML 回写、无 warning 字段、handler 不调 reload()；YAML 快照刷新是手动操作（见 F10.8） | boom-main / boom-dashboard | §5.4 详述 |
