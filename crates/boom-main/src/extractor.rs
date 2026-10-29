@@ -1,6 +1,6 @@
 use crate::hooks::PreAuthOutcome;
 use crate::request_log::log_auth_error;
-use crate::routes::{GatewayErrorReply, extract_client_ip, extract_user_tag};
+use crate::routes::{GatewayErrorReply, extract_client_ip, extract_user_tags};
 use crate::state::AppState;
 use axum::body::Bytes;
 use axum::extract::{FromRequest, FromRequestParts, Request};
@@ -139,7 +139,7 @@ impl FromRequestParts<AppState> for RequiredAuth {
         // Hook-constructed headers become ordinary request headers —
         // insert (override) any client-sent same-named value — before any
         // downstream consumer reads them. From here on they are
-        // indistinguishable from client headers: user_tag attribution,
+        // indistinguishable from client headers: user_tags attribution,
         // prompt-log capture, and the deployment client-header whitelist
         // for upstream forwarding all apply unchanged.
         apply_hook_headers(&mut parts.headers, &hook_result.headers);
@@ -149,7 +149,7 @@ impl FromRequestParts<AppState> for RequiredAuth {
         // every path, including auth failures (a 401 from a shared key
         // still shows which user sent it). No-op when user_tag_headers is
         // unconfigured.
-        let user_tag = extract_user_tag(&state.user_tag_store.get(), &parts.headers);
+        let user_tags = extract_user_tags(&state.user_tag_store.get(), &parts.headers);
 
         let mut new_model_opt: Option<String> = None;
         let effective_key = match hook_result.outcome {
@@ -169,7 +169,7 @@ impl FromRequestParts<AppState> for RequiredAuth {
                     &err,
                     Some(Uuid::new_v4().to_string()),
                     client_ip.clone(),
-                    user_tag.clone(),
+                    user_tags.clone(),
                 );
                 return Err(GatewayErrorReply(err, false));
             }
@@ -184,7 +184,7 @@ impl FromRequestParts<AppState> for RequiredAuth {
                     &err,
                     Some(Uuid::new_v4().to_string()),
                     client_ip.clone(),
-                    user_tag.clone(),
+                    user_tags.clone(),
                 );
                 return Err(GatewayErrorReply(err, false));
             }
@@ -201,7 +201,7 @@ impl FromRequestParts<AppState> for RequiredAuth {
                     &e,
                     Some(Uuid::new_v4().to_string()),
                     client_ip.clone(),
-                    user_tag.clone(),
+                    user_tags.clone(),
                 );
                 return Err(GatewayErrorReply(e, false));
             }
@@ -281,7 +281,7 @@ pub async fn buffer_request_body(
 /// control characters) are skipped with a warn instead of failing the
 /// request — a broken hook must not 500 every request. Values are
 /// validated with `HeaderValue::from_bytes` (not `from_str`) so
-/// non-ASCII UTF-8 passes as obs-text, matching `extract_user_tag`'s
+/// non-ASCII UTF-8 passes as obs-text, matching `extract_user_tags`'s
 /// lossy-decode handling of non-ASCII client values.
 fn apply_hook_headers(
     headers: &mut axum::http::HeaderMap,
@@ -465,7 +465,7 @@ mod tests {
     #[test]
     fn apply_hook_headers_allows_non_ascii_value() {
         // CJK values must survive — from_bytes treats them as obs-text,
-        // consistent with extract_user_tag's from_utf8_lossy decode.
+        // consistent with extract_user_tags's from_utf8_lossy decode.
         let mut headers = axum::http::HeaderMap::new();
         apply_hook_headers(&mut headers, &hook_headers(&[("X-User-Tag", "张三")]));
         assert_eq!(headers.get("x-user-tag").unwrap().as_bytes(), "张三".as_bytes());

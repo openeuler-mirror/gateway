@@ -2719,6 +2719,11 @@ struct LogRow {
     trie_max_blocks: Option<i64>,
     request_tokens: Option<i64>,
     queue_wait_ms: Option<i32>,
+    // Per-user attribution slots — values of the configured user_tag_headers,
+    // one column per header in list order.
+    user_tag1: Option<String>,
+    user_tag2: Option<String>,
+    user_tag3: Option<String>,
 }
 
 pub async fn list_logs(
@@ -2825,7 +2830,7 @@ pub async fn list_logs(
                   rl.deployment_id, rl.client_ip, rl.cached_tokens,
                   rl.schedule_policy, rl.kv_hit_blocks, rl.kv_input_blocks,
                   rl.trie_blocks, rl.trie_max_blocks, rl.request_tokens,
-                  rl.queue_wait_ms
+                  rl.queue_wait_ms, rl.user_tag1, rl.user_tag2, rl.user_tag3
            FROM boom_request_log rl
            LEFT JOIN boom_team_table bt ON rl.team_id = bt.team_id
            {where_sql}
@@ -3017,6 +3022,9 @@ pub async fn list_logs(
                 "trie_max_blocks": r.trie_max_blocks,
                 "request_tokens": r.request_tokens,
                 "queue_wait_ms": r.queue_wait_ms,
+                "user_tag1": r.user_tag1,
+                "user_tag2": r.user_tag2,
+                "user_tag3": r.user_tag3,
             })
         })
         .collect();

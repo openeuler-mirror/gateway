@@ -159,29 +159,30 @@ pub(crate) fn extract_client_ip(headers: &axum::http::HeaderMap, remote_addr: Op
     "unknown".to_string()
 }
 
-/// Extract the per-user attribution tag from the configured headers.
+/// Per-user attribution tags: one slot per configured header (max 3), stored
+/// as the independent `boom_request_log.user_tag1/2/3` columns. Slot i holds
+/// the value of configured header i — stable slot positions, so reordering
+/// the header list changes which slot a value lands in.
+pub(crate) type UserTags = [Option<String>; 3];
+
+/// Extract the per-user attribution tags from the configured headers.
 ///
 /// `configured` is the DB-authoritative header-name list (UserTagStore, up
-/// to 3 entries); joins the captured header *values* with ';' in configured
-/// order (e.g. `x-user-tag: hello` + `x-request-id: 321` → `hello;321`).
-/// Per header, repeated occurrences are joined with ','; a missing or
-/// whitespace-only header is skipped; entries beyond the 3rd are ignored.
-/// The joined string is truncated to 256 bytes at a char boundary (header
-/// values can legally reach 8 KiB). Returns None when the feature is
-/// unconfigured or no header produced a value — display-only attribution,
-/// never used for auth/routing decisions.
-pub(crate) fn extract_user_tag(
+/// to 3 entries). Each slot is filled independently: a missing or
+/// whitespace-only header leaves that slot NULL (slots are NOT compressed),
+/// and each value is truncated to 256 bytes at a char boundary (header
+/// values can legally reach 8 KiB). Repeated occurrences of one header are
+/// joined with ','. All-NULL when the feature is unconfigured — display-only
+/// attribution, never used for auth/routing decisions.
+pub(crate) fn extract_user_tags(
     configured: &[String],
     headers: &axum::http::HeaderMap,
-) -> Option<String> {
+) -> UserTags {
     const USER_TAG_MAX_BYTES: usize = 256;
     const USER_TAG_MAX_HEADERS: usize = 3;
 
-    if configured.is_empty() {
-        return None;
-    }
-    let mut parts: Vec<String> = Vec::new();
-    for raw in configured.iter().take(USER_TAG_MAX_HEADERS) {
+    let mut tags: UserTags = [None, None, None];
+    for (slot, raw) in configured.iter().take(USER_TAG_MAX_HEADERS).enumerate() {
         let raw = raw.trim();
         if raw.is_empty() {
             continue;
@@ -200,23 +201,20 @@ pub(crate) fn extract_user_tag(
             .iter()
             .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
             .collect();
-        let joined = values.join(",").trim().to_string();
-        if !joined.is_empty() {
-            parts.push(joined);
+        let mut joined = values.join(",").trim().to_string();
+        if joined.is_empty() {
+            continue;
         }
-    }
-    if parts.is_empty() {
-        return None;
-    }
-    let mut value = parts.join(";");
-    if value.len() > USER_TAG_MAX_BYTES {
-        let mut end = USER_TAG_MAX_BYTES;
-        while end > 0 && !value.is_char_boundary(end) {
-            end -= 1;
+        if joined.len() > USER_TAG_MAX_BYTES {
+            let mut end = USER_TAG_MAX_BYTES;
+            while end > 0 && !joined.is_char_boundary(end) {
+                end -= 1;
+            }
+            joined.truncate(end);
         }
-        value.truncate(end);
+        tags[slot] = Some(joined);
     }
-    Some(value)
+    tags
 }
 
 /// Acquire flow control guard for a deployment.
@@ -247,7 +245,7 @@ async fn acquire_fc_guard<E>(
     start: Instant,
     request_id: &str,
     client_ip: Option<String>,
-    user_tag: Option<String>,
+    user_tags: UserTags,
     err_wrap: impl Fn(GatewayError, bool) -> E,
 ) -> Result<Option<boom_flowcontrol::FlowControlGuard>, E> {
     match state.flow_controller.acquire(deployment_id, context_chars, timeout, is_vip, key_alias, fc_key_hash, fc_model).await {
@@ -262,7 +260,7 @@ async fn acquire_fc_guard<E>(
             log_error_with_queue_wait(
                 state, identity, model, api_path, is_stream, start, &e,
                 Some(request_id.to_string()), Some(deployment_id.to_string()),
-                None, client_ip, user_tag, queue_wait_ms,
+                None, client_ip, user_tags, queue_wait_ms,
             );
             Err(err_wrap(e, is_stream))
         }
@@ -276,7 +274,7 @@ async fn acquire_fc_guard<E>(
                 scope_id: None,
                 plan_name: None,
             };
-            log_error(state, identity, model, api_path, is_stream, start, &e, Some(request_id.to_string()), Some(deployment_id.to_string()), None, client_ip, user_tag);
+            log_error(state, identity, model, api_path, is_stream, start, &e, Some(request_id.to_string()), Some(deployment_id.to_string()), None, client_ip, user_tags);
             Err(err_wrap(e, is_stream))
         }
     }
@@ -623,7 +621,7 @@ async fn chat_completions_inner(
     let request_id = new_request_id();
     let client_ip = extract_client_ip(headers, remote_addr);
     let inner = state.inner.load();
-    let user_tag = extract_user_tag(&state.user_tag_store.get(), headers);
+    let user_tags = extract_user_tags(&state.user_tag_store.get(), headers);
     // pre_auth hook may have decided to rewrite the request's model (along
     // with the key). Apply before any downstream consumer — check_model_access
     // will then verify the rewritten model is in the key's whitelist.
@@ -670,7 +668,7 @@ async fn chat_completions_inner(
         is_stream,
         &request_id,
         &client_ip,
-        user_tag.clone(),
+        user_tags.clone(),
         start,
     )
     .map_err(|e| GatewayErrorReply(e, is_stream))?;
@@ -758,7 +756,7 @@ async fn chat_completions_inner(
     // 1. Model access check (deployment-aware, alias-aware).
     check_model_access(identity, &req.model, &state.router)
         .map_err(|e| {
-            log_error(&state, &identity, &model, api_path, is_stream, start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()), user_tag.clone());
+            log_error(&state, &identity, &model, api_path, is_stream, start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()), user_tags.clone());
             GatewayErrorReply(e, false)
         })?;
 
@@ -795,7 +793,7 @@ async fn chat_completions_inner(
     )
     .await
     .map_err(|e| {
-        log_error(&state, &identity, &model, api_path, is_stream, start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()), user_tag.clone());
+        log_error(&state, &identity, &model, api_path, is_stream, start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()), user_tags.clone());
         GatewayErrorReply(e, false)
     })?;
 
@@ -837,7 +835,7 @@ async fn chat_completions_inner(
                 &resolved_model, Some(&identity.key_hash), input_chars as u64, &[],
             ).ok_or_else(|| {
                 let e = GatewayError::ModelNotFound(resolved_model.clone());
-                log_error(&state, &identity, &model, api_path, is_stream, start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()), user_tag.clone());
+                log_error(&state, &identity, &model, api_path, is_stream, start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()), user_tags.clone());
                 GatewayErrorReply(e, false)
             })?;
             let did = selection.provider.deployment_id().map(|s| s.to_string());
@@ -858,7 +856,7 @@ async fn chat_completions_inner(
             identity.key_alias.clone(), Some(identity.key_hash.clone()),
             Some(inflight_model.clone()),
             api_path, &identity, &model,
-            is_stream, start, &request_id, Some(client_ip.clone()), user_tag.clone(), GatewayErrorReply,
+            is_stream, start, &request_id, Some(client_ip.clone()), user_tags.clone(), GatewayErrorReply,
         ).await?
     } else {
         None
@@ -961,7 +959,7 @@ async fn chat_completions_inner(
             Err(e) => {
                 let partial_usage = provider_billing.actual_usage();
                 settle_partial_provider_accounting(&mut plan_charge, &provider_billing);
-                log_error_with_usage(&state, &identity, &model, api_path, true, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()), user_tag.clone(), partial_usage.as_ref(), None);
+                log_error_with_usage(&state, &identity, &model, api_path, true, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()), user_tags.clone(), partial_usage.as_ref(), None);
                 write_prompt_log_error(
                     &state,
                     prompt_log_should,
@@ -1036,7 +1034,7 @@ async fn chat_completions_inner(
             trie_max_blocks,
             request_tokens: request_bytes,
             queue_wait_ms,
-            user_tag: user_tag.clone(),
+            user_tags: user_tags.clone(),
         }, start, usage, Some(state.agent_stats.clone()))
         .with_plan_charge(plan_charge)
         .with_provider_billing(provider_billing);
@@ -1115,7 +1113,7 @@ async fn chat_completions_inner(
             Err(e) => {
                 let partial_usage = provider_billing.actual_usage();
                 settle_partial_provider_accounting(&mut plan_charge, &provider_billing);
-                log_error_with_usage(&state, &identity, &model, api_path, false, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()), user_tag.clone(), partial_usage.as_ref(), None);
+                log_error_with_usage(&state, &identity, &model, api_path, false, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()), user_tags.clone(), partial_usage.as_ref(), None);
                 write_prompt_log_error(
                     &state,
                     prompt_log_should,
@@ -1202,7 +1200,7 @@ async fn chat_completions_inner(
                 trie_max_blocks,
                 request_tokens: request_bytes,
                 queue_wait_ms,
-                user_tag: user_tag.clone(),
+                user_tags: user_tags.clone(),
             },
         );
         state.agent_stats.record_tokens(
@@ -1758,7 +1756,7 @@ fn check_client_block_rules(
     is_stream: bool,
     request_id: &str,
     client_ip: &str,
-    user_tag: Option<String>,
+    user_tags: UserTags,
     start: Instant,
 ) -> Result<(), GatewayError> {
     // Hot-path fast exit: no rules loaded or blocklist disabled.
@@ -1806,7 +1804,7 @@ fn check_client_block_rules(
         None,
         None,
         Some(client_ip.to_string()),
-        user_tag,
+        user_tags,
         None,
         None,
     );
@@ -3083,7 +3081,7 @@ pub async fn messages(
     let request_id = new_request_id();
     let client_ip = extract_client_ip(&headers, Some(remote_addr));
     let inner = state.inner.load();
-    let user_tag = extract_user_tag(&state.user_tag_store.get(), &headers);
+    let user_tags = extract_user_tags(&state.user_tag_store.get(), &headers);
 
     // pre_auth hook may have decided to rewrite the request's model (along
     // with the key). Apply before anthropic_request_to_openai so the
@@ -3125,7 +3123,7 @@ pub async fn messages(
         is_stream,
         &request_id,
         &client_ip,
-        user_tag.clone(),
+        user_tags.clone(),
         start,
     )
     .map_err(|e| AnthropicErrorReply(e, is_stream))?;
@@ -3174,7 +3172,7 @@ pub async fn messages(
     // 1. Model access check (deployment-aware, alias-aware).
     check_model_access(identity, &openai_req.model, &state.router)
         .map_err(|e| {
-            log_error(&state, &identity, &model, "/v1/messages", is_stream, start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()), user_tag.clone());
+            log_error(&state, &identity, &model, "/v1/messages", is_stream, start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()), user_tags.clone());
             AnthropicErrorReply(e, is_stream)
         })?;
 
@@ -3206,7 +3204,7 @@ pub async fn messages(
     )
     .await
     .map_err(|e| {
-        log_error(&state, &identity, &model, "/v1/messages", is_stream, start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()), user_tag.clone());
+        log_error(&state, &identity, &model, "/v1/messages", is_stream, start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()), user_tags.clone());
         AnthropicErrorReply(e, is_stream)
     })?;
 
@@ -3249,7 +3247,7 @@ pub async fn messages(
                 &resolved_model, Some(&identity.key_hash), input_chars as u64, &[],
             ).ok_or_else(|| {
                 let e = GatewayError::ModelNotFound(resolved_model.clone());
-                log_error(&state, &identity, &model, "/v1/messages", is_stream, start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()), user_tag.clone());
+                log_error(&state, &identity, &model, "/v1/messages", is_stream, start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()), user_tags.clone());
                 AnthropicErrorReply(e, is_stream)
             })?;
             let did = selection.provider.deployment_id().map(|s| s.to_string());
@@ -3270,7 +3268,7 @@ pub async fn messages(
             identity.key_alias.clone(), Some(identity.key_hash.clone()),
             Some(inflight_model.clone()),
             "/v1/messages", &identity, &model,
-            is_stream, start, &request_id, Some(client_ip.clone()), user_tag.clone(), AnthropicErrorReply,
+            is_stream, start, &request_id, Some(client_ip.clone()), user_tags.clone(), AnthropicErrorReply,
         ).await?
     } else {
         None
@@ -3348,7 +3346,7 @@ pub async fn messages(
         let stream = match provider.chat_stream(openai_req).await {
             Ok(s) => s,
             Err(e) => {
-                log_error(&state, &identity, &model, "/v1/messages", true, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()), user_tag.clone());
+                log_error(&state, &identity, &model, "/v1/messages", true, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()), user_tags.clone());
                 write_prompt_log_error(
                     &state,
                     prompt_log_should,
@@ -3423,7 +3421,7 @@ pub async fn messages(
             trie_max_blocks,
             request_tokens: request_bytes,
             queue_wait_ms,
-            user_tag: user_tag.clone(),
+            user_tags: user_tags.clone(),
         }, start, usage, Some(state.agent_stats.clone()))
         .with_plan_charge(plan_charge);
         // Move the trace guard into the stream wrapper (mirror of the
@@ -3475,7 +3473,7 @@ pub async fn messages(
         let response = match provider.chat(openai_req).await {
             Ok(r) => r,
             Err(e) => {
-                log_error(&state, &identity, &model, "/v1/messages", false, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()), user_tag.clone());
+                log_error(&state, &identity, &model, "/v1/messages", false, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()), user_tags.clone());
                 write_prompt_log_error(
                     &state,
                     prompt_log_should,
@@ -3562,7 +3560,7 @@ pub async fn messages(
                 trie_max_blocks,
                 request_tokens: request_bytes,
                 queue_wait_ms,
-                user_tag: user_tag.clone(),
+                user_tags: user_tags.clone(),
             },
         );
         state.agent_stats.record_tokens(
@@ -3773,7 +3771,6 @@ impl From<GatewayError> for AnthropicErrorReply {
 /// the dedup point the three-pipeline review asked for — field-level changes
 /// land HERE, not per-handler.
 struct EdgeRequestPrep {
-    req_body_value: Option<Arc<serde_json::Value>>,
     prompt_log_should: bool,
     raw_capture: Option<Arc<boom_core::provider::RawCaptureChannel>>,
     req_body: Option<Arc<serde_json::Value>>,
@@ -3795,7 +3792,7 @@ fn prepare_edge_request<T: serde::Serialize>(
     is_stream: bool,
     request_id: &str,
     client_ip: &str,
-    user_tag: Option<String>,
+    user_tags: UserTags,
     start: std::time::Instant,
 ) -> Result<EdgeRequestPrep, GatewayError> {
     let prompt_log_should = state.prompt_log_writer.should_capture(
@@ -3821,15 +3818,14 @@ fn prepare_edge_request<T: serde::Serialize>(
         is_stream,
         request_id,
         client_ip,
-        user_tag,
+        user_tags,
         start,
     )?;
 
     let capture_raw =
         prompt_log_should && state.prompt_log_writer.config().capture_raw_upstream;
-    let pl_req_body = if prompt_log_should { req_body_value.clone() } else { None };
+    let pl_req_body = if prompt_log_should { req_body_value } else { None };
     Ok(EdgeRequestPrep {
-        req_body_value,
         prompt_log_should,
         raw_capture: if capture_raw {
             Some(Arc::new(boom_core::provider::RawCaptureChannel::default()))
@@ -3864,7 +3860,7 @@ pub async fn responses(
     let request_id = new_request_id();
     let client_ip = extract_client_ip(&headers, Some(remote_addr));
     let inner = state.inner.load();
-    let user_tag = extract_user_tag(&state.user_tag_store.get(), &headers);
+    let user_tags = extract_user_tags(&state.user_tag_store.get(), &headers);
 
     // pre_auth hook model rewrite — same position as the messages path so the
     // converted request inherits the new model everywhere downstream.
@@ -3888,7 +3884,7 @@ pub async fn responses(
     if let Some(prev_id) = req.previous_response_id.clone() {
         if !store_available {
             let e = previous_response_id_without_store();
-            log_error(&state, &identity, &req.model, "/v1/responses", req.stream.unwrap_or(false), start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()), user_tag.clone());
+            log_error(&state, &identity, &req.model, "/v1/responses", req.stream.unwrap_or(false), start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()), user_tags.clone());
             return Err(ResponsesErrorReply(e));
         }
         // Rehydrate BEFORE routing: the rebuilt full history participates in
@@ -3906,12 +3902,12 @@ pub async fn responses(
             Err(boom_responses::ResponseStoreError::NotFound) => {
                 // Uniform 404: missing, expired, or another key's id.
                 let e = GatewayError::ResponseNotFound(prev_id.clone());
-                log_error(&state, &identity, &req.model, "/v1/responses", req.stream.unwrap_or(false), start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()), user_tag.clone());
+                log_error(&state, &identity, &req.model, "/v1/responses", req.stream.unwrap_or(false), start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()), user_tags.clone());
                 return Err(ResponsesErrorReply(e));
             }
             Err(other) => {
                 let e = GatewayError::InternalError(format!("response store: {other}"));
-                log_error(&state, &identity, &req.model, "/v1/responses", req.stream.unwrap_or(false), start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()), user_tag.clone());
+                log_error(&state, &identity, &req.model, "/v1/responses", req.stream.unwrap_or(false), start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()), user_tags.clone());
                 return Err(ResponsesErrorReply(e));
             }
         }
@@ -3920,7 +3916,7 @@ pub async fn responses(
     // Guards (conversation / background / built-in tools / unsupported input
     // items) + conversion into the chat kernel, rehydrated history prepended.
     let mut openai_req = responses_request_to_openai_with_history(&effective_req, &history_items).map_err(|e| {
-        log_error(&state, &identity, &req.model, "/v1/responses", req.stream.unwrap_or(false), start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()), user_tag.clone());
+        log_error(&state, &identity, &req.model, "/v1/responses", req.stream.unwrap_or(false), start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()), user_tags.clone());
         ResponsesErrorReply(e)
     })?;
     let model = openai_req.model.clone();
@@ -3975,7 +3971,7 @@ pub async fn responses(
         is_stream,
         &request_id,
         &client_ip,
-        user_tag.clone(),
+        user_tags.clone(),
         start,
     )
     .map_err(ResponsesErrorReply)?;
@@ -4021,7 +4017,7 @@ pub async fn responses(
 
     // 1. Model access check (deployment-aware, alias-aware).
     check_model_access(identity, &openai_req.model, &state.router).map_err(|e| {
-        log_error(&state, &identity, &model, "/v1/responses", is_stream, start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()), user_tag.clone());
+        log_error(&state, &identity, &model, "/v1/responses", is_stream, start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()), user_tags.clone());
         ResponsesErrorReply(e)
     })?;
 
@@ -4052,7 +4048,7 @@ pub async fn responses(
     )
     .await
     .map_err(|e| {
-        log_error(&state, &identity, &model, "/v1/responses", is_stream, start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()), user_tag.clone());
+        log_error(&state, &identity, &model, "/v1/responses", is_stream, start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()), user_tags.clone());
         ResponsesErrorReply(e)
     })?;
 
@@ -4093,7 +4089,7 @@ pub async fn responses(
                 &resolved_model, Some(&identity.key_hash), input_chars as u64, &[],
             ).ok_or_else(|| {
                 let e = GatewayError::ModelNotFound(resolved_model.clone());
-                log_error(&state, &identity, &model, "/v1/responses", is_stream, start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()), user_tag.clone());
+                log_error(&state, &identity, &model, "/v1/responses", is_stream, start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()), user_tags.clone());
                 ResponsesErrorReply(e)
             })?;
             let did = selection.provider.deployment_id().map(|s| s.to_string());
@@ -4114,7 +4110,7 @@ pub async fn responses(
             identity.key_alias.clone(), Some(identity.key_hash.clone()),
             Some(inflight_model.clone()),
             "/v1/responses", &identity, &model,
-            is_stream, start, &request_id, Some(client_ip.clone()), user_tag.clone(),
+            is_stream, start, &request_id, Some(client_ip.clone()), user_tags.clone(),
             |e, _is_stream| ResponsesErrorReply(e),
         ).await?
     } else {
@@ -4186,7 +4182,7 @@ pub async fn responses(
         // deployment skips this so they reach the upstream natively. The
         // lenient conversion above already dropped them from the chat view.
         boom_core::responses::validate_conversion_supported(&effective_req).map_err(|e| {
-            log_error(&state, &identity, &req.model, "/v1/responses", req.stream.unwrap_or(false), start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()), user_tag.clone());
+            log_error(&state, &identity, &req.model, "/v1/responses", req.stream.unwrap_or(false), start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()), user_tags.clone());
             ResponsesErrorReply(e)
         })?;
     }
@@ -4197,7 +4193,7 @@ pub async fn responses(
         let stream = match provider.chat_stream(openai_req).await {
             Ok(s) => s,
             Err(e) => {
-                log_error(&state, &identity, &model, "/v1/responses", true, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()), user_tag.clone());
+                log_error(&state, &identity, &model, "/v1/responses", true, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()), user_tags.clone());
                 write_prompt_log_error(
                     &state,
                     prompt_log_should,
@@ -4228,7 +4224,7 @@ pub async fn responses(
         let usage = UsageTracker::default();
         let sse_stream = sse_stream_from_responses_chat_stream(
             stream, model.clone(), response_id.clone(), created_at, usage.clone(),
-            persist_ctx, state.response_store.clone(), custom_tool_names,
+            persist_ctx, state.response_store.clone(),
         );
         let inflight_guard = if let Some(ref did) = deployment_id {
             InFlightGuard::new_for_deployment(state.inflight.clone(), &inflight_model, did, input_chars as u64)
@@ -4274,7 +4270,7 @@ pub async fn responses(
             trie_max_blocks,
             request_tokens: request_bytes,
             queue_wait_ms,
-            user_tag: user_tag.clone(),
+            user_tags: user_tags.clone(),
         }, start, usage, Some(state.agent_stats.clone()))
         .with_plan_charge(plan_charge);
         let logged = match trace_guard.take() {
@@ -4316,10 +4312,10 @@ pub async fn responses(
         } else {
             InFlightGuard::new(state.inflight.clone(), &inflight_model, input_chars as u64)
         };
-        let mut response = match provider.chat(openai_req).await {
+        let response = match provider.chat(openai_req).await {
             Ok(r) => r,
             Err(e) => {
-                log_error(&state, &identity, &model, "/v1/responses", false, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()), user_tag.clone());
+                log_error(&state, &identity, &model, "/v1/responses", false, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()), user_tags.clone());
                 write_prompt_log_error(
                     &state,
                     prompt_log_should,
@@ -4395,7 +4391,7 @@ pub async fn responses(
                 trie_max_blocks,
                 request_tokens: request_bytes,
                 queue_wait_ms,
-                user_tag: user_tag.clone(),
+                user_tags: user_tags.clone(),
             },
         );
         state.agent_stats.record_tokens(
@@ -4487,7 +4483,6 @@ fn sse_stream_from_responses_chat_stream(
     usage: UsageTracker,
     persist: Option<ResponsesPersistCtx>,
     store: Arc<boom_responses::ResponseStore>,
-    custom_tools: std::collections::HashSet<String>,
 ) -> impl futures::Stream<Item = Result<SseItem, Infallible>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<SseItem>(64);
 
@@ -4920,8 +4915,9 @@ fn sse_anthropic_extractor() -> impl FnMut(&Result<SseItem, Infallible>) -> Opti
 mod tests {
     use super::{
         build_gateway_headers, compose_gateway_headers, done_sse_item,
-        extract_user_tag, forward_client_headers, insert_header_ci, is_vip_key,
+        extract_user_tags, forward_client_headers, insert_header_ci, is_vip_key,
         preferred_stream_usage, sse_stream_from_chat_stream, UsageTracker, UsageTrackerState,
+        UserTags,
     };
     use axum::http::{HeaderMap, HeaderName, HeaderValue};
     use boom_core::types::{
@@ -4960,10 +4956,14 @@ mod tests {
         h
     }
 
+    fn tags(a: Option<&str>, b: Option<&str>, c: Option<&str>) -> UserTags {
+        [a.map(String::from), b.map(String::from), c.map(String::from)]
+    }
+
     #[test]
-    fn user_tag_unconfigured_returns_none() {
+    fn user_tag_unconfigured_returns_all_none() {
         let headers = headers_with(&[("x-user-tag", "alice")]);
-        assert_eq!(extract_user_tag(&user_tag_settings(&[]), &headers), None);
+        assert_eq!(extract_user_tags(&user_tag_settings(&[]), &headers), tags(None, None, None));
     }
 
     #[test]
@@ -4972,28 +4972,28 @@ mod tests {
         // header lookup is case-insensitive. Only the value is stored.
         let settings = user_tag_settings(&["X-User-Tag"]);
         let headers = headers_with(&[("x-USER-TAG", "alice")]);
-        assert_eq!(extract_user_tag(&settings, &headers), Some("alice".to_string()));
+        assert_eq!(extract_user_tags(&settings, &headers), tags(Some("alice"), None, None));
     }
 
     #[test]
-    fn user_tag_missing_header_returns_none() {
+    fn user_tag_missing_header_leaves_slot_null() {
         let settings = user_tag_settings(&["X-User-Tag"]);
         let headers = headers_with(&[("x-other", "bob")]);
-        assert_eq!(extract_user_tag(&settings, &headers), None);
+        assert_eq!(extract_user_tags(&settings, &headers), tags(None, None, None));
     }
 
     #[test]
-    fn user_tag_blank_value_returns_none() {
+    fn user_tag_blank_value_leaves_slot_null() {
         let settings = user_tag_settings(&["X-User-Tag"]);
         let headers = headers_with(&[("x-user-tag", "   ")]);
-        assert_eq!(extract_user_tag(&settings, &headers), None);
+        assert_eq!(extract_user_tags(&settings, &headers), tags(None, None, None));
     }
 
     #[test]
-    fn user_tag_empty_config_string_returns_none() {
+    fn user_tag_empty_config_string_leaves_slots_null() {
         let settings = user_tag_settings(&["  "]);
         let headers = headers_with(&[("x-user-tag", "alice")]);
-        assert_eq!(extract_user_tag(&settings, &headers), None);
+        assert_eq!(extract_user_tags(&settings, &headers), tags(None, None, None));
     }
 
     #[test]
@@ -5003,23 +5003,20 @@ mod tests {
             ("x-user-tag", "alice"),
             ("x-user-tag", "bob"),
         ]);
-        assert_eq!(extract_user_tag(&settings, &headers), Some("alice,bob".to_string()));
+        assert_eq!(extract_user_tags(&settings, &headers), tags(Some("alice,bob"), None, None));
     }
 
     #[test]
-    fn user_tag_multi_header_joins_values_with_semicolon_in_config_order() {
-        // Storage order is strictly the configured header order, regardless
-        // of header arrival order.
+    fn user_tag_multi_header_fills_slots_in_config_order() {
+        // Slot i holds configured header i's value, regardless of header
+        // arrival order.
         let settings = user_tag_settings(&["X-User-Tag", "X-Request-Id", "X-Trace-Id"]);
         let headers = headers_with(&[
             ("x-trace-id", "world"),
             ("x-user-tag", "hello"),
             ("x-request-id", "321"),
         ]);
-        assert_eq!(
-            extract_user_tag(&settings, &headers),
-            Some("hello;321;world".to_string())
-        );
+        assert_eq!(extract_user_tags(&settings, &headers), tags(Some("hello"), Some("321"), Some("world")));
     }
 
     #[test]
@@ -5031,14 +5028,16 @@ mod tests {
             ("c-hdr", "3"),
             ("d-hdr", "4"),
         ]);
-        assert_eq!(extract_user_tag(&settings, &headers), Some("1;2;3".to_string()));
+        assert_eq!(extract_user_tags(&settings, &headers), tags(Some("1"), Some("2"), Some("3")));
     }
 
     #[test]
-    fn user_tag_skips_missing_middle_header() {
+    fn user_tag_missing_middle_header_keeps_slot_stable() {
+        // Slots are NOT compressed: a missing header leaves its slot NULL,
+        // so later values stay in their configured positions.
         let settings = user_tag_settings(&["A-Hdr", "B-Hdr", "C-Hdr"]);
         let headers = headers_with(&[("a-hdr", "1"), ("c-hdr", "3")]);
-        assert_eq!(extract_user_tag(&settings, &headers), Some("1;3".to_string()));
+        assert_eq!(extract_user_tags(&settings, &headers), tags(Some("1"), None, Some("3")));
     }
 
     #[test]
@@ -5046,7 +5045,7 @@ mod tests {
         let settings = user_tag_settings(&["X-User-Tag"]);
         let long = "a".repeat(300);
         let headers = headers_with(&[("x-user-tag", long.as_str())]);
-        assert_eq!(extract_user_tag(&settings, &headers), Some("a".repeat(256)));
+        assert_eq!(extract_user_tags(&settings, &headers), tags(Some(&"a".repeat(256)), None, None));
     }
 
     #[test]
@@ -5056,15 +5055,15 @@ mod tests {
         let settings = user_tag_settings(&["X-User-Tag"]);
         let long = "中".repeat(86);
         let headers = headers_with(&[("x-user-tag", long.as_str())]);
-        assert_eq!(extract_user_tag(&settings, &headers), Some("中".repeat(85)));
+        assert_eq!(extract_user_tags(&settings, &headers), tags(Some(&"中".repeat(85)), None, None));
     }
 
     #[test]
-    fn user_tag_invalid_config_header_name_returns_none() {
+    fn user_tag_invalid_config_header_name_leaves_slots_null() {
         // Spaces make an invalid header name — from_bytes rejects it.
         let settings = user_tag_settings(&["Bad Header Name"]);
         let headers = headers_with(&[("x-user-tag", "alice")]);
-        assert_eq!(extract_user_tag(&settings, &headers), None);
+        assert_eq!(extract_user_tags(&settings, &headers), tags(None, None, None));
     }
 
     #[test]
