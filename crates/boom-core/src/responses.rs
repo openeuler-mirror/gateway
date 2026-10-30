@@ -325,6 +325,39 @@ fn convert_tools(tools: &[serde_json::Value]) -> Result<Option<Vec<Tool>>, Gatew
     let mut out = Vec::new();
     for t in tools {
         let ty = t.get("type").and_then(|x| x.as_str()).unwrap_or("");
+        if ty == "namespace" {
+            // Codex serializes its sub-agent toolset (and each MCP server's
+            // tools) as ONE `type:"namespace"` entry holding sub-tools. Chat
+            // Completions has no namespaces — flatten to plain functions
+            // named `<ns>__<sub>` (the ecosystem convention: GLM/Mistral/
+            // Ollama providers and APISIX do the same; Codex recognizes the
+            // flattened names on the way back).
+            let ns = t.get("name").and_then(|x| x.as_str()).unwrap_or_default();
+            let ns_desc = t.get("description").and_then(|x| x.as_str());
+            for sub in t.get("tools").and_then(|x| x.as_array()).unwrap_or(&Vec::new()) {
+                let sub_name = sub.get("name").and_then(|x| x.as_str()).unwrap_or_default();
+                if ns.is_empty() || sub_name.is_empty() {
+                    continue; // malformed sub-tool — skipped, not fatal
+                }
+                let description = sub
+                    .get("description")
+                    .and_then(|x| x.as_str())
+                    .or(ns_desc)
+                    .map(String::from);
+                out.push(Tool {
+                    tool_type: "function".to_string(),
+                    function: ToolFunction {
+                        name: format!("{ns}__{sub_name}"),
+                        description,
+                        parameters: sub
+                            .get("parameters")
+                            .cloned()
+                            .unwrap_or(serde_json::json!({ "type": "object" })),
+                    },
+                });
+            }
+            continue;
+        }
         if ty != "function" && ty != "custom" {
             continue; // passthrough-only tool — dropped from the chat view
         }
@@ -384,9 +417,13 @@ pub fn validate_conversion_supported(req: &ResponsesRequest) -> Result<(), Gatew
     if let Some(tools) = &req.tools {
         for t in tools {
             let ty = t.get("type").and_then(|x| x.as_str()).unwrap_or("");
-            if ty != "function" && ty != "custom" {
+            // `namespace` is convertible (flattened to `<ns>__<sub>` function
+            // tools in convert_tools) — Codex sends one per session.
+            if ty != "function" && ty != "custom" && ty != "namespace" {
+                let name = t.get("name").and_then(|x| x.as_str()).unwrap_or("<unnamed>");
                 return Err(GatewayError::UnsupportedMode(format!(
-                    "unsupported tool type '{ty}' (only \"function\" and \"custom\" are supported)"
+                    "unsupported tool type '{ty}' on tool '{name}' \
+                     (only \"function\" and \"custom\" are supported)"
                 )));
             }
             if t.get("name").and_then(|x| x.as_str()).is_none() {
@@ -2459,6 +2496,61 @@ mod tests {
     }
 
     // ---------- P2: native passthrough ----------
+
+    #[test]
+    fn namespace_tool_flattens_to_underscore_functions() {
+        // Codex sends one `type:"namespace"` tool per session (multi_agent_v1,
+        // MCP servers) — the chat kernel gets one function per sub-tool,
+        // named `<ns>__<sub>` (ecosystem convention; Codex maps them back).
+        let req = parse_req(json!({
+            "model": "gpt-test",
+            "input": "hi",
+            "tools": [
+                { "type": "namespace", "name": "multi_agent_v1",
+                  "description": "sub-agent orchestration",
+                  "tools": [
+                    { "name": "spawn_agent", "description": "spawn a sub-agent",
+                      "parameters": { "type": "object", "properties": { "prompt": { "type": "string" } } } },
+                    { "name": "wait_agent", "parameters": { "type": "object" } },
+                  ] },
+                { "type": "function", "name": "get_time", "parameters": { "type": "object" } },
+            ],
+        }));
+        // Conversion deployments accept it (validate first, like the handler).
+        validate_conversion_supported(&req).expect("namespace must be convertible");
+        let chat = convert_request(&req, &[]).expect("converts");
+        let names: Vec<String> = chat
+            .tools
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|t| t.function.name.clone())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "multi_agent_v1__spawn_agent".to_string(),
+                "multi_agent_v1__wait_agent".to_string(),
+                "get_time".to_string(),
+            ]
+        );
+        let flattened = &chat.tools.as_ref().unwrap()[0];
+        assert_eq!(flattened.function.description.as_deref(), Some("spawn a sub-agent"));
+        assert!(flattened.function.parameters["properties"]["prompt"].is_object());
+    }
+
+    #[test]
+    fn unknown_tool_type_still_rejected_for_conversion() {
+        // Namespace is now convertible; other native-only types (web_search,
+        // mcp, …) keep the explicit R2 rejection — silent-drop would hand the
+        // client wrong semantics.
+        let req = parse_req(json!({
+            "model": "gpt-test", "input": "hi",
+            "tools": [{ "type": "web_search", "name": "search" }],
+        }));
+        let err = validate_conversion_supported(&req).unwrap_err();
+        assert!(err.to_string().contains("unsupported tool type 'web_search' on tool 'search'"));
+    }
 
     #[test]
     fn passthrough_body_strips_gateway_fields_and_inlines_history() {
