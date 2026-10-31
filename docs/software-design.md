@@ -484,7 +484,7 @@ DB 写（store.*_db / AdminCommand handler 内 SQL）
 | manifest + 编译期测试 | 字段 5 处同步靠人必然腐化，用编译失败当 forcing function |
 | CRUD 直改内存而非 reload | reload 是对账 + 策略重建而非写路径；"DB 写成功 → 立即可路由"是运行期权威语义 |
 | DB 权威而非 YAML 双权威 | 单一可写面（AdminCommand）+ 增量对账原语 + seed 幂等标记，为多实例演进留结构；YAML 降级为 seed 源 + 回滚工件，消除"reload 反杀 CRUD"（原场景 D）与双源漂移 |
-| 并发限制走 plan 而非 litellm 列 | boom_verification_token.max_parallel_requests 为兼容死列，实际并发由 plan.concurrency_limit 执行（单一执行体系避免双轨） |
+| 并发限制 key 级仅作保底 | key 级 `boom_verification_token.max_parallel_requests` 是"无 plan 时的兜底上限"：仅当 key 与 team 都没有 plan 时生效；一旦有 plan（key 或 team），一律按 plan 的 `concurrency_limit` 执行并忽略 key 自身限制。两条路径共用按 `key_hash` 的同一计数器（避免双计，且 Dashboard 在飞数口径一致） |
 
 ---
 

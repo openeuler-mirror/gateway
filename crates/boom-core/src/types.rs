@@ -676,6 +676,9 @@ pub struct AuthIdentity {
     pub team_models: Vec<String>,
     pub rpm_limit: Option<u64>,
     pub tpm_limit: Option<u64>,
+    /// litellm-compatible per-key in-flight cap (`max_parallel_requests`).
+    /// 0 / absent = unlimited.
+    pub max_parallel_requests: Option<u32>,
     pub max_budget: Option<f64>,
     /// `budget_duration` parsed into seconds (e.g. "30d" → 2592000).
     /// `None` means the budget is a lifetime cap instead of a per-period one.

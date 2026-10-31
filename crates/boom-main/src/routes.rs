@@ -792,6 +792,7 @@ async fn chat_completions_inner(
         effective_tpm,
         identity.max_budget,
         identity.budget_period_secs,
+        identity.max_parallel_requests,
         &window_limits,
         weight,
     )
@@ -2665,6 +2666,10 @@ async fn check_plan_limits(
     tpm_limit: Option<u64>,
     max_budget: Option<f64>,
     budget_period_secs: Option<u64>,
+    // Key's own in-flight cap (`boom_verification_token.max_parallel_requests`).
+    // Enforced in both the plan-based and legacy paths; the stricter of this
+    // and the plan's `concurrency_limit` wins.
+    max_parallel_requests: Option<u32>,
     window_limits: &[boom_core::types::WindowLimit],
     weight: u64,
 ) -> Result<PlanCharge, GatewayError> {
@@ -2730,12 +2735,27 @@ async fn check_plan_limits(
         }
 
         let cost_rate = state.deployment_store.get_cost_rate(resolved_model);
+        // No plan → the only per-key in-flight cap is the litellm-compatible
+        // `max_parallel_requests` column. Without this guard the field is
+        // silently ignored and concurrent requests all slip through.
+        let key_max_parallel = max_parallel_requests.filter(|v| *v > 0);
+        let key_concurrency_guard = key_max_parallel
+            .map(|limit| {
+                plan_store.try_acquire(key_hash, limit).ok_or_else(|| {
+                    GatewayError::ConcurrencyExceeded {
+                        limit,
+                        message: format!("Concurrency limit exceeded. Limit: {}", limit),
+                    }
+                })
+            })
+            .transpose()?;
+        let concurrency_display = plan_store.get_concurrency(key_hash);
         return Ok(PlanCharge {
             limiter: limiter.clone(),
             key: rl_key,
             window_limits: legacy_windows,
             weight,
-            concurrency_guard: None,
+            concurrency_guard: key_concurrency_guard,
             team_concurrency_guard: None,
             team_key: None,
             team_window_limits: None,
@@ -2745,8 +2765,8 @@ async fn check_plan_limits(
             plan_name: None,
             team_plan_name: None,
             rpm_limit_display: decision.limit,
-            concurrency_display: 0,
-            concurrency_limit_display: None,
+            concurrency_display,
+            concurrency_limit_display: key_max_parallel,
             peek_remaining: decision.remaining,
             committed: false,
             settled: false,
@@ -2847,19 +2867,25 @@ async fn check_plan_limits(
         team_scope_capture = Some(team_scope);
     }
 
-    // 2a. Key concurrency guard
-    let (concurrency_limit, plan_window_limits, stale_limits) = match key_plan_ref {
+    // 2a. Key concurrency guard. In the plan path the plan governs: the key's
+    // own litellm-compatible `max_parallel_requests` column is only a fallback
+    // for the no-plan path, so it is deliberately ignored once a plan (key or
+    // team) applies. The counter is still keyed by `key_hash` so the
+    // dashboard's in-flight gauge stays accurate.
+    let (plan_concurrency_limit, plan_window_limits, stale_limits) = match key_plan_ref {
         Some(p) => p.effective_limits(),
         None => (None, Vec::new(), Vec::new()),
     };
     let plan_name = key_plan_ref.map(|p| p.name.clone());
 
-    let key_concurrency_guard = if let (Some(limit), Some(_kp)) = (concurrency_limit, key_plan_ref) {
+    let key_concurrency_guard = if let Some(limit) = plan_concurrency_limit {
         Some(plan_store.try_acquire(key_hash, limit).ok_or_else(|| {
-            let msg = if let Some(pn) = plan_name.as_ref() {
-                format!("Concurrency limit exceeded. Plan: {}, Limit: {}", pn, limit)
-            } else {
-                format!("Concurrency limit exceeded. Limit: {}", limit)
+            let msg = match &plan_name {
+                Some(pn) => format!(
+                    "Concurrency limit exceeded. Plan: {}, Limit: {}",
+                    pn, limit
+                ),
+                None => format!("Concurrency limit exceeded. Limit: {}", limit),
             };
             GatewayError::ConcurrencyExceeded {
                 limit,
@@ -2993,7 +3019,7 @@ async fn check_plan_limits(
         team_plan_name,
         rpm_limit_display: key_decision.limit,
         concurrency_display,
-        concurrency_limit_display: concurrency_limit,
+        concurrency_limit_display: plan_concurrency_limit,
         peek_remaining: key_decision.remaining,
         committed: false,
         settled: false,
@@ -3234,6 +3260,7 @@ pub async fn messages(
         effective_tpm,
         identity.max_budget,
         identity.budget_period_secs,
+        identity.max_parallel_requests,
         &window_limits,
         weight,
     )
@@ -4082,6 +4109,7 @@ pub async fn responses(
         effective_tpm,
         identity.max_budget,
         identity.budget_period_secs,
+        identity.max_parallel_requests,
         &window_limits,
         weight,
     )
