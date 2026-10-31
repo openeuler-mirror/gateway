@@ -4212,14 +4212,24 @@ pub async fn responses(
     // conversion above still drove routing/limits/audit. Chat requests to
     // this deployment are unaffected — they carry no passthrough body.
     if true {
-        // Strict chat-expressibility check, POST-routing (R2): a conversion
-        // deployment must reject native-only tools/items; a passthrough
-        // deployment skips this so they reach the upstream natively. The
-        // lenient conversion above already dropped them from the chat view.
-        boom_core::responses::validate_conversion_supported(&effective_req).map_err(|e| {
+        // Chat-expressibility pre-flight, POST-routing (R2, Codex-compat
+        // revision): non-expressible tools/items are DROPPED from the chat
+        // view with a loud warn — Codex sends web_search & friends
+        // unconditionally and a 400 bricks the whole session; structural
+        // errors still fail fast. Passthrough deployments skip this
+        // entirely, so native-only types reach their upstream.
+        let dropped = boom_core::responses::validate_conversion_supported(&effective_req).map_err(|e| {
             log_error(&state, &identity, &req.model, "/v1/responses", req.stream.unwrap_or(false), start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()), user_tags.clone());
             ResponsesErrorReply(e)
         })?;
+        if !dropped.is_empty() {
+            tracing::warn!(
+                request_id = %request_id,
+                model = %req.model,
+                dropped = ?dropped,
+                "conversion deployment dropped non-expressible tools/items (client loses those capabilities)"
+            );
+        }
     }
 
 

@@ -408,28 +408,34 @@ fn convert_tools(tools: &[serde_json::Value]) -> Result<Option<Vec<Tool>>, Gatew
     }
 }
 
-/// Strict pre-flight for CONVERSION deployments (chat-kernel expressibility):
-/// the chat upstream can only honor `function`/`custom` tools and the known
-/// input item types. Called by the handler AFTER routing — a passthrough
-/// deployment never runs this, so native-only types reach their upstream
-/// (Response.md R2 review finding).
-pub fn validate_conversion_supported(req: &ResponsesRequest) -> Result<(), GatewayError> {
+/// Pre-flight for CONVERSION deployments (chat-kernel expressibility).
+///
+/// POLICY (Codex-compat revision of R2): non-expressible tool types
+/// (`web_search`, `mcp`, …) and input item types (`web_search_call`, …) are
+/// DROPPED from the chat view, not rejected — Codex sends hosted built-ins
+/// unconditionally and a 400 bricks the whole session; the proxy ecosystem
+/// (LiteLLM, APISIX) drops them too. Everything dropped is named in the
+/// returned descriptors so the handler can warn — loud-drop, never silent.
+/// Structural errors still fail fast; `namespace` is convertible (flattened
+/// in convert_tools).
+pub fn validate_conversion_supported(req: &ResponsesRequest) -> Result<Vec<String>, GatewayError> {
+    let mut dropped = Vec::new();
     if let Some(tools) = &req.tools {
         for t in tools {
             let ty = t.get("type").and_then(|x| x.as_str()).unwrap_or("");
-            // `namespace` is convertible (flattened to `<ns>__<sub>` function
-            // tools in convert_tools) — Codex sends one per session.
-            if ty != "function" && ty != "custom" && ty != "namespace" {
-                let name = t.get("name").and_then(|x| x.as_str()).unwrap_or("<unnamed>");
-                return Err(GatewayError::UnsupportedMode(format!(
-                    "unsupported tool type '{ty}' on tool '{name}' \
-                     (only \"function\" and \"custom\" are supported)"
-                )));
-            }
-            if t.get("name").and_then(|x| x.as_str()).is_none() {
-                return Err(GatewayError::UnsupportedMode(
-                    "tool is missing 'name'".to_string(),
-                ));
+            match ty {
+                "function" | "custom" => {
+                    if t.get("name").and_then(|x| x.as_str()).is_none() {
+                        return Err(GatewayError::UnsupportedMode(
+                            "tool is missing 'name'".to_string(),
+                        ));
+                    }
+                }
+                "namespace" => {} // flattened to `<ns>__<sub>` function tools
+                _ => {
+                    let name = t.get("name").and_then(|x| x.as_str()).unwrap_or("<unnamed>");
+                    dropped.push(format!("tool {ty}({name})"));
+                }
             }
         }
     }
@@ -445,13 +451,11 @@ pub fn validate_conversion_supported(req: &ResponsesRequest) -> Result<(), Gatew
                     | "custom_tool_call_output"
                     | "reasoning"
             ) {
-                return Err(GatewayError::UnsupportedMode(format!(
-                    "unsupported input item type '{ty}'"
-                )));
+                dropped.push(format!("item {ty}"));
             }
         }
     }
-    Ok(())
+    Ok(dropped)
 }
 
 /// Responses tool_choice is flat, chat is nested (Response.md R1):
@@ -1691,15 +1695,15 @@ mod tests {
     }
 
     #[test]
-    fn non_function_tools_are_rejected() {
-        // Strict pre-flight for conversion deployments (post-routing).
+    fn non_function_tools_are_dropped_with_descriptor() {
+        // Codex-compat policy: hosted built-ins are dropped (loud), not
+        // rejected — a 400 bricks Codex sessions that always send them.
         let req = parse_req(json!({
             "model": "m", "input": "hi",
             "tools": [{ "type": "web_search" }]
         }));
-        let err = validate_conversion_supported(&req).unwrap_err();
-        assert_eq!(err.status_code(), 400);
-        assert!(err.to_string().contains("web_search"));
+        let dropped = validate_conversion_supported(&req).unwrap();
+        assert_eq!(dropped, vec!["tool web_search(<unnamed>)".to_string()]);
     }
 
     #[test]
@@ -1725,10 +1729,10 @@ mod tests {
         // Unknown input item dropped, message kept.
         assert_eq!(out.messages.len(), 1);
         assert_eq!(text_of(&out.messages[0]), "hi");
-        // But the strict check still names both offenders.
-        let err = validate_conversion_supported(&req).unwrap_err();
-        assert_eq!(err.status_code(), 400);
-        assert!(err.to_string().contains("web_search"));
+        // The pre-flight names everything dropped for the handler's warn.
+        let dropped = validate_conversion_supported(&req).unwrap();
+        assert!(dropped.iter().any(|d| d == "tool web_search(<unnamed>)"));
+        assert!(dropped.iter().any(|d| d == "item web_search_call"));
     }
 
     #[test]
@@ -1869,14 +1873,15 @@ mod tests {
     }
 
     #[test]
-    fn guard_rejects_unsupported_input_item_type() {
+    fn unsupported_input_item_type_is_dropped_with_descriptor() {
+        // Codex replays web_search_call items in history — dropped loudly,
+        // not rejected, so the session survives.
         let req = parse_req(json!({
             "model": "m",
             "input": [{ "type": "web_search_call", "id": "ws_1" }]
         }));
-        let err = validate_conversion_supported(&req).unwrap_err();
-        assert_eq!(err.status_code(), 400);
-        assert!(err.to_string().contains("web_search_call"));
+        let dropped = validate_conversion_supported(&req).unwrap();
+        assert_eq!(dropped, vec!["item web_search_call".to_string()]);
     }
 
     #[test]
@@ -2540,16 +2545,24 @@ mod tests {
     }
 
     #[test]
-    fn unknown_tool_type_still_rejected_for_conversion() {
-        // Namespace is now convertible; other native-only types (web_search,
-        // mcp, …) keep the explicit R2 rejection — silent-drop would hand the
-        // client wrong semantics.
+    fn structural_tool_errors_still_fail_fast() {
+        // Dropped built-ins are tolerated; a convertible tool missing its
+        // name is a structural error and keeps failing fast.
+        let req = parse_req(json!({
+            "model": "gpt-test", "input": "hi",
+            "tools": [{ "type": "function", "parameters": { "type": "object" } }],
+        }));
+        let err = validate_conversion_supported(&req).unwrap_err();
+        assert!(err.to_string().contains("tool is missing 'name'"));
+        // And the mcp-style hosted type is dropped, named.
         let req = parse_req(json!({
             "model": "gpt-test", "input": "hi",
             "tools": [{ "type": "web_search", "name": "search" }],
         }));
-        let err = validate_conversion_supported(&req).unwrap_err();
-        assert!(err.to_string().contains("unsupported tool type 'web_search' on tool 'search'"));
+        assert_eq!(
+            validate_conversion_supported(&req).unwrap(),
+            vec!["tool web_search(search)".to_string()]
+        );
     }
 
     #[test]
