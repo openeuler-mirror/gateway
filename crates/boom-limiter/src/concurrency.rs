@@ -591,10 +591,12 @@ impl PlanStore {
             .insert(key_hash.to_string(), Some(plan_name.to_string()));
     }
 
-    /// Type-only check used by `assign_key_db` to fail fast before any DB
-    /// write. Same rule as `assign_key`: type=team plans cannot be assigned
-    /// to individual keys. Returns the resolved plan name for caller logging.
-    fn validate_plan_for_key(&self, plan_name: &str, key_hash: &str) -> Result<(), String> {
+    /// Validate that `plan_name` may be assigned to a key: the plan must
+    /// exist and must not be type=Team. Shared by `assign_key` /
+    /// `assign_key_db` and by the dashboard's pre-INSERT validation so the
+    /// two can never drift apart. `key_hash` is only used in error messages
+    /// (callers that have not generated the key yet may pass a placeholder).
+    pub fn validate_plan_for_key(&self, plan_name: &str, key_hash: &str) -> Result<(), String> {
         let plan = self
             .plans
             .get(plan_name)
@@ -1029,7 +1031,7 @@ impl PlanStore {
         .await
         .map_err(|e| format!("DB error: {}", e))?;
         if updated.rows_affected() == 0 {
-            if let Err(_) = sqlx::query(
+            if let Err(insert_err) = sqlx::query(
                 r#"INSERT INTO boom_key_plan_assignment (key_hash, plan_name, assigned_at)
                    VALUES ($1, $2, NOW())"#,
             )
@@ -1038,7 +1040,12 @@ impl PlanStore {
             .execute(pool)
             .await
             {
-                sqlx::query(
+                // INSERT lost a race (duplicate key) or hit a transient error.
+                // Retry the UPDATE, but verify it actually landed: a 0-row
+                // retry means the assignment never reached the DB, and
+                // returning Ok would leave memory-only state that disappears
+                // on restart — the caller must see this to roll the key back.
+                let retry = sqlx::query(
                     r#"UPDATE boom_key_plan_assignment SET plan_name = $2 WHERE key_hash = $1"#,
                 )
                 .bind(key_hash)
@@ -1046,6 +1053,12 @@ impl PlanStore {
                 .execute(pool)
                 .await
                 .map_err(|e| format!("DB error: {}", e))?;
+                if retry.rows_affected() == 0 {
+                    return Err(format!(
+                        "Failed to persist plan assignment '{}' (INSERT error: {})",
+                        plan_name, insert_err
+                    ));
+                }
             }
         }
 
