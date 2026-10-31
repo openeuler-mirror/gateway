@@ -4779,6 +4779,11 @@ pub async fn get_response(
     match state.response_store.get(&response_id, &identity.key_hash).await {
         Ok(Some(json)) => Ok(Json(json).into_response()),
         Ok(None) => Err(ResponsesErrorReply(GatewayError::ResponseNotFound(response_id))),
+        // Disabled is the documented uniform-404 case (no existence leak),
+        // not a 500 — matches the doc comment on this handler.
+        Err(boom_responses::ResponseStoreError::Disabled) => {
+            Err(ResponsesErrorReply(GatewayError::ResponseNotFound(response_id)))
+        }
         Err(e) => Err(ResponsesErrorReply(GatewayError::InternalError(format!(
             "response store: {e}"
         )))),

@@ -219,12 +219,14 @@ fn build_router(state: AppState) -> Router {
         // Alias routes (without /v1 prefix — OpenAI client compatibility)
         .route("/chat/completions", post(routes::chat_completions))
         .route("/completions", post(routes::completions))
+        .route("/responses", post(routes::responses))
         .layer(axum::middleware::from_fn(extractor::buffer_request_body));
 
     let api_routes = Router::new()
         .route("/v1/models", get(routes::list_models))
         .route("/v1/models/{id}", get(routes::get_model))
         .route("/v1/responses/{id}", get(routes::get_response))
+        .route("/responses/{id}", get(routes::get_response))
         .route("/models", get(routes::list_models))
         .route("/models/{id}", get(routes::get_model))
         // Unsupported endpoints (return proper errors)
@@ -318,7 +320,7 @@ fn build_router(state: AppState) -> Router {
                 let path = req.uri().path();
                 if path.starts_with("/v1/") || path.starts_with("/admin/")
                     || path.starts_with("/chat/") || path.starts_with("/completions")
-                    || path.starts_with("/models")
+                    || path.starts_with("/responses") || path.starts_with("/models")
                 {
                     count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
