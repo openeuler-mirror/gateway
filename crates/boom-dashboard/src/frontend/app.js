@@ -3712,7 +3712,9 @@
               ? '<span class="mono">-/-/-</span>'
               : `<span class="mono">${k.usage_count}/${fmtTokens(k.usage_tokens)}/${fmtCost(k.usage_cost)}</span><br><span class="muted" style="font-size:11px">${formatCountdown(k.usage_reset_secs || 0)}</span>`}</td>
         <td>${fmtCost(k.spend)}</td>
-        <td>${k.max_budget != null ? "$" + k.max_budget : "-"}</td>
+        <td>${k.max_budget > 0
+              ? `<span title="${esc(k.budget_scope || "lifetime")}">${fmtCost(k.budget_period_spend != null ? k.budget_period_spend : k.spend)} / $${k.max_budget}</span>`
+              : "-"}</td>
         <td>${k.blocked
               ? '<span style="color:var(--danger)">' + t("status.blocked") + '</span>'
               : (k.metadata && k.metadata.vip === true)

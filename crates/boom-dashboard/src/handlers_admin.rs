@@ -132,6 +132,63 @@ fn validate_key_limits(
     Ok(())
 }
 
+/// Reject the dead-config combination: `max_budget > 0` on a key that a plan
+/// (explicit assignment, default-plan fallback, or team plan) will govern.
+/// Runtime policy is fallback-only — the budget would never execute, and the
+/// admin would set a cap that silently does nothing. Same reject-up-front
+/// spirit as [`validate_key_limits`].
+fn budget_plan_conflict(
+    plan_store: &boom_limiter::PlanStore,
+    max_budget: Option<f64>,
+    plan_name: &Option<Option<String>>,
+    team_id: Option<&str>,
+) -> Option<String> {
+    let budget = max_budget.filter(|b| b.is_finite() && *b > 0.0)?;
+    let plan_governed = match plan_name {
+        // Explicit "no plan" → no key-layer plan; team layer still counts.
+        Some(None) => false,
+        // Explicit assignment → governed.
+        Some(Some(_)) => true,
+        // Field absent → default_plan fallback governs when one exists.
+        None => plan_store.get_default_plan_name().is_some(),
+    } || team_id
+        .filter(|t| !t.is_empty())
+        .and_then(|t| plan_store.resolve_team_plan(t))
+        .is_some();
+    plan_governed.then(|| {
+        format!(
+            "max_budget ({budget}) conflicts with a governing plan: the runtime policy is \
+             fallback-only, so a plan-governed key's budget never executes. \
+             Move the cap into the plan's cost limits, or clear the plan/team assignment."
+        )
+    })
+}
+
+/// Current stored `max_budget` for a key (update payloads use COALESCE
+/// semantics — an absent field leaves the stored value in force).
+async fn state_key_budget(db_pool: &sqlx::PgPool, token_hash: &str) -> Option<f64> {
+    sqlx::query_scalar::<_, Option<f64>>(
+        r#"SELECT max_budget FROM "boom_verification_token" WHERE token = $1"#,
+    )
+    .bind(token_hash)
+    .fetch_one(db_pool)
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Current stored `team_id` for a key (None row → None; NULL column → None).
+async fn state_key_team(db_pool: &sqlx::PgPool, token_hash: &str) -> Option<String> {
+    sqlx::query_scalar::<_, Option<String>>(
+        r#"SELECT team_id FROM "boom_verification_token" WHERE token = $1"#,
+    )
+    .bind(token_hash)
+    .fetch_one(db_pool)
+    .await
+    .ok()
+    .flatten()
+}
+
 /// Best-effort rollback for a token row inserted during creation when the
 /// follow-up plan assignment fails. Keeping the row would leave the key with
 /// no rate-limiting plan while the API reports an error — the silently
@@ -626,6 +683,26 @@ pub async fn list_keys(
             let total_cost = rust_decimal::Decimal::from(total_cost_micros)
                 / rust_decimal::Decimal::from(1_000_000);
 
+            // Budget-scope-aligned spend: the enforcement path charges the
+            // PERIOD counter when budget_duration is set (total − baseline)
+            // and the lifetime cumulative otherwise. Surfacing that exact
+            // number keeps the displayed spend comparable to max_budget —
+            // lifetime spend vs a period cap was apples-to-oranges.
+            let (budget_period_spend, budget_scope) = r
+                .budget_duration
+                .as_deref()
+                .and_then(boom_core::types::parse_budget_duration_secs)
+                .map(|secs| {
+                    let micros = state.limiter.peek_budget_period_cost_micros(
+                        &boom_limiter::QuotaScope::Key { key_hash: r.token.clone() },
+                        secs,
+                    );
+                    let d = rust_decimal::Decimal::from(micros)
+                        / rust_decimal::Decimal::from(1_000_000);
+                    (d.to_string(), format!("period({raw})", raw = r.budget_duration.clone().unwrap_or_default()))
+                })
+                .unwrap_or_else(|| (total_cost.to_string(), "lifetime".to_string()));
+
             json!({
                 "token_prefix": token_prefix,
                 "token_hash": r.token,
@@ -638,6 +715,9 @@ pub async fn list_keys(
                 "models": r.models,
                 "spend": total_cost.to_string(),
                 "total_cost": total_cost.to_string(),
+                "budget_scope": budget_scope,
+                "budget_period_spend": budget_period_spend,
+                "max_budget": r.max_budget,
                 "blocked": r.blocked.unwrap_or(false),
                 "rpm_limit": r.rpm_limit,
                 "tpm_limit": r.tpm_limit,
@@ -765,6 +845,16 @@ pub async fn create_key(
         req.tpm_limit,
         req.max_budget,
         req.budget_duration.as_deref(),
+    ) {
+        return (StatusCode::BAD_REQUEST, msg).into_response();
+    }
+
+    // 0b. Reject a budget that a governing plan would silently disable.
+    if let Some(msg) = budget_plan_conflict(
+        &state.plan_store,
+        req.max_budget,
+        &req.plan_name,
+        req.team_id.as_deref(),
     ) {
         return (StatusCode::BAD_REQUEST, msg).into_response();
     }
@@ -1008,6 +1098,42 @@ pub async fn update_key(
         req.budget_duration.as_deref(),
     ) {
         return (StatusCode::BAD_REQUEST, msg).into_response();
+    }
+
+    // Same budget/plan exclusivity as create, resolved against the key's
+    // EFFECTIVE config: an update may set a budget on a key that a plan (or
+    // its new team) already governs. COALESCE semantics mean req.max_budget
+    // None can still leave a stored budget in force — resolve the row's
+    // current values first (the UPDATE body is built below from req + row).
+    {
+        // Only police edits that TOUCH the conflict axes — a pre-existing
+        // dead-config key must still be renamable/unblockable (the runtime
+        // warn covers it); rejecting every edit would lock legacy keys.
+        let budget_touched = req.max_budget.is_some_and(|b| b > 0.0);
+        let team_touched = req.team_id.as_deref().is_some_and(|t| !t.is_empty());
+        if !budget_touched && !team_touched {
+            {} // fall through: unrelated-field edits pass
+        } else {
+        let effective_budget = req
+            .max_budget
+            .or(state_key_budget(&db_pool, &token_hash).await);
+        let effective_team = match req.team_id.as_deref() {
+            // Some("") clears the team — no team layer for the conflict check.
+            Some("") => None,
+            // Some(team) reassigns; None keeps the stored value.
+            Some(_) => req.team_id.clone(),
+            None => state_key_team(&db_pool, &token_hash).await,
+        };
+        let explicit_3state = state.plan_store.get_plan_name_explicit(&token_hash);
+        if let Some(msg) = budget_plan_conflict(
+            &state.plan_store,
+            effective_budget,
+            &explicit_3state,
+            effective_team.as_deref(),
+        ) {
+            return (StatusCode::BAD_REQUEST, msg).into_response();
+        }
+        }
     }
 
     let models_list: Option<Vec<String>> = req.models.as_ref().map(|v| {
@@ -1340,6 +1466,21 @@ pub async fn assign_key(
     Extension(state): Extension<std::sync::Arc<DashboardState>>,
     Json(req): Json<AssignRequest>,
 ) -> Response {
+    // Assigning a plan to a budgeted key creates the dead-config combo the
+    // create/update paths reject — same rule here.
+    if let (Some(db_pool), Some(Some(_))) = (&state.db_pool, &req.plan_name) {
+        let budget = state_key_budget(db_pool, &req.key_hash).await;
+        let team = state_key_team(db_pool, &req.key_hash).await;
+        if let Some(msg) = budget_plan_conflict(
+            &state.plan_store,
+            budget,
+            &req.plan_name,
+            team.as_deref(),
+        ) {
+            return (axum::http::StatusCode::BAD_REQUEST, msg).into_response();
+        }
+    }
+
     // For backward compat: callers that send a non-null plan_name route to
     // assign_key_db. Sending null routes to assign_key_no_plan_db. Sending
     // the field absent is a no-op (legacy callers always include it).
@@ -1402,11 +1543,43 @@ pub struct AssignTeamRequest {
     pub plan_name: String,
 }
 
+/// Reject assigning a team plan when member keys carry a live budget — the
+/// fallback-only policy would silently disable every one of them (same rule
+/// as the per-key paths, applied at the team layer).
+async fn team_has_budgeted_members(db_pool: &sqlx::PgPool, team_id: &str) -> i64 {
+    sqlx::query_scalar::<_, i64>(
+        r#"SELECT COUNT(*) FROM "boom_verification_token"
+            WHERE team_id = $1 AND max_budget IS NOT NULL AND max_budget > 0"#,
+    )
+    .bind(team_id)
+    .fetch_one(db_pool)
+    .await
+    .unwrap_or(0)
+}
+
 pub async fn assign_team_plan(
     _session: AdminSession,
     Extension(state): Extension<std::sync::Arc<DashboardState>>,
     Json(req): Json<AssignTeamRequest>,
 ) -> Response {
+    // Team-plan assignment governs every member key at once — a member with
+    // its own budget would become dead config in bulk (per-key paths reject
+    // the same combo individually).
+    if let Some(ref pool) = state.db_pool {
+        let budgeted = team_has_budgeted_members(pool, &req.team_id).await;
+        if budgeted > 0 {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                format!(
+                    "team '{}' has {} member key(s) with max_budget set; the fallback-only \
+                     policy would silently ignore those budgets under a team plan. \
+                     Clear the member budgets or move the caps into the plan.",
+                    req.team_id, budgeted
+                ),
+            )
+                .into_response();
+        }
+    }
     if let Some(ref pool) = state.db_pool {
         match state
             .plan_store
@@ -1580,6 +1753,21 @@ async fn insert_single_key(
         return CreateOutcome::Skipped {
             key_alias: req.key_alias,
             reason: "invalid_limits",
+        };
+    }
+    // Budget that a governing plan would silently disable (same rule as the
+    // single-create endpoint, reported as a batch skip instead of a 400).
+    if budget_plan_conflict(
+        &state.plan_store,
+        req.max_budget,
+        &req.plan_name,
+        req.team_id.as_deref(),
+    )
+    .is_some()
+    {
+        return CreateOutcome::Skipped {
+            key_alias: req.key_alias,
+            reason: "budget_plan_conflict",
         };
     }
     // Dedup check on key_alias.
