@@ -1926,6 +1926,9 @@ td.kvc-prefix .kvc-sub { font-size: 11px; color: var(--text3); }
    request-rate chart cards. Private keeps the team count as tooltip. */
 .private-model-badge { margin-left: 6px; padding: 1px 7px; font-size: 10px; vertical-align: middle; white-space: nowrap; background: var(--warn-bg); color: var(--warn); }
 .public-model-badge { margin-left: 6px; padding: 1px 7px; font-size: 10px; vertical-align: middle; white-space: nowrap; background: var(--info-bg); color: var(--info); }
+/* Inline warning note on config cards (e.g. metrics switch on but the trace
+   master switch is off — /metrics stays dark until it is enabled). */
+.cfg-warn-note { margin: 4px 0 0; padding: 6px 10px; border-radius: 8px; font-size: 12px; background: var(--warn-bg); color: var(--warn); }
 .rb-chart-card__label .private-model-badge { margin-left: 4px; padding: 0 6px; }
 .rb-chart-card__label .public-model-badge { margin-left: 4px; padding: 0 6px; }
 .badge-plan-default {

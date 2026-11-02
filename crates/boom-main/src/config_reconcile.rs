@@ -844,6 +844,15 @@ pub fn warn_inert_yaml_runtime_sections(config: &Config) {
             );
         }
     }
+    if let Some(trace) = &config.trace {
+        if trace.metrics.enabled {
+            tracing::warn!(
+                "trace.metrics.enabled in YAML is inert (seed-only) — the metrics switch is \
+                 managed in the DB via the Dashboard (Trace card) \
+                 or PUT /dashboard/api/admin/trace/metrics-enabled"
+            );
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════

@@ -8,7 +8,8 @@ edition.workspace = true
 # `trace.otlp.enabled` is set in YAML, so the cost of carrying the codegen is
 # the few extra crates linked in — no runtime behavior unless configured.
 # Disable with `--no-default-features` for an embedded build that doesn't
-# need OTLP at all.
+# need OTLP at all. The metrics channel (Prometheus pull, GET /metrics) is
+# NOT part of this feature — it self-aggregates and has no OTel deps.
 default = ["otlp"]
 otlp = [
     "dep:opentelemetry-proto",

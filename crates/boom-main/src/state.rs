@@ -306,6 +306,10 @@ impl AppState {
         // load everything from the DB. YAML runtime sections are inert from
         // then on. Without a DB, YAML remains the build source (master-key-
         // only mode — a deployment form choice, not a second authority).
+        //
+        // metrics_switch: Some(v) = DB-authoritative value adopted above;
+        // None = no-DB mode, fall back to the YAML value below.
+        let mut metrics_switch: Option<bool> = None;
         if let Some(ref pool) = db_pool {
             // Run migrations. boom_dashboard::run_migrations calls
             // boom_audit::run_request_log_migration internally (with
@@ -352,6 +356,20 @@ impl AppState {
                 &config,
             )
             .await?;
+            // Metrics channel switch: DB-authoritative (boom_config KV),
+            // seeded from the YAML value on first boot only.
+            metrics_switch = Some(
+                boom_dashboard::config_kv::adopt_bool(
+                    pool,
+                    boom_dashboard::config_kv::TRACE_METRICS_ENABLED,
+                    config
+                        .trace
+                        .as_ref()
+                        .map(|t| t.metrics.enabled)
+                        .unwrap_or(false),
+                )
+                .await?,
+            );
 
             // Restore runtime state.
             plan_store.restore_assignments_from_db(pool).await;
@@ -408,6 +426,12 @@ impl AppState {
                 .replace_otlp(&trace_config.otlp, trace_config.enabled)
                 .await;
         }
+        // Prometheus pull channel — independent of the OTLP traces exporter.
+        // Switch value: DB (adopted above) in DB mode, YAML seed in no-DB
+        // mode. The trace master switch AND is applied inside the registry.
+        trace_registry.set_metrics_enabled(
+            metrics_switch.unwrap_or(trace_config.metrics.enabled),
+        );
 
         // Process start time — single origin shared by `/health`'s uptime_secs
         // and the stressmon snapshot, so both tick in lockstep. The reload
@@ -683,6 +707,8 @@ impl AppState {
         // Rebuild auto router classifier.
         self.router.set_classifier(build_auto_router(&new_config));
 
+        // Metrics switch: Some(v) = re-adopted DB value; None = no-DB mode.
+        let mut metrics_switch: Option<bool> = None;
         if let Some(ref pool) = db_pool {
             // DB is the runtime authority: reconcile the live stores with DB
             // state — a per-key diff, never a clear, so routing continues on
@@ -724,6 +750,20 @@ impl AppState {
                 &new_config,
             )
             .await?;
+            // Metrics switch re-adopt: DB value wins; the YAML value is
+            // seed-only (inert across reloads).
+            metrics_switch = Some(
+                boom_dashboard::config_kv::adopt_bool(
+                    pool,
+                    boom_dashboard::config_kv::TRACE_METRICS_ENABLED,
+                    new_config
+                        .trace
+                        .as_ref()
+                        .map(|t| t.metrics.enabled)
+                        .unwrap_or(false),
+                )
+                .await?,
+            );
         }
 
         self.register_fusion_models(&new_config).await?;
@@ -766,6 +806,15 @@ impl AppState {
                 .replace_otlp(&new_trace_config.otlp, new_trace_config.enabled)
                 .await;
         }
+        // Metrics channel across reloads: DB-authoritative value when a DB
+        // is configured (adopted above), YAML seed value in no-DB mode. The
+        // trace master switch AND is applied inside the registry, so a
+        // `trace.enabled` YAML flip turns /metrics on/off alongside the
+        // traces exporter swap above. Re-enabling restarts histogram series
+        // from zero (Prometheus reset semantics).
+        self.trace.set_metrics_enabled(
+            metrics_switch.unwrap_or(new_trace_config.metrics.enabled),
+        );
 
         // 6. Build new inner state.
         let new_inner =
@@ -1094,6 +1143,7 @@ impl AppState {
             &snapshot,
             self.block_rule_store.is_enabled(),
             &self.user_tag_store.get(),
+            self.trace.metrics_enabled(),
         )
     }
 
@@ -1129,7 +1179,7 @@ impl AppState {
         // ignores (or, pre-M4, partially consumes for workflow/cost) — reject
         // with a pointer to the right surface instead of silently doing the
         // wrong thing on the next reload.
-        const DB_OWNED_PATHS: [&str; 7] = [
+        const DB_OWNED_PATHS: [&str; 8] = [
             "model_list",
             "plan_settings",
             "client_blocklist",
@@ -1137,6 +1187,7 @@ impl AppState {
             "workflow_settings",
             "cost_templates",
             "general_settings.user_tag_headers",
+            "trace.metrics.enabled",
         ];
         if DB_OWNED_PATHS.contains(&path) {
             return Err(format!(
@@ -1172,11 +1223,14 @@ impl AppState {
 /// fallback when the snapshot carries no `enabled` (no-DB mode / missing
 /// state row). `user_tag_headers` is the running UserTagStore list, same
 /// fallback role for `general_settings.user_tag_headers`.
+/// `metrics_enabled` is the running registry's DB-semantic metrics switch,
+/// fallback role for `trace.metrics.enabled`.
 fn merge_runtime_sections(
     root: &mut serde_yaml::Value,
     snapshot: &serde_json::Value,
     blocklist_enabled: bool,
     user_tag_headers: &[String],
+    metrics_enabled: bool,
 ) -> Result<(), String> {
     let obj = snapshot
         .as_object()
@@ -1270,6 +1324,21 @@ fn merge_runtime_sections(
         }
     }
 
+    // Trace metrics switch is DB-owned runtime state. The snapshot carries
+    // the KV row when it exists; the running registry value covers the
+    // missing-row transient. Written so a fresh-DB restore seeds from what
+    // the operator last set, not from a stale YAML value.
+    let tm_value = obj
+        .get("trace")
+        .and_then(|t| t.get("metrics"))
+        .and_then(|m| m.get("enabled"))
+        .cloned()
+        .filter(|v| !v.is_null())
+        .unwrap_or_else(|| serde_json::Value::Bool(metrics_enabled));
+    let yaml_tm = json_to_yaml(&tm_value)?;
+    boom_config::set_yaml_path(root, &["trace", "metrics", "enabled"], yaml_tm)
+        .map_err(|e| format!("set trace.metrics.enabled: {}", e))?;
+
     // Strip the legacy singular alias. The field now lives in the DB; a stale
     // `user_tag_header:` key left in the file would re-seed the OLD value on a
     // fresh-DB restore even after the operator cleared the list (the empty
@@ -1319,8 +1388,15 @@ fn compose_export_yaml(
     snapshot: &serde_json::Value,
     blocklist_enabled: bool,
     user_tag_headers: &[String],
+    metrics_enabled: bool,
 ) -> Result<String, String> {
-    merge_runtime_sections(root, snapshot, blocklist_enabled, user_tag_headers)?;
+    merge_runtime_sections(
+        root,
+        snapshot,
+        blocklist_enabled,
+        user_tag_headers,
+        metrics_enabled,
+    )?;
     serde_yaml::to_string(root).map_err(|e| format!("serialize yaml: {}", e))
 }
 
@@ -2319,6 +2395,14 @@ pub(crate) async fn build_config_snapshot_value(pool: &PgPool) -> Result<serde_j
         .fetch_optional(pool)
         .await?;
 
+    // ── Trace metrics switch (boom-dashboard boom_config KV row) ──
+    let trace_metrics_enabled: Option<bool> =
+        boom_dashboard::config_kv::get_bool(
+            pool,
+            boom_dashboard::config_kv::TRACE_METRICS_ENABLED,
+        )
+        .await?;
+
     // ── Workflows (delegated to WorkflowStore tables) ──
     let definition_rows = boom_routing::WorkflowStore::list_definitions_db(pool).await?;
     let model_binding_rows = boom_routing::WorkflowStore::list_models_db(pool).await?;
@@ -2388,6 +2472,11 @@ pub(crate) async fn build_config_snapshot_value(pool: &PgPool) -> Result<serde_j
         "general_settings": {
             "user_tag_headers": user_tag_headers,
         },
+        "trace": {
+            "metrics": {
+                "enabled": trace_metrics_enabled,
+            },
+        },
     }))
 }
 
@@ -2421,10 +2510,32 @@ mod merge_runtime_sections_tests {
         // otherwise parse the section with the serde default (true) and
         // silently activate rules the operator never turned on.
         let mut root = parse("model_list: []\n");
-        merge_runtime_sections(&mut root, &snapshot_with_rules(), false, &[]).expect("merge");
+        merge_runtime_sections(&mut root, &snapshot_with_rules(), false, &[], false)
+            .expect("merge");
         let bl = root.get("client_blocklist").expect("section created");
         assert_eq!(bl.get("enabled"), Some(&serde_yaml::Value::Bool(false)));
         assert!(bl.get("rules").is_some());
+    }
+
+    #[test]
+    fn trace_metrics_switch_snapshot_overrides_and_fallback() {
+        // Snapshot (KV row) wins over a stale YAML value…
+        let mut root = parse("trace:\n  enabled: true\n  metrics:\n    enabled: true\n");
+        let snapshot = serde_json::json!({"trace": {"metrics": {"enabled": false}}});
+        merge_runtime_sections(&mut root, &snapshot, false, &[], true).expect("merge");
+        assert_eq!(
+            root.get("trace").and_then(|t| t.get("metrics")).and_then(|m| m.get("enabled")),
+            Some(&serde_yaml::Value::Bool(false))
+        );
+        // …and the running registry value materializes the path when the KV
+        // row is missing (fresh install transient / no-DB restore).
+        let mut root = parse("model_list: []\n");
+        merge_runtime_sections(&mut root, &serde_json::json!({}), false, &[], true)
+            .expect("merge");
+        assert_eq!(
+            root.get("trace").and_then(|t| t.get("metrics")).and_then(|m| m.get("enabled")),
+            Some(&serde_yaml::Value::Bool(true))
+        );
     }
 
     #[test]
@@ -2434,7 +2545,7 @@ mod merge_runtime_sections_tests {
         let mut root = parse("client_blocklist:\n  enabled: true\n");
         let mut snapshot = snapshot_with_rules();
         snapshot["client_blocklist"]["enabled"] = serde_json::Value::Bool(false);
-        merge_runtime_sections(&mut root, &snapshot, true, &[]).expect("merge");
+        merge_runtime_sections(&mut root, &snapshot, true, &[], false).expect("merge");
         let bl = root.get("client_blocklist").expect("section kept");
         assert_eq!(bl.get("enabled"), Some(&serde_yaml::Value::Bool(false)));
     }
@@ -2452,7 +2563,7 @@ mod merge_runtime_sections_tests {
             ],
             "client_blocklist": {"rules": []},
         });
-        let yaml = compose_export_yaml(&mut root, &snapshot, true, &[]).expect("compose");
+        let yaml = compose_export_yaml(&mut root, &snapshot, true, &[], false).expect("compose");
         let reparsed = parse(&yaml);
         assert!(reparsed.get("server").is_some(), "singleton section preserved");
         assert_eq!(
@@ -2487,7 +2598,7 @@ mod merge_runtime_sections_tests {
         let snapshot = serde_json::json!({
             "general_settings": {"user_tag_headers": ["x-user-id"]}
         });
-        merge_runtime_sections(&mut root, &snapshot, true, &[]).expect("merge");
+        merge_runtime_sections(&mut root, &snapshot, true, &[], false).expect("merge");
         let got = root
             .get("general_settings")
             .and_then(|g| g.get("user_tag_headers"))
@@ -2500,7 +2611,7 @@ mod merge_runtime_sections_tests {
         let snapshot = serde_json::json!({
             "general_settings": {"user_tag_headers": []}
         });
-        merge_runtime_sections(&mut root, &snapshot, true, &[]).expect("merge");
+        merge_runtime_sections(&mut root, &snapshot, true, &[], false).expect("merge");
         let gs = root
             .get("general_settings")
             .and_then(|g| g.as_mapping())
@@ -2521,7 +2632,7 @@ mod merge_runtime_sections_tests {
         let mut root = parse(
             "general_settings:\n  user_tag_header: x-old\n  user_tag_headers: [x-old]\n",
         );
-        merge_runtime_sections(&mut root, &snapshot, true, &[]).expect("merge");
+        merge_runtime_sections(&mut root, &snapshot, true, &[], false).expect("merge");
         let gs = root
             .get("general_settings")
             .and_then(|g| g.as_mapping())
@@ -2542,7 +2653,7 @@ mod merge_runtime_sections_tests {
         // fallback (no-DB transient).
         let mut root = parse("general_settings:\n  master_key: ${MASTER}\n");
         let snapshot = serde_json::json!({"general_settings": {}});
-        merge_runtime_sections(&mut root, &snapshot, true, &["x-user-tag".to_string()])
+        merge_runtime_sections(&mut root, &snapshot, true, &["x-user-tag".to_string()], false)
             .expect("merge");
         assert_eq!(
             root.get("general_settings")

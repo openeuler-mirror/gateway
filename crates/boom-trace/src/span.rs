@@ -36,6 +36,27 @@ pub struct RequestSpan {
     /// attribute bag (key → value). Bodies stored as `Arc<serde_json::Value>`
     /// so the same Arc is shared with `PromptLogEntry`.
     pub attributes: Vec<(String, SpanAttributeValue)>,
+    // ---- Structured timing fields (metrics data path, issue #49) ----
+    // Written by boom-main via `TraceGuard` setters at the point each value
+    // becomes known; read once at finalize by `MetricsRecorder::record_request_done`.
+    pub queue_wait_ms: Option<u64>,
+    pub routing_duration_ms: Option<u64>,
+    pub ttft_ms: Option<u64>,
+    pub duration_ms: Option<u64>,
+    /// Total chunks observed on the response stream (first chunk included).
+    pub chunk_count: Option<u64>,
+    /// Generation window in ms: last chunk timestamp − first chunk timestamp.
+    pub gen_duration_ms: Option<u64>,
+    pub upstream_start_ns: Option<u64>,
+    pub upstream_end_ns: Option<u64>,
+    /// Model name the deployment actually serves (may differ from the
+    /// requested `model` after alias/fallback resolution).
+    pub response_model: Option<String>,
+    /// Whether this span is exported to OTLP traces. Spans are now created
+    /// for EVERY request (metrics need full coverage); only spans whose
+    /// inbound request carried a valid traceparent AND matched the report
+    /// filter are exported as traces. Metrics record regardless.
+    pub export_eligible: bool,
 }
 
 impl RequestSpan {
@@ -50,6 +71,7 @@ impl RequestSpan {
         api_path: String,
         is_stream: bool,
         now_unix_nano: u64,
+        export_eligible: bool,
     ) -> Self {
         Self {
             request_id,
@@ -66,6 +88,16 @@ impl RequestSpan {
             api_path,
             trace_state: w3c.trace_state.clone(),
             attributes: Vec::new(),
+            queue_wait_ms: None,
+            routing_duration_ms: None,
+            ttft_ms: None,
+            duration_ms: None,
+            chunk_count: None,
+            gen_duration_ms: None,
+            upstream_start_ns: None,
+            upstream_end_ns: None,
+            response_model: None,
+            export_eligible,
         }
     }
 
@@ -88,6 +120,64 @@ impl RequestSpan {
 
     pub fn set_deployment_id(&mut self, did: String) {
         self.deployment_id = Some(did);
+    }
+
+    pub fn set_response_model(&mut self, m: String) {
+        self.response_model = Some(m);
+    }
+
+    pub fn set_queue_wait_ms(&mut self, ms: u64) {
+        self.queue_wait_ms = Some(ms);
+    }
+
+    pub fn set_routing_duration_ms(&mut self, ms: u64) {
+        self.routing_duration_ms = Some(ms);
+    }
+
+    pub fn set_ttft_ms(&mut self, ms: u64) {
+        self.ttft_ms = Some(ms);
+    }
+
+    pub fn set_duration_ms(&mut self, ms: u64) {
+        self.duration_ms = Some(ms);
+    }
+
+    pub fn set_chunk_stats(&mut self, count: u64, gen_ms: u64) {
+        self.chunk_count = Some(count);
+        self.gen_duration_ms = Some(gen_ms);
+    }
+
+    pub fn note_upstream_start(&mut self, now_unix_nano: u64) {
+        self.upstream_start_ns = Some(now_unix_nano);
+    }
+
+    pub fn note_upstream_end(&mut self, now_unix_nano: u64) {
+        self.upstream_end_ns = Some(now_unix_nano);
+    }
+
+    /// Fill in the stream-shaped fields for non-stream requests, where the
+    /// whole response arrives in one shot: TTFT ≈ total duration, one chunk,
+    /// generation window = duration. Applied at finalize before metrics
+    /// recording so downstream consumers never see the None variants.
+    pub fn apply_nonstream_fallbacks(&mut self) {
+        if self.is_stream {
+            return;
+        }
+        let duration = self.duration_ms.or_else(|| {
+            Some(self.end_time_unix_nano.saturating_sub(self.start_time_unix_nano) / 1_000_000)
+        });
+        if let Some(d) = duration {
+            self.duration_ms = Some(d);
+            if self.ttft_ms.is_none() {
+                self.ttft_ms = Some(d);
+            }
+            if self.chunk_count.is_none() {
+                self.chunk_count = Some(1);
+            }
+            if self.gen_duration_ms.is_none() {
+                self.gen_duration_ms = Some(d);
+            }
+        }
     }
 
     pub fn finalize_ok(&mut self, now_unix_nano: u64) {
@@ -171,6 +261,7 @@ mod tests {
             "/v1/chat/completions".to_string(),
             false,
             1_000_000_000,
+            true,
         );
         assert_ne!(span.span_id, w3c.parent_span_id);
         assert_eq!(span.trace_id, w3c.trace_id);
@@ -189,6 +280,7 @@ mod tests {
             "/p".to_string(),
             false,
             0,
+            true,
         );
         span.set_attribute("k", SpanAttributeValue::Int(1));
         span.set_attribute("k", SpanAttributeValue::Int(2));
@@ -209,6 +301,7 @@ mod tests {
             "/p".to_string(),
             false,
             1_000,
+            true,
         );
         span.finalize_ok(2_000);
         assert_eq!(span.end_time_unix_nano, 2_000);
@@ -225,6 +318,7 @@ mod tests {
             "/p".to_string(),
             false,
             1_000,
+            true,
         );
         span.finalize_error(2_000, "boom".to_string());
         assert_eq!(span.status, SpanStatus::Error);
@@ -241,6 +335,7 @@ mod tests {
             "/p".to_string(),
             false,
             0,
+            true,
         );
         let req = Arc::new(serde_json::json!({"messages": []}));
         span.set_llm_request(req.clone());

@@ -87,13 +87,15 @@
 
 pub mod context;
 pub mod guard;
+pub mod metrics;
 #[cfg(feature = "otlp")]
 pub mod otlp_export;
 pub mod registry;
 pub mod span;
 
-pub use context::{parse_traceparent, build_child_traceparent, W3cContext};
+pub use context::{parse_traceparent, build_child_traceparent, synthetic_context, W3cContext};
 pub use guard::{trace_filter_matches, TraceGuard};
+pub use metrics::MetricsRecorder;
 #[cfg(feature = "otlp")]
 pub use otlp_export::{convert_span_to_resource_spans, ping_endpoint, TraceExporter};
 pub use registry::TraceRegistry;

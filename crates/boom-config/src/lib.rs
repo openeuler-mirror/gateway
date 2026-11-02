@@ -1813,6 +1813,24 @@ pub struct TraceConfig {
     /// paying for full-fidelity tracing on every request.
     #[serde(default)]
     pub report_filter: TraceFilterConfig,
+    /// Prometheus pull channel (issue #49). When enabled (and the trace
+    /// master switch is on), the gateway serves `GET /metrics` with the
+    /// semantic-convention metrics. Effective switch:
+    /// `trace.enabled && trace.metrics.enabled`.
+    #[serde(default)]
+    pub metrics: MetricsConfig,
+}
+
+/// Configuration for the `/metrics` Prometheus endpoint. Kept deliberately
+/// minimal — bucket boundaries and the exposition path are compile-time
+/// constants, not knobs.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Default)]
+pub struct MetricsConfig {
+    /// Serve `GET /metrics` (no auth — same trust boundary as `/health`;
+    /// labels are low-cardinality and carry no keys/user ids). Default
+    /// false.
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 fn default_trace_capture_body() -> bool {
@@ -1836,6 +1854,7 @@ impl Default for TraceConfig {
             max_body_bytes: default_trace_max_body_bytes(),
             propagate_only: default_trace_propagate_only(),
             report_filter: TraceFilterConfig::default(),
+            metrics: MetricsConfig::default(),
         }
     }
 }
@@ -1897,6 +1916,14 @@ report_filter:
         assert_eq!(cfg.max_body_bytes, 4096);
         assert_eq!(cfg.report_filter.tracestate_keys, vec!["opencode_user_id".to_string()]);
         assert_eq!(cfg.report_filter.trace_id_regex.as_deref(), Some("^abc"));
+        assert!(!cfg.metrics.enabled);
+    }
+
+    #[test]
+    fn trace_config_parses_metrics_section() {
+        let yaml = "enabled: true\nmetrics:\n  enabled: true\n";
+        let cfg: TraceConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.metrics.enabled);
     }
 
     #[test]

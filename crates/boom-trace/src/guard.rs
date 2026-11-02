@@ -68,14 +68,17 @@ pub struct TraceGuard {
 }
 
 impl TraceGuard {
-    /// Start a new in-flight span. Returns `None` when the registry is
-    /// disabled (channel off, or filter didn't match) — handler treats
-    /// `None` as a no-op for all subsequent `set_attribute` calls.
+    /// Start a new in-flight span. Metrics need full coverage (issue #49),
+    /// so the span is created for EVERY request whenever the trace channel
+    /// is enabled — the caller passes a synthetic W3C context when the
+    /// inbound request carries no `traceparent`. `should_trace` (inbound
+    /// traceparent parsed + report filter matched) only decides whether the
+    /// span is *exported* as an OTLP trace; metrics record regardless.
+    /// Returns `None` when the registry is disabled — the handler treats
+    /// `None` as a no-op for all subsequent setter calls.
     ///
     /// `now_unix_nano` is the caller's time basis (so the queue-wait
-    /// attribute can use the same clock). `should_trace` is the boolean
-    /// the handler already computed from `TraceConfig.enabled` + filter
-    /// match — passing it here keeps the guard self-contained.
+    /// attribute can use the same clock).
     pub fn start(
         registry: Arc<TraceRegistry>,
         request_id: String,
@@ -86,7 +89,7 @@ impl TraceGuard {
         now_unix_nano: u64,
         should_trace: bool,
     ) -> Option<Self> {
-        if !should_trace || !registry.enabled() {
+        if !registry.enabled() {
             return None;
         }
         registry.start_request(
@@ -96,6 +99,7 @@ impl TraceGuard {
             api_path,
             is_stream,
             now_unix_nano,
+            should_trace,
         );
         Some(Self {
             registry,
@@ -134,6 +138,61 @@ impl TraceGuard {
     pub fn mark_error(&mut self, message: String) {
         self.errored = true;
         self.error_message = Some(message);
+    }
+
+    // ---- Metrics data setters (issue #49) ----
+    // Thin write-throughs onto the span's structured timing fields; the
+    // values are consumed once at finalize by `MetricsRecorder`.
+
+    pub fn set_queue_wait_ms(&self, ms: u64) {
+        let _ = self.registry.with_span_mut(&self.request_id, |s| s.set_queue_wait_ms(ms));
+    }
+
+    pub fn set_routing_duration_ms(&self, ms: u64) {
+        let _ = self
+            .registry
+            .with_span_mut(&self.request_id, |s| s.set_routing_duration_ms(ms));
+    }
+
+    pub fn set_ttft_ms(&self, ms: u64) {
+        let _ = self.registry.with_span_mut(&self.request_id, |s| s.set_ttft_ms(ms));
+    }
+
+    pub fn set_duration_ms(&self, ms: u64) {
+        let _ = self.registry.with_span_mut(&self.request_id, |s| s.set_duration_ms(ms));
+    }
+
+    pub fn set_chunk_stats(&self, count: u64, gen_ms: u64) {
+        let _ = self
+            .registry
+            .with_span_mut(&self.request_id, |s| s.set_chunk_stats(count, gen_ms));
+    }
+
+    /// Stamp the deployment chosen by routing plus the model it actually
+    /// serves (post alias/fallback resolution).
+    pub fn set_deployment(&self, deployment_id: Option<String>, response_model: Option<String>) {
+        let _ = self.registry.with_span_mut(&self.request_id, |s| {
+            if let Some(did) = deployment_id {
+                s.set_deployment_id(did);
+            }
+            if let Some(m) = response_model {
+                s.set_response_model(m);
+            }
+        });
+    }
+
+    /// Upstream dispatch marker: stamps the span and bumps
+    /// `http.client.active_requests`.
+    pub fn note_upstream_start(&self) {
+        let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64;
+        self.registry.note_upstream_started(&self.request_id, now);
+    }
+
+    /// Upstream completion marker (stream end or non-stream response).
+    /// Error paths that return between start/end are reconciled at finalize.
+    pub fn note_upstream_end(&self) {
+        let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64;
+        self.registry.note_upstream_ended(&self.request_id, now);
     }
 
     /// The 8-byte gateway span_id, suitable for use as the parent_span_id in

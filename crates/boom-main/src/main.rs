@@ -233,11 +233,14 @@ fn build_router(state: AppState) -> Router {
         .route("/v1/audio/transcriptions", post(routes::audio_transcriptions))
         .route("/v1/moderations", post(routes::moderations));
 
-    // Health check routes (no auth required).
+    // Health check routes (no auth required). /metrics joins this group:
+    // Prometheus pull endpoint, no auth (network-boundary trust, low-
+    // cardinality labels — see prometheus_metrics doc).
     let health_routes = Router::new()
         .route("/health", get(routes::health_check))
         .route("/health/live", get(routes::liveness_check))
-        .route("/health/ready", get(routes::readiness_check));
+        .route("/health/ready", get(routes::readiness_check))
+        .route("/metrics", get(routes::prometheus_metrics));
 
     // Admin routes (require master key).
     let admin_routes = Router::new()

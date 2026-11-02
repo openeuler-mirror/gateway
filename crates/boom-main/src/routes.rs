@@ -441,6 +441,11 @@ struct LoggedStream<S> {
     log: Option<RequestLog>,
     start: Instant,
     first_token_at: Option<Instant>,
+    /// Chunks observed on the stream (first chunk included; the terminating
+    /// `None` poll is not counted). Pure struct fields — the per-chunk cost
+    /// is two assignments; registry lookups happen once at Drop.
+    chunk_count: u64,
+    last_chunk_at: Option<Instant>,
     usage: UsageTracker,
     agent_stats: Option<Arc<AgentStatsTracker>>,
     /// Plan charge to settle on drop. None when running without quota tracking
@@ -469,6 +474,8 @@ impl<S> LoggedStream<S> {
             log: Some(log),
             start,
             first_token_at: None,
+            chunk_count: 0,
+            last_chunk_at: None,
             usage,
             agent_stats,
             plan_charge: None,
@@ -502,6 +509,22 @@ impl<S> LoggedStream<S> {
 
 impl<S> Drop for LoggedStream<S> {
     fn drop(&mut self) {
+        // Stamp the stream-shaped metrics fields before the trace guard's
+        // own Drop (fields drop after this method) finalizes the span —
+        // this is where TTFT / chunk stats / upstream end become known.
+        if let Some(g) = self.trace_guard.as_ref() {
+            g.set_duration_ms(self.start.elapsed().as_millis() as u64);
+            if let Some(first) = self.first_token_at {
+                g.set_ttft_ms((first - self.start).as_millis() as u64);
+            }
+            let gen_ms = match (self.first_token_at, self.last_chunk_at) {
+                (Some(f), Some(l)) => (l - f).as_millis() as u64,
+                _ => 0,
+            };
+            g.set_chunk_stats(self.chunk_count, gen_ms);
+            g.note_upstream_end();
+        }
+
         let observed_usage = self
             .usage
             .lock()
@@ -587,8 +610,14 @@ impl<S: futures::Stream + Unpin> futures::Stream for LoggedStream<S> {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let result = self.inner.poll_next_unpin(cx);
-        if self.first_token_at.is_none() && result.is_ready() {
-            self.first_token_at = Some(Instant::now());
+        if result.is_ready() {
+            if self.first_token_at.is_none() {
+                self.first_token_at = Some(Instant::now());
+            }
+            if matches!(result, Poll::Ready(Some(_))) {
+                self.chunk_count += 1;
+                self.last_chunk_at = Some(Instant::now());
+            }
         }
         result
     }
@@ -731,20 +760,21 @@ async fn chat_completions_inner(
             .as_ref()
             .map(|w| boom_trace::trace_filter_matches(&trace_cfg.report_filter.tracestate_keys, &trace_cfg.report_filter.trace_id_regex, w))
             .unwrap_or(false);
-    let mut trace_guard = if let Some(w3c) = w3c_ctx.as_ref() {
-        TraceGuard::start(
-            state.trace.clone(),
-            request_id.clone(),
-            w3c,
-            model.clone(),
-            api_path.to_string(),
-            is_stream,
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64,
-            should_trace,
-        )
-    } else {
-        None
-    };
+    // Full-coverage guard (issue #49): a span is created for every request
+    // so metrics see all traffic — a synthetic W3C context stands in when
+    // the client sent no traceparent. `should_trace` only gates OTLP trace
+    // export, not metrics.
+    let synthetic_w3c = boom_trace::synthetic_context(&request_id);
+    let mut trace_guard = TraceGuard::start(
+        state.trace.clone(),
+        request_id.clone(),
+        w3c_ctx.as_ref().unwrap_or(&synthetic_w3c),
+        model.clone(),
+        api_path.to_string(),
+        is_stream,
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64,
+        should_trace,
+    );
     // Capture request body for the span attribute (if capture_body on). Same
     // Arc as the prompt log entry — shared, zero-copy.
     if let (Some(g), Some(body)) = (trace_guard.as_ref(), prompt_log_req_body.as_ref()) {
@@ -815,6 +845,7 @@ async fn chat_completions_inner(
     //    gets a RouteResult or None (fallback). plan_charge is NOT passed in;
     //    it stays in the handler scope, preserving the two-phase commit.
     let candidates = state.router.candidates_for(&resolved_model);
+    let route_start = Instant::now();
     let kvc_route = state.kvc_orchestrator.route(
         &inner.config, &resolved_model, &identity.key_hash, input_chars as u64,
         &req, candidates.as_ref().map(|c| c.as_slice()).unwrap_or(&[]),
@@ -843,6 +874,7 @@ async fn chat_completions_inner(
             (selection.provider, did, im, None, None, None, None, None, None)
         }
     };
+    let routing_ms = route_start.elapsed().as_millis() as u64;
 
     // 3.5. Flow control — queue if per-deployment limits exceeded.
     let is_vip = is_vip_key(&identity.metadata);
@@ -876,8 +908,11 @@ async fn chat_completions_inner(
     if let Some(g) = trace_guard.as_ref() {
         use boom_core::trace::SpanAttributeValue;
         g.set_attribute("boom-gateway.request.id", SpanAttributeValue::String(request_id.clone()));
+        g.set_deployment(deployment_id.clone(), Some(inflight_model.clone()));
+        g.set_routing_duration_ms(routing_ms);
         if let Some(qw) = queue_wait_ms {
             g.set_attribute("boom-gateway.time_in_queue", SpanAttributeValue::Int(qw as i64));
+            g.set_queue_wait_ms(qw as u64);
         }
         if let Some(w3c) = w3c_ctx.as_ref() {
             if let Some(uid) = w3c.tracestate_value("opencode_user_id") {
@@ -954,6 +989,7 @@ async fn chat_completions_inner(
 
     // 4. Route to provider (streaming or non-streaming).
     if is_stream {
+        if let Some(g) = trace_guard.as_ref() { g.note_upstream_start(); }
         let stream = match provider.chat_stream_with_context(req, provider_context).await {
             Ok(s) => s,
             Err(e) => {
@@ -1108,6 +1144,7 @@ async fn chat_completions_inner(
         } else {
             InFlightGuard::new(state.inflight.clone(), &inflight_model, input_chars as u64)
         };
+        if let Some(g) = trace_guard.as_ref() { g.note_upstream_start(); }
         let response = match provider.chat_with_context(req, provider_context).await {
             Ok(r) => r,
             Err(e) => {
@@ -1136,6 +1173,7 @@ async fn chat_completions_inner(
                 return Err(GatewayErrorReply(e, false));
             }
         };
+        if let Some(g) = trace_guard.as_ref() { g.note_upstream_end(); }
         // Provider accepted the request — commit the plan charge now.
         let _decision = plan_charge.commit();
         // Release concurrency guard now (non-streaming: response is already complete,
@@ -1423,6 +1461,26 @@ pub async fn health_check(State(state): State<AppState>) -> Json<HealthResponse>
 
 pub async fn liveness_check() -> &'static str {
     "ok"
+}
+
+/// Prometheus scrape endpoint (pull model, issue #49). No auth — same trust
+/// boundary as `/health`: rely on network isolation; labels are
+/// low-cardinality and carry no keys/user ids. 404 when
+/// `trace.metrics.enabled` is off so a stale scrape config surfaces as
+/// target-down instead of a silently empty body.
+pub async fn prometheus_metrics(State(state): State<AppState>) -> axum::response::Response {
+    match state.trace.prometheus_text() {
+        Some(text) => (
+            axum::http::StatusCode::OK,
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; version=0.0.4; charset=utf-8",
+            )],
+            text,
+        )
+            .into_response(),
+        None => (axum::http::StatusCode::NOT_FOUND, "metrics disabled\n").into_response(),
+    }
 }
 
 pub async fn readiness_check(State(state): State<AppState>) -> impl IntoResponse {
@@ -3149,20 +3207,20 @@ pub async fn messages(
             .as_ref()
             .map(|w| boom_trace::trace_filter_matches(&trace_cfg.report_filter.tracestate_keys, &trace_cfg.report_filter.trace_id_regex, w))
             .unwrap_or(false);
-    let mut trace_guard = if let Some(w3c) = w3c_ctx.as_ref() {
-        TraceGuard::start(
-            state.trace.clone(),
-            request_id.clone(),
-            w3c,
-            model.clone(),
-            "/v1/messages".to_string(),
-            is_stream,
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64,
-            should_trace,
-        )
-    } else {
-        None
-    };
+    // Guard is created unconditionally (metrics need full coverage); spans
+    // without an inbound traceparent get a synthetic W3C context and are
+    // never exported as traces (export_eligible=false).
+    let synthetic_w3c = boom_trace::synthetic_context(&request_id);
+    let mut trace_guard = TraceGuard::start(
+        state.trace.clone(),
+        request_id.clone(),
+        w3c_ctx.as_ref().unwrap_or(&synthetic_w3c),
+        model.clone(),
+        "/v1/messages".to_string(),
+        is_stream,
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64,
+        should_trace,
+    );
     if let (Some(g), Some(body)) = (trace_guard.as_ref(), prompt_log_req_body.as_ref()) {
         if trace_cfg.capture_body {
             g.set_llm_request(body.clone());
@@ -3227,6 +3285,7 @@ pub async fn messages(
     //    before the trie query, which would degrade every /v1/messages request
     //    to key_affinity and never request a full KV report.
     let candidates = state.router.candidates_for(&resolved_model);
+    let route_start = Instant::now();
     let kvc_route = state.kvc_orchestrator.route(
         &inner.config, &resolved_model, &identity.key_hash, input_chars as u64,
         &openai_req, candidates.as_ref().map(|c| c.as_slice()).unwrap_or(&[]),
@@ -3255,6 +3314,7 @@ pub async fn messages(
             (selection.provider, did, im, None, None, None, None, None, None)
         }
     };
+    let routing_ms = route_start.elapsed().as_millis() as u64;
 
     // 3.5. Flow control — queue if per-deployment limits exceeded.
     let is_vip = is_vip_key(&identity.metadata);
@@ -3284,8 +3344,11 @@ pub async fn messages(
     if let Some(g) = trace_guard.as_ref() {
         use boom_core::trace::SpanAttributeValue;
         g.set_attribute("boom-gateway.request.id", SpanAttributeValue::String(request_id.clone()));
+        g.set_deployment(deployment_id.clone(), Some(inflight_model.clone()));
+        g.set_routing_duration_ms(routing_ms);
         if let Some(qw) = queue_wait_ms {
             g.set_attribute("boom-gateway.time_in_queue", SpanAttributeValue::Int(qw as i64));
+            g.set_queue_wait_ms(qw as u64);
         }
         if let Some(w3c) = w3c_ctx.as_ref() {
             if let Some(uid) = w3c.tracestate_value("opencode_user_id") {
@@ -3343,6 +3406,7 @@ pub async fn messages(
 
     // 4. Route to provider.
     if is_stream {
+        if let Some(g) = trace_guard.as_ref() { g.note_upstream_start(); }
         let stream = match provider.chat_stream(openai_req).await {
             Ok(s) => s,
             Err(e) => {
@@ -3470,6 +3534,7 @@ pub async fn messages(
         } else {
             InFlightGuard::new(state.inflight.clone(), &inflight_model, input_chars as u64)
         };
+        if let Some(g) = trace_guard.as_ref() { g.note_upstream_start(); }
         let response = match provider.chat(openai_req).await {
             Ok(r) => r,
             Err(e) => {
@@ -3497,6 +3562,7 @@ pub async fn messages(
                 return Err(AnthropicErrorReply(e, false));
             }
         };
+        if let Some(g) = trace_guard.as_ref() { g.note_upstream_end(); }
         // Provider accepted the request — commit the plan charge now.
         let _decision = plan_charge.commit();
         // Release concurrency guard now (non-streaming: response is already complete).
@@ -3995,20 +4061,20 @@ pub async fn responses(
             .as_ref()
             .map(|w| boom_trace::trace_filter_matches(&trace_cfg.report_filter.tracestate_keys, &trace_cfg.report_filter.trace_id_regex, w))
             .unwrap_or(false);
-    let mut trace_guard = if let Some(w3c) = w3c_ctx.as_ref() {
-        TraceGuard::start(
-            state.trace.clone(),
-            request_id.clone(),
-            w3c,
-            model.clone(),
-            "/v1/responses".to_string(),
-            is_stream,
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64,
-            should_trace,
-        )
-    } else {
-        None
-    };
+    // Guard is created unconditionally (metrics need full coverage); spans
+    // without an inbound traceparent get a synthetic W3C context and are
+    // never exported as traces (export_eligible=false).
+    let synthetic_w3c = boom_trace::synthetic_context(&request_id);
+    let mut trace_guard = TraceGuard::start(
+        state.trace.clone(),
+        request_id.clone(),
+        w3c_ctx.as_ref().unwrap_or(&synthetic_w3c),
+        model.clone(),
+        "/v1/responses".to_string(),
+        is_stream,
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64,
+        should_trace,
+    );
     if let (Some(g), Some(body)) = (trace_guard.as_ref(), prompt_log_req_body.as_ref()) {
         if trace_cfg.capture_body {
             g.set_llm_request(body.clone());
@@ -4070,6 +4136,7 @@ pub async fn responses(
 
     // 3. Route (kvc-aware or default).
     let candidates = state.router.candidates_for(&resolved_model);
+    let route_start = Instant::now();
     let kvc_route = state.kvc_orchestrator.route(
         &inner.config, &resolved_model, &identity.key_hash, input_chars as u64,
         &openai_req, candidates.as_ref().map(|c| c.as_slice()).unwrap_or(&[]),
@@ -4097,6 +4164,7 @@ pub async fn responses(
             (selection.provider, did, im, None, None, None, None, None, None)
         }
     };
+    let routing_ms = route_start.elapsed().as_millis() as u64;
 
     // 3.5. Flow control — queue if per-deployment limits exceeded.
     let is_vip = is_vip_key(&identity.metadata);
@@ -4123,8 +4191,11 @@ pub async fn responses(
     if let Some(g) = trace_guard.as_ref() {
         use boom_core::trace::SpanAttributeValue;
         g.set_attribute("boom-gateway.request.id", SpanAttributeValue::String(request_id.clone()));
+        g.set_deployment(deployment_id.clone(), Some(inflight_model.clone()));
+        g.set_routing_duration_ms(routing_ms);
         if let Some(qw) = queue_wait_ms {
             g.set_attribute("boom-gateway.time_in_queue", SpanAttributeValue::Int(qw as i64));
+            g.set_queue_wait_ms(qw as u64);
         }
         if let Some(w3c) = w3c_ctx.as_ref() {
             if let Some(uid) = w3c.tracestate_value("opencode_user_id") {
@@ -4190,6 +4261,7 @@ pub async fn responses(
 
     // 4. Route to provider.
     if is_stream {
+        if let Some(g) = trace_guard.as_ref() { g.note_upstream_start(); }
         let stream = match provider.chat_stream(openai_req).await {
             Ok(s) => s,
             Err(e) => {
@@ -4312,6 +4384,7 @@ pub async fn responses(
         } else {
             InFlightGuard::new(state.inflight.clone(), &inflight_model, input_chars as u64)
         };
+        if let Some(g) = trace_guard.as_ref() { g.note_upstream_start(); }
         let response = match provider.chat(openai_req).await {
             Ok(r) => r,
             Err(e) => {
@@ -4338,6 +4411,7 @@ pub async fn responses(
                 return Err(ResponsesErrorReply(e));
             }
         };
+        if let Some(g) = trace_guard.as_ref() { g.note_upstream_end(); }
         let _decision = plan_charge.commit();
         drop(plan_charge.take_concurrency_guard());
         crate::health_monitor::reset_request_failure(&state, &deployment_id);

@@ -4711,6 +4711,7 @@
   function renderCardTrace(p) {
     const o = (p && p.otlp) || {};
     const f = (p && p.report_filter) || {};
+    const m = (p && p.metrics) || {};
     return `<div class="form-card" data-section="trace">
       <div class="form-card-title">${t("config.section.trace")}</div>
       <div class="form-card-grid">
@@ -4718,7 +4719,9 @@
         ${fieldCheckbox("cfg-tr-capture-body", t("config.field.trace_capture_body"), p.capture_body !== false, { tip: t("config.tip.trace_capture_body") })}
         ${fieldNum("cfg-tr-max-body-bytes", t("config.field.trace_max_body_bytes"), p.max_body_bytes || 16384, { min: 256, step: 256, tip: t("config.tip.trace_max_body_bytes") })}
         ${fieldCheckbox("cfg-tr-propagate-only", t("config.field.trace_propagate_only"), p.propagate_only !== false, { tip: t("config.tip.trace_propagate_only") })}
+        ${fieldCheckbox("cfg-tr-metrics-enabled", t("config.field.trace_metrics_enabled"), !!m.enabled, { tip: t("config.tip.trace_metrics_enabled") })}
       </div>
+      ${m.enabled && !p.enabled ? `<p class="cfg-warn-note">${t("config.tip.trace_metrics_master_off")}</p>` : ""}
 
       <div class="form-card-subtitle">${t("config.section.trace_filter")}</div>
       <div class="form-card-grid">
@@ -5287,28 +5290,49 @@
           },
         });
       } else if (kind === "trace") {
-        await saveConfigSection("trace", {
-          enabled: $("cfg-tr-enabled").checked,
-          capture_body: $("cfg-tr-capture-body").checked,
-          max_body_bytes: numOr($("cfg-tr-max-body-bytes"), 16384),
-          propagate_only: $("cfg-tr-propagate-only").checked,
-          report_filter: {
-            tracestate_keys: parseListInput($("cfg-tr-filter-keys")),
-            trace_id_regex: $("cfg-tr-filter-regex").value || null,
-          },
-          otlp: {
-            enabled: $("cfg-tr-otlp-enabled").checked,
-            endpoint: $("cfg-tr-otlp-endpoint").value || "",
-            service_name: $("cfg-tr-otlp-service-name").value || "boom-gateway",
-            service_version: $("cfg-tr-otlp-service-version").value || null,
-            timeout_secs: numOr($("cfg-tr-otlp-timeout-secs"), 10),
-            batch_size: numOr($("cfg-tr-otlp-batch-size"), 512),
-            flush_interval_secs: numOr($("cfg-tr-otlp-flush-interval-secs"), 5),
-            max_attribute_bytes: numOr($("cfg-tr-otlp-max-attribute-bytes"), 4096),
-            headers: parseJsonInput($("cfg-tr-otlp-headers"), {}),
-            max_queue_size: numOr($("cfg-tr-otlp-max-queue-size"), 10000),
-          },
-        });
+        // metrics.enabled is DB-authoritative (boom_config KV) — direct PUT
+        // to the dedicated endpoint, immediate effect. The rest of the trace
+        // section is process-level YAML. One confirm covers both channels
+        // (saveConfigSection's confirm fires inside its own call below).
+        if (!confirm(t("common.confirm_write"))) throw new Error(t("common.canceled"));
+        const metricsOn = $("cfg-tr-metrics-enabled").checked;
+        try {
+          await api("/admin/trace/metrics-enabled", {
+            method: "PUT", skipConfirm: true,
+            body: JSON.stringify({ enabled: metricsOn }),
+          });
+        } catch (e) {
+          // No-DB mode: the switch is YAML-backed there and the section
+          // write below carries it. Any other failure is real and aborts.
+          if (!String(e.message || "").includes("Database not available")) throw e;
+        }
+        await saveConfigSections([
+          ["trace", {
+            enabled: $("cfg-tr-enabled").checked,
+            capture_body: $("cfg-tr-capture-body").checked,
+            max_body_bytes: numOr($("cfg-tr-max-body-bytes"), 16384),
+            propagate_only: $("cfg-tr-propagate-only").checked,
+            // Seed-only in YAML; carrying the live DB value keeps the file
+            // from silently dropping the field on a whole-section rewrite.
+            metrics: { enabled: metricsOn },
+            report_filter: {
+              tracestate_keys: parseListInput($("cfg-tr-filter-keys")),
+              trace_id_regex: $("cfg-tr-filter-regex").value || null,
+            },
+            otlp: {
+              enabled: $("cfg-tr-otlp-enabled").checked,
+              endpoint: $("cfg-tr-otlp-endpoint").value || "",
+              service_name: $("cfg-tr-otlp-service-name").value || "boom-gateway",
+              service_version: $("cfg-tr-otlp-service-version").value || null,
+              timeout_secs: numOr($("cfg-tr-otlp-timeout-secs"), 10),
+              batch_size: numOr($("cfg-tr-otlp-batch-size"), 512),
+              flush_interval_secs: numOr($("cfg-tr-otlp-flush-interval-secs"), 5),
+              max_attribute_bytes: numOr($("cfg-tr-otlp-max-attribute-bytes"), 4096),
+              headers: parseJsonInput($("cfg-tr-otlp-headers"), {}),
+              max_queue_size: numOr($("cfg-tr-otlp-max-queue-size"), 10000),
+            },
+          }],
+        ]);
       } else if (kind === "router") {
         const routerValue = {
           schedule_policy: $("cfg-rs-policy").value,

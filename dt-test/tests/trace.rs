@@ -138,6 +138,7 @@ fn span_new_has_distinct_id_and_defaults() {
         "/v1/chat/completions".to_string(),
         false,
         1_000_000_000,
+        true,
     );
     assert_ne!(span.span_id, w.parent_span_id);
     assert_eq!(span.trace_id, w.trace_id);
@@ -152,7 +153,7 @@ fn span_new_has_distinct_id_and_defaults() {
 #[test]
 fn span_set_attribute_replaces_and_body_setters() {
     let w = w3c();
-    let mut span = RequestSpan::new("r".to_string(), &w, "m".to_string(), "/p".to_string(), false, 0);
+    let mut span = RequestSpan::new("r".to_string(), &w, "m".to_string(), "/p".to_string(), false, 0, true);
     span.set_attribute("k", SpanAttributeValue::Int(1));
     span.set_attribute("k", SpanAttributeValue::Int(2));
     assert_eq!(span.attributes.len(), 1);
@@ -171,12 +172,12 @@ fn span_set_attribute_replaces_and_body_setters() {
 #[test]
 fn span_finalize_ok_and_error() {
     let w = w3c();
-    let mut span = RequestSpan::new("r".to_string(), &w, "m".to_string(), "/p".to_string(), false, 1_000);
+    let mut span = RequestSpan::new("r".to_string(), &w, "m".to_string(), "/p".to_string(), false, 1_000, true);
     span.finalize_ok(2_000);
     assert_eq!(span.end_time_unix_nano, 2_000);
     assert_eq!(span.status, SpanStatus::Ok);
 
-    let mut span2 = RequestSpan::new("r2".to_string(), &w, "m".to_string(), "/p".to_string(), false, 1_000);
+    let mut span2 = RequestSpan::new("r2".to_string(), &w, "m".to_string(), "/p".to_string(), false, 1_000, true);
     span2.finalize_error(2_000, "boom".to_string());
     assert_eq!(span2.status, SpanStatus::Error);
     assert_eq!(span2.error_message.as_deref(), Some("boom"));
@@ -186,7 +187,7 @@ fn span_finalize_ok_and_error() {
 #[test]
 fn span_to_snapshot_encodes_ids_as_hex() {
     let w = w3c();
-    let span = RequestSpan::new("r".to_string(), &w, "m".to_string(), "/p".to_string(), true, 1_000);
+    let span = RequestSpan::new("r".to_string(), &w, "m".to_string(), "/p".to_string(), true, 1_000, true);
     let snap = span.to_snapshot();
     assert_eq!(snap.request_id, "r");
     assert_eq!(snap.trace_id, w.trace_id_hex());
@@ -222,6 +223,7 @@ async fn registry_start_finalize_ok_lands_in_recent() {
         "/p".to_string(),
         false,
         1_000_000_000,
+        true,
     );
     assert_eq!(reg.active_count(), 1);
     reg.finalize_ok("req-1", 2_000_000_000);
@@ -241,7 +243,7 @@ async fn registry_start_finalize_ok_lands_in_recent() {
 async fn registry_finalize_error_bumps_counter() {
     let reg = enabled_registry().await;
     let w = w3c();
-    let _span = reg.start_request("req-2".to_string(), &w, "m".to_string(), "/p".to_string(), false, 1_000);
+    let _span = reg.start_request("req-2".to_string(), &w, "m".to_string(), "/p".to_string(), false, 1_000, true);
     reg.finalize_error("req-2", 2_000, "boom".to_string());
     let snap = reg.snapshot().await;
     assert_eq!(snap.total_spans_error, 1);
@@ -266,7 +268,7 @@ async fn registry_finalize_unknown_is_noop() {
 async fn registry_with_span_mut() {
     let reg = enabled_registry().await;
     let w = w3c();
-    let _span = reg.start_request("r".to_string(), &w, "m".to_string(), "/p".to_string(), false, 100);
+    let _span = reg.start_request("r".to_string(), &w, "m".to_string(), "/p".to_string(), false, 100, true);
     let set = reg.with_span_mut("r", |s| {
         s.set_attribute("k", SpanAttributeValue::Int(42));
         s.deployment_id = Some("d1".to_string());

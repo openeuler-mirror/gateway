@@ -63,6 +63,7 @@ fn make_span(req_id: &str) -> RequestSpan {
         "/v1/chat/completions".to_string(),
         false,
         1_000_000_000,
+        true,
     );
     span.finalize_ok(2_000_000_000);
     span
@@ -396,6 +397,7 @@ fn convert_span_maps_ids_status_and_attributes() {
         "/v1/chat/completions".into(),
         true,
         1_000_000_000,
+        true,
     );
     span.set_deployment_id("dep-7".into());
     span.trace_state = "vendor=1".to_string();
@@ -454,7 +456,7 @@ fn convert_span_maps_ids_status_and_attributes() {
 
     // 零 parent → 空 parent_span_id
     let w3c_zero = parse_traceparent(TP_ZERO_PARENT).unwrap();
-    let span_zero = RequestSpan::new("r-z".into(), &w3c_zero, "m".into(), "/p".into(), false, 0);
+    let span_zero = RequestSpan::new("r-z".into(), &w3c_zero, "m".into(), "/p".into(), false, 0, true);
     let rs_zero = convert_span_to_resource_spans(&span_zero, &empty_resource());
     assert!(rs_zero.scope_spans[0].spans[0].parent_span_id.is_empty());
     // Unset 状态 + 无 deployment/trace_state 属性
@@ -463,7 +465,7 @@ fn convert_span_maps_ids_status_and_attributes() {
     assert!(attr(&rs_zero, "boom-gateway.trace_state").is_none());
 
     // Error 状态 → code 2 + message
-    let mut span_err = RequestSpan::new("r-e".into(), &w3c, "m".into(), "/p".into(), false, 0);
+    let mut span_err = RequestSpan::new("r-e".into(), &w3c, "m".into(), "/p".into(), false, 0, true);
     span_err.finalize_error(9, "boom".into());
     let rs_err = convert_span_to_resource_spans(&span_err, &empty_resource());
     let st = rs_err.scope_spans[0].spans[0].status.as_ref().unwrap();
@@ -475,7 +477,7 @@ fn convert_span_maps_ids_status_and_attributes() {
 #[test]
 fn convert_span_carries_resource_metadata() {
     let w3c = parse_traceparent(TP).unwrap();
-    let span = RequestSpan::new("r".into(), &w3c, "m".into(), "/p".into(), false, 0);
+    let span = RequestSpan::new("r".into(), &w3c, "m".into(), "/p".into(), false, 0, true);
 
     let mut res = empty_resource();
     res.attributes.push(opentelemetry_proto::tonic::common::v1::KeyValue {
