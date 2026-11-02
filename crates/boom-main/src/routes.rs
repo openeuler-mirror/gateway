@@ -4764,12 +4764,26 @@ fn sse_responses_extractor() -> impl FnMut(&Result<SseItem, Infallible>) -> Opti
                     content: v.get("delta").and_then(|d| d.as_str()).map(String::from),
                     finish_reason: None,
                     usage: None,
+                    error: None,
                 }),
                 "response.function_call_arguments.delta" => Some(ChunkDelta {
                     content: v.get("delta").and_then(|d| d.as_str()).map(String::from),
                     finish_reason: None,
                     usage: None,
+                    error: None,
                 }),
+                // Mid-stream upstream failure: the failed terminal carries an
+                // error object — surface it as the failure sentinel so the
+                // wrapper logs 5xx + the error code instead of the
+                // CLIENT_DISCONNECTED mislabel (same class as the completed/
+                // incomplete fix above).
+                "response.failed" => {
+                    let error = v
+                        .pointer("/response/error")
+                        .cloned()
+                        .filter(|e| !e.is_null());
+                    Some(ChunkDelta { content: None, finish_reason: None, usage: None, error })
+                }
                 // Terminal events must surface a finish_reason — otherwise
                 // PromptLogStream never marks StreamEnd::Finished and every
                 // completed /v1/responses stream logs 499 CLIENT_DISCONNECTED
@@ -4784,6 +4798,7 @@ fn sse_responses_extractor() -> impl FnMut(&Result<SseItem, Infallible>) -> Opti
                         content: None,
                         finish_reason: Some("stop".to_string()),
                         usage,
+                        error: None,
                     })
                 }
                 "response.incomplete" => {
@@ -4798,7 +4813,7 @@ fn sse_responses_extractor() -> impl FnMut(&Result<SseItem, Infallible>) -> Opti
                         .and_then(|r| r.as_str())
                         .map(String::from)
                         .map(|r| if r == "max_output_tokens" { "length".to_string() } else { r });
-                    Some(ChunkDelta { content: None, finish_reason: reason, usage })
+                    Some(ChunkDelta { content: None, finish_reason: reason, usage, error: None })
                 }
                 _ => None,
             }
@@ -4864,7 +4879,7 @@ fn sse_raw_data_extractor() -> impl FnMut(&Result<SseItem, Infallible>) -> Optio
                 .and_then(|f| f.as_str())
                 .map(|s| s.to_string());
             let usage = v.get("usage").cloned();
-            Some(ChunkDelta { content, finish_reason, usage })
+            Some(ChunkDelta { content, finish_reason, usage, error: None })
         }
         Err(_) => None,
     }
@@ -4934,6 +4949,7 @@ fn sse_anthropic_extractor() -> impl FnMut(&Result<SseItem, Infallible>) -> Opti
                         content: Some(content),
                         finish_reason: None,
                         usage: None,
+                        error: None,
                     })
                 }
                 "message_delta" => {
@@ -4955,11 +4971,13 @@ fn sse_anthropic_extractor() -> impl FnMut(&Result<SseItem, Infallible>) -> Opti
                             content: Some(c),
                             finish_reason: stop_reason,
                             usage,
+                            error: None,
                         }),
                         (_, Some(_), _) | (_, _, Some(_)) => Some(ChunkDelta {
                             content: None,
                             finish_reason: stop_reason,
                             usage,
+                            error: None,
                         }),
                         _ => None,
                     }
@@ -4977,6 +4995,7 @@ fn sse_anthropic_extractor() -> impl FnMut(&Result<SseItem, Infallible>) -> Opti
                             content: None,
                             finish_reason: None,
                             usage,
+                            error: None,
                         })
                     } else {
                         None

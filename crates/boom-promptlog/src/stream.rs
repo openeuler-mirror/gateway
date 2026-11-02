@@ -9,10 +9,14 @@ use tokio::time::Instant;
 
 /// What the stream wrapper accumulated when it ended. `Finished` means the
 /// upstream sent a terminal chunk with `finish_reason`; `Truncated` means the
-/// stream ended without one (timeout / client disconnect / upstream error).
+/// stream ended without one (timeout / client disconnect); `Failed` means the
+/// producer surfaced an in-stream failure sentinel (Responses
+/// `response.failed` — mid-stream upstream error) — logged as 5xx with the
+/// sentinel's error code, never the 499 CLIENT_DISCONNECTED mislabel.
 enum StreamEnd {
     Finished,
     Truncated,
+    Failed,
 }
 
 /// Per-chunk delta extracted by a producer-supplied closure. The closure is
@@ -26,6 +30,11 @@ pub struct ChunkDelta {
     /// `usage` object from the final chunk (OpenAI streams it on the last
     /// data event; Anthropic sends a separate `message_delta` with `usage`).
     pub usage: Option<serde_json::Value>,
+    /// In-stream failure sentinel (e.g. Responses `response.failed` event
+    /// payload's `error` object). When set, the stream ended in an upstream
+    /// FAILURE — the wrapper logs 5xx + the error code on Drop, regardless
+    /// of any terminal marker seen before it.
+    pub error: Option<serde_json::Value>,
 }
 
 /// Stream wrapper that accumulates streaming chunks into a single assembled
@@ -56,6 +65,8 @@ pub struct PromptLogStream<S, F> {
     /// Whether we saw a terminal chunk (finish_reason set or stream ended
     /// cleanly). Determines `error_code` on Drop.
     end_state: Option<StreamEnd>,
+    /// The failure sentinel payload when `end_state` is `Failed`.
+    stream_error: Option<serde_json::Value>,
     /// Extracts ChunkDelta from a stream item. Returns `None` for non-data
     /// events (e.g. comment lines in Anthropic SSE).
     delta_fn: F,
@@ -82,6 +93,7 @@ impl<S, F> PromptLogStream<S, F> {
             finish_reason: None,
             usage: None,
             end_state: None,
+            stream_error: None,
             delta_fn,
             entry_enricher: None,
         }
@@ -132,6 +144,21 @@ impl<S, F> Drop for PromptLogStream<S, F> {
 
         let (status, error_code_opt) = match &self.end_state {
             Some(StreamEnd::Finished) => (200, None),
+            // Mid-stream upstream failure surfaced in-stream (Responses
+            // response.failed; other providers may use the sentinel too):
+            // 5xx + the sentinel's error code — same vocabulary as the
+            // producer-side error path, never 499 CLIENT_DISCONNECTED and
+            // never a bogus 200.
+            Some(StreamEnd::Failed) => {
+                let code = self
+                    .stream_error
+                    .as_ref()
+                    .and_then(|e| e.get("code"))
+                    .and_then(|c| c.as_str())
+                    .map(|c| c.to_uppercase())
+                    .unwrap_or_else(|| error_code::UPSTREAM_ERROR.to_string());
+                (502, Some(code))
+            }
             // Truncated = upstream ended without a terminal chunk OR client
             // disconnected. We can't reliably tell which from inside Drop, so
             // we surface CLIENT_DISCONNECTED as the conservative read — the
@@ -193,6 +220,14 @@ where
                     if let Some(usage) = delta.usage {
                         this.usage = Some(usage);
                     }
+                    if let Some(err) = delta.error {
+                        if this.stream_error.is_none() {
+                            this.stream_error = Some(err);
+                            // A failure sentinel overrides any earlier terminal
+                            // marker — the stream is dead either way.
+                            this.end_state = Some(StreamEnd::Failed);
+                        }
+                    }
                 }
                 Poll::Ready(Some(item))
             }
@@ -240,6 +275,7 @@ mod tests {
         content: Option<String>,
         finish_reason: Option<String>,
         usage: Option<serde_json::Value>,
+        error: Option<serde_json::Value>,
     }
 
     fn extractor(c: &FakeChunk) -> Option<ChunkDelta> {
@@ -247,6 +283,7 @@ mod tests {
             content: c.content.clone(),
             finish_reason: c.finish_reason.clone(),
             usage: c.usage.clone(),
+            error: c.error.clone(),
         })
     }
 
@@ -255,12 +292,13 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let req = make_request_entry("req-1");
         let chunks = vec![
-            FakeChunk { content: Some("Hello".to_string()), finish_reason: None, usage: None },
-            FakeChunk { content: Some(", world".to_string()), finish_reason: None, usage: None },
+            FakeChunk { content: Some("Hello".to_string()), finish_reason: None, usage: None, error: None },
+            FakeChunk { content: Some(", world".to_string()), finish_reason: None, usage: None, error: None },
             FakeChunk {
                 content: None,
                 finish_reason: Some("stop".to_string()),
                 usage: Some(serde_json::json!({"prompt_tokens": 5, "completion_tokens": 3})),
+                error: None,
             },
         ];
         let s = stream::iter(chunks);
@@ -283,7 +321,7 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let req = make_request_entry("req-2");
         let chunks = vec![
-            FakeChunk { content: Some("partial".to_string()), finish_reason: None, usage: None },
+            FakeChunk { content: Some("partial".to_string()), finish_reason: None, usage: None, error: None },
             // No terminal chunk — stream just ends.
         ];
         let s = stream::iter(chunks);
@@ -302,6 +340,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn in_stream_failure_sentinel_logs_upstream_error_not_499() {
+        // Mid-stream upstream failure (Responses response.failed): the
+        // sentinel must win over both truncation (499 mislabel) and any
+        // terminal marker (bogus 200) — 502 + the sentinel's code.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let req = make_request_entry("req-fail");
+        let chunks = vec![
+            FakeChunk { content: Some("partial ".to_string()), finish_reason: None, usage: None, error: None },
+            FakeChunk { content: Some("answer".to_string()), finish_reason: None, usage: None, error: None },
+            FakeChunk {
+                content: None,
+                finish_reason: None,
+                usage: None,
+                error: Some(serde_json::json!({ "code": "upstream_error", "message": "connection reset" })),
+            },
+        ];
+        let s = stream::iter(chunks);
+        let mut wrapper = PromptLogStream::new(s, tx, req, extractor);
+        while let Some(_) = wrapper.next().await {}
+        drop(wrapper);
+        let entry = rx.recv().await.expect("entry sent");
+        assert_eq!(entry.phase, LogPhase::Response);
+        assert_eq!(entry.status_code, Some(502));
+        assert_eq!(entry.error_code.as_deref(), Some("UPSTREAM_ERROR"));
+        let resp = entry.response.expect("response set");
+        assert_eq!(resp["choices"][0]["message"]["content"], "partial answer");
+    }
+
+    #[tokio::test]
+    async fn failure_sentinel_overrides_earlier_finish_reason() {
+        // The sentinel arrives AFTER a terminal marker (producers may emit
+        // both when a stream degrades late) — failure wins.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let req = make_request_entry("req-fail2");
+        let chunks = vec![
+            FakeChunk { content: Some("x".to_string()), finish_reason: Some("stop".to_string()), usage: None, error: None },
+            FakeChunk { content: None, finish_reason: None, usage: None,
+                error: Some(serde_json::json!({ "code": "upstream_timeout" })) },
+        ];
+        let s = stream::iter(chunks);
+        let mut wrapper = PromptLogStream::new(s, tx, req, extractor);
+        while let Some(_) = wrapper.next().await {}
+        drop(wrapper);
+        let entry = rx.recv().await.expect("entry sent");
+        assert_eq!(entry.status_code, Some(502));
+        assert_eq!(entry.error_code.as_deref(), Some("UPSTREAM_TIMEOUT"));
+    }
+
+    #[tokio::test]
     async fn dropped_without_draining_records_truncation() {
         // A wrapper that's dropped before any chunks are consumed should be
         // treated as truncated (we never saw a terminal marker).
@@ -311,6 +398,7 @@ mod tests {
             content: Some("partial".to_string()),
             finish_reason: None,
             usage: None,
+            error: None,
         }];
         let s = stream::iter(chunks);
         let _wrapper = PromptLogStream::new(s, tx, req, extractor);
