@@ -124,7 +124,7 @@ impl<S, F> Drop for PromptLogStream<S, F> {
         // final assistant text without replaying chunks. Wrap in `Arc` so
         // the same allocation can be shared with `boom_trace::RequestSpan`'s
         // `boom-gateway.llm_response` attribute (single-source-of-truth).
-        let response = Arc::new(serde_json::json!({
+        let mut response = serde_json::json!({
             "id": req_entry.request_id,
             "object": "chat.completion",
             "model": req_entry.model,
@@ -137,7 +137,14 @@ impl<S, F> Drop for PromptLogStream<S, F> {
                 "finish_reason": self.finish_reason.clone(),
             }],
             "usage": self.usage.clone(),
-        }));
+        });
+        if let Some(err) = &self.stream_error {
+            // The failure sentinel rides on the assembled response so the
+            // provider's original code/message stay diagnosable even though
+            // error_code is normalized for statistics.
+            response["error"] = err.clone();
+        }
+        let response = Arc::new(response);
 
         let mut entry = PromptLogEntry::new_response_from(&req_entry);
         entry.set_response(response);
@@ -150,14 +157,17 @@ impl<S, F> Drop for PromptLogStream<S, F> {
             // producer-side error path, never 499 CLIENT_DISCONNECTED and
             // never a bogus 200.
             Some(StreamEnd::Failed) => {
+                // Same (status, error_code) rules as the non-stream error
+                // path (see error_code::from_stream_sentinel): timeout →
+                // 504/TIMEOUT, everything else merged → 502/UPSTREAM_ERROR.
                 let code = self
                     .stream_error
                     .as_ref()
                     .and_then(|e| e.get("code"))
                     .and_then(|c| c.as_str())
-                    .map(|c| c.to_uppercase())
-                    .unwrap_or_else(|| error_code::UPSTREAM_ERROR.to_string());
-                (502, Some(code))
+                    .unwrap_or("");
+                let (status, normalized) = error_code::from_stream_sentinel(code);
+                (status, Some(normalized))
             }
             // Truncated = upstream ended without a terminal chunk OR client
             // disconnected. We can't reliably tell which from inside Drop, so
@@ -377,15 +387,41 @@ mod tests {
         let chunks = vec![
             FakeChunk { content: Some("x".to_string()), finish_reason: Some("stop".to_string()), usage: None, error: None },
             FakeChunk { content: None, finish_reason: None, usage: None,
-                error: Some(serde_json::json!({ "code": "upstream_timeout" })) },
+                error: Some(serde_json::json!({ "code": "timeout" })) },
         ];
         let s = stream::iter(chunks);
         let mut wrapper = PromptLogStream::new(s, tx, req, extractor);
         while let Some(_) = wrapper.next().await {}
         drop(wrapper);
         let entry = rx.recv().await.expect("entry sent");
-        assert_eq!(entry.status_code, Some(502));
-        assert_eq!(entry.error_code.as_deref(), Some("UPSTREAM_TIMEOUT"));
+        assert_eq!(entry.status_code, Some(504));
+        assert_eq!(entry.error_code.as_deref(), Some("TIMEOUT"));
+    }
+
+    #[tokio::test]
+    async fn provider_reported_codes_merge_to_upstream_error() {
+        // Non-stream rules merge UpstreamError/ProviderError/UpstreamParseError
+        // into UPSTREAM_ERROR — the stream sentinel must not split that class
+        // (nor admit provider vocab like server_error/overloaded_error).
+        for code in ["provider_error", "upstream_parse_error", "server_error", "overloaded_error"] {
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let req = make_request_entry("req-merge");
+            let chunks = vec![FakeChunk {
+                content: None,
+                finish_reason: None,
+                usage: None,
+                error: Some(serde_json::json!({ "code": code, "message": "boom" })),
+            }];
+            let s = stream::iter(chunks);
+            let mut wrapper = PromptLogStream::new(s, tx, req, extractor);
+            while let Some(_) = wrapper.next().await {}
+            drop(wrapper);
+            let entry = rx.recv().await.expect("entry sent");
+            assert_eq!(entry.status_code, Some(502), "code {code}");
+            assert_eq!(entry.error_code.as_deref(), Some("UPSTREAM_ERROR"), "code {code}");
+            let resp = entry.response.expect("response set");
+            assert_eq!(resp["error"]["code"], code, "original code preserved on the response");
+        }
     }
 
     #[tokio::test]

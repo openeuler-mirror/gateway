@@ -4813,7 +4813,14 @@ fn sse_responses_extractor() -> impl FnMut(&Result<SseItem, Infallible>) -> Opti
                         .and_then(|r| r.as_str())
                         .map(String::from)
                         .map(|r| if r == "max_output_tokens" { "length".to_string() } else { r });
-                    Some(ChunkDelta { content: None, finish_reason: reason, usage, error: None })
+                    // incomplete IS terminal even without a reason — default
+                    // to "length" so the wrapper marks Finished, not Truncated.
+                    Some(ChunkDelta {
+                        content: None,
+                        finish_reason: Some(reason.unwrap_or_else(|| "length".to_string())),
+                        usage,
+                        error: None,
+                    })
                 }
                 _ => None,
             }
@@ -4867,6 +4874,23 @@ fn sse_raw_data_extractor() -> impl FnMut(&Result<SseItem, Infallible>) -> Optio
                 Ok(v) => v,
                 Err(_) => return None,
             };
+            // In-stream error event ({"error": {...}}, no choices/finish/usage):
+            // surface as the failure sentinel — otherwise the stream ends
+            // marker-less and Drop mislabels a real upstream failure as 499
+            // CLIENT_DISCONNECTED.
+            if v.get("error").is_some_and(serde_json::Value::is_object) {
+                let err = &v["error"];
+                return Some(ChunkDelta {
+                    content: None,
+                    finish_reason: None,
+                    usage: None,
+                    error: Some(serde_json::json!({
+                        "code": err.get("type").or_else(|| err.get("code"))
+                            .and_then(|c| c.as_str()).unwrap_or("upstream_error"),
+                        "message": err.get("message").and_then(|m| m.as_str()).unwrap_or(""),
+                    })),
+                });
+            }
             let choices = v.get("choices").and_then(|c| c.as_array());
             let first_choice = choices.and_then(|c| c.first());
             let delta = first_choice.and_then(|c| c.get("delta"));
@@ -4919,6 +4943,20 @@ fn sse_anthropic_extractor() -> impl FnMut(&Result<SseItem, Infallible>) -> Opti
             };
             let chunk_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
             match chunk_type {
+                // Anthropic mid-stream error event: surface as the failure
+                // sentinel (same mislabel fix as the chat/responses paths).
+                "error" => {
+                    let err = v.get("error").cloned().unwrap_or_else(|| serde_json::json!({}));
+                    Some(ChunkDelta {
+                        content: None,
+                        finish_reason: None,
+                        usage: None,
+                        error: Some(serde_json::json!({
+                            "code": err.get("type").and_then(|t| t.as_str()).unwrap_or("upstream_error"),
+                            "message": err.get("message").and_then(|m| m.as_str()).unwrap_or(""),
+                        })),
+                    })
+                }
                 "content_block_delta" => {
                     let delta = v.get("delta");
                     let delta_type = delta
