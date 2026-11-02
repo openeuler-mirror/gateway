@@ -47,6 +47,7 @@ fn auth_identity() -> AuthIdentity {
         rpm_limit: None,
         tpm_limit: None,
         max_budget: None,
+        budget_period_secs: None,
         spend: 0.0,
         blocked: false,
         expires_at: None,
@@ -947,7 +948,8 @@ fn auth_identity_is_expired() {
     assert!(!id.is_expired()); // 未来 → false
 }
 
-/// DT-CORE-49：is_budget_exceeded — None 不超；spend >= budget → true；< → false。
+/// DT-CORE-49：is_budget_exceeded — None 不超；spend >= budget → true；< → false；
+/// max_budget <= 0 视为不限制。
 #[test]
 fn auth_identity_is_budget_exceeded() {
     let mut id = auth_identity();
@@ -963,6 +965,17 @@ fn auth_identity_is_budget_exceeded() {
 
     id.spend = 150.0;
     assert!(id.is_budget_exceeded());
+
+    // max_budget = 0 / 负数 → 不限制，零消费新 key 不应被拦截。
+    id.max_budget = Some(0.0);
+    id.spend = 0.0;
+    assert!(!id.is_budget_exceeded());
+    id.spend = 10.0;
+    assert!(!id.is_budget_exceeded());
+
+    id.max_budget = Some(-1.0);
+    id.spend = 0.0;
+    assert!(!id.is_budget_exceeded());
 }
 
 // ═════════════════════════════════════════════════════════════

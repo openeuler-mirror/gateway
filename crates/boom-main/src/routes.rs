@@ -788,6 +788,8 @@ async fn chat_completions_inner(
         &resolved_model_for_quota,
         effective_rpm,
         effective_tpm,
+        identity.max_budget,
+        identity.budget_period_secs,
         &window_limits,
         weight,
     )
@@ -2659,6 +2661,8 @@ async fn check_plan_limits(
     resolved_model: &str,
     rpm_limit: Option<u64>,
     tpm_limit: Option<u64>,
+    max_budget: Option<f64>,
+    budget_period_secs: Option<u64>,
     window_limits: &[boom_core::types::WindowLimit],
     weight: u64,
 ) -> Result<PlanCharge, GatewayError> {
@@ -2675,6 +2679,36 @@ async fn check_plan_limits(
     // window_limits came from the global rate_limit config; rpm_limit/tpm_limit
     // are per-key (already merged with global defaults at the call site).
     if key_plan.is_none() && team_plan.is_none() {
+        let key_scope = QuotaScope::Key {
+            key_hash: key_hash.to_string(),
+        };
+
+        // ── Per-key max_budget (legacy spend cap) ──
+        // Fallback-only, like rpm/tpm: a key's own limits apply only when no
+        // plan (key or team) governs the request, so we never stack a second
+        // cost cap on top of a plan's total_cost_limit/cost windows.
+        //
+        // The token row's `spend` column is never updated per request, so the
+        // auth-time `is_budget_exceeded()` check never trips; enforce against
+        // the live cumulative counter instead — the same counter the dashboard
+        // shows as `spend`. A zero budget follows the same "0 = no limit"
+        // convention as rpm/tpm, and a `budget_duration` scopes the counter to
+        // the current period so the cap resets on its own.
+        if let Some(budget) = max_budget {
+            if budget.is_finite() && budget > 0.0 {
+                let budget_micros = (budget * 1_000_000.0).round() as i64;
+                let spent_micros = match budget_period_secs.filter(|secs| *secs > 0) {
+                    Some(period_secs) => {
+                        limiter.peek_budget_period_cost_micros(&key_scope, period_secs)
+                    }
+                    None => limiter.peek_cumulative(&key_scope, CumulativeKind::TotalCost),
+                } as i64;
+                if spent_micros >= budget_micros {
+                    return Err(GatewayError::BudgetExceeded);
+                }
+            }
+        }
+
         let mut legacy_windows: Vec<boom_core::types::WindowLimit> = window_limits.to_vec();
         fold_rpm_tpm_into_60s(&mut legacy_windows, rpm_limit, tpm_limit);
 
@@ -2694,9 +2728,6 @@ async fn check_plan_limits(
         }
 
         let cost_rate = state.deployment_store.get_cost_rate(resolved_model);
-        let key_scope = QuotaScope::Key {
-            key_hash: key_hash.to_string(),
-        };
         return Ok(PlanCharge {
             limiter: limiter.clone(),
             key: rl_key,
@@ -3199,6 +3230,8 @@ pub async fn messages(
         &resolved_model_for_quota,
         effective_rpm,
         effective_tpm,
+        identity.max_budget,
+        identity.budget_period_secs,
         &window_limits,
         weight,
     )
@@ -4043,6 +4076,8 @@ pub async fn responses(
         &resolved_model_for_quota,
         effective_rpm,
         effective_tpm,
+        identity.max_budget,
+        identity.budget_period_secs,
         &window_limits,
         weight,
     )

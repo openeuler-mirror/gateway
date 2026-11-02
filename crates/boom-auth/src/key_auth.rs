@@ -155,9 +155,16 @@ impl DbAuthenticator {
             team_alias: None, // resolved later in authenticate()
             models: token.models,
             team_models: vec![], // resolved later in authenticate()
-            rpm_limit: token.rpm_limit.map(|v| v as u64),
-            tpm_limit: token.tpm_limit.map(|v| v as u64),
-            max_budget: token.max_budget,
+            // Legacy rows may hold negative values from before write-time
+            // validation existed; treat them as "no limit" instead of casting
+            // to a huge u64 (which silently disabled the limit).
+            rpm_limit: token.rpm_limit.filter(|v| *v >= 0).map(|v| v as u64),
+            tpm_limit: token.tpm_limit.filter(|v| *v >= 0).map(|v| v as u64),
+            max_budget: token.max_budget.filter(|b| b.is_finite() && *b >= 0.0),
+            budget_period_secs: token
+                .budget_duration
+                .as_deref()
+                .and_then(boom_core::types::parse_budget_duration_secs),
             spend: token.spend,
             blocked: token.blocked.unwrap_or(false),
             expires_at: token.expires,
@@ -229,6 +236,7 @@ impl Authenticator for DbAuthenticator {
                 rpm_limit: None,
                 tpm_limit: None,
                 max_budget: None,
+                budget_period_secs: None,
                 spend: 0.0,
                 blocked: false,
                 expires_at: None,
