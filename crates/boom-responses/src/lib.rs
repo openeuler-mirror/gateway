@@ -51,7 +51,9 @@ pub struct PersistTurn {
     /// inherited set when the client omitted them).
     pub tools: Option<Vec<Value>>,
     pub items: Vec<Value>,
-    /// "completed" | "incomplete" (callers skip failed turns).
+    /// "completed" | "incomplete" | "failed" — every client-visible id is
+    /// checkpointed: failed turns hand the id out in response.failed, and an
+    /// unpersisted id makes the next previous_response_id 404.
     pub status: String,
     /// The final ResponseObject, served verbatim by GET /v1/responses/{id}.
     pub response_json: Value,

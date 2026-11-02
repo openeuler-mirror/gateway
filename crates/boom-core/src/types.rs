@@ -502,6 +502,12 @@ pub struct ChatCompletionResponse {
     pub created: u64,
     #[serde(default, deserialize_with = "lenient::string_lenient")]
     pub model: String,
+    /// Usage-only / non-standard upstreams (e.g. nemotron-class vLLM) can
+    /// answer 200 WITHOUT `choices` — same leniency as the stream side
+    /// (StreamChoice comment below): default to empty instead of failing
+    /// the whole parse with a 502. Empty output surfaces downstream (empty
+    /// response output / empty chat completion), never as a parse error.
+    #[serde(default)]
     pub choices: Vec<Choice>,
     /// None = upstream did not report usage (non-standard backend). Token
     /// accounting (audit log, quota settle, KV hit rate) is then skipped

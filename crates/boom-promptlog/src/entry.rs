@@ -110,6 +110,19 @@ pub struct PromptLogEntry {
 /// a migration. Keep this list in sync with `boom_core::GatewayError` variants.
 pub mod error_code {
     pub const CLIENT_DISCONNECTED: &str = "CLIENT_DISCONNECTED";
+    /// Normalize an in-stream failure sentinel's code to the SAME
+    /// (status, error_code) pair the non-stream error path records:
+    /// `timeout` → 504/TIMEOUT; every other upstream/provider failure
+    /// (upstream_error / provider_error / upstream_parse_error, plus
+    /// provider-reported error types like server_error / overloaded_error)
+    /// → 502/UPSTREAM_ERROR, merged — per-code statistics must not split
+    /// the same failure class across paths.
+    pub fn from_stream_sentinel(code: &str) -> (i32, String) {
+        match code {
+            "timeout" => (504, TIMEOUT.to_string()),
+            _ => (502, UPSTREAM_ERROR.to_string()),
+        }
+    }
     pub const UPSTREAM_ERROR: &str = "UPSTREAM_ERROR";
     pub const TIMEOUT: &str = "TIMEOUT";
     pub const MODEL_NOT_ALLOWED: &str = "MODEL_NOT_ALLOWED";

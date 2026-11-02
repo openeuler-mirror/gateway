@@ -4250,8 +4250,23 @@ pub async fn responses(
                 crate::health_monitor::record_request_failure(&state, &deployment_id, &e);
                 // plan_charge drops here without commit — no quota consumed.
                 // response.created was already promised on the wire (Response.md
-                // §6.5 rule 2), so the failure is delivered in-stream.
-                return Ok(responses_failed_sse_response(&model, &response_id, created_at, &e));
+                // §6.5 rule 2), so the failure is delivered in-stream. The
+                // failed turn is STILL checkpointed — the client chains on the
+                // id carried by response.failed (real-LLM chain-break trap:
+                // an unpersisted id makes the next previous_response_id 404).
+                let (failed_resp, final_obj) =
+                    responses_failed_sse(&model, &response_id, created_at, &e);
+                if let Some(ctx) = persist_ctx {
+                    let turn = ctx.into_turn("failed", Vec::new(), final_obj);
+                    if let Err(persist_err) = state.response_store.persist_turn(turn).await {
+                        tracing::warn!(
+                            response_id = %response_id,
+                            error = %persist_err,
+                            "responses store persist failed (failed turn) — next previous_response_id will 404"
+                        );
+                    }
+                }
+                return Ok(failed_resp);
             }
         };
         let _decision = plan_charge.commit();
@@ -4507,9 +4522,11 @@ pub async fn responses(
 /// upstream errors become in-stream response.failed; the stream always ends
 /// on a terminal event with no `[DONE]` sentinel.
 ///
-/// P1: after the terminal event the completed turn is checkpointed (the
-/// transcoder owns the final output items). A client disconnect before the
-/// terminal event returns early — a cancelled generation is not persisted.
+/// P1: after the terminal event the turn is checkpointed (the transcoder
+/// owns the final output items) — including failed turns and client
+/// disconnects: `response.created` hands the id out on the wire, and every
+/// client-visible id must land in the store or the next
+/// previous_response_id 404s with an id the gateway itself minted.
 fn sse_stream_from_responses_chat_stream(
     stream: ChatStream,
     model: String,
@@ -4524,6 +4541,10 @@ fn sse_stream_from_responses_chat_stream(
     tokio::spawn(async move {
         let mut transcoder = ResponsesStreamTranscoder::new(&model, &response_id, created_at);
         let mut stream = std::pin::pin!(stream);
+        // NO early return may skip the persist tail. `client_gone` marks a
+        // mid-stream disconnect: close items locally (events discarded) so
+        // the turn still reaches a terminal status and gets checkpointed.
+        let mut client_gone = false;
 
         for ev in transcoder.begin() {
             let item = SseItem {
@@ -4531,66 +4552,89 @@ fn sse_stream_from_responses_chat_stream(
                 json_data: ev.data,
             };
             if tx.send(item).await.is_err() {
-                return;
+                client_gone = true;
+                break;
             }
         }
 
-        while let Some(result) = stream.next().await {
-            match result {
-                Ok(chunk) => {
-                    if let Some(ref u) = chunk.usage {
-                        if let Ok(mut g) = usage.lock() {
-                            g.prompt_tokens = u.prompt_tokens;
-                            g.completion_tokens = u.completion_tokens;
-                            g.cached_tokens = u
-                                .prompt_tokens_details
-                                .as_ref()
-                                .and_then(|d| d.cached_tokens)
-                                .map(|c| c as i32);
+        if !client_gone {
+            while let Some(result) = stream.next().await {
+                match result {
+                    Ok(chunk) => {
+                        if let Some(ref u) = chunk.usage {
+                            if let Ok(mut g) = usage.lock() {
+                                g.prompt_tokens = u.prompt_tokens;
+                                g.completion_tokens = u.completion_tokens;
+                                g.cached_tokens = u
+                                    .prompt_tokens_details
+                                    .as_ref()
+                                    .and_then(|d| d.cached_tokens)
+                                    .map(|c| c as i32);
+                            }
+                        }
+                        for ev in transcoder.transcode(&chunk) {
+                            let item = SseItem {
+                                event: Event::default().event(&ev.event).data(&ev.data),
+                                json_data: ev.data,
+                            };
+                            if tx.send(item).await.is_err() {
+                                client_gone = true;
+                                break;
+                            }
+                        }
+                        if client_gone {
+                            break;
                         }
                     }
-                    for ev in transcoder.transcode(&chunk) {
-                        let item = SseItem {
-                            event: Event::default().event(&ev.event).data(&ev.data),
-                            json_data: ev.data,
-                        };
-                        if tx.send(item).await.is_err() {
-                            return;
+                    Err(e) => {
+                        tracing::error!("SSE stream error (Responses): {}", e);
+                        for ev in transcoder.fail(&e) {
+                            let item = SseItem {
+                                event: Event::default().event(&ev.event).data(&ev.data),
+                                json_data: ev.data,
+                            };
+                            let _ = tx.send(item).await;
                         }
+                        break; // failed terminal — fall through to the persist tail
                     }
-                }
-                Err(e) => {
-                    tracing::error!("SSE stream error (Responses): {}", e);
-                    for ev in transcoder.fail(&e) {
-                        let item = SseItem {
-                            event: Event::default().event(&ev.event).data(&ev.data),
-                            json_data: ev.data,
-                        };
-                        let _ = tx.send(item).await;
-                    }
-                    return;
                 }
             }
         }
 
-        for ev in transcoder.drain() {
-            let item = SseItem {
-                event: Event::default().event(&ev.event).data(&ev.data),
-                json_data: ev.data,
-            };
-            if tx.send(item).await.is_err() {
-                return;
+        if !client_gone {
+            for ev in transcoder.drain() {
+                let item = SseItem {
+                    event: Event::default().event(&ev.event).data(&ev.data),
+                    json_data: ev.data,
+                };
+                if tx.send(item).await.is_err() {
+                    client_gone = true;
+                    break;
+                }
             }
+        } else {
+            // Client vanished after response.created exposed the id — the
+            // checkpoint must still exist (the events themselves are moot).
+            let _ = transcoder.drain();
         }
 
-        // Terminal event sent — checkpoint the turn (completed/incomplete only).
+        // Terminal event sent — checkpoint the turn. Failed turns are
+        // checkpointed too: the client was handed this round's id in the
+        // response.failed event, so the id MUST stay resolvable — otherwise
+        // the next previous_response_id 404s with an id the gateway itself
+        // returned (the real-LLM chain-break trap).
         if let (Some(ctx), Some(final_obj)) = (persist, transcoder.final_response_object()) {
             let status = final_obj["status"].as_str().unwrap_or_default().to_string();
-            if status == "completed" || status == "incomplete" {
+            if status == "completed" || status == "incomplete" || status == "failed" {
+                let response_id = ctx.response_id.clone();
                 let output_items = final_obj["output"].as_array().cloned().unwrap_or_default();
                 let turn = ctx.into_turn(&status, output_items, final_obj.clone());
                 if let Err(e) = store.persist_turn(turn).await {
-                    tracing::warn!("responses store persist failed (stream): {e}");
+                    tracing::warn!(
+                        response_id = %response_id,
+                        error = %e,
+                        "responses store persist failed (stream) — next previous_response_id will 404"
+                    );
                 }
             }
         }
@@ -4602,17 +4646,23 @@ fn sse_stream_from_responses_chat_stream(
 /// Full SSE body for "created already promised, upstream call failed": an
 /// in-stream response.failed per Response.md §6.5 rule 2. HTTP 200 — the SSE
 /// stream has started, so the failure must not surface as a late HTTP error.
-fn responses_failed_sse_response(
+/// Also returns the final failed Response object so the caller can checkpoint
+/// the turn (the client chains on this id).
+fn responses_failed_sse(
     model: &str,
     response_id: &str,
     created_at: u64,
     e: &GatewayError,
-) -> axum::response::Response {
+) -> (axum::response::Response, serde_json::Value) {
     let mut transcoder = ResponsesStreamTranscoder::new(model, response_id, created_at);
     let mut body = String::new();
     for ev in transcoder.begin().into_iter().chain(transcoder.fail(e)) {
         body.push_str(&format!("event: {}\ndata: {}\n\n", ev.event, ev.data));
     }
+    let final_obj = transcoder
+        .final_response_object()
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({ "id": response_id, "status": "failed" }));
     let mut response = body.into_response();
     response.headers_mut().insert(
         axum::http::header::CONTENT_TYPE,
@@ -4622,7 +4672,7 @@ fn responses_failed_sse_response(
         axum::http::header::CACHE_CONTROL,
         "no-cache".parse().unwrap(),
     );
-    response
+    (response, final_obj)
 }
 
 // ============================================================
@@ -4744,18 +4794,63 @@ fn sse_responses_extractor() -> impl FnMut(&Result<SseItem, Infallible>) -> Opti
                     content: v.get("delta").and_then(|d| d.as_str()).map(String::from),
                     finish_reason: None,
                     usage: None,
+                    error: None,
                 }),
                 "response.function_call_arguments.delta" => Some(ChunkDelta {
                     content: v.get("delta").and_then(|d| d.as_str()).map(String::from),
                     finish_reason: None,
                     usage: None,
+                    error: None,
                 }),
-                "response.completed" | "response.incomplete" => {
+                // Mid-stream upstream failure: the failed terminal carries an
+                // error object — surface it as the failure sentinel so the
+                // wrapper logs 5xx + the error code instead of the
+                // CLIENT_DISCONNECTED mislabel (same class as the completed/
+                // incomplete fix above).
+                "response.failed" => {
+                    let error = v
+                        .pointer("/response/error")
+                        .cloned()
+                        .filter(|e| !e.is_null());
+                    Some(ChunkDelta { content: None, finish_reason: None, usage: None, error })
+                }
+                // Terminal events must surface a finish_reason — otherwise
+                // PromptLogStream never marks StreamEnd::Finished and every
+                // completed /v1/responses stream logs 499 CLIENT_DISCONNECTED
+                // (the conservative mislabel; full content+usage was right
+                // there in the entry).
+                "response.completed" => {
                     let usage = v
                         .pointer("/response/usage")
                         .cloned()
                         .filter(|u| !u.is_null());
-                    Some(ChunkDelta { content: None, finish_reason: None, usage })
+                    Some(ChunkDelta {
+                        content: None,
+                        finish_reason: Some("stop".to_string()),
+                        usage,
+                        error: None,
+                    })
+                }
+                "response.incomplete" => {
+                    let usage = v
+                        .pointer("/response/usage")
+                        .cloned()
+                        .filter(|u| !u.is_null());
+                    // Map the Responses incomplete reason onto the chat
+                    // finish_reason vocabulary (max_output_tokens → length).
+                    let reason = v
+                        .pointer("/response/incomplete_details/reason")
+                        .and_then(|r| r.as_str())
+                        .map(String::from)
+                        .map(|r| if r == "max_output_tokens" { "length".to_string() } else { r });
+                    // incomplete IS terminal even without a reason — default
+                    // to "length" so the wrapper marks Finished, not Truncated.
+                    Some(ChunkDelta {
+                        content: None,
+                        finish_reason: Some(reason.unwrap_or_else(|| "length".to_string())),
+                        usage,
+                        error: None,
+                    })
                 }
                 _ => None,
             }
@@ -4809,6 +4904,23 @@ fn sse_raw_data_extractor() -> impl FnMut(&Result<SseItem, Infallible>) -> Optio
                 Ok(v) => v,
                 Err(_) => return None,
             };
+            // In-stream error event ({"error": {...}}, no choices/finish/usage):
+            // surface as the failure sentinel — otherwise the stream ends
+            // marker-less and Drop mislabels a real upstream failure as 499
+            // CLIENT_DISCONNECTED.
+            if v.get("error").is_some_and(serde_json::Value::is_object) {
+                let err = &v["error"];
+                return Some(ChunkDelta {
+                    content: None,
+                    finish_reason: None,
+                    usage: None,
+                    error: Some(serde_json::json!({
+                        "code": err.get("type").or_else(|| err.get("code"))
+                            .and_then(|c| c.as_str()).unwrap_or("upstream_error"),
+                        "message": err.get("message").and_then(|m| m.as_str()).unwrap_or(""),
+                    })),
+                });
+            }
             let choices = v.get("choices").and_then(|c| c.as_array());
             let first_choice = choices.and_then(|c| c.first());
             let delta = first_choice.and_then(|c| c.get("delta"));
@@ -4821,7 +4933,7 @@ fn sse_raw_data_extractor() -> impl FnMut(&Result<SseItem, Infallible>) -> Optio
                 .and_then(|f| f.as_str())
                 .map(|s| s.to_string());
             let usage = v.get("usage").cloned();
-            Some(ChunkDelta { content, finish_reason, usage })
+            Some(ChunkDelta { content, finish_reason, usage, error: None })
         }
         Err(_) => None,
     }
@@ -4861,6 +4973,20 @@ fn sse_anthropic_extractor() -> impl FnMut(&Result<SseItem, Infallible>) -> Opti
             };
             let chunk_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
             match chunk_type {
+                // Anthropic mid-stream error event: surface as the failure
+                // sentinel (same mislabel fix as the chat/responses paths).
+                "error" => {
+                    let err = v.get("error").cloned().unwrap_or_else(|| serde_json::json!({}));
+                    Some(ChunkDelta {
+                        content: None,
+                        finish_reason: None,
+                        usage: None,
+                        error: Some(serde_json::json!({
+                            "code": err.get("type").and_then(|t| t.as_str()).unwrap_or("upstream_error"),
+                            "message": err.get("message").and_then(|m| m.as_str()).unwrap_or(""),
+                        })),
+                    })
+                }
                 "content_block_delta" => {
                     let delta = v.get("delta");
                     let delta_type = delta
@@ -4891,6 +5017,7 @@ fn sse_anthropic_extractor() -> impl FnMut(&Result<SseItem, Infallible>) -> Opti
                         content: Some(content),
                         finish_reason: None,
                         usage: None,
+                        error: None,
                     })
                 }
                 "message_delta" => {
@@ -4912,11 +5039,13 @@ fn sse_anthropic_extractor() -> impl FnMut(&Result<SseItem, Infallible>) -> Opti
                             content: Some(c),
                             finish_reason: stop_reason,
                             usage,
+                            error: None,
                         }),
                         (_, Some(_), _) | (_, _, Some(_)) => Some(ChunkDelta {
                             content: None,
                             finish_reason: stop_reason,
                             usage,
+                            error: None,
                         }),
                         _ => None,
                     }
@@ -4934,6 +5063,7 @@ fn sse_anthropic_extractor() -> impl FnMut(&Result<SseItem, Infallible>) -> Opti
                             content: None,
                             finish_reason: None,
                             usage,
+                            error: None,
                         })
                     } else {
                         None
