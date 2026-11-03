@@ -219,12 +219,14 @@ fn build_router(state: AppState) -> Router {
         // Alias routes (without /v1 prefix — OpenAI client compatibility)
         .route("/chat/completions", post(routes::chat_completions))
         .route("/completions", post(routes::completions))
+        .route("/responses", post(routes::responses))
         .layer(axum::middleware::from_fn(extractor::buffer_request_body));
 
     let api_routes = Router::new()
         .route("/v1/models", get(routes::list_models))
         .route("/v1/models/{id}", get(routes::get_model))
         .route("/v1/responses/{id}", get(routes::get_response))
+        .route("/responses/{id}", get(routes::get_response))
         .route("/models", get(routes::list_models))
         .route("/models/{id}", get(routes::get_model))
         // Unsupported endpoints (return proper errors)
@@ -265,6 +267,11 @@ fn build_router(state: AppState) -> Router {
     // Returns Router<()> — state injected via Extension<Arc<DashboardState>>.
     let inner = state.inner.load();
     let master_key = inner.config.general_settings.master_key.clone();
+    let dashboard_session_secret = inner
+        .config
+        .general_settings
+        .dashboard_session_secret
+        .clone();
     let key_alias_lookup = inner.key_alias_lookup.clone();
     drop(inner);
 
@@ -284,6 +291,7 @@ fn build_router(state: AppState) -> Router {
         state.flow_controller.clone(),
         admin_tx,
         master_key,
+        dashboard_session_secret,
         state.debug_store.clone(),
         state.prompt_log_query.clone(),
         state.rebalance_move_tracker.clone(),
@@ -315,7 +323,7 @@ fn build_router(state: AppState) -> Router {
                 let path = req.uri().path();
                 if path.starts_with("/v1/") || path.starts_with("/admin/")
                     || path.starts_with("/chat/") || path.starts_with("/completions")
-                    || path.starts_with("/models")
+                    || path.starts_with("/responses") || path.starts_with("/models")
                 {
                     count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }

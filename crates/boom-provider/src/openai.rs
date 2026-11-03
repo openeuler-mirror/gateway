@@ -329,8 +329,27 @@ impl Provider for OpenAIProvider {
                 }
             }
         } else {
-            match serde_json::from_str(parse_input) {
-                Ok(parsed) => parsed,
+            match serde_json::from_str::<ChatCompletionResponse>(parse_input) {
+                Ok(parsed) => {
+                    // Lenient defaults (choices-missing nemotron bodies) made
+                    // SHAPELESS bodies parse as all-default Ok — a body with
+                    // no recognizable completion field at all is still a
+                    // parse failure carrying the raw bytes.
+                    if parsed.id.is_empty()
+                        && parsed.object.is_empty()
+                        && parsed.choices.is_empty()
+                        && parsed.usage.is_none()
+                    {
+                        tracing::error!(
+                            "OpenAI response has no recognizable completion fields"
+                        );
+                        return Err(GatewayError::UpstreamParseError {
+                            parse_error: "no recognizable completion fields".to_string(),
+                            raw_body: raw_text,
+                        });
+                    }
+                    parsed
+                }
                 Err(e) => {
                     tracing::error!("Failed to parse OpenAI response: {}", e);
                     return Err(GatewayError::UpstreamParseError {
@@ -416,6 +435,35 @@ impl Provider for OpenAIProvider {
                         if data.is_empty() || data == "[DONE]" {
                             continue;
                         }
+                        // In-stream error event ({"error": {...}}, no choices):
+                        // the lenient chunk parse would swallow it as an empty
+                        // chunk and the failure would surface only as a
+                        // marker-less stream end (prompt-log 499 mislabel).
+                        // Surface it as a stream error instead — every path
+                        // downstream already knows how to render Err.
+                        let parsed_error = if data.starts_with('{') {
+                            serde_json::from_str::<serde_json::Value>(data)
+                                .ok()
+                                .and_then(|v| {
+                                    v.get("error")
+                                        .filter(|e| e.is_object())
+                                        .and_then(|e| {
+                                            e.get("message").and_then(|m| m.as_str()).map(String::from)
+                                        })
+                                })
+                        } else {
+                            None
+                        };
+                        if let Some(msg) = parsed_error {
+                            let msg =
+                                msg; // Upstream error frame: surface as stream error (see comment above).
+                            let _ = tx
+                                .send(Err(GatewayError::ProviderError(format!(
+                                    "Upstream in-stream error: {msg}"
+                                ))))
+                                .await;
+                            return;
+                        }
                         match serde_json::from_str::<ChatStreamChunk>(data) {
                             Ok(mut chunk) => {
                                 chunk.raw_data = Some(data.to_string());
@@ -448,6 +496,29 @@ impl Provider for OpenAIProvider {
                             }
                             if data == "[DONE]" {
                                 let _ = tx.send(Ok(None)).await;
+                                return;
+                            }
+                            let parsed_error = if data.starts_with('{') {
+                                serde_json::from_str::<serde_json::Value>(data)
+                                    .ok()
+                                    .and_then(|v| {
+                                        v.get("error")
+                                            .filter(|e| e.is_object())
+                                            .and_then(|e| {
+                                                e.get("message").and_then(|m| m.as_str()).map(String::from)
+                                            })
+                                    })
+                            } else {
+                                None
+                            };
+                            if let Some(msg) = parsed_error {
+                                let msg =
+                                    msg; // Upstream error frame: surface as stream error (see comment above).
+                                let _ = tx
+                                    .send(Err(GatewayError::ProviderError(format!(
+                                        "Upstream in-stream error: {msg}"
+                                    ))))
+                                    .await;
                                 return;
                             }
                             match serde_json::from_str::<ChatStreamChunk>(data) {
@@ -896,7 +967,11 @@ mod tests {
         let err = provider.chat(request_with_headers(&[])).await.unwrap_err();
         match err {
             GatewayError::UpstreamParseError { parse_error, raw_body } => {
-                assert!(parse_error.contains("missing field"), "unexpected parse error: {parse_error}");
+                assert!(
+                    parse_error.contains("missing field")
+                        || parse_error.contains("no recognizable completion fields"),
+                    "unexpected parse error: {parse_error}"
+                );
                 assert_eq!(raw_body, body);
             }
             other => panic!("expected UpstreamParseError, got: {other:?}"),

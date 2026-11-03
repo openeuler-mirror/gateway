@@ -108,6 +108,12 @@ general_settings:
   master_key: os.environ/MASTER_KEY
   # PostgreSQL 连接串（litellm DB；env bootstrap 模式取 BOOM_DATABASE_URL）
   database_url: os.environ/DATABASE_URL
+  # Dashboard session JWT 签名密钥（可选）。必须与 master_key 不同，
+  # 否则持有 master_key 的人可离线伪造 admin 会话；与 master_key 相同时
+  # 会打 warn（不阻断启动）。建议至少 32 字符（不足仅打 warn）。不配则每次
+  # 启动随机生成（重启后会话失效、多副本之间不共享）。env bootstrap 模式取
+  # BOOM_DASHBOARD_SESSION_SECRET。
+  dashboard_session_secret: os.environ/DASHBOARD_SESSION_SECRET
   # 已废弃：store_model_in_db（v2 双模式开关）不再有任何作用，残留值被忽略
 
 # ──────────────────────────────────────────────

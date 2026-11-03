@@ -1113,8 +1113,9 @@ impl AppState {
     /// disk (including `${VAR}` secret references — see `read_raw_yaml`).
     ///
     /// Env-bootstrap mode has no file to preserve: the root is synthesized
-    /// from the live process config, with master_key/database_url written as
-    /// `${BOOM_*}` env references for a clean round-trip.
+    /// from the live process config, with master_key/database_url/
+    /// dashboard_session_secret written as `${BOOM_*}` env references for a
+    /// clean round-trip.
     ///
     /// Shared pipeline for the export button (returns the string, no file
     /// touched) and the write-back button (writes it to the startup file
@@ -1419,6 +1420,12 @@ fn synthesize_bootstrap_root(config: &Config) -> Result<serde_yaml::Value, Strin
         }
         if config.general_settings.database_url.is_some() {
             gs.insert("database_url".into(), "${BOOM_DATABASE_URL}".into());
+        }
+        if config.general_settings.dashboard_session_secret.is_some() {
+            gs.insert(
+                "dashboard_session_secret".into(),
+                "${BOOM_DASHBOARD_SESSION_SECRET}".into(),
+            );
         }
     }
 
@@ -2676,7 +2683,7 @@ mod merge_runtime_sections_tests {
         // Built the same way bootstrap_from_env builds it — via the serde
         // path, so field defaults match the real env-bootstrap state.
         let config: boom_config::Config = serde_yaml::from_str(
-            "general_settings:\n  master_key: sk-live\n  database_url: postgres://u:p@h/db\n",
+            "general_settings:\n  master_key: sk-live\n  database_url: postgres://u:p@h/db\n  dashboard_session_secret: sk-session-live\n",
         )
         .expect("parse config");
 
@@ -2690,6 +2697,10 @@ mod merge_runtime_sections_tests {
         assert_eq!(
             gs.get(&Value::String("database_url".into())),
             Some(&Value::String("${BOOM_DATABASE_URL}".into()))
+        );
+        assert_eq!(
+            gs.get(&Value::String("dashboard_session_secret".into())),
+            Some(&Value::String("${BOOM_DASHBOARD_SESSION_SECRET}".into()))
         );
         assert!(
             !root

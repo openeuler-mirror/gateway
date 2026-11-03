@@ -89,6 +89,133 @@ fn validate_prefix_and_tag(req: &CreateKeyRequest) -> Option<Response> {
     None
 }
 
+/// Validate the numeric limit fields shared by the create/update/batch paths.
+///
+/// Negative RPM/TPM are nonsensical and get silently cast to a huge `u64` at
+/// auth time (effectively disabling the limit), while a negative or non-finite
+/// `max_budget` can never be a meaningful spend cap. A malformed
+/// `budget_duration` would silently degrade to a lifetime budget at auth time.
+/// Reject all of them up front so bad admin input is a 400 instead of corrupt
+/// or silently-ignored quota state.
+fn validate_key_limits(
+    rpm_limit: Option<i64>,
+    tpm_limit: Option<i64>,
+    max_budget: Option<f64>,
+    budget_duration: Option<&str>,
+) -> Result<(), String> {
+    if let Some(v) = rpm_limit {
+        if v < 0 {
+            return Err("Invalid rpm_limit: must be >= 0".to_string());
+        }
+    }
+    if let Some(v) = tpm_limit {
+        if v < 0 {
+            return Err("Invalid tpm_limit: must be >= 0".to_string());
+        }
+    }
+    if let Some(v) = max_budget {
+        if !v.is_finite() || v < 0.0 {
+            return Err("Invalid max_budget: must be a finite number >= 0".to_string());
+        }
+    }
+    // An empty string is the dashboard's "clear this field" signal, so only
+    // non-blank values are format-checked.
+    if let Some(raw) = budget_duration {
+        if !raw.trim().is_empty()
+            && boom_core::types::parse_budget_duration_secs(raw).is_none()
+        {
+            return Err(
+                "Invalid budget_duration: expected <n><s|m|h|d|w>, e.g. 30d".to_string()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Reject the dead-config combination: `max_budget > 0` on a key that a plan
+/// (explicit assignment, default-plan fallback, or team plan) will govern.
+/// Runtime policy is fallback-only — the budget would never execute, and the
+/// admin would set a cap that silently does nothing. Same reject-up-front
+/// spirit as [`validate_key_limits`].
+fn budget_plan_conflict(
+    plan_store: &boom_limiter::PlanStore,
+    max_budget: Option<f64>,
+    plan_name: &Option<Option<String>>,
+    team_id: Option<&str>,
+) -> Option<String> {
+    let budget = max_budget.filter(|b| b.is_finite() && *b > 0.0)?;
+    let plan_governed = match plan_name {
+        // Explicit "no plan" → no key-layer plan; team layer still counts.
+        Some(None) => false,
+        // Explicit assignment → governed.
+        Some(Some(_)) => true,
+        // Field absent → default_plan fallback governs when one exists.
+        None => plan_store.get_default_plan_name().is_some(),
+    } || team_id
+        .filter(|t| !t.is_empty())
+        .and_then(|t| plan_store.resolve_team_plan(t))
+        .is_some();
+    plan_governed.then(|| {
+        format!(
+            "max_budget ({budget}) conflicts with a governing plan: the runtime policy is \
+             fallback-only, so a plan-governed key's budget never executes. \
+             Move the cap into the plan's cost limits, or clear the plan/team assignment."
+        )
+    })
+}
+
+/// Current stored `max_budget` for a key (update payloads use COALESCE
+/// semantics — an absent field leaves the stored value in force).
+async fn state_key_budget(db_pool: &sqlx::PgPool, token_hash: &str) -> Option<f64> {
+    sqlx::query_scalar::<_, Option<f64>>(
+        r#"SELECT max_budget FROM "boom_verification_token" WHERE token = $1"#,
+    )
+    .bind(token_hash)
+    .fetch_one(db_pool)
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Current stored `team_id` for a key (None row → None; NULL column → None).
+async fn state_key_team(db_pool: &sqlx::PgPool, token_hash: &str) -> Option<String> {
+    sqlx::query_scalar::<_, Option<String>>(
+        r#"SELECT team_id FROM "boom_verification_token" WHERE token = $1"#,
+    )
+    .bind(token_hash)
+    .fetch_one(db_pool)
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Best-effort rollback for a token row inserted during creation when the
+/// follow-up plan assignment fails. Keeping the row would leave the key with
+/// no rate-limiting plan while the API reports an error — the silently
+/// unlimited state this module must not produce.
+///
+/// Returns `true` when the row is gone (deleted now or already absent) and
+/// `false` when the DELETE failed. Callers must surface the `false` case:
+/// the orphan token is still a valid, unlimited key and needs manual cleanup.
+async fn rollback_inserted_key(pool: &sqlx::PgPool, token_hash: &str) -> bool {
+    match sqlx::query(r#"DELETE FROM "boom_verification_token" WHERE token = $1"#)
+        .bind(token_hash)
+        .execute(pool)
+        .await
+    {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::error!(
+                token_hash = %token_hash,
+                "Failed to roll back key after plan assignment failure — \
+                 an orphan token remains and must be deleted manually: {}",
+                e
+            );
+            false
+        }
+    }
+}
+
 // ═══════════════════════════════════════════════════════════
 // Plan management (delegated to PlanStore)
 // ═══════════════════════════════════════════════════════════
@@ -624,6 +751,26 @@ pub async fn list_keys(
             let total_cost = rust_decimal::Decimal::from(total_cost_micros)
                 / rust_decimal::Decimal::from(1_000_000);
 
+            // Budget-scope-aligned spend: the enforcement path charges the
+            // PERIOD counter when budget_duration is set (total − baseline)
+            // and the lifetime cumulative otherwise. Surfacing that exact
+            // number keeps the displayed spend comparable to max_budget —
+            // lifetime spend vs a period cap was apples-to-oranges.
+            let (budget_period_spend, budget_scope) = r
+                .budget_duration
+                .as_deref()
+                .and_then(boom_core::types::parse_budget_duration_secs)
+                .map(|secs| {
+                    let micros = state.limiter.peek_budget_period_cost_micros(
+                        &boom_limiter::QuotaScope::Key { key_hash: r.token.clone() },
+                        secs,
+                    );
+                    let d = rust_decimal::Decimal::from(micros)
+                        / rust_decimal::Decimal::from(1_000_000);
+                    (d.to_string(), format!("period({raw})", raw = r.budget_duration.clone().unwrap_or_default()))
+                })
+                .unwrap_or_else(|| (total_cost.to_string(), "lifetime".to_string()));
+
             json!({
                 "token_prefix": token_prefix,
                 "token_hash": r.token,
@@ -636,6 +783,9 @@ pub async fn list_keys(
                 "models": r.models,
                 "spend": total_cost.to_string(),
                 "total_cost": total_cost.to_string(),
+                "budget_scope": budget_scope,
+                "budget_period_spend": budget_period_spend,
+                "max_budget": r.max_budget,
                 "blocked": r.blocked.unwrap_or(false),
                 "rpm_limit": r.rpm_limit,
                 "tpm_limit": r.tpm_limit,
@@ -757,12 +907,42 @@ pub async fn create_key(
         return resp;
     }
 
+    // 0a. Reject negative / non-finite numeric limits and malformed durations.
+    if let Err(msg) = validate_key_limits(
+        req.rpm_limit,
+        req.tpm_limit,
+        req.max_budget,
+        req.budget_duration.as_deref(),
+    ) {
+        return (StatusCode::BAD_REQUEST, msg).into_response();
+    }
+
+    // 0b. Reject a budget that a governing plan would silently disable.
+    if let Some(msg) = budget_plan_conflict(
+        &state.plan_store,
+        req.max_budget,
+        &req.plan_name,
+        req.team_id.as_deref(),
+    ) {
+        return (StatusCode::BAD_REQUEST, msg).into_response();
+    }
+
     // 1. Generate raw key + token hash + optional prefix metadata.
     //    Prefixed keys hash only the secret portion; legacy keys hash the
     //    whole raw_key so old DB rows remain matchable.
     let (raw_key, token_hash, key_prefix) = generate_key_material(req.key_prefix.as_deref());
 
-    // 1b. Check key_alias dedup (if provided).
+    // 1b. Validate the requested plan BEFORE the INSERT using the exact same
+    //     rules the assignment path applies (plan exists + not type=team).
+    //     Delegating to PlanStore prevents this pre-check from drifting out
+    //     of sync when assignment-side rules change.
+    if let Some(Some(ref plan_name)) = req.plan_name {
+        if let Err(msg) = state.plan_store.validate_plan_for_key(plan_name, &token_hash) {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response();
+        }
+    }
+
+    // 1c. Check key_alias dedup (if provided).
     if let Some(ref alias) = req.key_alias {
         let exists: bool = sqlx::query_scalar(
             r#"SELECT EXISTS(SELECT 1 FROM "boom_verification_token" WHERE key_alias = $1)"#,
@@ -832,6 +1012,11 @@ pub async fn create_key(
     //    - Some(Some(name))→ row with plan_name = name
     //    Skip DB write when the explicit assignment is the same as default_plan:
     //    no row needed; default fallback already yields the right plan at runtime.
+    //
+    //    The token row is already committed at this point. Any assignment
+    //    failure (e.g. the plan was deleted between validation and here, or a
+    //    DB error) must NOT be left as a warning: roll the token back so we
+    //    never hand out a key without the requested rate-limiting plan.
     match req.plan_name {
         None => {}
         Some(None) => {
@@ -840,7 +1025,24 @@ pub async fn create_key(
                 .assign_key_no_plan_db(db_pool, &token_hash)
                 .await
             {
-                tracing::warn!("Key created but 'no plan' assignment failed: {}", e);
+                tracing::error!("'No plan' assignment failed, rolling back key: {}", e);
+                let rolled_back = rollback_inserted_key(db_pool, &token_hash).await;
+                let msg = if rolled_back {
+                    format!(
+                        "Key creation failed: could not persist 'no plan' assignment: {}", e
+                    )
+                } else {
+                    format!(
+                        "Key creation failed: could not persist 'no plan' assignment: {}; \
+                         rollback failed, orphan token '{}' must be deleted manually",
+                        e, token_hash
+                    )
+                };
+                let mut body = json!({ "error": msg });
+                if !rolled_back {
+                    body["rollback_failed"] = json!(true);
+                }
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response();
             }
         }
         Some(Some(ref plan_name)) => {
@@ -852,7 +1054,28 @@ pub async fn create_key(
                 state.plan_store.assign_key_db(db_pool, &token_hash, plan_name).await
             };
             if let Err(e) = result {
-                tracing::warn!("Key created but plan assignment failed: {}", e);
+                tracing::error!(
+                    plan = %plan_name,
+                    "Plan assignment failed, rolling back key: {}",
+                    e
+                );
+                let rolled_back = rollback_inserted_key(db_pool, &token_hash).await;
+                let msg = if rolled_back {
+                    format!(
+                        "Key creation failed: could not assign plan '{}': {}", plan_name, e
+                    )
+                } else {
+                    format!(
+                        "Key creation failed: could not assign plan '{}': {}; \
+                         rollback failed, orphan token '{}' must be deleted manually",
+                        plan_name, e, token_hash
+                    )
+                };
+                let mut body = json!({ "error": msg });
+                if !rolled_back {
+                    body["rollback_failed"] = json!(true);
+                }
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response();
             }
         }
     }
@@ -931,6 +1154,53 @@ pub async fn update_key(
                 format!("Invalid tag: length must be <= {} chars", MAX_TAG_LEN),
             )
                 .into_response();
+        }
+    }
+
+    // Reject negative / non-finite numeric limits and malformed durations
+    // (same rule as create).
+    if let Err(msg) = validate_key_limits(
+        req.rpm_limit,
+        req.tpm_limit,
+        req.max_budget,
+        req.budget_duration.as_deref(),
+    ) {
+        return (StatusCode::BAD_REQUEST, msg).into_response();
+    }
+
+    // Same budget/plan exclusivity as create, resolved against the key's
+    // EFFECTIVE config: an update may set a budget on a key that a plan (or
+    // its new team) already governs. COALESCE semantics mean req.max_budget
+    // None can still leave a stored budget in force — resolve the row's
+    // current values first (the UPDATE body is built below from req + row).
+    {
+        // Only police edits that TOUCH the conflict axes — a pre-existing
+        // dead-config key must still be renamable/unblockable (the runtime
+        // warn covers it); rejecting every edit would lock legacy keys.
+        let budget_touched = req.max_budget.is_some_and(|b| b > 0.0);
+        let team_touched = req.team_id.as_deref().is_some_and(|t| !t.is_empty());
+        if !budget_touched && !team_touched {
+            {} // fall through: unrelated-field edits pass
+        } else {
+        let effective_budget = req
+            .max_budget
+            .or(state_key_budget(&db_pool, &token_hash).await);
+        let effective_team = match req.team_id.as_deref() {
+            // Some("") clears the team — no team layer for the conflict check.
+            Some("") => None,
+            // Some(team) reassigns; None keeps the stored value.
+            Some(_) => req.team_id.clone(),
+            None => state_key_team(&db_pool, &token_hash).await,
+        };
+        let explicit_3state = state.plan_store.get_plan_name_explicit(&token_hash);
+        if let Some(msg) = budget_plan_conflict(
+            &state.plan_store,
+            effective_budget,
+            &explicit_3state,
+            effective_team.as_deref(),
+        ) {
+            return (StatusCode::BAD_REQUEST, msg).into_response();
+        }
         }
     }
 
@@ -1264,6 +1534,21 @@ pub async fn assign_key(
     Extension(state): Extension<std::sync::Arc<DashboardState>>,
     Json(req): Json<AssignRequest>,
 ) -> Response {
+    // Assigning a plan to a budgeted key creates the dead-config combo the
+    // create/update paths reject — same rule here.
+    if let (Some(db_pool), Some(Some(_))) = (&state.db_pool, &req.plan_name) {
+        let budget = state_key_budget(db_pool, &req.key_hash).await;
+        let team = state_key_team(db_pool, &req.key_hash).await;
+        if let Some(msg) = budget_plan_conflict(
+            &state.plan_store,
+            budget,
+            &req.plan_name,
+            team.as_deref(),
+        ) {
+            return (axum::http::StatusCode::BAD_REQUEST, msg).into_response();
+        }
+    }
+
     // For backward compat: callers that send a non-null plan_name route to
     // assign_key_db. Sending null routes to assign_key_no_plan_db. Sending
     // the field absent is a no-op (legacy callers always include it).
@@ -1326,11 +1611,43 @@ pub struct AssignTeamRequest {
     pub plan_name: String,
 }
 
+/// Reject assigning a team plan when member keys carry a live budget — the
+/// fallback-only policy would silently disable every one of them (same rule
+/// as the per-key paths, applied at the team layer).
+async fn team_has_budgeted_members(db_pool: &sqlx::PgPool, team_id: &str) -> i64 {
+    sqlx::query_scalar::<_, i64>(
+        r#"SELECT COUNT(*) FROM "boom_verification_token"
+            WHERE team_id = $1 AND max_budget IS NOT NULL AND max_budget > 0"#,
+    )
+    .bind(team_id)
+    .fetch_one(db_pool)
+    .await
+    .unwrap_or(0)
+}
+
 pub async fn assign_team_plan(
     _session: AdminSession,
     Extension(state): Extension<std::sync::Arc<DashboardState>>,
     Json(req): Json<AssignTeamRequest>,
 ) -> Response {
+    // Team-plan assignment governs every member key at once — a member with
+    // its own budget would become dead config in bulk (per-key paths reject
+    // the same combo individually).
+    if let Some(ref pool) = state.db_pool {
+        let budgeted = team_has_budgeted_members(pool, &req.team_id).await;
+        if budgeted > 0 {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                format!(
+                    "team '{}' has {} member key(s) with max_budget set; the fallback-only \
+                     policy would silently ignore those budgets under a team plan. \
+                     Clear the member budgets or move the caps into the plan.",
+                    req.team_id, budgeted
+                ),
+            )
+                .into_response();
+        }
+    }
     if let Some(ref pool) = state.db_pool {
         match state
             .plan_store
@@ -1493,7 +1810,34 @@ async fn insert_single_key(
             };
         }
     }
-
+    if validate_key_limits(
+        req.rpm_limit,
+        req.tpm_limit,
+        req.max_budget,
+        req.budget_duration.as_deref(),
+    )
+    .is_err()
+    {
+        return CreateOutcome::Skipped {
+            key_alias: req.key_alias,
+            reason: "invalid_limits",
+        };
+    }
+    // Budget that a governing plan would silently disable (same rule as the
+    // single-create endpoint, reported as a batch skip instead of a 400).
+    if budget_plan_conflict(
+        &state.plan_store,
+        req.max_budget,
+        &req.plan_name,
+        req.team_id.as_deref(),
+    )
+    .is_some()
+    {
+        return CreateOutcome::Skipped {
+            key_alias: req.key_alias,
+            reason: "budget_plan_conflict",
+        };
+    }
     // Dedup check on key_alias.
     if let Some(ref alias) = req.key_alias {
         let exists: bool = sqlx::query_scalar(
@@ -1513,6 +1857,18 @@ async fn insert_single_key(
     }
 
     let (raw_key, token_hash, key_prefix) = generate_key_material(req.key_prefix.as_deref());
+
+    // Reject plans that cannot be assigned to a key (missing or type=team)
+    // before inserting — same rule the assignment path enforces, via the
+    // shared PlanStore validation so the two stay in lockstep.
+    if let Some(Some(ref plan_name)) = req.plan_name {
+        if state.plan_store.validate_plan_for_key(plan_name, &token_hash).is_err() {
+            return CreateOutcome::Skipped {
+                key_alias: req.key_alias,
+                reason: "invalid_plan",
+            };
+        }
+    }
 
     let expires: Option<NaiveDateTime> = req
         .expires
@@ -1552,6 +1908,9 @@ async fn insert_single_key(
     match result {
         Ok(_) => {
             // Plan assignment — 3 states (see CreateKeyRequest::plan_name).
+            // Any failure here must roll the token back: a key without the
+            // requested plan would be silently unlimited, and the row was
+            // already reported as created otherwise.
             match req.plan_name {
                 None => {}
                 Some(None) => {
@@ -1560,7 +1919,12 @@ async fn insert_single_key(
                         .assign_key_no_plan_db(db_pool, &token_hash)
                         .await
                     {
-                        tracing::warn!("Key created but 'no plan' assignment failed: {}", e);
+                        tracing::error!("'No plan' assignment failed, rolling back key: {}", e);
+                        let rolled_back = rollback_inserted_key(db_pool, &token_hash).await;
+                        return CreateOutcome::Skipped {
+                            key_alias: req.key_alias,
+                            reason: if rolled_back { "assignment_failed" } else { "rollback_failed" },
+                        };
                     }
                 }
                 Some(Some(ref plan_name)) => {
@@ -1572,7 +1936,16 @@ async fn insert_single_key(
                         state.plan_store.assign_key_db(db_pool, &token_hash, plan_name).await
                     };
                     if let Err(e) = result {
-                        tracing::warn!("Key created but plan assignment failed: {}", e);
+                        tracing::error!(
+                            plan = %plan_name,
+                            "Plan assignment failed, rolling back key: {}",
+                            e
+                        );
+                        let rolled_back = rollback_inserted_key(db_pool, &token_hash).await;
+                        return CreateOutcome::Skipped {
+                            key_alias: req.key_alias,
+                            reason: if rolled_back { "assignment_failed" } else { "rollback_failed" },
+                        };
                     }
                 }
             }
@@ -1685,7 +2058,6 @@ pub async fn import_keys(
     //    explicit flag in the response noting that the rest were dropped.
     let truncated = parsed_reqs.len() > IMPORT_MAX_ROWS;
     let parsed_total = parsed_reqs.len();
-    let inserted_count = if truncated { IMPORT_MAX_ROWS } else { parsed_total };
     let parsed_reqs = if truncated {
         parsed_reqs.into_iter().take(IMPORT_MAX_ROWS).collect::<Vec<_>>()
     } else {
@@ -1727,7 +2099,7 @@ pub async fn import_keys(
         "file_name": name,
         "format": ext,
         "parsed": parsed_total,
-        "inserted": inserted_count,
+        "inserted": created.len(),
         "truncated": truncated,
         "max_rows": IMPORT_MAX_ROWS,
         "parse_errors": parse_errors,
@@ -4760,9 +5132,27 @@ pub async fn get_prompt_log_entry(
 
 // ═══════════════════════════════════════════════════════════
 // Quota management — team-organized view of cumulative / window
-// counters across all keys & teams. Reads boom_rate_limit_cumulative
-// via SQL JOIN (avoids scanning the whole limiter DashMap).
+// counters across all keys & teams. Cumulative counters are read
+// from the live in-memory limiter (same source as /admin/keys);
+// boom_rate_limit_cumulative is only a 600s snapshot and would lag.
 // ═══════════════════════════════════════════════════════════
+
+/// Live cumulative counters for one quota scope, ordered
+/// `(input tokens, output tokens, total cost micros)`.
+///
+/// Dashboard cumulative views must all use this — reading
+/// `boom_rate_limit_cumulative` directly yields a stale (up to 600s old)
+/// value that disagrees with /admin/keys' `spend` for the same key.
+fn live_cumulative(
+    limiter: &boom_limiter::SlidingWindowLimiter,
+    scope: &boom_limiter::QuotaScope,
+) -> (i64, i64, i64) {
+    (
+        limiter.peek_cumulative(scope, boom_limiter::CumulativeKind::TotalInputTokens) as i64,
+        limiter.peek_cumulative(scope, boom_limiter::CumulativeKind::TotalOutputTokens) as i64,
+        limiter.peek_cumulative(scope, boom_limiter::CumulativeKind::TotalCost) as i64,
+    )
+}
 
 #[derive(Debug, sqlx::FromRow)]
 struct QuotaKeyRow {
@@ -4775,10 +5165,9 @@ struct QuotaKeyRow {
 }
 /// totals, plus a synthetic "no_team" entry for keys without a team.
 ///
-/// GaussDB distributed note: each SELECT is a single-table query. Cross-table
-/// JOINs against `boom_rate_limit_cumulative` fail with "relation does not
-/// exist on datanode" because that table is not distributed. We aggregate in
-/// application memory instead.
+/// GaussDB distributed note: each SELECT is a single-table query (no
+/// cross-table JOINs). Cumulative counters come from the live limiter
+/// rather than `boom_rate_limit_cumulative`, which is a 600s snapshot.
 pub async fn quota_overview(
     _session: AdminSession,
     Extension(state): Extension<std::sync::Arc<DashboardState>>,
@@ -4842,55 +5231,20 @@ pub async fn quota_overview(
         }
     };
 
-    // 4. All cumulative rows. Single-table scan — safe under GaussDB distributed.
-    let cum_rows: Vec<(String, i64)> = match sqlx::query_as(
-        "SELECT cache_key, value FROM boom_rate_limit_cumulative",
-    )
-    .fetch_all(db_pool)
-    .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::error!("quota_overview cumulative query failed: {}", e);
-            return (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                format!("quota_overview cumulative query failed: {e}"),
-            )
-                .into_response();
-        }
-    };
-
-    // Aggregate cumulative by (scope, id) → (tin, tout, tcost).
-    // cache_key format: 'kc:{token}:{kind}' or 'tc:{team_id}:{kind}'.
-    let mut team_cum: std::collections::HashMap<String, (i64, i64, i64)> =
-        std::collections::HashMap::new();
-    let mut key_cum: std::collections::HashMap<String, (i64, i64, i64)> =
-        std::collections::HashMap::new();
-    for (cache_key, value) in &cum_rows {
-        if let Some(rest) = cache_key.strip_prefix("tc:") {
-            if let Some((id, kind)) = rest.rsplit_once(':') {
-                let e = team_cum.entry(id.to_string()).or_insert((0, 0, 0));
-                match kind {
-                    "tin" => e.0 = *value,
-                    "tout" => e.1 = *value,
-                    "tcost" => e.2 = *value,
-                    _ => {}
-                }
-            }
-            continue;
-        }
-        if let Some(rest) = cache_key.strip_prefix("kc:") {
-            if let Some((id, kind)) = rest.rsplit_once(':') {
-                let e = key_cum.entry(id.to_string()).or_insert((0, 0, 0));
-                match kind {
-                    "tin" => e.0 = *value,
-                    "tout" => e.1 = *value,
-                    "tcost" => e.2 = *value,
-                    _ => {}
-                }
-            }
-        }
-    }
+    // 4. Cumulative counters come from the live in-memory limiter (team
+    // scope for team totals, key scope for the no-team rollup) — same source
+    // as /admin/keys and /admin/quota/{team,unassigned}. The DB table
+    // boom_rate_limit_cumulative is only a periodic (600s) snapshot, so
+    // reading it here made overview totals lag the per-key views.
+    let team_cum: std::collections::HashMap<String, (i64, i64, i64)> = team_rows
+        .iter()
+        .map(|(team_id, _, _)| {
+            let scope = boom_limiter::QuotaScope::Team {
+                team_id: team_id.clone(),
+            };
+            (team_id.clone(), live_cumulative(&state.limiter, &scope))
+        })
+        .collect();
 
     // team_id → key_count.
     let mut team_key_count: std::collections::HashMap<String, i64> =
@@ -4911,14 +5265,17 @@ pub async fn quota_overview(
         .cloned()
         .collect();
 
-    // No-team cumulative: sum key_cum for tokens whose team_id IS NULL.
+    // No-team cumulative: sum the live key counters of tokens whose
+    // team_id IS NULL.
     let mut no_team_cum = (0i64, 0i64, 0i64);
     for (token, _) in token_team_rows.iter().filter(|(_, t)| t.is_none()) {
-        if let Some(c) = key_cum.get(token) {
-            no_team_cum.0 += c.0;
-            no_team_cum.1 += c.1;
-            no_team_cum.2 += c.2;
-        }
+        let scope = boom_limiter::QuotaScope::Key {
+            key_hash: token.clone(),
+        };
+        let c = live_cumulative(&state.limiter, &scope);
+        no_team_cum.0 += c.0;
+        no_team_cum.1 += c.1;
+        no_team_cum.2 += c.2;
     }
 
     // team → plan_name lookup (explicit assignments only).
@@ -5090,9 +5447,7 @@ async fn quota_keys_inner(
     // ── Branch on sort mode ──
     // For alias / created_at: SQL-side sort + pagination (cheap, scalable).
     // For cost / tokens: fetch full result set (capped at 5000), look up
-    // cumulative via IN-list single-table query, then sort + slice in memory.
-    // GaussDB distributed mode forbids cross-table JOINs, so the cumulative
-    // lookup has to happen as a separate single-table SELECT regardless.
+    // cumulative from the in-memory limiter, then sort + slice in memory.
     let in_memory_sort = matches!(q.sort.as_deref(), Some("cost") | Some("tokens"));
 
     let mut sort_truncated = false;
@@ -5195,53 +5550,20 @@ async fn quota_keys_inner(
         }
     };
 
-    // Cumulative lookup for these tokens via IN list.
-    // In in-memory-sort mode rows may be up to 5000, so up to 15000 cache_keys.
-    let mut key_cum: std::collections::HashMap<String, (i64, i64, i64)> =
-        std::collections::HashMap::new();
-    if !rows.is_empty() {
-        let cache_keys: Vec<String> = rows
-            .iter()
-            .flat_map(|r| {
-                vec![
-                    format!("kc:{}:tin", r.token),
-                    format!("kc:{}:tout", r.token),
-                    format!("kc:{}:tcost", r.token),
-                ]
-            })
-            .collect();
-        let placeholders: Vec<String> =
-            (1..=cache_keys.len()).map(|i| format!("${i}")).collect();
-        let cum_sql = format!(
-            "SELECT cache_key, value FROM boom_rate_limit_cumulative WHERE cache_key IN ({})",
-            placeholders.join(", ")
-        );
-        let mut cum_query = sqlx::query_as::<_, (String, i64)>(&cum_sql);
-        for ck in &cache_keys {
-            cum_query = cum_query.bind(ck);
-        }
-        match cum_query.fetch_all(db_pool).await {
-            Ok(cum_rows) => {
-                for (cache_key, value) in cum_rows {
-                    if let Some(rest) = cache_key.strip_prefix("kc:") {
-                        if let Some((token, kind)) = rest.rsplit_once(':') {
-                            let e = key_cum.entry(token.to_string()).or_insert((0, 0, 0));
-                            match kind {
-                                "tin" => e.0 = value,
-                                "tout" => e.1 = value,
-                                "tcost" => e.2 = value,
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!("quota_keys_inner cumulative fetch failed: {}", e);
-                // Non-fatal: proceed with zeroed cumulative.
-            }
-        }
-    }
+    // Cumulative counters come from the live in-memory limiter — the same
+    // source /admin/keys and /admin/quota/key/{hash}/windows use. The DB
+    // table boom_rate_limit_cumulative is only a periodic (600s) snapshot,
+    // so reading it here made the quota list report a stale total_cost that
+    // disagreed with /admin/keys' spend for the same key.
+    let key_cum: std::collections::HashMap<String, (i64, i64, i64)> = rows
+        .iter()
+        .map(|r| {
+            let scope = boom_limiter::QuotaScope::Key {
+                key_hash: r.token.clone(),
+            };
+            (r.token.clone(), live_cumulative(&state.limiter, &scope))
+        })
+        .collect();
 
     // In-memory sort + page slice (only for cost/tokens mode).
     let page_rows: Vec<QuotaKeyRow> = if in_memory_sort {
@@ -5574,14 +5896,16 @@ pub async fn quota_reset_key_cumulative(
     };
 
     // Look up the key's team (for rollup subtraction). None if no team.
-    let team_id: Option<String> = match sqlx::query_scalar::<_, String>(
+    // team_id is a nullable column, so decode as Option<String> — otherwise a
+    // NULL value fails to decode into String and the handler returns 500.
+    let team_id: Option<String> = match sqlx::query_scalar::<_, Option<String>>(
         r#"SELECT team_id FROM boom_verification_token WHERE token = $1"#,
     )
     .bind(&key_hash)
     .fetch_optional(db_pool)
     .await
     {
-        Ok(v) => v,
+        Ok(v) => v.flatten(),
         Err(e) => {
             tracing::error!("quota_reset_key_cumulative team lookup failed: {}", e);
             return (
@@ -6435,7 +6759,34 @@ pub async fn ping_trace_otlp_endpoint(
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_pagination, CreateKeyRequest};
+    use super::{normalize_pagination, validate_key_limits, CreateKeyRequest};
+
+    /// Numeric limits must reject negatives / non-finite budgets but accept
+    /// absent values (unlimited) and zero.
+    #[test]
+    fn validate_key_limits_rejects_invalid_values() {
+        assert!(validate_key_limits(None, None, None, None).is_ok());
+        assert!(validate_key_limits(Some(0), Some(0), Some(0.0), None).is_ok());
+        assert!(validate_key_limits(Some(60), Some(1000), Some(12.5), Some("30d")).is_ok());
+        // Empty/blank duration means "clear the field", not invalid input.
+        assert!(validate_key_limits(None, None, None, Some("")).is_ok());
+        assert!(validate_key_limits(None, None, None, Some("   ")).is_ok());
+
+        assert!(validate_key_limits(Some(-1), None, None, None).is_err());
+        assert!(validate_key_limits(None, Some(-1), None, None).is_err());
+        assert!(validate_key_limits(None, None, Some(-0.01), None).is_err());
+        assert!(validate_key_limits(None, None, Some(f64::NAN), None).is_err());
+        assert!(validate_key_limits(None, None, Some(f64::INFINITY), None).is_err());
+
+        // Malformed durations must fail here instead of silently becoming a
+        // lifetime budget at auth time.
+        for raw in ["1mo", "30", "d", "0d", "1.5d"] {
+            assert!(
+                validate_key_limits(None, None, None, Some(raw)).is_err(),
+                "{raw:?} must be rejected"
+            );
+        }
+    }
 
     #[test]
     fn normalize_pagination_clamps_invalid_values() {

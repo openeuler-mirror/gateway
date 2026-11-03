@@ -502,6 +502,12 @@ pub struct ChatCompletionResponse {
     pub created: u64,
     #[serde(default, deserialize_with = "lenient::string_lenient")]
     pub model: String,
+    /// Usage-only / non-standard upstreams (e.g. nemotron-class vLLM) can
+    /// answer 200 WITHOUT `choices` — same leniency as the stream side
+    /// (StreamChoice comment below): default to empty instead of failing
+    /// the whole parse with a 502. Empty output surfaces downstream (empty
+    /// response output / empty chat completion), never as a parse error.
+    #[serde(default)]
     pub choices: Vec<Choice>,
     /// None = upstream did not report usage (non-standard backend). Token
     /// accounting (audit log, quota settle, KV hit rate) is then skipped
@@ -677,6 +683,9 @@ pub struct AuthIdentity {
     pub rpm_limit: Option<u64>,
     pub tpm_limit: Option<u64>,
     pub max_budget: Option<f64>,
+    /// `budget_duration` parsed into seconds (e.g. "30d" → 2592000).
+    /// `None` means the budget is a lifetime cap instead of a per-period one.
+    pub budget_period_secs: Option<u64>,
     pub spend: f64,
     pub blocked: bool,
     pub expires_at: Option<chrono::NaiveDateTime>,
@@ -709,12 +718,41 @@ impl AuthIdentity {
     }
 
     /// Check if the budget is exceeded.
+    ///
+    /// `max_budget <= 0` means "no limit" (same as rpm/tpm), so a freshly
+    /// created key with `max_budget = 0` is never blocked at auth time.
     pub fn is_budget_exceeded(&self) -> bool {
         match self.max_budget {
-            Some(budget) => self.spend >= budget,
-            None => false,
+            Some(budget) if budget > 0.0 => self.spend >= budget,
+            _ => false,
         }
     }
+}
+
+/// Parse a `budget_duration` string into seconds.
+///
+/// Accepted forms are `<positive integer><unit>` where the unit is one of
+/// `s`, `m`, `h`, `d`, `w` (long names such as `day`/`days` also work).
+/// Returns `None` for malformed input, a zero value, or an overflowing
+/// multiplication — a zero-length period would reset the budget on every
+/// request, so it must never be treated as valid.
+pub fn parse_budget_duration_secs(raw: &str) -> Option<u64> {
+    let trimmed = raw.trim();
+    let unit_start = trimmed.find(|c: char| !c.is_ascii_digit())?;
+    let (digits, unit) = trimmed.split_at(unit_start);
+    let value: u64 = digits.parse().ok()?;
+    if value == 0 {
+        return None;
+    }
+    let multiplier = match unit.to_ascii_lowercase().as_str() {
+        "s" | "sec" | "secs" | "second" | "seconds" => 1,
+        "m" | "min" | "mins" | "minute" | "minutes" => 60,
+        "h" | "hr" | "hrs" | "hour" | "hours" => 3_600,
+        "d" | "day" | "days" => 86_400,
+        "w" | "week" | "weeks" => 604_800,
+        _ => return None,
+    };
+    value.checked_mul(multiplier)
 }
 
 // ============================================================
@@ -1066,6 +1104,32 @@ mod header_policy_tests {
         for name in ["x-request-id", "user-agent", "anthropic-beta", "x-custom-header"] {
             assert!(!is_hard_blocked_header(name), "{name} must be allowed");
         }
+    }
+}
+
+#[cfg(test)]
+mod budget_duration_tests {
+    use crate::types::parse_budget_duration_secs;
+
+    #[test]
+    fn parses_supported_units() {
+        assert_eq!(parse_budget_duration_secs("1s"), Some(1));
+        assert_eq!(parse_budget_duration_secs("15m"), Some(900));
+        assert_eq!(parse_budget_duration_secs("12h"), Some(43_200));
+        assert_eq!(parse_budget_duration_secs("7d"), Some(604_800));
+        assert_eq!(parse_budget_duration_secs("2w"), Some(1_209_600));
+        assert_eq!(parse_budget_duration_secs(" 30d "), Some(2_592_000));
+        assert_eq!(parse_budget_duration_secs("1D"), Some(86_400));
+        assert_eq!(parse_budget_duration_secs("2days"), Some(172_800));
+    }
+
+    #[test]
+    fn rejects_invalid_values() {
+        for raw in ["", "d", "30", "0d", "-1d", "1.5d", "1y", "abc", "30 d"] {
+            assert_eq!(parse_budget_duration_secs(raw), None, "{raw:?} must be rejected");
+        }
+        // Multiplication overflow must not wrap into a tiny period.
+        assert_eq!(parse_budget_duration_secs("18446744073709551615w"), None);
     }
 }
 

@@ -49,6 +49,12 @@ pub enum CumulativeKind {
     TotalCachedInputCost,
     /// Output token cost.
     TotalOutputCost,
+    /// Epoch seconds when the current `max_budget` period started (internal,
+    /// not user-visible spend). 0 means "no period started yet".
+    BudgetPeriodStart,
+    /// Lifetime total cost (micros) captured at `BudgetPeriodStart`, used to
+    /// derive the spend accrued inside the current budget period (internal).
+    BudgetPeriodBaseCost,
 }
 
 impl CumulativeKind {
@@ -61,6 +67,8 @@ impl CumulativeKind {
             CumulativeKind::TotalRegularInputCost => "cric",
             CumulativeKind::TotalCachedInputCost => "ccic",
             CumulativeKind::TotalOutputCost => "coc",
+            CumulativeKind::BudgetPeriodStart => "bpstart",
+            CumulativeKind::BudgetPeriodBaseCost => "bpbase",
         }
     }
 }
@@ -147,6 +155,29 @@ fn now_epoch_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Partition a lifetime cost counter into the current budget period.
+///
+/// Returns `(period_start, baseline, period_spend)`:
+/// - `period_start == 0` means no period has been anchored yet; the period
+///   starts at `now` with the lifetime total as baseline (spend 0).
+/// - once `period_secs` has elapsed the period rolls over the same way.
+/// - `period_secs == 0` is treated as "no reset" so a bad config can never
+///   reset the budget on every request.
+fn budget_period_partition(
+    period_start: u64,
+    baseline: u64,
+    total: u64,
+    now: u64,
+    period_secs: u64,
+) -> (u64, u64, u64) {
+    let elapsed = period_start == 0 || now.saturating_sub(period_start) >= period_secs;
+    if period_secs > 0 && elapsed {
+        (now, total, 0)
+    } else {
+        (period_start, baseline, total.saturating_sub(baseline))
+    }
+}
+
 // ─────────────────────────────────────────────────────────────
 // SlidingWindowLimiter
 // ─────────────────────────────────────────────────────────────
@@ -162,6 +193,19 @@ pub struct SlidingWindowLimiter {
     /// Entries touched since last sync.
     dirty_windows: Arc<RwLock<HashSet<String>>>,
     dirty_cumulative: Arc<RwLock<HashSet<String>>>,
+    /// Budget-period anchors keyed by the `BudgetPeriodStart` cache_key.
+    /// Kept in a single map entry so the start/baseline pair is read and
+    /// updated atomically (the two cumulative rows are the persisted mirror).
+    budget_periods: Arc<DashMap<String, BudgetPeriod>>,
+}
+
+/// Current `max_budget` period for one scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BudgetPeriod {
+    /// Epoch seconds when the period started; 0 = not anchored yet.
+    start: u64,
+    /// Lifetime total cost (micros) when the period started.
+    baseline: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -184,6 +228,7 @@ impl SlidingWindowLimiter {
             cumulative: Arc::new(DashMap::new()),
             dirty_windows: Arc::new(RwLock::new(HashSet::new())),
             dirty_cumulative: Arc::new(RwLock::new(HashSet::new())),
+            budget_periods: Arc::new(DashMap::new()),
         }
     }
 
@@ -504,6 +549,56 @@ impl SlidingWindowLimiter {
             .unwrap_or(0)
     }
 
+    /// Spend accrued inside the current `max_budget` period, in micros.
+    ///
+    /// The lifetime `TotalCost` counter is partitioned by a persisted period
+    /// anchor: the first call (or the first call after `period_secs` has
+    /// elapsed) stores the current lifetime total as the baseline, so later
+    /// calls report only the spend since the period started.
+    pub fn peek_budget_period_cost_micros(&self, scope: &QuotaScope, period_secs: u64) -> u64 {
+        self.peek_budget_period_cost_micros_at(scope, period_secs, now_epoch_secs())
+    }
+
+    fn peek_budget_period_cost_micros_at(
+        &self,
+        scope: &QuotaScope,
+        period_secs: u64,
+        now: u64,
+    ) -> u64 {
+        let total = self.peek_cumulative(scope, CumulativeKind::TotalCost);
+        let cache_key = cumulative_cache_key(scope, CumulativeKind::BudgetPeriodStart);
+
+        // The anchor pair lives in ONE map entry, so concurrent requests at a
+        // period boundary cannot observe a start/baseline mismatch.
+        let mut rollover: Option<(u64, u64)> = None;
+        let spend = {
+            let mut entry = self
+                .budget_periods
+                .entry(cache_key)
+                .or_insert_with(|| BudgetPeriod {
+                    // First touch after a restart: hydrate from the persisted
+                    // cumulative mirror (loaded by `restore_cumulative`).
+                    start: self.peek_cumulative(scope, CumulativeKind::BudgetPeriodStart),
+                    baseline: self.peek_cumulative(scope, CumulativeKind::BudgetPeriodBaseCost),
+                });
+            let (start, baseline, spend) =
+                budget_period_partition(entry.start, entry.baseline, total, now, period_secs);
+            if start != entry.start || baseline != entry.baseline {
+                entry.start = start;
+                entry.baseline = baseline;
+                rollover = Some((start, baseline));
+            }
+            spend
+        };
+
+        if let Some((start, baseline)) = rollover {
+            // Mirror the new anchor into the cumulative rows for persistence.
+            self.overwrite_cumulative(scope, CumulativeKind::BudgetPeriodStart, start);
+            self.overwrite_cumulative(scope, CumulativeKind::BudgetPeriodBaseCost, baseline);
+        }
+        spend
+    }
+
     fn add_cumulative(&self, scope: &QuotaScope, kind: CumulativeKind, delta: u64) {
         if delta == 0 {
             return;
@@ -528,6 +623,12 @@ impl SlidingWindowLimiter {
     /// Reset all cumulative counters for a scope to zero (in-memory only).
     /// Returns pre-reset snapshot. Caller handles DB cleanup + team recompute.
     pub fn reset_cumulative_local(&self, scope: &QuotaScope) -> CumulativeSnapshot {
+        // Budget-period anchors are derived state; clearing them makes the
+        // next request start a fresh period alongside the zeroed totals.
+        self.budget_periods
+            .remove(&cumulative_cache_key(scope, CumulativeKind::BudgetPeriodStart));
+        self.reset_one_local(scope, CumulativeKind::BudgetPeriodStart);
+        self.reset_one_local(scope, CumulativeKind::BudgetPeriodBaseCost);
         CumulativeSnapshot {
             input_tokens: self.reset_one_local(scope, CumulativeKind::TotalInputTokens),
             output_tokens: self.reset_one_local(scope, CumulativeKind::TotalOutputTokens),
@@ -1419,6 +1520,117 @@ mod tests {
         let output = limiter.peek_cumulative(&scope, CumulativeKind::TotalOutputTokens);
         assert_eq!(input, 100);
         assert_eq!(output, 200);
+    }
+
+    // ── Budget-period partitioning ──
+
+    #[test]
+    fn budget_period_starts_on_first_call() {
+        // No anchor yet: the period starts now and the lifetime total becomes
+        // the baseline, so nothing counts as spent inside the period.
+        assert_eq!(
+            budget_period_partition(0, 0, 42_000, 1_000, 86_400),
+            (1_000, 42_000, 0)
+        );
+    }
+
+    #[test]
+    fn budget_period_reports_spend_inside_window() {
+        assert_eq!(
+            budget_period_partition(1_000, 42_000, 60_000, 2_000, 86_400),
+            (1_000, 42_000, 18_000)
+        );
+    }
+
+    #[test]
+    fn budget_period_rolls_over_after_duration() {
+        assert_eq!(
+            budget_period_partition(1_000, 42_000, 60_000, 1_000 + 86_400, 86_400),
+            (1_000 + 86_400, 60_000, 0)
+        );
+    }
+
+    #[test]
+    fn budget_period_zero_duration_never_resets() {
+        // A zero length must not silently reset the budget on every request.
+        assert_eq!(
+            budget_period_partition(1_000, 42_000, 60_000, 999_999, 0),
+            (1_000, 42_000, 18_000)
+        );
+    }
+
+    #[test]
+    fn budget_period_baseline_above_total_saturates() {
+        // An admin cumulative reset can leave a stale, larger baseline.
+        assert_eq!(
+            budget_period_partition(1_000, 90_000, 10_000, 2_000, 86_400),
+            (1_000, 90_000, 0)
+        );
+    }
+
+    #[test]
+    fn budget_period_cost_tracks_usage_and_rollover() {
+        let limiter = SlidingWindowLimiter::new();
+        let scope = QuotaScope::Key {
+            key_hash: "budget_period".to_string(),
+        };
+        let now = 10_000;
+
+        // First check anchors the period.
+        assert_eq!(limiter.peek_budget_period_cost_micros_at(&scope, 3_600, now), 0);
+
+        limiter.add_cumulative(&scope, CumulativeKind::TotalCost, 5_000);
+        assert_eq!(
+            limiter.peek_budget_period_cost_micros_at(&scope, 3_600, now + 10),
+            5_000
+        );
+
+        // Still inside the hour: spend does not roll off on its own.
+        assert_eq!(
+            limiter.peek_budget_period_cost_micros_at(&scope, 3_600, now + 3_599),
+            5_000
+        );
+
+        // Period elapsed: fresh baseline, spend starts over.
+        assert_eq!(
+            limiter.peek_budget_period_cost_micros_at(&scope, 3_600, now + 3_600),
+            0
+        );
+        limiter.add_cumulative(&scope, CumulativeKind::TotalCost, 1_500);
+        assert_eq!(
+            limiter.peek_budget_period_cost_micros_at(&scope, 3_600, now + 3_601),
+            1_500
+        );
+    }
+
+    #[test]
+    fn reset_cumulative_clears_budget_period() {
+        let limiter = SlidingWindowLimiter::new();
+        let scope = QuotaScope::Key {
+            key_hash: "budget_reset".to_string(),
+        };
+        let now = 20_000;
+
+        limiter.add_cumulative(&scope, CumulativeKind::TotalCost, 5_000);
+        assert_eq!(limiter.peek_budget_period_cost_micros_at(&scope, 3_600, now), 0);
+        limiter.add_cumulative(&scope, CumulativeKind::TotalCost, 2_000);
+        assert_eq!(
+            limiter.peek_budget_period_cost_micros_at(&scope, 3_600, now + 1),
+            2_000
+        );
+
+        limiter.reset_cumulative_local(&scope);
+
+        // Anchors are gone: the next check starts a clean period.
+        assert_eq!(
+            limiter.peek_budget_period_cost_micros_at(&scope, 3_600, now + 2),
+            0
+        );
+        limiter.add_cumulative(&scope, CumulativeKind::TotalCost, 700);
+        assert_eq!(
+            limiter.peek_budget_period_cost_micros_at(&scope, 3_600, now + 3),
+            700
+        );
     }
 
     #[tokio::test]

@@ -3712,7 +3712,9 @@
               ? '<span class="mono">-/-/-</span>'
               : `<span class="mono">${k.usage_count}/${fmtTokens(k.usage_tokens)}/${fmtCost(k.usage_cost)}</span><br><span class="muted" style="font-size:11px">${formatCountdown(k.usage_reset_secs || 0)}</span>`}</td>
         <td>${fmtCost(k.spend)}</td>
-        <td>${k.max_budget != null ? "$" + k.max_budget : "-"}</td>
+        <td>${k.max_budget > 0
+              ? `<span title="${esc(k.budget_scope || "lifetime")}">${fmtCost(k.budget_period_spend != null ? k.budget_period_spend : k.spend)} / $${k.max_budget}</span>`
+              : "-"}</td>
         <td>${k.blocked
               ? '<span style="color:var(--danger)">' + t("status.blocked") + '</span>'
               : (k.metadata && k.metadata.vip === true)
@@ -6313,6 +6315,23 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
     });
   }
 
+  // Skip reasons returned by the batch/import endpoint. Map known machine
+  // reasons to i18n labels; unknown reasons fall back to the raw string.
+  const IMPORT_SKIP_REASON_KEYS = {
+    invalid_prefix: "keys.import.reason.invalid_prefix",
+    invalid_tag: "keys.import.reason.invalid_tag",
+    invalid_limits: "keys.import.reason.invalid_limits",
+    duplicate: "keys.import.reason.duplicate",
+    invalid_plan: "keys.import.reason.invalid_plan",
+    assignment_failed: "keys.import.reason.assignment_failed",
+    rollback_failed: "keys.import.reason.rollback_failed",
+    db_error: "keys.import.reason.db_error",
+  };
+  function importSkipReasonLabel(reason) {
+    const key = IMPORT_SKIP_REASON_KEYS[reason];
+    return key ? t(key) : reason;
+  }
+
   function renderImportResult(data) {
     const createdRows = (data.created || []).map((c) => `<tr>
       <td class="mono">${esc(c.key_alias || "-")}</td>
@@ -6321,7 +6340,7 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
     </tr>`).join("");
     const skippedRows = (data.skipped || []).map((s) => `<tr>
       <td>${esc(s.key_alias || "-")}</td>
-      <td class="muted">${esc(s.reason)}</td>
+      <td class="muted">${esc(importSkipReasonLabel(s.reason))}</td>
     </tr>`).join("");
     const parseErrorRows = (data.parse_errors || []).map((e) => `<tr>
       <td class="mono">${t("keys.import.line_n", { n: e.line })}</td>
