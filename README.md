@@ -60,7 +60,7 @@
 
 ## 网关基础能力
 
-统一接入 20+ 上游服务商；litellm 密钥体系兼容；Anthropic 原生 `/v1/messages`（Claude Code / opencode 可直连）；Direct Synthesis Workflow（并发调用多个 panel 模型后由 aggregator 合成标准 OpenAI 响应）；公开模型、模型别名与 `"*"` 兜底路由；业务配置 DB 权威（模型 / 套餐 / 别名 / 拦截规则 / Workflow / 计费模板全部面板 CRUD，写完即生效，YAML 仅作首次 seed 与回滚工件）；Web 管理面板（密钥 / 模型 / 套餐 / 配额 / 日志 / 实时在途与统计）；SIGHUP / API / 面板按钮零停机热加载。
+统一接入 20+ 上游服务商；litellm 密钥体系兼容；Anthropic 原生 `/v1/messages`（Claude Code / opencode 可直连）；OpenAI Responses API（`/v1/responses` + `/responses` 别名，Codex CLI 可直连——`namespace` 工具自动拍平、托管工具宽容丢弃并以 `x-boom-dropped-tools` 响应头透出信号、`previous_response_id` 有状态续接）；Direct Synthesis Workflow（并发调用多个 panel 模型后由 aggregator 合成标准 OpenAI 响应）；公开模型、模型别名与 `"*"` 兜底路由；业务配置 DB 权威（模型 / 套餐 / 别名 / 拦截规则 / Workflow / 计费模板全部面板 CRUD，写完即生效，YAML 仅作首次 seed 与回滚工件）；Web 管理面板（密钥 / 模型 / 套餐 / 配额 / 日志 / 实时在途与统计）；SIGHUP / API / 面板按钮零停机热加载。
 
 ---
 
