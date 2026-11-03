@@ -182,6 +182,8 @@ model_list:
 - 限流维度：每 key 滑动窗口 RPM + 自定义时间窗口 + 并发数。
 - 套餐系统：`plan_settings.plans` 定义多档套餐，每个套餐可设 `concurrency_limit`、`rpm_limit`、`window_limits`；通过 Dashboard 或 `POST /admin/plans/assign` 给 key 分配套餐。
 - 三级回退：key 显式分配的 plan > key 自身 `rpm_limit`/`tpm_limit` > `default_plan` > `rate_limit.default_rpm`。
+- **`max_budget` 与 plan 互斥**：预算是 fallback-only——key（或其团队、或 default_plan 回退）被 plan 接管时，该 key 自身的 `max_budget` 不生效。创建/更新/批量导入/指派 plan 时带此组合会被 **400 拒绝**（提示把限额放进 plan 的 cost 配置，或清除 plan/团队指派）；历史遗留的冲突配置在网关日志按请求 WARN。`max_budget` 配 `budget_duration`（如 `30d`）时为**周期预算**（周期内消耗 ≥ 预算即阻断，到期自动重置），不配则为生命周期累计上限。
+- 面板密钥列表的 Budget 列显示**与执行口径一致**的「消耗 / 上限」（周期预算显示周期内消耗，鼠标悬停可见口径 `period(30d)` / `lifetime`）；Spend 列恒为生命周期累计，勿与周期预算直接比较。
 - 时段调度：套餐可带 `schedule`，按 `"H:MM-H:MM"` 分时段覆盖限流参数，支持跨午夜（如 `"21:00-9:00"`）。适合"白天高峰严控、夜间宽松"的策略。
 - 配额倍率：`model_info.quota_count_ratio` 控制每次请求消耗的配额单位数。设为 3 表示一次请求消耗 3 个配额。昂贵模型设高倍率，廉价模型保持默认 1。
 
