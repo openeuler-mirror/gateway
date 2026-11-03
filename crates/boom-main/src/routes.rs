@@ -2749,6 +2749,16 @@ async fn check_plan_limits(
             committed: false,
             settled: false,
         });
+    } else if let Some(budget) = max_budget.filter(|b| b.is_finite() && *b > 0.0) {
+        // Fallback-only policy means a plan-governed key's own budget is
+        // dead config — surface it instead of leaving the admin wondering
+        // why the cap never trips (write-time rejection covers new keys;
+        // this catches pre-existing rows and team/default-plan changes).
+        tracing::warn!(
+            key_hash_prefix = %key_hash.get(..8.min(key_hash.len())).unwrap_or(""),
+            max_budget = budget,
+            "per-key max_budget ignored: a plan governs this key (fallback-only policy);              move the cap into the plan's cost limits or clear the plan assignment"
+        );
     }
 
     // ── Plan-based path: team layer first, then key layer ──
@@ -4211,15 +4221,44 @@ pub async fn responses(
     // stripped, rehydrated history inlined) via the side channel; the chat
     // conversion above still drove routing/limits/audit. Chat requests to
     // this deployment are unaffected — they carry no passthrough body.
+    let mut dropped_header: Option<String> = None;
     if true {
-        // Strict chat-expressibility check, POST-routing (R2): a conversion
-        // deployment must reject native-only tools/items; a passthrough
-        // deployment skips this so they reach the upstream natively. The
-        // lenient conversion above already dropped them from the chat view.
-        boom_core::responses::validate_conversion_supported(&effective_req).map_err(|e| {
+        // Chat-expressibility pre-flight, POST-routing (R2, Codex-compat
+        // revision): non-expressible tools/items are DROPPED from the chat
+        // view with a loud warn — Codex sends web_search & friends
+        // unconditionally and a 400 bricks the whole session; structural
+        // errors still fail fast. Passthrough deployments skip this
+        // entirely, so native-only types reach their upstream.
+        let dropped = boom_core::responses::validate_conversion_supported(&effective_req).map_err(|e| {
             log_error(&state, &identity, &req.model, "/v1/responses", req.stream.unwrap_or(false), start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()), user_tags.clone());
             ResponsesErrorReply(e)
         })?;
+        if !dropped.is_empty() {
+            tracing::warn!(
+                request_id = %request_id,
+                model = %req.model,
+                dropped = ?dropped,
+                "conversion deployment dropped non-expressible tools/items (client loses those capabilities)"
+            );
+        }
+        // Client-visible signal for the same fact: the 200 body carries no
+        // trace of the dropped tools, and "tool available but not called" is
+        // indistinguishable from "tool dropped" without this header.
+        dropped_header = (!dropped.is_empty()).then(|| {
+            // HeaderValue::from_str only accepts visible ASCII — anything
+            // else (control chars, non-ASCII tool names) would make it Err
+            // and silently drop the signal. Replace, don't reject; cap by
+            // popping chars (String::truncate panics on a non-char boundary).
+            let mut v: String = dropped
+                .join("; ")
+                .chars()
+                .map(|c| if (32..127).contains(&(c as u32)) { c } else { '?' })
+                .collect();
+            while v.len() > 512 {
+                v.pop();
+            }
+            v
+        });
     }
 
 
@@ -4254,8 +4293,13 @@ pub async fn responses(
                 // failed turn is STILL checkpointed — the client chains on the
                 // id carried by response.failed (real-LLM chain-break trap:
                 // an unpersisted id makes the next previous_response_id 404).
-                let (failed_resp, final_obj) =
+                let (mut failed_resp, final_obj) =
                     responses_failed_sse(&model, &response_id, created_at, &e);
+                if let Some(v) = dropped_header.take() {
+                    if let Ok(hv) = axum::http::HeaderValue::from_str(&v) {
+                        failed_resp.headers_mut().insert("x-boom-dropped-tools", hv);
+                    }
+                }
                 if let Some(ctx) = persist_ctx {
                     let turn = ctx.into_turn("failed", Vec::new(), final_obj);
                     if let Err(persist_err) = state.response_store.persist_turn(turn).await {
@@ -4351,11 +4395,23 @@ pub async fn responses(
                     }));
                 }
                 let response = Sse::new(sse_item_to_event(prompt_logged)).keep_alive(KeepAlive::default());
-                return Ok(response.into_response());
+                let mut resp = response.into_response();
+                if let Some(v) = dropped_header.take() {
+                    if let Ok(hv) = axum::http::HeaderValue::from_str(&v) {
+                        resp.headers_mut().insert("x-boom-dropped-tools", hv);
+                    }
+                }
+                return Ok(resp);
             }
         }
         let response = Sse::new(sse_item_to_event(logged)).keep_alive(KeepAlive::default());
-        Ok(response.into_response())
+        let mut resp = response.into_response();
+        if let Some(v) = dropped_header.take() {
+            if let Ok(hv) = axum::http::HeaderValue::from_str(&v) {
+                resp.headers_mut().insert("x-boom-dropped-tools", hv);
+            }
+        }
+        Ok(resp)
     } else {
         let _inflight = if let Some(ref did) = deployment_id {
             InFlightGuard::new_for_deployment(state.inflight.clone(), &inflight_model, did, input_chars as u64)
@@ -4512,7 +4568,13 @@ pub async fn responses(
             }
         }
 
-        Ok(Json(responses_value).into_response())
+        let mut resp = Json(responses_value).into_response();
+        if let Some(v) = dropped_header {
+            if let Ok(hv) = axum::http::HeaderValue::from_str(&v) {
+                resp.headers_mut().insert("x-boom-dropped-tools", hv);
+            }
+        }
+        Ok(resp)
     }
 }
 
@@ -4769,6 +4831,11 @@ pub async fn get_response(
     match state.response_store.get(&response_id, &identity.key_hash).await {
         Ok(Some(json)) => Ok(Json(json).into_response()),
         Ok(None) => Err(ResponsesErrorReply(GatewayError::ResponseNotFound(response_id))),
+        // Disabled is the documented uniform-404 case (no existence leak),
+        // not a 500 — matches the doc comment on this handler.
+        Err(boom_responses::ResponseStoreError::Disabled) => {
+            Err(ResponsesErrorReply(GatewayError::ResponseNotFound(response_id)))
+        }
         Err(e) => Err(ResponsesErrorReply(GatewayError::InternalError(format!(
             "response store: {e}"
         )))),

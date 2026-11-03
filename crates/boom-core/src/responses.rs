@@ -325,6 +325,39 @@ fn convert_tools(tools: &[serde_json::Value]) -> Result<Option<Vec<Tool>>, Gatew
     let mut out = Vec::new();
     for t in tools {
         let ty = t.get("type").and_then(|x| x.as_str()).unwrap_or("");
+        if ty == "namespace" {
+            // Codex serializes its sub-agent toolset (and each MCP server's
+            // tools) as ONE `type:"namespace"` entry holding sub-tools. Chat
+            // Completions has no namespaces — flatten to plain functions
+            // named `<ns>__<sub>` (the ecosystem convention: GLM/Mistral/
+            // Ollama providers and APISIX do the same; Codex recognizes the
+            // flattened names on the way back).
+            let ns = t.get("name").and_then(|x| x.as_str()).unwrap_or_default();
+            let ns_desc = t.get("description").and_then(|x| x.as_str());
+            for sub in t.get("tools").and_then(|x| x.as_array()).unwrap_or(&Vec::new()) {
+                let sub_name = sub.get("name").and_then(|x| x.as_str()).unwrap_or_default();
+                if ns.is_empty() || sub_name.is_empty() {
+                    continue; // malformed sub-tool — skipped, not fatal
+                }
+                let description = sub
+                    .get("description")
+                    .and_then(|x| x.as_str())
+                    .or(ns_desc)
+                    .map(String::from);
+                out.push(Tool {
+                    tool_type: "function".to_string(),
+                    function: ToolFunction {
+                        name: format!("{ns}__{sub_name}"),
+                        description,
+                        parameters: sub
+                            .get("parameters")
+                            .cloned()
+                            .unwrap_or(serde_json::json!({ "type": "object" })),
+                    },
+                });
+            }
+            continue;
+        }
         if ty != "function" && ty != "custom" {
             continue; // passthrough-only tool — dropped from the chat view
         }
@@ -375,24 +408,34 @@ fn convert_tools(tools: &[serde_json::Value]) -> Result<Option<Vec<Tool>>, Gatew
     }
 }
 
-/// Strict pre-flight for CONVERSION deployments (chat-kernel expressibility):
-/// the chat upstream can only honor `function`/`custom` tools and the known
-/// input item types. Called by the handler AFTER routing — a passthrough
-/// deployment never runs this, so native-only types reach their upstream
-/// (Response.md R2 review finding).
-pub fn validate_conversion_supported(req: &ResponsesRequest) -> Result<(), GatewayError> {
+/// Pre-flight for CONVERSION deployments (chat-kernel expressibility).
+///
+/// POLICY (Codex-compat revision of R2): non-expressible tool types
+/// (`web_search`, `mcp`, …) and input item types (`web_search_call`, …) are
+/// DROPPED from the chat view, not rejected — Codex sends hosted built-ins
+/// unconditionally and a 400 bricks the whole session; the proxy ecosystem
+/// (LiteLLM, APISIX) drops them too. Everything dropped is named in the
+/// returned descriptors so the handler can warn — loud-drop, never silent.
+/// Structural errors still fail fast; `namespace` is convertible (flattened
+/// in convert_tools).
+pub fn validate_conversion_supported(req: &ResponsesRequest) -> Result<Vec<String>, GatewayError> {
+    let mut dropped = Vec::new();
     if let Some(tools) = &req.tools {
         for t in tools {
             let ty = t.get("type").and_then(|x| x.as_str()).unwrap_or("");
-            if ty != "function" && ty != "custom" {
-                return Err(GatewayError::UnsupportedMode(format!(
-                    "unsupported tool type '{ty}' (only \"function\" and \"custom\" are supported)"
-                )));
-            }
-            if t.get("name").and_then(|x| x.as_str()).is_none() {
-                return Err(GatewayError::UnsupportedMode(
-                    "tool is missing 'name'".to_string(),
-                ));
+            match ty {
+                "function" | "custom" => {
+                    if t.get("name").and_then(|x| x.as_str()).is_none() {
+                        return Err(GatewayError::UnsupportedMode(
+                            "tool is missing 'name'".to_string(),
+                        ));
+                    }
+                }
+                "namespace" => {} // flattened to `<ns>__<sub>` function tools
+                _ => {
+                    let name = t.get("name").and_then(|x| x.as_str()).unwrap_or("<unnamed>");
+                    dropped.push(format!("tool {ty}({name})"));
+                }
             }
         }
     }
@@ -408,13 +451,11 @@ pub fn validate_conversion_supported(req: &ResponsesRequest) -> Result<(), Gatew
                     | "custom_tool_call_output"
                     | "reasoning"
             ) {
-                return Err(GatewayError::UnsupportedMode(format!(
-                    "unsupported input item type '{ty}'"
-                )));
+                dropped.push(format!("item {ty}"));
             }
         }
     }
-    Ok(())
+    Ok(dropped)
 }
 
 /// Responses tool_choice is flat, chat is nested (Response.md R1):
@@ -1654,15 +1695,15 @@ mod tests {
     }
 
     #[test]
-    fn non_function_tools_are_rejected() {
-        // Strict pre-flight for conversion deployments (post-routing).
+    fn non_function_tools_are_dropped_with_descriptor() {
+        // Codex-compat policy: hosted built-ins are dropped (loud), not
+        // rejected — a 400 bricks Codex sessions that always send them.
         let req = parse_req(json!({
             "model": "m", "input": "hi",
             "tools": [{ "type": "web_search" }]
         }));
-        let err = validate_conversion_supported(&req).unwrap_err();
-        assert_eq!(err.status_code(), 400);
-        assert!(err.to_string().contains("web_search"));
+        let dropped = validate_conversion_supported(&req).unwrap();
+        assert_eq!(dropped, vec!["tool web_search(<unnamed>)".to_string()]);
     }
 
     #[test]
@@ -1688,10 +1729,10 @@ mod tests {
         // Unknown input item dropped, message kept.
         assert_eq!(out.messages.len(), 1);
         assert_eq!(text_of(&out.messages[0]), "hi");
-        // But the strict check still names both offenders.
-        let err = validate_conversion_supported(&req).unwrap_err();
-        assert_eq!(err.status_code(), 400);
-        assert!(err.to_string().contains("web_search"));
+        // The pre-flight names everything dropped for the handler's warn.
+        let dropped = validate_conversion_supported(&req).unwrap();
+        assert!(dropped.iter().any(|d| d == "tool web_search(<unnamed>)"));
+        assert!(dropped.iter().any(|d| d == "item web_search_call"));
     }
 
     #[test]
@@ -1832,14 +1873,15 @@ mod tests {
     }
 
     #[test]
-    fn guard_rejects_unsupported_input_item_type() {
+    fn unsupported_input_item_type_is_dropped_with_descriptor() {
+        // Codex replays web_search_call items in history — dropped loudly,
+        // not rejected, so the session survives.
         let req = parse_req(json!({
             "model": "m",
             "input": [{ "type": "web_search_call", "id": "ws_1" }]
         }));
-        let err = validate_conversion_supported(&req).unwrap_err();
-        assert_eq!(err.status_code(), 400);
-        assert!(err.to_string().contains("web_search_call"));
+        let dropped = validate_conversion_supported(&req).unwrap();
+        assert_eq!(dropped, vec!["item web_search_call".to_string()]);
     }
 
     #[test]
@@ -2459,6 +2501,69 @@ mod tests {
     }
 
     // ---------- P2: native passthrough ----------
+
+    #[test]
+    fn namespace_tool_flattens_to_underscore_functions() {
+        // Codex sends one `type:"namespace"` tool per session (multi_agent_v1,
+        // MCP servers) — the chat kernel gets one function per sub-tool,
+        // named `<ns>__<sub>` (ecosystem convention; Codex maps them back).
+        let req = parse_req(json!({
+            "model": "gpt-test",
+            "input": "hi",
+            "tools": [
+                { "type": "namespace", "name": "multi_agent_v1",
+                  "description": "sub-agent orchestration",
+                  "tools": [
+                    { "name": "spawn_agent", "description": "spawn a sub-agent",
+                      "parameters": { "type": "object", "properties": { "prompt": { "type": "string" } } } },
+                    { "name": "wait_agent", "parameters": { "type": "object" } },
+                  ] },
+                { "type": "function", "name": "get_time", "parameters": { "type": "object" } },
+            ],
+        }));
+        // Conversion deployments accept it (validate first, like the handler).
+        validate_conversion_supported(&req).expect("namespace must be convertible");
+        let chat = convert_request(&req, &[]).expect("converts");
+        let names: Vec<String> = chat
+            .tools
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|t| t.function.name.clone())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "multi_agent_v1__spawn_agent".to_string(),
+                "multi_agent_v1__wait_agent".to_string(),
+                "get_time".to_string(),
+            ]
+        );
+        let flattened = &chat.tools.as_ref().unwrap()[0];
+        assert_eq!(flattened.function.description.as_deref(), Some("spawn a sub-agent"));
+        assert!(flattened.function.parameters["properties"]["prompt"].is_object());
+    }
+
+    #[test]
+    fn structural_tool_errors_still_fail_fast() {
+        // Dropped built-ins are tolerated; a convertible tool missing its
+        // name is a structural error and keeps failing fast.
+        let req = parse_req(json!({
+            "model": "gpt-test", "input": "hi",
+            "tools": [{ "type": "function", "parameters": { "type": "object" } }],
+        }));
+        let err = validate_conversion_supported(&req).unwrap_err();
+        assert!(err.to_string().contains("tool is missing 'name'"));
+        // And the mcp-style hosted type is dropped, named.
+        let req = parse_req(json!({
+            "model": "gpt-test", "input": "hi",
+            "tools": [{ "type": "web_search", "name": "search" }],
+        }));
+        assert_eq!(
+            validate_conversion_supported(&req).unwrap(),
+            vec!["tool web_search(search)".to_string()]
+        );
+    }
 
     #[test]
     fn passthrough_body_strips_gateway_fields_and_inlines_history() {
