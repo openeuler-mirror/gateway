@@ -293,13 +293,13 @@ curl -X POST $BASE/dashboard/api/auth/logout
 curl $BASE/dashboard/api/user/plan -H "Cookie: boom_session=$JWT"
 ```
 
-返回 `plan_name`、`concurrency_limit`、`rpm_limit`、`window_limits`（数组形式 `[counts, tokens, costs, window_secs]`）、`schedule`。三态：未指派→回落 default；显式 no-plan→`is_explicit_no_plan:true`。
+返回 `plan_name`、`concurrency_limit`、`rpm_limit`、`window_limits`（数组形式 `[counts, tokens, costs, window_secs]`）、`schedule`。三态：未指派→回落 default；显式 no-plan→`is_explicit_no_plan:true`。`concurrency_limit` 为**实际生效值**：有 plan（key 或 team）时即该 plan 的 `concurrency_limit`，key 自身的 `max_parallel_requests` 被忽略；无 plan 时回落 key 自身的 `max_parallel_requests`（未设置为不限）。
 
 ### 5.2 Usage（实时用量 + 累计）
 
 **GET** `/dashboard/api/user/usage`
 
-返回每个 window 的 current/limit（counts/tokens/costs 三维），以及累计 `cumulative`：`total_input_tokens`、`total_output_tokens`、`total_cost`、各类成本拆分、`total_token_limit`、`total_cost_limit`。
+返回每个 window 的 current/limit（counts/tokens/costs 三维），以及累计 `cumulative`：`total_input_tokens`、`total_output_tokens`、`total_cost`、各类成本拆分、`total_token_limit`、`total_cost_limit`。`concurrency_limit` 与 `/user/plan` 同口径（生效值）。
 
 ### 5.3 Key Info（本人 key 元数据）
 
@@ -405,7 +405,7 @@ Query：
 | `vip_only` | `true`/`1` 只返回 metadata.vip=true |
 | `plan` | `unassigned`/`none`（无指派）/`no_plan`（显式空）/具体 plan 名 |
 
-返回 `keys[]`（含 `token_prefix`、`token_hash`、`key_alias`、`tag`、`models`、`spend`、`total_cost`、`usage_*`、`plan_name`、`plan_assignment_kind`）、`page`、`per_page`、`total`。全局按 `usage_count` DESC 排序后再分页。
+返回 `keys[]`（含 `token_prefix`、`token_hash`、`key_alias`、`tag`、`models`、`spend`、`total_cost`、`usage_*`、`rpm_limit`、`tpm_limit`、`max_parallel_requests`、`plan_name`、`plan_assignment_kind`）、`page`、`per_page`、`total`。全局按 `usage_count` DESC 排序后再分页。
 
 ### 7.2 创建单个
 
@@ -425,6 +425,7 @@ curl -X POST $BASE/dashboard/api/admin/keys \
     "models":["gpt-4o","claude-3-7-sonnet"],
     "rpm_limit":60,
     "tpm_limit":60000,
+    "max_parallel_requests":1,
     "max_budget":50.0,
     "budget_duration":"30d",
     "expires":"2027-01-01 00:00:00",
@@ -446,6 +447,7 @@ curl -X POST $BASE/dashboard/api/admin/keys \
 | `models` | 数组，`["all-team-models"]` 视为全权限（即空数组的语义） |
 | `expires` | `"YYYY-MM-DD HH:MM:SS"` |
 | `metadata` | JSON 对象，`{"vip":true}` 触发 VIP 调度 |
+| `max_parallel_requests` | key 级并发上限（≥0 整数，`0`/省略 = 不限）。**仅作保底**：仅当 key/team 都没有 plan 时生效；一旦有 plan，按 plan 的 `concurrency_limit` 执行并忽略本值。负数返回 400 |
 | `plan_name` | 三态：省略→回落 default；`null`→显式无 plan；`"name"`→指派 |
 
 ### 7.3 批量创建（JSON 数组）
@@ -469,13 +471,13 @@ curl -X POST $BASE/dashboard/api/admin/keys/batch \
 **POST** `/dashboard/api/admin/keys/import` · admin · `multipart/form-data`，字段名 `file`，扩展名 `.csv` 或 `.jsonl`，≤1 MiB，≤10000 行。
 
 ```bash
-# CSV：列序 key_alias,key_name,key_prefix,tag,user_id,team_id,models(rsp 用 | 分隔),rpm_limit,tpm_limit,max_budget,budget_duration,expires,metadata(JSON),plan_name
+# CSV：列序 key_alias,key_name,key_prefix,tag,user_id,team_id,models(rsp 用 | 分隔),rpm_limit,tpm_limit,max_parallel_requests,max_budget,budget_duration,expires,metadata(JSON),plan_name
 curl -X POST $BASE/dashboard/api/admin/keys/import \
   -H "Cookie: boom_session=$JWT" \
   -F 'file=@/path/to/keys.csv'
 ```
 
-响应含 `parsed`、`inserted`、`truncated`、`parse_errors[]`、`created[]`、`skipped[]`、`download`（同名 + `api_key` 列的回写附件，filename `<stem>-with-keys.<ext>`、`content`、`mime`）。
+响应含 `parsed`、`inserted`、`truncated`、`parse_errors[]`、`created[]`、`skipped[]`、`download`（同名 + `api_key` 列的回写附件，filename `<stem>-with-keys.<ext>`、`content`、`mime`）。CSV 按表头名匹配、忽略列序，缺失的可选列按空处理（如缺少 `max_parallel_requests` 列 = 不限）；"显式无 plan"无法用 CSV 表达，请用 JSONL（行即 `CreateKeyRequest`）。
 
 ### 7.5 修改
 
@@ -495,7 +497,7 @@ curl -X PUT $BASE/dashboard/api/admin/keys/$KEYHASH \
   }'
 ```
 
-字段全部 optional，省略即不变；`team_id:""` 表示从 team 移出。`key_prefix` 不可改。
+字段全部 optional，省略即不变；`team_id:""` 表示从 team 移出。`key_prefix` 不可改。`max_parallel_requests` 省略或 `null` 时保留原值（SQL `COALESCE`），传 `0` 表示改为不限。
 
 ### 7.6 阻断 / 解封 / 删除
 

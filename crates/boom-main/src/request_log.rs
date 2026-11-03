@@ -442,6 +442,7 @@ pub fn log_auth_error(
         team_models: vec![],
         rpm_limit: None,
         tpm_limit: None,
+        max_parallel_requests: None,
         max_budget: None,
         budget_period_secs: None,
         spend: 0.0,

@@ -1226,9 +1226,11 @@ Key 的关键字段（litellm 兼容）：
 | `models` | 允许的模型白名单。`[]` 或含 `"all-team-models"` 表示全权限 |
 | `team_id` | 所属团队，团队 `models` 作为白名单兜底 |
 | `metadata.vip` | `true` 时流控优先调度 |
-| `max_parallel_requests` | 该 key 的并发上限 |
-| `rpm_limit` / `tpm_limit` | 该 key 自身的 RPM/TPM（优先级高于 plan） |
+| `max_parallel_requests` | 该 key 的并发上限（仅作保底：未分配 plan 时生效；有 plan 时按 plan 的并发上限） |
+| `rpm_limit` / `tpm_limit` | 该 key 自身的 RPM/TPM（仅未分配 plan 时生效；有 plan 时按 plan） |
 | `blocked` | `true` 立即拉黑 |
+
+> `max_parallel_requests` 目前仅在 API（创建/修改/批量/CSV/JSONL 导入）中提供，Dashboard 表单不展示，需要通过上面的 curl 设置。
 
 ### 5.6 分配套餐
 

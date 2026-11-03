@@ -10,6 +10,28 @@ use crate::state::DashboardState;
 use boom_flowcontrol::UserRequestStage;
 use boom_limiter::RateLimitPlan;
 
+/// Per-key in-flight cap from the litellm-compatible
+/// `boom_verification_token.max_parallel_requests` column. This is a fallback:
+/// the gateway only enforces it when no plan (key or team) governs the request,
+/// and ignores it entirely once a plan applies. The dashboard mirrors that rule
+/// so a key capped at 1 is not shown as "unlimited" in the no-plan state.
+async fn key_max_parallel_requests(
+    db_pool: Option<&sqlx::PgPool>,
+    key_hash: &str,
+) -> Option<u32> {
+    let pool = db_pool?;
+    let row: Option<Option<i32>> = sqlx::query_scalar(
+        r#"SELECT max_parallel_requests FROM "boom_verification_token" WHERE token = $1"#,
+    )
+    .bind(key_hash)
+    .fetch_optional(pool)
+    .await
+    .ok()?;
+    row.flatten()
+        .and_then(|v| u32::try_from(v).ok())
+        .filter(|v| *v > 0)
+}
+
 // ── GET /dashboard/api/user/plan ───────────────────────────
 
 pub async fn get_plan(
@@ -44,6 +66,8 @@ pub async fn get_plan(
 
     match plan {
         Some(p) => {
+            // A plan governs: the key-level `max_parallel_requests` fallback is
+            // not applied, matching the gateway's enforcement.
             let (concurrency_limit, window_limits, _) = p.effective_limits();
             // rpm_limit is the 60s counts dimension — surfaced separately for
             // front-end compat (effective_limits folds it into window_limits).
@@ -81,10 +105,14 @@ pub async fn get_plan(
                 state.plan_store.get_plan_name_explicit(key_hash),
                 Some(None)
             );
+            // No plan does not mean no in-flight cap: the legacy path still
+            // enforces the key's own max_parallel_requests.
+            let concurrency_limit =
+                key_max_parallel_requests(state.db_pool.as_ref(), key_hash).await;
             Json(json!({
                 "plan_name": null,
                 "is_explicit_no_plan": explicit_no_plan,
-                "concurrency_limit": null,
+                "concurrency_limit": concurrency_limit,
                 "rpm_limit": null,
                 "window_limits": [],
                 "schedule": [],
@@ -270,11 +298,19 @@ pub async fn get_usage(
         .peek_cumulative(&key_scope, boom_limiter::CumulativeKind::TotalOutputCost);
 
     let concurrency = state.plan_store.get_concurrency(key_hash);
+    // A plan governs and the key-level `max_parallel_requests` fallback is
+    // ignored — even when the plan itself leaves concurrency unlimited. Only
+    // the no-plan state surfaces the key's own cap.
+    let concurrency_limit = if plan.is_some() {
+        plan_concurrency
+    } else {
+        key_max_parallel_requests(state.db_pool.as_ref(), key_hash).await
+    };
 
     Json(json!({
         "plan_name": plan.as_ref().map(|p| p.name.as_str()),
         "concurrency": concurrency,
-        "concurrency_limit": plan_concurrency,
+        "concurrency_limit": concurrency_limit,
         "windows": windows,
         "cumulative": {
             "total_input_tokens": total_in,
