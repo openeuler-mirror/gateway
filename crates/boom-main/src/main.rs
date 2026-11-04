@@ -129,6 +129,10 @@ async fn async_main(
     // Spawn request summary logger (every 60s).
     spawn_request_summary(state.request_count.clone(), shutdown_tx.subscribe());
 
+    // Spawn key-affinity TTL sweeper (quarter-TTL cadence, no-op when TTL
+    // is 0/unset — see `spawn_affinity_sweeper`).
+    spawn_affinity_sweeper(state.clone(), shutdown_tx.subscribe());
+
     // Spawn periodic FC dispatch (every 1s — prevents idle capacity).
     spawn_periodic_fc_dispatch(state.flow_controller.clone(), shutdown_tx.subscribe());
 
@@ -391,6 +395,55 @@ fn spawn_sighup_listener(state: AppState, mut shutdown: tokio::sync::broadcast::
         let _ = state; // suppress unused warning
         let _ = shutdown;
     }
+}
+
+/// Background task: sweep expired key-affinity bindings.
+///
+/// Bindings whose key has been idle longer than
+/// `router_settings.key_affinity_ttl_secs` are dropped (and re-spread by
+/// bindings/capacity ratio on the key's next request). The sleep interval
+/// adapts to config reloads: quarter-TTL, bounded to at least 30s. TTL 0
+/// (disabled) re-checks the config every 60s and sweeps nothing, so an
+/// empty sweep costs one atomic load.
+fn spawn_affinity_sweeper(state: AppState, mut shutdown: tokio::sync::broadcast::Receiver<()>) {
+    tokio::spawn(async move {
+        tracing::debug!("key_affinity TTL sweeper spawned");
+        loop {
+            let ttl_secs = state
+                .inner
+                .load()
+                .config
+                .router_settings
+                .key_affinity_ttl_secs
+                .unwrap_or(0);
+            let sleep_for = if ttl_secs > 0 {
+                std::cmp::max(
+                    std::time::Duration::from_secs(ttl_secs / 4),
+                    std::time::Duration::from_secs(30),
+                )
+            } else {
+                std::time::Duration::from_secs(60)
+            };
+            tokio::select! {
+                _ = tokio::time::sleep(sleep_for) => {}
+                _ = shutdown.recv() => {
+                    tracing::debug!("key_affinity TTL sweeper shutting down");
+                    return;
+                }
+            }
+            if ttl_secs == 0 {
+                continue;
+            }
+            let removed = state.router.sweep_affinity(std::time::Instant::now());
+            if removed > 0 {
+                tracing::info!(
+                    removed,
+                    bindings = ?state.router.affinity_binding_counts(),
+                    "key_affinity TTL sweep: dropped idle bindings"
+                );
+            }
+        }
+    });
 }
 
 /// Background task: every 60s, log a summary of requests processed in the last minute.

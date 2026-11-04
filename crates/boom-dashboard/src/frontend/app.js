@@ -4777,7 +4777,8 @@
       <div class="form-card-grid">
         ${fieldSelect("cfg-rs-policy", t("config.field.schedule_policy"), buildPolicyOptions(),
           r.schedule_policy || "round_robin", { tip: t("tip.config.schedule_policy") })}
-        ${fieldNum("cfg-rs-affinity-ctx", t("config.field.key_affinity_context_threshold"), r.key_affinity_context_threshold || 0, { min: 0, tip: t("tip.config.affinity_context_threshold") })}
+        ${fieldNum("cfg-rs-affinity-ctx", t("config.field.key_affinity_context_threshold"), r.key_affinity_context_threshold || 0, { min: 0, tip: t("tip.config.key_affinity_context_threshold") })}
+        ${fieldNum("cfg-rs-affinity-ttl", t("config.field.key_affinity_ttl_secs"), r.key_affinity_ttl_secs || 0, { min: 0, step: 1, tip: t("tip.config.key_affinity_ttl_secs") })}
         ${fieldNum("cfg-rs-affinity-rebal", t("config.field.rebalance_threshold"), r.rebalance_threshold || 20, { min: 1, step: 1, tip: t("tip.config.rebalance_threshold") })}
         ${fieldNum("cfg-rs-flow-timeout", t("config.field.flow_control_queue_timeout_secs"), r.flow_control_queue_timeout_secs || 1200, { min: 1, step: 1, tip: t("tip.config.flow_control_queue_timeout_secs") })}
       </div>
@@ -5339,6 +5340,7 @@
         const routerValue = {
           schedule_policy: $("cfg-rs-policy").value,
           key_affinity_context_threshold: numOr($("cfg-rs-affinity-ctx"), 0),
+          key_affinity_ttl_secs: numOr($("cfg-rs-affinity-ttl"), 0),
           rebalance_threshold: numOr($("cfg-rs-affinity-rebal"), 20),
           flow_control_queue_timeout_secs: numOr($("cfg-rs-flow-timeout"), 1200),
           // These three editors live on the General card; their inputs are

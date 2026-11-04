@@ -2008,9 +2008,11 @@ fn create_policy(
         "key_affinity" => {
             let ctx_threshold = config.router_settings.key_affinity_context_threshold;
             let rebalance_threshold = config.router_settings.rebalance_threshold;
+            let ttl_secs = config.router_settings.key_affinity_ttl_secs.unwrap_or(0);
             tracing::info!(
-                "Using key_affinity policy: context_threshold={}, rebalance_threshold={}",
+                "Using key_affinity policy: context_threshold={}, ttl_secs={}, rebalance_threshold={}",
                 ctx_threshold,
+                ttl_secs,
                 rebalance_threshold,
             );
             let mut policy = KeyAffinityPolicy::new(
@@ -2018,6 +2020,7 @@ fn create_policy(
                 ctx_threshold,
                 rebalance_threshold,
                 Some(rebalance_move_tracker.clone()),
+                std::time::Duration::from_secs(ttl_secs),
             );
             policy.set_queue_info(flow_controller.clone());
             Arc::new(policy)

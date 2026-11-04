@@ -659,11 +659,20 @@ pub struct RouterSettings {
     /// Model group aliases: alias_name → target_model_name.
     #[serde(default)]
     pub model_group_alias: HashMap<String, ModelGroupAlias>,
-    /// Key-affinity: context threshold (total input chars) below which
-    /// the policy always picks lowest-load (warm-up phase).
-    /// 0 means always use affinity (no warm-up). Default: 0.
+    /// Key-affinity: short-context bypass threshold (input chars). Requests
+    /// smaller than this skip key affinity and ride the lowest-load pick —
+    /// re-prefill of a short input is cheap, so there is no cache value to
+    /// protect. 0 = always use affinity. Default: 0.
     #[serde(default)]
     pub key_affinity_context_threshold: u64,
+    /// Key-affinity: idle TTL (seconds) for key→deployment bindings. A key
+    /// idle longer than the TTL loses its binding and is re-spread by
+    /// bindings/capacity ratio on its next request. `None`/0 = bindings
+    /// never expire. Align with the upstream prefix-cache survival window —
+    /// a binding that outlives the cache has no reuse upside, only load
+    /// rigidity.
+    #[serde(default)]
+    pub key_affinity_ttl_secs: Option<u64>,
     /// Key-affinity: rebalance threshold (percentage, 1..=100).
     /// Shared rebalance threshold for key_affinity AND kvc_aware: if the
     /// preferred/winning provider's utilization exceeds the least-loaded
@@ -882,6 +891,7 @@ impl Default for RouterSettings {
             schedule_policy: default_schedule_policy(),
             model_group_alias: HashMap::new(),
             key_affinity_context_threshold: 0,
+            key_affinity_ttl_secs: None,
             rebalance_threshold: default_rebalance_threshold(),
             auto_router: None,
             kvc_aware: KvcAwareSettings::default(),

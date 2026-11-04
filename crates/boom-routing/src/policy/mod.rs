@@ -6,6 +6,7 @@ pub mod shuffle;
 
 use boom_core::provider::Provider;
 use std::sync::Arc;
+use std::time::Instant;
 
 /// Result of provider selection, carrying the KV-cache prefix hit ratio
 /// for the request so the gateway can decide full vs incremental reporting.
@@ -74,4 +75,18 @@ pub trait SchedulePolicy: Send + Sync {
 
     /// Policy name (for display / config validation).
     fn name(&self) -> &str;
+
+    /// Remove expired key-affinity bindings, returning how many were swept.
+    /// Called by boom-main's background sweeper; policies without affinity
+    /// state do nothing.
+    fn sweep_expired(&self, _now: Instant) -> usize {
+        0
+    }
+
+    /// Current key-affinity binding counts per deployment
+    /// (`deployment_id`, bound keys), zeros skipped, sorted by id. For
+    /// logging/observability; policies without affinity state return empty.
+    fn affinity_binding_counts(&self) -> Vec<(String, u64)> {
+        Vec::new()
+    }
 }

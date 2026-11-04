@@ -338,7 +338,7 @@ AppState (Clone, 进程生命)
 ### 4.3 关键配置结构
 
 - **ProviderParams**：model（provider/model-id）、api_key/base、aws 凭证、rpm/tpm、timeout（默认 1200s）、headers、temperature/max_tokens。
-- **router_settings**：schedule_policy、model_group_alias（Simple/Extended{hidden}）、key_affinity_context_threshold、rebalance_threshold、auto_router、kvc_aware{max_blocks/router_ttl_secs}（块大小为 512B 代码常量 `KV_BLOCK_SIZE`，非配置项）、enable_priority_header、flow_control_queue_timeout_secs、strip_claude_code_attribution、forward_client_headers。
+- **router_settings**：schedule_policy、model_group_alias（Simple/Extended{hidden}）、key_affinity_context_threshold（短上下文绕行阈值，低于它的请求走最低负载，0=始终亲和）、key_affinity_ttl_secs（key→部署绑定的空闲 TTL，0=永不过期）、rebalance_threshold、auto_router、kvc_aware{max_blocks/router_ttl_secs}（块大小为 512B 代码常量 `KV_BLOCK_SIZE`，非配置项）、enable_priority_header、flow_control_queue_timeout_secs、strip_claude_code_attribution、forward_client_headers。
 - **plan_settings**：default_plan / default_team_plan / plans[]（含 schedule 时段）。
 - **deployment_health_check**：path、failure/recovery_threshold、检查间隔。
 - **trace / prompt_log**：OTLP 端点与采样/截断参数（共享 OtlpConfig）。
