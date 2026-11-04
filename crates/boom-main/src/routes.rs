@@ -1107,32 +1107,35 @@ async fn chat_completions_inner(
                 // any upstream bytes arrive. The stream wrapper's Drop will
                 // emit the matching Response-phase entry via `new_response_from`.
                 let _ = sender.send(prompt_entry.clone());
+                let response_id_slot = new_streamed_response_id_slot();
                 let mut prompt_logged = PromptLogStream::new(
                     logged,
                     sender,
                     prompt_entry,
-                    sse_raw_data_extractor(),
+                    sse_raw_data_extractor(response_id_slot.clone()),
                 );
-                // Provider-owned trace snapshot (fusion/KV-index/etc.) and the
-                // raw upstream exchange are injected into the Response-phase
-                // entry built on Drop — runs AFTER the inner stream's Drop so
+                // The enricher runs after the wrapper's Drop assembled the
+                // response: stamp the upstream response id (chatcmpl-…)
+                // captured from the chunks over the request-uuid placeholder,
+                // then inject provider-owned metadata (fusion trace snapshot,
+                // raw upstream exchange) — AFTER the inner stream's Drop so
                 // trace finalization side effects and the final captured
                 // frames are visible.
-                if provider_prompt_trace.is_some() || prompt_log_raw_capture.is_some() {
-                    let trace = provider_prompt_trace.clone();
-                    let raw_capture = prompt_log_raw_capture.clone();
-                    prompt_logged = prompt_logged.with_entry_enricher(Arc::new(move |entry| {
-                        if let Some(trace) = trace.as_ref() {
-                            trace.finalize();
-                            if let Some(fusion) = trace.snapshot() {
-                                entry.set_fusion(fusion);
-                            }
+                let stamp = stamp_streamed_response_id(response_id_slot);
+                let trace = provider_prompt_trace.clone();
+                let raw_capture = prompt_log_raw_capture.clone();
+                prompt_logged = prompt_logged.with_entry_enricher(Arc::new(move |entry| {
+                    stamp(entry);
+                    if let Some(trace) = trace.as_ref() {
+                        trace.finalize();
+                        if let Some(fusion) = trace.snapshot() {
+                            entry.set_fusion(fusion);
                         }
-                        if let Some(cap) = raw_capture.as_ref() {
-                            entry.set_raw_exchange(cap.take_request_body(), cap.take_response_body());
-                        }
-                    }));
-                }
+                    }
+                    if let Some(cap) = raw_capture.as_ref() {
+                        entry.set_raw_exchange(cap.take_request_body(), cap.take_response_body());
+                    }
+                }));
                 let response =
                     Sse::new(sse_item_to_event(prompt_logged)).keep_alive(KeepAlive::default());
                 return Ok(response.into_response());
@@ -3557,14 +3560,25 @@ pub async fn messages(
                 // Request-phase fires immediately. Stream wrapper's Drop
                 // emits the Response-phase entry with assembled content.
                 let _ = sender.send(prompt_entry.clone());
-                let mut prompt_logged = PromptLogStream::new(logged, sender, prompt_entry, sse_anthropic_extractor());
-                // Raw upstream exchange is injected on Drop — after the inner
-                // stream finished so all captured frames are visible.
-                if let Some(cap) = prompt_log_raw_capture.clone() {
-                    prompt_logged = prompt_logged.with_entry_enricher(Arc::new(move |entry| {
+                let response_id_slot = new_streamed_response_id_slot();
+                let mut prompt_logged = PromptLogStream::new(
+                    logged,
+                    sender,
+                    prompt_entry,
+                    sse_anthropic_extractor(response_id_slot.clone()),
+                );
+                // Stamp the transcoded message id (msg_…) captured from
+                // message_start over the request-uuid placeholder, then
+                // inject the raw upstream exchange — after the inner stream
+                // finished so all captured frames are visible.
+                let stamp = stamp_streamed_response_id(response_id_slot);
+                let raw_capture = prompt_log_raw_capture.clone();
+                prompt_logged = prompt_logged.with_entry_enricher(Arc::new(move |entry| {
+                    stamp(entry);
+                    if let Some(cap) = raw_capture.as_ref() {
                         entry.set_raw_exchange(cap.take_request_body(), cap.take_response_body());
-                    }));
-                }
+                    }
+                }));
                 let response = Sse::new(sse_item_to_event(prompt_logged)).keep_alive(KeepAlive::default());
                 return Ok(response.into_response());
             }
@@ -4460,12 +4474,25 @@ pub async fn responses(
                     prompt_log_headers.clone(),
                 );
                 let _ = sender.send(prompt_entry.clone());
-                let mut prompt_logged = PromptLogStream::new(logged, sender, prompt_entry, sse_responses_extractor());
-                if let Some(cap) = prompt_log_raw_capture.clone() {
-                    prompt_logged = prompt_logged.with_entry_enricher(Arc::new(move |entry| {
+                let response_id_slot = new_streamed_response_id_slot();
+                let mut prompt_logged = PromptLogStream::new(
+                    logged,
+                    sender,
+                    prompt_entry,
+                    sse_responses_extractor(response_id_slot.clone()),
+                );
+                // Stamp the gateway-minted resp_ id (captured from
+                // response.created — the id the client chains on with
+                // previous_response_id) over the request-uuid placeholder,
+                // then inject the raw upstream exchange.
+                let stamp = stamp_streamed_response_id(response_id_slot);
+                let raw_capture = prompt_log_raw_capture.clone();
+                prompt_logged = prompt_logged.with_entry_enricher(Arc::new(move |entry| {
+                    stamp(entry);
+                    if let Some(cap) = raw_capture.as_ref() {
                         entry.set_raw_exchange(cap.take_request_body(), cap.take_response_body());
-                    }));
-                }
+                    }
+                }));
                 let response = Sse::new(sse_item_to_event(prompt_logged)).keep_alive(KeepAlive::default());
                 let mut resp = response.into_response();
                 if let Some(v) = dropped_header.take() {
@@ -4917,8 +4944,13 @@ pub async fn get_response(
 }
 
 /// Prompt-log extractor for Responses SSE events: captures text deltas (and
-/// tool-call argument deltas as content) from the event stream.
-fn sse_responses_extractor() -> impl FnMut(&Result<SseItem, Infallible>) -> Option<boom_promptlog::ChunkDelta> + Unpin {
+/// tool-call argument deltas as content) from the event stream. Any event
+/// carrying a `response` object exposes the gateway-minted `resp_` id (the
+/// one the client chains on with previous_response_id) — captured into the
+/// slot for the enricher stamp.
+fn sse_responses_extractor(
+    response_id_slot: StreamedResponseIdSlot,
+) -> impl FnMut(&Result<SseItem, Infallible>) -> Option<boom_promptlog::ChunkDelta> + Unpin {
     use boom_promptlog::ChunkDelta;
     move |item: &Result<SseItem, Infallible>| match item {
         Ok(sse_item) => {
@@ -4930,6 +4962,9 @@ fn sse_responses_extractor() -> impl FnMut(&Result<SseItem, Infallible>) -> Opti
                 Ok(v) => v,
                 Err(_) => return None,
             };
+            if let Some(id) = v.pointer("/response/id").and_then(|i| i.as_str()) {
+                note_streamed_response_id(&response_id_slot, id);
+            }
             match v.get("type").and_then(|t| t.as_str()).unwrap_or("") {
                 "response.output_text.delta" => Some(ChunkDelta {
                     content: v.get("delta").and_then(|d| d.as_str()).map(String::from),
@@ -5028,8 +5063,58 @@ where
     })
 }
 
+/// Shared slot carrying the streamed response's real id from the extractor
+/// closure (which parses every chunk) to the entry enricher (which runs after
+/// `PromptLogStream`'s Drop assembled the response). The gateway request uuid
+/// the wrapper stamps as a placeholder gets overwritten with the id the
+/// client actually saw — mirroring the non-streaming path, which logs the
+/// provider response's id verbatim.
+type StreamedResponseIdSlot = Arc<std::sync::Mutex<Option<String>>>;
+
+fn new_streamed_response_id_slot() -> StreamedResponseIdSlot {
+    Arc::new(std::sync::Mutex::new(None))
+}
+
+/// Record the first non-empty id a chunk exposes (OpenAI repeats the same
+/// `chatcmpl-…` on every chunk; Anthropic/Responses carry it on the opening
+/// event) — first-wins, later chunks are no-ops.
+fn note_streamed_response_id(slot: &StreamedResponseIdSlot, id: &str) {
+    if id.is_empty() {
+        return;
+    }
+    let mut g = slot.lock().unwrap();
+    if g.is_none() {
+        *g = Some(id.to_string());
+    }
+}
+
+/// Enricher half of the slot protocol: stamp the captured id onto the
+/// assembled response's `id` field. No-op when no chunk carried one (stream
+/// truncated before the first chunk, or a provider that puts no id on
+/// chunks) — the wrapper's request-uuid placeholder then stands.
+fn stamp_streamed_response_id(
+    slot: StreamedResponseIdSlot,
+) -> impl Fn(&mut PromptLogEntry) + Send + Sync + 'static {
+    move |entry| {
+        let Some(id) = slot.lock().ok().and_then(|mut g| g.take()) else {
+            return;
+        };
+        if let Some(resp) = entry.response.as_mut() {
+            let r = Arc::make_mut(resp);
+            if let Some(obj) = r.as_object_mut() {
+                obj.insert("id".to_string(), serde_json::Value::String(id));
+            }
+        }
+    }
+}
+
 /// Returns a closure that extracts raw JSON data from an SSE stream item.
-fn sse_raw_data_extractor() -> impl FnMut(&Result<SseItem, Infallible>) -> Option<boom_promptlog::ChunkDelta> + Unpin {
+/// The upstream `chatcmpl-…` id (repeated on every OpenAI-shaped chunk) is
+/// captured into the slot for the enricher stamp — the assembled response
+/// then carries the provider id, matching the non-stream log.
+fn sse_raw_data_extractor(
+    response_id_slot: StreamedResponseIdSlot,
+) -> impl FnMut(&Result<SseItem, Infallible>) -> Option<boom_promptlog::ChunkDelta> + Unpin {
     use boom_promptlog::ChunkDelta;
     // OpenAI SSE chunks have shape `{"choices": [{"delta": {"content": "..."}, "finish_reason": ...}], "usage": {...}}`.
     // We parse the raw SSE `data:` payload and pull out content / finish_reason / usage.
@@ -5045,6 +5130,9 @@ fn sse_raw_data_extractor() -> impl FnMut(&Result<SseItem, Infallible>) -> Optio
                 Ok(v) => v,
                 Err(_) => return None,
             };
+            if let Some(id) = v.get("id").and_then(|i| i.as_str()) {
+                note_streamed_response_id(&response_id_slot, id);
+            }
             // In-stream error event ({"error": {...}}, no choices/finish/usage):
             // surface as the failure sentinel — otherwise the stream ends
             // marker-less and Drop mislabels a real upstream failure as 499
@@ -5091,11 +5179,15 @@ fn sse_raw_data_extractor() -> impl FnMut(&Result<SseItem, Infallible>) -> Optio
 ///   accumulated content so model reasoning is recoverable from prompt log)
 /// - `message_delta` → `delta.stop_reason` + `usage`
 /// - `message_start` → `message.usage.input_tokens` (for prompt-tokens capture
-///   when the upstream doesn't include them in the final message_delta)
+///   when the upstream doesn't include them in the final message_delta); the
+///   `message.id` (transcoder-minted, the one the client sees) is captured
+///   into the slot for the enricher stamp
 ///
 /// Other chunk types (content_block_start/stop, message_stop, ping) return
 /// None — the wrapper just skips them.
-fn sse_anthropic_extractor() -> impl FnMut(&Result<SseItem, Infallible>) -> Option<boom_promptlog::ChunkDelta> + Unpin {
+fn sse_anthropic_extractor(
+    response_id_slot: StreamedResponseIdSlot,
+) -> impl FnMut(&Result<SseItem, Infallible>) -> Option<boom_promptlog::ChunkDelta> + Unpin {
     use boom_promptlog::ChunkDelta;
     // Toggle so the prompt log shows model thinking as a distinct block
     // instead of blending it into the user-facing text.
@@ -5192,9 +5284,15 @@ fn sse_anthropic_extractor() -> impl FnMut(&Result<SseItem, Infallible>) -> Opti
                     }
                 }
                 "message_start" => {
-                    // message_start carries input_tokens; surface as usage so the
-                    // wrapper picks it up. The terminal message_delta may overwrite
-                    // it with the final count, which is fine.
+                    // message_start carries the message id (minted by the
+                    // transcoder — the one the client sees and can reference)
+                    // plus input_tokens; the id goes to the slot for the
+                    // enricher stamp, the usage surfaces for prompt-tokens
+                    // capture. The terminal message_delta may overwrite the
+                    // usage with the final count, which is fine.
+                    if let Some(id) = v.pointer("/message/id").and_then(|i| i.as_str()) {
+                        note_streamed_response_id(&response_id_slot, id);
+                    }
                     let usage = v
                         .get("message")
                         .and_then(|m| m.get("usage"))
@@ -5222,8 +5320,9 @@ mod tests {
     use super::{
         build_gateway_headers, compose_gateway_headers, done_sse_item,
         extract_user_tags, forward_client_headers, insert_header_ci, is_vip_key,
-        preferred_stream_usage, sse_stream_from_chat_stream, UsageTracker, UsageTrackerState,
-        UserTags,
+        new_streamed_response_id_slot, preferred_stream_usage, sse_anthropic_extractor,
+        sse_raw_data_extractor, sse_stream_from_chat_stream, stamp_streamed_response_id,
+        UsageTracker, UsageTrackerState, UserTags,
     };
     use axum::http::{HeaderMap, HeaderName, HeaderValue};
     use boom_core::types::{
@@ -5231,9 +5330,11 @@ mod tests {
         StreamChoice, StreamDelta, ToolCallDelta, Usage,
     };
     use boom_core::GatewayError;
+    use boom_promptlog::{LogPhase, PromptLogEntry, PromptLogStream};
     use futures::StreamExt;
     use serde_json::json;
     use std::convert::Infallible;
+    use std::sync::Arc;
 
     #[test]
     fn vip_true_in_metadata() {
@@ -5788,6 +5889,85 @@ mod tests {
             Some("tool_calls")
         );
         assert_eq!(items.last().unwrap().json_data, "[DONE]");
+    }
+
+    #[tokio::test]
+    async fn prompt_log_stream_records_upstream_chatcmpl_id() {
+        // The assembled streaming response must carry the upstream chatcmpl id
+        // (present on every chunk the client sees), not the gateway's internal
+        // request uuid — matching the non-streaming log, which records the
+        // provider's response id verbatim.
+        let text_chunk = |content: &str, finish: Option<&str>| ChatStreamChunk {
+            id: "chatcmpl-upstream-9".to_string(),
+            object: "chat.completion.chunk".to_string(),
+            created: 0,
+            model: "test-model".to_string(),
+            choices: vec![StreamChoice {
+                index: 0,
+                delta: StreamDelta {
+                    role: None,
+                    content: Some(content.to_string()),
+                    tool_calls: None,
+                    reasoning_content: None,
+                },
+                finish_reason: finish.map(|s| s.to_string()),
+            }],
+            usage: None,
+            raw_data: None,
+        };
+        let chunks: Vec<Result<ChatStreamChunk, GatewayError>> = vec![
+            Ok(text_chunk("Hi", None)),
+            Ok(text_chunk("", Some("stop"))),
+        ];
+        let stream: ChatStream = Box::pin(futures::stream::iter(chunks));
+        let sse = sse_stream_from_chat_stream(stream, UsageTracker::default());
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let req = PromptLogEntry::new_request(
+            "gateway-request-uuid",
+            None,
+            "kh",
+            None,
+            None,
+            "test-model",
+            "/v1/chat/completions",
+            true,
+            Arc::new(json!({})),
+            None,
+            None,
+        );
+        let response_id_slot = new_streamed_response_id_slot();
+        let mut wrapper = PromptLogStream::new(
+            sse,
+            tx,
+            req,
+            sse_raw_data_extractor(response_id_slot.clone()),
+        )
+        .with_entry_enricher(Arc::new(stamp_streamed_response_id(response_id_slot)));
+        while wrapper.next().await.is_some() {}
+        drop(wrapper);
+
+        let entry = rx.recv().await.expect("response entry sent");
+        assert_eq!(entry.phase, LogPhase::Response);
+        let resp = entry.response.expect("response set");
+        assert_eq!(resp["id"], "chatcmpl-upstream-9");
+        assert_eq!(resp["choices"][0]["message"]["content"], "Hi");
+    }
+
+    #[test]
+    fn anthropic_extractor_pulls_message_id_from_message_start() {
+        let response_id_slot = new_streamed_response_id_slot();
+        let mut f = sse_anthropic_extractor(response_id_slot.clone());
+        let item = Ok(super::SseItem {
+            event: axum::response::sse::Event::default(),
+            json_data: r#"{"type":"message_start","message":{"id":"msg_transcoded_1","usage":{"input_tokens":5,"output_tokens":0}}}"#.to_string(),
+        });
+        let delta = f(&item).expect("message_start yields a delta");
+        assert_eq!(
+            response_id_slot.lock().unwrap().as_deref(),
+            Some("msg_transcoded_1")
+        );
+        assert!(delta.usage.is_some());
     }
 
     #[tokio::test]
