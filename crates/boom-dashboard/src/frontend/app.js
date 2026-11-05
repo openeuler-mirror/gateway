@@ -3598,6 +3598,7 @@
   let keysVipOnly = false;
   let keysPlanFilter = "";  // "" = all, "unassigned"/"none" = follows default, "no_plan" = explicit no-plan, otherwise plan name
   let keysDataCache = [];
+  let keysLoadToken = 0;
 
   function setupKeysSearch() {
     const el = document.getElementById("keys-search");
@@ -3641,6 +3642,9 @@
       if (!stillExists) {
         keysPlanFilter = "";
         sel.value = "";
+        // Reload with the visible filter and invalidate any in-flight query
+        // that still carries the removed plan.
+        loadKeys(1);
       } else {
         sel.value = keysPlanFilter;
       }
@@ -3649,21 +3653,29 @@
 
   async function loadKeys(page) {
     if (page !== undefined) keysPage = page;
+    const myToken = ++keysLoadToken;
     try {
-      // Load prompt log excluded keys list.
-      try {
-        const plData = await api("/admin/prompt-log/status");
-        window._promptLogExcludedKeys = plData.excluded_keys || [];
-      } catch { window._promptLogExcludedKeys = []; }
+      // Snapshot the query before awaiting the prompt-log request.
       let url = `/admin/keys?page=${keysPage}&per_page=50`;
       if (keysSearch) url += `&search=${encodeURIComponent(keysSearch)}`;
       if (keysVipOnly) url += "&vip_only=true";
       if (keysPlanFilter) url += `&plan=${encodeURIComponent(keysPlanFilter)}`;
+      // Load prompt log excluded keys list.
+      let excludedKeys = [];
+      try {
+        const plData = await api("/admin/prompt-log/status");
+        excludedKeys = plData.excluded_keys || [];
+      } catch { /* Prompt-log status is optional for listing keys. */ }
+      if (myToken !== keysLoadToken) return;
       const data = await api(url);
+      if (myToken !== keysLoadToken) return;
+      // Publish the edit metadata and rows only for the latest load.
+      window._promptLogExcludedKeys = excludedKeys;
       keysDataCache = data.keys || [];
       renderKeysTable(keysDataCache);
       renderKeysPagination(data);
     } catch (err) {
+      if (myToken !== keysLoadToken) return;
       const wrap = document.getElementById("keys-table-wrap");
       if (wrap) wrap.innerHTML = `<p class="error-msg">${t("common.failed_to_load", { what: t("keys.title"), message: esc(err.message) })}</p>`;
       console.error("loadKeys error:", err);
