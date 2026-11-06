@@ -1082,6 +1082,13 @@
       errorBanner = '<p style="color:#c00;margin:0 0 6px">' + t("stats.inflight.24h_load_failed", { error: esc(String(deployment24hSummary.__error)) }) + "</p>";
     }
 
+    // Rows arrive model-sorted from the backend (alphabetical model, then
+    // deployment_id), so same-model instances are consecutive. Render the
+    // vendor logo + model name + visibility badge once per model group;
+    // continuation rows show only the instance id, aligned under the
+    // first row's id.
+    var prevModel = null;
+
     wrap.innerHTML =
       errorBanner +
       '<table class="data-table"><thead><tr>' +
@@ -1113,8 +1120,13 @@
             reqsHtml = '<span class="cell-tip" data-tip="' + reqItems.join("&#10;").replace(/"/g, "&quot;") + '">' + reqsDisplay + '</span>';
           }
 
-          var deployCell = renderDeployCell(d.model, d.deployment_id)
-            + (visMap ? visibilityBadgeFor(visMap[d.model]) : "");
+          var isGroupFirst = d.model !== prevModel;
+          prevModel = d.model;
+          var deployCell = isGroupFirst
+            ? renderDeployCell(d.model, d.deployment_id)
+              + (visMap ? visibilityBadgeFor(visMap[d.model]) : "")
+            : '<div class="deploy-cell deploy-cell--inst"><div class="deploy-id">' +
+              esc(d.deployment_id) + "</div></div>";
 
           // 24h aggregates — read from cache populated on page load / Refresh button.
           var s = d.deployment_id ? deployment24hSummary[d.deployment_id] : null;
@@ -7933,18 +7945,30 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
     return v.toFixed(1) + "%";
   }
 
-  // Ordered series palette: the accent leads, neutral graphite steps follow,
-  // quiet hues only past five series. Index comes from the chart's fixed
-  // alphabetical segmentOrder, so colors are stable within a chart.
+  // Ordered series palette for per-instance chart segments. The accent leads
+  // (single-instance models keep the brand color); the rest spread across
+  // distinct hues with mid lightness so they read on both light and dark
+  // themes. 12–15 are darker siblings of earlier hues, placed far from their
+  // bright counterpart in segment order so a >12-instance stack stays
+  // distinguishable. Index comes from the chart's fixed alphabetical
+  // segmentOrder, so colors are stable within a chart.
   var DEPLOYMENT_SERIES = [
-    "var(--primary)",
-    "#94a3b8",
-    "#cbd5e1",
-    "#64748b",
-    "#e2e8f0",
-    "#7dd3fc",
-    "#c4b5fd",
-    "#fcd34d",
+    "var(--primary)", // 0  cyan — brand accent
+    "#ef4444",        // 1  red
+    "#f97316",        // 2  orange
+    "#eab308",        // 3  yellow
+    "#84cc16",        // 4  lime
+    "#16a34a",        // 5  green
+    "#14b8a6",        // 6  teal
+    "#a855f7",        // 7  purple
+    "#ec4899",        // 8  pink
+    "#4f46e5",        // 9  indigo
+    "#3b82f6",        // 10 blue
+    "#94a3b8",        // 11 slate (neutral break)
+    "#b45309",        // 12 amber-brown
+    "#a21caf",        // 13 fuchsia (deep sibling of 8)
+    "#1d4ed8",        // 14 blue-700 (deep sibling of 10)
+    "#7e22ce",        // 15 violet-700 (deep sibling of 7)
   ];
   function deploymentColor(index) {
     return DEPLOYMENT_SERIES[index % DEPLOYMENT_SERIES.length];

@@ -468,9 +468,11 @@
           <section id="admin-config" class="section">
             <div class="section-header">
               <h2 data-i18n="config.title">Configuration</h2>
-              <button class="btn-small" id="btn-export-config" data-i18n="action.export_config">Export Config</button>
-              <button class="btn-small" id="btn-writeback-config" data-i18n="action.writeback_config">Write Back Config</button>
-              <button class="btn-small" id="btn-reload-config-page" data-i18n="action.reload_config">Reload Config</button>
+              <div>
+                <button class="btn-small" id="btn-export-config" data-i18n="action.export_config">Export Config</button>
+                <button class="btn-small" id="btn-writeback-config" data-i18n="action.writeback_config">Write Back Config</button>
+                <button class="btn-small" id="btn-reload-config-page" data-i18n="action.reload_config">Reload Config</button>
+              </div>
             </div>
             <p class="modal-hint" data-i18n="config.intro">All settings live in config.yaml. Edits here write back in place and trigger a hot-reload.</p>
             <div class="config-notice" data-i18n="config.comment_notice">Note: web edits re-serialize the YAML and drop comments. A rolling .bak is saved before each write.</div>

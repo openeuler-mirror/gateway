@@ -410,9 +410,6 @@ p.error { color: var(--danger); font-style: italic; margin: 0; }
   flex: 1; padding: 32px; overflow-y: auto; background: var(--bg);
   animation: fadeIn .2s ease;
 }
-/* Fluid but capped — on ultrawide monitors tables stop stretching
-   edge-to-edge; the scroll surface itself stays full-bleed. */
-.main-content > * { max-width: 1600px; margin-left: auto; margin-right: auto; }
 @keyframes fadeIn {
   from { opacity: 0; }
   to   { opacity: 1; }
@@ -1847,6 +1844,11 @@ input[list] {
   color: var(--text3);
   margin-top: 2px;
 }
+/* Continuation rows of a multi-instance model group in the inflight
+   table: the logo + model name render once on the group's first row;
+   these rows carry only the instance id, aligned under the first id. */
+.deploy-cell--inst { padding-left: 32px; }
+.deploy-cell--inst .deploy-id { margin-top: 0; }
 
 /* ── Per-1M-token cost cell (models table) ───────────────── */
 /* Inline "label:$value" per line — three rows stack tightly so the
