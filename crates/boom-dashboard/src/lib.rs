@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod config_kv;
 pub mod handlers_admin;
 pub mod handlers_static;
 pub mod handlers_user;
@@ -358,6 +359,12 @@ pub fn build_router<S: Clone + Send + Sync + 'static>(state: DashboardState) -> 
         .route(
             "/dashboard/api/admin/trace/otlp-ping",
             post(handlers_admin::ping_trace_otlp_endpoint),
+        )
+        // Admin — Trace metrics switch (DB-backed via boom_config KV).
+        .route(
+            "/dashboard/api/admin/trace/metrics-enabled",
+            get(handlers_admin::get_trace_metrics_enabled)
+                .put(handlers_admin::set_trace_metrics_enabled),
         )
         // Admin — Hot-reload config.
         .route(

@@ -77,6 +77,19 @@ impl Router {
         self.policy.load().inner.name().to_string()
     }
 
+    /// Sweep expired key-affinity bindings on the current policy (idle-TTL
+    /// hygiene). Delegates through the ArcSwap so it always targets the
+    /// post-reload policy. Returns the number of bindings removed.
+    pub fn sweep_affinity(&self, now: std::time::Instant) -> usize {
+        self.policy.load().inner.sweep_expired(now)
+    }
+
+    /// Snapshot of per-deployment affinity binding counts for
+    /// logging/observability.
+    pub fn affinity_binding_counts(&self) -> Vec<(String, u64)> {
+        self.policy.load().inner.affinity_binding_counts()
+    }
+
     /// Hot-swap the auto router classifier (e.g. on config reload).
     pub fn set_classifier(&self, classifier: Option<Arc<AutoRouter>>) {
         self.classifier

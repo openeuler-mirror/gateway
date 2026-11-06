@@ -468,6 +468,74 @@ pub async fn set_user_tag_headers(
 }
 
 // ═══════════════════════════════════════════════════════════
+// Trace metrics switch (boom_config KV)
+// ═══════════════════════════════════════════════════════════
+
+/// GET /admin/trace/metrics-enabled — DB-semantic switch value + the YAML
+/// trace master switch, so the frontend can warn when the switch is on but
+/// the master gate keeps `/metrics` dark.
+pub async fn get_trace_metrics_enabled(
+    _session: AdminSession,
+    Extension(state): Extension<std::sync::Arc<DashboardState>>,
+) -> Response {
+    let enabled = state.trace.metrics_enabled().await;
+    let trace_enabled = state.trace.trace_enabled().await;
+    Json(json!({
+        "enabled": enabled,
+        "trace_enabled": trace_enabled,
+    }))
+    .into_response()
+}
+
+/// PUT /admin/trace/metrics-enabled — flip the DB-authoritative metrics
+/// channel switch (`boom_config` KV `trace_metrics_enabled`). Body:
+/// `{ "enabled": bool }`. DB write first, memory second — a DB failure
+/// returns 500 and leaves the running channel untouched. The effective
+/// channel state is `trace master switch && this switch` (computed inside
+/// the registry).
+#[derive(Debug, Deserialize)]
+pub struct SetTraceMetricsEnabledRequest {
+    pub enabled: bool,
+}
+
+pub async fn set_trace_metrics_enabled(
+    _session: AdminSession,
+    Extension(state): Extension<std::sync::Arc<DashboardState>>,
+    Json(req): Json<SetTraceMetricsEnabledRequest>,
+) -> Response {
+    let db_pool = match &state.db_pool {
+        Some(pool) => pool,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "Database not available — metrics switch is DB-backed; \
+                              use trace.metrics.enabled in YAML for no-DB mode"
+                })),
+            )
+                .into_response()
+        }
+    };
+    match crate::config_kv::set_bool(db_pool, crate::config_kv::TRACE_METRICS_ENABLED, req.enabled)
+        .await
+    {
+        Ok(()) => {
+            state.trace.set_metrics_enabled(req.enabled).await;
+            tracing::info!(enabled = req.enabled, "Trace metrics switch updated");
+            Json(json!({"ok": true, "enabled": req.enabled})).into_response()
+        }
+        Err(e) => {
+            tracing::error!("set_trace_metrics_enabled failed: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "Internal error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
 // Key management (DB operations)
 // ═══════════════════════════════════════════════════════════
 

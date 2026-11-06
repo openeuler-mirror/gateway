@@ -1,5 +1,5 @@
 /* ── Fonts ───────────────────────────────────────────────── */
-@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700;800&family=Space+Grotesk:wght@500;600;700&family=Fira+Code:wght@400;500;600&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600&family=Space+Grotesk:wght@500;600&family=Fira+Code:wght@400;500&display=swap');
 
 /* ── Reset ─────────────────────────────────────────────── */
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -28,11 +28,18 @@
   --text3:     #8891a5;
   --text-inv:  #ffffff;
 
-  /* Brand */
-  --primary:     #e8740c;
-  --primary-h:   #c9600a;
-  --primary-bg:  rgba(232,116,12,.07);
-  --primary-glow:rgba(232,116,12,.15);
+  /* Brand — signal cyan, from the instrument-panel world. #0e7490 keeps
+     4.5:1 contrast both as white-text button fill and as text on white. */
+  --primary:     #0e7490;
+  --primary-h:   #155e75;
+  --primary-bg:  rgba(14,116,144,.08);
+  --primary-glow:rgba(14,116,144,.16);
+  --accent-ink:  #ffffff;
+  /* Primary button fill differs per theme: light = accent fill, dark =
+     off-white fill with dark ink (accent recedes to selection + figures). */
+  --btn-primary-bg:   var(--primary);
+  --btn-primary-bg-h: var(--primary-h);
+  --btn-primary-text: var(--accent-ink);
 
   /* Semantic */
   --success:     #10b981;
@@ -50,70 +57,49 @@
   --shadow-md: 0 4px 14px rgba(0,0,0,.06), 0 1px 3px rgba(0,0,0,.03);
   --shadow-lg: 0 12px 40px rgba(0,0,0,.08), 0 4px 12px rgba(0,0,0,.04);
 
-  /* Sidebar */
-  --sidebar-bg:    #111318;
-  --sidebar-hover: rgba(255,255,255,.06);
-  --sidebar-active:rgba(232,116,12,.14);
-  --sidebar-text:  #9ca3b8;
-  --sidebar-text-active:#f0a04b;
-  --sidebar-border:rgba(255,255,255,.08);
-
-  /* Sidebar gradient — bright brand purple. Overridden in dark mode. */
-  --sidebar-gradient-1: #5053e8;
-  --sidebar-gradient-2: #7879f0;
-  --sidebar-gradient-3: #a1a4f7;
-
-  /* Login — Aurora stage: neutral base + multi-layer ambient purple pools
-   * over a faint grid + noise. Card is solid white with multi-layer shadow
-   * and a soft inner top-edge glow so it reads as floating above the stage.
-   * Accent is the brand purple, same hue family as the sidebar gradient. */
-  --login-bg:            #f5f6fa;
-  --login-aurora-1:      rgba(80,83,232,.14);
-  --login-aurora-2:      rgba(120,121,240,.10);
-  --login-aurora-3:      rgba(161,164,247,.16);
-  --login-grid-color:    rgba(80,83,232,.045);
-  --login-card-bg:       #ffffff;
-  --login-card-border:   rgba(228,231,238,.9);
-  --login-card-glow:     rgba(255,255,255,.7);
-  --login-input-bg:      #f7f8fb;
-  --login-input-border:  #d8dce5;
-  --login-input-bg-focus:#ffffff;
-
-  /* Login accent — purple gradient endpoints for button + focus ring +
-   * hover link. Same hue family as sidebar. */
-  --login-accent:   #5053e8;
-  --login-accent-2: #7879f0;
+  /* Sidebar — graphite in both themes; a long-stare surface, so no hue.
+     Accent appears only as the active indicator bar and stays a brighter
+     cyan shade than the content accent (dark surface needs the lighter step). */
+  --sidebar-bg:         #131519;
+  --sidebar-hover:      rgba(255,255,255,.06);
+  --sidebar-active:     rgba(255,255,255,.10);
+  --sidebar-text:       #9aa1ad;
+  --sidebar-text-active:#f4f6f8;
+  --sidebar-border:     rgba(255,255,255,.08);
+  --sidebar-accent:     #22d3ee;
 
   /* Scrollbar */
   --scrollbar-track: transparent;
   --scrollbar-thumb: var(--border);
   --scrollbar-hover: var(--border2);
 
-  /* Selection — purple to match brand (was orange #e8740c, caused a
-   * yellow flash when text/button got briefly selected during click). */
-  --selection-bg: rgba(80,83,232,.20);
+  --selection-bg: rgba(14,116,144,.20);
 }
 
 /* ── Dark Theme ────────────────────────────────────────── */
 [data-theme="dark"] {
-  /* Surfaces — tinted slightly purple so they harmonize with the deep-purple
-     sidebar (#1f1b4d→#3a3170) rather than reading as neutral gray-blue. */
-  --bg:        #0c0e1a;
-  --surface:   #15182a;
-  --surface2:  #1d2138;
-  --surface3:  #262b48;
-  --border:    #2a2f4e;
-  --border2:   #3a4170;
+  /* Surfaces — neutral graphite ramp, no hue. Depth from surface steps and
+     hairlines, not shadows. */
+  --bg:        #0f1115;
+  --surface:   #15181d;
+  --surface2:  #1b1f25;
+  --surface3:  #232830;
+  --border:    #272c34;
+  --border2:   #363d47;
 
-  --text:      #e4e7ee;
-  --text2:     #a0a8c0;
-  --text3:     #636d88;
-  --text-inv:  #111318;
+  --text:      #e6e9ed;
+  --text2:     #a3aab5;
+  --text3:     #69707c;
+  --text-inv:  #0f1115;
 
-  --primary:     #f0920e;
-  --primary-h:   #ffa62b;
-  --primary-bg:  rgba(240,146,14,.1);
-  --primary-glow:rgba(240,146,14,.2);
+  --primary:     #22d3ee;
+  --primary-h:   #67e8f9;
+  --primary-bg:  rgba(34,211,238,.10);
+  --primary-glow:rgba(34,211,238,.20);
+  --accent-ink:  #0f1115;
+  --btn-primary-bg:   #e6e9ed;
+  --btn-primary-bg-h: #ffffff;
+  --btn-primary-text: #0f1115;
 
   --success:     #34d399;
   --success-bg:  rgba(52,211,153,.1);
@@ -129,46 +115,18 @@
   --shadow-md: 0 4px 14px rgba(0,0,0,.4), 0 1px 3px rgba(0,0,0,.3);
   --shadow-lg: 0 12px 40px rgba(0,0,0,.5), 0 4px 12px rgba(0,0,0,.4);
 
-  --sidebar-bg:     #0a0c10;
-  --sidebar-hover:  rgba(255,255,255,.05);
-  --sidebar-active: rgba(240,146,14,.14);
-  --sidebar-text:   #6b7394;
-  --sidebar-text-active:#f5a623;
-  --sidebar-border: rgba(255,255,255,.06);
-
-  /* Sidebar gradient override — deep purple, same hue family as the light-mode
-     #5053e8→#a1a4f7 sidebar but tuned for dark surfaces. Light mode keeps the
-     bright gradient as a brand anchor; dark mode dims it so the sidebar
-     doesn't visually shout against #161922 surfaces. */
-  --sidebar-gradient-1: #1f1b4d;
-  --sidebar-gradient-2: #2a245e;
-  --sidebar-gradient-3: #3a3170;
-
-  /* Login — dark Aurora stage: near-black base with brighter ambient pools
-     (the noise + grid layers below dim them further) and a slightly lighter
-     accent so the button stays visible against the dark base. Card is solid
-     dark, not glass — keeps form clarity against the busy background. */
-  --login-bg:            #0a0c14;
-  --login-aurora-1:      rgba(80,83,232,.22);
-  --login-aurora-2:      rgba(120,121,240,.14);
-  --login-aurora-3:      rgba(161,164,247,.16);
-  --login-grid-color:    rgba(161,164,247,.05);
-  --login-card-bg:       #15182a;
-  --login-card-border:   rgba(58,65,112,.55);
-  --login-card-glow:     rgba(120,121,240,.06);
-  --login-input-bg:      #0e1018;
-  --login-input-border:  #2a2f4e;
-  --login-input-bg-focus:#1a1e30;
-
-  /* Login accent — brighter than sidebar gradient so focus rings / buttons
-     stay visible on the deep dark background. */
-  --login-accent:   #7879f0;
-  --login-accent-2: #a1a4f7;
+  --sidebar-bg:         #0b0d11;
+  --sidebar-hover:      rgba(255,255,255,.05);
+  --sidebar-active:     rgba(255,255,255,.08);
+  --sidebar-text:       #7d8592;
+  --sidebar-text-active:#eef1f4;
+  --sidebar-border:     rgba(255,255,255,.07);
+  --sidebar-accent:     #22d3ee;
 
   --scrollbar-thumb: var(--border);
   --scrollbar-hover: var(--border2);
 
-  --selection-bg: rgba(120,121,240,.24);
+  --selection-bg: rgba(34,211,238,.24);
 }
 
 /* ── Base ──────────────────────────────────────────────── */
@@ -197,225 +155,67 @@ input, select, textarea { font-family: var(--font); font-size: 14px; }
 .page { display: none; height: 100vh; }
 .page.active { display: flex; }
 
-/* ── Login — Aurora stage ─────────────────────────────────
- * Layered backdrop (Linear/Vercel/Stripe school): a near-neutral base
- * carries three slow-drifting purple pools (Aurora) above a faint engineering
- * grid and a fine noise veil. The card sits centered with multi-layer
- * shadow + inner top-edge glow so it reads as floating above the stage.
- * Logo and accent are the brand purple — already approved, not changed.
- * ───────────────────────────────────────────────────────── */
+/* ── Login — commissioned hero illustration + one quiet card ── */
 #page-login {
   align-items: center; justify-content: center;
-  position: relative; overflow: hidden;
-  background: var(--login-bg);
+  background: var(--bg);
 }
-
-/* ── Login split layout ──────────────────────────────────
- * Two-column shell: left = hero illustration, right = form card.
- * Shell shrinks to content (`width: max-content`) so #page-login's flex
- * centering positions the whole pair at the viewport center — hero on the
- * left of the vertical midline, card on the right. Below 960px the hero
- * hides and the card centers as the single column. */
 .login-shell {
-  position: relative; z-index: 2;
   display: grid;
   grid-template-columns: auto auto;
+  align-items: center; justify-items: center;
+  gap: 64px;
   width: max-content;
   max-width: calc(100% - 48px);
-  align-items: center; justify-items: center;
-  gap: 80px;
 }
-.login-hero {
-  display: flex; align-items: center; justify-content: center;
-  min-height: 0;
+.login-hero { display: flex; align-items: center; justify-content: center; }
+/* Matted print: the frame matches the login card (surface, border, radius,
+   shadow) so the two read as siblings; the artwork keeps its own background
+   with a small radius + hairline, like a print mounted in a mat. */
+.hero-frame {
+  width: 520px;
+  max-width: calc(58vw - 80px);
+  padding: 12px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: var(--shadow-md);
 }
-.login-hero img {
-  width: 560px;
-  max-width: calc(60vw - 80px);
+.hero-frame img {
+  display: block;
+  width: 100%;
   height: auto;
-  object-fit: contain;
-  border-radius: 24px;
-  filter: drop-shadow(0 30px 80px rgba(80,83,232,.22));
-  animation: cardIn .55s cubic-bezier(.16,1,.3,1);
+  border: 1px solid var(--border);
+  border-radius: 4px;
   user-select: none;
 }
 @media (max-width: 960px) {
-  .login-shell {
-    grid-template-columns: 1fr;
-    width: 100%;
-    padding: 0 24px;
-    gap: 0;
-  }
+  .login-shell { grid-template-columns: 1fr; width: 100%; padding: 0 24px; gap: 0; }
   .login-hero { display: none; }
 }
 
-/* Card keeps its original fixed 420px width (defined in the .login-card
- * rule below). No shell-level override needed. */
-
-/* Layer order, back→front: aurora (z=0) → grid (z=0) → noise (z=1) → card (z=2).
- * Each layer is absolutely positioned, full-bleed, pointer-events:none. */
-
-/* Aurora — three soft radial pools, slowly drifting so the backdrop never
- * feels static. Animation is reduced for users who prefer reduced motion. */
-.login-aurora {
-  position: absolute; inset: 0;
-  pointer-events: none; z-index: 0;
-  background:
-    radial-gradient(ellipse 50% 42% at 18% 18%, var(--login-aurora-1) 0%, transparent 60%),
-    radial-gradient(ellipse 42% 50% at 82% 28%, var(--login-aurora-2) 0%, transparent 60%),
-    radial-gradient(ellipse 60% 40% at 50% 95%, var(--login-aurora-3) 0%, transparent 65%);
-  animation: auroraDrift 28s ease-in-out infinite alternate;
-  will-change: transform;
-}
-@keyframes auroraDrift {
-  0%   { transform: translate3d(0,0,0)     scale(1); }
-  50%  { transform: translate3d(-3%,2%,0)  scale(1.05); }
-  100% { transform: translate3d(2%,-2%,0)  scale(1.02); }
-}
-@media (prefers-reduced-motion: reduce) {
-  .login-aurora { animation: none; }
-}
-
-/* ── Swimming light blobs ────────────────────────────────
- * Three soft purple blobs that drift independently across the backdrop —
- * the "海底生物" feel the page had in v1 (6bc7a3b) and lost in v2. Colors
- * are rebased onto the Aurora purple palette so they layer naturally with
- * the ambient pools and grid instead of reading as foreign decoration.
- * Blobs sit ABOVE the static aurora+grid, BELOW the noise veil and card. */
-.login-creature {
-  position: absolute;
-  border-radius: 50%;
-  pointer-events: none;
-  z-index: 0;
-  will-change: transform;
-  filter: blur(48px);
-  mix-blend-mode: screen;
-}
-[data-theme="dark"] .login-creature { mix-blend-mode: screen; }
-/* Blob 1 — large, slow, bright lavender — patrols the upper band. */
-.login-creature.sc-1 {
-  width: 480px; height: 220px;
-  top: -10%; left: -8%;
-  background: radial-gradient(ellipse, rgba(161,164,247,.32) 0%, rgba(120,121,240,.10) 50%, transparent 70%);
-  animation: swim1 26s ease-in-out infinite;
-}
-[data-theme="dark"] .login-creature.sc-1 {
-  background: radial-gradient(ellipse, rgba(161,164,247,.28) 0%, rgba(120,121,240,.10) 50%, transparent 70%);
-}
-@keyframes swim1 {
-  0%   { transform: translate(0, 0) scaleX(1); }
-  15%  { transform: translate(28vw, 12vh) scaleX(1.08); }
-  35%  { transform: translate(62vw, 4vh)  scaleX(.96); }
-  55%  { transform: translate(38vw, 22vh) scaleX(1.04); }
-  75%  { transform: translate(10vw, 14vh) scaleX(.99); }
-  100% { transform: translate(0, 0) scaleX(1); }
-}
-/* Blob 2 — medium, deep purple — patrols the lower-right. */
-.login-creature.sc-2 {
-  width: 380px; height: 180px;
-  bottom: -8%; right: -8%;
-  background: radial-gradient(ellipse, rgba(80,83,232,.30) 0%, rgba(120,121,240,.10) 50%, transparent 70%);
-  animation: swim2 20s ease-in-out infinite;
-  animation-delay: -7s;
-}
-[data-theme="dark"] .login-creature.sc-2 {
-  background: radial-gradient(ellipse, rgba(80,83,232,.36) 0%, rgba(120,121,240,.14) 50%, transparent 70%);
-}
-@keyframes swim2 {
-  0%   { transform: translate(0, 0) scaleX(1); }
-  20%  { transform: translate(-30vw, -16vh) scaleX(1.06); }
-  45%  { transform: translate(-62vw, -4vh)  scaleX(.97); }
-  70%  { transform: translate(-26vw, 10vh)  scaleX(1.04); }
-  100% { transform: translate(0, 0) scaleX(1); }
-}
-/* Blob 3 — small, bright lavender — crosses the mid-band. */
-.login-creature.sc-3 {
-  width: 280px; height: 130px;
-  top: 45%; left: 30%;
-  background: radial-gradient(ellipse, rgba(161,164,247,.28) 0%, rgba(161,164,247,.06) 50%, transparent 70%);
-  animation: swim3 15s ease-in-out infinite;
-  animation-delay: -4s;
-}
-[data-theme="dark"] .login-creature.sc-3 {
-  background: radial-gradient(ellipse, rgba(161,164,247,.22) 0%, rgba(161,164,247,.05) 50%, transparent 70%);
-}
-@keyframes swim3 {
-  0%   { transform: translate(0, 0) scaleX(1); }
-  25%  { transform: translate(18vw, -20vh) scaleX(1.10); }
-  50%  { transform: translate(46vw, 6vh)   scaleX(.92); }
-  75%  { transform: translate(14vw, 16vh) scaleX(1.05); }
-  100% { transform: translate(0, 0) scaleX(1); }
-}
-@media (prefers-reduced-motion: reduce) {
-  .login-creature { animation: none; }
-}
-
-/* Engineering grid — barely visible 32px lines, fading toward edges so the
- * center reads as the focal area. Sits below aurora but above noise. */
-.login-grid {
-  position: absolute; inset: 0;
-  pointer-events: none; z-index: 0;
-  background-image:
-    linear-gradient(var(--login-grid-color) 1px, transparent 1px),
-    linear-gradient(90deg, var(--login-grid-color) 1px, transparent 1px);
-  background-size: 32px 32px, 32px 32px;
-  background-position: center center;
-  -webkit-mask-image: radial-gradient(ellipse 70% 60% at 50% 45%, #000 0%, transparent 75%);
-          mask-image: radial-gradient(ellipse 70% 60% at 50% 45%, #000 0%, transparent 75%);
-}
-
-/* Noise veil — inline SVG turbulence, opacity tuned so it adds texture
- * without making the backdrop dirty. Sits above aurora+grid, below card. */
-.login-noise {
-  position: absolute; inset: 0;
-  pointer-events: none; z-index: 1;
-  opacity: .035;
-  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='200' height='200'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 1  0 0 0 0 1  0 0 0 0 1  0 0 0 0.6 0'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");
-  mix-blend-mode: overlay;
-}
-[data-theme="dark"] .login-noise { opacity: .06; }
-
-/* Card — solid (not glass), multi-layer shadow, faint inner top-edge glow
- * so it reads as a polished surface catching the aurora light. Glow layer
- * below is a soft purple halo behind the card. */
+/* Card — same surface language as the app: one border, one soft shadow. */
 .login-card {
-  position: relative; z-index: 2;
-  background: var(--login-card-bg);
-  border: 1px solid var(--login-card-border);
-  border-radius: 20px; padding: 48px 44px; width: 420px;
-  margin: auto;
-  box-shadow:
-    0 1px 2px rgba(0,0,0,.04),
-    0 24px 60px rgba(0,0,0,.08),
-    0 8px 24px rgba(80,83,232,.10),
-    inset 0 1px 0 var(--login-card-glow);
-  animation: cardIn .5s cubic-bezier(.16,1,.3,1);
-  isolation: isolate;
-}
-[data-theme="dark"] .login-card {
-  box-shadow:
-    0 1px 2px rgba(0,0,0,.3),
-    0 24px 60px rgba(0,0,0,.55),
-    0 8px 24px rgba(80,83,232,.22),
-    inset 0 1px 0 var(--login-card-glow);
-}
-@keyframes cardIn {
-  from { opacity: 0; transform: translateY(14px) scale(.985); }
-  to   { opacity: 1; transform: translateY(0)    scale(1); }
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 36px 36px 32px;
+  width: 400px; max-width: 100%;
+  box-shadow: var(--shadow-md);
 }
 
 .login-card .form-group label {
   color: var(--text2);
-  font-size: 12px; font-weight: 600; letter-spacing: .3px;
+  font-size: 13px; font-weight: 500; letter-spacing: 0;
   margin-bottom: 8px; display: block;
 }
 .login-card .form-group input {
   width: 100%;
-  height: 44px;
-  padding: 0 16px;
-  background: var(--login-input-bg);
-  border: 1px solid var(--login-input-border);
-  border-radius: 10px;
+  height: 40px;
+  padding: 0 12px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
   color: var(--text);
   font-size: 14px;
   outline: none;
@@ -423,16 +223,14 @@ input, select, textarea { font-family: var(--font); font-size: 14px; }
 }
 .login-card .form-group input::placeholder { color: var(--text3); }
 .login-card .form-group input:focus {
-  border-color: var(--login-accent);
-  box-shadow:
-    0 0 0 4px rgba(80,83,232,.12),
-    inset 0 1px 2px rgba(80,83,232,.05);
-  background: var(--login-input-bg-focus);
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px var(--primary-bg);
+  background: var(--surface);
 }
 .login-card .error-msg {
   background: var(--danger-bg); border: 1px solid rgba(239,68,68,.18);
   color: var(--danger);
-  border-radius: 8px;
+  border-radius: var(--radius-sm);
   padding: 10px 12px;
   font-size: 13px;
   margin: 0 0 12px;
@@ -441,123 +239,55 @@ input, select, textarea { font-family: var(--font); font-size: 14px; }
   background: rgba(239,68,68,.16); border-color: rgba(239,68,68,.28);
   color: #fca5a5;
 }
-/* Button — purple gradient with an animated underglow that blooms on hover.
- * The underglow is a separate ::before layer so the button face stays crisp
- * while the halo blooms behind it. Active state flattens the lift. */
 .login-card #login-btn {
-  position: relative;
-  width: 100%; height: 44px; padding: 0 16px;
-  background: linear-gradient(135deg, var(--login-accent) 0%, var(--login-accent-2) 100%);
-  border: none; border-radius: 10px;
-  font-weight: 600; font-size: 14px; letter-spacing: .3px;
-  color: #ffffff;
-  transition: transform .15s ease, box-shadow .25s ease, filter .15s ease;
-  isolation: isolate;
+  width: 100%; height: 40px; padding: 0 16px;
+  background: var(--btn-primary-bg);
+  color: var(--btn-primary-text);
+  border: none; border-radius: var(--radius-sm);
+  font-weight: 500; font-size: 14px;
+  transition: background var(--transition);
 }
-.login-card #login-btn::before {
-  content: ""; position: absolute; inset: 0;
-  border-radius: 10px;
-  background: linear-gradient(135deg, var(--login-accent-2), var(--login-accent));
-  opacity: 0;
-  box-shadow: 0 8px 28px rgba(80,83,232,.45);
-  transition: opacity .25s ease;
-  z-index: -1;
-}
-.login-card #login-btn:hover {
-  transform: translateY(-1px);
-  filter: saturate(1.05);
-}
-.login-card #login-btn:hover::before { opacity: 1; }
-.login-card #login-btn:active {
-  transform: translateY(0);
-  filter: saturate(.98);
-}
-.login-card #login-btn:disabled {
-  opacity: .6; cursor: not-allowed; filter: grayscale(.3);
-}
+.login-card #login-btn:hover { background: var(--btn-primary-bg-h); }
+.login-card #login-btn:disabled { opacity: .55; cursor: not-allowed; }
 
-/* Brand block — logo + name + tagline stacked, centered. Logo carries the
- * brand color so it's the most visible element on the card; name and
- * tagline use neutral text colors so they don't compete.
- *
- * Brand mark is the same diamond+4-dots icon used in /misc/logo.svg, just
- * scaled larger for the login surface. Keeping the icon identical across
- * README, login, etc. is what makes the brand recognizable. */
+/* Brand block — flat glyph, product name, quiet tagline. */
 .login-brand {
   text-align: center;
-  margin-bottom: 36px;
+  margin-bottom: 28px;
   display: flex; flex-direction: column; align-items: center;
-  gap: 14px;
+  gap: 12px;
 }
-/* Brand mark — same diamond+4-dots icon as /misc/logo.svg. Wraps in a
- * relative box so the halo pseudo-element can sit behind the SVG. Static
- * drop-shadow gives weight; a slow halo pulse breathes around it so the
- * card never feels inert. Reduced-motion users get a static halo only. */
-.brand-mark-wrap {
-  position: relative;
-  width: 56px; height: 56px;
-  display: flex; align-items: center; justify-content: center;
-}
-.brand-mark {
-  width: 56px; height: 56px;
-  display: block;
-  filter: drop-shadow(0 6px 16px rgba(80,83,232,.35));
-  position: relative; z-index: 1;
-}
-.brand-mark-halo {
-  position: absolute; inset: -14px;
-  border-radius: 50%;
-  background: radial-gradient(circle, rgba(80,83,232,.22) 0%, transparent 70%);
-  z-index: 0; pointer-events: none;
-  animation: brandPulse 6s ease-in-out infinite;
-}
-@keyframes brandPulse {
-  0%, 100% { opacity: .55; transform: scale(.9); }
-  50%      { opacity: 1;   transform: scale(1.1); }
-}
-@media (prefers-reduced-motion: reduce) {
-  .brand-mark-halo { animation: none; opacity: .7; }
-}
+.brand-mark { width: 40px; height: 40px; display: block; }
 .login-brand .brand-name {
-  font-family: var(--mono); font-size: 28px; font-weight: 700; letter-spacing: 4px;
+  font-family: var(--heading); font-size: 20px; font-weight: 500;
+  letter-spacing: 0;
   color: var(--text);
   line-height: 1;
 }
 .login-brand .brand-tagline {
-  color: var(--text3); font-size: 11px; letter-spacing: 2.5px;
-  text-transform: uppercase; margin-top: 2px; font-weight: 500;
+  color: var(--text3); font-size: 13px; letter-spacing: 0;
+  margin-top: 0; font-weight: 400;
   line-height: 1;
 }
 .form-group { margin-bottom: 18px; }
 .form-group.hidden { display: none; }
 .login-hint {
   text-align: center; color: var(--text3);
-  font-size: 13px; margin: 0 0 28px; line-height: 1.5;
-  letter-spacing: .2px;
+  font-size: 13px; margin: 0 0 24px; line-height: 1.5;
 }
 .admin-toggle-wrap {
-  margin-top: 20px;
-  padding-top: 18px;
-  border-top: 1px solid var(--login-card-border);
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
   text-align: center;
-  position: relative;
-}
-.admin-toggle-wrap::before {
-  /* Subtle gradient fade on the divider so it doesn't read as a hard line. */
-  content: ""; position: absolute; left: 0; right: 0; top: 0;
-  height: 1px;
-  background: linear-gradient(90deg, transparent, var(--login-card-border) 25%, var(--login-card-border) 75%, transparent);
 }
 .admin-toggle {
   display: inline-block;
   font-size: 13px; color: var(--text3); text-decoration: none;
-  letter-spacing: .3px; cursor: pointer;
-  transition: color var(--transition), transform .2s ease;
+  cursor: pointer;
+  transition: color var(--transition);
 }
-.admin-toggle:hover {
-  color: var(--login-accent);
-  transform: translateY(-1px);
-}
+.admin-toggle:hover { color: var(--primary); }
 .form-group label {
   display: block; font-weight: 600; margin-bottom: 6px;
   font-size: 12px; color: var(--text3); letter-spacing: .4px;
@@ -574,12 +304,6 @@ input, select, textarea { font-family: var(--font); font-size: 14px; }
   box-shadow: 0 0 0 3px var(--primary-bg);
   background: var(--surface);
 }
-/* Legacy fallback `#login-btn` rules removed — the button is fully
- * styled by the `.login-card #login-btn` block above, and these legacy
- * `background: var(--primary)` (orange #e8740c) rules were the source of
- * the yellow flash on hover when the more specific selectors momentarily
- * ceded specificity (e.g. during transition). The login button should
- * only ever render in the brand purple. */
 .error-msg {
   color: var(--danger); font-size: 13px; margin-top: 12px; text-align: center;
   padding: 10px; background: var(--danger-bg); border-radius: var(--radius-sm);
@@ -591,45 +315,44 @@ p.error { color: var(--danger); font-style: italic; margin: 0; }
 /* ── Layout ─────────────────────────────────────────────── */
 .layout { display: flex; width: 100%; height: 100%; }
 
-/* ── Sidebar ────────────────────────────────────────────── */
+/* ── Sidebar ──────────────────────────────────────────────
+ * Graphite in both themes — a surface people stare at for hours. The only
+ * color is the accent bar on the active row. */
 .sidebar {
   width: 240px;
-  background: linear-gradient(to bottom,
-    var(--sidebar-gradient-1) 0%,
-    var(--sidebar-gradient-2) 50%,
-    var(--sidebar-gradient-3) 100%);
+  background: var(--sidebar-bg);
   display: flex; flex-direction: column;
-  border-right: 1px solid rgba(255,255,255,.18);
-  color: #ffffff;
+  border-right: 1px solid var(--sidebar-border);
+  color: var(--sidebar-text-active);
 }
 .sidebar h2 {
-  padding: 22px 20px 18px; font-size: 13px; letter-spacing: 1.2px;
-  color: #ffffff; border-bottom: 1px solid rgba(255,255,255,.18);
-  font-weight: 600; text-transform: uppercase;
+  padding: 20px 20px 16px; font-size: 13px; letter-spacing: 0;
+  color: var(--sidebar-text-active); border-bottom: 1px solid var(--sidebar-border);
+  font-weight: 500;
 }
-.sidebar nav { flex: 1; padding: 10px 0; }
+.sidebar nav { flex: 1; padding: 8px 0; }
 .nav-link {
   display: flex; align-items: center; gap: 10px;
-  padding: 10px 20px; color: rgba(255,255,255,.85);
+  padding: 8px 20px; color: var(--sidebar-text);
   font-size: 13px; font-weight: 500;
-  transition: all var(--transition);
+  transition: background var(--transition), color var(--transition);
   border-left: 3px solid transparent;
   margin: 1px 0;
 }
 .nav-link:hover {
-  color: #ffffff;
-  background: rgba(255,255,255,.12);
+  color: var(--sidebar-text-active);
+  background: var(--sidebar-hover);
 }
 .nav-link.active {
-  color: #ffffff;
-  background: rgba(255,255,255,.18);
-  border-left-color: #ffffff;
-  font-weight: 600;
+  color: var(--sidebar-text-active);
+  background: var(--sidebar-active);
+  border-left-color: var(--sidebar-accent);
+  font-weight: 500;
 }
-.nav-link svg { width: 16px; height: 16px; flex-shrink: 0; opacity: .8; }
+.nav-link svg { width: 16px; height: 16px; flex-shrink: 0; opacity: .75; }
 .nav-link.active svg { opacity: 1; }
 .sidebar-footer {
-  padding: 12px 16px; border-top: 1px solid rgba(255,255,255,.18);
+  padding: 12px 16px; border-top: 1px solid var(--sidebar-border);
   display: flex; gap: 8px; align-items: center;
   flex-wrap: wrap;
 }
@@ -637,23 +360,21 @@ p.error { color: var(--danger); font-style: italic; margin: 0; }
 .sidebar-version {
   flex-basis: 100%;
   font-size: 11px;
-  color: rgba(255,255,255,.7);
+  color: var(--sidebar-text);
   font-variant-numeric: tabular-nums;
-  letter-spacing: .02em;
   margin-bottom: 2px;
 }
 
 /* ── Theme Toggle ───────────────────────────────────────── */
 .theme-toggle {
-  width: 36px; height: 36px; border-radius: var(--radius-sm);
-  background: rgba(255,255,255,.12); border: 1px solid rgba(255,255,255,.18);
-  color: #ffffff; display: flex; align-items: center; justify-content: center;
-  transition: all var(--transition); flex-shrink: 0;
+  width: 32px; height: 32px; border-radius: var(--radius-sm);
+  background: transparent; border: 1px solid var(--sidebar-border);
+  color: var(--sidebar-text); display: flex; align-items: center; justify-content: center;
+  transition: background var(--transition), color var(--transition); flex-shrink: 0;
 }
 .theme-toggle:hover {
-  background: rgba(255,255,255,.22);
-  color: #ffffff;
-  border-color: rgba(255,255,255,.35);
+  background: var(--sidebar-hover);
+  color: var(--sidebar-text-active);
 }
 .theme-toggle svg { width: 18px; height: 18px; }
 
@@ -661,11 +382,11 @@ p.error { color: var(--danger); font-style: italic; margin: 0; }
 .sidebar-top {
   display: flex; align-items: center; justify-content: space-between;
   gap: 8px; padding: 16px 20px 14px;
-  border-bottom: 1px solid rgba(255,255,255,.18);
+  border-bottom: 1px solid var(--sidebar-border);
 }
 .sidebar-top h2 {
-  padding: 0; margin: 0; font-size: 13px; letter-spacing: 1.2px;
-  color: #ffffff; font-weight: 600; text-transform: uppercase;
+  padding: 0; margin: 0; font-size: 13px; letter-spacing: 0;
+  color: var(--sidebar-text-active); font-weight: 500;
 }
 
 /* ── Language Toggle ─────────────────────────────────────── */
@@ -679,8 +400,8 @@ p.error { color: var(--danger); font-style: italic; margin: 0; }
   font-family: var(--font-ui, inherit);
 }
 .lang-toggle:hover {
-  background: var(--sidebar-active); color: var(--sidebar-text-active);
-  border-color: rgba(232,116,12,.3);
+  background: var(--sidebar-hover); color: var(--sidebar-text-active);
+  border-color: rgba(255,255,255,.18);
 }
 .lang-toggle .lang-current { display: inline-block; }
 
@@ -701,7 +422,7 @@ p.error { color: var(--danger); font-style: italic; margin: 0; }
   display: flex; justify-content: space-between; align-items: center;
   margin-bottom: 22px;
 }
-.section-header h2 { font-size: 20px; color: var(--text); font-weight: 700; letter-spacing: -.2px; }
+.section-header h2 { font-size: 20px; color: var(--text); font-weight: 500; letter-spacing: -.2px; }
 .section-header > div { display: flex; gap: 8px; align-items: center; }
 .section-header__hint {
   font-size: 12px;
@@ -851,11 +572,10 @@ p.error { color: var(--danger); font-style: italic; margin: 0; }
 }
 .anomaly-metric-card h4 {
   margin: 0 0 6px 0;
-  font-size: 12px;
-  color: var(--text3);
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: .04em;
+  font-size: 13px;
+  color: var(--text2);
+  font-weight: 500;
+  letter-spacing: 0;
 }
 .anomaly-metric-card .row {
   display: flex;
@@ -916,7 +636,7 @@ p.error { color: var(--danger); font-style: italic; margin: 0; }
   opacity: .85;
 }
 .anomaly-table .sev-cell {
-  font-weight: 700;
+  font-weight: 600;
   font-variant-numeric: tabular-nums;
 }
 .anomaly-table .group-alias {
@@ -985,8 +705,8 @@ p.error { color: var(--danger); font-style: italic; margin: 0; }
 }
 .card:hover { border-color: var(--border2); box-shadow: var(--shadow); }
 .card h3 {
-  font-size: 11px; color: var(--text3); margin-bottom: 16px;
-  text-transform: uppercase; letter-spacing: 1.5px; font-weight: 600;
+  font-size: 13px; color: var(--text2); margin-bottom: 16px;
+  letter-spacing: 0; font-weight: 500;
 }
 }
 
@@ -1006,17 +726,16 @@ p.error { color: var(--danger); font-style: italic; margin: 0; }
  * reserved for hero buttons, not table-row actions.
  */
 .btn-primary {
-  background: var(--primary); color: #fff; border: none;
+  background: var(--btn-primary-bg); color: var(--btn-primary-text); border: none;
   padding: 0 18px; height: 32px; line-height: 1;
   border-radius: var(--radius-sm);
-  font-size: 13px; font-weight: 600; letter-spacing: .2px;
-  transition: all var(--transition);
-  box-shadow: 0 1px 2px rgba(0,0,0,.08);
+  font-size: 13px; font-weight: 500;
+  transition: background var(--transition);
   display: inline-flex; align-items: center; justify-content: center;
   cursor: pointer;
 }
-.btn-primary:hover { background: var(--primary-h); box-shadow: 0 2px 8px rgba(0,0,0,.12); transform: translateY(-1px); }
-.btn-primary:active { transform: translateY(0) scale(.98); box-shadow: 0 1px 2px rgba(0,0,0,.08); }
+.btn-primary:hover { background: var(--btn-primary-bg-h); }
+.btn-primary:active { opacity: .9; }
 
 .btn-secondary {
   background: var(--surface2); border: 1px solid var(--border);
@@ -1027,18 +746,18 @@ p.error { color: var(--danger); font-style: italic; margin: 0; }
   cursor: pointer; font-size: 13px;
 }
 .btn-secondary:hover { border-color: var(--border2); color: var(--text); background: var(--surface3); }
-/* Sidebar buttons (Logout, etc.) on purple gradient — override default surface colors. */
+/* Sidebar buttons (Logout, etc.) on graphite — translucent white. */
 .sidebar-footer .btn-secondary,
 .sidebar .btn-secondary {
-  background: rgba(255,255,255,.14);
-  border: 1px solid rgba(255,255,255,.25);
-  color: #ffffff;
+  background: rgba(255,255,255,.08);
+  border: 1px solid rgba(255,255,255,.16);
+  color: var(--sidebar-text-active);
 }
 .sidebar-footer .btn-secondary:hover,
 .sidebar .btn-secondary:hover {
-  background: rgba(255,255,255,.24);
-  border-color: rgba(255,255,255,.4);
-  color: #ffffff;
+  background: rgba(255,255,255,.14);
+  border-color: rgba(255,255,255,.26);
+  color: var(--sidebar-text-active);
 }
 
 .btn-danger {
@@ -1064,6 +783,16 @@ p.error { color: var(--danger); font-style: italic; margin: 0; }
 /* When btn-small and btn-secondary are combined (e.g. prompt-log toggle in
    quota card), override btn-secondary's width:100% to keep the button inline. */
 .btn-small.btn-secondary { width: auto; }
+/* Compact primary — filled emphasis at btn-small height for toolbar hero
+   actions ("+ Create Key"), keeping the 28px row alignment. */
+.btn-small.btn-primary {
+  background: var(--btn-primary-bg); color: var(--btn-primary-text);
+  border: none; box-shadow: none;
+}
+.btn-small.btn-primary:hover {
+  background: var(--btn-primary-bg-h); border: none;
+  color: var(--btn-primary-text);
+}
 /* Inline cancel/close/copy buttons in modals — override btn-secondary's
    width:100% so they hug their content instead of stretching full-width. */
 .btn-secondary.btn-inline { width: auto; }
@@ -1096,8 +825,7 @@ p.error { color: var(--danger); font-style: italic; margin: 0; }
 }
 .btn-range:hover { border-color: var(--primary); color: var(--primary); }
 .btn-range.active {
-  background: var(--primary); color: #fff; border-color: var(--primary);
-  box-shadow: 0 1px 4px rgba(0,0,0,.12);
+  background: var(--primary); color: var(--accent-ink); border-color: var(--primary);
 }
 .range-custom {
   display: inline-flex; align-items: center; gap: 4px;
@@ -1109,7 +837,7 @@ p.error { color: var(--danger); font-style: italic; margin: 0; }
 .btn-tiny {
   padding: 0 10px; height: 24px; line-height: 1; font-size: 11px;
   border-radius: var(--radius-xs);
-  border: 1px solid var(--primary); background: var(--primary); color: #fff;
+  border: 1px solid var(--primary); background: var(--primary); color: var(--accent-ink);
   font-weight: 500; cursor: pointer;
   display: inline-flex; align-items: center; justify-content: center;
 }
@@ -1141,8 +869,8 @@ p.error { color: var(--danger); font-style: italic; margin: 0; }
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
 th {
   height: 40px; padding: 0 14px; text-align: left;
-  font-weight: 600; color: var(--text3);
-  font-size: 11px; text-transform: uppercase; letter-spacing: .8px;
+  font-weight: 500; color: var(--text3);
+  font-size: 12px; letter-spacing: 0;
   line-height: 1;
   background: var(--surface2); border-bottom: 1px solid var(--border);
 }
@@ -1183,6 +911,22 @@ tbody tr.model-row-warning td {
 }
 .mono { font-family: var(--mono); font-size: 13px; }
 .muted { color: var(--text3); font-size: 12px; }
+/* Data-table refinements: headers never wrap (a 3-line "Prefix Hit Rate"
+   header wrecks the column budget); numeric columns carry the .num utility
+   (right-aligned tabular figures so multi-digit values don't jitter). */
+[id$="-table-wrap"] th { white-space: nowrap; }
+.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+/* Empty states: a lone colspan row or <p> reads as a broken table row —
+   center it, give it air, mute it. */
+[id$="-table-wrap"] td.no-results,
+[id$="-table-wrap"] tbody td[colspan].muted {
+  padding: 48px 16px; text-align: center; color: var(--text3);
+}
+[id$="-table-wrap"] > p:only-child:not(.loading) {
+  padding: 48px 16px; text-align: center; color: var(--text3);
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+  margin: 0;
+}
 
 /* Outer rounded panel that frames every table — applies uniformly to every
    `*-table-wrap` div without HTML changes. */
@@ -1267,8 +1011,8 @@ div[id$="-table-wrap"]:not(.bare) > table > thead:first-child > tr:first-child >
   border-radius: var(--radius-sm);
   background: var(--surface);
 }
-.usage-limit-title { font-size: .8em; font-weight: 600; color: var(--text3); text-transform: uppercase; letter-spacing: .04em; margin-bottom: 6px; }
-.usage-limit-count { font-size: 1.2em; font-weight: 700; color: var(--text); font-family: var(--heading); margin-bottom: 8px; }
+.usage-limit-title { font-size: .85em; font-weight: 400; color: var(--text3); letter-spacing: 0; margin-bottom: 6px; }
+.usage-limit-count { font-size: 1.2em; font-weight: 500; color: var(--text); font-family: var(--heading); margin-bottom: 8px; }
 .usage-limit-card .progress-bar { margin-bottom: 6px; }
 .usage-limit-reset { font-size: .8em; color: var(--text3); }
 
@@ -1281,15 +1025,13 @@ div[id$="-table-wrap"]:not(.bare) > table > thead:first-child > tr:first-child >
 }
 .plan-name-badge {
   display: inline-block;
-  padding: 4px 12px;
+  padding: 2px 8px;
   margin-bottom: 12px;
-  border-radius: 12px;
-  font-weight: 700;
-  font-size: 14px;
-  letter-spacing: .02em;
-  background: linear-gradient(135deg, var(--primary), color-mix(in srgb, var(--primary) 70%, #fff 30%));
-  color: #fff;
-  box-shadow: 0 2px 4px rgba(0, 0, 0, .12);
+  border-radius: var(--radius-xs);
+  font-weight: 500;
+  font-size: 13px;
+  background: var(--primary-bg);
+  color: var(--primary);
 }
 .plan-limits { display: flex; flex-direction: column; gap: 6px; }
 .plan-limit-row {
@@ -1331,7 +1073,7 @@ div[id$="-table-wrap"]:not(.bare) > table > thead:first-child > tr:first-child >
   to   { opacity: 1; transform: scale(1) translateY(0); }
 }
 .modal-wide { width: 90vw; }
-.modal h3 { margin-bottom: 20px; font-size: 17px; color: var(--text); font-weight: 700; }
+.modal h3 { margin-bottom: 20px; font-size: 17px; color: var(--text); font-weight: 500; }
 .modal table {
   width: 100%; border-collapse: collapse; margin-bottom: 16px;
   font-size: 12px;
@@ -1401,11 +1143,10 @@ div[id$="-table-wrap"]:not(.bare) > table > thead:first-child > tr:first-child >
   order: 4;
 }
 .form-card-title {
-  font-size: 11px;
-  font-weight: 700;
+  font-size: 13px;
+  font-weight: 500;
   color: var(--text2);
-  text-transform: uppercase;
-  letter-spacing: 0.6px;
+  letter-spacing: 0;
   margin-bottom: 14px;
   padding-bottom: 8px;
   border-bottom: 1px solid var(--border);
@@ -1414,11 +1155,10 @@ div[id$="-table-wrap"]:not(.bare) > table > thead:first-child > tr:first-child >
    Prompt Log card). Lighter than the card title — it groups a sub-form
    without competing with the parent title. */
 .form-card-subtitle {
-  font-size: 10px;
-  font-weight: 600;
+  font-size: 12px;
+  font-weight: 500;
   color: var(--text2);
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
+  letter-spacing: 0;
   margin: 18px 0 8px;
   padding-top: 12px;
   border-top: 1px dashed var(--border);
@@ -1560,9 +1300,9 @@ div[id$="-table-wrap"]:not(.bare) > table > thead:first-child > tr:first-child >
 .slot-time-input:focus { border-color: var(--primary); box-shadow: 0 0 0 2px var(--primary-bg); outline: none; }
 .slot-dash { color: var(--text3); }
 .slot-cross-badge {
-  padding: 2px 8px; font-size: 10px; font-weight: 600;
+  padding: 1px 8px; font-size: 11px; font-weight: 500;
   color: var(--primary); background: var(--primary-bg);
-  border-radius: 10px; border: 1px solid var(--primary);
+  border-radius: var(--radius-xs); border: 1px solid var(--primary);
 }
 .slot-remove {
   width: 28px; height: 28px; padding: 0; line-height: 1;
@@ -1653,8 +1393,8 @@ div[id$="-table-wrap"]:not(.bare) > table > thead:first-child > tr:first-child >
   color: var(--danger); line-height: 1.4;
 }
 .form-card-collapsible summary {
-  cursor: pointer; font-size: 11px; font-weight: 700;
-  color: var(--text2); text-transform: uppercase; letter-spacing: 0.6px;
+  cursor: pointer; font-size: 12px; font-weight: 500;
+  color: var(--text2); letter-spacing: 0;
   margin-bottom: 8px; padding: 6px 0; user-select: none;
 }
 .form-card-collapsible[open] summary { margin-bottom: 14px; }
@@ -1695,10 +1435,9 @@ div[id$="-table-wrap"]:not(.bare) > table > thead:first-child > tr:first-child >
 }
 .config-side-group + .config-side-group { margin-top: 16px; }
 .config-side-group-title {
-  font-size: 10px;
-  font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: .8px;
+  font-size: 12px;
+  font-weight: 400;
+  letter-spacing: 0;
   color: var(--text3);
   padding: 4px 12px 8px;
 }
@@ -1758,7 +1497,7 @@ div[id$="-table-wrap"]:not(.bare) > table > thead:first-child > tr:first-child >
 .config-notice {
   margin: 8px 0 16px;
   padding: 8px 12px;
-  border-left: 3px solid var(--accent, #f59e0b);
+  border-left: 3px solid var(--warn);
   background: var(--surface2, rgba(245, 158, 11, 0.08));
   border-radius: 4px;
   font-size: 12px;
@@ -1770,8 +1509,8 @@ div[id$="-table-wrap"]:not(.bare) > table > thead:first-child > tr:first-child >
   border-bottom: 1px solid var(--border, #e5e7eb);
 }
 .modal-table th {
-  font-weight: 600; color: var(--text3, #6b7280);
-  font-size: 11px; text-transform: uppercase; letter-spacing: .6px;
+  font-weight: 500; color: var(--text3, #6b7280);
+  font-size: 12px; letter-spacing: 0;
   white-space: nowrap;
 }
 /* WIP / disabled section — used for kvc_aware advanced config while the
@@ -1784,11 +1523,9 @@ div[id$="-table-wrap"]:not(.bare) > table > thead:first-child > tr:first-child >
   padding: 1px 8px;
   background: var(--warn-bg, #fef3c7);
   color: var(--warn-text, #92400e);
-  border-radius: 999px;
-  font-size: 10px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: .5px;
+  border-radius: var(--radius-xs);
+  font-size: 11px;
+  font-weight: 500;
   vertical-align: middle;
 }
 .form-card-collapsible.is-disabled > .form-card-grid {
@@ -1873,7 +1610,26 @@ div[id$="-table-wrap"]:not(.bare) > table > thead:first-child > tr:first-child >
 .mcc-divider { height: 1px; background: var(--border); margin: 4px 0; }
 
 /* ── Search & Toolbar ───────────────────────────────────── */
-.keys-toolbar { display: flex; gap: 8px; align-items: center; }
+/* Toolbar: filters on the left, actions on the right — two clusters sharing
+   the content edges, instead of six controls floating in one flat row. */
+.keys-toolbar {
+  display: flex; gap: 8px; align-items: center;
+  justify-content: space-between; flex-wrap: wrap;
+  margin-bottom: 16px;
+}
+.toolbar-group { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+/* Filter toggle chip — a pressed/unpressed filter, not an action button. */
+.btn-chip {
+  height: 28px; padding: 0 12px; border-radius: 999px;
+  border: 1px solid var(--border); background: var(--surface); color: var(--text2);
+  font-size: 12px; font-weight: 500; cursor: pointer;
+  transition: all var(--transition);
+  display: inline-flex; align-items: center;
+}
+.btn-chip:hover { border-color: var(--primary); color: var(--primary); }
+.btn-chip[aria-pressed="true"] {
+  background: var(--primary); border-color: var(--primary); color: var(--accent-ink);
+}
 .search-input {
   padding: 8px 14px; background: var(--surface2);
   border: 1px solid var(--border); border-radius: var(--radius-sm);
@@ -1909,14 +1665,11 @@ tr.filter-row td { padding: 3px 4px; background: var(--surface2); border-bottom:
 td.kvc-prefix { line-height: 1.35; white-space: nowrap; }
 td.kvc-prefix .kvc-pct { font-weight: 600; color: var(--text); }
 td.kvc-prefix .kvc-sub { font-size: 11px; color: var(--text3); }
-.no-results {
-  text-align: center; color: var(--text3); padding: 24px 14px !important; font-size: 13px;
-}
 
 /* ── Status badges ──────────────────────────────────────── */
 .badge {
-  display: inline-block; padding: 3px 10px; border-radius: 20px;
-  font-size: 11px; font-weight: 600; letter-spacing: .2px;
+  display: inline-block; padding: 2px 8px; border-radius: var(--radius-xs);
+  font-size: 11px; font-weight: 500; letter-spacing: 0;
 }
 .badge-active { background: var(--success-bg); color: var(--success); }
 .badge-blocked { background: var(--danger-bg); color: var(--danger); }
@@ -1926,6 +1679,9 @@ td.kvc-prefix .kvc-sub { font-size: 11px; color: var(--text3); }
    request-rate chart cards. Private keeps the team count as tooltip. */
 .private-model-badge { margin-left: 6px; padding: 1px 7px; font-size: 10px; vertical-align: middle; white-space: nowrap; background: var(--warn-bg); color: var(--warn); }
 .public-model-badge { margin-left: 6px; padding: 1px 7px; font-size: 10px; vertical-align: middle; white-space: nowrap; background: var(--info-bg); color: var(--info); }
+/* Inline warning note on config cards (e.g. metrics switch on but the trace
+   master switch is off — /metrics stays dark until it is enabled). */
+.cfg-warn-note { margin: 4px 0 0; padding: 6px 10px; border-radius: 8px; font-size: 12px; background: var(--warn-bg); color: var(--warn); }
 .rb-chart-card__label .private-model-badge { margin-left: 4px; padding: 0 6px; }
 .rb-chart-card__label .public-model-badge { margin-left: 4px; padding: 0 6px; }
 .badge-plan-default {
@@ -1940,10 +1696,10 @@ td.kvc-prefix .kvc-sub { font-size: 11px; color: var(--text3); }
 .badge-tag { background: rgba(59,130,246,.12); color: #2563eb; margin-left: 6px; font-weight: 500; max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block; vertical-align: middle; }
 [data-theme="dark"] .badge-tag { color: #93c5fd; }
 .badge-vip {
-  background: rgba(232,116,12,.12); color: var(--primary);
-  font-weight: 700; border: 1px solid rgba(232,116,12,.25);
+  background: var(--primary-bg); color: var(--primary);
+  font-weight: 500; border: 1px solid transparent;
 }
-[data-theme="dark"] .badge-vip { color: var(--primary); border-color: rgba(240,146,14,.3); }
+[data-theme="dark"] .badge-vip { color: var(--primary); }
 
 /* ── Token stats ────────────────────────────────────────── */
 .token-stats { display: flex; gap: 14px; }
@@ -1955,10 +1711,10 @@ td.kvc-prefix .kvc-sub { font-size: 11px; color: var(--text3); }
 }
 .token-stat:hover { border-color: var(--border2); }
 .token-stat-label {
-  font-size: 10px; color: var(--text3); text-transform: uppercase;
-  letter-spacing: 1px; margin-bottom: 8px; font-weight: 600;
+  font-size: 12px; color: var(--text3);
+  letter-spacing: 0; margin-bottom: 8px; font-weight: 400;
 }
-.token-stat-value { font-size: 24px; font-weight: 700; color: var(--text); }
+.token-stat-value { font-size: 24px; font-weight: 500; color: var(--text); }
 .token-stat-pct { font-size: 11px; color: var(--text3); margin-top: 4px; }
 .token-stat-total { background: var(--primary-bg); border-color: transparent; }
 .token-stat-total .token-stat-value { color: var(--primary); }
@@ -1986,7 +1742,7 @@ td.kvc-prefix .kvc-sub { font-size: 11px; color: var(--text3); }
 .field-tip {
   display: inline-block;
   width: 16px; height: 16px; line-height: 16px; text-align: center;
-  font-size: 10px; font-weight: 700;
+  font-size: 10px; font-weight: 600;
   color: var(--text3); background: var(--surface3);
   border: 1px solid var(--border); border-radius: 50%;
   cursor: help; margin-left: 4px; vertical-align: middle;
@@ -2088,6 +1844,11 @@ input[list] {
   color: var(--text3);
   margin-top: 2px;
 }
+/* Continuation rows of a multi-instance model group in the inflight
+   table: the logo + model name render once on the group's first row;
+   these rows carry only the instance id, aligned under the first id. */
+.deploy-cell--inst { padding-left: 32px; }
+.deploy-cell--inst .deploy-id { margin-top: 0; }
 
 /* ── Per-1M-token cost cell (models table) ───────────────── */
 /* Inline "label:$value" per line — three rows stack tightly so the
@@ -2132,7 +1893,7 @@ input[list] {
 .alias-chip-btn:hover {
   border-color: var(--primary);
   background: var(--primary);
-  color: #fff;
+  color: var(--accent-ink);
 }
 
 /* ── Alias management card (model edit modal 别名卡片) ──────── */
@@ -2154,9 +1915,9 @@ input[list] {
 }
 .alias-mgmt-row .btn-small { flex: 0 0 auto; }
 .alias-hidden-toggle.is-on {
-  background: var(--warning-bg, rgba(232, 116, 12, .12));
-  color: var(--warning, #e8740c);
-  border-color: var(--warning, #e8740c);
+  background: var(--warn-bg);
+  color: var(--warn);
+  border-color: var(--warn);
 }
 .alias-add-row {
   display: flex;
@@ -2230,11 +1991,6 @@ input[list] {
   transition: height .3s ease;
   position: relative;
 }
-.rb-bar::after {
-  content: ""; position: absolute; inset: 0;
-  border-radius: inherit;
-  background: linear-gradient(180deg, rgba(255,255,255,.15) 0%, transparent 60%);
-}
 .rb-bar-label {
   font-size: 10px; color: var(--text3); margin-top: 3px;
   /* Constrain to column width so long labels (MM-DD HH:MM) truncate with
@@ -2298,7 +2054,7 @@ input[list] {
   margin-bottom: 16px;
 }
 .request-rate-panel__head h2 {
-  font-size: 20px; color: var(--text); font-weight: 700; letter-spacing: -.2px;
+  font-size: 20px; color: var(--text); font-weight: 500; letter-spacing: -.2px;
 }
 .request-rate-panel #request-rate-wrap > p.loading,
 .request-rate-panel #request-rate-wrap > p {
@@ -2344,12 +2100,8 @@ input[list] {
   width: 14px; min-height: 1px; border-radius: 3px 3px 0 0;
   transition: height .3s ease; position: relative;
 }
-.rbm-bar::after {
-  content: ""; position: absolute; inset: 0; border-radius: inherit;
-  background: linear-gradient(180deg, rgba(255,255,255,.15) 0%, transparent 60%);
-}
-.rbm-bar-out { background: linear-gradient(180deg, #f87171, #ef4444); } /* red-400 → red-500 */
-.rbm-bar-in  { background: linear-gradient(180deg, #4ade80, #22c55e); } /* green-400 → green-500 */
+.rbm-bar-out { background: var(--danger); }
+.rbm-bar-in  { background: var(--success); }
 .rbm-label {
   font-size: 10px; color: var(--text3); margin-top: 6px;
   white-space: nowrap; text-align: center;
@@ -2369,12 +2121,12 @@ input[list] {
   border-radius: var(--radius-sm); padding: 12px 16px;
 }
 .kcs-value {
-  font-size: 24px; font-weight: 700; color: var(--text); line-height: 1.1;
+  font-size: 24px; font-weight: 500; color: var(--text); line-height: 1.1;
   font-variant-numeric: tabular-nums;
 }
 .kcs-label {
-  font-size: 11px; color: var(--text3);
-  text-transform: uppercase; letter-spacing: .04em; margin-top: 4px;
+  font-size: 12px; color: var(--text3);
+  letter-spacing: 0; margin-top: 4px;
 }
 .kcs-warn .kcs-value { color: var(--warn, #e2a600); }
 .kcs-breakdown { font-size: 12px; color: var(--text3); margin: 8px 0 0; line-height: 1.5; }
@@ -2436,8 +2188,8 @@ input[list] {
   width: 38%; max-width: 22px; min-width: 8px;
   border-radius: 3px 3px 0 0;
 }
-.calib-bar-pred   { background: linear-gradient(180deg, #cbd5e1, #94a3b8); } /* slate-300→400 */
-.calib-bar-actual { background: linear-gradient(180deg, #34d399, #10b981); } /* emerald-400→500 */
+.calib-bar-pred   { background: #94a3b8; }
+.calib-bar-actual { background: var(--success); }
 .calib-legend {
   display: flex; align-items: center; gap: 16px;
   font-size: 12px; color: var(--text3);
@@ -2480,11 +2232,11 @@ input[list] {
   border-radius: var(--radius-sm); padding: 12px 16px;
 }
 .agent-summary-label {
-  font-size: 11px; color: var(--text3);
-  text-transform: uppercase; letter-spacing: .04em; margin-bottom: 4px;
+  font-size: 12px; color: var(--text3);
+  letter-spacing: 0; margin-bottom: 4px;
 }
 .agent-summary-value {
-  font-size: 24px; font-weight: 700; color: var(--text); line-height: 1.1;
+  font-size: 24px; font-weight: 500; color: var(--text); line-height: 1.1;
 }
 .agent-bar {
   width: 14px; min-width: 6px; max-width: 22px;
@@ -2494,11 +2246,11 @@ input[list] {
   transition: height .3s ease;
 }
 .agent-bar-anthropic {
-  background: linear-gradient(180deg, #34d399, #10b981);  /* emerald-400 → emerald-500 */
+  background: var(--success);
   flex: 0; min-height: 0;
 }
 .agent-bar-other {
-  background: linear-gradient(180deg, #cbd5e1, #94a3b8);  /* slate-300 → slate-400 */
+  background: #94a3b8;
   flex: 0; min-height: 0;
 }
 .agent-legend {
@@ -2588,15 +2340,14 @@ input[list] {
   gap: 8px;
 }
 .chat-plan-label {
-  font-size: 11px;
-  text-transform: uppercase;
-  letter-spacing: 1px;
+  font-size: 12px;
+  letter-spacing: 0;
   color: var(--text3);
-  font-weight: 600;
+  font-weight: 400;
 }
 .chat-plan-name {
   font-size: 15px;
-  font-weight: 700;
+  font-weight: 500;
   color: var(--text);
   font-family: var(--heading);
 }
@@ -2618,9 +2369,8 @@ input[list] {
 }
 .chat-meter-label {
   color: var(--text2);
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: .5px;
+  font-weight: 400;
+  letter-spacing: 0;
 }
 .chat-meter-value {
   color: var(--text);
@@ -2678,7 +2428,7 @@ input[list] {
   color: var(--text2);
   background: var(--surface2);
   border: 1px solid var(--border);
-  border-radius: 999px;
+  border-radius: var(--radius-xs);
   padding: 3px 10px;
   white-space: nowrap;
 }
@@ -3000,9 +2750,8 @@ input[list] {
   flex: 0 0 130px;
   font-size: 12px;
   color: var(--text3);
-  font-weight: 500;
-  text-transform: uppercase;
-  letter-spacing: .03em;
+  font-weight: 400;
+  letter-spacing: 0;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -3026,11 +2775,10 @@ input[list] {
 /* ── Admin Quota Management ───────────────────────────── */
 .quota-section-title {
   font-size: 14px;
-  font-weight: 700;
+  font-weight: 500;
   color: var(--text);
   margin: 18px 0 12px;
-  text-transform: uppercase;
-  letter-spacing: .04em;
+  letter-spacing: 0;
 }
 .quota-grid {
   display: grid;
@@ -3092,11 +2840,10 @@ input[list] {
   border-left: 3px solid var(--primary);
 }
 .team-limits-title {
-  font-size: 11px;
-  font-weight: 700;
+  font-size: 12px;
+  font-weight: 400;
   color: var(--text3);
-  text-transform: uppercase;
-  letter-spacing: .04em;
+  letter-spacing: 0;
   margin-bottom: 4px;
 }
 .team-limits-title .team-limits-name-explicit {
@@ -3104,7 +2851,7 @@ input[list] {
   letter-spacing: 0;
   font-size: 12px;
   color: var(--primary);
-  font-weight: 700;
+  font-weight: 500;
 }
 .team-limits-title .team-limits-name-implicit {
   text-transform: none;
@@ -3132,11 +2879,10 @@ input[list] {
   border-left: 3px solid var(--text3);
 }
 .team-models-title {
-  font-size: 11px;
-  font-weight: 700;
+  font-size: 12px;
+  font-weight: 400;
   color: var(--text3);
-  text-transform: uppercase;
-  letter-spacing: .04em;
+  letter-spacing: 0;
   margin-bottom: 4px;
 }
 .team-models-list {
@@ -3233,7 +2979,7 @@ input[list] {
 }
 .stress-uptime__value {
   font-size: 18px;
-  font-weight: 700;
+  font-weight: 500;
   color: var(--text);
   letter-spacing: .2px;
   /* Fixed-width digits — the 1.5s poll refresh never makes the value jump. */
@@ -3271,7 +3017,7 @@ input[list] {
   border: 1px solid var(--border);
   color: var(--text3);
   font-size: 11px;
-  font-weight: 700;
+  font-weight: 600;
   cursor: help;
   user-select: none;
   margin-left: auto;
@@ -3334,7 +3080,7 @@ input[list] {
   color: var(--text2);
 }
 .stress-card__value {
-  font-weight: 700;
+  font-weight: 500;
   font-size: 14px;
   color: var(--text);
   font-variant-numeric: tabular-nums;
@@ -3357,25 +3103,21 @@ input[list] {
   margin-left: auto; flex-shrink: 0;
   transition: background .3s ease;
 }
-.alert-dot.green {
-  background: #10b981;
-  box-shadow: 0 0 8px rgba(16,185,129,.9);
-}
+.alert-dot.green { background: #10b981; }
 .alert-dot.red {
   background: #ef4444;
-  box-shadow: 0 0 8px rgba(239,68,68,.9);
   animation: alert-pulse 1.6s ease-in-out infinite;
 }
 @keyframes alert-pulse {
-  0%, 100% { box-shadow: 0 0 4px 0 rgba(239,68,68,.5); }
-  50%      { box-shadow: 0 0 10px 3px rgba(239,68,68,.75); }
+  0%, 100% { opacity: 1; }
+  50%      { opacity: .45; }
 }
 
-/* Health banner pill */
+/* Health banner */
 .status-banner {
   display: inline-flex; align-items: center; gap: 8px;
-  padding: 6px 16px; border-radius: 999px;
-  font-size: 13px; font-weight: 600;
+  padding: 4px 10px; border-radius: var(--radius-sm);
+  font-size: 13px; font-weight: 500;
 }
 .status-banner--green { background: var(--success-bg); color: var(--success); }
 .status-banner--red   { background: var(--danger-bg);  color: var(--danger); }
@@ -3400,11 +3142,11 @@ input[list] {
   border-bottom: 1px solid var(--border);
 }
 .status-panel__title {
-  font-size: 14px; font-weight: 700; color: var(--text);
+  font-size: 14px; font-weight: 500; color: var(--text);
 }
 .status-panel__count {
-  font-size: 12px; font-weight: 700;
-  padding: 2px 10px; border-radius: 999px;
+  font-size: 12px; font-weight: 500;
+  padding: 1px 8px; border-radius: var(--radius-xs);
   background: var(--surface2); color: var(--text2);
 }
 .status-panel__count--red    { background: var(--danger-bg);  color: var(--danger); }
@@ -3423,11 +3165,9 @@ input[list] {
 .alert-card:last-child { margin-bottom: 0; }
 .alert-card--red {
   border-left-color: var(--danger);
-  background: linear-gradient(90deg, var(--danger-bg) 0%, var(--surface2) 30%);
 }
 .alert-card--green {
   border-left-color: var(--success);
-  background: linear-gradient(90deg, var(--success-bg) 0%, var(--surface2) 30%);
 }
 .alert-card__top {
   display: flex; align-items: center; flex-wrap: wrap;
@@ -3439,7 +3179,7 @@ input[list] {
 .alert-card__badge--red   { background: var(--danger); }
 .alert-card__badge--green { background: var(--success); }
 .alert-card__kind {
-  font-weight: 700; font-size: 13px;
+  font-weight: 600; font-size: 13px;
 }
 .alert-card--red   .alert-card__kind { color: var(--danger); }
 .alert-card--green .alert-card__kind { color: var(--success); }
@@ -3450,7 +3190,7 @@ input[list] {
   padding: 2px 8px; border-radius: 6px;
 }
 .alert-card__duration {
-  margin-left: auto; font-size: 12px; font-weight: 600;
+  margin-left: auto; font-size: 12px; font-weight: 500;
   color: var(--text2); font-variant-numeric: tabular-nums;
 }
 .alert-card__message {
@@ -3464,9 +3204,9 @@ input[list] {
   font-variant-numeric: tabular-nums;
 }
 .alert-card__live {
-  color: var(--danger); font-weight: 600;
+  color: var(--danger); font-weight: 500;
   background: var(--danger-bg);
-  padding: 1px 8px; border-radius: 999px;
+  padding: 1px 8px; border-radius: var(--radius-xs);
 }
 
 /* Empty state */
@@ -3479,7 +3219,7 @@ input[list] {
   display: inline-flex; align-items: center; justify-content: center;
   width: 22px; height: 22px; border-radius: 50%;
   background: var(--success-bg); color: var(--success);
-  font-size: 12px; font-weight: 700;
+  font-size: 12px; font-weight: 600;
 }
 
 /* Logs page: time-range selector bar (below the table, above pagination) */

@@ -178,6 +178,24 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
 
     // 4. KV config store (dashboard-owned).
     tracing::info!("Migration 7/8: boom_config...");
+    // The abandoned config-db-authority experiment (P1/P2, reverted in
+    // 7bf138d) recreated boom_config with a `section` column. IF NOT EXISTS
+    // can't evolve that back to the KV shape — probe the column shape and
+    // drop explicitly (mirror of the section_store era's conditional
+    // legacy-KV drop in ba4b68f, now in the opposite direction). Section
+    // rows belong to the reverted line and have no readers in current code.
+    let section_shaped: Option<String> = sqlx::query_scalar(
+        r#"SELECT column_name FROM information_schema.columns
+           WHERE table_name = 'boom_config' AND column_name = 'section'"#,
+    )
+    .fetch_optional(&mut *conn)
+    .await?;
+    if section_shaped.is_some() {
+        sqlx::query("DROP TABLE boom_config").execute(&mut *conn).await?;
+        tracing::info!(
+            "Dropped section-shaped boom_config (reverted config-db-authority experiment leftover)"
+        );
+    }
     sqlx::query(
         r#"CREATE TABLE IF NOT EXISTS boom_config (
             key         TEXT PRIMARY KEY,

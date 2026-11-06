@@ -56,6 +56,27 @@ impl W3cContext {
     }
 }
 
+/// Build a synthetic context for requests that arrive without a valid
+/// `traceparent` header. The trace id is derived deterministically from the
+/// request id (same SHA-256 trick as `fresh_span_id`), the parent span id is
+/// all-zero (no upstream parent), and sampled=true so the gateway span
+/// records as sampled. Used so metrics cover every request — spans created
+/// from a synthetic context simply aren't export-eligible as traces.
+pub fn synthetic_context(request_id: &str) -> W3cContext {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(request_id.as_bytes());
+    let digest = hasher.finalize();
+    let mut trace_id = [0u8; 16];
+    trace_id.copy_from_slice(&digest[..16]);
+    W3cContext {
+        trace_id,
+        parent_span_id: [0u8; 8],
+        sampled: true,
+        trace_state: String::new(),
+    }
+}
+
 /// Parse a W3C `traceparent` header. Returns `None` on any malformation
 /// (wrong section count, wrong length, non-hex chars). Format:
 /// `00-{32 hex trace id}-{16 hex span id}-{2 hex flags}`.

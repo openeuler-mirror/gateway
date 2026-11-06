@@ -7,6 +7,7 @@
 //! (mirrors `PromptLogWriter::replace_otlp`).
 
 use crate::context::W3cContext;
+use crate::metrics::MetricsRecorder;
 use crate::otlp_export::TraceExporter;
 use crate::span::RequestSpan;
 use arc_swap::ArcSwap;
@@ -70,10 +71,19 @@ pub struct TraceRegistry {
     active: DashMap<String, RequestSpan>,
     recent_ring: std::sync::Mutex<SlowRing>,
     otlp: Arc<ArcSwap<Option<Arc<TraceExporter>>>>,
+    /// Self-aggregating metrics recorder (issue #49, Prometheus pull via
+    /// `GET /metrics`). Presence == enabled; swapped by
+    /// `set_metrics_enabled` from `trace.metrics.enabled`.
+    metrics: Arc<ArcSwap<Option<Arc<MetricsRecorder>>>>,
     flush_handle: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
     /// When true, the OTLP exporter is configured and `enqueue_finalized`
     /// forwards the span to OTLP traces. Driven by `TraceConfig.enabled`.
     enabled: std::sync::atomic::AtomicBool,
+    /// DB-backed metrics channel switch (`boom_config` KV
+    /// `trace_metrics_enabled`). Kept separate from the effective state in
+    /// `metrics` so the dashboard can round-trip the DB semantic value even
+    /// while the YAML trace master switch is off.
+    metrics_switch: std::sync::atomic::AtomicBool,
     total_started: AtomicU64,
     total_finalized: AtomicU64,
     total_error: AtomicU64,
@@ -89,8 +99,10 @@ impl TraceRegistry {
             active: DashMap::with_capacity(1024),
             recent_ring: std::sync::Mutex::new(SlowRing::new(DEFAULT_RECENT_CAP)),
             otlp: Arc::new(ArcSwap::from_pointee(None)),
+            metrics: Arc::new(ArcSwap::from_pointee(None)),
             flush_handle: Arc::new(std::sync::Mutex::new(None)),
             enabled: std::sync::atomic::AtomicBool::new(false),
+            metrics_switch: std::sync::atomic::AtomicBool::new(false),
             total_started: AtomicU64::new(0),
             total_finalized: AtomicU64::new(0),
             total_error: AtomicU64::new(0),
@@ -122,11 +134,58 @@ impl TraceRegistry {
         };
         self.otlp.store(Arc::new(new_exporter));
         self.enabled.store(enabled, Ordering::Relaxed);
+        // The trace master switch gates the metrics channel too — recompute
+        // the effective state so a YAML trace.enabled toggle on reload
+        // turns /metrics on/off alongside the traces exporter.
+        let metrics_switch = self.metrics_switch.load(Ordering::Relaxed);
+        let metrics_effective = enabled && metrics_switch;
+        self.metrics.store(Arc::new(if metrics_effective {
+            Some(MetricsRecorder::new())
+        } else {
+            None
+        }));
         tracing::info!(
             enabled,
             endpoint = %config.endpoint,
             "Trace exporter hot-swapped"
         );
+    }
+
+    /// Toggle the metrics channel switch (DB-backed via `boom_config` KV
+    /// `trace_metrics_enabled`; YAML value is seed-only). The effective
+    /// channel state is `trace master switch && this switch`, recomputed
+    /// here and in `replace_otlp` whenever either side changes. Enabling
+    /// installs a fresh recorder — histogram series restart from zero
+    /// (standard Prometheus reset semantics); disabling drops all
+    /// aggregation state. In-flight requests that started before the
+    /// toggle may skew the active gauges until they drain (their finalize
+    /// decrements a counter they never incremented).
+    pub fn set_metrics_enabled(&self, enabled: bool) {
+        self.metrics_switch.store(enabled, Ordering::Relaxed);
+        let effective = self.enabled.load(Ordering::Relaxed) && enabled;
+        self.metrics.store(Arc::new(if effective {
+            Some(MetricsRecorder::new())
+        } else {
+            None
+        }));
+    }
+
+    /// The DB-semantic metrics switch value (last value passed to
+    /// `set_metrics_enabled`), regardless of the trace master switch.
+    /// Used by the dashboard to round-trip the checkbox state.
+    pub fn metrics_enabled(&self) -> bool {
+        self.metrics_switch.load(Ordering::Relaxed)
+    }
+
+    /// Current metrics exposition (Prometheus text format) for
+    /// `GET /metrics`. `None` when the channel is disabled — the handler
+    /// answers 404 so a stale scrape config surfaces as target-down.
+    pub fn prometheus_text(&self) -> Option<String> {
+        if let Some(m) = self.metrics.load().as_ref() {
+            Some(m.render())
+        } else {
+            None
+        }
     }
 
     /// Whether the trace channel is enabled. Read at every request ingress
@@ -160,16 +219,21 @@ impl TraceRegistry {
         api_path: String,
         is_stream: bool,
         now_unix_nano: u64,
+        export_eligible: bool,
     ) -> RequestSpan {
         let span = RequestSpan::new(
             request_id.clone(),
             w3c,
-            model,
-            api_path,
+            model.clone(),
+            api_path.clone(),
             is_stream,
             now_unix_nano,
+            export_eligible,
         );
         self.total_started.fetch_add(1, Ordering::Relaxed);
+        if let Some(m) = self.metrics.load().as_ref() {
+            m.add_server_active(1, &model, &api_path);
+        }
         // Evict oldest if at cap.
         if self.active.len() >= self.active_cap {
             // DashMap doesn't have a "remove oldest" — we scan for the
@@ -204,8 +268,9 @@ impl TraceRegistry {
 
     /// Mark the span as finalized-OK and remove it from the active table.
     /// Every finalized span (regardless of duration) lands in the recent
-    /// ring so the dashboard can show "what just finished". If OTLP is
-    /// enabled, also enqueue for export to the collector.
+    /// ring so the dashboard can show "what just finished". OTLP traces
+    /// export only spans flagged `export_eligible` at start; metrics record
+    /// for every span (full-coverage semantics, issue #49).
     pub fn finalize_ok(&self, request_id: &str, now_unix_nano: u64) {
         let span = match self.active.remove(request_id) {
             Some((_, s)) => s,
@@ -213,11 +278,16 @@ impl TraceRegistry {
         };
         let mut span = span;
         span.finalize_ok(now_unix_nano);
+        span.apply_nonstream_fallbacks();
         self.total_finalized.fetch_add(1, Ordering::Relaxed);
+        if let Some(m) = self.metrics.load().as_ref() {
+            m.record_request_done(&span);
+            m.add_server_active(-1, &span.model, &span.api_path);
+        }
         if let Ok(mut ring) = self.recent_ring.lock() {
             ring.push(span.clone());
         }
-        if self.enabled.load(Ordering::Relaxed) {
+        if span.export_eligible {
             if let Some(exp) = self.otlp.load().as_ref() {
                 let exp = exp.clone();
                 let span = span;
@@ -237,12 +307,17 @@ impl TraceRegistry {
         };
         let mut span = span;
         span.finalize_error(now_unix_nano, message);
+        span.apply_nonstream_fallbacks();
         self.total_finalized.fetch_add(1, Ordering::Relaxed);
         self.total_error.fetch_add(1, Ordering::Relaxed);
+        if let Some(m) = self.metrics.load().as_ref() {
+            m.record_request_done(&span);
+            m.add_server_active(-1, &span.model, &span.api_path);
+        }
         if let Ok(mut ring) = self.recent_ring.lock() {
             ring.push(span.clone());
         }
-        if self.enabled.load(Ordering::Relaxed) {
+        if span.export_eligible {
             if let Some(exp) = self.otlp.load().as_ref() {
                 let exp = exp.clone();
                 tokio::spawn(async move {
@@ -250,6 +325,35 @@ impl TraceRegistry {
                 });
             }
         }
+    }
+
+    /// Upstream dispatch marker for the span identified by `request_id`:
+    /// stamps `upstream_start_ns` and bumps `http.client.active_requests`.
+    /// No-op when the span was evicted or metrics are off.
+    pub fn note_upstream_started(&self, request_id: &str, now_unix_nano: u64) {
+        if let Some(span) = self.active.get(request_id).map(|e| e.value().clone()) {
+            if let Some(m) = self.metrics.load().as_ref() {
+                m.add_client_active(&span, 1);
+            }
+        }
+        let _ = self
+            .active
+            .get_mut(request_id)
+            .map(|mut e| e.note_upstream_start(now_unix_nano));
+    }
+
+    /// Upstream completion marker: stamps `upstream_end_ns` and decrements
+    /// `http.client.active_requests`.
+    pub fn note_upstream_ended(&self, request_id: &str, now_unix_nano: u64) {
+        if let Some(span) = self.active.get(request_id).map(|e| e.value().clone()) {
+            if let Some(m) = self.metrics.load().as_ref() {
+                m.add_client_active(&span, -1);
+            }
+        }
+        let _ = self
+            .active
+            .get_mut(request_id)
+            .map(|mut e| e.note_upstream_end(now_unix_nano));
     }
 
     /// Active span count (for diagnostics).
@@ -302,6 +406,18 @@ impl TraceApi for TraceRegistry {
         };
         Some(exporter.clone().probe().await)
     }
+
+    async fn set_metrics_enabled(&self, enabled: bool) {
+        self.set_metrics_enabled(enabled);
+    }
+
+    async fn metrics_enabled(&self) -> bool {
+        self.metrics_enabled()
+    }
+
+    async fn trace_enabled(&self) -> bool {
+        self.enabled()
+    }
 }
 
 #[cfg(test)]
@@ -333,6 +449,7 @@ mod tests {
             "/p".to_string(),
             false,
             1_000_000_000,
+            true,
         );
         reg.finalize_ok("req-1", 2_000_000_000);
         let snap = reg.snapshot().await;
@@ -354,6 +471,7 @@ mod tests {
             "/p".to_string(),
             false,
             1_000,
+            true,
         );
         reg.finalize_error("req-2", 2_000, "boom".to_string());
         let snap = reg.snapshot().await;
@@ -370,6 +488,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn metrics_toggle_drives_prometheus_text() {
+        let reg = TraceRegistry::new();
+        reg.set_enabled_for_test(true);
+        assert!(reg.prometheus_text().is_none());
+
+        reg.set_metrics_enabled(true);
+        let w3c = make_w3c();
+        let _span = reg.start_request(
+            "r-metrics".to_string(),
+            &w3c,
+            "gpt-4".to_string(),
+            "/v1/chat/completions".to_string(),
+            false,
+            1_000_000_000,
+            true,
+        );
+        reg.finalize_ok("r-metrics", 2_000_000_000);
+        let text = reg.prometheus_text().expect("metrics enabled");
+        assert!(text.contains("http_server_request_duration_seconds_count"));
+        // start/finalize pairing leaves a zero-valued gauge series behind.
+        assert!(text.contains("http_server_active_requests"));
+
+        reg.set_metrics_enabled(false);
+        assert!(reg.prometheus_text().is_none());
+        // The DB-semantic switch round-trips independent of the master gate.
+        assert!(!reg.metrics_enabled());
+    }
+
+    #[tokio::test]
+    async fn metrics_switch_gated_by_trace_master_switch() {
+        // Master switch off: metrics_switch=true is remembered (DB semantic
+        // value round-trips) but the channel stays dark.
+        let reg = TraceRegistry::new();
+        reg.set_metrics_enabled(true);
+        assert!(reg.metrics_enabled());
+        assert!(reg.prometheus_text().is_none());
+    }
+
+    #[tokio::test]
+    async fn replace_otlp_master_toggle_recomputes_metrics() {
+        // A trace master switch flip (reload path) must turn the metrics
+        // channel on/off alongside the traces exporter, keeping the DB
+        // semantic switch value intact. Exporter itself stays disabled so
+        // no OTLP endpoint is needed here.
+        let reg = TraceRegistry::new();
+        reg.set_metrics_enabled(true);
+        assert!(reg.prometheus_text().is_none());
+
+        let cfg = boom_core::OtlpConfig::default(); // enabled=false
+        reg.replace_otlp(&cfg, true).await;
+        assert!(reg.prometheus_text().is_some());
+
+        reg.replace_otlp(&cfg, false).await;
+        assert!(reg.prometheus_text().is_none());
+        assert!(reg.metrics_enabled());
+    }
+
+    #[tokio::test]
     async fn finalize_ok_without_otlp_does_not_panic() {
         // enabled=false default. Should silently no-op the OTLP enqueue path.
         let reg = TraceRegistry::new();
@@ -381,6 +557,7 @@ mod tests {
             "/p".to_string(),
             false,
             1_000,
+            true,
         );
         reg.finalize_ok("r", 2_000);
     }
@@ -403,6 +580,7 @@ mod tests {
                 "/p".to_string(),
                 false,
                 i as u64,
+                true,
             );
         }
         assert_eq!(reg.active.len(), 1_000);

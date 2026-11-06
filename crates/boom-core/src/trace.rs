@@ -120,6 +120,21 @@ pub trait TraceApi: Send + Sync + 'static {
     /// (Offline → Online on success). Returns `None` when no exporter is
     /// configured. Shape mirrors `boom_promptlog::ProbeResult`.
     async fn probe_otlp(&self) -> Option<ProbeResult>;
+
+    /// Set the metrics channel switch (DB-backed via `boom_config` KV
+    /// `trace_metrics_enabled`). The producer recomputes the effective
+    /// channel state as `trace master switch && this switch`.
+    async fn set_metrics_enabled(&self, enabled: bool);
+
+    /// The DB-semantic metrics switch value (last value stored), regardless
+    /// of the trace master switch. Used by the dashboard to round-trip the
+    /// checkbox state.
+    async fn metrics_enabled(&self) -> bool;
+
+    /// Whether the trace master switch (YAML `trace.enabled`) is on. Surfaced
+    /// so the dashboard can warn when the metrics switch is on but the
+    /// master gate keeps `/metrics` dark.
+    async fn trace_enabled(&self) -> bool;
 }
 
 /// Status snapshot of the OTLP traces exporter. Shape mirrors

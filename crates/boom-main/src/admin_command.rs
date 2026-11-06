@@ -259,6 +259,17 @@ fn overlay_db_owned_sections(config: &mut Value, snapshot: &Value) {
             gs_obj.insert("user_tag_headers".to_string(), headers.clone());
         }
     }
+    // trace.metrics.enabled lives under trace — same sub-key merge so the
+    // rest of trace (endpoint, filters, master switch — process-level) stays
+    // untouched.
+    if let Some(metrics) = snapshot.get("trace").and_then(|t| t.get("metrics")) {
+        let trace = cfg_obj
+            .entry("trace")
+            .or_insert_with(|| serde_json::json!({}));
+        if let Some(trace_obj) = trace.as_object_mut() {
+            trace_obj.insert("metrics".to_string(), metrics.clone());
+        }
+    }
 }
 
 /// Parse the request's visibility string into the enum. System boundary —
