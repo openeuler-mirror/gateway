@@ -16,40 +16,28 @@
 </head>
 <body>
   <div id="app">
-    <!-- Login Page — Aurora stage: ambient purple pools over a faint grid +
-         noise texture. Card sits centered with multi-layer shadow + inner
-         glow. References Linear / Vercel / Stripe login aesthetics. -->
+    <!-- Login — split stage: commissioned hero illustration (the one rich
+         element) + a quiet card. Chrome stays neutral; the artwork carries
+         the color. -->
     <div id="page-login" class="page active">
-      <div class="login-aurora" aria-hidden="true"></div>
-      <!-- Three slow-swimming light blobs — revived from v1 (6bc7a3b) per
-           feedback: the page felt static. Trajectories preserved (swim1/2/3);
-           colors rebased onto the purple Aurora palette so they read as
-           drifting brand-colored light, not foreign decoration. -->
-      <div class="login-creature sc-1" aria-hidden="true"></div>
-      <div class="login-creature sc-2" aria-hidden="true"></div>
-      <div class="login-creature sc-3" aria-hidden="true"></div>
-      <div class="login-grid" aria-hidden="true"></div>
-      <div class="login-noise" aria-hidden="true"></div>
       <div class="login-shell">
         <div class="login-hero">
-          <img src="/dashboard/assets/login.png" alt="BooMGateway" draggable="false" decoding="async">
+          <div class="hero-frame">
+            <img src="/dashboard/assets/login.png" alt="BooMGateway" draggable="false" decoding="async">
+          </div>
         </div>
         <div class="login-card">
-        <div class="login-card-glow" aria-hidden="true"></div>
         <div class="login-brand">
-          <div class="brand-mark-wrap">
-            <span class="brand-mark-halo" aria-hidden="true"></span>
-            <svg class="brand-mark" viewBox="0 0 48 48" width="48" height="48" aria-hidden="true">
-              <!-- Diamond + 4 dots — matches the mark in /misc/logo.svg (purple palette). -->
-              <g transform="translate(24,24)">
-                <rect x="-7" y="-7" width="14" height="14" fill="#5053e8" transform="rotate(45)" rx="1.5"/>
-                <circle cx="-18" cy="0" r="3" fill="rgba(80,83,232,0.35)"/>
-                <circle cx="18" cy="0" r="3" fill="rgba(80,83,232,0.35)"/>
-                <circle cx="0" cy="-18" r="3" fill="rgba(80,83,232,0.35)"/>
-                <circle cx="0" cy="18" r="3" fill="rgba(80,83,232,0.35)"/>
-              </g>
-            </svg>
-          </div>
+          <svg class="brand-mark" viewBox="0 0 48 48" width="40" height="40" aria-hidden="true">
+            <!-- Diamond + 4 dots — same geometry as /misc/logo.svg, single accent hue. -->
+            <g transform="translate(24,24)">
+              <rect x="-7" y="-7" width="14" height="14" fill="var(--primary)" transform="rotate(45)" rx="1.5"/>
+              <circle cx="-18" cy="0" r="3" fill="var(--primary)" opacity=".35"/>
+              <circle cx="18" cy="0" r="3" fill="var(--primary)" opacity=".35"/>
+              <circle cx="0" cy="-18" r="3" fill="var(--primary)" opacity=".35"/>
+              <circle cx="0" cy="18" r="3" fill="var(--primary)" opacity=".35"/>
+            </g>
+          </svg>
           <div class="brand-name" data-i18n="brand.name">BooM</div>
           <div class="brand-tagline" data-i18n="brand.tagline">Gateway Dashboard</div>
         </div>
@@ -137,7 +125,7 @@
               <select id="chat-model" class="chat-model-select"></select>
               <span class="chat-toolbar-spacer"></span>
               <span class="chat-param-chip" id="chat-param-chip"></span>
-              <button class="btn-small" id="chat-settings-btn" data-i18n="chat.settings_btn">⚙ Settings</button>
+              <button class="btn-small" id="chat-settings-btn" data-i18n="chat.settings_btn">Settings</button>
             </div>
             <div id="chat-queue-status" class="chat-queue hidden"></div>
             <div id="chat-messages" class="chat-messages"></div>
@@ -418,8 +406,8 @@
             <div class="section-header">
               <h2 data-i18n="models.title">Model Deployments</h2>
               <div style="display:flex;gap:8px">
-                <button class="btn-small" id="btn-new-model" data-i18n="models.add">+ Add Model</button>
                 <button class="btn-small" id="btn-import-yaml-models" data-i18n="models.import_yaml">Import from YAML</button>
+                <button class="btn-small btn-primary" id="btn-new-model" data-i18n="models.add">+ Add Model</button>
               </div>
             </div>
             <div id="models-table-wrap"><p class="loading" data-i18n="common.loading">Loading...</p></div>
@@ -449,7 +437,7 @@
               <h2 data-i18n="plans.title">Plans</h2>
               <div style="display:flex;gap:8px">
                 <button class="btn-small is-danger" id="btn-reset-all-limits" data-i18n="plans.reset_all">Reset All Limits</button>
-                <button class="btn-small" id="btn-new-plan" data-i18n="plans.add">+ New Plan</button>
+                <button class="btn-small btn-primary" id="btn-new-plan" data-i18n="plans.add">+ New Plan</button>
               </div>
             </div>
             <div id="plans-table-wrap"><p class="loading" data-i18n="common.loading">Loading...</p></div>
@@ -459,13 +447,17 @@
           <section id="admin-keys" class="section">
             <div class="section-header">
               <h2 data-i18n="keys.title">API Keys</h2>
-              <div class="keys-toolbar">
+            </div>
+            <div class="keys-toolbar">
+              <div class="toolbar-group">
                 <input type="text" id="keys-search" data-i18n-ph="keys.search_placeholder" placeholder="Search alias, name, user, token..." class="search-input">
                 <select id="keys-plan-filter" class="search-input" style="max-width:180px"></select>
-                <button class="btn-small" id="btn-vip-filter" data-i18n="keys.vip_only">VIP Only</button>
+                <button class="btn-chip" id="btn-vip-filter" aria-pressed="false" data-i18n="keys.vip_only">VIP Only</button>
+              </div>
+              <div class="toolbar-group">
                 <button class="btn-small" id="btn-import-help" data-i18n="keys.import_help">Import Help</button>
                 <button class="btn-small" id="btn-import-keys" data-i18n="keys.import_file">Import File</button>
-                <button class="btn-small" id="btn-new-key" data-i18n="keys.add">+ Create Key</button>
+                <button class="btn-small btn-primary" id="btn-new-key" data-i18n="keys.add">+ Create Key</button>
               </div>
             </div>
             <div id="keys-table-wrap"><p class="loading" data-i18n="common.loading">Loading...</p></div>
@@ -617,11 +609,11 @@
                     <th data-i18n="logs.col.path">Path</th>
                     <th data-i18n="logs.col.status">Status</th>
                     <th data-i18n="logs.col.stream">Stream</th>
-                    <th data-i18n="logs.col.in_out">IN/OUT</th>
-                    <th data-i18n="logs.col.prefix_hit_rate">Prefix Hit Rate</th>
-                    <th data-i18n="logs.col.duration">Duration</th>
-                    <th data-i18n="logs.col.ttft">TTFT</th>
-                    <th data-i18n="logs.col.queue_wait">Queue Wait</th>
+                    <th class="num" data-i18n="logs.col.in_out">IN/OUT</th>
+                    <th class="num" data-i18n="logs.col.prefix_hit_rate">Prefix Hit Rate</th>
+                    <th class="num" data-i18n="logs.col.duration">Duration</th>
+                    <th class="num" data-i18n="logs.col.ttft">TTFT</th>
+                    <th class="num" data-i18n="logs.col.queue_wait">Queue Wait</th>
                     <th data-i18n="logs.col.error">Error</th>
                     <th data-i18n="logs.col.detail">Detail</th>
                   </tr>

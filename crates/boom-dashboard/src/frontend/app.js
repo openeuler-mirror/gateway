@@ -697,7 +697,7 @@
       accessor: (s) => s.cpu_pct,
       yMax: "auto",
       yMinFloor: 100,
-      color: "#10b981",
+      color: cssVar("--primary") || "#0e7490",
       emptyHint: "Collecting… (first sample takes 1s)",
       formatValue: (v) => v.toFixed(1) + "%",
       formatY: (v) => v.toFixed(0) + "%",
@@ -711,7 +711,7 @@
       accessor: (s) => s.rss_bytes,
       yMax: "auto",
       yMinFloor: 100 * 1024 * 1024,
-      color: "#a855f7",
+      color: cssVar("--primary") || "#0e7490",
       emptyHint: "—",
       formatValue: formatBytes,
       formatY: (v) => formatBytes(v, true),
@@ -724,7 +724,7 @@
       samples,
       accessor: (s) => s.worker_queue_depth,
       yMax: "auto",
-      color: "#f59e0b",
+      color: cssVar("--primary") || "#0e7490",
       emptyHint: "—",
       formatValue: (v) => String(v),
       formatY: (v) => String(Math.round(v)),
@@ -737,7 +737,7 @@
       samples,
       accessor: (s) => s.blocking_tasks_queued,
       yMax: "auto",
-      color: "#ef4444",
+      color: cssVar("--primary") || "#0e7490",
       emptyHint: "—",
       formatValue: (v) => String(v),
       formatY: (v) => String(Math.round(v)),
@@ -750,8 +750,8 @@
       samples,
       accessor: (s) => s.inflight,
       yMax: "auto",
-      color: "#6366f1",
-      fill: "rgba(99,102,241,0.18)",
+      color: cssVar("--primary") || "#0e7490",
+      fill: cssVar("--primary-glow") || "rgba(14,116,144,.16)",
       emptyHint: "—",
       formatValue: (v) => String(v),
       formatY: (v) => String(Math.round(v)),
@@ -842,6 +842,8 @@
       "--text3": styles.getPropertyValue("--text3").trim(),
       "--border": styles.getPropertyValue("--border").trim(),
       "--surface2": styles.getPropertyValue("--surface2").trim(),
+      "--primary": styles.getPropertyValue("--primary").trim(),
+      "--primary-glow": styles.getPropertyValue("--primary-glow").trim(),
     };
     return _cssVarCache[name] || "";
   }
@@ -1083,8 +1085,8 @@
     wrap.innerHTML =
       errorBanner +
       '<table class="data-table"><thead><tr>' +
-      "<th>" + t("stats.inflight.col.deployment") + "</th><th>" + t("stats.inflight.col.fc_queue") + "</th><th>" + t("stats.inflight.col.in_reqs") + "</th><th>" + t("stats.inflight.col.in_context") + "</th>" +
-      "<th>" + t("stats.inflight.col.24h_reqs") + "</th><th>" + t("stats.inflight.col.avg_in") + "</th><th>" + t("stats.inflight.col.avg_out") + "</th><th>" + t("stats.inflight.col.avg_ttft") + "</th><th>" + t("stats.inflight.col.avg_prefix_hit_rate") + "</th>" +
+      "<th>" + t("stats.inflight.col.deployment") + "</th><th class=\"num\">" + t("stats.inflight.col.fc_queue") + "</th><th class=\"num\">" + t("stats.inflight.col.in_reqs") + "</th><th class=\"num\">" + t("stats.inflight.col.in_context") + "</th>" +
+      "<th class=\"num\">" + t("stats.inflight.col.24h_reqs") + "</th><th class=\"num\">" + t("stats.inflight.col.avg_in") + "</th><th class=\"num\">" + t("stats.inflight.col.avg_out") + "</th><th class=\"num\">" + t("stats.inflight.col.avg_ttft") + "</th><th class=\"num\">" + t("stats.inflight.col.avg_prefix_hit_rate") + "</th>" +
       "</tr></thead><tbody>" +
       deployments
         .map(function (d) {
@@ -1123,14 +1125,14 @@
           return (
             "<tr>" +
             "<td>" + deployCell + "</td>" +
-            "<td>" + fcQueueHtml + "</td>" +
-            "<td>" + reqsHtml + "</td>" +
-            "<td>" + ctxDisplay + "</td>" +
-            "<td>" + fmtInt(s ? s.total_requests : null) + "</td>" +
-            "<td>" + fmtToken(s ? s.avg_input_tokens : null) + "</td>" +
-            "<td>" + fmtToken(s ? s.avg_output_tokens : null) + "</td>" +
-            "<td>" + fmtTtft(s ? s.avg_ttft_ms : null) + "</td>" +
-            "<td>" + fmtPrefixHit(s ? s.avg_prefix_hit_rate : null) + "</td>" +
+            "<td class=\"num\">" + fcQueueHtml + "</td>" +
+            "<td class=\"num\">" + reqsHtml + "</td>" +
+            "<td class=\"num\">" + ctxDisplay + "</td>" +
+            "<td class=\"num\">" + fmtInt(s ? s.total_requests : null) + "</td>" +
+            "<td class=\"num\">" + fmtToken(s ? s.avg_input_tokens : null) + "</td>" +
+            "<td class=\"num\">" + fmtToken(s ? s.avg_output_tokens : null) + "</td>" +
+            "<td class=\"num\">" + fmtTtft(s ? s.avg_ttft_ms : null) + "</td>" +
+            "<td class=\"num\">" + fmtPrefixHit(s ? s.avg_prefix_hit_rate : null) + "</td>" +
             "</tr>"
           );
         })
@@ -1155,11 +1157,9 @@
     }
   }
 
-  // Throughput chart colors — cool cyan/teal palette suggesting high traffic
-  function throughputBarColor(pct) {
-    if (pct > 75) return "linear-gradient(180deg, #06b6d4, #0891b2)"; // cyan-500 → cyan-600
-    if (pct > 40) return "linear-gradient(180deg, #22d3ee, #06b6d4)"; // cyan-400 → cyan-500
-    return "linear-gradient(180deg, #67e8f9, #22d3ee)";                // cyan-300 → cyan-400
+  // Throughput chart color — the accent, flat. Height already encodes value.
+  function throughputBarColor() {
+    return "var(--primary)";
   }
 
   // ── Range controls (Agent Statistics + Request Rate) ─────
@@ -1353,7 +1353,7 @@
             var seg = segs.find(function (s) { return s.deployment_id === depId; });
             var c = seg ? (seg.count || 0) : 0;
             var segPct = total > 0 ? (c / total * 100) : 0;
-            var color = deploymentColor(depId);
+            var color = deploymentColor(segmentOrder.indexOf(depId));
             // 0-count segments still render a 1px sliver so the stack ordering
             // is visually consistent across buckets.
             var segHeight = c === 0 ? "1px" : (segPct + "%");
@@ -1376,7 +1376,7 @@
           '<div class="rb-legend">' +
             segmentOrder.map(function (depId) {
               return '<span class="rb-legend-item">' +
-                '<span class="rb-legend-swatch" style="background:' + deploymentColor(depId) + '"></span>' +
+                '<span class="rb-legend-swatch" style="background:' + deploymentColor(segmentOrder.indexOf(depId)) + '"></span>' +
                 esc(depId) +
               '</span>';
             }).join("") +
@@ -2923,7 +2923,7 @@
       return;
     }
     wrap.innerHTML = `<table>
-      <tr><th>${t("logs.col.time")}</th><th>${t("logs.col.ip")}</th><th>${t("logs.col.model")}</th><th>${t("logs.col.path")}</th><th>${t("logs.col.status")}</th><th>${t("logs.col.stream")}</th><th>${t("logs.col.in_out")}</th><th>${t("logs.col.prefix_hit_rate")}</th><th>${t("logs.col.duration")}</th><th>${t("logs.col.queue_wait")}</th><th>${t("logs.col.error")}</th></tr>
+      <tr><th>${t("logs.col.time")}</th><th>${t("logs.col.ip")}</th><th>${t("logs.col.model")}</th><th>${t("logs.col.path")}</th><th>${t("logs.col.status")}</th><th>${t("logs.col.stream")}</th><th class="num">${t("logs.col.in_out")}</th><th class="num">${t("logs.col.prefix_hit_rate")}</th><th class="num">${t("logs.col.duration")}</th><th class="num">${t("logs.col.queue_wait")}</th><th>${t("logs.col.error")}</th></tr>
       ${logs.map((l) => {
         // Prefix hit rate = cached_tokens / input_tokens * 100, truncated to
         // 1 decimal and capped at 99.9 (no rounding to 100%). "-" if missing.
@@ -2941,10 +2941,10 @@
         <td class="mono">${esc(l.api_path)}</td>
         <td>${l.status_code >= 400 ? '<span style="color:var(--danger)">' + l.status_code + '</span>' : l.status_code}</td>
         <td>${l.is_stream ? t("common.yes") : t("common.no")}</td>
-        <td class="mono">${inOutCell}</td>
-        <td class="mono">${kvCell}</td>
-        <td>${l.duration_ms != null ? l.duration_ms + "ms" : "-"}</td>
-        <td>${l.queue_wait_ms != null ? l.queue_wait_ms + "ms" : "-"}</td>
+        <td class="mono num">${inOutCell}</td>
+        <td class="mono num">${kvCell}</td>
+        <td class="num">${l.duration_ms != null ? l.duration_ms + "ms" : "-"}</td>
+        <td class="num">${l.queue_wait_ms != null ? l.queue_wait_ms + "ms" : "-"}</td>
         <td>${l.error_message ? '<span style="color:var(--danger)" title="' + esc(l.error_message) + '">' + esc((l.error_type || "").substring(0, 20)) + '</span>' : "-"}</td>
       </tr>`}).join("")}
     </table>`;
@@ -2956,7 +2956,7 @@
     // total is a bounded exact count (min(real, 50k)); append "+" when the
     // cap was hit. has_next (row probe) still enables ">" beyond the cap.
     const suffix = data.total_capped ? "+" : "";
-    const pages = Math.ceil(data.total / data.per_page);
+    const pages = Math.ceil((data.total || 0) / (data.per_page || 50));
     if (pages <= 1 && !data.has_next) { el.innerHTML = ""; return; }
     el.innerHTML = `
       <button ${data.page <= 1 ? "disabled" : ""} onclick="window._loadUserLogsPage(${data.page - 1})">&lt;</button>
@@ -3316,12 +3316,12 @@
       <tr>
         <th>${t("plans.col.name")}</th>
         <th>${t("plans.col.type")}</th>
-        <th>${t("plans.col.concurrent")}</th>
-        <th>${t("plans.col.rpm")}</th>
-        <th>${t("plans.col.tpm")}</th>
+        <th class="num">${t("plans.col.concurrent")}</th>
+        <th class="num">${t("plans.col.rpm")}</th>
+        <th class="num">${t("plans.col.tpm")}</th>
         <th>${t("plans.col.windows")}</th>
-        <th>${t("plans.col.total_token")}</th>
-        <th>${t("plans.col.total_cost")}</th>
+        <th class="num">${t("plans.col.total_token")}</th>
+        <th class="num">${t("plans.col.total_cost")}</th>
         <th>${t("plans.col.member_plan")}</th>
         <th>${t("plans.col.schedule")}</th>
         <th>${t("plans.col.actions")}</th>
@@ -3343,12 +3343,12 @@
         return `<tr>
           <td><strong>${esc(p.name)}</strong></td>
           <td>${esc(typeLabel)}</td>
-          <td>${fmtOptInt(p.concurrency_limit)}</td>
-          <td>${fmtOptInt(p.rpm_limit)}</td>
-          <td>${fmtOptInt(p.tpm_limit)}</td>
+          <td class="num">${fmtOptInt(p.concurrency_limit)}</td>
+          <td class="num">${fmtOptInt(p.rpm_limit)}</td>
+          <td class="num">${fmtOptInt(p.tpm_limit)}</td>
           <td>${wlSummary || "-"}</td>
-          <td>${fmtOptInt(p.total_token_limit)}</td>
-          <td>${fmtOptCost(p.total_cost_limit)}</td>
+          <td class="num">${fmtOptInt(p.total_token_limit)}</td>
+          <td class="num">${fmtOptCost(p.total_cost_limit)}</td>
           <td>${p.member_plan ? esc(p.member_plan) : "-"}</td>
           <td>${fmtSchedule(p.schedule)}</td>
           <td>
@@ -3702,17 +3702,17 @@
       return String(v);
     };
     wrap.innerHTML = `<table>
-      <tr><th>${t("keys.col.token")}</th><th>${t("keys.col.alias")}</th><th>${t("keys.col.user")}</th><th>${t("keys.col.plan")}</th><th>${t("keys.col.usage")}</th><th>${t("keys.col.spend")}</th><th>${t("keys.col.budget")}</th><th>${t("keys.col.status")}</th><th>${t("keys.col.actions")}</th></tr>
+      <tr><th>${t("keys.col.token")}</th><th>${t("keys.col.alias")}</th><th>${t("keys.col.user")}</th><th>${t("keys.col.plan")}</th><th class="num">${t("keys.col.usage")}</th><th class="num">${t("keys.col.spend")}</th><th class="num">${t("keys.col.budget")}</th><th>${t("keys.col.status")}</th><th>${t("keys.col.actions")}</th></tr>
       ${keys.map((k) => `<tr>
         <td class="mono">${esc(k.token_prefix)}</td>
         <td>${esc(k.key_alias || "-")}${k.key_prefix ? ' <span class="badge badge-prefix">' + esc(k.key_prefix) + "</span>" : ""}${k.tag ? ' <span class="badge badge-tag">' + esc(k.tag) + "</span>" : ""}</td>
         <td>${esc(k.user_id || "-")}</td>
         <td>${renderKeyPlanCell(k)}</td>
-        <td>${k.usage_count == null
+        <td class="num">${k.usage_count == null
               ? '<span class="mono">-/-/-</span>'
               : `<span class="mono">${k.usage_count}/${fmtTokens(k.usage_tokens)}/${fmtCost(k.usage_cost)}</span><br><span class="muted" style="font-size:11px">${formatCountdown(k.usage_reset_secs || 0)}</span>`}</td>
-        <td>${fmtCost(k.spend)}</td>
-        <td>${k.max_budget > 0
+        <td class="num">${fmtCost(k.spend)}</td>
+        <td class="num">${k.max_budget > 0
               ? `<span title="${esc(k.budget_scope || "lifetime")}">${fmtCost(k.budget_period_spend != null ? k.budget_period_spend : k.spend)} / $${k.max_budget}</span>`
               : "-"}</td>
         <td>${k.blocked
@@ -3734,7 +3734,7 @@
 
   function renderKeysPagination(data) {
     const el = document.getElementById("keys-pagination");
-    const pages = Math.ceil(data.total / data.per_page);
+    const pages = Math.ceil((data.total || 0) / (data.per_page || 50));
     if (pages <= 1) { el.innerHTML = ""; return; }
     el.innerHTML = `
       <button ${data.page <= 1 ? "disabled" : ""} onclick="window._loadKeysPage(${data.page - 1})">&lt;</button>
@@ -3826,7 +3826,7 @@
     if (models.length === 0) { wrap.innerHTML = "<p>" + t("models.empty") + "</p>"; return; }
     aliasesMap = aliasesMap || {};
     wrap.innerHTML = `<table class="models-table">
-      <tr><th>${t("models.col.model")}</th><th>${t("models.col.aliases")}</th><th>${t("models.col.litellm_model")}</th><th>${t("models.col.cost")}</th><th>${t("models.col.base_url")}</th><th>${t("models.col.ratio")}</th><th>${t("models.col.rpm")}</th><th>${t("models.col.timeout")}</th><th>${t("models.col.enabled")}</th><th>${t("models.col.source")}</th><th>${t("models.col.actions")}</th></tr>
+      <tr><th>${t("models.col.model")}</th><th>${t("models.col.aliases")}</th><th>${t("models.col.litellm_model")}</th><th class="num">${t("models.col.cost")}</th><th>${t("models.col.base_url")}</th><th class="num">${t("models.col.ratio")}</th><th class="num">${t("models.col.rpm")}</th><th class="num">${t("models.col.timeout")}</th><th>${t("models.col.enabled")}</th><th>${t("models.col.source")}</th><th>${t("models.col.actions")}</th></tr>
       ${models.map((m) => {
         const isAutoDisabled = !m.enabled && m.auto_disabled;
         const rowClass = !m.enabled ? "model-row-disabled" : "";
@@ -3866,11 +3866,11 @@
         <td>${renderDeployCell(m.model_name, m.deployment_id)} ${visBadge}</td>
         <td>${aliasCell}</td>
         <td class="mono">${esc(m.litellm_model)}</td>
-        <td>${costCell}</td>
+        <td class="num">${costCell}</td>
         <td class="mono cell-url" title="${esc(m.api_base || "")}">${esc(m.api_base || "-")}</td>
-        <td>${m.quota_count_ratio && m.quota_count_ratio !== 1 ? '<span class="badge badge-plan">x' + m.quota_count_ratio + '</span>' : 'x1'}</td>
-        <td>${m.rpm || "-"}</td>
-        <td>${m.timeout}s</td>
+        <td class="num">${m.quota_count_ratio && m.quota_count_ratio !== 1 ? '<span class="badge badge-plan">x' + m.quota_count_ratio + '</span>' : 'x1'}</td>
+        <td class="num">${m.rpm || "-"}</td>
+        <td class="num">${m.timeout}s</td>
         <td>${enabledBadge}</td>
         <td><span class="badge badge-plan">${esc(m.source || "-")}</span></td>
         <td>
@@ -4778,7 +4778,7 @@
         ${fieldSelect("cfg-rs-policy", t("config.field.schedule_policy"), buildPolicyOptions(),
           r.schedule_policy || "round_robin", { tip: t("tip.config.schedule_policy") })}
         ${fieldNum("cfg-rs-affinity-ctx", t("config.field.key_affinity_context_threshold"), r.key_affinity_context_threshold || 0, { min: 0, tip: t("tip.config.key_affinity_context_threshold") })}
-        ${fieldNum("cfg-rs-affinity-ttl", t("config.field.key_affinity_ttl_secs"), r.key_affinity_ttl_secs || 0, { min: 0, step: 1, tip: t("tip.config.key_affinity_ttl_secs") })}
+        ${fieldNum("cfg-rs-affinity-ttl", t("config.field.key_affinity_ttl_secs"), r.key_affinity_ttl_secs || 3600, { min: 0, step: 1, tip: t("tip.config.key_affinity_ttl_secs") })}
         ${fieldNum("cfg-rs-affinity-rebal", t("config.field.rebalance_threshold"), r.rebalance_threshold || 20, { min: 1, step: 1, tip: t("tip.config.rebalance_threshold") })}
         ${fieldNum("cfg-rs-flow-timeout", t("config.field.flow_control_queue_timeout_secs"), r.flow_control_queue_timeout_secs || 1200, { min: 1, step: 1, tip: t("tip.config.flow_control_queue_timeout_secs") })}
       </div>
@@ -5340,7 +5340,7 @@
         const routerValue = {
           schedule_policy: $("cfg-rs-policy").value,
           key_affinity_context_threshold: numOr($("cfg-rs-affinity-ctx"), 0),
-          key_affinity_ttl_secs: numOr($("cfg-rs-affinity-ttl"), 0),
+          key_affinity_ttl_secs: numOr($("cfg-rs-affinity-ttl"), 3600),
           rebalance_threshold: numOr($("cfg-rs-affinity-rebal"), 20),
           flow_control_queue_timeout_secs: numOr($("cfg-rs-flow-timeout"), 1200),
           // These three editors live on the General card; their inputs are
@@ -5462,7 +5462,7 @@
     btn.textContent = debugEnabled ? t("logs.debug.on") : t("logs.debug.off");
     if (debugEnabled) {
       btn.style.background = "var(--danger)";
-      btn.style.color = "#fff";
+      btn.style.color = "var(--text-inv)";
       btn.style.borderColor = "var(--danger)";
     } else {
       btn.style.background = "";
@@ -5510,7 +5510,7 @@
     btn.textContent = promptLogEnabled ? t("logs.prompt_log.on") : t("logs.prompt_log.off");
     if (promptLogEnabled) {
       btn.style.background = "var(--info)";
-      btn.style.color = "#fff";
+      btn.style.color = "var(--text-inv)";
       btn.style.borderColor = "var(--info)";
     } else {
       btn.style.background = "";
@@ -5663,15 +5663,7 @@
     const btnVipFilter = document.getElementById("btn-vip-filter");
     if (btnVipFilter) btnVipFilter.addEventListener("click", () => {
       keysVipOnly = !keysVipOnly;
-      if (keysVipOnly) {
-        btnVipFilter.style.background = "var(--primary)";
-        btnVipFilter.style.color = "#fff";
-        btnVipFilter.style.borderColor = "var(--primary)";
-      } else {
-        btnVipFilter.style.background = "";
-        btnVipFilter.style.color = "";
-        btnVipFilter.style.borderColor = "";
-      }
+      btnVipFilter.setAttribute("aria-pressed", String(keysVipOnly));
       keysPage = 1;
       loadKeys();
     });
@@ -6892,9 +6884,9 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
       <tr>
         <th>${t("quota.col.alias")}</th>
         <th>${t("quota.col.plan")}</th>
-        <th>${t("quota.col.concurrency")}</th>
-        <th>${t("quota.col.tokens")}</th>
-        <th>${t("quota.col.cost")}</th>
+        <th class="num">${t("quota.col.concurrency")}</th>
+        <th class="num">${t("quota.col.tokens")}</th>
+        <th class="num">${t("quota.col.cost")}</th>
         <th>${t("quota.col.actions")}</th>
       </tr>
       ${keys.map((k) => {
@@ -6909,9 +6901,9 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
             ${k.blocked ? `<br><span class="badge-danger">blocked</span>` : ""}
           </td>
           <td>${renderKeyPlanCell(k)}</td>
-          <td>${k.concurrency || 0}</td>
-          <td>${formatNumber(tokens)}</td>
-          <td>$${esc(k.total_cost || "0")}</td>
+          <td class="num">${k.concurrency || 0}</td>
+          <td class="num">${formatNumber(tokens)}</td>
+          <td class="num">$${esc(k.total_cost || "0")}</td>
           <td>
             <button class="btn-small" onclick="window._quotaToggleWindows('${esc(k.token)}', this)">${t("quota.expand_windows")}</button>
             ${removeBtn}
@@ -7375,11 +7367,11 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
         <td class="mono">${esc(l.api_path)}</td>
         <td>${l.status_code >= 400 ? '<span style="color:var(--danger)">' + l.status_code + '</span>' : l.status_code}</td>
         <td>${l.is_stream ? t("common.yes") : t("common.no")}</td>
-        <td class="mono">${inOutCell}</td>
-        <td class="mono">${kvCell}</td>
-        <td>${l.duration_ms != null ? l.duration_ms + "ms" : "-"}</td>
-        <td>${l.ttft_ms != null ? l.ttft_ms + "ms" : "-"}</td>
-        <td>${l.queue_wait_ms != null ? l.queue_wait_ms + "ms" : "-"}</td>
+        <td class="mono num">${inOutCell}</td>
+        <td class="mono num">${kvCell}</td>
+        <td class="num">${l.duration_ms != null ? l.duration_ms + "ms" : "-"}</td>
+        <td class="num">${l.ttft_ms != null ? l.ttft_ms + "ms" : "-"}</td>
+        <td class="num">${l.queue_wait_ms != null ? l.queue_wait_ms + "ms" : "-"}</td>
         <td>${errorCell}</td>
         <td>${detailCell}</td>
       </tr>`;
@@ -7391,7 +7383,7 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
     // total is a bounded exact count (min(real, 50k)); append "+" when the
     // cap was hit so "1000+" reads as "at least", not an exact figure.
     const suffix = data.total_capped ? "+" : "";
-    const pages = Math.max(1, Math.ceil(data.total / data.per_page));
+    const pages = Math.max(1, Math.ceil((data.total || 0) / (data.per_page || 50)));
     el.innerHTML = `
       <button ${data.page <= 1 ? "disabled" : ""} onclick="window._loadLogsPage(${data.page - 1})">&lt;</button>
       <span>${t("common.page_of", { page: data.page, total: pages + suffix, count: data.total + suffix, unit: t("logs.title") })}</span>
@@ -7941,24 +7933,19 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
     return v.toFixed(1) + "%";
   }
 
-  // Stable pastel color for a deployment_id. Same id → same color across all
-  // charts. Low saturation / high lightness keep it easy on the eyes; the
-  // hue is derived from a 32-bit FNV-1a hash of the id so similar ids do not
-  // collapse to the same hue.
-  var __deploymentColorCache = {};
-  function deploymentColor(deploymentId) {
-    if (__deploymentColorCache[deploymentId]) return __deploymentColorCache[deploymentId];
-    var h = 0x811c9dc5;
-    for (var i = 0; i < deploymentId.length; i++) {
-      h ^= deploymentId.charCodeAt(i);
-      h = (h + ((h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24))) >>> 0;
-    }
-    var hue = h % 360;
-    // Pastel: 38-45% saturation, 64-70% lightness.
-    var sat = 38 + (h % 8);       // 38..45
-    var light = 64 + ((h >> 4) % 7); // 64..70
-    var c = "hsl(" + hue + ", " + sat + "%, " + light + "%)";
-    __deploymentColorCache[deploymentId] = c;
-    return c;
-  }
-})();
+  // Ordered series palette: the accent leads, neutral graphite steps follow,
+  // quiet hues only past five series. Index comes from the chart's fixed
+  // alphabetical segmentOrder, so colors are stable within a chart.
+  var DEPLOYMENT_SERIES = [
+    "var(--primary)",
+    "#94a3b8",
+    "#cbd5e1",
+    "#64748b",
+    "#e2e8f0",
+    "#7dd3fc",
+    "#c4b5fd",
+    "#fcd34d",
+  ];
+  function deploymentColor(index) {
+    return DEPLOYMENT_SERIES[index % DEPLOYMENT_SERIES.length];
+  }})();
