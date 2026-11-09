@@ -918,7 +918,7 @@ fn shuffle_policy_distribution() {
 #[test]
 fn key_affinity_empty_and_single() {
     let tracker = Arc::new(InFlightTracker::new());
-    let pol = KeyAffinityPolicy::new(tracker, 0, 100, None);
+    let pol = KeyAffinityPolicy::new(tracker, 0, 100, None, std::time::Duration::ZERO);
     assert_eq!(pol.name(), "key_affinity");
     assert!(pol.select("m", &[], None, 0).is_none());
     let single = vec![p("a", "d1")];
@@ -929,7 +929,7 @@ fn key_affinity_empty_and_single() {
 #[test]
 fn key_affinity_no_key_falls_back_to_lowest_load() {
     let tracker = Arc::new(InFlightTracker::new());
-    let pol = KeyAffinityPolicy::new(tracker.clone(), 0, 100, None);
+    let pol = KeyAffinityPolicy::new(tracker.clone(), 0, 100, None, std::time::Duration::ZERO);
     let cands = vec![p("a", "d1"), p("a", "d2")];
     let r = pol.select("m", &cands, None, 0).unwrap();
     // 所有 load=0 → min_load_candidate 返回首候选
@@ -940,7 +940,7 @@ fn key_affinity_no_key_falls_back_to_lowest_load() {
 #[test]
 fn key_affinity_initial_assignment_and_hit() {
     let tracker = Arc::new(InFlightTracker::new());
-    let pol = KeyAffinityPolicy::new(tracker, 0, 100, None);
+    let pol = KeyAffinityPolicy::new(tracker, 0, 100, None, std::time::Duration::ZERO);
     let cands = vec![p("a", "d1"), p("a", "d2")];
     // 首次：最低负载 → d1，记录 affinity k1→d1
     let r1 = pol.select("m", &cands, Some("k1"), 0).unwrap();
@@ -954,7 +954,7 @@ fn key_affinity_initial_assignment_and_hit() {
 #[test]
 fn key_affinity_warmup_below_threshold() {
     let tracker = Arc::new(InFlightTracker::new());
-    let pol = KeyAffinityPolicy::new(tracker, 10_000, 100, None);
+    let pol = KeyAffinityPolicy::new(tracker, 10_000, 100, None, std::time::Duration::ZERO);
     let cands = vec![p("a", "d1"), p("a", "d2")];
     // tracker 无 inflight → total_input=0 < 10000 → warm-up 走最低负载
     let r = pol.select("m", &cands, Some("k1"), 0).unwrap();
@@ -966,7 +966,7 @@ fn key_affinity_warmup_below_threshold() {
 fn key_affinity_rebalance_migrates() {
     let tracker = Arc::new(InFlightTracker::new());
     let move_t = Arc::new(RebalanceMoveTracker::new());
-    let mut pol = KeyAffinityPolicy::new(tracker.clone(), 0, 10, Some(move_t.clone()));
+    let mut pol = KeyAffinityPolicy::new(tracker.clone(), 0, 10, Some(move_t.clone()), std::time::Duration::ZERO);
     let qi = Arc::new(MockQueueInfo::new());
     pol.set_queue_info(qi.clone());
     let cands = vec![p("a", "d1"), p("a", "d2")];
