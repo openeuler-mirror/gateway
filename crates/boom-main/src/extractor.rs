@@ -71,6 +71,13 @@ impl RequiredAuth {
         &self.identity
     }
 
+    /// Build from an already-authenticated identity — used by the WebSocket
+    /// transport, which authenticates once at the upgrade handshake and
+    /// reuses the identity for every frame's request.
+    pub fn from_identity(identity: AuthIdentity) -> Self {
+        Self { identity, new_model: None }
+    }
+
     /// Take the hook-decided `new_model`, if any. Leaves `None` in its place
     /// so subsequent calls return `None` (write-once semantics — the handler
     /// applies the rewrite exactly once, before `check_model_access`).

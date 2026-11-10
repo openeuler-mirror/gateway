@@ -10,6 +10,7 @@ mod request_log;
 mod revision_watcher;
 mod rewrite;
 mod routes;
+mod ws_transport;
 mod state;
 
 use axum::routing::{delete, get, post, put};
@@ -231,7 +232,7 @@ fn build_router(state: AppState) -> Router {
         .route("/v1/chat/completions", post(routes::chat_completions))
         .route("/v1/messages", post(routes::messages))
         .route("/v1/completions", post(routes::completions))
-        .route("/v1/responses", post(routes::responses))
+        .route("/v1/responses", post(routes::responses).get(ws_transport::responses_ws))
         // Alias routes (without /v1 prefix — OpenAI client compatibility)
         .route("/chat/completions", post(routes::chat_completions))
         .route("/completions", post(routes::completions))
