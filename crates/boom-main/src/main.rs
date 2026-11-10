@@ -520,7 +520,7 @@ fn spawn_daily_stats_sync(
     mut shutdown: tokio::sync::broadcast::Receiver<()>,
 ) {
     let Some(pool) = state.dashboard_db_pool.clone() else {
-        tracing::debug!("Daily stats sync disabled (no dashboard DB pool)");
+        tracing::warn!("Daily stats sync disabled (no dashboard DB pool)");
         return;
     };
     let tracker = state.daily_stats.clone();

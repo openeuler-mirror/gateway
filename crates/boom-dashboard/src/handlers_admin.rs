@@ -4518,11 +4518,11 @@ pub async fn get_agent_stats(
             r#"SELECT
                  (FLOOR((EXTRACT(EPOCH FROM created_at) - $1) / $2) * $2 + $1)::bigint AS bucket_epoch,
                  COUNT(*)::bigint AS total,
-                 COUNT(*) FILTER (WHERE api_path LIKE '/v1/messages%')::bigint AS anthropic,
+                 COUNT(CASE WHEN api_path LIKE '/v1/messages%' THEN 1 END)::bigint AS anthropic,
                  COALESCE(SUM(input_tokens), 0)::bigint AS input_tokens_total,
-                 COALESCE(SUM(input_tokens) FILTER (WHERE api_path LIKE '/v1/messages%'), 0)::bigint AS input_tokens_anthropic,
+                 COALESCE(SUM(CASE WHEN api_path LIKE '/v1/messages%' THEN input_tokens END), 0)::bigint AS input_tokens_anthropic,
                  COALESCE(SUM(output_tokens), 0)::bigint AS output_tokens_total,
-                 COALESCE(SUM(output_tokens) FILTER (WHERE api_path LIKE '/v1/messages%'), 0)::bigint AS output_tokens_anthropic
+                 COALESCE(SUM(CASE WHEN api_path LIKE '/v1/messages%' THEN output_tokens END), 0)::bigint AS output_tokens_anthropic
                FROM boom_request_log
                WHERE created_at >= $3 AND created_at < $4
                  AND status_code = 200

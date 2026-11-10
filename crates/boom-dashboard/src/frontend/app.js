@@ -611,7 +611,11 @@
         : "—";
     }
     if (!ok) {
-      const msg = '<p class="loading">' + esc(t("analytics.unavailable")) + "</p>";
+      // Surface the server's reason (no DB vs failed refresh) instead of
+      // one generic line — it's the first thing you need when the board
+      // won't come up.
+      const detail = data && data.error ? " — " + esc(String(data.error)) : "";
+      const msg = '<p class="loading">' + esc(t("analytics.unavailable")) + detail + "</p>";
       ["an-metrics-wrap", "an-hourly-wrap", "an-table-wrap"].forEach((id) => {
         const el = document.getElementById(id);
         if (el) el.innerHTML = msg;

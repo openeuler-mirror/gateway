@@ -262,12 +262,14 @@ async fn query_snapshot(
     let (since, bucket, total_slots) = range.window();
 
     let model_rows = sqlx::query_as::<_, ModelAggRow>(
+        // CASE-based conditional aggregation: the aggregate FILTER clause
+        // needs PG 9.4+ and GaussDB (PG 9.2-based) rejects it.
         r#"SELECT model,
                   COUNT(*)::BIGINT AS requests,
                   COALESCE(SUM(input_tokens), 0)::BIGINT AS input_tokens,
                   COALESCE(SUM(output_tokens), 0)::BIGINT AS output_tokens,
                   COALESCE(SUM(cached_tokens), 0)::BIGINT AS cached_tokens,
-                  COUNT(*) FILTER (WHERE status_code >= 400)::BIGINT AS errors
+                  COUNT(CASE WHEN status_code >= 400 THEN 1 END)::BIGINT AS errors
            FROM boom_request_log
            WHERE created_at >= $1
            GROUP BY model
