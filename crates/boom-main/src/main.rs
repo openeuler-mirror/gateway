@@ -155,10 +155,6 @@ async fn async_main(
         shutdown_tx.subscribe(),
     );
 
-    // Spawn the daily-stats sync task (analytics board snapshot: startup +
-    // every 30s re-aggregation of boom_request_log). No-op without a DB.
-    spawn_daily_stats_sync(state.clone(), shutdown_tx.subscribe());
-
     // Build router.
 
     // Build router.
@@ -507,51 +503,6 @@ fn spawn_stressmon_sampler(
         }
     });
     tracing::info!("System pressure sampler spawned (1 Hz)");
-}
-
-/// Background task: keep the analytics board's daily snapshot warm.
-/// Refreshes once at startup (rebuilds from the DB after a restart,
-/// picking up traffic other instances served while this one was down),
-/// then every 30s. Uses the dashboard DB pool (max=3) so aggregations
-/// never contend with the forwarding path's pool. No DB → task exits;
-/// the dashboard then reports "not ready" for this endpoint.
-fn spawn_daily_stats_sync(
-    state: AppState,
-    mut shutdown: tokio::sync::broadcast::Receiver<()>,
-) {
-    let Some(pool) = state.dashboard_db_pool.clone() else {
-        tracing::warn!("Daily stats sync disabled (no dashboard DB pool)");
-        return;
-    };
-    let tracker = state.daily_stats.clone();
-    tokio::spawn(async move {
-        if let Err(e) = tracker
-            .snapshot_for(boom_audit::StatsRange::Today, &pool, 0, false)
-            .await
-        {
-            tracing::warn!("Daily stats initial refresh failed: {e}");
-        }
-        loop {
-            tokio::select! {
-                _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
-                _ = shutdown.recv() => {
-                    tracing::debug!("Daily stats sync task shutting down");
-                    return;
-                }
-            }
-            // max_age 0 → always re-aggregate; only the today window is
-            // kept warm here — rolling windows lazy-load on request.
-            if let Err(e) = tracker
-                .snapshot_for(boom_audit::StatsRange::Today, &pool, 0, false)
-                .await
-            {
-                // Transient DB hiccups shouldn't kill the task — the
-                // snapshot stays at its last good refresh until recovery.
-                tracing::warn!("Daily stats refresh failed: {e}");
-            }
-        }
-    });
-    tracing::info!("Daily stats sync spawned (every 30s, today window)");
 }
 
 /// Take one pressure sample. CPU is process-level: sum of utime+stime

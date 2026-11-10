@@ -3721,13 +3721,11 @@ pub async fn get_daily_stats(
         }))
         .into_response();
     };
-    // The today window is kept warm by boom-main's 30s background sync, so
-    // polling above that cycle never touches the DB. Rolling windows
-    // lazy-load on first request and re-aggregate at most once per TTL.
-    let ttl = match range {
-        boom_audit::StatsRange::Today => 35,
-        _ => 60,
-    };
+    // Presence-based refresh: no background task keeps any window warm —
+    // the first request lazy-loads it, and while the page is being viewed
+    // the frontend poll re-aggregates at most once per TTL (5 min).
+    // Nobody viewing → no requests → zero DB sync.
+    let ttl = 300;
     let snap = match state
         .daily_stats
         .snapshot_for(range, pool, ttl, params.force.is_some())

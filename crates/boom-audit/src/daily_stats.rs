@@ -5,14 +5,15 @@
 //! 24h/72h/168h windows at 10-min/30-min/1h buckets — every window keeps
 //! ~144 points so chart resolution stays uniform. Lifecycle:
 //! `DailyStatsTracker` is owned by AppState (top-level Arc, survives
-//! reloads). boom-main refreshes the today snapshot every 30s; rolling
-//! windows are lazy — the dashboard handler loads them on first request
-//! and re-aggregates at most once per TTL window. Every refresh
-//! re-aggregates the full window — idempotent and correct under
-//! multi-instance deployment (rows written by peer instances are picked
-//! up on the next cycle). No watermark/incremental reads: the audit log
-//! writer batches INSERTs from multiple instances, so id-based watermarks
-//! have commit-order gaps and would silently undercount.
+//! reloads). All windows are lazy — there is no background sync task; the
+//! dashboard handler loads a window on first request and re-aggregates at
+//! most once per TTL (5 min) while the page is being viewed. Nobody
+//! viewing → no requests → zero DB sync. Every refresh re-aggregates the
+//! full window — idempotent and correct under multi-instance deployment
+//! (rows written by peer instances are picked up on the next cycle). No
+//! watermark/incremental reads: the audit log writer batches INSERTs from
+//! multiple instances, so id-based watermarks have commit-order gaps and
+//! would silently undercount.
 
 use std::sync::Arc;
 
@@ -226,11 +227,11 @@ impl DailyStatsTracker {
     /// coalesce on the per-range lock: late callers wait, then re-read the
     /// winner's snapshot (their own query is skipped — same window). A
     /// cache younger than `max_age_secs` is returned as-is; `force`
-    /// bypasses the age check (manual refresh button). The today snapshot
-    /// is kept warm by boom-main's 30s background sync, so dashboard
-    /// polling with max_age above that cycle never touches the DB;
-    /// rolling windows lazy-load here and re-aggregate at most once per
-    /// `max_age_secs`. `max_age_secs = 0` always re-aggregates.
+    /// bypasses the age check (manual refresh button). All windows
+    /// lazy-load here and re-aggregate at most once per `max_age_secs` —
+    /// with no background sync task, the DB is only touched when a
+    /// dashboard request actually arrives. `max_age_secs = 0` always
+    /// re-aggregates.
     pub async fn snapshot_for(
         &self,
         range: StatsRange,

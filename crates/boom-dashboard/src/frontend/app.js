@@ -492,7 +492,10 @@
   // The server keeps in-memory snapshots per range: today is refreshed
   // from boom_request_log by a boom-main task every 30s; rolling 24h/3d/7d
   // windows lazy-load on request and re-aggregate at most once per ~60s.
-  // This page polls the API every 10s — N open tabs cost nothing extra.
+  // This page polls the API every 60s; the server re-aggregates from the
+  // DB at most once per 5 min, so while the page is viewed the data
+  // refreshes every ~5 min — and when nobody is on the page nothing
+  // syncs at all (no background task). Leaving the page stops polling.
   // The Refresh button passes force=1 to trigger one extra sync before
   // responding. All wall-clock rendering is UTC+8 to match the backend's
   // day boundary, regardless of the browser's timezone.
@@ -507,7 +510,7 @@
   function startAnalyticsPoll() {
     stopAnalyticsPoll();
     loadAnalytics(false);
-    analyticsTimer = setInterval(() => loadAnalytics(false), 10000);
+    analyticsTimer = setInterval(() => loadAnalytics(false), 60000);
   }
 
   function stopAnalyticsPoll() {
