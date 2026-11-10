@@ -49,6 +49,15 @@ const MAX_EVENT_BYTES: usize = 512 * 1024;
 /// handler — axum dispatches here only when the request carries a
 /// WebSocket upgrade (`Upgrade: websocket`); plain GETs never match this
 /// extractor and fall through to the method-not-allowed path.
+/// Identity plus the raw key, so every frame can recheck revocation
+/// (P1: a key blocked mid-connection stops serving new creates; in-flight
+/// generations finish — same window HTTP has between cache entries).
+#[derive(Clone)]
+struct SessionPrincipal {
+    identity: AuthIdentity,
+    raw_key: String,
+}
+
 pub async fn responses_ws(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -69,22 +78,29 @@ pub async fn responses_ws(
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_string)
         });
-    let identity = match key {
-        Some(key) => {
-            let inner = state.inner.load();
-            match inner.auth.authenticate(&key).await {
-                Ok(id) => id,
-                Err(e) => {
-                    tracing::warn!(error = %e, "websocket handshake auth failed");
-                    return handshake_reject(e.status_code());
-                }
+    let raw_key = match key {
+        Some(k) => k,
+        None => return handshake_reject(401),
+    };
+    let identity = {
+        let inner = state.inner.load();
+        match inner.auth.authenticate(&raw_key).await {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::warn!(error = %e, "websocket handshake auth failed");
+                return handshake_reject(e.status_code());
             }
         }
-        None => return handshake_reject(401),
     };
 
     ws.on_upgrade(move |socket| {
-        Box::pin(session_loop(socket, state, headers, remote_addr, identity))
+        Box::pin(session_loop(
+            socket,
+            state,
+            headers,
+            remote_addr,
+            SessionPrincipal { identity, raw_key },
+        ))
     })
 }
 
@@ -144,12 +160,91 @@ struct WsCreate {
     stream_id: Option<String>,
 }
 
+/// `generate: false` — accept-and-store without inference. The mock-free
+/// contract (agentic-api local.rs): synthesize the lifecycle pair around
+/// the client's own input items, persist the checkpoint, relay the two
+/// events. This is how a client parks state on the store over WS.
+async fn complete_without_inference(
+    state: &AppState,
+    identity: &AuthIdentity,
+    create: &WsCreate,
+    tx: &tokio::sync::mpsc::Sender<WsOutboundEvent>,
+) {
+    let inner = create.inner.clone();
+    let sid = create.stream_id.as_deref();
+    let response_id = format!("resp_{}", uuid::Uuid::new_v4().simple());
+    let created_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let input_items: Vec<serde_json::Value> = match &inner.input {
+        boom_core::responses::ResponsesInput::Text(t) => {
+            vec![serde_json::json!({ "role": "user", "content": t })]
+        }
+        boom_core::responses::ResponsesInput::Items(items) => items.clone(),
+    };
+    let shell = |status: &str, seq: u64| {
+        serde_json::json!({
+            "type": if seq == 0 { "response.created" } else { "response.completed" },
+            "sequence_number": seq,
+            "response": {
+                "id": response_id, "object": "response", "created_at": created_at,
+                "status": status, "model": inner.model, "output": [],
+                "usage": { "input_tokens": 0, "output_tokens": 0, "total_tokens": 0 },
+            },
+        })
+    };
+    // Persist the checkpoint so the id is a continuation point — the whole
+    // point of a non-generating create. Store unavailable → skip silently:
+    // the events still relay, the id just isn't continuable (same semantic
+    // as HTTP with store disabled).
+    if state.response_store.is_enabled() && inner.store != Some(false) {
+        let history: Vec<serde_json::Value> = match &inner.previous_response_id {
+            Some(prev) => state
+                .response_store
+                .rehydrate(prev, &identity.key_hash)
+                .await
+                .map(|t| t.items)
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+        let mut items = history;
+        items.extend(input_items);
+        let turn = boom_responses::PersistTurn {
+            response_id: response_id.clone(),
+            previous_response_id: inner.previous_response_id.clone(),
+            key_hash: identity.key_hash.clone(),
+            model: inner.model.clone(),
+            instructions: inner.instructions.clone(),
+            tools: inner.tools.clone(),
+            items,
+            status: "completed".to_string(),
+            response_json: shell("completed", 1)["response"].clone(),
+            ttl_secs: 2_592_000,
+            max_history_items: 1000,
+        };
+        if let Err(e) = state.response_store.persist_turn(turn).await {
+            tracing::warn!(error = %e, "ws generate:false persist failed");
+        }
+    }
+    for seq in [0u64, 1] {
+        let ev = shell(if seq == 0 { "in_progress" } else { "completed" }, seq);
+        let _ = tx.send(WsOutboundEvent::build(ev, sid).unwrap_or_else(|e| {
+            error_frame(500, "server_error", e, sid)
+        })).await;
+    }
+}
+
 struct WorkItem {
     request: WsCreate,
     input_bytes: usize,
 }
 
 /// Per-connection state: byte budget + per-lane FIFO queues.
+///
+/// (P1 lane-continuation cache — skipping the DB rehydrate for same-lane
+/// follow-ups — is deferred: it needs the handler kernel extraction so the
+/// WS layer can inject pre-rehydrated history. The DB round trip remains.)
 struct Multiplexer {
     lanes: HashMap<Option<String>, VecDeque<WorkItem>>,
     inflight: usize,
@@ -159,7 +254,12 @@ struct Multiplexer {
 
 impl Multiplexer {
     fn new() -> Self {
-        Self { lanes: HashMap::new(), inflight: 0, queued: 0, bytes_used: 0 }
+        Self {
+            lanes: HashMap::new(),
+            inflight: 0,
+            queued: 0,
+            bytes_used: 0,
+        }
     }
 
     fn has_capacity(&self, input_bytes: usize) -> bool {
@@ -230,8 +330,9 @@ async fn session_loop(
     state: AppState,
     headers: axum::http::HeaderMap,
     remote_addr: SocketAddr,
-    identity: AuthIdentity,
+    principal: SessionPrincipal,
 ) {
+    let identity = principal.identity.clone();
     let (mut sink, mut source) = socket.split();
     let (tx, mut rx) = tokio::sync::mpsc::channel::<WsOutboundEvent>(OUTBOUND_BUFFER);
     let mut mux = Multiplexer::new();
@@ -248,7 +349,7 @@ async fn session_loop(
                 match joined {
                     Ok(Some((lane, input_bytes))) => {
                         if let Some(next) = mux.complete(&lane, input_bytes) {
-                            spawn_runner_inner(&mut runners, state.clone(), tx.clone(), headers.clone(), remote_addr, identity.clone(), next);
+                            spawn_runner_inner(&mut runners, state.clone(), tx.clone(), headers.clone(), remote_addr, identity.clone(), principal.raw_key.clone(), next);
                         }
                     }
                     Ok(None) => {} // backlog drained inside the runner
@@ -273,7 +374,7 @@ async fn session_loop(
                     Message::Text(text) => {
                         match handle_client_text(
                             &state, &tx, &mut mux, &mut runners, &headers, remote_addr,
-                            &identity, text.as_str(),
+                            &identity, &principal.raw_key, text.as_str(),
                         ) {
                             Flow::Continue => {}
                         }
@@ -313,6 +414,7 @@ fn handle_client_text(
     headers: &axum::http::HeaderMap,
     remote_addr: SocketAddr,
     identity: &AuthIdentity,
+    raw_key: &str,
     text: &str,
 ) -> Flow {
     // Discriminator-only probe first (agentic-api pattern): only
@@ -350,6 +452,8 @@ fn handle_client_text(
             return Flow::Continue;
         }
     };
+    // generate:false → accept-and-store without inference (P1).
+    let generate = value_generate(text);
     request.stream = Some(true); // forced: a non-streaming create is meaningless over WS
 
     let input_bytes = text.len();
@@ -364,12 +468,36 @@ fn handle_client_text(
         return Flow::Continue;
     }
 
+    if generate == Some(false) {
+        // Local completion bypasses admission (no inference, no upstream);
+        // budget impact is the persist alone.
+        let create = WsCreate { inner: request, stream_id };
+        let state = state.clone();
+        let identity = identity.clone();
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            complete_without_inference(&state, &identity, &create, &tx).await;
+        });
+        return Flow::Continue;
+    }
+
     let item = WorkItem { request: WsCreate { inner: request, stream_id }, input_bytes };
     let ready = mux.admit(item);
     if let Some(ready) = ready {
-        spawn_runner_inner(runners, state.clone(), tx.clone(), headers.clone(), remote_addr, identity.clone(), ready);
+        spawn_runner_inner(runners, state.clone(), tx.clone(), headers.clone(), remote_addr, identity.clone(), raw_key.to_string(), ready);
     }
     Flow::Continue
+}
+
+/// Extract top-level `generate` (bool) from the raw frame text — it is a
+/// transport-layer member like type/stream_id, stripped before the body
+/// parse, so we must probe the original text.
+fn value_generate(text: &str) -> Option<bool> {
+    #[derive(serde::Deserialize)]
+    struct Probe {
+        generate: Option<bool>,
+    }
+    serde_json::from_str::<Probe>(text).ok().and_then(|p| p.generate)
 }
 
 /// A lane runner executes its item, then keeps draining the lane's backlog
@@ -382,10 +510,11 @@ fn spawn_runner_inner(
     headers: axum::http::HeaderMap,
     remote_addr: SocketAddr,
     identity: AuthIdentity,
+    raw_key: String,
     item: WorkItem,
 ) {
     runners.spawn(async move {
-        execute_create(&state, &tx, headers, remote_addr, identity, item).await
+        execute_create(&state, &tx, headers, remote_addr, identity, raw_key, item).await
     });
 }
 
@@ -400,10 +529,21 @@ async fn execute_create(
     headers: axum::http::HeaderMap,
     remote_addr: SocketAddr,
     identity: AuthIdentity,
+    raw_key: String,
     item: WorkItem,
 ) -> Option<(Option<String>, usize)> {
     let stream_id = item.request.stream_id.clone();
     let input_bytes = item.input_bytes;
+
+    // Per-frame revocation recheck (P1): blocked/rotated keys stop serving
+    // new creates immediately; moka-cached, so this is cheap.
+    if let Err(e) = state.inner.load().auth.authenticate(&raw_key).await {
+        tracing::info!(error = %e, "websocket frame auth recheck failed");
+        let _ = tx
+            .send(error_frame(e.status_code(), "invalid_token", e.to_string(), stream_id.as_deref()))
+            .await;
+        return Some((stream_id, input_bytes));
+    }
 
     let auth = RequiredAuth::from_identity(identity);
     let result = routes::responses(
