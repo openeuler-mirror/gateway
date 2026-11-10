@@ -4713,6 +4713,7 @@
         ${fieldNum("cfg-pl-otlp-flush-interval-secs", t("config.field.otlp_flush_interval_secs"), o.flush_interval_secs, { min: 1, tip: t("config.tip.otlp_flush_interval_secs") })}
         ${fieldNum("cfg-pl-otlp-max-attribute-bytes", t("config.field.otlp_max_attribute_bytes"), o.max_attribute_bytes, { min: 256, step: 256, tip: t("config.tip.otlp_max_attribute_bytes") })}
         ${fieldNum("cfg-pl-otlp-max-queue-size", t("config.field.otlp_max_queue_size"), o.max_queue_size, { min: 100, step: 100, tip: t("config.tip.otlp_max_queue_size") })}
+        ${fieldNum("cfg-pl-otlp-max-queue-bytes", t("config.field.otlp_max_queue_bytes"), o.max_queue_bytes ?? 67108864, { min: 0, step: 1048576, tip: t("config.tip.otlp_max_queue_bytes") })}
         ${fieldTextarea("cfg-pl-otlp-headers", t("config.field.otlp_headers"), o.headers || {}, { rows: 3, tip: t("config.tip.otlp_headers") })}
       </div>
 
@@ -4764,6 +4765,7 @@
         ${fieldNum("cfg-tr-otlp-flush-interval-secs", t("config.field.otlp_flush_interval_secs"), o.flush_interval_secs, { min: 1, tip: t("config.tip.otlp_flush_interval_secs") })}
         ${fieldNum("cfg-tr-otlp-max-attribute-bytes", t("config.field.otlp_max_attribute_bytes"), o.max_attribute_bytes, { min: 256, step: 256, tip: t("config.tip.otlp_max_attribute_bytes") })}
         ${fieldNum("cfg-tr-otlp-max-queue-size", t("config.field.otlp_max_queue_size"), o.max_queue_size, { min: 100, step: 100, tip: t("config.tip.otlp_max_queue_size") })}
+        ${fieldNum("cfg-tr-otlp-max-queue-bytes", t("config.field.otlp_max_queue_bytes"), o.max_queue_bytes ?? 67108864, { min: 0, step: 1048576, tip: t("config.tip.otlp_max_queue_bytes") })}
         ${fieldTextarea("cfg-tr-otlp-headers", t("config.field.otlp_headers"), o.headers || {}, { rows: 3, tip: t("config.tip.otlp_headers") })}
       </div>
 
@@ -5302,6 +5304,7 @@
             max_attribute_bytes: numOr($("cfg-pl-otlp-max-attribute-bytes"), 4096),
             headers: parseJsonInput($("cfg-pl-otlp-headers"), {}),
             max_queue_size: numOr($("cfg-pl-otlp-max-queue-size"), 10000),
+            max_queue_bytes: numOr($("cfg-pl-otlp-max-queue-bytes"), 67108864),
           },
         });
       } else if (kind === "trace") {
@@ -5345,6 +5348,7 @@
               max_attribute_bytes: numOr($("cfg-tr-otlp-max-attribute-bytes"), 4096),
               headers: parseJsonInput($("cfg-tr-otlp-headers"), {}),
               max_queue_size: numOr($("cfg-tr-otlp-max-queue-size"), 10000),
+              max_queue_bytes: numOr($("cfg-tr-otlp-max-queue-bytes"), 67108864),
             },
           }],
         ]);

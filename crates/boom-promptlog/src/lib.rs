@@ -12,7 +12,7 @@ pub use config::{OtlpConfig, PromptLogConfig};
 pub use entry::{error_code, LogPhase, PromptLogEntry};
 pub use query::{FilePromptLogQuery, PromptLogConfigSnapshot, PromptLogQueryApi};
 pub use stream::{ChunkDelta, PromptLogStream};
-pub use writer::PromptLogWriter;
+pub use writer::{PromptLogSender, PromptLogWriter};
 
 #[cfg(feature = "otlp")]
 pub use otlp::{ping_endpoint, ExporterStatusSnapshot, OtelExporter, ProbeResult};
