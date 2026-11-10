@@ -300,6 +300,7 @@ dependencies = [
 name = "boom-audit"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "boom-core",
  "chrono",
  "serde",

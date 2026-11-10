@@ -262,6 +262,9 @@ pub struct DashboardState {
     /// alert reconciler. Erased to `Arc<dyn boom_core::AlertApi>` so
     /// boom-dashboard doesn't depend on boom-alert. Read by the status page.
     pub alerts: Arc<dyn boom_core::AlertApi>,
+    /// Daily business-volume snapshot for the analytics board. Refreshed by
+    /// boom-main's background task (30s) + manual force-refresh endpoint.
+    pub daily_stats: Arc<boom_audit::DailyStatsTracker>,
 }
 
 impl DashboardState {
@@ -291,6 +294,7 @@ impl DashboardState {
         stressmon: Arc<dyn boom_core::StressmonApi>,
         trace: Arc<dyn boom_core::TraceApi>,
         alerts: Arc<dyn boom_core::AlertApi>,
+        daily_stats: Arc<boom_audit::DailyStatsTracker>,
     ) -> Self {
         // The session signing key must NOT be derived from the master key:
         // anyone who knows the master key (API clients, a leaked config file)
@@ -325,6 +329,7 @@ impl DashboardState {
             stressmon,
             trace,
             alerts,
+            daily_stats,
         }
     }
 }

@@ -3683,6 +3683,85 @@ pub async fn delete_team(
 }
 
 // ═══════════════════════════════════════════════════════════
+// Daily Business Volume (analytics board)
+// ═══════════════════════════════════════════════════════════
+
+#[derive(Debug, Deserialize)]
+pub struct DailyStatsParams {
+    /// `?force=1` — re-aggregate from the DB before responding (manual
+    /// refresh button). String (not bool) so `force=1` works — serde's
+    /// bool only accepts literal `true`/`false` in query strings. Any
+    /// presence of the param triggers a refresh.
+    pub force: Option<String>,
+    /// `?range=today|1d|3d|7d` (default today).
+    pub range: Option<String>,
+}
+
+pub async fn get_daily_stats(
+    _session: AdminSession,
+    Query(params): Query<DailyStatsParams>,
+    Extension(state): Extension<Arc<DashboardState>>,
+) -> Response {
+    let range = match boom_audit::StatsRange::from_param(
+        params.range.as_deref().unwrap_or("today"),
+    ) {
+        Some(r) => r,
+        None => {
+            return Json(json!({
+                "ready": false,
+                "error": "invalid range (expected today|1d|3d|7d)",
+            }))
+            .into_response()
+        }
+    };
+    let Some(pool) = &state.db_pool else {
+        return Json(json!({
+            "ready": false,
+            "error": "daily stats unavailable (no database configured)",
+        }))
+        .into_response();
+    };
+    // The today window is kept warm by boom-main's 30s background sync, so
+    // polling above that cycle never touches the DB. Rolling windows
+    // lazy-load on first request and re-aggregate at most once per TTL.
+    let ttl = match range {
+        boom_audit::StatsRange::Today => 35,
+        _ => 60,
+    };
+    let snap = match state
+        .daily_stats
+        .snapshot_for(range, pool, ttl, params.force.is_some())
+        .await
+    {
+        Ok(s) => Some(s),
+        // Refresh failed: serve the last good snapshot rather than an
+        // unavailable page — stale data beats no data on a dashboard.
+        Err(e) => {
+            tracing::warn!("Daily stats refresh failed ({}): {e}", range.as_str());
+            state.daily_stats.current(range)
+        }
+    };
+    match snap {
+        Some(snap) => {
+            let mut v = serde_json::to_value(&*snap).unwrap_or_else(|_| json!({}));
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("ready".to_string(), json!(true));
+            }
+            Json(v).into_response()
+        }
+        // No snapshot yet: the first refresh is still pending or keeps
+        // failing. The frontend shows a loading/unavailable state instead
+        // of zeros — zeros here would read as "no traffic", which is a
+        // different message.
+        None => Json(json!({
+            "ready": false,
+            "error": "daily stats unavailable (refresh pending or failing)",
+        }))
+        .into_response(),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
 // In-Flight Request Stats (real-time)
 // ═══════════════════════════════════════════════════════════
 

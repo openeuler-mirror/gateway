@@ -188,6 +188,12 @@ pub fn build_router<S: Clone + Send + Sync + 'static>(state: DashboardState) -> 
             "/dashboard/api/admin/stats/inflight",
             get(handlers_admin::get_inflight_stats),
         )
+        // Admin — Daily Business Volume (analytics board; memory snapshot,
+        // refreshed by boom-main every 30s; ?force=1 triggers an extra refresh).
+        .route(
+            "/dashboard/api/admin/stats/daily",
+            get(handlers_admin::get_daily_stats),
+        )
         // Admin — System Pressure timeseries (1Hz ring buffer, last N minutes).
         .route(
             "/dashboard/api/admin/stress/timeseries",

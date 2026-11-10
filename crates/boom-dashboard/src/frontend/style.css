@@ -3237,3 +3237,173 @@ input[list] {
   cursor: pointer;
 }
 .logs-range-bar select:hover { border-color: var(--primary); }
+
+/* ── Analytics Board (natural-day business volume) ─────── */
+.section-subtitle {
+  font-size: 13px; color: var(--text3); margin-top: 3px;
+  font-variant-numeric: tabular-nums;
+}
+/* Range switcher — segmented control. */
+.an-range {
+  display: inline-flex; gap: 2px; padding: 2px;
+  background: var(--surface2); border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+.an-range button {
+  border: none; background: transparent; cursor: pointer;
+  padding: 3px 10px; font-size: 12px; line-height: 1.4;
+  color: var(--text2); border-radius: calc(var(--radius-sm) - 1px);
+}
+.an-range button:hover { color: var(--text); }
+.an-range button.active {
+  background: var(--surface); color: var(--primary); font-weight: 600;
+  box-shadow: var(--shadow-sm);
+}
+
+.an-live {
+  display: inline-flex; align-items: center; gap: 7px;
+  font-size: 12px; color: var(--text3); padding: 0 4px;
+}
+.an-live-dot {
+  width: 6px; height: 6px; border-radius: 50%; background: var(--success);
+  animation: an-pulse 2.4s ease-in-out infinite;
+}
+@keyframes an-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .3; } }
+
+/* Metric cards — one row of five, degrading 3→2 columns on narrow viewports.
+   Values are mono tabular figures so digits don't jitter as they tick. */
+.an-metrics {
+  display: grid; grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 12px; margin-bottom: 16px;
+}
+@media (max-width: 1180px) { .an-metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+@media (max-width: 720px)  { .an-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.an-metric {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 16px 18px 14px;
+  box-shadow: var(--shadow-sm);
+  transition: border-color var(--transition), box-shadow var(--transition);
+}
+.an-metric:hover { border-color: var(--border2); box-shadow: var(--shadow); }
+.an-metric-label { font-size: 12px; color: var(--text3); margin-bottom: 10px; }
+.an-metric-value {
+  font-family: var(--mono); font-size: 27px; font-weight: 500;
+  color: var(--text); line-height: 1; letter-spacing: -.5px;
+  font-variant-numeric: tabular-nums;
+}
+.an-metric-hint {
+  font-size: 12px; color: var(--text3); margin-top: 9px; line-height: 1.5;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.an-err-text { color: var(--danger); }
+
+.an-panel { padding: 18px 20px 16px; }
+.an-card-head {
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: 12px; margin-bottom: 14px;
+}
+.an-card-head h3 { margin-bottom: 0; }
+.an-hint { font-size: 12px; color: var(--text3); }
+
+/* Request-volume chart: SVG line over a soft area gradient. Gridlines are
+   dashed hairlines; the current 10-minute slot is marked with a pulsing
+   dot; hover shows a vertical reference line + highlighted point. Y labels
+   are outside the plot area (left rail). Strokes carry
+   vector-effect="non-scaling-stroke" in the markup so the viewBox stretch
+   keeps hairline weights. */
+.an-hchart { position: relative; }
+.an-hplot { display: flex; }
+.an-hy {
+  width: 44px; flex: none; position: relative; height: 160px;
+}
+.an-hy span {
+  position: absolute; right: 10px; transform: translateY(50%);
+  font-size: 11px; color: var(--text3); font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+/* Axis labels are tiny 11px figures — the generic dark --text3 is too
+   dim for them (≈2.6:1); lift to a legible-but-still-muted tone. */
+[data-theme="dark"] .an-hy span,
+[data-theme="dark"] .an-hx span { color: #8b94a8; }
+.an-svgwrap {
+  position: relative; flex: 1; height: 160px;
+  border-bottom: 1px solid var(--border2);
+}
+.an-svg { display: block; width: 100%; height: 100%; overflow: visible; }
+.an-grid {
+  stroke: var(--border); stroke-width: 1; stroke-dasharray: 4 4;
+}
+[data-theme="dark"] .an-grid { stroke: var(--border2); }
+.an-grad-a { stop-color: var(--primary); stop-opacity: .18; }
+.an-grad-b { stop-color: var(--primary); stop-opacity: 0; }
+.an-line {
+  fill: none; stroke: var(--primary); stroke-width: 2;
+  stroke-linejoin: round; stroke-linecap: round;
+}
+.an-area { fill: url(#an-grad); stroke: none; }
+.an-hoverline { stroke: var(--border2); stroke-width: 1; visibility: hidden; }
+.an-hoverdot {
+  fill: var(--surface); stroke: var(--primary); stroke-width: 2;
+  visibility: hidden;
+}
+.an-nowdot { fill: var(--primary); animation: an-pulse 2.4s ease-in-out infinite; }
+.an-hx { position: relative; height: 16px; margin-left: 44px; margin-top: 6px; }
+.an-hx span {
+  position: absolute; transform: translateX(-50%);
+  font-size: 10.5px; color: var(--text3); font-family: var(--mono);
+}
+
+/* Hover tooltip — absolutely positioned inside the chart card, follows the
+   cursor but flips side near the right edge (JS measures). */
+.an-tip {
+  position: absolute; z-index: 6; display: none; pointer-events: none;
+  background: var(--surface); border: 1px solid var(--border2);
+  border-radius: var(--radius-sm); box-shadow: var(--shadow-md);
+  padding: 9px 12px; min-width: 168px;
+}
+.an-tip-head {
+  font-weight: 600; font-size: 12px; margin-bottom: 6px;
+  font-family: var(--mono); color: var(--text);
+}
+.an-tip-row {
+  display: flex; justify-content: space-between; gap: 16px;
+  font-size: 12px; color: var(--text2); line-height: 1.7;
+}
+.an-tip-row b {
+  color: var(--text); font-weight: 500; font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Model ranking table — sits in #an-table-wrap so it inherits the global
+   table-card look via the [id$="-table-wrap"] selector. */
+.an-table th[data-sort] { cursor: pointer; user-select: none; }
+.an-table th[data-sort]:hover { color: var(--primary); }
+.an-table .an-sort-arrow { display: none; }
+.an-table th.an-sorted { color: var(--primary); }
+.an-table th.an-sorted .an-sort-arrow::after { content: "↓"; margin-left: 2px; }
+.an-rank {
+  font-family: var(--mono); font-size: 12px; color: var(--text3);
+  font-variant-numeric: tabular-nums; width: 36px;
+}
+.an-rank--top { color: var(--primary); font-weight: 600; }
+.an-model {
+  font-family: var(--mono); font-size: 12.5px; max-width: 280px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* Share column: inline share-of-day bar. Bar width is relative to the TOP
+   model (visual comparison), the number is share of total. */
+.an-share { display: flex; align-items: center; gap: 10px; min-width: 120px; }
+.an-share-bar {
+  flex: 1; height: 4px; border-radius: 2px;
+  background: var(--surface3); overflow: hidden;
+}
+.an-share-bar i {
+  display: block; height: 100%; border-radius: 2px; background: var(--primary);
+}
+.an-share span {
+  font-size: 12px; color: var(--text2); font-family: var(--mono);
+  width: 48px; text-align: right; font-variant-numeric: tabular-nums;
+}
+.an-errrate-zero { color: var(--text3); }
+.an-errrate-low { color: var(--warn); }
+.an-errrate-high { color: var(--danger); font-weight: 600; }

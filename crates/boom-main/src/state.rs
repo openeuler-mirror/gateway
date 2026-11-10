@@ -142,6 +142,11 @@ pub struct AppState {
     /// exporter status; health-monitor auto-disable/enable hooks raise/clear
     /// immediately for low latency.
     pub alerts: Arc<boom_alert::AlertManager>,
+    /// Daily business-volume snapshot for the analytics board (数据看板):
+    /// natural-day aggregates over boom_request_log, refreshed from the DB
+    /// by `spawn_daily_stats_sync` (startup + every 30s). Survives reloads
+    /// (top-level Arc). None until the first successful refresh.
+    pub daily_stats: Arc<boom_audit::DailyStatsTracker>,
 }
 
 /// The state that gets swapped on config reload.
@@ -498,6 +503,7 @@ impl AppState {
             stressmon,
             trace: trace_registry,
             alerts: Arc::new(boom_alert::AlertManager::new()),
+            daily_stats: Arc::new(boom_audit::DailyStatsTracker::new()),
         };
         state.register_fusion_models(&state.inner.load().config).await?;
         Ok(state)

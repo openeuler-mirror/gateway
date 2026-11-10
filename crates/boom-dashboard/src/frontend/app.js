@@ -429,6 +429,12 @@
     } else {
       stopStressPoll();
     }
+    if (section === "admin-analytics") {
+      setupAnalytics();
+      startAnalyticsPoll();
+    } else {
+      stopAnalyticsPoll();
+    }
     if (section === "admin-status") {
       loadAlerts();
       startAlertsPoll();
@@ -469,6 +475,7 @@
     if (hash.includes("/admin/logs")) return "admin-logs";
     if (hash.includes("/admin/debug")) return "admin-debug";
     if (hash.includes("/admin/config")) return "admin-config";
+    if (hash.includes("/admin/analytics")) return "admin-analytics";
     if (hash.includes("/admin/stress")) return "admin-stress";
     if (hash.includes("/admin/status")) return "admin-status";
     return "admin-models";
@@ -479,6 +486,428 @@
     loadInflight();
     loadRequestRateStats();
     loadDeployment24hSummary();
+  }
+
+  // ── Analytics Board (business volume over selectable range) ─────
+  // The server keeps in-memory snapshots per range: today is refreshed
+  // from boom_request_log by a boom-main task every 30s; rolling 24h/3d/7d
+  // windows lazy-load on request and re-aggregate at most once per ~60s.
+  // This page polls the API every 10s — N open tabs cost nothing extra.
+  // The Refresh button passes force=1 to trigger one extra sync before
+  // responding. All wall-clock rendering is UTC+8 to match the backend's
+  // day boundary, regardless of the browser's timezone.
+  const ANALYTICS_RANGES = ["today", "1d", "3d", "7d"];
+  let analyticsTimer = null;
+  let analyticsData = null;
+  let analyticsSortKey = "requests";
+  const ANALYTICS_SORT_KEYS = ["requests", "input_tokens", "output_tokens"];
+  let analyticsRange = ANALYTICS_RANGES.includes(localStorage.getItem("analyticsRange"))
+    ? localStorage.getItem("analyticsRange") : "today";
+
+  function startAnalyticsPoll() {
+    stopAnalyticsPoll();
+    loadAnalytics(false);
+    analyticsTimer = setInterval(() => loadAnalytics(false), 10000);
+  }
+
+  function stopAnalyticsPoll() {
+    if (analyticsTimer) {
+      clearInterval(analyticsTimer);
+      analyticsTimer = null;
+    }
+  }
+
+  function updateAnalyticsRangeUI() {
+    document.querySelectorAll("#an-range button").forEach((b) => {
+      b.classList.toggle("active", b.dataset.range === analyticsRange);
+    });
+  }
+
+  function setupAnalytics() {
+    const btn = document.getElementById("btn-refresh-analytics");
+    if (btn && !btn.dataset.bound) {
+      btn.dataset.bound = "1";
+      btn.addEventListener("click", () => loadAnalytics(true));
+    }
+    const rangeBar = document.getElementById("an-range");
+    if (rangeBar && !rangeBar.dataset.bound) {
+      rangeBar.dataset.bound = "1";
+      rangeBar.addEventListener("click", (e) => {
+        const b = e.target.closest("button[data-range]");
+        if (!b || b.dataset.range === analyticsRange) return;
+        analyticsRange = b.dataset.range;
+        localStorage.setItem("analyticsRange", analyticsRange);
+        updateAnalyticsRangeUI();
+        loadAnalytics(false);
+      });
+    }
+    const tableWrap = document.getElementById("an-table-wrap");
+    if (tableWrap && !tableWrap.dataset.bound) {
+      tableWrap.dataset.bound = "1";
+      tableWrap.addEventListener("click", (e) => {
+        const th = e.target.closest("th[data-sort]");
+        if (!th) return;
+        analyticsSortKey = th.dataset.sort;
+        if (analyticsData) renderAnalyticsModels(analyticsData);
+      });
+    }
+    updateAnalyticsRangeUI();
+    setupAnalyticsTooltip();
+  }
+
+  async function loadAnalytics(force) {
+    const requested = analyticsRange;
+    try {
+      const res = await api(
+        "/admin/stats/daily?range=" + requested + (force ? "&force=1" : "")
+      );
+      // A range switch can race an in-flight poll — only the response
+      // matching the range still on screen gets rendered.
+      if (requested !== analyticsRange) return;
+      analyticsData = res;
+      renderAnalytics();
+    } catch (e) {
+      // Read-only page — polling errors (expired session etc.) shouldn't
+      // spam the console every 10s. api() already redirects on 401.
+    }
+  }
+
+  // ── Analytics formatting helpers ──
+  // Compact figures for card values (<10k stays exact — request counts are
+  // usually in that range and "9,876" reads better than "9.9K").
+  function fmtCompactNum(v) {
+    const n = Number(v);
+    if (!isFinite(n)) return "—";
+    if (n < 10000) return n.toLocaleString();
+    if (n < 1e6) return (n / 1e3).toFixed(n < 1e5 ? 1 : 0) + "K";
+    if (n < 1e9) return (n / 1e6).toFixed(n < 1e8 ? 1 : 0) + "M";
+    return (n / 1e9).toFixed(2) + "B";
+  }
+  function fmtFullNum(v) {
+    const n = Number(v);
+    return isFinite(n) ? n.toLocaleString() : "—";
+  }
+  // UTC+8 wall-clock from epoch seconds, independent of browser timezone.
+  function cstParts(epochSecs) {
+    const d = new Date((epochSecs + 8 * 3600) * 1000);
+    const p2 = (x) => String(x).padStart(2, "0");
+    return {
+      hour: d.getUTCHours(),
+      minute: d.getUTCMinutes(),
+      time: p2(d.getUTCHours()) + ":" + p2(d.getUTCMinutes()) + ":" + p2(d.getUTCSeconds()),
+    };
+  }
+
+  function renderAnalytics() {
+    const data = analyticsData;
+    const sub = document.getElementById("analytics-subtitle");
+    const ok = data && data.ready;
+    if (sub) {
+      sub.textContent = ok
+        ? t("analytics.subtitle." + (data.range || "today"), {
+            day: data.day,
+            time: cstParts(data.generated_at).time,
+          })
+        : "—";
+    }
+    if (!ok) {
+      const msg = '<p class="loading">' + esc(t("analytics.unavailable")) + "</p>";
+      ["an-metrics-wrap", "an-hourly-wrap", "an-table-wrap"].forEach((id) => {
+        const el = document.getElementById(id);
+        if (el) el.innerHTML = msg;
+      });
+      const hint = document.getElementById("an-models-hint");
+      if (hint) hint.textContent = "";
+      return;
+    }
+    renderAnalyticsMetrics(data);
+    renderAnalyticsSeries(data);
+    renderAnalyticsModels(data);
+  }
+
+  function renderAnalyticsMetrics(data) {
+    const wrap = document.getElementById("an-metrics-wrap");
+    if (!wrap) return;
+    const totals = data;
+    const errPct = totals.total_requests > 0
+      ? (totals.total_errors / totals.total_requests * 100)
+      : 0;
+    const cachePct = totals.total_input_tokens > 0
+      ? (totals.total_cached_tokens / totals.total_input_tokens * 100)
+      : 0;
+    const errHtml = totals.total_errors > 0
+      ? '<span class="an-err-text">' +
+          esc(t("analytics.metrics.errors_hint", {
+            n: fmtFullNum(totals.total_errors),
+            rate: errPct.toFixed(2) + "%",
+          })) +
+        "</span>"
+      : esc(t("analytics.no_error"));
+    const cacheHtml = totals.total_cached_tokens > 0
+      ? " · " + esc(t("analytics.metrics.cache_hint", { pct: cachePct.toFixed(1) + "%" }))
+      : "";
+
+    const cards = [
+      { label: t("analytics.metrics.requests"), value: fmtCompactNum(totals.total_requests),
+        hint: fmtFullNum(totals.total_requests) + " · " + errHtml },
+      { label: t("analytics.metrics.input_tokens"), value: fmtCompactNum(totals.total_input_tokens),
+        hint: fmtFullNum(totals.total_input_tokens) + cacheHtml },
+      { label: t("analytics.metrics.output_tokens"), value: fmtCompactNum(totals.total_output_tokens),
+        hint: fmtFullNum(totals.total_output_tokens) },
+      { label: t("analytics.metrics.active_keys"), value: fmtCompactNum(totals.active_keys),
+        hint: t("analytics.metrics.keys_hint") },
+      { label: t("analytics.metrics.active_teams"), value: fmtCompactNum(totals.active_teams),
+        hint: t("analytics.metrics.teams_hint") },
+    ];
+    wrap.innerHTML = cards.map((c) =>
+      '<div class="an-metric">' +
+        '<div class="an-metric-label">' + esc(c.label) + "</div>" +
+        '<div class="an-metric-value">' + esc(c.value) + "</div>" +
+        '<div class="an-metric-hint" title="' + esc(c.hint.replace(/<[^>]+>/g, "")) + '">' + c.hint + "</div>" +
+      "</div>"
+    ).join("");
+  }
+
+  // ── Analytics request-volume chart (SVG line over a time-bucket
+  // series). Bucket size and slot count come from the snapshot: today/24h
+  // = 10-min buckets (144 slots), 3d = 30-min (144), 7d = 1h (168) — every
+  // window renders ~144 points. Window-relative slot index =
+  // (slot_epoch − since_epoch) / bucket_secs, both from the snapshot. ──
+  const AN_W = 720, AN_H = 160;
+  let anChartCtx = null; // chart geometry shared with the hover overlay
+
+  function renderAnalyticsSeries(data) {
+    const wrap = document.getElementById("an-hourly-wrap");
+    if (!wrap) return;
+    const total = Math.max(1, Number(data.total_slots) || 144);
+    const bucket = Math.max(60, Number(data.bucket_secs) || 600);
+    const since = Number(data.since_epoch) || 0;
+    const isToday = data.range === "today";
+
+    const slots = Array.from({ length: total }, () => ({ requests: 0, input: 0, output: 0 }));
+    (data.series || []).forEach((p) => {
+      const idx = Math.round((p.slot_epoch - since) / bucket);
+      if (idx >= 0 && idx < total) {
+        slots[idx].requests += p.requests || 0;
+        slots[idx].input += p.input_tokens || 0;
+        slots[idx].output += p.output_tokens || 0;
+      }
+    });
+    // Today's chart draws only the elapsed part — the blank right side
+    // reads as "not happened yet" rather than a line diving to zero.
+    // Rolling windows are all history and draw in full.
+    const nowSecs = Math.floor(Date.now() / 1000);
+    const elapsed = Math.floor((nowSecs - since) / bucket) + 1;
+    const span = isToday ? Math.min(Math.max(elapsed, 1), total) : total;
+    const max = Math.max(1, ...slots.slice(0, span).map((s) => s.requests));
+    // Nice axis ceiling (1/2/5×10ⁿ). Fifths split it into integer steps;
+    // quarters can yield 12.5/37.5 tick labels.
+    const niceCeil = (v) => {
+      if (v <= 5) return 5;
+      const exp = Math.pow(10, Math.floor(Math.log10(v)));
+      const f = v / exp;
+      return (f <= 1 ? 1 : f <= 2 ? 2 : f <= 5 ? 5 : 10) * exp;
+    };
+    const yMax = niceCeil(max);
+    anChartCtx = { yMax, total, bucket, since, span };
+
+    const x = (i) => ((i + 0.5) / total) * AN_W; // slot center
+    const y = (v) => AN_H - (v / yMax) * AN_H;
+    let lineD = "";
+    for (let i = 0; i < span; i++) {
+      lineD += (i ? "L" : "M") + x(i).toFixed(1) + " " + y(slots[i].requests).toFixed(1);
+    }
+    const areaD = lineD +
+      "L" + x(span - 1).toFixed(1) + " " + AN_H +
+      "L" + x(0).toFixed(1) + " " + AN_H + "Z";
+
+    const yLabels = [1, 0.8, 0.6, 0.4, 0.2].map((p) =>
+      '<span style="bottom:' + p * 100 + '%">' + fmtCompactNum(yMax * p) + "</span>"
+    ).join("");
+    const gridLines = [0.2, 0.4, 0.6, 0.8, 1].map((p) => {
+      const gy = ((1 - p) * AN_H).toFixed(1);
+      return '<line class="an-grid" vector-effect="non-scaling-stroke" x1="0" x2="' + AN_W + '" y1="' + gy + '" y2="' + gy + '"></line>';
+    }).join("");
+    // X labels: CST midnight marks get a date ("MM-DD"); other aligned
+    // hours get "HH:00". Stride grows with the window — 3h for 10-min
+    // buckets, 6h for 30-min, 12h for the 7-day/1h grid.
+    const stepH = bucket <= 600 ? 3 : total > 144 ? 12 : 6;
+    const p2 = (n) => String(n).padStart(2, "0");
+    let xLabels = "";
+    for (let i = 0; i < total; i++) {
+      const d = new Date((since + i * bucket + 28800) * 1000);
+      let label = "";
+      if (d.getUTCMinutes() === 0 && d.getUTCHours() === 0) {
+        label = p2(d.getUTCMonth() + 1) + "-" + p2(d.getUTCDate());
+      } else if (d.getUTCMinutes() === 0 && d.getUTCHours() % stepH === 0) {
+        label = p2(d.getUTCHours()) + ":00";
+      }
+      if (label) {
+        xLabels += '<span style="left:' + ((i + 0.5) / total * 100) + '%">' + label + "</span>";
+      }
+    }
+
+    wrap.innerHTML =
+      '<div class="an-hchart">' +
+        '<div class="an-hplot">' +
+          '<div class="an-hy">' + yLabels + "</div>" +
+          '<div class="an-svgwrap">' +
+            '<svg class="an-svg" viewBox="0 0 ' + AN_W + " " + AN_H + '" preserveAspectRatio="none">' +
+              '<defs><linearGradient id="an-grad" x1="0" y1="0" x2="0" y2="1">' +
+                '<stop class="an-grad-a" offset="0"></stop>' +
+                '<stop class="an-grad-b" offset="1"></stop>' +
+              "</linearGradient></defs>" +
+              gridLines +
+              '<path class="an-area" d="' + areaD + '"></path>' +
+              '<path class="an-line" vector-effect="non-scaling-stroke" d="' + lineD + '"></path>' +
+              '<line class="an-hoverline" id="an-hoverline" vector-effect="non-scaling-stroke" x1="0" x2="0" y1="0" y2="' + AN_H + '"></line>' +
+              '<circle class="an-hoverdot" id="an-hoverdot" vector-effect="non-scaling-stroke" r="3.5" cx="0" cy="0"></circle>' +
+              '<circle class="an-nowdot" cx="' + x(span - 1).toFixed(1) + '" cy="' + y(slots[span - 1].requests).toFixed(1) + '" r="3"></circle>' +
+            "</svg>" +
+          "</div>" +
+        "</div>" +
+        '<div class="an-hx">' + xLabels + "</div>" +
+        '<div class="an-tip" id="an-tip"></div>' +
+      "</div>";
+  }
+
+  function setupAnalyticsTooltip() {
+    const wrap = document.getElementById("an-hourly-wrap");
+    if (!wrap || wrap.dataset.tipBound) return;
+    wrap.dataset.tipBound = "1";
+    const tip = () => document.getElementById("an-tip");
+    const hide = () => {
+      const el = tip();
+      if (el) el.style.display = "none";
+      ["an-hoverline", "an-hoverdot"].forEach((id) => {
+        const n = document.getElementById(id);
+        if (n) n.style.visibility = "hidden";
+      });
+    };
+    wrap.addEventListener("mousemove", (e) => {
+      const plot = e.target.closest(".an-svgwrap");
+      const el = tip();
+      if (!plot || !el || !analyticsData || !anChartCtx) {
+        hide();
+        return;
+      }
+      const rect = plot.getBoundingClientRect();
+      const frac = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
+      const slot = Math.min(anChartCtx.total - 1, Math.floor(frac * anChartCtx.total));
+      // Today's future slots are blank — no tooltip there.
+      if (slot > anChartCtx.span - 1) { hide(); return; }
+
+      const agg = { requests: 0, input_tokens: 0, output_tokens: 0 };
+      (analyticsData.series || []).forEach((p) => {
+        if (Math.round((p.slot_epoch - anChartCtx.since) / anChartCtx.bucket) === slot) {
+          agg.requests += p.requests || 0;
+          agg.input_tokens += p.input_tokens || 0;
+          agg.output_tokens += p.output_tokens || 0;
+        }
+      });
+
+      const vx = ((slot + 0.5) / anChartCtx.total) * AN_W;
+      const line = document.getElementById("an-hoverline");
+      const dot = document.getElementById("an-hoverdot");
+      if (line) {
+        line.setAttribute("x1", vx);
+        line.setAttribute("x2", vx);
+        line.style.visibility = "visible";
+      }
+      if (dot) {
+        dot.setAttribute("cx", vx);
+        dot.setAttribute("cy", AN_H - (agg.requests / anChartCtx.yMax) * AN_H);
+        dot.style.visibility = "visible";
+      }
+
+      // "HH:MM – HH:MM", prefixed with the date when the window spans
+      // multiple days (or the bucket crosses midnight).
+      const p2 = (n) => String(n).padStart(2, "0");
+      const multiDay = anChartCtx.total * anChartCtx.bucket > 86400;
+      const fmt = (t, withDate) => {
+        const d = new Date((t + 28800) * 1000);
+        return (withDate ? p2(d.getUTCMonth() + 1) + "-" + p2(d.getUTCDate()) + " " : "") +
+          p2(d.getUTCHours()) + ":" + p2(d.getUTCMinutes());
+      };
+      const startT = anChartCtx.since + slot * anChartCtx.bucket;
+      const endT = startT + anChartCtx.bucket;
+      const sd = new Date((startT + 28800) * 1000);
+      const ed = new Date((endT + 28800) * 1000);
+      const crossesMidnight =
+        sd.getUTCDate() !== ed.getUTCDate() || sd.getUTCMonth() !== ed.getUTCMonth();
+      const range = fmt(startT, multiDay) + " – " + fmt(endT, multiDay || crossesMidnight);
+      el.innerHTML =
+        '<div class="an-tip-head">' + range + "</div>" +
+        '<div class="an-tip-row"><span>' + esc(t("analytics.series.requests")) + "</span><b>" + fmtFullNum(agg.requests) + "</b></div>" +
+        '<div class="an-tip-row"><span>' + esc(t("analytics.series.input")) + "</span><b>" + fmtFullNum(agg.input_tokens) + "</b></div>" +
+        '<div class="an-tip-row"><span>' + esc(t("analytics.series.output")) + "</span><b>" + fmtFullNum(agg.output_tokens) + "</b></div>";
+      el.style.display = "block";
+      const gridRect = wrap.getBoundingClientRect();
+      const tipW = el.offsetWidth;
+      let left = e.clientX - gridRect.left + 14;
+      if (left + tipW > gridRect.width) left = e.clientX - gridRect.left - tipW - 14;
+      el.style.left = left + "px";
+      el.style.top = Math.max(0, e.clientY - gridRect.top - 30) + "px";
+    });
+    wrap.addEventListener("mouseleave", hide);
+  }
+
+  function renderAnalyticsModels(data) {
+    const wrap = document.getElementById("an-table-wrap");
+    if (!wrap) return;
+    const hint = document.getElementById("an-models-hint");
+    if (hint) hint.textContent = t("analytics.models.hint", { n: (data.models || []).length });
+
+    const models = (data.models || []).slice();
+    if (!models.length) {
+      wrap.innerHTML = '<p class="loading">' + esc(t("common.no_records")) + "</p>";
+      return;
+    }
+    models.sort((a, b) => (b[analyticsSortKey] || 0) - (a[analyticsSortKey] || 0));
+    const totalReq = data.total_requests || 0;
+    const maxReq = Math.max(1, ...models.map((m) => m.requests));
+
+    const th = (key, labelKey, cls) => {
+      const classes = [];
+      if (cls) classes.push(cls);
+      if (key && analyticsSortKey === key) classes.push("an-sorted");
+      return "<th " + (key ? 'data-sort="' + key + '" ' : "") +
+        (classes.length ? 'class="' + classes.join(" ") + '" ' : "") + ">" +
+        esc(t(labelKey)) + (key ? ' <span class="an-sort-arrow"></span>' : "") + "</th>";
+    };
+
+    const head =
+      "<tr><th>#</th>" +
+      th(null, "analytics.models.model") +
+      th("requests", "analytics.models.requests", "num") +
+      th(null, "analytics.models.share") +
+      th("input_tokens", "analytics.models.input", "num") +
+      th("output_tokens", "analytics.models.output", "num") +
+      th(null, "analytics.models.cached", "num") +
+      th(null, "analytics.models.errors", "num") +
+      th(null, "analytics.models.errrate", "num") +
+      "</tr>";
+
+    const rows = models.map((m, i) => {
+      const share = totalReq > 0 ? (m.requests / totalReq * 100) : 0;
+      const barW = (m.requests / maxReq * 100).toFixed(2);
+      const errRate = m.requests > 0 ? (m.errors / m.requests * 100) : 0;
+      const errRateCls = m.errors === 0 ? "an-errrate-zero" : errRate >= 5 ? "an-errrate-high" : errRate >= 1 ? "an-errrate-low" : "";
+      const rank = i < 3 ? '<td class="an-rank an-rank--top">' + (i + 1) + "</td>" : '<td class="an-rank">' + (i + 1) + "</td>";
+      return "<tr>" + rank +
+        '<td class="an-model" title="' + esc(m.model) + '">' + esc(m.model) + "</td>" +
+        '<td class="num" title="' + fmtFullNum(m.requests) + '">' + fmtFullNum(m.requests) + "</td>" +
+        '<td><div class="an-share"><div class="an-share-bar"><i style="width:' + barW + '%"></i></div><span>' + share.toFixed(1) + "%</span></div></td>" +
+        '<td class="num" title="' + fmtFullNum(m.input_tokens) + '">' + fmtCompactNum(m.input_tokens) + "</td>" +
+        '<td class="num" title="' + fmtFullNum(m.output_tokens) + '">' + fmtCompactNum(m.output_tokens) + "</td>" +
+        '<td class="num" title="' + fmtFullNum(m.cached_tokens) + '">' + fmtCompactNum(m.cached_tokens) + "</td>" +
+        '<td class="num' + (m.errors > 0 ? " an-err-text" : "") + '">' + fmtFullNum(m.errors) + "</td>" +
+        '<td class="num ' + errRateCls + '">' + errRate.toFixed(2) + "%</td>" +
+      "</tr>";
+    }).join("");
+
+    wrap.innerHTML =
+      '<table class="an-table"><thead>' + head + "</thead><tbody>" + rows + "</tbody></table>";
   }
 
   // ── In-Flight ─────────────────────────────────────────
