@@ -3409,6 +3409,31 @@ input[list] {
 .an-errrate-high { color: var(--danger); font-weight: 600; }
 
 /* ── Analytics detail pages (model / consumption / schedule) ── */
+/* Sub-tab bar switching the analytics panes (overview / model /
+   consumption / schedule). Same shape as the debug sub-tabs. */
+.an-subtabs {
+  display: flex; gap: 4px; flex-wrap: wrap;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 1.25rem;
+}
+.an-subtab {
+  background: transparent; border: none;
+  border-bottom: 2px solid transparent;
+  padding: 8px 14px; font-size: 13px;
+  color: var(--text3); cursor: pointer;
+}
+.an-subtab:hover { color: var(--text); }
+.an-subtab.active { color: var(--primary); border-bottom-color: var(--primary); font-weight: 600; }
+.an-pane { display: none; }
+.an-pane.active { display: block; }
+/* Collapsed group of 100%-error (phantom) models in the overview ranking. */
+.an-table tr.an-errgroup { cursor: pointer; }
+.an-table tr.an-errgroup td {
+  color: var(--text3); font-size: 12.5px;
+  background: var(--surface1);
+}
+.an-table tr.an-errgroup:hover td { color: var(--text); }
+.an-table tr.an-errmember td { color: var(--text3); }
 /* Overview model rows / key ranking rows drill into detail pages. */
 .an-table tr[data-model] { cursor: pointer; }
 .an-table tr[data-model]:hover td { background: var(--surface2); }

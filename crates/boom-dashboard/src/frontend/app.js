@@ -411,8 +411,10 @@
   // ── Routing (admin) ───────────────────────────────────
   function onRoute() {
     const hash = location.hash || "#/admin/stats";
+    // Match by section, not exact href: analytics sub-page hashes
+    // (#/admin/analytics/model/<name>) must still highlight the sidebar.
     document.querySelectorAll("#page-admin .nav-link").forEach((a) => {
-      a.classList.toggle("active", a.getAttribute("href") === hash);
+      a.classList.toggle("active", a.dataset.section === sectionFromHash(hash));
     });
     document.querySelectorAll("#page-admin .section").forEach((s) => {
       s.classList.toggle("active", s.id === sectionFromHash(hash));
@@ -429,36 +431,34 @@
     } else {
       stopStressPoll();
     }
+    // Analytics board: one section, four panes (overview / model /
+    // consumption / schedule). The active pane comes from the hash, and
+    // ONLY that pane's poller runs — closed panes don't refresh.
     if (section === "admin-analytics") {
       setupAnalytics();
-      startAnalyticsPoll();
+      const page = analyticsPageFromHash(hash);
+      document.querySelectorAll("#admin-analytics .an-pane").forEach((p) => {
+        p.classList.toggle("active", p.dataset.anpane === page);
+      });
+      document.querySelectorAll("#admin-analytics .an-subtab").forEach((b) => {
+        b.classList.toggle("active", b.dataset.anpage === page);
+      });
+      if (page === "overview") startAnalyticsPoll();
+      else stopAnalyticsPoll();
+      // loadModel re-parses the hash each time — model A → B switches are
+      // same-pane hash changes that fire onRoute (quota-page pattern).
+      if (page === "model") { setupModelPage(); startModelPoll(); }
+      else stopModelPoll();
+      // Main (cached) consumption view polls 60s; the key drill-down is a
+      // direct query — startConsumptionPoll skips the interval there.
+      if (page === "consumption") { setupConsumptionPage(); startConsumptionPoll(); }
+      else stopConsumptionPoll();
+      if (page === "schedule") { setupSchedulePage(); startSchedulePoll(); }
+      else stopSchedulePoll();
     } else {
       stopAnalyticsPoll();
-    }
-    // loadModel on every route change: same-section hash changes (model
-    // A → model B) don't re-run this branch's section toggle but do fire
-    // onRoute — loadModel re-parses the hash each time (quota-page
-    // pattern).
-    if (section === "admin-model") {
-      setupModelPage();
-      startModelPoll();
-    } else {
       stopModelPoll();
-    }
-    // Same pattern as the model page: loadConsumption re-parses the hash,
-    // so main view ⇄ key drill-down switches inside the section work.
-    // The key drill-down is a direct query — no interval, manual refresh
-    // only; the main (cached) view polls every 60s.
-    if (section === "admin-consumption") {
-      setupConsumptionPage();
-      startConsumptionPoll();
-    } else {
       stopConsumptionPoll();
-    }
-    if (section === "admin-schedule") {
-      setupSchedulePage();
-      startSchedulePoll();
-    } else {
       stopSchedulePoll();
     }
     if (section === "admin-status") {
@@ -494,11 +494,6 @@
   function sectionFromHash(hash) {
     if (hash.includes("/admin/stats")) return "admin-stats";
     if (hash.includes("/admin/models")) return "admin-models";
-    // Must come AFTER "/admin/models" — that string also contains
-    // "/admin/model" (hash.includes substring matching).
-    if (hash.includes("/admin/model")) return "admin-model";
-    if (hash.includes("/admin/consumption")) return "admin-consumption";
-    if (hash.includes("/admin/schedule")) return "admin-schedule";
     // if (hash.includes("/admin/workflows")) return "admin-workflows"; // workflow page disabled
     if (hash.includes("/admin/plans")) return "admin-plans";
     if (hash.includes("/admin/keys")) return "admin-keys";
@@ -510,6 +505,16 @@
     if (hash.includes("/admin/stress")) return "admin-stress";
     if (hash.includes("/admin/status")) return "admin-status";
     return "admin-models";
+  }
+
+  // Active pane inside the analytics section. Sub-pages live under
+  // #/admin/analytics/<page>[/<param>]; a bare #/admin/analytics is the
+  // overview.
+  function analyticsPageFromHash(hash) {
+    if (hash.includes("/admin/analytics/model")) return "model";
+    if (hash.includes("/admin/analytics/consumption")) return "consumption";
+    if (hash.includes("/admin/analytics/schedule")) return "schedule";
+    return "overview";
   }
 
   // ── Stats ─────────────────────────────────────────────
@@ -534,7 +539,9 @@
   let analyticsTimer = null;
   let analyticsData = null;
   let analyticsSortKey = "requests";
-  const ANALYTICS_SORT_KEYS = ["requests", "input_tokens", "output_tokens"];
+  // Collapse state for the 100%-error phantom-model group; survives poll
+  // re-renders, resets on reload.
+  let analyticsErrExpanded = false;
   let analyticsRange = ANALYTICS_RANGES.includes(localStorage.getItem("analyticsRange"))
     ? localStorage.getItem("analyticsRange") : "today";
 
@@ -568,6 +575,17 @@
       btn.dataset.bound = "1";
       btn.addEventListener("click", () => loadAnalytics(true));
     }
+    // Sub-tabs navigate by hash — onRoute then swaps panes and pollers.
+    const tabs = document.querySelector("#admin-analytics .an-subtabs");
+    if (tabs && !tabs.dataset.bound) {
+      tabs.dataset.bound = "1";
+      tabs.addEventListener("click", (e) => {
+        const b = e.target.closest("button[data-anpage]");
+        if (!b) return;
+        const target = "#/admin/analytics/" + b.dataset.anpage;
+        if (location.hash !== target) location.hash = target;
+      });
+    }
     const rangeBar = document.getElementById("an-range");
     if (rangeBar && !rangeBar.dataset.bound) {
       rangeBar.dataset.bound = "1";
@@ -584,6 +602,12 @@
     if (tableWrap && !tableWrap.dataset.bound) {
       tableWrap.dataset.bound = "1";
       tableWrap.addEventListener("click", (e) => {
+        // 100%-error group row: toggle the collapsed phantom models.
+        if (e.target.closest("tr[data-errgroup]")) {
+          analyticsErrExpanded = !analyticsErrExpanded;
+          if (analyticsData) renderAnalyticsModels(analyticsData);
+          return;
+        }
         const th = e.target.closest("th[data-sort]");
         if (th) {
           analyticsSortKey = th.dataset.sort;
@@ -594,7 +618,7 @@
         // ("*" is a real fallback model name) — always encodeURIComponent.
         const tr = e.target.closest("tr[data-model]");
         if (tr) {
-          location.hash = "#/admin/model/" + encodeURIComponent(tr.dataset.model);
+          location.hash = "#/admin/analytics/model/" + encodeURIComponent(tr.dataset.model);
         }
       });
     }
@@ -909,12 +933,22 @@
     const hint = document.getElementById("an-models-hint");
     if (hint) hint.textContent = t("analytics.models.hint", { n: (data.models || []).length });
 
-    const models = (data.models || []).slice();
-    if (!models.length) {
+    const all = (data.models || []).slice();
+    if (!all.length) {
       wrap.innerHTML = '<p class="loading">' + esc(t("common.no_records")) + "</p>";
       return;
     }
-    models.sort((a, b) => (b[analyticsSortKey] || 0) - (a[analyticsSortKey] || 0));
+    // 100%-error rows are almost always phantom model names (client asked
+    // for a model that doesn't exist; the gateway 404s but still audits
+    // the request). Collapse them into one expandable group at the bottom
+    // so real models stay readable.
+    const isErrAll = (m) => m.requests > 0 && m.errors >= m.requests;
+    const models = all.filter((m) => !isErrAll(m));
+    const errModels = all.filter((m) => isErrAll(m));
+    const totalOf = (m) => (m.input_tokens || 0) + (m.output_tokens || 0);
+    const sortVal = (m) => analyticsSortKey === "total_tokens" ? totalOf(m) : (m[analyticsSortKey] || 0);
+    models.sort((a, b) => sortVal(b) - sortVal(a));
+    errModels.sort((a, b) => sortVal(b) - sortVal(a));
     const totalReq = data.total_requests || 0;
     const maxReq = Math.max(1, ...models.map((m) => m.requests));
 
@@ -932,33 +966,52 @@
       th(null, "analytics.models.model") +
       th("requests", "analytics.models.requests", "num") +
       th(null, "analytics.models.share") +
-      th("input_tokens", "analytics.models.input", "num") +
-      th("output_tokens", "analytics.models.output", "num") +
+      th(null, "analytics.models.inout", "num") +
+      th("total_tokens", "analytics.models.total", "num") +
       th(null, "analytics.models.cached", "num") +
       th(null, "analytics.models.errors", "num") +
       th(null, "analytics.models.errrate", "num") +
       "</tr>";
 
-    const rows = models.map((m, i) => {
+    const rowOf = (m, rank) => {
       const share = totalReq > 0 ? (m.requests / totalReq * 100) : 0;
       const barW = (m.requests / maxReq * 100).toFixed(2);
       const errRate = m.requests > 0 ? (m.errors / m.requests * 100) : 0;
       const errRateCls = m.errors === 0 ? "an-errrate-zero" : errRate >= 5 ? "an-errrate-high" : errRate >= 1 ? "an-errrate-low" : "";
-      const rank = i < 3 ? '<td class="an-rank an-rank--top">' + (i + 1) + "</td>" : '<td class="an-rank">' + (i + 1) + "</td>";
+      const total = totalOf(m);
       return '<tr data-model="' + esc(m.model) + '">' + rank +
         '<td class="an-model" title="' + esc(m.model) + '">' + esc(m.model) + "</td>" +
         '<td class="num" title="' + fmtFullNum(m.requests) + '">' + fmtFullNum(m.requests) + "</td>" +
         '<td><div class="an-share"><div class="an-share-bar"><i style="width:' + barW + '%"></i></div><span>' + share.toFixed(1) + "%</span></div></td>" +
-        '<td class="num" title="' + fmtFullNum(m.input_tokens) + '">' + fmtCompactNum(m.input_tokens) + "</td>" +
-        '<td class="num" title="' + fmtFullNum(m.output_tokens) + '">' + fmtCompactNum(m.output_tokens) + "</td>" +
+        '<td class="num" title="' + fmtFullNum(m.input_tokens) + " / " + fmtFullNum(m.output_tokens) + '">' +
+          fmtCompactNum(m.input_tokens) + " / " + fmtCompactNum(m.output_tokens) + "</td>" +
+        '<td class="num" title="' + fmtFullNum(total) + '">' + fmtCompactNum(total) + "</td>" +
         '<td class="num" title="' + fmtFullNum(m.cached_tokens) + '">' + fmtCompactNum(m.cached_tokens) + "</td>" +
         '<td class="num' + (m.errors > 0 ? " an-err-text" : "") + '">' + fmtFullNum(m.errors) + "</td>" +
         '<td class="num ' + errRateCls + '">' + errRate.toFixed(2) + "%</td>" +
       "</tr>";
-    }).join("");
+    };
+
+    const rows = models.map((m, i) =>
+      rowOf(m, i < 3
+        ? '<td class="an-rank an-rank--top">' + (i + 1) + "</td>"
+        : '<td class="an-rank">' + (i + 1) + "</td>")
+    ).join("");
+
+    let errHtml = "";
+    if (errModels.length) {
+      const chev = analyticsErrExpanded ? "▾" : "▸";
+      errHtml =
+        '<tr class="an-errgroup" data-errgroup="1"><td></td>' +
+          '<td colspan="8">' + chev + " " +
+          esc(t("analytics.models.errgroup", { n: errModels.length })) + "</td></tr>" +
+        (analyticsErrExpanded
+          ? errModels.map((m) => rowOf(m, '<td class="an-rank">·</td>')).join("")
+          : "");
+    }
 
     wrap.innerHTML =
-      '<table class="an-table"><thead>' + head + "</thead><tbody>" + rows + "</tbody></table>";
+      '<table class="an-table"><thead>' + head + "</thead><tbody>" + rows + errHtml + "</tbody></table>";
   }
 
   // ── Analytics detail pages: generic multi-series trend chart ──
@@ -1124,7 +1177,7 @@
   }
 
   // ── Analytics detail: model drill-down page ──
-  // Selected model lives in the hash (#/admin/model/<enc>) so reload,
+  // Selected model lives in the hash (#/admin/analytics/model/<enc>) so reload,
   // back/forward and overview row clicks all work through plain
   // navigation. Shares the overview's range selector state
   // (analyticsRange + localStorage) — drilling in keeps the window you
@@ -1133,7 +1186,7 @@
   let mdData = null;
 
   function currentModelFromHash() {
-    const m = (location.hash || "").match(/\/admin\/model\/([^/?#]+)/);
+    const m = (location.hash || "").match(/\/admin\/analytics\/model\/([^/?#]+)/);
     return m ? decodeURIComponent(m[1]) : "";
   }
 
@@ -1210,7 +1263,7 @@
     if (!model) {
       body.innerHTML =
         '<div class="card an-panel"><p class="loading">' + esc(t("model.empty")) + "</p>" +
-        '<a class="tr-back" href="#/admin/analytics">← ' + esc(t("model.back_overview")) + "</a></div>";
+        '<a class="tr-back" href="#/admin/analytics/overview">← ' + esc(t("model.back_overview")) + "</a></div>";
       return;
     }
     const data = mdData;
@@ -1394,7 +1447,7 @@
   let csKeyData = null; // key drill-down report
 
   function currentKeyFromHash() {
-    const m = (location.hash || "").match(/\/admin\/consumption\/key\/([^/?#]+)/);
+    const m = (location.hash || "").match(/\/admin\/analytics\/consumption\/key\/([^/?#]+)/);
     return m ? decodeURIComponent(m[1]) : "";
   }
 
@@ -1438,7 +1491,7 @@
       bodyEl.addEventListener("click", (e) => {
         const tr = e.target.closest("tr[data-key]");
         if (tr) {
-          location.hash = "#/admin/consumption/key/" + encodeURIComponent(tr.dataset.key);
+          location.hash = "#/admin/analytics/consumption/key/" + encodeURIComponent(tr.dataset.key);
         }
       });
     }
@@ -1731,7 +1784,7 @@
     const bucketHint = t("model.series.hint", { bucket: bucketLabel(data.bucket_secs) });
 
     body.innerHTML =
-      '<a class="tr-back" href="#/admin/consumption">← ' + esc(t("consumption.back_keys")) + "</a>" +
+      '<a class="tr-back" href="#/admin/analytics/consumption">← ' + esc(t("consumption.back_keys")) + "</a>" +
       metrics +
       chartCard("csk-chart-req", "model.series.requests", bucketHint) +
       chartCard("csk-chart-tokens", "model.series.tokens", bucketHint) +
