@@ -28,12 +28,16 @@ use chrono::Utc;
 
 mod consumption;
 mod model;
+mod schedule;
 
 pub use consumption::{
     query_consumption, query_key_consumption_detail, ConsumptionSeriesPoint, ConsumptionSnapshot,
     IpAgg, KeyAgg, KeyConsumptionDetail, KeySeriesPoint, TagAgg, TeamAgg,
 };
 pub use model::{query_model_detail, DeploymentAgg, ModelDetailSnapshot, ModelSeriesPoint};
+pub use schedule::{
+    query_schedule, PolicyAgg, PolicyBucketPoint, ScheduleSeriesPoint, ScheduleSnapshot,
+};
 
 /// Cache slots kept before stale-entry pruning kicks in.
 const MAX_SLOTS: usize = 64;
@@ -162,6 +166,8 @@ pub struct AnalyticsHub {
     pub model: TtlCache<ModelDetailSnapshot>,
     /// Consumption snapshots, keyed `"{range}"`.
     pub consumption: TtlCache<ConsumptionSnapshot>,
+    /// Schedule & cache snapshots, keyed `"{range}"`.
+    pub schedule: TtlCache<ScheduleSnapshot>,
 }
 
 impl Default for AnalyticsHub {
@@ -175,6 +181,7 @@ impl AnalyticsHub {
         Self {
             model: TtlCache::new(),
             consumption: TtlCache::new(),
+            schedule: TtlCache::new(),
         }
     }
 }

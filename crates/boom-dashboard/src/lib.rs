@@ -210,6 +210,12 @@ pub fn build_router<S: Clone + Send + Sync + 'static>(state: DashboardState) -> 
             "/dashboard/api/admin/stats/consumption/key/{key_hash}",
             get(handlers_admin::get_consumption_key_detail),
         )
+        // Admin — Analytics schedule & cache history (lazy TTL cache keyed
+        // "{range}").
+        .route(
+            "/dashboard/api/admin/stats/schedule",
+            get(handlers_admin::get_schedule_stats),
+        )
         // Admin — System Pressure timeseries (1Hz ring buffer, last N minutes).
         .route(
             "/dashboard/api/admin/stress/timeseries",

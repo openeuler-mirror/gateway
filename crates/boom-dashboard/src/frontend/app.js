@@ -455,6 +455,12 @@
     } else {
       stopConsumptionPoll();
     }
+    if (section === "admin-schedule") {
+      setupSchedulePage();
+      startSchedulePoll();
+    } else {
+      stopSchedulePoll();
+    }
     if (section === "admin-status") {
       loadAlerts();
       startAlertsPoll();
@@ -492,6 +498,7 @@
     // "/admin/model" (hash.includes substring matching).
     if (hash.includes("/admin/model")) return "admin-model";
     if (hash.includes("/admin/consumption")) return "admin-consumption";
+    if (hash.includes("/admin/schedule")) return "admin-schedule";
     // if (hash.includes("/admin/workflows")) return "admin-workflows"; // workflow page disabled
     if (hash.includes("/admin/plans")) return "admin-plans";
     if (hash.includes("/admin/keys")) return "admin-keys";
@@ -545,10 +552,11 @@
   }
 
   function updateAnalyticsRangeUI() {
-    // Overview + model detail + consumption share the range state; keep
-    // the bars in sync (drilling in keeps the window you were looking at).
+    // Overview + model detail + consumption + schedule share the range
+    // state; keep the bars in sync (drilling in keeps the window you were
+    // looking at).
     document
-      .querySelectorAll("#an-range button, #md-range button, #cs-range button")
+      .querySelectorAll("#an-range button, #md-range button, #cs-range button, #sc-range button")
       .forEach((b) => {
         b.classList.toggle("active", b.dataset.range === analyticsRange);
       });
@@ -1793,6 +1801,217 @@
   function shortHash(hash) {
     const s = String(hash || "");
     return s.length > 12 ? s.slice(0, 8) + "…" : s;
+  }
+
+  // ── Schedule & Cache History ─────────────────────────
+  // Answers "did key-affinity routing actually improve cache hit and
+  // TTFT": schedule policy distribution over time, KV prefix hit / trie
+  // utilization / provider cache ratio trends, and a per-policy
+  // comparison table. 60s poll like the other cached analytics views.
+  let scheduleTimer = null;
+  let scheduleData = null;
+
+  function startSchedulePoll() {
+    stopSchedulePoll();
+    loadSchedule(false);
+    scheduleTimer = setInterval(() => loadSchedule(false), 60000);
+  }
+
+  function stopSchedulePoll() {
+    if (scheduleTimer) {
+      clearInterval(scheduleTimer);
+      scheduleTimer = null;
+    }
+  }
+
+  function setupSchedulePage() {
+    const btn = document.getElementById("btn-refresh-schedule");
+    if (btn && !btn.dataset.bound) {
+      btn.dataset.bound = "1";
+      btn.addEventListener("click", () => loadSchedule(true));
+    }
+    const bar = document.getElementById("sc-range");
+    if (bar && !bar.dataset.bound) {
+      bar.dataset.bound = "1";
+      bar.addEventListener("click", (e) => {
+        const b = e.target.closest("button[data-range]");
+        if (!b || b.dataset.range === analyticsRange) return;
+        analyticsRange = b.dataset.range;
+        localStorage.setItem("analyticsRange", analyticsRange);
+        updateAnalyticsRangeUI();
+        loadSchedule(false);
+      });
+    }
+    updateAnalyticsRangeUI();
+  }
+
+  async function loadSchedule(force) {
+    const requested = analyticsRange;
+    try {
+      const res = await api(
+        "/admin/stats/schedule?range=" + analyticsRange + (force ? "&force=1" : "")
+      );
+      // A range switch can race the in-flight request — drop stale renders.
+      if (requested !== analyticsRange) return;
+      scheduleData = res;
+      renderSchedule();
+    } catch (e) {
+      // Read-only poller — api() already surfaces auth problems.
+    }
+  }
+
+  function renderSchedule() {
+    const body = document.getElementById("sc-body");
+    if (!body) return;
+    const sub = document.getElementById("sc-subtitle");
+    if (sub) sub.textContent = t("schedule.subtitle");
+    const data = scheduleData;
+    if (!data || !data.ready) {
+      const detail = data && data.error ? " — " + esc(String(data.error)) : "";
+      body.innerHTML = '<p class="loading">' + esc(t("analytics.unavailable")) + detail + "</p>";
+      return;
+    }
+
+    const errRate = data.requests > 0 ? (data.errors / data.requests * 100) : 0;
+    const cards = [
+      { label: t("analytics.metrics.requests"), value: fmtFullNum(data.requests), hint: "" },
+      { label: t("analytics.metrics.errors"), value: fmtFullNum(data.errors),
+        hint: errRate.toFixed(2) + "%" },
+      { label: t("schedule.metrics.kv_hit"), value: fmtPct(data.kv_hit_ratio),
+        hint: t("schedule.metrics.kv_hit_hint") },
+      { label: t("schedule.metrics.trie_util"), value: fmtPct(data.trie_util_ratio),
+        hint: t("schedule.metrics.trie_util_hint") },
+      { label: t("model.metrics.cache_hit"), value: fmtPct(data.cache_hit_ratio),
+        hint: t("model.metrics.cache_hit_hint") },
+    ];
+    const metrics = '<div class="an-metrics">' + cards.map((c) =>
+      '<div class="an-metric">' +
+        '<div class="an-metric-label">' + esc(c.label) + "</div>" +
+        '<div class="an-metric-value">' + esc(c.value) + "</div>" +
+        (c.hint ? '<div class="an-metric-hint">' + esc(c.hint) + "</div>" : "") +
+      "</div>"
+    ).join("") + "</div>";
+
+    const chartCard = (id, titleKey, hint) =>
+      '<div class="card an-panel">' +
+        '<div class="an-card-head"><h3>' + esc(t(titleKey)) + '</h3><span class="an-hint">' + esc(hint) + "</span></div>" +
+        '<div id="' + id + '"></div>' +
+      "</div>";
+    const bucketHint = t("model.series.hint", { bucket: bucketLabel(data.bucket_secs) });
+    const tableCard = (id, titleKey, hint, inner) =>
+      '<div class="card an-panel">' +
+        '<div class="an-card-head"><h3>' + esc(t(titleKey)) + '</h3><span class="an-hint">' + esc(hint) + "</span></div>" +
+        '<div id="' + id + '">' + inner + "</div>" +
+      "</div>";
+
+    body.innerHTML = metrics +
+      chartCard("sc-chart-policy", "schedule.chart.policy", bucketHint) +
+      chartCard("sc-chart-kv", "schedule.chart.kv", bucketHint) +
+      chartCard("sc-chart-trie", "schedule.chart.trie", bucketHint) +
+      chartCard("sc-chart-cache", "schedule.chart.cache", bucketHint) +
+      tableCard("sc-policy-table", "schedule.table.title",
+        t("schedule.table.hint"), "");
+
+    const total = Math.max(1, Number(data.total_slots) || 144);
+    const bucket = Math.max(60, Number(data.bucket_secs) || 600);
+    const since = Number(data.since_epoch) || 0;
+    const span = data.range === "today"
+      ? Math.min(Math.max(Math.floor((Date.now() / 1000 - since) / bucket) + 1, 1), total)
+      : total;
+    const C_MAIN = "var(--primary)";
+
+    // ── Policy trend: one line per policy, ordered by window requests ──
+    const policyTotals = new Map();
+    (data.policy_series || []).forEach((p) => {
+      policyTotals.set(p.policy, (policyTotals.get(p.policy) || 0) + (p.requests || 0));
+    });
+    const policyOrder = [...policyTotals.keys()].sort(
+      (a, b) => (policyTotals.get(b) || 0) - (policyTotals.get(a) || 0)
+    );
+    const policyGrids = new Map(policyOrder.map((p) => [p, Array.from({ length: total }, () => 0)]));
+    (data.policy_series || []).forEach((p) => {
+      const grid = policyGrids.get(p.policy);
+      if (!grid) return;
+      const idx = Math.round((p.slot_epoch - since) / bucket);
+      if (idx < 0 || idx >= total) return;
+      grid[idx] += p.requests || 0;
+    });
+    if (policyOrder.length) {
+      renderTrendChart("sc-chart-policy", {
+        since, bucket, total, span,
+        series: policyOrder.map((p, i) => ({
+          label: p, color: deploymentColor(i), values: policyGrids.get(p),
+        })),
+        tooltipRows: (i) => policyOrder.map((p) => ({
+          label: p, value: fmtFullNum(policyGrids.get(p)[i]),
+        })),
+      });
+    } else {
+      const wrap = document.getElementById("sc-chart-policy");
+      if (wrap) wrap.innerHTML = '<p class="loading">' + esc(t("common.no_records")) + "</p>";
+    }
+
+    // ── Ratio trends: null (no denominator) breaks the line ──
+    const ratioGrid = (pick) => {
+      const grid = Array.from({ length: total }, () => null);
+      (data.series || []).forEach((p) => {
+        const idx = Math.round((p.slot_epoch - since) / bucket);
+        if (idx < 0 || idx >= total) return;
+        grid[idx] = pick(p);
+      });
+      return grid;
+    };
+    const pctChart = (id, labelKey, grid) => {
+      if (!grid.some((v) => v != null)) {
+        const wrap = document.getElementById(id);
+        if (wrap) wrap.innerHTML = '<p class="loading">' + esc(t("common.no_records")) + "</p>";
+        return;
+      }
+      renderTrendChart(id, {
+        since, bucket, total, span, yMax: 1,
+        fmtY: (v) => Math.round(v * 100) + "%",
+        series: [{ label: t(labelKey), color: C_MAIN, values: grid }],
+        tooltipRows: (i) => [{ label: t(labelKey), value: fmtPct(grid[i]) }],
+      });
+    };
+    pctChart("sc-chart-kv", "schedule.chart.kv", ratioGrid((p) => p.kv_hit_ratio));
+    pctChart("sc-chart-trie", "schedule.chart.trie", ratioGrid((p) => p.trie_util_ratio));
+    pctChart("sc-chart-cache", "schedule.chart.cache",
+      ratioGrid((p) => p.cache_hit_ratio));
+
+    // ── Policy comparison table ──
+    const tableWrap = document.getElementById("sc-policy-table");
+    if (tableWrap) {
+      const policies = data.policies || [];
+      if (!policies.length) {
+        tableWrap.innerHTML = '<p class="loading">' + esc(t("common.no_records")) + "</p>";
+      } else {
+        const th = (labelKey, cls) =>
+          "<th" + (cls ? ' class="' + cls + '"' : "") + ">" + esc(t(labelKey)) + "</th>";
+        const head = "<tr>" +
+          th("schedule.th.policy") + th("analytics.metrics.requests", "num") +
+          th("analytics.metrics.errors", "num") +
+          th("schedule.th.kv", "num") + th("schedule.th.trie", "num") +
+          th("schedule.th.cache", "num") +
+          th("schedule.th.avg_duration", "num") + th("schedule.th.avg_ttft", "num") +
+          th("schedule.th.avg_queue", "num") + "</tr>";
+        const rows = policies.map((p, i) =>
+          '<tr><td><span class="tr-swatch" style="background:' + deploymentColor(i) +
+            '"></span> ' + esc(p.policy) + "</td>" +
+            '<td class="num">' + fmtFullNum(p.requests) + "</td>" +
+            '<td class="num' + (p.errors > 0 ? " an-err-text" : "") + '">' + fmtFullNum(p.errors) + "</td>" +
+            '<td class="num">' + fmtPct(p.kv_hit_ratio) + "</td>" +
+            '<td class="num">' + fmtPct(p.trie_util_ratio) + "</td>" +
+            '<td class="num">' + fmtPct(p.cache_hit_ratio) + "</td>" +
+            '<td class="num">' + fmtMs(p.avg_duration_ms) + "</td>" +
+            '<td class="num">' + fmtMs(p.avg_ttft_ms) + "</td>" +
+            '<td class="num">' + fmtMs(p.avg_queue_wait_ms) + "</td>" +
+          "</tr>"
+        ).join("");
+        tableWrap.innerHTML =
+          '<table class="an-table"><thead>' + head + "</thead><tbody>" + rows + "</tbody></table>";
+      }
+    }
   }
 
   // ── In-Flight ─────────────────────────────────────────
