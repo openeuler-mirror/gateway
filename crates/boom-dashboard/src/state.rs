@@ -50,6 +50,17 @@ pub enum AdminCommand {
     ImportModelsFromYaml {
         reply: oneshot::Sender<Result<Value, String>>,
     },
+    /// Set rollback participation at one of three granularities: a single
+    /// deployment row (`deployment_id`), one pool (`model_name`), or every
+    /// pool (both None — the toolbar master toggle). Writes
+    /// `rollback_enabled` on the affected rows, then reloads routing for
+    /// the affected model group(s).
+    SetModelRollback {
+        deployment_id: Option<Uuid>,
+        model_name: Option<String>,
+        enabled: bool,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
     /// Save a workflow definition (create or replace). Boom-main parses the
     /// raw definition JSON against `WorkflowDefinitionConfig`, validates the
     /// resulting settings snapshot, writes DB, then re-registers fusion.

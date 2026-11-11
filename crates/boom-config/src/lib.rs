@@ -394,6 +394,12 @@ pub struct ModelEntry {
     /// otherwise. Default: false.
     #[serde(default)]
     pub client_type_header: bool,
+    /// Whether this deployment participates in context rollback. Pool-level
+    /// semantics: a model group participates when EVERY deployment row has
+    /// this flag set (the Models page pool toggle writes the whole group).
+    /// Default: false.
+    #[serde(default)]
+    pub rollback_enabled: bool,
     /// Unified access-control state. See [`ModelVisibility`].
     ///
     /// Backward compatibility: entries written before this field existed that
@@ -450,6 +456,15 @@ pub struct ProviderParams {
     pub temperature: Option<f64>,
     /// Max tokens override.
     pub max_tokens: Option<u32>,
+    /// Context capability declaration for rollback tiering (tokens, per-request
+    /// ceiling). Deployments sharing a model_name are partitioned into tiers
+    /// by this value; a context-length error on one tier falls back to a
+    /// strictly larger tier. NULL = not participating.
+    ///
+    /// Distinct from flow_control's `max_context_len` (chars, aggregate
+    /// in-flight budget for queue admission).
+    #[serde(default)]
+    pub max_context_tokens: Option<u64>,
 }
 
 impl ProviderParams {
@@ -651,6 +666,70 @@ impl ModelGroupAlias {
     }
 }
 
+/// Rollback policy framework — `router_settings.rollback`.
+///
+/// ```yaml
+/// router_settings:
+///   rollback:
+///     context:                 # context-length strategy (first of its kind)
+///       patterns:
+///         - "code:InputTokenExceeded"
+///         - "maximum context length"
+/// ```
+///
+/// Participation is per-deployment DB state (Models page pool toggles +
+/// global select-all / deselect-all), not YAML. This section only carries
+/// strategy parameters; the framework name is generic so future strategies
+/// extend as sibling sub-sections.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct RollbackSettings {
+    /// Context-length rollback strategy (currently the only strategy).
+    /// Framework container kept generic: future strategies extend as
+    /// sibling sub-sections.
+    ///
+    /// Participation lives in the DB (`boom_model_deployment.rollback_enabled`,
+    /// toggled per pool / globally from the Models page) — NOT here. This
+    /// section only carries strategy parameters (identification patterns).
+    #[serde(default)]
+    pub context: ContextRollbackSettings,
+}
+
+impl Default for RollbackSettings {
+    fn default() -> Self {
+        Self {
+            context: ContextRollbackSettings::default(),
+        }
+    }
+}
+
+/// Context-length rollback strategy settings.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct ContextRollbackSettings {
+    /// Error-identification patterns. Each entry is matched against the
+    /// upstream error `code` first (entries prefixed `code:`, exact match),
+    /// then as a case-insensitive substring of the error message. Defaults
+    /// cover the GLM / vLLM / Anthropic stacks (empirically verified).
+    #[serde(default = "default_context_rollback_patterns")]
+    pub patterns: Vec<String>,
+}
+
+impl Default for ContextRollbackSettings {
+    fn default() -> Self {
+        Self {
+            patterns: default_context_rollback_patterns(),
+        }
+    }
+}
+
+fn default_context_rollback_patterns() -> Vec<String> {
+    vec![
+        "code:InputTokenExceeded".to_string(),
+        "maximum input length".to_string(),
+        "maximum context length".to_string(),
+        "prompt is too long".to_string(),
+    ]
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct RouterSettings {
     /// Scheduling policy: round_robin (default) or key_affinity.
@@ -691,6 +770,12 @@ pub struct RouterSettings {
     /// KV-cache aware routing settings.
     #[serde(default)]
     pub kvc_aware: KvcAwareSettings,
+    /// Rollback policy framework (generic name by design — the Config page
+    /// card is「回落策略」and context-length is the first strategy
+    /// sub-section; future strategies extend as siblings under
+    /// `rollback.<strategy>`).
+    #[serde(default)]
+    pub rollback: RollbackSettings,
     /// When true, inject the `X-Gateway-Priority` header into upstream requests
     /// (consumed by the downstream load-aware scheduler). Default false: no extra
     /// header is injected, keeping normal flows clean. Enable this only when
@@ -895,6 +980,7 @@ impl Default for RouterSettings {
             rebalance_threshold: default_rebalance_threshold(),
             auto_router: None,
             kvc_aware: KvcAwareSettings::default(),
+            rollback: RollbackSettings::default(),
             enable_priority_header: false,
             enable_workflow: false,
             flow_control_queue_timeout_secs: None,
@@ -1438,6 +1524,34 @@ mod tests {
     }
 
     #[test]
+    fn rollback_settings_and_model_entry_parse() {
+        // Omitted rollback section → built-in patterns (GLM / vLLM /
+        // Anthropic, empirically verified).
+        let cfg: Config = serde_yaml::from_str("server:\n  port: 4000\n").unwrap();
+        let pats = &cfg.router_settings.rollback.context.patterns;
+        assert!(pats.contains(&"code:InputTokenExceeded".to_string()), "{:?}", pats);
+        assert!(pats.iter().any(|p| p.contains("maximum context length")));
+
+        // Custom patterns round-trip.
+        let cfg: Config = serde_yaml::from_str(
+            "server:\n  port: 4000\nrouter_settings:\n  rollback:\n    context:\n      patterns:\n        - \"code:SomeCode\"\n        - \"prompt is too long\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.router_settings.rollback.context.patterns,
+            vec!["code:SomeCode".to_string(), "prompt is too long".to_string()]
+        );
+
+        // ModelEntry.rollback_enabled: omitted → false; explicit → round-trip.
+        let cfg: Config = serde_yaml::from_str(
+            "server:\n  port: 4000\nmodel_list:\n  - model_name: a\n    litellm_params:\n      model: openai/x\n  - model_name: b\n    litellm_params:\n      model: openai/y\n    rollback_enabled: true\n",
+        )
+        .unwrap();
+        assert!(!cfg.model_list[0].rollback_enabled);
+        assert!(cfg.model_list[1].rollback_enabled);
+    }
+
+    #[test]
     fn test_mask_secrets_in_place_masks_known_fields() {
         let mut v = serde_json::json!({
             "master_key": "sk-live-123",
@@ -1505,6 +1619,7 @@ mod tests {
             headers: HashMap::new(),
             temperature: None,
             max_tokens: None,
+            max_context_tokens: None,
         };
         let (provider, model) = params.resolve_provider_and_model();
         assert_eq!(provider, "openai");
@@ -1527,6 +1642,7 @@ mod tests {
             headers: HashMap::new(),
             temperature: None,
             max_tokens: None,
+            max_context_tokens: None,
         };
         let (provider, model) = params.resolve_provider_and_model();
         assert_eq!(provider, "openai");

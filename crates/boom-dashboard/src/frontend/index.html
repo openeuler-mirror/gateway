@@ -522,6 +522,10 @@
             <div class="section-header">
               <h2 data-i18n="models.title">Model Deployments</h2>
               <div style="display:flex;gap:8px">
+                <label class="rb-master-toggle" title="Enable / disable rollback for ALL model pools">
+                  <input type="checkbox" id="rb-master" onchange="window._masterRollback(this)">
+                  <span>rollback</span>
+                </label>
                 <button class="btn-small" id="btn-import-yaml-models" data-i18n="models.import_yaml">Import from YAML</button>
                 <button class="btn-small btn-primary" id="btn-new-model" data-i18n="models.add">+ Add Model</button>
               </div>

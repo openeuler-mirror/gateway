@@ -105,6 +105,11 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
     // it ("visibility" does not exist). Propagates with `?` — startup
     // should fail loudly when a hard-required column can't be added.
     run_ddl_on_conn(&mut conn, boom_routing::migrations::migration_add_visibility()).await?;
+    // Add max_context_tokens (rollback tiering capability, tokens). Same
+    // run_ddl_on_conn + `?` discipline as visibility: DeploymentRow SELECTs
+    // reference the column, so a failed add must fail startup loudly.
+    run_ddl_on_conn(&mut conn, boom_routing::migrations::migration_add_max_context_tokens()).await?;
+    run_ddl_on_conn(&mut conn, boom_routing::migrations::migration_add_rollback_enabled()).await?;
     // Backfill deployment_id for legacy rows written before insert-path
     // auto-generation (NULL/''): gives them a stable persisted identity for
     // flow-control slots and kv affinity. Idempotent — fires at most once

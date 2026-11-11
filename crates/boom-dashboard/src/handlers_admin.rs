@@ -2402,6 +2402,15 @@ pub struct CreateDeploymentRequest {
     /// Max total input context chars across in-flight requests (flow control, 0 = no limit).
     #[serde(default)]
     pub max_context_len: Option<i64>,
+    /// Context capability declaration for rollback tiering (tokens, NULL =
+    /// not participating). Distinct from max_context_len (flow-control chars).
+    #[serde(default)]
+    pub max_context_tokens: Option<i64>,
+    /// Per-deployment rollback participation (pool semantics: group
+    /// participates when every row is set). None = false (create) / the
+    /// frontend echoes the current value on update.
+    #[serde(default)]
+    pub rollback_enabled: Option<bool>,
     /// Attach `X-BooM-Client-Type` header to outgoing requests (default false).
     #[serde(default)]
     pub client_type_header: bool,
@@ -2487,6 +2496,8 @@ pub async fn list_models(
                 "quota_count_ratio": r.quota_count_ratio.unwrap_or(1),
                 "max_inflight_queue_len": r.max_inflight_queue_len,
                 "max_context_len": r.max_context_len,
+                "max_context_tokens": r.max_context_tokens,
+                "rollback_enabled": r.rollback_enabled,
                 "client_type_header": r.client_type_header.unwrap_or(false),
                 "serve_not_match": r.serve_not_match,
                 "allowed_teams": r.allowed_teams,
@@ -2519,6 +2530,62 @@ pub async fn list_models(
         .collect();
 
     Json(json!({"models": models})).into_response()
+}
+
+/// Body for `POST /admin/models/rollback`. Exactly one granularity:
+/// `deployment_id` (one row), `model_name` (one pool), or neither (ALL
+/// pools — the toolbar master toggle).
+#[derive(Debug, serde::Deserialize)]
+pub struct SetRollbackRequest {
+    /// Single deployment row (per-row checkbox in the models table).
+    pub deployment_id: Option<String>,
+    /// Whole model group.
+    pub model_name: Option<String>,
+    pub enabled: bool,
+}
+
+/// POST /dashboard/api/admin/models/rollback — set rollback participation
+/// at one of three granularities: a single deployment row (deployment_id),
+/// one pool (model_name), or every pool (neither). Boom-main writes
+/// `rollback_enabled` on the affected rows and reloads routing.
+pub async fn set_model_rollback(
+    _session: AdminSession,
+    Extension(state): Extension<std::sync::Arc<DashboardState>>,
+    Json(req): Json<SetRollbackRequest>,
+) -> Response {
+    if req.deployment_id.is_some() && req.model_name.is_some() {
+        return Json(json!({"error": "specify either deployment_id or model_name, not both"})).into_response();
+    }
+    let deployment_id = match req.deployment_id.as_deref() {
+        None => None,
+        Some(raw) => match raw.parse::<uuid::Uuid>() {
+            Ok(id) => Some(id),
+            Err(_) => return Json(json!({"error": format!("invalid deployment_id '{}'", raw)})).into_response(),
+        },
+    };
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let cmd = crate::state::AdminCommand::SetModelRollback {
+        deployment_id,
+        model_name: req.model_name,
+        enabled: req.enabled,
+        reply: reply_tx,
+    };
+    if state.admin_tx.send(cmd).await.is_err() {
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "Admin command handler unavailable",
+        )
+            .into_response();
+    }
+    match reply_rx.await {
+        Ok(Ok(value)) => Json(value).into_response(),
+        Ok(Err(msg)) => Json(json!({"error": msg})).into_response(),
+        Err(_) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "Admin command handler dropped reply",
+        )
+            .into_response(),
+    }
 }
 
 pub async fn create_model(

@@ -3465,3 +3465,42 @@ input[list] {
 .md-hist-track { height: 12px; border-radius: 3px; background: var(--surface2); overflow: hidden; }
 .md-hist-track i { display: block; height: 100%; border-radius: 3px; background: var(--primary); }
 .md-hist-val { color: var(--text2); text-align: right; font-variant-numeric: tabular-nums; }
+
+/* ── Models page: pool grouping inside a single table ────────────
+   One rollback checkbox per pool (rowspan cell on the pool's first row);
+   pools separated by a strong dark border instead of header rows. */
+th.col-rollback { text-align: center; }
+td.cell-rollback {
+  text-align: center;
+  vertical-align: middle; /* rowspan: centered across the pool's rows */
+  width: 96px;
+}
+td.cell-rollback input[type="checkbox"] { display: block; margin: 0 auto 5px; accent-color: var(--primary); cursor: pointer; }
+td.cell-rollback .badge { display: inline-flex; }
+/* Even-row pools: the pool's center is a row boundary — the stack
+   (checkbox + badge below) is bottom-aligned so the badge text lands on
+   the center line. td has no vertical padding, so vertical-align:bottom
+   is exact. */
+td.cell-rollback-bottom { vertical-align: bottom; }
+tr.pool-start > td { border-top: 2px solid var(--text2); }
+
+
+
+/* ── Models page toolbar: rollback master toggle (tri-state) ───── */
+.rb-master-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm, 8px);
+  background: var(--surface);
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text2);
+  user-select: none;
+}
+.rb-master-toggle input { accent-color: var(--primary); cursor: pointer; width: 15px; height: 15px; }
+.rb-master-toggle input:disabled { cursor: not-allowed; opacity: .5; }
+.rb-master-toggle:hover { border-color: var(--border2); }

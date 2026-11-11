@@ -47,7 +47,7 @@ L4  记忆跟随              无新增机制（复用各策略既有迁移路�
 
 ### 3.1 部署级：编辑弹窗「Rollback 配置」独立分区
 
-- 字段：`max_context_tokens: Option<u64>`（NULL = 不参与）；
+- 字段：`max_context_tokens: Option<u64>`（NULL = 不参与）。**编辑界面以 K 为单位**（十进制：1K = 1000 tokens，1M = 1000K = 1,000,000；输入 × 1000 落库，DB 始终存 tokens。声明值仅用于层间相对比较，与上游实现的实际上限无关）；
 - 独立分区（非基础配置内），为后续条件预留扩展位（跨模型回落目标、其他能力维度）；
 - **列表页不展示字段值**，只在编辑弹窗配置；池头保留聚合的层分布摘要；
 - 存储为 DB 业务配置（五点同步）：
@@ -57,14 +57,13 @@ L4  记忆跟随              无新增机制（复用各策略既有迁移路�
   4. Dashboard app.js 表单 + i18n
   5. boom-main migration：`ALTER TABLE boom_model_deployment ADD COLUMN max_context_tokens BIGINT NULL`
 
-### 3.2 进程级：Config 页「回落策略」卡片（通用名）
+### 3.2 进程级：YAML-only（无 Dashboard 卡片）
 
-卡片与 YAML 节用**通用名 rollback**——上下文只是第一个回落策略（`context` 子节），未来新策略平级扩展（跨模型回落、其他能力维度等），总开关管整个回落框架：
+识别模式是上游栈的协议属性，不是业务数据——**不占 Dashboard 界面**，仅 config.yaml 可覆盖（内置默认覆盖 GLM / vLLM / Anthropic 实证措辞）：
 
 ```yaml
 router_settings:
-  rollback:                  # 回落策略框架（通用）
-    enabled: true            # 总开关：紧急关断所有回落行为（热加载，不动部署数据）
+  rollback:
     context:                 # 上下文长度回落（当前唯一策略）
       patterns:              # 识别模式表（默认内置，可追加）
         - code: "InputTokenExceeded"
@@ -73,30 +72,36 @@ router_settings:
         - "prompt is too long"
 ```
 
-（扩展点：未来可为单个策略加独立开关，如 `rollback.context.enabled`。）
+（历史：曾设计 Config 卡片承载总开关 + 模型勾选名单，2026-11-12 重设计移除——两级 opt-in 造成"勾了模型仍显示关闭"的困惑；参与状态全部收敛到模型部署页，见决策记录 #12。）
 
-对标「模型健康监控」卡片模式（`update_config_section` → YAML → reload）。模型部署页池头徽标**只读**显示总开关状态。
-
-### 3.3 模型部署页池视图
-
-按 model_name 分组（纯前端 groupby，数据不动）：
+### 3.3 模型部署页：rollback 列 + 主开关（唯一操作入口）
 
 ```
-┌─ 资源池 GLM-5.3-stable ─────── ● 激活 ─┐
-│ 3 实例 · 层分布 2×200K + 1×1M           │
-│ ├ dep-a  api_base…  在线  [编辑]       │
-│ └ …                                    │
-└────────────────────────────────────────┘
+[✓ rollback]                              ← 工具栏三态主开关：
+┌─────────┬──────────┬─────┬───┐             全开=✓ / 混合=− / 全关=□，
+│ 模型     │ rollback │ 别名 │ … │             点击即全开/全关（confirm）
+├─────────┼──────────┼─────┼───┤
+│ glm-5.3 │          │  -  │ … │ ← 每行自己的格子（跟随行底色）
+│ glm-5.3 │  [✓]●激活 │  -  │ … │ ← 勾选框在池的中间行，下带徽标
+│ glm-5.3 │          │  -  │ … │
+├─────────┼──────────┼─────┼───┤ ← 池间黑框分隔
+│ qwen3   │   [ ]    │  -  │ … │
+└─────────┴──────────┴─────┴───┘
 ```
 
-徽标矩阵：
+- **rollback 列（模型列之后，每池一个勾选框）**：**每行都有自己的 rollback 单元格**（跟随行底色，斑马纹逐行保持——不用 rowspan，一个跨行格子只能有一种底色，必然与条纹冲突，headless Chrome 复现已验证）；勾选框渲染在**池的中间行**（徽标统一在勾选框下方）：奇数池垂直居中，**偶数池底边对齐该行下边界**（= 池的视觉中线，徽标文字落在中线上）；勾选写组内全部 deployment 行（`POST /admin/models/rollback {model_name, enabled}` → AdminCommand → 批量 UPDATE + reload 路由）。API 另支持 `{deployment_id}` 行级粒度（YAML/seed 写入的行状态以池勾选框的聚合呈现：全开才勾选）；
+- **工具栏三态主开关**：checked=全开、indeterminate=混合、unchecked=全关，点击翻转全局（`{enabled}` 无 id/model_name → 全表 UPDATE，RETURNING 收集受影响组逐组 reload；取消 confirm 时重渲染还原视觉态）；
+- 编辑弹窗「Rollback 配置」只有最大上下文（K 单位）；`rollback_enabled` 不在弹窗编辑（池勾选框是编辑面），更新 body 回显当前值防误清；
+- 池视图单表（所有池列宽一致），池分组由 `pool-start` 行的黑框上边框表达。
 
-| 总开关 | 池配置 | 徽标 |
+徽标（只在池勾选时显示；未勾选 = 池未参与）：
+
+| 池勾选 | 池配置 | 徽标 |
 |---|---|---|
-| off | 任意 | "rollback 已关闭（总开关）" |
-| on | 全配 + 多层 | ● 激活 |
-| on | 全配 + 单层 | ○ 激活 · 无回落目标 |
-| on | 混配 | ⚠ 未激活 · 列出未配置实例（+ reload 告警） |
+| 未勾 | — | 无徽标 |
+| 勾选 | 全配 + 多层 | ● 激活 |
+| 勾选 | 全配 + 单层 | ○ 无回落目标（tooltip：需存在更大层） |
+| 勾选 | 混配（有行缺 max_context_tokens） | ⚠ 未激活 · 列出缺配数（tooltip 说明激活条件） |
 
 ## 4. L1 错误识别
 
@@ -109,7 +114,7 @@ router_settings:
 ## 5. L2 资源池划分
 
 - 分层：`groupby(model_name, max_context_tokens)`，同值同层，层内即现有行为；
-- **组激活门（all-or-nothing）**：组内全部实例已配 `max_context_tokens` 才参与回落；混配组 inert + 告警（最坏情况 = 今天的行为，正确性永不劣化）；
+- **参与条件**：池开关（组内全部行 `rollback_enabled`，模型部署页切换）&& **组激活门（all-or-nothing）**——组内全部实例已配 `max_context_tokens`；混配组 inert + 告警（最坏情况 = 今天的行为，正确性永不劣化）；
 - 回落目标层：解析出 requested 值 → 选 **max_context ≥ requested 的最小层**；解析失败 → 最大层（保单次成功）；
 - 组内只有一个层：条件永不成立，配置无害；
 - 回落的第二次 select 带目标层候选集，记忆跟随由各策略既有迁移路径完成（§7），**无候选收缩等新增机制**。
@@ -134,7 +139,7 @@ router_settings:
   ├─ A1 返回 400（上下文错，4.1s 实测）
   ├─ L1 识别命中？──否──→ 原错误路径（401/403 计自动下线；其他透传）
   │       ↓ 是
-  ├─ L2 组激活 && 更大层在线？──否──→ 原始 400 直返 agent（+回落失败计数/告警）
+  ├─ L2 池开启 && 组激活 && 更大层在线？──否──→ 原始 400 直返 agent（+回落失败计数/告警）
   │       ↓ 是
   ├─ L3 换持流控 → 策略选择目标层候选 → rr/亲和/kvc + rebalance
   │       ├─ 成功 → 响应客户端；Ok 记录前缀→1M worker + on_outcome 纠正绑定（下轮直达）
@@ -255,3 +260,5 @@ kvc rebalance 的收敛机制（关键澄清：**rebalance 不做任何使 B1 �
 8. **回落失败透传 400**：修 UpstreamError→502 映射导致 agent 误重试的现有缺陷。
 9. **回落框架通用命名**（2026-11-11 补）：Config 卡片与 YAML 节用通用名 `rollback`（「回落策略」），上下文为首个策略子节 `context`，未来策略平级扩展；总开关 `rollback.enabled` 管整个框架，单策略独立开关留作扩展点。
 10. **亲和记忆统一"失败不学习"，key_affinity 用 on_outcome 回调**（2026-11-11 补）：key_affinity 绑定在 select 时写入，回落层单实例时 len==1 短路导致绑定恒指失败实例（100% 回撞，比 trie 并列 ~50% 更严重）；因 select 时写绑定承担并发摊开（anti-magnet）职责，不能整体搬时机——改为结果回调：回落成功后 rebind 到最终实例。kvc 侧由 PR2 的 Ok 记录统一覆盖正常/rebalance/rollback 三条路径。
+11. **K 单位 UI**（2026-11-11）：部署编辑的最大上下文输入以 K 为单位（1K = 1024 tokens，1M = 1024K），× 1024 落库，DB 始终存 tokens；池视图池头不展示层分布明细（徽标保留激活态）。
+12. **参与状态全部收敛到模型部署页，删除 Config 卡片**（2026-11-12 重设计，取代 #11 的名单方案）：`boom_model_deployment.rollback_enabled`（DB，每部署行）+ 池分隔行开关（批量写组内行）+ 工具栏全局全选/全部去除（替代总开关，一次写全表并逐组 reload）。理由：两级 opt-in（YAML 总开关 × YAML 名单）造成"勾了模型仍显示关闭"的不可推理状态；"哪些模型参与回落"是业务配置，归 DB / 模型部署页本就符合 §7 权威拆分。YAML 仅保留 `rollback.context.patterns`（识别模式，协议属性）。编辑弹窗不暴露单行 rollback_enabled（避免组内混合态），更新回显防误清。
