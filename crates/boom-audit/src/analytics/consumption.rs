@@ -42,7 +42,8 @@ struct KeyRow {
 
 #[derive(Debug, Clone, FromRow)]
 struct TeamRow {
-    team_id: String,
+    // GaussDB Oracle-compat: '' ≡ NULL, so COALESCE(team_id, '') can still return NULL
+    team_id: Option<String>,
     requests: i64,
     input_tokens: i64,
     output_tokens: i64,
@@ -61,7 +62,7 @@ struct TagRow {
 
 #[derive(Debug, Clone, FromRow)]
 struct IpRow {
-    client_ip: String,
+    client_ip: Option<String>,
     requests: i64,
     input_tokens: i64,
     output_tokens: i64,
@@ -352,7 +353,7 @@ pub async fn query_consumption(
         teams: team_rows
             .into_iter()
             .map(|r| TeamAgg {
-                team_id: r.team_id,
+                team_id: r.team_id.unwrap_or_default(),
                 requests: r.requests,
                 input_tokens: r.input_tokens,
                 output_tokens: r.output_tokens,
@@ -373,7 +374,7 @@ pub async fn query_consumption(
         client_ips: ip_rows
             .into_iter()
             .map(|r| IpAgg {
-                client_ip: r.client_ip,
+                client_ip: r.client_ip.unwrap_or_default(),
                 requests: r.requests,
                 input_tokens: r.input_tokens,
                 output_tokens: r.output_tokens,

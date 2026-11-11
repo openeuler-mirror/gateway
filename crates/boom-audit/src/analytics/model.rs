@@ -59,8 +59,9 @@ struct HistRow {
 
 #[derive(Debug, Clone, FromRow)]
 struct DeploymentRow {
-    deployment_id: String,
-    model_name: String,
+    // GaussDB Oracle-compat: '' ≡ NULL, so COALESCE(col, '') can still return NULL
+    deployment_id: Option<String>,
+    model_name: Option<String>,
     requests: i64,
     input_tokens: i64,
     output_tokens: i64,
@@ -269,8 +270,8 @@ pub async fn query_model_detail(
         deployments: deployment_rows
             .into_iter()
             .map(|r| DeploymentAgg {
-                deployment_id: r.deployment_id,
-                model_name: r.model_name,
+                deployment_id: r.deployment_id.unwrap_or_default(),
+                model_name: r.model_name.unwrap_or_default(),
                 requests: r.requests,
                 input_tokens: r.input_tokens,
                 output_tokens: r.output_tokens,
