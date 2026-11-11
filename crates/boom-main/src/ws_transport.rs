@@ -333,6 +333,16 @@ async fn session_loop(
     principal: SessionPrincipal,
 ) {
     let identity = principal.identity.clone();
+    tracing::info!(
+        key_alias = identity.key_alias.as_deref().unwrap_or("-"),
+        "websocket responses session open"
+    );
+    // Session heartbeat stat: one INFO line per minute while open, so a
+    // long-lived WS session is visible in gateway.log without waiting for
+    // close (the open-session log blind spot).
+    let served = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut stat_tick = tokio::time::interval(std::time::Duration::from_secs(60));
+    stat_tick.tick().await; // consume the immediate first tick
     let (mut sink, mut source) = socket.split();
     let (tx, mut rx) = tokio::sync::mpsc::channel::<WsOutboundEvent>(OUTBOUND_BUFFER);
     let mut mux = Multiplexer::new();
@@ -343,13 +353,23 @@ async fn session_loop(
 
     loop {
         tokio::select! {
+            _ = stat_tick.tick() => {
+                let served_requests = served.load(std::sync::atomic::Ordering::Relaxed);
+                tracing::info!(
+                    served_requests,
+                    active_lanes = mux.lanes.len(),
+                    inflight = mux.inflight,
+                    queued = mux.queued,
+                    "websocket responses session stat"
+                );
+            }
             // Completed lane-runner: it returns the lane + input bytes it
             // just finished; None means the lane's backlog is exhausted.
             Some(joined) = runners.join_next(), if !runners.is_empty() => {
                 match joined {
                     Ok(Some((lane, input_bytes))) => {
                         if let Some(next) = mux.complete(&lane, input_bytes) {
-                            spawn_runner_inner(&mut runners, state.clone(), tx.clone(), headers.clone(), remote_addr, identity.clone(), principal.raw_key.clone(), next);
+                            spawn_runner_inner(&mut runners, state.clone(), tx.clone(), headers.clone(), remote_addr, identity.clone(), principal.raw_key.clone(), next, served.clone());
                         }
                     }
                     Ok(None) => {} // backlog drained inside the runner
@@ -374,7 +394,7 @@ async fn session_loop(
                     Message::Text(text) => {
                         match handle_client_text(
                             &state, &tx, &mut mux, &mut runners, &headers, remote_addr,
-                            &identity, &principal.raw_key, text.as_str(),
+                            &identity, &principal.raw_key, &served, text.as_str(),
                         ) {
                             Flow::Continue => {}
                         }
@@ -400,7 +420,12 @@ async fn session_loop(
         }
     }
     let _ = sink.close().await;
-    tracing::debug!(lanes_remaining = mux.lanes.len(), "websocket responses session closed");
+    tracing::info!(
+        key_alias = identity.key_alias.as_deref().unwrap_or("-"),
+        served_requests = served.load(std::sync::atomic::Ordering::Relaxed),
+        lanes_remaining = mux.lanes.len(),
+        "websocket responses session closed"
+    );
 }
 
 enum Flow { Continue }
@@ -415,6 +440,7 @@ fn handle_client_text(
     remote_addr: SocketAddr,
     identity: &AuthIdentity,
     raw_key: &str,
+    served: &std::sync::Arc<std::sync::atomic::AtomicU64>,
     text: &str,
 ) -> Flow {
     // Discriminator-only probe first (agentic-api pattern): only
@@ -484,7 +510,7 @@ fn handle_client_text(
     let item = WorkItem { request: WsCreate { inner: request, stream_id }, input_bytes };
     let ready = mux.admit(item);
     if let Some(ready) = ready {
-        spawn_runner_inner(runners, state.clone(), tx.clone(), headers.clone(), remote_addr, identity.clone(), raw_key.to_string(), ready);
+        spawn_runner_inner(runners, state.clone(), tx.clone(), headers.clone(), remote_addr, identity.clone(), raw_key.to_string(), ready, served.clone());
     }
     Flow::Continue
 }
@@ -512,8 +538,10 @@ fn spawn_runner_inner(
     identity: AuthIdentity,
     raw_key: String,
     item: WorkItem,
+    served: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) {
     runners.spawn(async move {
+        served.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         execute_create(&state, &tx, headers, remote_addr, identity, raw_key, item).await
     });
 }
