@@ -426,8 +426,14 @@ pub enum ProbeResult {
 ///
 /// # Memory bounds
 ///
-/// - `batch` is bounded by `max_queue_size` (default 10000). Overflow drops
-///   oldest (O(1) via VecDeque pop_front).
+/// - `batch` is bounded by `max_queue_size` (default 10000) AND
+///   `max_queue_bytes` (default 64MB, 0 = count-only). Entries hold full
+///   request/response bodies, so a count cap alone can't bound memory —
+///   when queued bytes exceed the budget, oldest entries are dropped (same
+///   policy as `max_queue_size`).
+/// - Each flush POST carries at most `batch_size` entries; backlog beyond
+///   one chunk goes in later chunks (next tick or the loop in `flush`) so
+///   the wire payload is never proportional to the full backlog.
 /// - In-flight `flush` tasks are bounded to **1** via a `Semaphore(1)`. While
 ///   one flush is in retry backoff, additional batch-full triggers do NOT
 ///   spawn more flush tasks — they accumulate in `batch` and are picked up
@@ -446,11 +452,15 @@ pub struct OtelExporter {
     endpoint: String,
     extra_headers: Vec<(String, String)>,
     resource: Resource,
-    batch: Arc<Mutex<VecDeque<PromptLogEntry>>>,
+    batch: Arc<Mutex<BatchQueue>>,
     batch_size: usize,
     flush_interval: Duration,
     max_attribute_bytes: usize,
     max_queue_size: usize,
+    /// 0 = count-only cap. Non-zero bounds the queue's in-memory bytes via
+    /// `PromptLogEntry::estimated_bytes` — mirror of boom-trace's
+    /// `TraceExporter`.
+    max_queue_bytes: usize,
     /// Total entries ever dropped (offline skip + batch overflow + flush
     /// failure). Surfaced to dashboard via `status_snapshot`.
     dropped_count: Arc<AtomicU64>,
@@ -473,6 +483,57 @@ pub struct OtelExporter {
     flush_permit: Arc<Semaphore>,
 }
 
+/// Pending entries with byte accounting. Push evicts from the front while
+/// either cap (count or bytes) would be exceeded — oldest-first drop, same
+/// policy as the historical count-only cap.
+#[derive(Default)]
+struct BatchQueue {
+    entries: VecDeque<PromptLogEntry>,
+    bytes: usize,
+}
+
+impl BatchQueue {
+    fn push(
+        &mut self,
+        entry: PromptLogEntry,
+        max_size: usize,
+        max_bytes: usize,
+        dropped: &AtomicU64,
+    ) {
+        let incoming = entry.estimated_bytes();
+        while !self.entries.is_empty()
+            && (self.entries.len() >= max_size
+                || (max_bytes > 0 && self.bytes + incoming > max_bytes))
+        {
+            match self.entries.pop_front() {
+                Some(old) => {
+                    self.bytes -= old.estimated_bytes();
+                    dropped.fetch_add(1, Ordering::Relaxed);
+                }
+                None => break,
+            }
+        }
+        self.bytes += incoming;
+        self.entries.push_back(entry);
+    }
+
+    /// Pop up to `n` entries from the front, keeping `bytes` consistent.
+    fn drain_up_to(&mut self, n: usize) -> VecDeque<PromptLogEntry> {
+        let take = n.min(self.entries.len());
+        let drained: VecDeque<PromptLogEntry> = self.entries.drain(..take).collect();
+        self.bytes -= drained.iter().map(|e| e.estimated_bytes()).sum::<usize>();
+        drained
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
 impl OtelExporter {
     /// Construct an exporter from config. Caller is responsible for spawning
     /// the flush task via `spawn_flush_task` and triggering a final flush
@@ -493,11 +554,12 @@ impl OtelExporter {
             endpoint: config.endpoint.clone(),
             extra_headers,
             resource,
-            batch: Arc::new(Mutex::new(VecDeque::with_capacity(config.batch_size))),
+            batch: Arc::new(Mutex::new(BatchQueue::default())),
             batch_size: config.batch_size,
             flush_interval: Duration::from_secs(config.flush_interval_secs.max(1)),
             max_attribute_bytes: config.max_attribute_bytes,
             max_queue_size: config.max_queue_size,
+            max_queue_bytes: config.max_queue_bytes,
             dropped_count: Arc::new(AtomicU64::new(0)),
             status: AtomicU8::new(STATUS_ONLINE),
             consecutive_probe_failures: AtomicU64::new(0),
@@ -581,16 +643,12 @@ impl OtelExporter {
 
         let should_flush = {
             let mut batch = self.batch.lock().await;
-            if batch.len() >= self.max_queue_size {
-                let dropped = batch.pop_front().expect("batch non-empty when len>=cap");
-                self.dropped_count.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(
-                    request_id = %dropped.request_id,
-                    queue_size = self.max_queue_size,
-                    "OTLP batch full, dropping oldest entry"
-                );
-            }
-            batch.push_back(entry);
+            batch.push(
+                entry,
+                self.max_queue_size,
+                self.max_queue_bytes,
+                &self.dropped_count,
+            );
             batch.len() >= self.batch_size
         };
 
@@ -614,23 +672,39 @@ impl OtelExporter {
     /// Used by the periodic task and by shutdown. Also used by `probe()` to
     /// drain pending entries after a successful probe (so they don't sit in
     /// the batch until the next tick).
+    ///
+    /// Flushes at most `batch_size` entries per POST: draining the whole
+    /// queue in one shot builds a wire body proportional to the backlog —
+    /// with bodies captured that transient alone is a multi-× memory spike
+    /// on top of the queue. Backlog beyond one chunk flushes in the loop
+    /// below (or the next tick).
     pub async fn flush(&self) {
-        let drained: VecDeque<PromptLogEntry> = {
-            let mut batch = self.batch.lock().await;
-            if batch.is_empty() {
-                return;
-            }
-            std::mem::take(&mut *batch)
-        };
+        loop {
+            let drained: VecDeque<PromptLogEntry> = {
+                let mut batch = self.batch.lock().await;
+                if batch.is_empty() {
+                    return;
+                }
+                batch.drain_up_to(self.batch_size)
+            };
 
-        match self.send_with_retry(&drained).await {
-            Ok(()) => { /* stay Online */ }
-            Err(()) => {
-                // Result-oriented: any failure (network, HTTP non-2xx,
-                // timeout) drives the exporter Offline. The drained batch's
-                // entries are counted as dropped — they're still in JSONL,
-                // so not truly lost, but the OTLP copy is gone.
-                self.transition_to_offline(drained.len() as u64);
+            match self.send_with_retry(&drained).await {
+                Ok(()) => { /* stay Online */ }
+                Err(()) => {
+                    // Result-oriented: any failure (network, HTTP non-2xx,
+                    // timeout) drives the exporter Offline. The drained
+                    // batch's entries are counted as dropped — they're still
+                    // in JSONL, so not truly lost, but the OTLP copy is gone.
+                    self.transition_to_offline(drained.len() as u64);
+                    return;
+                }
+            }
+            let more = {
+                let batch = self.batch.lock().await;
+                batch.len() >= self.batch_size
+            };
+            if !more {
+                return;
             }
         }
     }
@@ -644,7 +718,9 @@ impl OtelExporter {
             .map(|e| convert_entry_to_log_records(e, &self.resource, self.max_attribute_bytes))
             .collect();
         let req = build_export_request(resource_logs);
-        let body = req.encode_to_vec();
+        // Bytes clone is a refcount bump, not a memcpy of a potentially
+        // MB-scale payload — one encode, cheap clones per retry attempt.
+        let body: bytes::Bytes = req.encode_to_vec().into();
         let url = format!("{}/v1/logs", self.endpoint.trim_end_matches('/'));
 
         let mut attempt = 0u32;
@@ -1230,12 +1306,49 @@ mod tests {
         let batch = exp.batch.lock().await;
         assert_eq!(batch.len(), 2);
         // The first-in ("a") is gone; "b" and "c" remain.
-        let ids: Vec<&str> = batch.iter().map(|e| e.request_id.as_str()).collect();
+        let ids: Vec<&str> = batch.entries.iter().map(|e| e.request_id.as_str()).collect();
         assert_eq!(ids, vec!["b", "c"]);
         drop(batch);
 
         let snap = exp.status_snapshot();
         assert_eq!(snap.dropped_count, 1);
+    }
+
+    #[tokio::test]
+    async fn enqueue_byte_budget_drops_oldest() {
+        // Two ~100KB entries under a 150KB byte budget: the second push must
+        // evict the first. The count cap stays generous so only the byte cap
+        // fires — mirror of boom-trace's TraceExporter test.
+        let big_body = |id: &str| {
+            let mut e = make_request_entry(id, None);
+            e.request = Some(Arc::new(serde_json::json!({"prompt": "x".repeat(100_000)})));
+            e
+        };
+        let cfg = OtlpConfig {
+            enabled: true,
+            endpoint: "http://x".to_string(),
+            max_queue_size: 10_000,
+            max_queue_bytes: 150_000,
+            batch_size: 10, // large so we don't trigger flush spawn
+            ..OtlpConfig::default()
+        };
+        let exp = OtelExporter::new(&cfg);
+
+        exp.enqueue(big_body("a")).await;
+        exp.enqueue(big_body("b")).await;
+
+        let batch = exp.batch.lock().await;
+        assert_eq!(batch.len(), 1);
+        let ids: Vec<&str> = batch
+            .entries
+            .iter()
+            .map(|e| e.request_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["b"]);
+        assert!(batch.bytes <= 150_000);
+        drop(batch);
+
+        assert_eq!(exp.status_snapshot().dropped_count, 1);
     }
 
     #[tokio::test]

@@ -411,8 +411,10 @@
   // ── Routing (admin) ───────────────────────────────────
   function onRoute() {
     const hash = location.hash || "#/admin/stats";
+    // Match by section, not exact href: analytics sub-page hashes
+    // (#/admin/analytics/model/<name>) must still highlight the sidebar.
     document.querySelectorAll("#page-admin .nav-link").forEach((a) => {
-      a.classList.toggle("active", a.getAttribute("href") === hash);
+      a.classList.toggle("active", a.dataset.section === sectionFromHash(hash));
     });
     document.querySelectorAll("#page-admin .section").forEach((s) => {
       s.classList.toggle("active", s.id === sectionFromHash(hash));
@@ -428,6 +430,36 @@
       startStressPoll();
     } else {
       stopStressPoll();
+    }
+    // Analytics board: one section, four panes (overview / model /
+    // consumption / schedule). The active pane comes from the hash, and
+    // ONLY that pane's poller runs — closed panes don't refresh.
+    if (section === "admin-analytics") {
+      setupAnalytics();
+      const page = analyticsPageFromHash(hash);
+      document.querySelectorAll("#admin-analytics .an-pane").forEach((p) => {
+        p.classList.toggle("active", p.dataset.anpane === page);
+      });
+      document.querySelectorAll("#admin-analytics .an-subtab").forEach((b) => {
+        b.classList.toggle("active", b.dataset.anpage === page);
+      });
+      if (page === "overview") startAnalyticsPoll();
+      else stopAnalyticsPoll();
+      // loadModel re-parses the hash each time — model A → B switches are
+      // same-pane hash changes that fire onRoute (quota-page pattern).
+      if (page === "model") { setupModelPage(); startModelPoll(); }
+      else stopModelPoll();
+      // Main (cached) consumption view polls 60s; the key drill-down is a
+      // direct query — startConsumptionPoll skips the interval there.
+      if (page === "consumption") { setupConsumptionPage(); startConsumptionPoll(); }
+      else stopConsumptionPoll();
+      if (page === "schedule") { setupSchedulePage(); startSchedulePoll(); }
+      else stopSchedulePoll();
+    } else {
+      stopAnalyticsPoll();
+      stopModelPoll();
+      stopConsumptionPoll();
+      stopSchedulePoll();
     }
     if (section === "admin-status") {
       loadAlerts();
@@ -469,9 +501,20 @@
     if (hash.includes("/admin/logs")) return "admin-logs";
     if (hash.includes("/admin/debug")) return "admin-debug";
     if (hash.includes("/admin/config")) return "admin-config";
+    if (hash.includes("/admin/analytics")) return "admin-analytics";
     if (hash.includes("/admin/stress")) return "admin-stress";
     if (hash.includes("/admin/status")) return "admin-status";
     return "admin-models";
+  }
+
+  // Active pane inside the analytics section. Sub-pages live under
+  // #/admin/analytics/<page>[/<param>]; a bare #/admin/analytics is the
+  // overview.
+  function analyticsPageFromHash(hash) {
+    if (hash.includes("/admin/analytics/model")) return "model";
+    if (hash.includes("/admin/analytics/consumption")) return "consumption";
+    if (hash.includes("/admin/analytics/schedule")) return "schedule";
+    return "overview";
   }
 
   // ── Stats ─────────────────────────────────────────────
@@ -479,6 +522,1549 @@
     loadInflight();
     loadRequestRateStats();
     loadDeployment24hSummary();
+  }
+
+  // ── Analytics Board (business volume over selectable range) ─────
+  // The server keeps in-memory snapshots per range: today is refreshed
+  // from boom_request_log by a boom-main task every 30s; rolling 24h/3d/7d
+  // windows lazy-load on request and re-aggregate at most once per ~60s.
+  // This page polls the API every 60s; the server re-aggregates from the
+  // DB at most once per 5 min, so while the page is viewed the data
+  // refreshes every ~5 min — and when nobody is on the page nothing
+  // syncs at all (no background task). Leaving the page stops polling.
+  // The Refresh button passes force=1 to trigger one extra sync before
+  // responding. All wall-clock rendering is UTC+8 to match the backend's
+  // day boundary, regardless of the browser's timezone.
+  const ANALYTICS_RANGES = ["today", "1d", "3d", "7d"];
+  let analyticsTimer = null;
+  let analyticsData = null;
+  let analyticsSortKey = "requests";
+  // Collapse state for the 100%-error phantom-model group; survives poll
+  // re-renders, resets on reload.
+  let analyticsErrExpanded = false;
+  let analyticsRange = ANALYTICS_RANGES.includes(localStorage.getItem("analyticsRange"))
+    ? localStorage.getItem("analyticsRange") : "today";
+
+  function startAnalyticsPoll() {
+    stopAnalyticsPoll();
+    loadAnalytics(false);
+    analyticsTimer = setInterval(() => loadAnalytics(false), 60000);
+  }
+
+  function stopAnalyticsPoll() {
+    if (analyticsTimer) {
+      clearInterval(analyticsTimer);
+      analyticsTimer = null;
+    }
+  }
+
+  function updateAnalyticsRangeUI() {
+    // Overview + model detail + consumption + schedule share the range
+    // state; keep the bars in sync (drilling in keeps the window you were
+    // looking at).
+    document
+      .querySelectorAll("#an-range button, #md-range button, #cs-range button, #sc-range button")
+      .forEach((b) => {
+        b.classList.toggle("active", b.dataset.range === analyticsRange);
+      });
+  }
+
+  function setupAnalytics() {
+    const btn = document.getElementById("btn-refresh-analytics");
+    if (btn && !btn.dataset.bound) {
+      btn.dataset.bound = "1";
+      btn.addEventListener("click", () => loadAnalytics(true));
+    }
+    // Sub-tabs navigate by hash — onRoute then swaps panes and pollers.
+    const tabs = document.querySelector("#admin-analytics .an-subtabs");
+    if (tabs && !tabs.dataset.bound) {
+      tabs.dataset.bound = "1";
+      tabs.addEventListener("click", (e) => {
+        const b = e.target.closest("button[data-anpage]");
+        if (!b) return;
+        const target = "#/admin/analytics/" + b.dataset.anpage;
+        if (location.hash !== target) location.hash = target;
+      });
+    }
+    const rangeBar = document.getElementById("an-range");
+    if (rangeBar && !rangeBar.dataset.bound) {
+      rangeBar.dataset.bound = "1";
+      rangeBar.addEventListener("click", (e) => {
+        const b = e.target.closest("button[data-range]");
+        if (!b || b.dataset.range === analyticsRange) return;
+        analyticsRange = b.dataset.range;
+        localStorage.setItem("analyticsRange", analyticsRange);
+        updateAnalyticsRangeUI();
+        loadAnalytics(false);
+      });
+    }
+    const tableWrap = document.getElementById("an-table-wrap");
+    if (tableWrap && !tableWrap.dataset.bound) {
+      tableWrap.dataset.bound = "1";
+      tableWrap.addEventListener("click", (e) => {
+        // 100%-error group row: toggle the collapsed phantom models.
+        if (e.target.closest("tr[data-errgroup]")) {
+          analyticsErrExpanded = !analyticsErrExpanded;
+          if (analyticsData) renderAnalyticsModels(analyticsData);
+          return;
+        }
+        const th = e.target.closest("th[data-sort]");
+        if (th) {
+          analyticsSortKey = th.dataset.sort;
+          if (analyticsData) renderAnalyticsModels(analyticsData);
+          return;
+        }
+        // Row click → model drill-down. Model names are URL path segments
+        // ("*" is a real fallback model name) — always encodeURIComponent.
+        const tr = e.target.closest("tr[data-model]");
+        if (tr) {
+          location.hash = "#/admin/analytics/model/" + encodeURIComponent(tr.dataset.model);
+        }
+      });
+    }
+    updateAnalyticsRangeUI();
+    setupAnalyticsTooltip();
+  }
+
+  async function loadAnalytics(force) {
+    const requested = analyticsRange;
+    try {
+      const res = await api(
+        "/admin/stats/daily?range=" + requested + (force ? "&force=1" : "")
+      );
+      // A range switch can race an in-flight poll — only the response
+      // matching the range still on screen gets rendered.
+      if (requested !== analyticsRange) return;
+      analyticsData = res;
+      renderAnalytics();
+    } catch (e) {
+      // Read-only page — polling errors (expired session etc.) shouldn't
+      // spam the console every 10s. api() already redirects on 401.
+    }
+  }
+
+  // ── Analytics formatting helpers ──
+  // Compact figures for card values (<10k stays exact — request counts are
+  // usually in that range and "9,876" reads better than "9.9K").
+  function fmtCompactNum(v) {
+    const n = Number(v);
+    if (!isFinite(n)) return "—";
+    if (n < 10000) return n.toLocaleString();
+    if (n < 1e6) return (n / 1e3).toFixed(n < 1e5 ? 1 : 0) + "K";
+    if (n < 1e9) return (n / 1e6).toFixed(n < 1e8 ? 1 : 0) + "M";
+    return (n / 1e9).toFixed(2) + "B";
+  }
+  function fmtFullNum(v) {
+    const n = Number(v);
+    return isFinite(n) ? n.toLocaleString() : "—";
+  }
+  // UTC+8 wall-clock from epoch seconds, independent of browser timezone.
+  function cstParts(epochSecs) {
+    const d = new Date((epochSecs + 8 * 3600) * 1000);
+    const p2 = (x) => String(x).padStart(2, "0");
+    return {
+      hour: d.getUTCHours(),
+      minute: d.getUTCMinutes(),
+      time: p2(d.getUTCHours()) + ":" + p2(d.getUTCMinutes()) + ":" + p2(d.getUTCSeconds()),
+    };
+  }
+
+  function renderAnalytics() {
+    const data = analyticsData;
+    const sub = document.getElementById("analytics-subtitle");
+    const ok = data && data.ready;
+    if (sub) {
+      sub.textContent = ok
+        ? t("analytics.subtitle." + (data.range || "today"), {
+            day: data.day,
+            time: cstParts(data.generated_at).time,
+          })
+        : "—";
+    }
+    if (!ok) {
+      // Surface the server's reason (no DB vs failed refresh) instead of
+      // one generic line — it's the first thing you need when the board
+      // won't come up.
+      const detail = data && data.error ? " — " + esc(String(data.error)) : "";
+      const msg = '<p class="loading">' + esc(t("analytics.unavailable")) + detail + "</p>";
+      ["an-metrics-wrap", "an-hourly-wrap", "an-table-wrap"].forEach((id) => {
+        const el = document.getElementById(id);
+        if (el) el.innerHTML = msg;
+      });
+      const hint = document.getElementById("an-models-hint");
+      if (hint) hint.textContent = "";
+      return;
+    }
+    renderAnalyticsMetrics(data);
+    renderAnalyticsSeries(data);
+    renderAnalyticsModels(data);
+  }
+
+  function renderAnalyticsMetrics(data) {
+    const wrap = document.getElementById("an-metrics-wrap");
+    if (!wrap) return;
+    const totals = data;
+    const errPct = totals.total_requests > 0
+      ? (totals.total_errors / totals.total_requests * 100)
+      : 0;
+    const cachePct = totals.total_input_tokens > 0
+      ? (totals.total_cached_tokens / totals.total_input_tokens * 100)
+      : 0;
+    const errHtml = totals.total_errors > 0
+      ? '<span class="an-err-text">' +
+          esc(t("analytics.metrics.errors_hint", {
+            n: fmtFullNum(totals.total_errors),
+            rate: errPct.toFixed(2) + "%",
+          })) +
+        "</span>"
+      : esc(t("analytics.no_error"));
+    const cacheHtml = totals.total_cached_tokens > 0
+      ? " · " + esc(t("analytics.metrics.cache_hint", { pct: cachePct.toFixed(1) + "%" }))
+      : "";
+
+    const cards = [
+      { label: t("analytics.metrics.requests"), value: fmtCompactNum(totals.total_requests),
+        hint: fmtFullNum(totals.total_requests) + " · " + errHtml },
+      { label: t("analytics.metrics.input_tokens"), value: fmtCompactNum(totals.total_input_tokens),
+        hint: fmtFullNum(totals.total_input_tokens) + cacheHtml },
+      { label: t("analytics.metrics.output_tokens"), value: fmtCompactNum(totals.total_output_tokens),
+        hint: fmtFullNum(totals.total_output_tokens) },
+      { label: t("analytics.metrics.active_keys"), value: fmtCompactNum(totals.active_keys),
+        hint: t("analytics.metrics.keys_hint") },
+      { label: t("analytics.metrics.active_teams"), value: fmtCompactNum(totals.active_teams),
+        hint: t("analytics.metrics.teams_hint") },
+    ];
+    wrap.innerHTML = cards.map((c) =>
+      '<div class="an-metric">' +
+        '<div class="an-metric-label">' + esc(c.label) + "</div>" +
+        '<div class="an-metric-value">' + esc(c.value) + "</div>" +
+        '<div class="an-metric-hint" title="' + esc(c.hint.replace(/<[^>]+>/g, "")) + '">' + c.hint + "</div>" +
+      "</div>"
+    ).join("");
+  }
+
+  // ── Analytics request-volume chart (SVG line over a time-bucket
+  // series). Bucket size and slot count come from the snapshot: today/24h
+  // = 10-min buckets (144 slots), 3d = 30-min (144), 7d = 1h (168) — every
+  // window renders ~144 points. Window-relative slot index =
+  // (slot_epoch − since_epoch) / bucket_secs, both from the snapshot. ──
+  const AN_W = 720, AN_H = 160;
+  let anChartCtx = null; // chart geometry shared with the hover overlay
+
+  function renderAnalyticsSeries(data) {
+    const wrap = document.getElementById("an-hourly-wrap");
+    if (!wrap) return;
+    const total = Math.max(1, Number(data.total_slots) || 144);
+    const bucket = Math.max(60, Number(data.bucket_secs) || 600);
+    const since = Number(data.since_epoch) || 0;
+    const isToday = data.range === "today";
+
+    const slots = Array.from({ length: total }, () => ({ requests: 0, input: 0, output: 0 }));
+    (data.series || []).forEach((p) => {
+      const idx = Math.round((p.slot_epoch - since) / bucket);
+      if (idx >= 0 && idx < total) {
+        slots[idx].requests += p.requests || 0;
+        slots[idx].input += p.input_tokens || 0;
+        slots[idx].output += p.output_tokens || 0;
+      }
+    });
+    // Today's chart draws only the elapsed part — the blank right side
+    // reads as "not happened yet" rather than a line diving to zero.
+    // Rolling windows are all history and draw in full.
+    const nowSecs = Math.floor(Date.now() / 1000);
+    const elapsed = Math.floor((nowSecs - since) / bucket) + 1;
+    const span = isToday ? Math.min(Math.max(elapsed, 1), total) : total;
+    const max = Math.max(1, ...slots.slice(0, span).map((s) => s.requests));
+    // Nice axis ceiling (1/2/5×10ⁿ). Fifths split it into integer steps;
+    // quarters can yield 12.5/37.5 tick labels.
+    const niceCeil = (v) => {
+      if (v <= 5) return 5;
+      const exp = Math.pow(10, Math.floor(Math.log10(v)));
+      const f = v / exp;
+      return (f <= 1 ? 1 : f <= 2 ? 2 : f <= 5 ? 5 : 10) * exp;
+    };
+    const yMax = niceCeil(max);
+    anChartCtx = { yMax, total, bucket, since, span };
+
+    const x = (i) => ((i + 0.5) / total) * AN_W; // slot center
+    const y = (v) => AN_H - (v / yMax) * AN_H;
+    let lineD = "";
+    for (let i = 0; i < span; i++) {
+      lineD += (i ? "L" : "M") + x(i).toFixed(1) + " " + y(slots[i].requests).toFixed(1);
+    }
+    const areaD = lineD +
+      "L" + x(span - 1).toFixed(1) + " " + AN_H +
+      "L" + x(0).toFixed(1) + " " + AN_H + "Z";
+
+    const yLabels = [1, 0.8, 0.6, 0.4, 0.2].map((p) =>
+      '<span style="bottom:' + p * 100 + '%">' + fmtCompactNum(yMax * p) + "</span>"
+    ).join("");
+    const gridLines = [0.2, 0.4, 0.6, 0.8, 1].map((p) => {
+      const gy = ((1 - p) * AN_H).toFixed(1);
+      return '<line class="an-grid" vector-effect="non-scaling-stroke" x1="0" x2="' + AN_W + '" y1="' + gy + '" y2="' + gy + '"></line>';
+    }).join("");
+    // X labels: CST midnight marks get a date ("MM-DD"); other aligned
+    // hours get "HH:00". Stride grows with the window — 3h for 10-min
+    // buckets, 6h for 30-min, 12h for the 7-day/1h grid.
+    const stepH = bucket <= 600 ? 3 : total > 144 ? 12 : 6;
+    const p2 = (n) => String(n).padStart(2, "0");
+    let xLabels = "";
+    for (let i = 0; i < total; i++) {
+      const d = new Date((since + i * bucket + 28800) * 1000);
+      let label = "";
+      if (d.getUTCMinutes() === 0 && d.getUTCHours() === 0) {
+        label = p2(d.getUTCMonth() + 1) + "-" + p2(d.getUTCDate());
+      } else if (d.getUTCMinutes() === 0 && d.getUTCHours() % stepH === 0) {
+        label = p2(d.getUTCHours()) + ":00";
+      }
+      if (label) {
+        xLabels += '<span style="left:' + ((i + 0.5) / total * 100) + '%">' + label + "</span>";
+      }
+    }
+
+    wrap.innerHTML =
+      '<div class="an-hchart">' +
+        '<div class="an-hplot">' +
+          '<div class="an-hy">' + yLabels + "</div>" +
+          '<div class="an-svgwrap">' +
+            '<svg class="an-svg" viewBox="0 0 ' + AN_W + " " + AN_H + '" preserveAspectRatio="none">' +
+              '<defs><linearGradient id="an-grad" x1="0" y1="0" x2="0" y2="1">' +
+                '<stop class="an-grad-a" offset="0"></stop>' +
+                '<stop class="an-grad-b" offset="1"></stop>' +
+              "</linearGradient></defs>" +
+              gridLines +
+              '<path class="an-area" d="' + areaD + '"></path>' +
+              '<path class="an-line" vector-effect="non-scaling-stroke" d="' + lineD + '"></path>' +
+              '<line class="an-hoverline" id="an-hoverline" vector-effect="non-scaling-stroke" x1="0" x2="0" y1="0" y2="' + AN_H + '"></line>' +
+              '<circle class="an-hoverdot" id="an-hoverdot" vector-effect="non-scaling-stroke" r="3.5" cx="0" cy="0"></circle>' +
+              '<circle class="an-nowdot" cx="' + x(span - 1).toFixed(1) + '" cy="' + y(slots[span - 1].requests).toFixed(1) + '" r="3"></circle>' +
+            "</svg>" +
+          "</div>" +
+        "</div>" +
+        '<div class="an-hx">' + xLabels + "</div>" +
+        '<div class="an-tip" id="an-tip"></div>' +
+      "</div>";
+  }
+
+  function setupAnalyticsTooltip() {
+    const wrap = document.getElementById("an-hourly-wrap");
+    if (!wrap || wrap.dataset.tipBound) return;
+    wrap.dataset.tipBound = "1";
+    const tip = () => document.getElementById("an-tip");
+    const hide = () => {
+      const el = tip();
+      if (el) el.style.display = "none";
+      ["an-hoverline", "an-hoverdot"].forEach((id) => {
+        const n = document.getElementById(id);
+        if (n) n.style.visibility = "hidden";
+      });
+    };
+    wrap.addEventListener("mousemove", (e) => {
+      const plot = e.target.closest(".an-svgwrap");
+      const el = tip();
+      if (!plot || !el || !analyticsData || !anChartCtx) {
+        hide();
+        return;
+      }
+      const rect = plot.getBoundingClientRect();
+      const frac = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
+      const slot = Math.min(anChartCtx.total - 1, Math.floor(frac * anChartCtx.total));
+      // Today's future slots are blank — no tooltip there.
+      if (slot > anChartCtx.span - 1) { hide(); return; }
+
+      const agg = { requests: 0, input_tokens: 0, output_tokens: 0 };
+      (analyticsData.series || []).forEach((p) => {
+        if (Math.round((p.slot_epoch - anChartCtx.since) / anChartCtx.bucket) === slot) {
+          agg.requests += p.requests || 0;
+          agg.input_tokens += p.input_tokens || 0;
+          agg.output_tokens += p.output_tokens || 0;
+        }
+      });
+
+      const vx = ((slot + 0.5) / anChartCtx.total) * AN_W;
+      const line = document.getElementById("an-hoverline");
+      const dot = document.getElementById("an-hoverdot");
+      if (line) {
+        line.setAttribute("x1", vx);
+        line.setAttribute("x2", vx);
+        line.style.visibility = "visible";
+      }
+      if (dot) {
+        dot.setAttribute("cx", vx);
+        dot.setAttribute("cy", AN_H - (agg.requests / anChartCtx.yMax) * AN_H);
+        dot.style.visibility = "visible";
+      }
+
+      // "HH:MM – HH:MM", prefixed with the date when the window spans
+      // multiple days (or the bucket crosses midnight).
+      const p2 = (n) => String(n).padStart(2, "0");
+      const multiDay = anChartCtx.total * anChartCtx.bucket > 86400;
+      const fmt = (t, withDate) => {
+        const d = new Date((t + 28800) * 1000);
+        return (withDate ? p2(d.getUTCMonth() + 1) + "-" + p2(d.getUTCDate()) + " " : "") +
+          p2(d.getUTCHours()) + ":" + p2(d.getUTCMinutes());
+      };
+      const startT = anChartCtx.since + slot * anChartCtx.bucket;
+      const endT = startT + anChartCtx.bucket;
+      const sd = new Date((startT + 28800) * 1000);
+      const ed = new Date((endT + 28800) * 1000);
+      const crossesMidnight =
+        sd.getUTCDate() !== ed.getUTCDate() || sd.getUTCMonth() !== ed.getUTCMonth();
+      const range = fmt(startT, multiDay) + " – " + fmt(endT, multiDay || crossesMidnight);
+      el.innerHTML =
+        '<div class="an-tip-head">' + range + "</div>" +
+        '<div class="an-tip-row"><span>' + esc(t("analytics.series.requests")) + "</span><b>" + fmtFullNum(agg.requests) + "</b></div>" +
+        '<div class="an-tip-row"><span>' + esc(t("analytics.series.input")) + "</span><b>" + fmtFullNum(agg.input_tokens) + "</b></div>" +
+        '<div class="an-tip-row"><span>' + esc(t("analytics.series.output")) + "</span><b>" + fmtFullNum(agg.output_tokens) + "</b></div>";
+      el.style.display = "block";
+      const gridRect = wrap.getBoundingClientRect();
+      const tipW = el.offsetWidth;
+      let left = e.clientX - gridRect.left + 14;
+      if (left + tipW > gridRect.width) left = e.clientX - gridRect.left - tipW - 14;
+      el.style.left = left + "px";
+      el.style.top = Math.max(0, e.clientY - gridRect.top - 30) + "px";
+    });
+    wrap.addEventListener("mouseleave", hide);
+  }
+
+  function renderAnalyticsModels(data) {
+    const wrap = document.getElementById("an-table-wrap");
+    if (!wrap) return;
+    const hint = document.getElementById("an-models-hint");
+    if (hint) hint.textContent = t("analytics.models.hint", { n: (data.models || []).length });
+
+    const all = (data.models || []).slice();
+    if (!all.length) {
+      wrap.innerHTML = '<p class="loading">' + esc(t("common.no_records")) + "</p>";
+      return;
+    }
+    // 100%-error rows are almost always phantom model names (client asked
+    // for a model that doesn't exist; the gateway 404s but still audits
+    // the request). Collapse them into one expandable group at the bottom
+    // so real models stay readable.
+    const isErrAll = (m) => m.requests > 0 && m.errors >= m.requests;
+    const models = all.filter((m) => !isErrAll(m));
+    const errModels = all.filter((m) => isErrAll(m));
+    const totalOf = (m) => (m.input_tokens || 0) + (m.output_tokens || 0);
+    const sortVal = (m) => analyticsSortKey === "total_tokens" ? totalOf(m) : (m[analyticsSortKey] || 0);
+    models.sort((a, b) => sortVal(b) - sortVal(a));
+    errModels.sort((a, b) => sortVal(b) - sortVal(a));
+    const totalReq = data.total_requests || 0;
+    const maxReq = Math.max(1, ...models.map((m) => m.requests));
+
+    const th = (key, labelKey, cls) => {
+      const classes = [];
+      if (cls) classes.push(cls);
+      if (key && analyticsSortKey === key) classes.push("an-sorted");
+      return "<th " + (key ? 'data-sort="' + key + '" ' : "") +
+        (classes.length ? 'class="' + classes.join(" ") + '" ' : "") + ">" +
+        esc(t(labelKey)) + (key ? ' <span class="an-sort-arrow"></span>' : "") + "</th>";
+    };
+
+    const head =
+      "<tr><th>#</th>" +
+      th(null, "analytics.models.model") +
+      th("requests", "analytics.models.requests", "num") +
+      th(null, "analytics.models.share") +
+      th(null, "analytics.models.inout", "num") +
+      th("total_tokens", "analytics.models.total", "num") +
+      th(null, "analytics.models.cached", "num") +
+      th(null, "analytics.models.errors", "num") +
+      th(null, "analytics.models.errrate", "num") +
+      "</tr>";
+
+    const rowOf = (m, rank) => {
+      const share = totalReq > 0 ? (m.requests / totalReq * 100) : 0;
+      const barW = (m.requests / maxReq * 100).toFixed(2);
+      const errRate = m.requests > 0 ? (m.errors / m.requests * 100) : 0;
+      const errRateCls = m.errors === 0 ? "an-errrate-zero" : errRate >= 5 ? "an-errrate-high" : errRate >= 1 ? "an-errrate-low" : "";
+      const total = totalOf(m);
+      return '<tr data-model="' + esc(m.model) + '">' + rank +
+        '<td class="an-model" title="' + esc(m.model) + '">' + esc(m.model) + "</td>" +
+        '<td class="num" title="' + fmtFullNum(m.requests) + '">' + fmtFullNum(m.requests) + "</td>" +
+        '<td><div class="an-share"><div class="an-share-bar"><i style="width:' + barW + '%"></i></div><span>' + share.toFixed(1) + "%</span></div></td>" +
+        '<td class="num" title="' + fmtFullNum(m.input_tokens) + " / " + fmtFullNum(m.output_tokens) + '">' +
+          fmtCompactNum(m.input_tokens) + " / " + fmtCompactNum(m.output_tokens) + "</td>" +
+        '<td class="num" title="' + fmtFullNum(total) + '">' + fmtCompactNum(total) + "</td>" +
+        '<td class="num" title="' + fmtFullNum(m.cached_tokens) + '">' + fmtCompactNum(m.cached_tokens) + "</td>" +
+        '<td class="num' + (m.errors > 0 ? " an-err-text" : "") + '">' + fmtFullNum(m.errors) + "</td>" +
+        '<td class="num ' + errRateCls + '">' + errRate.toFixed(2) + "%</td>" +
+      "</tr>";
+    };
+
+    const rows = models.map((m, i) =>
+      rowOf(m, i < 3
+        ? '<td class="an-rank an-rank--top">' + (i + 1) + "</td>"
+        : '<td class="an-rank">' + (i + 1) + "</td>")
+    ).join("");
+
+    let errHtml = "";
+    if (errModels.length) {
+      const chev = analyticsErrExpanded ? "▾" : "▸";
+      errHtml =
+        '<tr class="an-errgroup" data-errgroup="1"><td></td>' +
+          '<td colspan="8">' + chev + " " +
+          esc(t("analytics.models.errgroup", { n: errModels.length })) + "</td></tr>" +
+        (analyticsErrExpanded
+          ? errModels.map((m) => rowOf(m, '<td class="an-rank">·</td>')).join("")
+          : "");
+    }
+
+    wrap.innerHTML =
+      '<table class="an-table"><thead>' + head + "</thead><tbody>" + rows + errHtml + "</tbody></table>";
+  }
+
+  // ── Analytics detail pages: generic multi-series trend chart ──
+  // Same geometry/axes as the overview chart above (720×160 SVG, CST
+  // wall-clock x labels, niceCeil y), but supports N series and binds
+  // hover state per container so several charts can coexist on the detail
+  // pages. The overview chart is left untouched — this helper is the one
+  // new pages build on.
+  function renderTrendChart(wrapId, spec) {
+    const wrap = document.getElementById(wrapId);
+    if (!wrap) return;
+    const total = Math.max(1, Number(spec.total) || 144);
+    const bucket = Math.max(60, Number(spec.bucket) || 600);
+    const since = Number(spec.since) || 0;
+    const span = Math.max(1, Math.min(Number(spec.span) || total, total));
+    const series = (spec.series || []).filter((s) => Array.isArray(s.values));
+    const niceCeil = (v) => {
+      if (v <= 5) return 5;
+      const exp = Math.pow(10, Math.floor(Math.log10(v)));
+      const f = v / exp;
+      return (f <= 1 ? 1 : f <= 2 ? 2 : f <= 5 ? 5 : 10) * exp;
+    };
+    let max = 0;
+    series.forEach((s) => {
+      for (let i = 0; i < span; i++) {
+        const v = s.values[i];
+        if (v != null && v > max) max = v;
+      }
+    });
+    const yMax = spec.yMax != null ? spec.yMax : niceCeil(Math.max(max, 0.000001));
+    const fmtY = spec.fmtY || fmtCompactNum;
+    const ctx = { total, bucket, since, span, yMax, series, tooltipRows: spec.tooltipRows };
+    wrap._trendCtx = ctx;
+    bindTrendHover(wrap);
+
+    const x = (i) => ((i + 0.5) / total) * AN_W;
+    const y = (v) => AN_H - (Math.min(v, yMax) / yMax) * AN_H;
+    // Null values (e.g. ratio buckets with zero denominator) break the
+    // line into subpaths instead of diving to zero.
+    const pathOf = (values) => {
+      let d = "", pen = false;
+      for (let i = 0; i < span; i++) {
+        const v = values[i];
+        if (v == null) { pen = false; continue; }
+        d += (pen ? "L" : "M") + x(i).toFixed(1) + " " + y(v).toFixed(1);
+        pen = true;
+      }
+      return d;
+    };
+    const paths = series.map((s) => {
+      const d = pathOf(s.values);
+      if (!d) return "";
+      const line = '<path class="tr-line" style="stroke:' + s.color + '" vector-effect="non-scaling-stroke" d="' + d + '"></path>';
+      // Single-series charts get a soft area fill; with 2+ series the
+      // fills would stack over each other and muddy the lines.
+      if (series.length === 1) {
+        const lastIdx = (() => { for (let i = span - 1; i >= 0; i--) if (s.values[i] != null) return i; return -1; })();
+        if (lastIdx >= 0) {
+          const areaD = d +
+            "L" + x(lastIdx).toFixed(1) + " " + AN_H +
+            "L" + x(0).toFixed(1) + " " + AN_H + "Z";
+          return '<path class="tr-area" style="fill:' + s.color + '" d="' + areaD + '"></path>' + line;
+        }
+      }
+      return line;
+    }).join("");
+
+    const yLabels = [1, 0.8, 0.6, 0.4, 0.2].map((p) =>
+      '<span style="bottom:' + p * 100 + '%">' + fmtY(yMax * p) + "</span>"
+    ).join("");
+    const gridLines = [0.2, 0.4, 0.6, 0.8, 1].map((p) => {
+      const gy = ((1 - p) * AN_H).toFixed(1);
+      return '<line class="an-grid" vector-effect="non-scaling-stroke" x1="0" x2="' + AN_W + '" y1="' + gy + '" y2="' + gy + '"></line>';
+    }).join("");
+    const stepH = bucket <= 600 ? 3 : total > 144 ? 12 : 6;
+    const p2 = (n) => String(n).padStart(2, "0");
+    let xLabels = "";
+    for (let i = 0; i < total; i++) {
+      const d = new Date((since + i * bucket + 28800) * 1000);
+      let label = "";
+      if (d.getUTCMinutes() === 0 && d.getUTCHours() === 0) {
+        label = p2(d.getUTCMonth() + 1) + "-" + p2(d.getUTCDate());
+      } else if (d.getUTCMinutes() === 0 && d.getUTCHours() % stepH === 0) {
+        label = p2(d.getUTCHours()) + ":00";
+      }
+      if (label) xLabels += '<span style="left:' + ((i + 0.5) / total * 100) + '%">' + label + "</span>";
+    }
+    const legend = series.length > 1
+      ? '<div class="tr-legend">' + series.map((s) =>
+          '<span class="tr-legend-item"><i class="tr-swatch" style="background:' + s.color + '"></i>' + esc(s.label) + "</span>"
+        ).join("") + "</div>"
+      : "";
+
+    wrap.innerHTML =
+      '<div class="an-hchart">' + legend +
+        '<div class="an-hplot">' +
+          '<div class="an-hy">' + yLabels + "</div>" +
+          '<div class="an-svgwrap">' +
+            '<svg class="an-svg" viewBox="0 0 ' + AN_W + " " + AN_H + '" preserveAspectRatio="none">' +
+              gridLines + paths +
+              '<line class="an-hoverline" vector-effect="non-scaling-stroke" x1="0" x2="0" y1="0" y2="' + AN_H + '"></line>' +
+            "</svg>" +
+          "</div>" +
+        "</div>" +
+        '<div class="an-hx">' + xLabels + "</div>" +
+        '<div class="an-tip"></div>' +
+      "</div>";
+  }
+
+  // One-time hover binding per chart container; the fresh geometry lives
+  // on wrap._trendCtx and is re-pointed by every renderTrendChart call.
+  function bindTrendHover(wrap) {
+    if (!wrap || wrap.dataset.trendBound) return;
+    wrap.dataset.trendBound = "1";
+    const q = (sel) => wrap.querySelector(sel);
+    const hide = () => {
+      const tip = q(".an-tip");
+      if (tip) tip.style.display = "none";
+      const line = q(".an-hoverline");
+      if (line) line.style.visibility = "hidden";
+    };
+    wrap.addEventListener("mousemove", (e) => {
+      const ctx = wrap._trendCtx;
+      const plot = e.target.closest(".an-svgwrap");
+      const tip = q(".an-tip");
+      if (!ctx || !plot || !tip) { hide(); return; }
+      const rect = plot.getBoundingClientRect();
+      const frac = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
+      const slot = Math.min(ctx.total - 1, Math.floor(frac * ctx.total));
+      if (slot > ctx.span - 1) { hide(); return; }
+      const line = q(".an-hoverline");
+      if (line) {
+        const vx = ((slot + 0.5) / ctx.total) * AN_W;
+        line.setAttribute("x1", vx);
+        line.setAttribute("x2", vx);
+        line.style.visibility = "visible";
+      }
+      const startT = ctx.since + slot * ctx.bucket;
+      const endT = startT + ctx.bucket;
+      const multiDay = ctx.total * ctx.bucket > 86400;
+      const fmtT = (t, withDate) => {
+        const d = new Date((t + 28800) * 1000);
+        return (withDate ? p2(d.getUTCMonth() + 1) + "-" + p2(d.getUTCDate()) + " " : "") +
+          p2(d.getUTCHours()) + ":" + p2(d.getUTCMinutes());
+      };
+      const sd = new Date((startT + 28800) * 1000);
+      const ed = new Date((endT + 28800) * 1000);
+      const crossesMidnight = sd.getUTCDate() !== ed.getUTCDate() || sd.getUTCMonth() !== ed.getUTCMonth();
+      const rows = (ctx.tooltipRows ? ctx.tooltipRows(slot) : [])
+        .map((r) => '<div class="an-tip-row"><span>' + esc(r.label) + "</span><b>" + esc(r.value) + "</b></div>")
+        .join("");
+      tip.innerHTML =
+        '<div class="an-tip-head">' + fmtT(startT, multiDay) + " – " + fmtT(endT, multiDay || crossesMidnight) + "</div>" + rows;
+      tip.style.display = "block";
+      const gridRect = wrap.getBoundingClientRect();
+      const tipW = tip.offsetWidth;
+      let left = e.clientX - gridRect.left + 14;
+      if (left + tipW > gridRect.width) left = e.clientX - gridRect.left - tipW - 14;
+      tip.style.left = left + "px";
+      tip.style.top = Math.max(0, e.clientY - gridRect.top - 30) + "px";
+    });
+    wrap.addEventListener("mouseleave", hide);
+  }
+
+  // ── Analytics detail: model drill-down page ──
+  // Selected model lives in the hash (#/admin/analytics/model/<enc>) so reload,
+  // back/forward and overview row clicks all work through plain
+  // navigation. Shares the overview's range selector state
+  // (analyticsRange + localStorage) — drilling in keeps the window you
+  // were looking at.
+  let modelTimer = null;
+  let mdData = null;
+
+  function currentModelFromHash() {
+    const m = (location.hash || "").match(/\/admin\/analytics\/model\/([^/?#]+)/);
+    return m ? decodeURIComponent(m[1]) : "";
+  }
+
+  function startModelPoll() {
+    stopModelPoll();
+    loadModel(false);
+    modelTimer = setInterval(() => loadModel(false), 60000);
+  }
+
+  function stopModelPoll() {
+    if (modelTimer) {
+      clearInterval(modelTimer);
+      modelTimer = null;
+    }
+  }
+
+  function setupModelPage() {
+    const btn = document.getElementById("btn-refresh-model");
+    if (btn && !btn.dataset.bound) {
+      btn.dataset.bound = "1";
+      btn.addEventListener("click", () => loadModel(true));
+    }
+    const bar = document.getElementById("md-range");
+    if (bar && !bar.dataset.bound) {
+      bar.dataset.bound = "1";
+      bar.addEventListener("click", (e) => {
+        const b = e.target.closest("button[data-range]");
+        if (!b || b.dataset.range === analyticsRange) return;
+        analyticsRange = b.dataset.range;
+        localStorage.setItem("analyticsRange", analyticsRange);
+        updateAnalyticsRangeUI();
+        loadModel(false);
+      });
+    }
+    updateAnalyticsRangeUI();
+  }
+
+  async function loadModel(force) {
+    const model = currentModelFromHash();
+    if (!model) {
+      mdData = null;
+      renderModel();
+      return;
+    }
+    const requested = model + "|" + analyticsRange;
+    try {
+      const res = await api(
+        "/admin/stats/model/" + encodeURIComponent(model) +
+          "?range=" + analyticsRange + (force ? "&force=1" : "")
+      );
+      // A hash change (model or range switch) can race an in-flight
+      // request — only render what's still on screen.
+      if (requested !== currentModelFromHash() + "|" + analyticsRange) return;
+      mdData = res;
+      renderModel();
+    } catch (e) {
+      // Read-only poller — api() already surfaces auth problems.
+    }
+  }
+
+  function fmtMs(v) {
+    return v == null ? "—" : Math.round(v).toLocaleString() + " ms";
+  }
+  function fmtPct(v) {
+    return v == null ? "—" : (v * 100).toFixed(1) + "%";
+  }
+
+  function renderModel() {
+    const body = document.getElementById("md-body");
+    const sub = document.getElementById("md-subtitle");
+    const model = currentModelFromHash();
+    if (sub) sub.textContent = model || "—";
+    if (!body) return;
+    if (!model) {
+      body.innerHTML =
+        '<div class="card an-panel"><p class="loading">' + esc(t("model.empty")) + "</p>" +
+        '<a class="tr-back" href="#/admin/analytics/overview">← ' + esc(t("model.back_overview")) + "</a></div>";
+      return;
+    }
+    const data = mdData;
+    if (!data || !data.ready) {
+      const detail = data && data.error ? " — " + esc(String(data.error)) : "";
+      body.innerHTML = '<p class="loading">' + esc(t("analytics.unavailable")) + detail + "</p>";
+      return;
+    }
+
+    const errRate = data.requests > 0 ? (data.errors / data.requests * 100) : 0;
+    const cards = [
+      { label: t("analytics.metrics.requests"), value: fmtFullNum(data.requests), hint: "" },
+      { label: t("analytics.metrics.input_tokens"), value: fmtCompactNum(data.input_tokens), hint: "" },
+      { label: t("analytics.metrics.output_tokens"), value: fmtCompactNum(data.output_tokens), hint: "" },
+      { label: t("analytics.metrics.errors"), value: fmtFullNum(data.errors),
+        hint: errRate.toFixed(2) + "%" },
+      { label: t("model.metrics.cache_hit"), value: fmtPct(data.cache_hit_ratio),
+        hint: t("model.metrics.cache_hit_hint") },
+      { label: t("model.metrics.avg_duration"), value: fmtMs(data.avg_duration_ms),
+        hint: t("model.metrics.avg_duration_hint") },
+      { label: t("model.metrics.avg_ttft"), value: fmtMs(data.avg_ttft_ms),
+        hint: t("model.metrics.avg_ttft_hint") },
+      { label: t("model.metrics.avg_queue"), value: fmtMs(data.avg_queue_wait_ms),
+        hint: t("model.metrics.avg_queue_hint") },
+    ];
+    const metrics = '<div class="an-metrics">' + cards.map((c) =>
+      '<div class="an-metric">' +
+        '<div class="an-metric-label">' + esc(c.label) + "</div>" +
+        '<div class="an-metric-value">' + esc(c.value) + "</div>" +
+        (c.hint ? '<div class="an-metric-hint">' + esc(c.hint) + "</div>" : "") +
+      "</div>"
+    ).join("") + "</div>";
+
+    // Skeleton with empty chart containers; renderTrendChart fills them
+    // after the innerHTML assignment.
+    const chartCard = (id, titleKey, hint) =>
+      '<div class="card an-panel">' +
+        '<div class="an-card-head"><h3>' + esc(t(titleKey)) + '</h3><span class="an-hint">' + esc(hint) + "</span></div>" +
+        '<div id="' + id + '"></div>' +
+      "</div>";
+
+    body.innerHTML = metrics +
+      chartCard("md-chart-req", "model.series.requests", t("model.series.hint", { bucket: bucketLabel(data.bucket_secs) })) +
+      chartCard("md-chart-tokens", "model.series.tokens", t("model.series.hint", { bucket: bucketLabel(data.bucket_secs) })) +
+      chartCard("md-chart-cache", "model.series.cache", t("model.series.hint", { bucket: bucketLabel(data.bucket_secs) })) +
+      chartCard("md-chart-latency", "model.series.latency", t("model.series.hint", { bucket: bucketLabel(data.bucket_secs) })) +
+      '<div class="card an-panel">' +
+        '<div class="an-card-head"><h3>' + esc(t("model.hist.title")) + '</h3><span class="an-hint">' +
+          esc(t("model.hist.total", { n: fmtFullNum(data.timed_requests) })) + "</span></div>" +
+        '<div id="md-hist"></div>' +
+      "</div>" +
+      '<div class="card an-panel">' +
+        '<div class="an-card-head"><h3>' + esc(t("model.deploy.title")) + '</h3><span class="an-hint">' +
+          esc(t("model.deploy.hint", { n: (data.deployments || []).length })) + "</span></div>" +
+        '<div id="md-deploy"></div>' +
+      "</div>";
+
+    // ── Charts ──
+    const total = Math.max(1, Number(data.total_slots) || 144);
+    const bucket = Math.max(60, Number(data.bucket_secs) || 600);
+    const since = Number(data.since_epoch) || 0;
+    const span = data.range === "today"
+      ? Math.min(Math.max(Math.floor((Date.now() / 1000 - since) / bucket) + 1, 1), total)
+      : total;
+    const zeros = () => Array.from({ length: total }, () => 0);
+    const req = zeros(), err = zeros(), input = zeros(), output = zeros();
+    const cached = zeros(), inputForRatio = zeros(), dur = Array.from({ length: total }, () => null);
+    (data.series || []).forEach((p) => {
+      const idx = Math.round((p.slot_epoch - since) / bucket);
+      if (idx < 0 || idx >= total) return;
+      req[idx] += p.requests || 0;
+      err[idx] += p.errors || 0;
+      input[idx] += p.input_tokens || 0;
+      output[idx] += p.output_tokens || 0;
+      cached[idx] += p.cached_tokens || 0;
+      inputForRatio[idx] += p.input_tokens || 0;
+      if (p.avg_duration_ms != null) dur[idx] = p.avg_duration_ms;
+    });
+    const ratioAt = (i) => (inputForRatio[i] > 0 ? cached[i] / inputForRatio[i] : null);
+    const C_MAIN = "var(--primary)", C_ALT = "var(--warn)", C_ERR = "var(--danger)";
+
+    renderTrendChart("md-chart-req", {
+      since, bucket, total, span,
+      series: [
+        { label: t("analytics.series.requests"), color: C_MAIN, values: req },
+        { label: t("analytics.metrics.errors"), color: C_ERR, values: err },
+      ],
+      tooltipRows: (i) => [
+        { label: t("analytics.series.requests"), value: fmtFullNum(req[i]) },
+        { label: t("analytics.metrics.errors"), value: fmtFullNum(err[i]) },
+      ],
+    });
+    renderTrendChart("md-chart-tokens", {
+      since, bucket, total, span,
+      series: [
+        { label: t("analytics.series.input"), color: C_MAIN, values: input },
+        { label: t("analytics.series.output"), color: C_ALT, values: output },
+      ],
+      tooltipRows: (i) => [
+        { label: t("analytics.series.input"), value: fmtFullNum(input[i]) },
+        { label: t("analytics.series.output"), value: fmtFullNum(output[i]) },
+      ],
+    });
+    const ratioVals = Array.from({ length: total }, (_, i) => ratioAt(i));
+    renderTrendChart("md-chart-cache", {
+      since, bucket, total, span, yMax: 1,
+      fmtY: (v) => Math.round(v * 100) + "%",
+      series: [{ label: t("model.series.cache"), color: C_MAIN, values: ratioVals }],
+      tooltipRows: (i) => [{ label: t("model.series.cache"), value: fmtPct(ratioAt(i)) }],
+    });
+    renderTrendChart("md-chart-latency", {
+      since, bucket, total, span,
+      series: [{ label: t("model.series.latency"), color: C_MAIN, values: dur }],
+      tooltipRows: (i) => [{ label: t("model.series.latency"), value: fmtMs(dur[i]) }],
+    });
+
+    // ── Latency histogram ──
+    const hist = document.getElementById("md-hist");
+    if (hist) {
+      const labels = ["model.hist.lt100", "model.hist.lt300", "model.hist.lt1s",
+        "model.hist.lt3s", "model.hist.lt10s", "model.hist.gte10s"];
+      const counts = data.latency_hist || [0, 0, 0, 0, 0, 0];
+      const maxCnt = Math.max(1, ...counts);
+      hist.innerHTML = '<div class="md-hist">' + counts.map((c, i) =>
+        '<div class="md-hist-row">' +
+          '<span class="md-hist-label">' + esc(t(labels[i])) + "</span>" +
+          '<div class="md-hist-track"><i style="width:' + (c / maxCnt * 100).toFixed(2) + '%"></i></div>' +
+          '<span class="md-hist-val">' + fmtFullNum(c) + "</span>" +
+        "</div>"
+      ).join("") + "</div>";
+    }
+
+    // ── Deployment split table ──
+    const depWrap = document.getElementById("md-deploy");
+    if (depWrap) {
+      const deps = data.deployments || [];
+      if (!deps.length) {
+        depWrap.innerHTML = '<p class="loading">' + esc(t("common.no_records")) + "</p>";
+      } else {
+        const th = (labelKey, cls) =>
+          "<th" + (cls ? ' class="' + cls + '"' : "") + ">" + esc(t(labelKey)) + "</th>";
+        const head = "<tr>" +
+          th("model.deploy.th.deployment") + th("model.deploy.th.model_name") +
+          th("model.deploy.th.requests", "num") + th("model.deploy.th.input", "num") +
+          th("model.deploy.th.output", "num") + th("model.deploy.th.errors", "num") +
+          th("model.deploy.th.avg_duration", "num") + th("model.deploy.th.avg_ttft", "num") +
+          "</tr>";
+        const rows = deps.map((d) => {
+          const depId = d.deployment_id ? esc(d.deployment_id) : '<span class="an-dim">' + esc(t("model.deploy.unattributed")) + "</span>";
+          const modelName = d.model_name ? esc(d.model_name) : '<span class="an-dim">' + esc(t("model.deploy.unattributed")) + "</span>";
+          return "<tr>" +
+            '<td title="' + esc(d.deployment_id || "") + '">' + depId + "</td>" +
+            '<td title="' + esc(d.model_name || "") + '">' + modelName + "</td>" +
+            '<td class="num">' + fmtFullNum(d.requests) + "</td>" +
+            '<td class="num">' + fmtCompactNum(d.input_tokens) + "</td>" +
+            '<td class="num">' + fmtCompactNum(d.output_tokens) + "</td>" +
+            '<td class="num' + (d.errors > 0 ? " an-err-text" : "") + '">' + fmtFullNum(d.errors) + "</td>" +
+            '<td class="num">' + fmtMs(d.avg_duration_ms) + "</td>" +
+            '<td class="num">' + fmtMs(d.avg_ttft_ms) + "</td>" +
+          "</tr>";
+        }).join("");
+        depWrap.innerHTML = '<table class="an-table"><thead>' + head + "</thead><tbody>" + rows + "</tbody></table>";
+      }
+    }
+  }
+
+  function bucketLabel(bucketSecs) {
+    if (bucketSecs <= 600) return t("model.bucket.10m");
+    if (bucketSecs <= 1800) return t("model.bucket.30m");
+    return t("model.bucket.1h");
+  }
+
+  // ── Analytics detail: consumption page ──
+  // Main view (#/admin/consumption): token spend by key / team / end-user
+  // tag / client IP from the TTL-cached snapshot, polled every 60s.
+  // Key drill-down (#/admin/consumption/key/<hash>): direct uncached
+  // query, no polling — manual refresh only (key cardinality is
+  // unbounded, caching would only add prune pressure).
+  let consumptionTimer = null;
+  let csData = null; // main-view snapshot
+  let csKeyData = null; // key drill-down report
+
+  function currentKeyFromHash() {
+    const m = (location.hash || "").match(/\/admin\/analytics\/consumption\/key\/([^/?#]+)/);
+    return m ? decodeURIComponent(m[1]) : "";
+  }
+
+  function startConsumptionPoll() {
+    stopConsumptionPoll();
+    loadConsumption(false);
+    if (!currentKeyFromHash()) {
+      consumptionTimer = setInterval(() => loadConsumption(false), 60000);
+    }
+  }
+
+  function stopConsumptionPoll() {
+    if (consumptionTimer) {
+      clearInterval(consumptionTimer);
+      consumptionTimer = null;
+    }
+  }
+
+  function setupConsumptionPage() {
+    const btn = document.getElementById("btn-refresh-consumption");
+    if (btn && !btn.dataset.bound) {
+      btn.dataset.bound = "1";
+      btn.addEventListener("click", () => loadConsumption(true));
+    }
+    const bar = document.getElementById("cs-range");
+    if (bar && !bar.dataset.bound) {
+      bar.dataset.bound = "1";
+      bar.addEventListener("click", (e) => {
+        const b = e.target.closest("button[data-range]");
+        if (!b || b.dataset.range === analyticsRange) return;
+        analyticsRange = b.dataset.range;
+        localStorage.setItem("analyticsRange", analyticsRange);
+        updateAnalyticsRangeUI();
+        loadConsumption(false);
+      });
+    }
+    // Key ranking rows navigate into the drill-down sub-view.
+    const bodyEl = document.getElementById("cs-body");
+    if (bodyEl && !bodyEl.dataset.keybound) {
+      bodyEl.dataset.keybound = "1";
+      bodyEl.addEventListener("click", (e) => {
+        const tr = e.target.closest("tr[data-key]");
+        if (tr) {
+          location.hash = "#/admin/analytics/consumption/key/" + encodeURIComponent(tr.dataset.key);
+        }
+      });
+    }
+    updateAnalyticsRangeUI();
+  }
+
+  async function loadConsumption(force) {
+    const keyHash = currentKeyFromHash();
+    const requested = (keyHash || "-") + "|" + analyticsRange;
+    try {
+      const res = keyHash
+        ? await api(
+            "/admin/stats/consumption/key/" + encodeURIComponent(keyHash) +
+              "?range=" + analyticsRange
+          )
+        : await api(
+            "/admin/stats/consumption?range=" + analyticsRange + (force ? "&force=1" : "")
+          );
+      // A hash change (main ⇄ key view, or range switch) can race an
+      // in-flight request — only render what's still on screen.
+      if (requested !== (currentKeyFromHash() || "-") + "|" + analyticsRange) return;
+      if (keyHash) csKeyData = res;
+      else csData = res;
+      renderConsumption();
+    } catch (e) {
+      // Read-only poller — api() already surfaces auth problems.
+    }
+  }
+
+  // UTC+8 "MM-DD HH:mm" from epoch seconds (first/last seen columns).
+  function fmtCstDT(epoch) {
+    if (epoch == null) return "—";
+    const d = new Date((epoch + 8 * 3600) * 1000);
+    const p2 = (x) => String(x).padStart(2, "0");
+    return (
+      p2(d.getUTCMonth() + 1) + "-" + p2(d.getUTCDate()) + " " +
+      p2(d.getUTCHours()) + ":" + p2(d.getUTCMinutes())
+    );
+  }
+
+  function keyDisplayLabel(k) {
+    return k.key_alias || k.key_name || k.key_hash || "";
+  }
+
+  function renderConsumption() {
+    const body = document.getElementById("cs-body");
+    if (!body) return;
+    if (currentKeyFromHash()) renderConsumptionKey(body);
+    else renderConsumptionMain(body);
+  }
+
+  function renderConsumptionMain(body) {
+    const sub = document.getElementById("cs-subtitle");
+    if (sub) sub.textContent = t("consumption.subtitle");
+    const data = csData;
+    if (!data || !data.ready) {
+      const detail = data && data.error ? " — " + esc(String(data.error)) : "";
+      body.innerHTML = '<p class="loading">' + esc(t("analytics.unavailable")) + detail + "</p>";
+      return;
+    }
+
+    const errRate = data.requests > 0 ? (data.errors / data.requests * 100) : 0;
+    const cards = [
+      { label: t("analytics.metrics.requests"), value: fmtFullNum(data.requests), hint: "" },
+      { label: t("analytics.metrics.input_tokens"), value: fmtCompactNum(data.input_tokens), hint: "" },
+      { label: t("analytics.metrics.output_tokens"), value: fmtCompactNum(data.output_tokens), hint: "" },
+      { label: t("analytics.metrics.errors"), value: fmtFullNum(data.errors),
+        hint: errRate.toFixed(2) + "%" },
+      { label: t("model.metrics.cache_hit"), value: fmtPct(
+          data.input_tokens > 0 ? data.cached_tokens / data.input_tokens : null),
+        hint: t("model.metrics.cache_hit_hint") },
+    ];
+    const metrics = '<div class="an-metrics">' + cards.map((c) =>
+      '<div class="an-metric">' +
+        '<div class="an-metric-label">' + esc(c.label) + "</div>" +
+        '<div class="an-metric-value">' + esc(c.value) + "</div>" +
+        (c.hint ? '<div class="an-metric-hint">' + esc(c.hint) + "</div>" : "") +
+      "</div>"
+    ).join("") + "</div>";
+
+    const chartCard = (id, titleKey, hint) =>
+      '<div class="card an-panel">' +
+        '<div class="an-card-head"><h3>' + esc(t(titleKey)) + '</h3><span class="an-hint">' + esc(hint) + "</span></div>" +
+        '<div id="' + id + '"></div>' +
+      "</div>";
+    const bucketHint = t("model.series.hint", { bucket: bucketLabel(data.bucket_secs) });
+
+    const tableCard = (id, titleKey, hint, inner) =>
+      '<div class="card an-panel">' +
+        '<div class="an-card-head"><h3>' + esc(t(titleKey)) + '</h3><span class="an-hint">' + esc(hint) + "</span></div>" +
+        '<div id="' + id + '">' + inner + "</div>" +
+      "</div>";
+
+    body.innerHTML = metrics +
+      chartCard("cs-chart-tokens", "model.series.tokens", bucketHint) +
+      chartCard("cs-chart-req", "model.series.requests", bucketHint) +
+      tableCard("cs-keys", "consumption.keys.title",
+        t("consumption.keys.hint", { n: (data.keys || []).length }), "") +
+      tableCard("cs-teams", "consumption.teams.title", "", "") +
+      tableCard("cs-tags", "consumption.tags.title", "", "") +
+      tableCard("cs-ips", "consumption.ips.title", "", "");
+
+    // ── Charts ──
+    const total = Math.max(1, Number(data.total_slots) || 144);
+    const bucket = Math.max(60, Number(data.bucket_secs) || 600);
+    const since = Number(data.since_epoch) || 0;
+    const span = data.range === "today"
+      ? Math.min(Math.max(Math.floor((Date.now() / 1000 - since) / bucket) + 1, 1), total)
+      : total;
+    const req = Array.from({ length: total }, () => 0);
+    const err = Array.from({ length: total }, () => 0);
+    const input = Array.from({ length: total }, () => 0);
+    const output = Array.from({ length: total }, () => 0);
+    (data.series || []).forEach((p) => {
+      const idx = Math.round((p.slot_epoch - since) / bucket);
+      if (idx < 0 || idx >= total) return;
+      req[idx] += p.requests || 0;
+      err[idx] += p.errors || 0;
+      input[idx] += p.input_tokens || 0;
+      output[idx] += p.output_tokens || 0;
+    });
+    const C_MAIN = "var(--primary)", C_ALT = "var(--warn)", C_ERR = "var(--danger)";
+    renderTrendChart("cs-chart-tokens", {
+      since, bucket, total, span,
+      series: [
+        { label: t("analytics.series.input"), color: C_MAIN, values: input },
+        { label: t("analytics.series.output"), color: C_ALT, values: output },
+      ],
+      tooltipRows: (i) => [
+        { label: t("analytics.series.input"), value: fmtFullNum(input[i]) },
+        { label: t("analytics.series.output"), value: fmtFullNum(output[i]) },
+      ],
+    });
+    renderTrendChart("cs-chart-req", {
+      since, bucket, total, span,
+      series: [
+        { label: t("analytics.series.requests"), color: C_MAIN, values: req },
+        { label: t("analytics.metrics.errors"), color: C_ERR, values: err },
+      ],
+      tooltipRows: (i) => [
+        { label: t("analytics.series.requests"), value: fmtFullNum(req[i]) },
+        { label: t("analytics.metrics.errors"), value: fmtFullNum(err[i]) },
+      ],
+    });
+
+    // ── Key ranking ──
+    const keysWrap = document.getElementById("cs-keys");
+    if (keysWrap) {
+      const keys = data.keys || [];
+      if (!keys.length) {
+        keysWrap.innerHTML = '<p class="loading">' + esc(t("common.no_records")) + "</p>";
+      } else {
+        const th = (labelKey, cls) =>
+          "<th" + (cls ? ' class="' + cls + '"' : "") + ">" + esc(t(labelKey)) + "</th>";
+        const head = "<tr>" +
+          th("consumption.th.rank", "num") + th("consumption.th.key") +
+          th("analytics.metrics.requests", "num") + th("analytics.metrics.input_tokens", "num") +
+          th("analytics.metrics.output_tokens", "num") + th("analytics.metrics.errors", "num") +
+          th("consumption.th.cache", "num") + th("consumption.th.first_seen") +
+          th("consumption.th.last_seen") + "</tr>";
+        const rows = keys.map((k, i) =>
+          "<tr data-key=\"" + esc(k.key_hash) + "\" title=\"" + esc(k.key_hash) + "\">" +
+            '<td class="num an-dim">' + (i + 1) + "</td>" +
+            "<td>" + esc(keyDisplayLabel(k)) + ' <span class="an-dim">' + esc(shortHash(k.key_hash)) + "</span></td>" +
+            '<td class="num">' + fmtFullNum(k.requests) + "</td>" +
+            '<td class="num">' + fmtCompactNum(k.input_tokens) + "</td>" +
+            '<td class="num">' + fmtCompactNum(k.output_tokens) + "</td>" +
+            '<td class="num' + (k.errors > 0 ? " an-err-text" : "") + '">' + fmtFullNum(k.errors) + "</td>" +
+            '<td class="num">' + fmtPct(k.cache_hit_ratio) + "</td>" +
+            "<td>" + fmtCstDT(k.first_seen_epoch) + "</td>" +
+            "<td>" + fmtCstDT(k.last_seen_epoch) + "</td>" +
+          "</tr>"
+        ).join("");
+        keysWrap.innerHTML =
+          '<table class="an-table"><thead>' + head + "</thead><tbody>" + rows + "</tbody></table>";
+      }
+    }
+
+    // ── Teams / user tags / client IPs ──
+    const renderAggTable = (wrapId, rows, cols, rowHtml) => {
+      const wrap = document.getElementById(wrapId);
+      if (!wrap) return;
+      if (!rows.length) {
+        wrap.innerHTML = '<p class="loading">' + esc(t("common.no_records")) + "</p>";
+        return;
+      }
+      const head = "<tr>" + cols.map((c) =>
+        "<th" + (c.cls ? ' class="' + c.cls + '"' : "") + ">" + esc(t(c.labelKey)) + "</th>"
+      ).join("") + "</tr>";
+      wrap.innerHTML =
+        '<table class="an-table"><thead>' + head + "</thead><tbody>" +
+        rows.map(rowHtml).join("") + "</tbody></table>";
+    };
+    const numCol = (labelKey) => ({ labelKey, cls: "num" });
+    renderAggTable(
+      "cs-teams",
+      data.teams || [],
+      [{ labelKey: "consumption.th.team" }, numCol("consumption.th.keys"),
+       numCol("analytics.metrics.requests"), numCol("analytics.metrics.input_tokens"),
+       numCol("analytics.metrics.output_tokens"), numCol("analytics.metrics.errors")],
+      (r) =>
+        "<tr>" +
+          "<td>" + (r.team_id
+            ? esc(r.team_id)
+            : '<span class="an-dim">' + esc(t("consumption.none_team")) + "</span>") + "</td>" +
+          '<td class="num">' + fmtFullNum(r.active_keys) + "</td>" +
+          '<td class="num">' + fmtFullNum(r.requests) + "</td>" +
+          '<td class="num">' + fmtCompactNum(r.input_tokens) + "</td>" +
+          '<td class="num">' + fmtCompactNum(r.output_tokens) + "</td>" +
+          '<td class="num' + (r.errors > 0 ? " an-err-text" : "") + '">' + fmtFullNum(r.errors) + "</td>" +
+        "</tr>"
+    );
+    renderAggTable(
+      "cs-tags",
+      data.user_tags || [],
+      [{ labelKey: "consumption.th.tag" }, numCol("analytics.metrics.requests"),
+       numCol("analytics.metrics.input_tokens"), numCol("analytics.metrics.output_tokens"),
+       numCol("analytics.metrics.errors")],
+      (r) =>
+        "<tr>" +
+          "<td>" + esc(r.user_tag1) + "</td>" +
+          '<td class="num">' + fmtFullNum(r.requests) + "</td>" +
+          '<td class="num">' + fmtCompactNum(r.input_tokens) + "</td>" +
+          '<td class="num">' + fmtCompactNum(r.output_tokens) + "</td>" +
+          '<td class="num' + (r.errors > 0 ? " an-err-text" : "") + '">' + fmtFullNum(r.errors) + "</td>" +
+        "</tr>"
+    );
+    renderAggTable(
+      "cs-ips",
+      data.client_ips || [],
+      [{ labelKey: "consumption.th.ip" }, numCol("analytics.metrics.requests"),
+       numCol("analytics.metrics.input_tokens"), numCol("analytics.metrics.output_tokens"),
+       numCol("analytics.metrics.errors")],
+      (r) =>
+        "<tr>" +
+          "<td>" + (r.client_ip
+            ? esc(r.client_ip)
+            : '<span class="an-dim">' + esc(t("consumption.unknown_ip")) + "</span>") + "</td>" +
+          '<td class="num">' + fmtFullNum(r.requests) + "</td>" +
+          '<td class="num">' + fmtCompactNum(r.input_tokens) + "</td>" +
+          '<td class="num">' + fmtCompactNum(r.output_tokens) + "</td>" +
+          '<td class="num' + (r.errors > 0 ? " an-err-text" : "") + '">' + fmtFullNum(r.errors) + "</td>" +
+        "</tr>"
+    );
+  }
+
+  function renderConsumptionKey(body) {
+    const sub = document.getElementById("cs-subtitle");
+    const data = csKeyData;
+    const keyHash = currentKeyFromHash();
+    if (sub) {
+      sub.textContent = data && (data.key_alias || data.key_name)
+        ? (data.key_alias || data.key_name) + " · " + shortHash(keyHash)
+        : keyHash || "—";
+    }
+    if (!data || !data.ready) {
+      const detail = data && data.error ? " — " + esc(String(data.error)) : "";
+      body.innerHTML = '<p class="loading">' + esc(t("analytics.unavailable")) + detail + "</p>";
+      return;
+    }
+
+    const errRate = data.requests > 0 ? (data.errors / data.requests * 100) : 0;
+    const cards = [
+      { label: t("analytics.metrics.requests"), value: fmtFullNum(data.requests), hint: "" },
+      { label: t("analytics.metrics.input_tokens"), value: fmtCompactNum(data.input_tokens), hint: "" },
+      { label: t("analytics.metrics.output_tokens"), value: fmtCompactNum(data.output_tokens), hint: "" },
+      { label: t("model.metrics.cache_hit"), value: fmtPct(
+          data.input_tokens > 0 ? data.cached_tokens / data.input_tokens : null),
+        hint: t("model.metrics.cache_hit_hint") },
+      { label: t("analytics.metrics.errors"), value: fmtFullNum(data.errors),
+        hint: errRate.toFixed(2) + "%" },
+      { label: t("model.metrics.avg_duration"), value: fmtMs(data.avg_duration_ms),
+        hint: t("model.metrics.avg_duration_hint") },
+      { label: t("model.metrics.avg_ttft"), value: fmtMs(data.avg_ttft_ms),
+        hint: t("model.metrics.avg_ttft_hint") },
+    ];
+    const metrics = '<div class="an-metrics">' + cards.map((c) =>
+      '<div class="an-metric">' +
+        '<div class="an-metric-label">' + esc(c.label) + "</div>" +
+        '<div class="an-metric-value">' + esc(c.value) + "</div>" +
+        (c.hint ? '<div class="an-metric-hint">' + esc(c.hint) + "</div>" : "") +
+      "</div>"
+    ).join("") + "</div>";
+
+    const chartCard = (id, titleKey, hint) =>
+      '<div class="card an-panel">' +
+        '<div class="an-card-head"><h3>' + esc(t(titleKey)) + '</h3><span class="an-hint">' + esc(hint) + "</span></div>" +
+        '<div id="' + id + '"></div>' +
+      "</div>";
+    const bucketHint = t("model.series.hint", { bucket: bucketLabel(data.bucket_secs) });
+
+    body.innerHTML =
+      '<a class="tr-back" href="#/admin/analytics/consumption">← ' + esc(t("consumption.back_keys")) + "</a>" +
+      metrics +
+      chartCard("csk-chart-req", "model.series.requests", bucketHint) +
+      chartCard("csk-chart-tokens", "model.series.tokens", bucketHint) +
+      chartCard("csk-chart-cache", "model.series.cache", bucketHint) +
+      chartCard("csk-chart-latency", "model.series.latency", bucketHint);
+
+    const total = Math.max(1, Number(data.total_slots) || 144);
+    const bucket = Math.max(60, Number(data.bucket_secs) || 600);
+    const since = Number(data.since_epoch) || 0;
+    const span = data.range === "today"
+      ? Math.min(Math.max(Math.floor((Date.now() / 1000 - since) / bucket) + 1, 1), total)
+      : total;
+    const req = Array.from({ length: total }, () => 0);
+    const err = Array.from({ length: total }, () => 0);
+    const input = Array.from({ length: total }, () => 0);
+    const output = Array.from({ length: total }, () => 0);
+    const cached = Array.from({ length: total }, () => 0);
+    const dur = Array.from({ length: total }, () => null);
+    (data.series || []).forEach((p) => {
+      const idx = Math.round((p.slot_epoch - since) / bucket);
+      if (idx < 0 || idx >= total) return;
+      req[idx] += p.requests || 0;
+      err[idx] += p.errors || 0;
+      input[idx] += p.input_tokens || 0;
+      output[idx] += p.output_tokens || 0;
+      cached[idx] += p.cached_tokens || 0;
+      if (p.avg_duration_ms != null) dur[idx] = p.avg_duration_ms;
+    });
+    const ratioAt = (i) => (input[i] > 0 ? cached[i] / input[i] : null);
+    const C_MAIN = "var(--primary)", C_ALT = "var(--warn)", C_ERR = "var(--danger)";
+    renderTrendChart("csk-chart-req", {
+      since, bucket, total, span,
+      series: [
+        { label: t("analytics.series.requests"), color: C_MAIN, values: req },
+        { label: t("analytics.metrics.errors"), color: C_ERR, values: err },
+      ],
+      tooltipRows: (i) => [
+        { label: t("analytics.series.requests"), value: fmtFullNum(req[i]) },
+        { label: t("analytics.metrics.errors"), value: fmtFullNum(err[i]) },
+      ],
+    });
+    renderTrendChart("csk-chart-tokens", {
+      since, bucket, total, span,
+      series: [
+        { label: t("analytics.series.input"), color: C_MAIN, values: input },
+        { label: t("analytics.series.output"), color: C_ALT, values: output },
+      ],
+      tooltipRows: (i) => [
+        { label: t("analytics.series.input"), value: fmtFullNum(input[i]) },
+        { label: t("analytics.series.output"), value: fmtFullNum(output[i]) },
+      ],
+    });
+    renderTrendChart("csk-chart-cache", {
+      since, bucket, total, span, yMax: 1,
+      fmtY: (v) => Math.round(v * 100) + "%",
+      series: [{ label: t("model.series.cache"), color: C_MAIN,
+        values: Array.from({ length: total }, (_, i) => ratioAt(i)) }],
+      tooltipRows: (i) => [{ label: t("model.series.cache"), value: fmtPct(ratioAt(i)) }],
+    });
+    renderTrendChart("csk-chart-latency", {
+      since, bucket, total, span,
+      series: [{ label: t("model.series.latency"), color: C_MAIN, values: dur }],
+      tooltipRows: (i) => [{ label: t("model.series.latency"), value: fmtMs(dur[i]) }],
+    });
+  }
+
+  function shortHash(hash) {
+    const s = String(hash || "");
+    return s.length > 12 ? s.slice(0, 8) + "…" : s;
+  }
+
+  // ── Schedule & Cache History ─────────────────────────
+  // Answers "did key-affinity routing actually improve cache hit and
+  // TTFT": schedule policy distribution over time, KV prefix hit / trie
+  // utilization / provider cache ratio trends, and a per-policy
+  // comparison table. 60s poll like the other cached analytics views.
+  let scheduleTimer = null;
+  let scheduleData = null;
+
+  function startSchedulePoll() {
+    stopSchedulePoll();
+    loadSchedule(false);
+    scheduleTimer = setInterval(() => loadSchedule(false), 60000);
+  }
+
+  function stopSchedulePoll() {
+    if (scheduleTimer) {
+      clearInterval(scheduleTimer);
+      scheduleTimer = null;
+    }
+  }
+
+  function setupSchedulePage() {
+    const btn = document.getElementById("btn-refresh-schedule");
+    if (btn && !btn.dataset.bound) {
+      btn.dataset.bound = "1";
+      btn.addEventListener("click", () => loadSchedule(true));
+    }
+    const bar = document.getElementById("sc-range");
+    if (bar && !bar.dataset.bound) {
+      bar.dataset.bound = "1";
+      bar.addEventListener("click", (e) => {
+        const b = e.target.closest("button[data-range]");
+        if (!b || b.dataset.range === analyticsRange) return;
+        analyticsRange = b.dataset.range;
+        localStorage.setItem("analyticsRange", analyticsRange);
+        updateAnalyticsRangeUI();
+        loadSchedule(false);
+      });
+    }
+    updateAnalyticsRangeUI();
+  }
+
+  async function loadSchedule(force) {
+    const requested = analyticsRange;
+    try {
+      const res = await api(
+        "/admin/stats/schedule?range=" + analyticsRange + (force ? "&force=1" : "")
+      );
+      // A range switch can race the in-flight request — drop stale renders.
+      if (requested !== analyticsRange) return;
+      scheduleData = res;
+      renderSchedule();
+    } catch (e) {
+      // Read-only poller — api() already surfaces auth problems.
+    }
+  }
+
+  function renderSchedule() {
+    const body = document.getElementById("sc-body");
+    if (!body) return;
+    const sub = document.getElementById("sc-subtitle");
+    if (sub) sub.textContent = t("schedule.subtitle");
+    const data = scheduleData;
+    if (!data || !data.ready) {
+      const detail = data && data.error ? " — " + esc(String(data.error)) : "";
+      body.innerHTML = '<p class="loading">' + esc(t("analytics.unavailable")) + detail + "</p>";
+      return;
+    }
+
+    const errRate = data.requests > 0 ? (data.errors / data.requests * 100) : 0;
+    const cards = [
+      { label: t("analytics.metrics.requests"), value: fmtFullNum(data.requests), hint: "" },
+      { label: t("analytics.metrics.errors"), value: fmtFullNum(data.errors),
+        hint: errRate.toFixed(2) + "%" },
+      { label: t("schedule.metrics.kv_hit"), value: fmtPct(data.kv_hit_ratio),
+        hint: t("schedule.metrics.kv_hit_hint") },
+      { label: t("schedule.metrics.trie_util"), value: fmtPct(data.trie_util_ratio),
+        hint: t("schedule.metrics.trie_util_hint") },
+      { label: t("model.metrics.cache_hit"), value: fmtPct(data.cache_hit_ratio),
+        hint: t("model.metrics.cache_hit_hint") },
+    ];
+    const metrics = '<div class="an-metrics">' + cards.map((c) =>
+      '<div class="an-metric">' +
+        '<div class="an-metric-label">' + esc(c.label) + "</div>" +
+        '<div class="an-metric-value">' + esc(c.value) + "</div>" +
+        (c.hint ? '<div class="an-metric-hint">' + esc(c.hint) + "</div>" : "") +
+      "</div>"
+    ).join("") + "</div>";
+
+    const chartCard = (id, titleKey, hint) =>
+      '<div class="card an-panel">' +
+        '<div class="an-card-head"><h3>' + esc(t(titleKey)) + '</h3><span class="an-hint">' + esc(hint) + "</span></div>" +
+        '<div id="' + id + '"></div>' +
+      "</div>";
+    const bucketHint = t("model.series.hint", { bucket: bucketLabel(data.bucket_secs) });
+    const tableCard = (id, titleKey, hint, inner) =>
+      '<div class="card an-panel">' +
+        '<div class="an-card-head"><h3>' + esc(t(titleKey)) + '</h3><span class="an-hint">' + esc(hint) + "</span></div>" +
+        '<div id="' + id + '">' + inner + "</div>" +
+      "</div>";
+
+    body.innerHTML = metrics +
+      chartCard("sc-chart-policy", "schedule.chart.policy", bucketHint) +
+      chartCard("sc-chart-kv", "schedule.chart.kv", bucketHint) +
+      chartCard("sc-chart-trie", "schedule.chart.trie", bucketHint) +
+      chartCard("sc-chart-cache", "schedule.chart.cache", bucketHint) +
+      tableCard("sc-policy-table", "schedule.table.title",
+        t("schedule.table.hint"), "");
+
+    const total = Math.max(1, Number(data.total_slots) || 144);
+    const bucket = Math.max(60, Number(data.bucket_secs) || 600);
+    const since = Number(data.since_epoch) || 0;
+    const span = data.range === "today"
+      ? Math.min(Math.max(Math.floor((Date.now() / 1000 - since) / bucket) + 1, 1), total)
+      : total;
+    const C_MAIN = "var(--primary)";
+
+    // ── Policy trend: one line per policy, ordered by window requests ──
+    const policyTotals = new Map();
+    (data.policy_series || []).forEach((p) => {
+      policyTotals.set(p.policy, (policyTotals.get(p.policy) || 0) + (p.requests || 0));
+    });
+    const policyOrder = [...policyTotals.keys()].sort(
+      (a, b) => (policyTotals.get(b) || 0) - (policyTotals.get(a) || 0)
+    );
+    const policyGrids = new Map(policyOrder.map((p) => [p, Array.from({ length: total }, () => 0)]));
+    (data.policy_series || []).forEach((p) => {
+      const grid = policyGrids.get(p.policy);
+      if (!grid) return;
+      const idx = Math.round((p.slot_epoch - since) / bucket);
+      if (idx < 0 || idx >= total) return;
+      grid[idx] += p.requests || 0;
+    });
+    if (policyOrder.length) {
+      renderTrendChart("sc-chart-policy", {
+        since, bucket, total, span,
+        series: policyOrder.map((p, i) => ({
+          label: p, color: deploymentColor(i), values: policyGrids.get(p),
+        })),
+        tooltipRows: (i) => policyOrder.map((p) => ({
+          label: p, value: fmtFullNum(policyGrids.get(p)[i]),
+        })),
+      });
+    } else {
+      const wrap = document.getElementById("sc-chart-policy");
+      if (wrap) wrap.innerHTML = '<p class="loading">' + esc(t("common.no_records")) + "</p>";
+    }
+
+    // ── Ratio trends: null (no denominator) breaks the line ──
+    const ratioGrid = (pick) => {
+      const grid = Array.from({ length: total }, () => null);
+      (data.series || []).forEach((p) => {
+        const idx = Math.round((p.slot_epoch - since) / bucket);
+        if (idx < 0 || idx >= total) return;
+        grid[idx] = pick(p);
+      });
+      return grid;
+    };
+    const pctChart = (id, labelKey, grid) => {
+      if (!grid.some((v) => v != null)) {
+        const wrap = document.getElementById(id);
+        if (wrap) wrap.innerHTML = '<p class="loading">' + esc(t("common.no_records")) + "</p>";
+        return;
+      }
+      renderTrendChart(id, {
+        since, bucket, total, span, yMax: 1,
+        fmtY: (v) => Math.round(v * 100) + "%",
+        series: [{ label: t(labelKey), color: C_MAIN, values: grid }],
+        tooltipRows: (i) => [{ label: t(labelKey), value: fmtPct(grid[i]) }],
+      });
+    };
+    pctChart("sc-chart-kv", "schedule.chart.kv", ratioGrid((p) => p.kv_hit_ratio));
+    pctChart("sc-chart-trie", "schedule.chart.trie", ratioGrid((p) => p.trie_util_ratio));
+    pctChart("sc-chart-cache", "schedule.chart.cache",
+      ratioGrid((p) => p.cache_hit_ratio));
+
+    // ── Policy comparison table ──
+    const tableWrap = document.getElementById("sc-policy-table");
+    if (tableWrap) {
+      const policies = data.policies || [];
+      if (!policies.length) {
+        tableWrap.innerHTML = '<p class="loading">' + esc(t("common.no_records")) + "</p>";
+      } else {
+        const th = (labelKey, cls) =>
+          "<th" + (cls ? ' class="' + cls + '"' : "") + ">" + esc(t(labelKey)) + "</th>";
+        const head = "<tr>" +
+          th("schedule.th.policy") + th("analytics.metrics.requests", "num") +
+          th("analytics.metrics.errors", "num") +
+          th("schedule.th.kv", "num") + th("schedule.th.trie", "num") +
+          th("schedule.th.cache", "num") +
+          th("schedule.th.avg_duration", "num") + th("schedule.th.avg_ttft", "num") +
+          th("schedule.th.avg_queue", "num") + "</tr>";
+        const rows = policies.map((p, i) =>
+          '<tr><td><span class="tr-swatch" style="background:' + deploymentColor(i) +
+            '"></span> ' + esc(p.policy) + "</td>" +
+            '<td class="num">' + fmtFullNum(p.requests) + "</td>" +
+            '<td class="num' + (p.errors > 0 ? " an-err-text" : "") + '">' + fmtFullNum(p.errors) + "</td>" +
+            '<td class="num">' + fmtPct(p.kv_hit_ratio) + "</td>" +
+            '<td class="num">' + fmtPct(p.trie_util_ratio) + "</td>" +
+            '<td class="num">' + fmtPct(p.cache_hit_ratio) + "</td>" +
+            '<td class="num">' + fmtMs(p.avg_duration_ms) + "</td>" +
+            '<td class="num">' + fmtMs(p.avg_ttft_ms) + "</td>" +
+            '<td class="num">' + fmtMs(p.avg_queue_wait_ms) + "</td>" +
+          "</tr>"
+        ).join("");
+        tableWrap.innerHTML =
+          '<table class="an-table"><thead>' + head + "</thead><tbody>" + rows + "</tbody></table>";
+      }
+    }
   }
 
   // ── In-Flight ─────────────────────────────────────────
@@ -4725,6 +6311,7 @@
         ${fieldNum("cfg-pl-otlp-flush-interval-secs", t("config.field.otlp_flush_interval_secs"), o.flush_interval_secs, { min: 1, tip: t("config.tip.otlp_flush_interval_secs") })}
         ${fieldNum("cfg-pl-otlp-max-attribute-bytes", t("config.field.otlp_max_attribute_bytes"), o.max_attribute_bytes, { min: 256, step: 256, tip: t("config.tip.otlp_max_attribute_bytes") })}
         ${fieldNum("cfg-pl-otlp-max-queue-size", t("config.field.otlp_max_queue_size"), o.max_queue_size, { min: 100, step: 100, tip: t("config.tip.otlp_max_queue_size") })}
+        ${fieldNum("cfg-pl-otlp-max-queue-bytes", t("config.field.otlp_max_queue_bytes"), o.max_queue_bytes ?? 67108864, { min: 0, step: 1048576, tip: t("config.tip.otlp_max_queue_bytes") })}
         ${fieldTextarea("cfg-pl-otlp-headers", t("config.field.otlp_headers"), o.headers || {}, { rows: 3, tip: t("config.tip.otlp_headers") })}
       </div>
 
@@ -4776,6 +6363,7 @@
         ${fieldNum("cfg-tr-otlp-flush-interval-secs", t("config.field.otlp_flush_interval_secs"), o.flush_interval_secs, { min: 1, tip: t("config.tip.otlp_flush_interval_secs") })}
         ${fieldNum("cfg-tr-otlp-max-attribute-bytes", t("config.field.otlp_max_attribute_bytes"), o.max_attribute_bytes, { min: 256, step: 256, tip: t("config.tip.otlp_max_attribute_bytes") })}
         ${fieldNum("cfg-tr-otlp-max-queue-size", t("config.field.otlp_max_queue_size"), o.max_queue_size, { min: 100, step: 100, tip: t("config.tip.otlp_max_queue_size") })}
+        ${fieldNum("cfg-tr-otlp-max-queue-bytes", t("config.field.otlp_max_queue_bytes"), o.max_queue_bytes ?? 67108864, { min: 0, step: 1048576, tip: t("config.tip.otlp_max_queue_bytes") })}
         ${fieldTextarea("cfg-tr-otlp-headers", t("config.field.otlp_headers"), o.headers || {}, { rows: 3, tip: t("config.tip.otlp_headers") })}
       </div>
 
@@ -5314,6 +6902,7 @@
             max_attribute_bytes: numOr($("cfg-pl-otlp-max-attribute-bytes"), 4096),
             headers: parseJsonInput($("cfg-pl-otlp-headers"), {}),
             max_queue_size: numOr($("cfg-pl-otlp-max-queue-size"), 10000),
+            max_queue_bytes: numOr($("cfg-pl-otlp-max-queue-bytes"), 67108864),
           },
         });
       } else if (kind === "trace") {
@@ -5357,6 +6946,7 @@
               max_attribute_bytes: numOr($("cfg-tr-otlp-max-attribute-bytes"), 4096),
               headers: parseJsonInput($("cfg-tr-otlp-headers"), {}),
               max_queue_size: numOr($("cfg-tr-otlp-max-queue-size"), 10000),
+              max_queue_bytes: numOr($("cfg-tr-otlp-max-queue-bytes"), 67108864),
             },
           }],
         ]);

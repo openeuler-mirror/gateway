@@ -40,6 +40,11 @@ pub struct OtlpConfig {
     /// `tracing::warn!` — the gateway must never block on OTLP.
     #[serde(default = "default_max_queue_size")]
     pub max_queue_size: usize,
+    /// In-memory queue byte budget. Bodies make span size unbounded, so a
+    /// count cap alone can't bound memory — when queued bytes exceed this,
+    /// oldest entries are dropped (same policy as `max_queue_size`).
+    #[serde(default = "default_max_queue_bytes")]
+    pub max_queue_bytes: usize,
 }
 
 impl Default for OtlpConfig {
@@ -55,6 +60,7 @@ impl Default for OtlpConfig {
             max_attribute_bytes: default_max_attribute_bytes(),
             headers: std::collections::HashMap::new(),
             max_queue_size: default_max_queue_size(),
+            max_queue_bytes: default_max_queue_bytes(),
         }
     }
 }
@@ -81,4 +87,8 @@ fn default_max_attribute_bytes() -> usize {
 
 fn default_max_queue_size() -> usize {
     10000
+}
+
+fn default_max_queue_bytes() -> usize {
+    64 * 1024 * 1024
 }

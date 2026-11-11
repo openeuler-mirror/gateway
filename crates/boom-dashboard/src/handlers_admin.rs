@@ -3683,6 +3683,314 @@ pub async fn delete_team(
 }
 
 // ═══════════════════════════════════════════════════════════
+// Daily Business Volume (analytics board)
+// ═══════════════════════════════════════════════════════════
+
+#[derive(Debug, Deserialize)]
+pub struct DailyStatsParams {
+    /// `?force=1` — re-aggregate from the DB before responding (manual
+    /// refresh button). String (not bool) so `force=1` works — serde's
+    /// bool only accepts literal `true`/`false` in query strings. Any
+    /// presence of the param triggers a refresh.
+    pub force: Option<String>,
+    /// `?range=today|1d|3d|7d` (default today).
+    pub range: Option<String>,
+}
+
+pub async fn get_daily_stats(
+    _session: AdminSession,
+    Query(params): Query<DailyStatsParams>,
+    Extension(state): Extension<Arc<DashboardState>>,
+) -> Response {
+    let range = match boom_audit::StatsRange::from_param(
+        params.range.as_deref().unwrap_or("today"),
+    ) {
+        Some(r) => r,
+        None => {
+            return Json(json!({
+                "ready": false,
+                "error": "invalid range (expected today|1d|3d|7d)",
+            }))
+            .into_response()
+        }
+    };
+    let Some(pool) = &state.db_pool else {
+        return Json(json!({
+            "ready": false,
+            "error": "daily stats unavailable (no database configured)",
+        }))
+        .into_response();
+    };
+    // Presence-based refresh: no background task keeps any window warm —
+    // the first request lazy-loads it, and while the page is being viewed
+    // the frontend poll re-aggregates at most once per TTL (5 min).
+    // Nobody viewing → no requests → zero DB sync.
+    let ttl = 300;
+    let snap = match state
+        .daily_stats
+        .snapshot_for(range, pool, ttl, params.force.is_some())
+        .await
+    {
+        Ok(s) => Some(s),
+        // Refresh failed: serve the last good snapshot rather than an
+        // unavailable page — stale data beats no data on a dashboard.
+        Err(e) => {
+            tracing::warn!("Daily stats refresh failed ({}): {e}", range.as_str());
+            state.daily_stats.current(range)
+        }
+    };
+    match snap {
+        Some(snap) => {
+            let mut v = serde_json::to_value(&*snap).unwrap_or_else(|_| json!({}));
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("ready".to_string(), json!(true));
+            }
+            Json(v).into_response()
+        }
+        // No snapshot yet: the first refresh is still pending or keeps
+        // failing. The frontend shows a loading/unavailable state instead
+        // of zeros — zeros here would read as "no traffic", which is a
+        // different message.
+        None => Json(json!({
+            "ready": false,
+            "error": "daily stats unavailable (refresh pending or failing)",
+        }))
+        .into_response(),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+// Analytics Detail Pages (model / consumption / schedule)
+// ═══════════════════════════════════════════════════════════
+//
+// Same presence-driven lifecycle as the daily stats above: lazy load on
+// first request, TTL 300s while the page is viewed, force=1 manual
+// refresh, stale snapshot served when a refresh fails. The caches live in
+// DashboardState.analytics (AnalyticsHub).
+
+/// Model drill-down from the analytics overview's model table.
+/// `model` is the requested model literal (the column the overview groups
+/// by — numbers reconcile exactly). Accepts `?range=today|1d|3d|7d&force=1`.
+pub async fn get_model_detail(
+    _session: AdminSession,
+    Path(model): Path<String>,
+    Query(params): Query<DailyStatsParams>,
+    Extension(state): Extension<Arc<DashboardState>>,
+) -> Response {
+    let range = match boom_audit::StatsRange::from_param(
+        params.range.as_deref().unwrap_or("today"),
+    ) {
+        Some(r) => r,
+        None => {
+            return Json(json!({
+                "ready": false,
+                "error": "invalid range (expected today|1d|3d|7d)",
+            }))
+            .into_response()
+        }
+    };
+    let Some(pool) = &state.db_pool else {
+        return Json(json!({
+            "ready": false,
+            "error": "model stats unavailable (no database configured)",
+        }))
+        .into_response();
+    };
+    let key = format!("{model}|{}", range.as_str());
+    let snap = match state
+        .analytics
+        .model
+        .get_or_refresh(&key, 300, params.force.is_some(), || {
+            boom_audit::analytics::query_model_detail(&model, range, pool)
+        })
+        .await
+    {
+        Ok(s) => Some(s),
+        // Refresh failed: serve the last good snapshot rather than an
+        // unavailable page — stale data beats no data on a dashboard.
+        Err(e) => {
+            tracing::warn!("Model detail refresh failed ({model}, {}): {e}", range.as_str());
+            state.analytics.model.current(&key)
+        }
+    };
+    match snap {
+        Some(snap) => {
+            let mut v = serde_json::to_value(&*snap).unwrap_or_else(|_| json!({}));
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("ready".to_string(), json!(true));
+            }
+            Json(v).into_response()
+        }
+        None => Json(json!({
+            "ready": false,
+            "error": "model stats unavailable (refresh pending or failing)",
+        }))
+        .into_response(),
+    }
+}
+
+/// Consumption overview: token spend by key / team / end-user tag / client
+/// IP plus a token-volume series. Accepts `?range=today|1d|3d|7d&force=1`.
+pub async fn get_consumption_stats(
+    _session: AdminSession,
+    Query(params): Query<DailyStatsParams>,
+    Extension(state): Extension<Arc<DashboardState>>,
+) -> Response {
+    let range = match boom_audit::StatsRange::from_param(
+        params.range.as_deref().unwrap_or("today"),
+    ) {
+        Some(r) => r,
+        None => {
+            return Json(json!({
+                "ready": false,
+                "error": "invalid range (expected today|1d|3d|7d)",
+            }))
+            .into_response()
+        }
+    };
+    let Some(pool) = &state.db_pool else {
+        return Json(json!({
+            "ready": false,
+            "error": "consumption stats unavailable (no database configured)",
+        }))
+        .into_response();
+    };
+    let key = range.as_str().to_string();
+    let snap = match state
+        .analytics
+        .consumption
+        .get_or_refresh(&key, 300, params.force.is_some(), || {
+            boom_audit::analytics::query_consumption(range, pool)
+        })
+        .await
+    {
+        Ok(s) => Some(s),
+        Err(e) => {
+            tracing::warn!("Consumption refresh failed ({}): {e}", range.as_str());
+            state.analytics.consumption.current(&key)
+        }
+    };
+    match snap {
+        Some(snap) => {
+            let mut v = serde_json::to_value(&*snap).unwrap_or_else(|_| json!({}));
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("ready".to_string(), json!(true));
+            }
+            Json(v).into_response()
+        }
+        None => Json(json!({
+            "ready": false,
+            "error": "consumption stats unavailable (refresh pending or failing)",
+        }))
+        .into_response(),
+    }
+}
+
+/// Single-key consumption drill-down. Direct query (no cache — key
+/// cardinality is unbounded); accepts `?range=today|1d|3d|7d`.
+pub async fn get_consumption_key_detail(
+    _session: AdminSession,
+    Path(key_hash): Path<String>,
+    Query(params): Query<DailyStatsParams>,
+    Extension(state): Extension<Arc<DashboardState>>,
+) -> Response {
+    let range = match boom_audit::StatsRange::from_param(
+        params.range.as_deref().unwrap_or("today"),
+    ) {
+        Some(r) => r,
+        None => {
+            return Json(json!({
+                "ready": false,
+                "error": "invalid range (expected today|1d|3d|7d)",
+            }))
+            .into_response()
+        }
+    };
+    let Some(pool) = &state.db_pool else {
+        return Json(json!({
+            "ready": false,
+            "error": "key stats unavailable (no database configured)",
+        }))
+        .into_response();
+    };
+    match boom_audit::analytics::query_key_consumption_detail(&key_hash, range, pool).await {
+        Ok(snap) => {
+            let mut v = serde_json::to_value(&snap).unwrap_or_else(|_| json!({}));
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("ready".to_string(), json!(true));
+            }
+            Json(v).into_response()
+        }
+        Err(e) => {
+            tracing::warn!("Key consumption detail failed ({key_hash}): {e}");
+            Json(json!({
+                "ready": false,
+                "error": "key stats query failed",
+            }))
+            .into_response()
+        }
+    }
+}
+
+/// Schedule & cache history: policy distribution trend, KV/trie/provider
+/// cache ratio trends, per-policy comparison. Accepts
+/// `?range=today|1d|3d|7d&force=1`.
+pub async fn get_schedule_stats(
+    _session: AdminSession,
+    Query(params): Query<DailyStatsParams>,
+    Extension(state): Extension<Arc<DashboardState>>,
+) -> Response {
+    let range = match boom_audit::StatsRange::from_param(
+        params.range.as_deref().unwrap_or("today"),
+    ) {
+        Some(r) => r,
+        None => {
+            return Json(json!({
+                "ready": false,
+                "error": "invalid range (expected today|1d|3d|7d)",
+            }))
+            .into_response()
+        }
+    };
+    let Some(pool) = &state.db_pool else {
+        return Json(json!({
+            "ready": false,
+            "error": "schedule stats unavailable (no database configured)",
+        }))
+        .into_response();
+    };
+    let key = range.as_str().to_string();
+    let snap = match state
+        .analytics
+        .schedule
+        .get_or_refresh(&key, 300, params.force.is_some(), || {
+            boom_audit::analytics::query_schedule(range, pool)
+        })
+        .await
+    {
+        Ok(s) => Some(s),
+        Err(e) => {
+            tracing::warn!("Schedule refresh failed ({}): {e}", range.as_str());
+            state.analytics.schedule.current(&key)
+        }
+    };
+    match snap {
+        Some(snap) => {
+            let mut v = serde_json::to_value(&*snap).unwrap_or_else(|_| json!({}));
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("ready".to_string(), json!(true));
+            }
+            Json(v).into_response()
+        }
+        None => Json(json!({
+            "ready": false,
+            "error": "schedule stats unavailable (refresh pending or failing)",
+        }))
+        .into_response(),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
 // In-Flight Request Stats (real-time)
 // ═══════════════════════════════════════════════════════════
 
@@ -4439,11 +4747,11 @@ pub async fn get_agent_stats(
             r#"SELECT
                  (FLOOR((EXTRACT(EPOCH FROM created_at) - $1) / $2) * $2 + $1)::bigint AS bucket_epoch,
                  COUNT(*)::bigint AS total,
-                 COUNT(*) FILTER (WHERE api_path LIKE '/v1/messages%')::bigint AS anthropic,
+                 COUNT(CASE WHEN api_path LIKE '/v1/messages%' THEN 1 END)::bigint AS anthropic,
                  COALESCE(SUM(input_tokens), 0)::bigint AS input_tokens_total,
-                 COALESCE(SUM(input_tokens) FILTER (WHERE api_path LIKE '/v1/messages%'), 0)::bigint AS input_tokens_anthropic,
+                 COALESCE(SUM(CASE WHEN api_path LIKE '/v1/messages%' THEN input_tokens END), 0)::bigint AS input_tokens_anthropic,
                  COALESCE(SUM(output_tokens), 0)::bigint AS output_tokens_total,
-                 COALESCE(SUM(output_tokens) FILTER (WHERE api_path LIKE '/v1/messages%'), 0)::bigint AS output_tokens_anthropic
+                 COALESCE(SUM(CASE WHEN api_path LIKE '/v1/messages%' THEN output_tokens END), 0)::bigint AS output_tokens_anthropic
                FROM boom_request_log
                WHERE created_at >= $3 AND created_at < $4
                  AND status_code = 200

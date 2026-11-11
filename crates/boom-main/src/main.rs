@@ -309,6 +309,7 @@ fn build_router(state: AppState) -> Router {
         state.stressmon.clone(),
         state.trace.clone() as Arc<dyn boom_core::TraceApi>,
         state.alerts.clone() as Arc<dyn boom_core::AlertApi>,
+        state.daily_stats.clone(),
     );
     let dashboard_router = boom_dashboard::build_router(dashboard_state);
 

@@ -161,8 +161,8 @@ fn span_set_attribute_replaces_and_body_setters() {
     assert_eq!(span.attributes.len(), 2);
 
     let body = std::sync::Arc::new(serde_json::json!({"messages": []}));
-    span.set_llm_request(body.clone());
-    span.set_llm_response(body.clone());
+    span.set_llm_request(body.clone(), 0);
+    span.set_llm_response(body.clone(), 0);
     assert_eq!(span.attributes.len(), 4); // k, other, llm_request, llm_response
     span.set_deployment_id("dep-1".to_string());
     assert_eq!(span.deployment_id.as_deref(), Some("dep-1"));
@@ -369,8 +369,8 @@ async fn guard_attribute_setters_and_child_span_id() {
     .expect("started");
     assert_eq!(g.request_id(), "req-4");
     g.set_attribute("custom", SpanAttributeValue::String("v".to_string()));
-    g.set_llm_request(body.clone());
-    g.set_llm_response(body.clone());
+    g.set_llm_request(body.clone(), 0);
+    g.set_llm_response(body.clone(), 0);
     let child_id = g.child_parent_span_id();
     assert_ne!(child_id, [0u8; 8]); // 非零
     assert_ne!(child_id, w.parent_span_id); // 与 parent 不同

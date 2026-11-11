@@ -663,35 +663,15 @@ async fn chat_completions_inner(
 
     tracing::info!(request_id = %request_id, model = %model, stream = is_stream, path = api_path, "chat_completions request started");
 
-    // Shared request-body Value — ONE serialization serves the client
-    // blocklist check and the prompt log. Skipped entirely when neither is
-    // armed (no rules / switch off / key not sampled) so the blocklist costs
-    // nothing on deployments that don't use it.
-    let prompt_log_should = state.prompt_log_writer.should_capture(
-        &identity.key_hash,
-        identity.team_id.as_deref(),
-    );
-    let blocklist_armed =
-        state.block_rule_store.is_enabled() && !state.block_rule_store.is_empty();
-    let req_body_value: Option<Arc<serde_json::Value>> =
-        if blocklist_armed || prompt_log_should {
-            serde_json::to_value(&req).ok().map(Arc::new)
-        } else {
-            None
-        };
-
-    // Fold `"tools": []` to None before any routing consumer sees it (vLLM
-    // and friends reject the empty array). Placed after the serialization
-    // above so the prompt log / blocklist keep the wire-faithful body.
-    req.normalize_empty_tools();
-
-    // Client blocklist — before any routing/limit work. Fail-open on body
-    // serialization failure (schema validation rejects the request anyway).
-    check_client_block_rules(
+    // Shared edge prep (blocklist + prompt-log + trace body capture) —
+    // dedup'd with the messages/responses handlers via prepare_edge_request;
+    // field-level changes land there, not per-handler.
+    let trace_cfg = inner.config.trace.clone().unwrap_or_default();
+    let prep = prepare_edge_request(
         &state,
-        &identity,
-        headers,
-        if blocklist_armed { req_body_value.clone() } else { None },
+        identity,
+        &headers,
+        &req,
         &model,
         api_path,
         is_stream,
@@ -701,56 +681,27 @@ async fn chat_completions_inner(
         start,
     )
     .map_err(|e| GatewayErrorReply(e, is_stream))?;
+    let prompt_log_should = prep.prompt_log_should;
+    let prompt_log_raw_capture = prep.raw_capture;
+    let prompt_log_req_body = prep.req_body;
+    let shared_req_body = prep.body;
+    let prompt_log_sender = prep.sender;
+    let prompt_log_rid = prep.rid;
+    let prompt_log_model = prep.model;
+    let prompt_log_headers = prep.headers;
+    let prompt_log_trace_id = prep.trace_id;
 
-    // Raw exchange capture channel — handed to the provider via the request
-    // side channel; the provider records the exact bytes it sends/receives.
-    let prompt_log_raw_capture = if prompt_log_should
-        && state.prompt_log_writer.config().capture_raw_upstream
-    {
-        Some(std::sync::Arc::new(
-            boom_core::provider::RawCaptureChannel::default(),
-        ))
-    } else {
-        None
-    };
-    let prompt_log_req_body = if prompt_log_should {
-        req_body_value
-    } else {
-        None
-    };
-    let prompt_log_sender = if prompt_log_should {
-        Some(state.prompt_log_writer.sender())
-    } else {
-        None
-    };
-    // Clone request_id and model for prompt log (they get moved into RequestLog later).
-    let prompt_log_rid = if prompt_log_should { Some(request_id.clone()) } else { None };
-    let prompt_log_model = if prompt_log_should { Some(model.clone()) } else { None };
-    // Snapshot whitelisted request headers (only when configured).
-    let prompt_log_headers: Option<std::collections::HashMap<String, String>> = if prompt_log_should {
-        snapshot_prompt_log_headers(&state, headers)
-    } else {
-        None
-    };
-    // Extract trace_id from W3C traceparent header (if present). When absent
-    // the prompt log exporter mints a synthetic one from the request_id, so
-    // we don't need to fall back here. Carried separately so it can be
-    // stamped into BOTH the Request-phase and Response-phase entries.
-    let prompt_log_trace_id: Option<String> = if prompt_log_should {
-        headers
-            .get("traceparent")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string())
-    } else {
-        None
-    };
+    // Fold `"tools": []` to None before any routing consumer sees it (vLLM
+    // and friends reject the empty array). prepare_edge_request serialized
+    // the wire-faithful body first, so the blocklist / prompt log / trace
+    // span keep the original body.
+    req.normalize_empty_tools();
 
     // Trace channel: parse W3C context, run filter, open a TraceGuard if the
     // request qualifies. The guard lives for the handler scope and finalizes
     // on Drop (OK or ERROR based on whether `mark_error` was called). Body
     // Arc is shared between the span's `llm_request` / `llm_response`
     // attributes and the prompt log entry — zero-copy.
-    let trace_cfg = inner.config.trace.clone().unwrap_or_default();
     let w3c_ctx: Option<W3cContext> = headers
         .get("traceparent")
         .and_then(|v| v.to_str().ok())
@@ -775,11 +726,12 @@ async fn chat_completions_inner(
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64,
         should_trace,
     );
-    // Capture request body for the span attribute (if capture_body on). Same
-    // Arc as the prompt log entry — shared, zero-copy.
-    if let (Some(g), Some(body)) = (trace_guard.as_ref(), prompt_log_req_body.as_ref()) {
+    // Capture request body for the span attribute (if capture_body on). Uses
+    // the shared prep body so trace body capture works with the prompt log
+    // off or the key excluded — the channels switch independently.
+    if let (Some(g), Some(body)) = (trace_guard.as_ref(), shared_req_body.as_ref()) {
         if trace_cfg.capture_body {
-            g.set_llm_request(body.clone());
+            g.set_llm_request(body.clone(), trace_cfg.max_body_bytes);
         }
     }
 
@@ -1046,6 +998,10 @@ async fn chat_completions_inner(
         }
 
         let api_path_owned = api_path.to_string();
+        // The span-stamping sinks below need the id (and model for the
+        // assembled response) after both move into RequestLog.
+        let trace_sink_rid = request_id.clone();
+        let trace_sink_model = model.clone();
         let logged = LoggedStream::new(guarded, state.log_writer.clone(), RequestLog {
             request_id: Some(request_id),
             key_hash: identity.key_hash.clone(),
@@ -1107,7 +1063,7 @@ async fn chat_completions_inner(
                 // reflects this request even if the client disconnects before
                 // any upstream bytes arrive. The stream wrapper's Drop will
                 // emit the matching Response-phase entry via `new_response_from`.
-                let _ = sender.send(prompt_entry.clone());
+                let _ = sender.try_send(prompt_entry.clone());
                 let response_id_slot = new_streamed_response_id_slot();
                 let mut prompt_logged = PromptLogStream::new(
                     logged,
@@ -1115,6 +1071,16 @@ async fn chat_completions_inner(
                     prompt_entry,
                     sse_raw_data_extractor(response_id_slot.clone()),
                 );
+                // Trace llm_response for streams: the sink stamps the
+                // assembled response on the still-active span BEFORE the
+                // inner LoggedStream's Drop finalizes it.
+                if trace_cfg.enabled && trace_cfg.capture_body {
+                    let reg = state.trace.clone();
+                    let maxb = trace_cfg.max_body_bytes;
+                    prompt_logged = prompt_logged.with_response_sink(Arc::new(move |resp| {
+                        reg.set_span_response_body(&trace_sink_rid, Arc::clone(resp), maxb);
+                    }));
+                }
                 // The enricher runs after the wrapper's Drop assembled the
                 // response: stamp the upstream response id (chatcmpl-…)
                 // captured from the chunks over the request-uuid placeholder,
@@ -1141,6 +1107,25 @@ async fn chat_completions_inner(
                     Sse::new(sse_item_to_event(prompt_logged)).keep_alive(KeepAlive::default());
                 return Ok(response.into_response());
             }
+        } else if trace_cfg.enabled && trace_cfg.capture_body {
+            // Trace-only stream (prompt log off or key excluded): wrap
+            // purely to assemble the streamed response and stamp it on the
+            // span — symmetric with the non-stream trace-only path and with
+            // the request-side capture. No prompt log entry ships.
+            let reg = state.trace.clone();
+            let maxb = trace_cfg.max_body_bytes;
+            let trace_logged = PromptLogStream::new_trace_only(
+                logged,
+                trace_sink_rid.clone(),
+                trace_sink_model.clone(),
+                sse_raw_data_extractor(new_streamed_response_id_slot()),
+            )
+            .with_response_sink(Arc::new(move |resp| {
+                reg.set_span_response_body(&trace_sink_rid, Arc::clone(resp), maxb);
+            }));
+            let response =
+                Sse::new(sse_item_to_event(trace_logged)).keep_alive(KeepAlive::default());
+            return Ok(response.into_response());
         }
         let response = Sse::new(sse_item_to_event(logged)).keep_alive(KeepAlive::default());
         Ok(response.into_response())
@@ -1261,6 +1246,15 @@ async fn chat_completions_inner(
             choice.message.normalize_reasoning_for_openai();
         }
 
+        // Assembled response body — ONE Arc shared by the prompt log entry
+        // and the trace span; built when either channel wants it so trace
+        // body capture works with the prompt log off or the key excluded.
+        let resp_arc: Option<Arc<serde_json::Value>> =
+            if prompt_log_sender.is_some() || (trace_cfg.enabled && trace_cfg.capture_body) {
+                Some(Arc::new(serde_json::to_value(&resp).unwrap_or(serde_json::Value::Null)))
+            } else {
+                None
+            };
         // Prompt log: emit Request-phase immediately, then Response-phase
         // with the assembled response body and status. (For non-streaming,
         // both phases fire nearly back-to-back; that's fine.)
@@ -1279,15 +1273,10 @@ async fn chat_completions_inner(
                     Some(client_ip.as_str()),
                     prompt_log_headers.clone(),
                 );
-                let _ = sender.send(request_entry.clone());
+                let _ = sender.try_send(request_entry.clone());
                 let mut response_entry = PromptLogEntry::new_response_from(&request_entry);
-                let resp_arc = Arc::new(serde_json::to_value(&resp).unwrap_or(serde_json::Value::Null));
-                response_entry.set_response(resp_arc.clone());
-                // Span sees the same Arc — zero-copy body single-source.
-                if let Some(g) = trace_guard.as_ref() {
-                    if trace_cfg.capture_body {
-                        g.set_llm_response(resp_arc);
-                    }
+                if let Some(ra) = resp_arc.clone() {
+                    response_entry.set_response(ra);
                 }
                 if let Some(trace) = provider_prompt_trace.as_ref() {
                     trace.finalize();
@@ -1299,7 +1288,13 @@ async fn chat_completions_inner(
                     response_entry.set_raw_exchange(cap.take_request_body(), cap.take_response_body());
                 }
                 response_entry.set_status(200, duration_ms as u64);
-                let _ = sender.send(response_entry);
+                let _ = sender.try_send(response_entry);
+            }
+        }
+        // Span sees the same Arc — zero-copy body single-source.
+        if let (Some(g), Some(ra)) = (trace_guard.as_ref(), resp_arc) {
+            if trace_cfg.capture_body {
+                g.set_llm_response(ra, trace_cfg.max_body_bytes);
             }
         }
 
@@ -3258,6 +3253,7 @@ pub async fn messages(
     let prompt_log_should = prep.prompt_log_should;
     let prompt_log_raw_capture = prep.raw_capture;
     let prompt_log_req_body = prep.req_body;
+    let shared_req_body = prep.body;
     let prompt_log_sender = prep.sender;
     let prompt_log_rid = prep.rid;
     let prompt_log_model = prep.model;
@@ -3291,9 +3287,11 @@ pub async fn messages(
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64,
         should_trace,
     );
-    if let (Some(g), Some(body)) = (trace_guard.as_ref(), prompt_log_req_body.as_ref()) {
+    // Span body capture uses the shared prep body — independent of the prompt
+    // log being enabled for this key.
+    if let (Some(g), Some(body)) = (trace_guard.as_ref(), shared_req_body.as_ref()) {
         if trace_cfg.capture_body {
-            g.set_llm_request(body.clone());
+            g.set_llm_request(body.clone(), trace_cfg.max_body_bytes);
         }
     }
 
@@ -3531,6 +3529,9 @@ pub async fn messages(
         }
 
         // Wrap with LoggedStream — log is written when stream finishes (Drop).
+        // Sink id/model kept alive past the RequestLog move (see chat path).
+        let trace_sink_rid = request_id.clone();
+        let trace_sink_model = model.clone();
         let logged = LoggedStream::new(guarded, state.log_writer.clone(), RequestLog {
             request_id: Some(request_id),
             key_hash: identity.key_hash.clone(),
@@ -3586,7 +3587,7 @@ pub async fn messages(
                 );
                 // Request-phase fires immediately. Stream wrapper's Drop
                 // emits the Response-phase entry with assembled content.
-                let _ = sender.send(prompt_entry.clone());
+                let _ = sender.try_send(prompt_entry.clone());
                 let response_id_slot = new_streamed_response_id_slot();
                 let mut prompt_logged = PromptLogStream::new(
                     logged,
@@ -3594,6 +3595,14 @@ pub async fn messages(
                     prompt_entry,
                     sse_anthropic_extractor(response_id_slot.clone()),
                 );
+                // Trace llm_response for streams — see chat path comment.
+                if trace_cfg.enabled && trace_cfg.capture_body {
+                    let reg = state.trace.clone();
+                    let maxb = trace_cfg.max_body_bytes;
+                    prompt_logged = prompt_logged.with_response_sink(Arc::new(move |resp| {
+                        reg.set_span_response_body(&trace_sink_rid, Arc::clone(resp), maxb);
+                    }));
+                }
                 // Stamp the transcoded message id (msg_…) captured from
                 // message_start over the request-uuid placeholder, then
                 // inject the raw upstream exchange — after the inner stream
@@ -3609,6 +3618,23 @@ pub async fn messages(
                 let response = Sse::new(sse_item_to_event(prompt_logged)).keep_alive(KeepAlive::default());
                 return Ok(response.into_response());
             }
+        } else if trace_cfg.enabled && trace_cfg.capture_body {
+            // Trace-only stream — see the chat path comment. Anthropic
+            // extractor drives the assembly.
+            let reg = state.trace.clone();
+            let maxb = trace_cfg.max_body_bytes;
+            let trace_logged = PromptLogStream::new_trace_only(
+                logged,
+                trace_sink_rid.clone(),
+                trace_sink_model.clone(),
+                sse_anthropic_extractor(new_streamed_response_id_slot()),
+            )
+            .with_response_sink(Arc::new(move |resp| {
+                reg.set_span_response_body(&trace_sink_rid, Arc::clone(resp), maxb);
+            }));
+            let response =
+                Sse::new(sse_item_to_event(trace_logged)).keep_alive(KeepAlive::default());
+            return Ok(response.into_response());
         }
         let response = Sse::new(sse_item_to_event(logged)).keep_alive(KeepAlive::default());
         Ok(response.into_response())
@@ -3721,6 +3747,15 @@ pub async fn messages(
 
         let anthropic_resp = openai_response_to_anthropic(&response);
 
+        // Assembled response body — ONE Arc shared by the prompt log entry
+        // and the trace span; built when either channel wants it so trace
+        // body capture works with the prompt log off or the key excluded.
+        let resp_arc: Option<Arc<serde_json::Value>> =
+            if prompt_log_sender.is_some() || (trace_cfg.enabled && trace_cfg.capture_body) {
+                Some(Arc::new(serde_json::to_value(&anthropic_resp).unwrap_or(serde_json::Value::Null)))
+            } else {
+                None
+            };
         // Prompt log: emit Request-phase immediately, then Response-phase with
         // the converted Anthropic response. The raw gateway→upstream exchange
         // (when enabled) travels only on the Response-phase entry.
@@ -3739,21 +3774,22 @@ pub async fn messages(
                     Some(client_ip.as_str()),
                     prompt_log_headers.clone(),
                 );
-                let _ = sender.send(request_entry.clone());
+                let _ = sender.try_send(request_entry.clone());
                 let mut response_entry = PromptLogEntry::new_response_from(&request_entry);
                 if let Some(cap) = prompt_log_raw_capture.as_ref() {
                     response_entry.set_raw_exchange(cap.take_request_body(), cap.take_response_body());
                 }
-                let resp_arc = Arc::new(serde_json::to_value(&anthropic_resp).unwrap_or(serde_json::Value::Null));
-                response_entry.set_response(resp_arc.clone());
-                // Span sees the same Arc — zero-copy body single-source.
-                if let Some(g) = trace_guard.as_ref() {
-                    if trace_cfg.capture_body {
-                        g.set_llm_response(resp_arc);
-                    }
+                if let Some(ra) = resp_arc.clone() {
+                    response_entry.set_response(ra);
                 }
                 response_entry.set_status(200, duration_ms as u64);
-                let _ = sender.send(response_entry);
+                let _ = sender.try_send(response_entry);
+            }
+        }
+        // Span sees the same Arc — zero-copy body single-source.
+        if let (Some(g), Some(ra)) = (trace_guard.as_ref(), resp_arc) {
+            if trace_cfg.capture_body {
+                g.set_llm_response(ra, trace_cfg.max_body_bytes);
             }
         }
 
@@ -3916,15 +3952,22 @@ impl From<GatewayError> for AnthropicErrorReply {
 /// whole middle of the pipeline (auth → limits → routing → provider →
 /// audit/计费 wrappers) is the shared chat machinery (Response.md §6.6).
 /// Edge-request observability prep shared by the protocol-edge handlers
-/// (messages / responses): ONE body serialization feeds the blocklist check
-/// and the prompt log; prompt-log capture fields are gathered once. This is
-/// the dedup point the three-pipeline review asked for — field-level changes
-/// land HERE, not per-handler.
+/// (chat / messages / responses): ONE body serialization feeds the blocklist
+/// check, the prompt log, and the trace span's body capture; prompt-log
+/// capture fields are gathered once. This is the dedup point the
+/// three-pipeline review asked for — field-level changes land HERE, not
+/// per-handler.
 struct EdgeRequestPrep {
     prompt_log_should: bool,
     raw_capture: Option<Arc<boom_core::provider::RawCaptureChannel>>,
+    /// Prompt-log-gated view of `body` (None when the key/team is excluded).
     req_body: Option<Arc<serde_json::Value>>,
-    sender: Option<tokio::sync::mpsc::UnboundedSender<boom_promptlog::PromptLogEntry>>,
+    /// Shared serialized body — Some whenever ANY consumer needs it
+    /// (blocklist / prompt log / trace body capture). Trace reads this so
+    /// its body capture works with the prompt log off or the key excluded —
+    /// the two channels switch independently.
+    body: Option<Arc<serde_json::Value>>,
+    sender: Option<boom_promptlog::PromptLogSender>,
     rid: Option<String>,
     model: Option<String>,
     headers: Option<std::collections::HashMap<String, String>>,
@@ -3951,8 +3994,13 @@ fn prepare_edge_request<T: serde::Serialize>(
     );
     let blocklist_armed =
         state.block_rule_store.is_enabled() && !state.block_rule_store.is_empty();
+    // Trace votes on body construction independently: enabled && capture_body
+    // is channel-level (every span carries the same attribute set), not
+    // per-request — per-request export filtering stays in the handler.
+    let trace_cfg = state.inner.load().config.trace.clone().unwrap_or_default();
+    let trace_wants_body = trace_cfg.enabled && trace_cfg.capture_body;
     let req_body_value: Option<Arc<serde_json::Value>> =
-        if blocklist_armed || prompt_log_should {
+        if blocklist_armed || prompt_log_should || trace_wants_body {
             serde_json::to_value(req).ok().map(Arc::new)
         } else {
             None
@@ -3974,7 +4022,7 @@ fn prepare_edge_request<T: serde::Serialize>(
 
     let capture_raw =
         prompt_log_should && state.prompt_log_writer.config().capture_raw_upstream;
-    let pl_req_body = if prompt_log_should { req_body_value } else { None };
+    let pl_req_body = if prompt_log_should { req_body_value.clone() } else { None };
     Ok(EdgeRequestPrep {
         prompt_log_should,
         raw_capture: if capture_raw {
@@ -3983,6 +4031,7 @@ fn prepare_edge_request<T: serde::Serialize>(
             None
         },
         req_body: pl_req_body,
+        body: req_body_value,
         sender: if prompt_log_should { Some(state.prompt_log_writer.sender()) } else { None },
         rid: if prompt_log_should { Some(request_id.to_string()) } else { None },
         model: if prompt_log_should { Some(model.to_string()) } else { None },
@@ -4128,6 +4177,7 @@ pub async fn responses(
     let prompt_log_should = prep.prompt_log_should;
     let prompt_log_raw_capture = prep.raw_capture;
     let prompt_log_req_body = prep.req_body;
+    let shared_req_body = prep.body;
     let prompt_log_sender = prep.sender;
     let prompt_log_rid = prep.rid;
     let prompt_log_model = prep.model;
@@ -4159,9 +4209,11 @@ pub async fn responses(
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64,
         should_trace,
     );
-    if let (Some(g), Some(body)) = (trace_guard.as_ref(), prompt_log_req_body.as_ref()) {
+    // Span body capture uses the shared prep body — independent of the prompt
+    // log being enabled for this key.
+    if let (Some(g), Some(body)) = (trace_guard.as_ref(), shared_req_body.as_ref()) {
         if trace_cfg.capture_body {
-            g.set_llm_request(body.clone());
+            g.set_llm_request(body.clone(), trace_cfg.max_body_bytes);
         }
     }
 
@@ -4451,6 +4503,9 @@ pub async fn responses(
             state.request_rate.record(did, &inflight_model);
         }
 
+        // Sink id/model kept alive past the RequestLog move (see chat path).
+        let trace_sink_rid = request_id.clone();
+        let trace_sink_model = model.clone();
         let logged = LoggedStream::new(guarded, state.log_writer.clone(), RequestLog {
             request_id: Some(request_id),
             key_hash: identity.key_hash.clone(),
@@ -4501,7 +4556,7 @@ pub async fn responses(
                     Some(&client_ip.as_str()),
                     prompt_log_headers.clone(),
                 );
-                let _ = sender.send(prompt_entry.clone());
+                let _ = sender.try_send(prompt_entry.clone());
                 let response_id_slot = new_streamed_response_id_slot();
                 let mut prompt_logged = PromptLogStream::new(
                     logged,
@@ -4509,6 +4564,14 @@ pub async fn responses(
                     prompt_entry,
                     sse_responses_extractor(response_id_slot.clone()),
                 );
+                // Trace llm_response for streams — see chat path comment.
+                if trace_cfg.enabled && trace_cfg.capture_body {
+                    let reg = state.trace.clone();
+                    let maxb = trace_cfg.max_body_bytes;
+                    prompt_logged = prompt_logged.with_response_sink(Arc::new(move |resp| {
+                        reg.set_span_response_body(&trace_sink_rid, Arc::clone(resp), maxb);
+                    }));
+                }
                 // Stamp the gateway-minted resp_ id (captured from
                 // response.created — the id the client chains on with
                 // previous_response_id) over the request-uuid placeholder,
@@ -4530,6 +4593,30 @@ pub async fn responses(
                 }
                 return Ok(resp);
             }
+        } else if trace_cfg.enabled && trace_cfg.capture_body {
+            // Trace-only stream — see the chat path comment. Responses
+            // extractor drives the assembly; dropped-tools header mirrors
+            // the other two branches.
+            let reg = state.trace.clone();
+            let maxb = trace_cfg.max_body_bytes;
+            let trace_logged = PromptLogStream::new_trace_only(
+                logged,
+                trace_sink_rid.clone(),
+                trace_sink_model.clone(),
+                sse_responses_extractor(new_streamed_response_id_slot()),
+            )
+            .with_response_sink(Arc::new(move |resp| {
+                reg.set_span_response_body(&trace_sink_rid, Arc::clone(resp), maxb);
+            }));
+            let response =
+                Sse::new(sse_item_to_event(trace_logged)).keep_alive(KeepAlive::default());
+            let mut resp = response.into_response();
+            if let Some(v) = dropped_header.take() {
+                if let Ok(hv) = axum::http::HeaderValue::from_str(&v) {
+                    resp.headers_mut().insert("x-boom-dropped-tools", hv);
+                }
+            }
+            return Ok(resp);
         }
         let response = Sse::new(sse_item_to_event(logged)).keep_alive(KeepAlive::default());
         let mut resp = response.into_response();
@@ -4643,6 +4730,15 @@ pub async fn responses(
         )
         .unwrap_or(serde_json::Value::Null);
 
+        // Assembled response body — ONE Arc shared by the prompt log entry
+        // and the trace span; built when either channel wants it so trace
+        // body capture works with the prompt log off or the key excluded.
+        let resp_arc: Option<Arc<serde_json::Value>> =
+            if prompt_log_sender.is_some() || (trace_cfg.enabled && trace_cfg.capture_body) {
+                Some(Arc::new(responses_value.clone()))
+            } else {
+                None
+            };
         // Prompt log (non-stream): emit Request-phase then Response-phase
         // with the assembled ResponseObject — mirrors the chat-completions
         // non-stream path. Stream requests are wrapped by PromptLogStream in
@@ -4663,21 +4759,23 @@ pub async fn responses(
                     Some(client_ip.as_str()),
                     prompt_log_headers.clone(),
                 );
-                let _ = sender.send(request_entry.clone());
+                let _ = sender.try_send(request_entry.clone());
                 let mut response_entry = PromptLogEntry::new_response_from(&request_entry);
-                let resp_arc = Arc::new(responses_value.clone());
-                response_entry.set_response(resp_arc.clone());
-                if let Some(g) = trace_guard.as_ref() {
-                    if trace_cfg.capture_body {
-                        g.set_llm_response(resp_arc);
-                    }
+                if let Some(ra) = resp_arc.clone() {
+                    response_entry.set_response(ra);
                 }
                 if let Some(cap) = prompt_log_raw_capture.as_ref() {
                     response_entry
                         .set_raw_exchange(cap.take_request_body(), cap.take_response_body());
                 }
                 response_entry.set_status(200, duration_ms as u64);
-                let _ = sender.send(response_entry);
+                let _ = sender.try_send(response_entry);
+            }
+        }
+        // Span sees the same Arc — zero-copy body single-source.
+        if let (Some(g), Some(ra)) = (trace_guard.as_ref(), resp_arc) {
+            if trace_cfg.capture_body {
+                g.set_llm_response(ra, trace_cfg.max_body_bytes);
             }
         }
 
@@ -4798,8 +4896,10 @@ fn sse_stream_from_responses_chat_stream(
                     event: Event::default().event(&ev.event).data(&ev.data),
                     json_data: ev.data,
                 };
+                // No client_gone flag here: drain() is eager, so the
+                // transcoder already reached its terminal state — dropping
+                // the remaining events can't strand the persist tail.
                 if tx.send(item).await.is_err() {
-                    client_gone = true;
                     break;
                 }
             }
@@ -5376,6 +5476,138 @@ mod tests {
         assert!(!is_vip_key(&meta));
     }
 
+    fn test_identity() -> boom_core::types::AuthIdentity {
+        boom_core::types::AuthIdentity {
+            key_hash: "k".to_string(),
+            key_name: None,
+            key_alias: None,
+            user_id: None,
+            team_id: None,
+            team_alias: None,
+            models: vec![],
+            team_models: vec![],
+            rpm_limit: None,
+            tpm_limit: None,
+            max_parallel_requests: None,
+            max_budget: None,
+            budget_period_secs: None,
+            spend: 0.0,
+            blocked: false,
+            expires_at: None,
+            metadata: serde_json::Value::Null,
+        }
+    }
+
+    async fn state_from_yaml(yaml: &str) -> crate::state::AppState {
+        let config: boom_config::Config = serde_yaml::from_str(yaml).expect("parse config yaml");
+        crate::state::AppState::from_config(config, None)
+            .await
+            .expect("build AppState")
+    }
+
+    #[tokio::test]
+    async fn trace_only_mode_still_captures_shared_body() {
+        // Regression for the trace↔prompt-log decoupling: with the prompt log
+        // off (and no blocklist rules), trace's enabled+capture_body must
+        // still construct the shared body. The old gate starved trace of
+        // body capture whenever the prompt log was disabled or excluded the
+        // key.
+        let state = state_from_yaml(
+            r#"
+server: { port: 18080 }
+general_settings:
+  master_key: sk-test-master-000000
+trace:
+  enabled: true
+  capture_body: true
+"#,
+        )
+        .await;
+        let prep = super::prepare_edge_request(
+            &state,
+            &test_identity(),
+            &HeaderMap::new(),
+            &json!({"model": "m", "messages": []}),
+            "m",
+            "/v1/chat/completions",
+            false,
+            "req-trace-only",
+            "127.0.0.1",
+            [None, None, None],
+            std::time::Instant::now(),
+        )
+        .expect("prep ok");
+        assert!(prep.body.is_some(), "trace-only mode must construct the shared body");
+        assert!(prep.req_body.is_none(), "prompt log stays off");
+        assert!(!prep.prompt_log_should);
+    }
+
+    #[tokio::test]
+    async fn all_channels_off_constructs_no_body() {
+        // Zero overhead when no consumer wants the body.
+        let state = state_from_yaml(
+            r#"
+server: { port: 18080 }
+general_settings:
+  master_key: sk-test-master-000000
+"#,
+        )
+        .await;
+        let prep = super::prepare_edge_request(
+            &state,
+            &test_identity(),
+            &HeaderMap::new(),
+            &json!({"model": "m", "messages": []}),
+            "m",
+            "/v1/chat/completions",
+            false,
+            "req-all-off",
+            "127.0.0.1",
+            [None, None, None],
+            std::time::Instant::now(),
+        )
+        .expect("prep ok");
+        assert!(prep.body.is_none());
+        assert!(prep.req_body.is_none());
+    }
+
+    #[tokio::test]
+    async fn promptlog_excluded_key_does_not_starve_trace_body() {
+        // promptlog's per-key exclusion list must only affect promptlog —
+        // trace still gets the shared body for the same key.
+        let state = state_from_yaml(
+            r#"
+server: { port: 18080 }
+general_settings:
+  master_key: sk-test-master-000000
+prompt_log:
+  enabled: true
+  excluded_keys: [k]
+trace:
+  enabled: true
+  capture_body: true
+"#,
+        )
+        .await;
+        let prep = super::prepare_edge_request(
+            &state,
+            &test_identity(),
+            &HeaderMap::new(),
+            &json!({"model": "m", "messages": []}),
+            "m",
+            "/v1/chat/completions",
+            false,
+            "req-excluded",
+            "127.0.0.1",
+            [None, None, None],
+            std::time::Instant::now(),
+        )
+        .expect("prep ok");
+        assert!(!prep.prompt_log_should, "key is excluded from prompt log");
+        assert!(prep.req_body.is_none());
+        assert!(prep.body.is_some(), "trace body capture is key-exclusion-agnostic");
+    }
+
     fn user_tag_settings(headers: &[&str]) -> Vec<String> {
         headers.iter().map(|h| h.to_string()).collect()
     }
@@ -5950,7 +6182,7 @@ mod tests {
         let stream: ChatStream = Box::pin(futures::stream::iter(chunks));
         let sse = sse_stream_from_chat_stream(stream, UsageTracker::default());
 
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
         let req = PromptLogEntry::new_request(
             "gateway-request-uuid",
             None,
@@ -5967,7 +6199,10 @@ mod tests {
         let response_id_slot = new_streamed_response_id_slot();
         let mut wrapper = PromptLogStream::new(
             sse,
-            tx,
+            boom_promptlog::PromptLogSender::new(
+                tx,
+                Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            ),
             req,
             sse_raw_data_extractor(response_id_slot.clone()),
         )

@@ -143,6 +143,30 @@ pub async fn run_request_log_migration(conn: &mut sqlx::PgConnection) -> Result<
         .execute(&mut *conn)
         .await;
     }
+    // Composite index for the analytics model detail page: windows filter
+    // on one model over a time range (WHERE model = $1 AND created_at >=
+    // $2). Same CONCURRENTLY-with-fallback shape as above.
+    let concurrent = sqlx::query(
+        r#"CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_request_log_model_created
+           ON boom_request_log(model, created_at DESC)"#,
+    )
+    .execute(&mut *conn)
+    .await;
+    if let Err(e) = concurrent {
+        tracing::warn!(
+            "CREATE INDEX CONCURRENTLY failed ({}), falling back to plain CREATE INDEX",
+            e
+        );
+        let _ = sqlx::query(r#"DROP INDEX IF EXISTS idx_request_log_model_created"#)
+            .execute(&mut *conn)
+            .await;
+        let _ = sqlx::query(
+            r#"CREATE INDEX IF NOT EXISTS idx_request_log_model_created
+               ON boom_request_log(model, created_at DESC)"#,
+        )
+        .execute(&mut *conn)
+        .await;
+    }
     Ok(())
 }
 
