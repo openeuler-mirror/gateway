@@ -114,7 +114,7 @@ impl StatsRange {
     /// (window start UTC, bucket seconds, axis slot count for the full
     /// window). Rolling-window starts are floored to the bucket grid so
     /// `slot_epoch - since` is always a whole number of buckets.
-    fn window(self) -> (DateTime<Utc>, i64, i64) {
+    pub fn window(self) -> (DateTime<Utc>, i64, i64) {
         let now = Utc::now().timestamp();
         match self {
             Self::Today => (cst_today_start_utc(), 600, 144),

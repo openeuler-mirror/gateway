@@ -435,6 +435,16 @@
     } else {
       stopAnalyticsPoll();
     }
+    // loadModel on every route change: same-section hash changes (model
+    // A → model B) don't re-run this branch's section toggle but do fire
+    // onRoute — loadModel re-parses the hash each time (quota-page
+    // pattern).
+    if (section === "admin-model") {
+      setupModelPage();
+      startModelPoll();
+    } else {
+      stopModelPoll();
+    }
     if (section === "admin-status") {
       loadAlerts();
       startAlertsPoll();
@@ -468,6 +478,9 @@
   function sectionFromHash(hash) {
     if (hash.includes("/admin/stats")) return "admin-stats";
     if (hash.includes("/admin/models")) return "admin-models";
+    // Must come AFTER "/admin/models" — that string also contains
+    // "/admin/model" (hash.includes substring matching).
+    if (hash.includes("/admin/model")) return "admin-model";
     // if (hash.includes("/admin/workflows")) return "admin-workflows"; // workflow page disabled
     if (hash.includes("/admin/plans")) return "admin-plans";
     if (hash.includes("/admin/keys")) return "admin-keys";
@@ -521,7 +534,9 @@
   }
 
   function updateAnalyticsRangeUI() {
-    document.querySelectorAll("#an-range button").forEach((b) => {
+    // Overview + model detail share the range state; keep both bars in
+    // sync (drilling in keeps the window you were looking at).
+    document.querySelectorAll("#an-range button, #md-range button").forEach((b) => {
       b.classList.toggle("active", b.dataset.range === analyticsRange);
     });
   }
@@ -549,9 +564,17 @@
       tableWrap.dataset.bound = "1";
       tableWrap.addEventListener("click", (e) => {
         const th = e.target.closest("th[data-sort]");
-        if (!th) return;
-        analyticsSortKey = th.dataset.sort;
-        if (analyticsData) renderAnalyticsModels(analyticsData);
+        if (th) {
+          analyticsSortKey = th.dataset.sort;
+          if (analyticsData) renderAnalyticsModels(analyticsData);
+          return;
+        }
+        // Row click → model drill-down. Model names are URL path segments
+        // ("*" is a real fallback model name) — always encodeURIComponent.
+        const tr = e.target.closest("tr[data-model]");
+        if (tr) {
+          location.hash = "#/admin/model/" + encodeURIComponent(tr.dataset.model);
+        }
       });
     }
     updateAnalyticsRangeUI();
@@ -901,7 +924,7 @@
       const errRate = m.requests > 0 ? (m.errors / m.requests * 100) : 0;
       const errRateCls = m.errors === 0 ? "an-errrate-zero" : errRate >= 5 ? "an-errrate-high" : errRate >= 1 ? "an-errrate-low" : "";
       const rank = i < 3 ? '<td class="an-rank an-rank--top">' + (i + 1) + "</td>" : '<td class="an-rank">' + (i + 1) + "</td>";
-      return "<tr>" + rank +
+      return '<tr data-model="' + esc(m.model) + '">' + rank +
         '<td class="an-model" title="' + esc(m.model) + '">' + esc(m.model) + "</td>" +
         '<td class="num" title="' + fmtFullNum(m.requests) + '">' + fmtFullNum(m.requests) + "</td>" +
         '<td><div class="an-share"><div class="an-share-bar"><i style="width:' + barW + '%"></i></div><span>' + share.toFixed(1) + "%</span></div></td>" +
@@ -915,6 +938,428 @@
 
     wrap.innerHTML =
       '<table class="an-table"><thead>' + head + "</thead><tbody>" + rows + "</tbody></table>";
+  }
+
+  // ── Analytics detail pages: generic multi-series trend chart ──
+  // Same geometry/axes as the overview chart above (720×160 SVG, CST
+  // wall-clock x labels, niceCeil y), but supports N series and binds
+  // hover state per container so several charts can coexist on the detail
+  // pages. The overview chart is left untouched — this helper is the one
+  // new pages build on.
+  function renderTrendChart(wrapId, spec) {
+    const wrap = document.getElementById(wrapId);
+    if (!wrap) return;
+    const total = Math.max(1, Number(spec.total) || 144);
+    const bucket = Math.max(60, Number(spec.bucket) || 600);
+    const since = Number(spec.since) || 0;
+    const span = Math.max(1, Math.min(Number(spec.span) || total, total));
+    const series = (spec.series || []).filter((s) => Array.isArray(s.values));
+    const niceCeil = (v) => {
+      if (v <= 5) return 5;
+      const exp = Math.pow(10, Math.floor(Math.log10(v)));
+      const f = v / exp;
+      return (f <= 1 ? 1 : f <= 2 ? 2 : f <= 5 ? 5 : 10) * exp;
+    };
+    let max = 0;
+    series.forEach((s) => {
+      for (let i = 0; i < span; i++) {
+        const v = s.values[i];
+        if (v != null && v > max) max = v;
+      }
+    });
+    const yMax = spec.yMax != null ? spec.yMax : niceCeil(Math.max(max, 0.000001));
+    const fmtY = spec.fmtY || fmtCompactNum;
+    const ctx = { total, bucket, since, span, yMax, series, tooltipRows: spec.tooltipRows };
+    wrap._trendCtx = ctx;
+    bindTrendHover(wrap);
+
+    const x = (i) => ((i + 0.5) / total) * AN_W;
+    const y = (v) => AN_H - (Math.min(v, yMax) / yMax) * AN_H;
+    // Null values (e.g. ratio buckets with zero denominator) break the
+    // line into subpaths instead of diving to zero.
+    const pathOf = (values) => {
+      let d = "", pen = false;
+      for (let i = 0; i < span; i++) {
+        const v = values[i];
+        if (v == null) { pen = false; continue; }
+        d += (pen ? "L" : "M") + x(i).toFixed(1) + " " + y(v).toFixed(1);
+        pen = true;
+      }
+      return d;
+    };
+    const paths = series.map((s) => {
+      const d = pathOf(s.values);
+      if (!d) return "";
+      const line = '<path class="tr-line" style="stroke:' + s.color + '" vector-effect="non-scaling-stroke" d="' + d + '"></path>';
+      // Single-series charts get a soft area fill; with 2+ series the
+      // fills would stack over each other and muddy the lines.
+      if (series.length === 1) {
+        const lastIdx = (() => { for (let i = span - 1; i >= 0; i--) if (s.values[i] != null) return i; return -1; })();
+        if (lastIdx >= 0) {
+          const areaD = d +
+            "L" + x(lastIdx).toFixed(1) + " " + AN_H +
+            "L" + x(0).toFixed(1) + " " + AN_H + "Z";
+          return '<path class="tr-area" style="fill:' + s.color + '" d="' + areaD + '"></path>' + line;
+        }
+      }
+      return line;
+    }).join("");
+
+    const yLabels = [1, 0.8, 0.6, 0.4, 0.2].map((p) =>
+      '<span style="bottom:' + p * 100 + '%">' + fmtY(yMax * p) + "</span>"
+    ).join("");
+    const gridLines = [0.2, 0.4, 0.6, 0.8, 1].map((p) => {
+      const gy = ((1 - p) * AN_H).toFixed(1);
+      return '<line class="an-grid" vector-effect="non-scaling-stroke" x1="0" x2="' + AN_W + '" y1="' + gy + '" y2="' + gy + '"></line>';
+    }).join("");
+    const stepH = bucket <= 600 ? 3 : total > 144 ? 12 : 6;
+    const p2 = (n) => String(n).padStart(2, "0");
+    let xLabels = "";
+    for (let i = 0; i < total; i++) {
+      const d = new Date((since + i * bucket + 28800) * 1000);
+      let label = "";
+      if (d.getUTCMinutes() === 0 && d.getUTCHours() === 0) {
+        label = p2(d.getUTCMonth() + 1) + "-" + p2(d.getUTCDate());
+      } else if (d.getUTCMinutes() === 0 && d.getUTCHours() % stepH === 0) {
+        label = p2(d.getUTCHours()) + ":00";
+      }
+      if (label) xLabels += '<span style="left:' + ((i + 0.5) / total * 100) + '%">' + label + "</span>";
+    }
+    const legend = series.length > 1
+      ? '<div class="tr-legend">' + series.map((s) =>
+          '<span class="tr-legend-item"><i class="tr-swatch" style="background:' + s.color + '"></i>' + esc(s.label) + "</span>"
+        ).join("") + "</div>"
+      : "";
+
+    wrap.innerHTML =
+      '<div class="an-hchart">' + legend +
+        '<div class="an-hplot">' +
+          '<div class="an-hy">' + yLabels + "</div>" +
+          '<div class="an-svgwrap">' +
+            '<svg class="an-svg" viewBox="0 0 ' + AN_W + " " + AN_H + '" preserveAspectRatio="none">' +
+              gridLines + paths +
+              '<line class="an-hoverline" vector-effect="non-scaling-stroke" x1="0" x2="0" y1="0" y2="' + AN_H + '"></line>' +
+            "</svg>" +
+          "</div>" +
+        "</div>" +
+        '<div class="an-hx">' + xLabels + "</div>" +
+        '<div class="an-tip"></div>' +
+      "</div>";
+  }
+
+  // One-time hover binding per chart container; the fresh geometry lives
+  // on wrap._trendCtx and is re-pointed by every renderTrendChart call.
+  function bindTrendHover(wrap) {
+    if (!wrap || wrap.dataset.trendBound) return;
+    wrap.dataset.trendBound = "1";
+    const q = (sel) => wrap.querySelector(sel);
+    const hide = () => {
+      const tip = q(".an-tip");
+      if (tip) tip.style.display = "none";
+      const line = q(".an-hoverline");
+      if (line) line.style.visibility = "hidden";
+    };
+    wrap.addEventListener("mousemove", (e) => {
+      const ctx = wrap._trendCtx;
+      const plot = e.target.closest(".an-svgwrap");
+      const tip = q(".an-tip");
+      if (!ctx || !plot || !tip) { hide(); return; }
+      const rect = plot.getBoundingClientRect();
+      const frac = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
+      const slot = Math.min(ctx.total - 1, Math.floor(frac * ctx.total));
+      if (slot > ctx.span - 1) { hide(); return; }
+      const line = q(".an-hoverline");
+      if (line) {
+        const vx = ((slot + 0.5) / ctx.total) * AN_W;
+        line.setAttribute("x1", vx);
+        line.setAttribute("x2", vx);
+        line.style.visibility = "visible";
+      }
+      const startT = ctx.since + slot * ctx.bucket;
+      const endT = startT + ctx.bucket;
+      const multiDay = ctx.total * ctx.bucket > 86400;
+      const fmtT = (t, withDate) => {
+        const d = new Date((t + 28800) * 1000);
+        return (withDate ? p2(d.getUTCMonth() + 1) + "-" + p2(d.getUTCDate()) + " " : "") +
+          p2(d.getUTCHours()) + ":" + p2(d.getUTCMinutes());
+      };
+      const sd = new Date((startT + 28800) * 1000);
+      const ed = new Date((endT + 28800) * 1000);
+      const crossesMidnight = sd.getUTCDate() !== ed.getUTCDate() || sd.getUTCMonth() !== ed.getUTCMonth();
+      const rows = (ctx.tooltipRows ? ctx.tooltipRows(slot) : [])
+        .map((r) => '<div class="an-tip-row"><span>' + esc(r.label) + "</span><b>" + esc(r.value) + "</b></div>")
+        .join("");
+      tip.innerHTML =
+        '<div class="an-tip-head">' + fmtT(startT, multiDay) + " – " + fmtT(endT, multiDay || crossesMidnight) + "</div>" + rows;
+      tip.style.display = "block";
+      const gridRect = wrap.getBoundingClientRect();
+      const tipW = tip.offsetWidth;
+      let left = e.clientX - gridRect.left + 14;
+      if (left + tipW > gridRect.width) left = e.clientX - gridRect.left - tipW - 14;
+      tip.style.left = left + "px";
+      tip.style.top = Math.max(0, e.clientY - gridRect.top - 30) + "px";
+    });
+    wrap.addEventListener("mouseleave", hide);
+  }
+
+  // ── Analytics detail: model drill-down page ──
+  // Selected model lives in the hash (#/admin/model/<enc>) so reload,
+  // back/forward and overview row clicks all work through plain
+  // navigation. Shares the overview's range selector state
+  // (analyticsRange + localStorage) — drilling in keeps the window you
+  // were looking at.
+  let modelTimer = null;
+  let mdData = null;
+
+  function currentModelFromHash() {
+    const m = (location.hash || "").match(/\/admin\/model\/([^/?#]+)/);
+    return m ? decodeURIComponent(m[1]) : "";
+  }
+
+  function startModelPoll() {
+    stopModelPoll();
+    loadModel(false);
+    modelTimer = setInterval(() => loadModel(false), 60000);
+  }
+
+  function stopModelPoll() {
+    if (modelTimer) {
+      clearInterval(modelTimer);
+      modelTimer = null;
+    }
+  }
+
+  function setupModelPage() {
+    const btn = document.getElementById("btn-refresh-model");
+    if (btn && !btn.dataset.bound) {
+      btn.dataset.bound = "1";
+      btn.addEventListener("click", () => loadModel(true));
+    }
+    const bar = document.getElementById("md-range");
+    if (bar && !bar.dataset.bound) {
+      bar.dataset.bound = "1";
+      bar.addEventListener("click", (e) => {
+        const b = e.target.closest("button[data-range]");
+        if (!b || b.dataset.range === analyticsRange) return;
+        analyticsRange = b.dataset.range;
+        localStorage.setItem("analyticsRange", analyticsRange);
+        updateAnalyticsRangeUI();
+        loadModel(false);
+      });
+    }
+    updateAnalyticsRangeUI();
+  }
+
+  async function loadModel(force) {
+    const model = currentModelFromHash();
+    if (!model) {
+      mdData = null;
+      renderModel();
+      return;
+    }
+    const requested = model + "|" + analyticsRange;
+    try {
+      const res = await api(
+        "/admin/stats/model/" + encodeURIComponent(model) +
+          "?range=" + analyticsRange + (force ? "&force=1" : "")
+      );
+      // A hash change (model or range switch) can race an in-flight
+      // request — only render what's still on screen.
+      if (requested !== currentModelFromHash() + "|" + analyticsRange) return;
+      mdData = res;
+      renderModel();
+    } catch (e) {
+      // Read-only poller — api() already surfaces auth problems.
+    }
+  }
+
+  function fmtMs(v) {
+    return v == null ? "—" : Math.round(v).toLocaleString() + " ms";
+  }
+  function fmtPct(v) {
+    return v == null ? "—" : (v * 100).toFixed(1) + "%";
+  }
+
+  function renderModel() {
+    const body = document.getElementById("md-body");
+    const sub = document.getElementById("md-subtitle");
+    const model = currentModelFromHash();
+    if (sub) sub.textContent = model || "—";
+    if (!body) return;
+    if (!model) {
+      body.innerHTML =
+        '<div class="card an-panel"><p class="loading">' + esc(t("model.empty")) + "</p>" +
+        '<a class="tr-back" href="#/admin/analytics">← ' + esc(t("model.back_overview")) + "</a></div>";
+      return;
+    }
+    const data = mdData;
+    if (!data || !data.ready) {
+      const detail = data && data.error ? " — " + esc(String(data.error)) : "";
+      body.innerHTML = '<p class="loading">' + esc(t("analytics.unavailable")) + detail + "</p>";
+      return;
+    }
+
+    const errRate = data.requests > 0 ? (data.errors / data.requests * 100) : 0;
+    const cards = [
+      { label: t("analytics.metrics.requests"), value: fmtFullNum(data.requests), hint: "" },
+      { label: t("analytics.metrics.input_tokens"), value: fmtCompactNum(data.input_tokens), hint: "" },
+      { label: t("analytics.metrics.output_tokens"), value: fmtCompactNum(data.output_tokens), hint: "" },
+      { label: t("analytics.metrics.errors"), value: fmtFullNum(data.errors),
+        hint: errRate.toFixed(2) + "%" },
+      { label: t("model.metrics.cache_hit"), value: fmtPct(data.cache_hit_ratio),
+        hint: t("model.metrics.cache_hit_hint") },
+      { label: t("model.metrics.avg_duration"), value: fmtMs(data.avg_duration_ms),
+        hint: t("model.metrics.avg_duration_hint") },
+      { label: t("model.metrics.avg_ttft"), value: fmtMs(data.avg_ttft_ms),
+        hint: t("model.metrics.avg_ttft_hint") },
+      { label: t("model.metrics.avg_queue"), value: fmtMs(data.avg_queue_wait_ms),
+        hint: t("model.metrics.avg_queue_hint") },
+    ];
+    const metrics = '<div class="an-metrics">' + cards.map((c) =>
+      '<div class="an-metric">' +
+        '<div class="an-metric-label">' + esc(c.label) + "</div>" +
+        '<div class="an-metric-value">' + esc(c.value) + "</div>" +
+        (c.hint ? '<div class="an-metric-hint">' + esc(c.hint) + "</div>" : "") +
+      "</div>"
+    ).join("") + "</div>";
+
+    // Skeleton with empty chart containers; renderTrendChart fills them
+    // after the innerHTML assignment.
+    const chartCard = (id, titleKey, hint) =>
+      '<div class="card an-panel">' +
+        '<div class="an-card-head"><h3>' + esc(t(titleKey)) + '</h3><span class="an-hint">' + esc(hint) + "</span></div>" +
+        '<div id="' + id + '"></div>' +
+      "</div>";
+
+    body.innerHTML = metrics +
+      chartCard("md-chart-req", "model.series.requests", t("model.series.hint", { bucket: bucketLabel(data.bucket_secs) })) +
+      chartCard("md-chart-tokens", "model.series.tokens", t("model.series.hint", { bucket: bucketLabel(data.bucket_secs) })) +
+      chartCard("md-chart-cache", "model.series.cache", t("model.series.hint", { bucket: bucketLabel(data.bucket_secs) })) +
+      chartCard("md-chart-latency", "model.series.latency", t("model.series.hint", { bucket: bucketLabel(data.bucket_secs) })) +
+      '<div class="card an-panel">' +
+        '<div class="an-card-head"><h3>' + esc(t("model.hist.title")) + '</h3><span class="an-hint">' +
+          esc(t("model.hist.total", { n: fmtFullNum(data.timed_requests) })) + "</span></div>" +
+        '<div id="md-hist"></div>' +
+      "</div>" +
+      '<div class="card an-panel">' +
+        '<div class="an-card-head"><h3>' + esc(t("model.deploy.title")) + '</h3><span class="an-hint">' +
+          esc(t("model.deploy.hint", { n: (data.deployments || []).length })) + "</span></div>" +
+        '<div id="md-deploy"></div>' +
+      "</div>";
+
+    // ── Charts ──
+    const total = Math.max(1, Number(data.total_slots) || 144);
+    const bucket = Math.max(60, Number(data.bucket_secs) || 600);
+    const since = Number(data.since_epoch) || 0;
+    const span = data.range === "today"
+      ? Math.min(Math.max(Math.floor((Date.now() / 1000 - since) / bucket) + 1, 1), total)
+      : total;
+    const zeros = () => Array.from({ length: total }, () => 0);
+    const req = zeros(), err = zeros(), input = zeros(), output = zeros();
+    const cached = zeros(), inputForRatio = zeros(), dur = Array.from({ length: total }, () => null);
+    (data.series || []).forEach((p) => {
+      const idx = Math.round((p.slot_epoch - since) / bucket);
+      if (idx < 0 || idx >= total) return;
+      req[idx] += p.requests || 0;
+      err[idx] += p.errors || 0;
+      input[idx] += p.input_tokens || 0;
+      output[idx] += p.output_tokens || 0;
+      cached[idx] += p.cached_tokens || 0;
+      inputForRatio[idx] += p.input_tokens || 0;
+      if (p.avg_duration_ms != null) dur[idx] = p.avg_duration_ms;
+    });
+    const ratioAt = (i) => (inputForRatio[i] > 0 ? cached[i] / inputForRatio[i] : null);
+    const C_MAIN = "var(--primary)", C_ALT = "var(--warn)", C_ERR = "var(--danger)";
+
+    renderTrendChart("md-chart-req", {
+      since, bucket, total, span,
+      series: [
+        { label: t("analytics.series.requests"), color: C_MAIN, values: req },
+        { label: t("analytics.metrics.errors"), color: C_ERR, values: err },
+      ],
+      tooltipRows: (i) => [
+        { label: t("analytics.series.requests"), value: fmtFullNum(req[i]) },
+        { label: t("analytics.metrics.errors"), value: fmtFullNum(err[i]) },
+      ],
+    });
+    renderTrendChart("md-chart-tokens", {
+      since, bucket, total, span,
+      series: [
+        { label: t("analytics.series.input"), color: C_MAIN, values: input },
+        { label: t("analytics.series.output"), color: C_ALT, values: output },
+      ],
+      tooltipRows: (i) => [
+        { label: t("analytics.series.input"), value: fmtFullNum(input[i]) },
+        { label: t("analytics.series.output"), value: fmtFullNum(output[i]) },
+      ],
+    });
+    const ratioVals = Array.from({ length: total }, (_, i) => ratioAt(i));
+    renderTrendChart("md-chart-cache", {
+      since, bucket, total, span, yMax: 1,
+      fmtY: (v) => Math.round(v * 100) + "%",
+      series: [{ label: t("model.series.cache"), color: C_MAIN, values: ratioVals }],
+      tooltipRows: (i) => [{ label: t("model.series.cache"), value: fmtPct(ratioAt(i)) }],
+    });
+    renderTrendChart("md-chart-latency", {
+      since, bucket, total, span,
+      series: [{ label: t("model.series.latency"), color: C_MAIN, values: dur }],
+      tooltipRows: (i) => [{ label: t("model.series.latency"), value: fmtMs(dur[i]) }],
+    });
+
+    // ── Latency histogram ──
+    const hist = document.getElementById("md-hist");
+    if (hist) {
+      const labels = ["model.hist.lt100", "model.hist.lt300", "model.hist.lt1s",
+        "model.hist.lt3s", "model.hist.lt10s", "model.hist.gte10s"];
+      const counts = data.latency_hist || [0, 0, 0, 0, 0, 0];
+      const maxCnt = Math.max(1, ...counts);
+      hist.innerHTML = '<div class="md-hist">' + counts.map((c, i) =>
+        '<div class="md-hist-row">' +
+          '<span class="md-hist-label">' + esc(t(labels[i])) + "</span>" +
+          '<div class="md-hist-track"><i style="width:' + (c / maxCnt * 100).toFixed(2) + '%"></i></div>' +
+          '<span class="md-hist-val">' + fmtFullNum(c) + "</span>" +
+        "</div>"
+      ).join("") + "</div>";
+    }
+
+    // ── Deployment split table ──
+    const depWrap = document.getElementById("md-deploy");
+    if (depWrap) {
+      const deps = data.deployments || [];
+      if (!deps.length) {
+        depWrap.innerHTML = '<p class="loading">' + esc(t("common.no_records")) + "</p>";
+      } else {
+        const th = (labelKey, cls) =>
+          "<th" + (cls ? ' class="' + cls + '"' : "") + ">" + esc(t(labelKey)) + "</th>";
+        const head = "<tr>" +
+          th("model.deploy.th.deployment") + th("model.deploy.th.model_name") +
+          th("model.deploy.th.requests", "num") + th("model.deploy.th.input", "num") +
+          th("model.deploy.th.output", "num") + th("model.deploy.th.errors", "num") +
+          th("model.deploy.th.avg_duration", "num") + th("model.deploy.th.avg_ttft", "num") +
+          "</tr>";
+        const rows = deps.map((d) => {
+          const depId = d.deployment_id ? esc(d.deployment_id) : '<span class="an-dim">' + esc(t("model.deploy.unattributed")) + "</span>";
+          const modelName = d.model_name ? esc(d.model_name) : '<span class="an-dim">' + esc(t("model.deploy.unattributed")) + "</span>";
+          return "<tr>" +
+            '<td title="' + esc(d.deployment_id || "") + '">' + depId + "</td>" +
+            '<td title="' + esc(d.model_name || "") + '">' + modelName + "</td>" +
+            '<td class="num">' + fmtFullNum(d.requests) + "</td>" +
+            '<td class="num">' + fmtCompactNum(d.input_tokens) + "</td>" +
+            '<td class="num">' + fmtCompactNum(d.output_tokens) + "</td>" +
+            '<td class="num' + (d.errors > 0 ? " an-err-text" : "") + '">' + fmtFullNum(d.errors) + "</td>" +
+            '<td class="num">' + fmtMs(d.avg_duration_ms) + "</td>" +
+            '<td class="num">' + fmtMs(d.avg_ttft_ms) + "</td>" +
+          "</tr>";
+        }).join("");
+        depWrap.innerHTML = '<table class="an-table"><thead>' + head + "</thead><tbody>" + rows + "</tbody></table>";
+      }
+    }
+  }
+
+  function bucketLabel(bucketSecs) {
+    if (bucketSecs <= 600) return t("model.bucket.10m");
+    if (bucketSecs <= 1800) return t("model.bucket.30m");
+    return t("model.bucket.1h");
   }
 
   // ── In-Flight ─────────────────────────────────────────

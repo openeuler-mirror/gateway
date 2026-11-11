@@ -3407,3 +3407,34 @@ input[list] {
 .an-errrate-zero { color: var(--text3); }
 .an-errrate-low { color: var(--warn); }
 .an-errrate-high { color: var(--danger); font-weight: 600; }
+
+/* ── Analytics detail pages (model / consumption / schedule) ── */
+/* Overview model rows drill into the model detail page. */
+.an-table tr[data-model] { cursor: pointer; }
+.an-table tr[data-model]:hover td { background: var(--surface2); }
+.an-dim { color: var(--text3); }
+/* Multi-series trend chart (renderTrendChart) — line/area colors are set
+   inline per series (CSS vars resolve); these carry the geometry. */
+.tr-line { fill: none; stroke-width: 2; }
+.tr-area { fill-opacity: .1; stroke: none; }
+.tr-legend {
+  display: flex; gap: 14px; flex-wrap: wrap; padding: 0 0 8px;
+  font-size: 12px; color: var(--text2);
+}
+.tr-legend-item { display: inline-flex; align-items: center; gap: 6px; }
+.tr-swatch { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+.tr-back {
+  display: inline-block; margin-top: 10px; font-size: 13px;
+  color: var(--primary); text-decoration: none;
+}
+.tr-back:hover { text-decoration: underline; }
+/* Latency histogram (model page). */
+.md-hist { display: flex; flex-direction: column; gap: 8px; padding: 4px 0; }
+.md-hist-row {
+  display: grid; grid-template-columns: 64px 1fr 72px; gap: 10px;
+  align-items: center; font-size: 12px;
+}
+.md-hist-label { color: var(--text2); font-family: var(--mono); }
+.md-hist-track { height: 12px; border-radius: 3px; background: var(--surface2); overflow: hidden; }
+.md-hist-track i { display: block; height: 100%; border-radius: 3px; background: var(--primary); }
+.md-hist-val { color: var(--text2); text-align: right; font-variant-numeric: tabular-nums; }

@@ -3760,6 +3760,76 @@ pub async fn get_daily_stats(
 }
 
 // ═══════════════════════════════════════════════════════════
+// Analytics Detail Pages (model / consumption / schedule)
+// ═══════════════════════════════════════════════════════════
+//
+// Same presence-driven lifecycle as the daily stats above: lazy load on
+// first request, TTL 300s while the page is viewed, force=1 manual
+// refresh, stale snapshot served when a refresh fails. The caches live in
+// DashboardState.analytics (AnalyticsHub).
+
+/// Model drill-down from the analytics overview's model table.
+/// `model` is the requested model literal (the column the overview groups
+/// by — numbers reconcile exactly). Accepts `?range=today|1d|3d|7d&force=1`.
+pub async fn get_model_detail(
+    _session: AdminSession,
+    Path(model): Path<String>,
+    Query(params): Query<DailyStatsParams>,
+    Extension(state): Extension<Arc<DashboardState>>,
+) -> Response {
+    let range = match boom_audit::StatsRange::from_param(
+        params.range.as_deref().unwrap_or("today"),
+    ) {
+        Some(r) => r,
+        None => {
+            return Json(json!({
+                "ready": false,
+                "error": "invalid range (expected today|1d|3d|7d)",
+            }))
+            .into_response()
+        }
+    };
+    let Some(pool) = &state.db_pool else {
+        return Json(json!({
+            "ready": false,
+            "error": "model stats unavailable (no database configured)",
+        }))
+        .into_response();
+    };
+    let key = format!("{model}|{}", range.as_str());
+    let snap = match state
+        .analytics
+        .model
+        .get_or_refresh(&key, 300, params.force.is_some(), || {
+            boom_audit::analytics::query_model_detail(&model, range, pool)
+        })
+        .await
+    {
+        Ok(s) => Some(s),
+        // Refresh failed: serve the last good snapshot rather than an
+        // unavailable page — stale data beats no data on a dashboard.
+        Err(e) => {
+            tracing::warn!("Model detail refresh failed ({model}, {}): {e}", range.as_str());
+            state.analytics.model.current(&key)
+        }
+    };
+    match snap {
+        Some(snap) => {
+            let mut v = serde_json::to_value(&*snap).unwrap_or_else(|_| json!({}));
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("ready".to_string(), json!(true));
+            }
+            Json(v).into_response()
+        }
+        None => Json(json!({
+            "ready": false,
+            "error": "model stats unavailable (refresh pending or failing)",
+        }))
+        .into_response(),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
 // In-Flight Request Stats (real-time)
 // ═══════════════════════════════════════════════════════════
 
