@@ -4896,8 +4896,10 @@ fn sse_stream_from_responses_chat_stream(
                     event: Event::default().event(&ev.event).data(&ev.data),
                     json_data: ev.data,
                 };
+                // No client_gone flag here: drain() is eager, so the
+                // transcoder already reached its terminal state — dropping
+                // the remaining events can't strand the persist tail.
                 if tx.send(item).await.is_err() {
-                    client_gone = true;
                     break;
                 }
             }
