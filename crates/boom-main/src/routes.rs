@@ -809,11 +809,11 @@ async fn chat_completions_inner(
 
     let (provider, deployment_id, inflight_model,
         schedule_policy, kv_hit_blocks, kv_input_blocks,
-        trie_blocks, trie_max_blocks, request_bytes) = match kvc_route {
+        trie_blocks, trie_max_blocks, request_bytes, prefix_bytes) = match kvc_route {
         Some(r) => {
             (r.provider, r.deployment_id, r.inflight_model.unwrap_or_default(),
              r.schedule_policy, r.kv_hit_blocks, r.kv_input_blocks,
-             r.trie_blocks, r.trie_max_blocks, r.request_bytes)
+             r.trie_blocks, r.trie_max_blocks, r.request_bytes, r.prefix_bytes)
         }
         None => {
             // kvc disabled / no match — fallback to default routing
@@ -826,7 +826,7 @@ async fn chat_completions_inner(
             })?;
             let did = selection.provider.deployment_id().map(|s| s.to_string());
             let im = state.router.resolve_model_name(&resolved_model);
-            (selection.provider, did, im, None, None, None, None, None, None)
+            (selection.provider, did, im, None, None, None, None, None, None, Vec::new())
         }
     };
     let routing_ms = route_start.elapsed().as_millis() as u64;
@@ -976,6 +976,9 @@ async fn chat_completions_inner(
         // Provider accepted the request — commit the plan charge now.
         let _decision = plan_charge.commit();
         crate::health_monitor::reset_request_failure(&state, &deployment_id);
+        // Trie learning: admission success is the "it fits" proof — record
+        // only on the Ok path (Err prefixes must never learn, design §7).
+        state.kvc_orchestrator.record_success(&resolved_model, provider.kv_worker_id(), &prefix_bytes);
         let usage = UsageTracker::default();
         let sse_stream = sse_stream_from_chat_stream(stream, usage.clone());
         let inflight_guard = if let Some(ref did) = deployment_id {
@@ -1171,6 +1174,9 @@ async fn chat_completions_inner(
         // concurrency slot no longer needed once we have the full response).
         drop(plan_charge.take_concurrency_guard());
         crate::health_monitor::reset_request_failure(&state, &deployment_id);
+        // Trie learning: admission success is the "it fits" proof — record
+        // only on the Ok path (Err prefixes must never learn, design §7).
+        state.kvc_orchestrator.record_success(&resolved_model, provider.kv_worker_id(), &prefix_bytes);
 
         let duration_ms = start.elapsed().as_millis() as i32;
         // None = upstream did not report usage → log NULL, settle 0 tokens.
@@ -3365,11 +3371,11 @@ pub async fn messages(
 
     let (provider, deployment_id, inflight_model,
         schedule_policy, kv_hit_blocks, kv_input_blocks,
-        trie_blocks, trie_max_blocks, request_bytes) = match kvc_route {
+        trie_blocks, trie_max_blocks, request_bytes, prefix_bytes) = match kvc_route {
         Some(r) => {
             (r.provider, r.deployment_id, r.inflight_model.unwrap_or_default(),
              r.schedule_policy, r.kv_hit_blocks, r.kv_input_blocks,
-             r.trie_blocks, r.trie_max_blocks, r.request_bytes)
+             r.trie_blocks, r.trie_max_blocks, r.request_bytes, r.prefix_bytes)
         }
         None => {
             // kvc disabled / no match — fallback to default routing
@@ -3382,7 +3388,7 @@ pub async fn messages(
             })?;
             let did = selection.provider.deployment_id().map(|s| s.to_string());
             let im = state.router.resolve_model_name(&resolved_model);
-            (selection.provider, did, im, None, None, None, None, None, None)
+            (selection.provider, did, im, None, None, None, None, None, None, Vec::new())
         }
     };
     let routing_ms = route_start.elapsed().as_millis() as u64;
@@ -3508,6 +3514,9 @@ pub async fn messages(
         // Provider accepted the request — commit the plan charge now.
         let _decision = plan_charge.commit();
         crate::health_monitor::reset_request_failure(&state, &deployment_id);
+        // Trie learning: admission success is the "it fits" proof — record
+        // only on the Ok path (Err prefixes must never learn, design §7).
+        state.kvc_orchestrator.record_success(&resolved_model, provider.kv_worker_id(), &prefix_bytes);
         let usage = UsageTracker::default();
         let sse_stream = sse_stream_from_anthropic_chat_stream(stream, model.clone(), usage.clone());
         let inflight_guard = if let Some(ref did) = deployment_id {
@@ -3678,6 +3687,9 @@ pub async fn messages(
         // Release concurrency guard now (non-streaming: response is already complete).
         drop(plan_charge.take_concurrency_guard());
         crate::health_monitor::reset_request_failure(&state, &deployment_id);
+        // Trie learning: admission success is the "it fits" proof — record
+        // only on the Ok path (Err prefixes must never learn, design §7).
+        state.kvc_orchestrator.record_success(&resolved_model, provider.kv_worker_id(), &prefix_bytes);
 
         let duration_ms = start.elapsed().as_millis() as i32;
         // None = upstream did not report usage → log NULL, settle 0 tokens.
@@ -4284,11 +4296,11 @@ pub async fn responses(
 
     let (provider, deployment_id, inflight_model,
         schedule_policy, kv_hit_blocks, kv_input_blocks,
-        trie_blocks, trie_max_blocks, request_bytes) = match kvc_route {
+        trie_blocks, trie_max_blocks, request_bytes, prefix_bytes) = match kvc_route {
         Some(r) => {
             (r.provider, r.deployment_id, r.inflight_model.unwrap_or_default(),
              r.schedule_policy, r.kv_hit_blocks, r.kv_input_blocks,
-             r.trie_blocks, r.trie_max_blocks, r.request_bytes)
+             r.trie_blocks, r.trie_max_blocks, r.request_bytes, r.prefix_bytes)
         }
         None => {
             let selection = state.router.select_provider_with_prefix(
@@ -4300,7 +4312,7 @@ pub async fn responses(
             })?;
             let did = selection.provider.deployment_id().map(|s| s.to_string());
             let im = state.router.resolve_model_name(&resolved_model);
-            (selection.provider, did, im, None, None, None, None, None, None)
+            (selection.provider, did, im, None, None, None, None, None, None, Vec::new())
         }
     };
     let routing_ms = route_start.elapsed().as_millis() as u64;
@@ -4481,6 +4493,9 @@ pub async fn responses(
         };
         let _decision = plan_charge.commit();
         crate::health_monitor::reset_request_failure(&state, &deployment_id);
+        // Trie learning: admission success is the "it fits" proof — record
+        // only on the Ok path (Err prefixes must never learn, design §7).
+        state.kvc_orchestrator.record_success(&resolved_model, provider.kv_worker_id(), &prefix_bytes);
         let usage = UsageTracker::default();
         let sse_stream = sse_stream_from_responses_chat_stream(
             stream, model.clone(), response_id.clone(), created_at, usage.clone(),
@@ -4663,6 +4678,9 @@ pub async fn responses(
         let _decision = plan_charge.commit();
         drop(plan_charge.take_concurrency_guard());
         crate::health_monitor::reset_request_failure(&state, &deployment_id);
+        // Trie learning: admission success is the "it fits" proof — record
+        // only on the Ok path (Err prefixes must never learn, design §7).
+        state.kvc_orchestrator.record_success(&resolved_model, provider.kv_worker_id(), &prefix_bytes);
 
         let duration_ms = start.elapsed().as_millis() as i32;
         let usage = response.usage.as_ref();
