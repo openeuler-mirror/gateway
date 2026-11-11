@@ -5851,7 +5851,7 @@ fn sse_stream_from_responses_chat_stream(
                 // transcoder already reached its terminal state — dropping
                 // the remaining events can't strand the persist tail.
                 if tx.send(item).await.is_err() {
-                    break;
+                    break; // client gone — persist tail still runs below
                 }
             }
         } else {
