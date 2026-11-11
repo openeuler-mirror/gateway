@@ -3829,6 +3829,109 @@ pub async fn get_model_detail(
     }
 }
 
+/// Consumption overview: token spend by key / team / end-user tag / client
+/// IP plus a token-volume series. Accepts `?range=today|1d|3d|7d&force=1`.
+pub async fn get_consumption_stats(
+    _session: AdminSession,
+    Query(params): Query<DailyStatsParams>,
+    Extension(state): Extension<Arc<DashboardState>>,
+) -> Response {
+    let range = match boom_audit::StatsRange::from_param(
+        params.range.as_deref().unwrap_or("today"),
+    ) {
+        Some(r) => r,
+        None => {
+            return Json(json!({
+                "ready": false,
+                "error": "invalid range (expected today|1d|3d|7d)",
+            }))
+            .into_response()
+        }
+    };
+    let Some(pool) = &state.db_pool else {
+        return Json(json!({
+            "ready": false,
+            "error": "consumption stats unavailable (no database configured)",
+        }))
+        .into_response();
+    };
+    let key = range.as_str().to_string();
+    let snap = match state
+        .analytics
+        .consumption
+        .get_or_refresh(&key, 300, params.force.is_some(), || {
+            boom_audit::analytics::query_consumption(range, pool)
+        })
+        .await
+    {
+        Ok(s) => Some(s),
+        Err(e) => {
+            tracing::warn!("Consumption refresh failed ({}): {e}", range.as_str());
+            state.analytics.consumption.current(&key)
+        }
+    };
+    match snap {
+        Some(snap) => {
+            let mut v = serde_json::to_value(&*snap).unwrap_or_else(|_| json!({}));
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("ready".to_string(), json!(true));
+            }
+            Json(v).into_response()
+        }
+        None => Json(json!({
+            "ready": false,
+            "error": "consumption stats unavailable (refresh pending or failing)",
+        }))
+        .into_response(),
+    }
+}
+
+/// Single-key consumption drill-down. Direct query (no cache — key
+/// cardinality is unbounded); accepts `?range=today|1d|3d|7d`.
+pub async fn get_consumption_key_detail(
+    _session: AdminSession,
+    Path(key_hash): Path<String>,
+    Query(params): Query<DailyStatsParams>,
+    Extension(state): Extension<Arc<DashboardState>>,
+) -> Response {
+    let range = match boom_audit::StatsRange::from_param(
+        params.range.as_deref().unwrap_or("today"),
+    ) {
+        Some(r) => r,
+        None => {
+            return Json(json!({
+                "ready": false,
+                "error": "invalid range (expected today|1d|3d|7d)",
+            }))
+            .into_response()
+        }
+    };
+    let Some(pool) = &state.db_pool else {
+        return Json(json!({
+            "ready": false,
+            "error": "key stats unavailable (no database configured)",
+        }))
+        .into_response();
+    };
+    match boom_audit::analytics::query_key_consumption_detail(&key_hash, range, pool).await {
+        Ok(snap) => {
+            let mut v = serde_json::to_value(&snap).unwrap_or_else(|_| json!({}));
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("ready".to_string(), json!(true));
+            }
+            Json(v).into_response()
+        }
+        Err(e) => {
+            tracing::warn!("Key consumption detail failed ({key_hash}): {e}");
+            Json(json!({
+                "ready": false,
+                "error": "key stats query failed",
+            }))
+            .into_response()
+        }
+    }
+}
+
 // ═══════════════════════════════════════════════════════════
 // In-Flight Request Stats (real-time)
 // ═══════════════════════════════════════════════════════════

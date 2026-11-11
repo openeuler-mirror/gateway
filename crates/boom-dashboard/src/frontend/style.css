@@ -3409,9 +3409,11 @@ input[list] {
 .an-errrate-high { color: var(--danger); font-weight: 600; }
 
 /* ── Analytics detail pages (model / consumption / schedule) ── */
-/* Overview model rows drill into the model detail page. */
+/* Overview model rows / key ranking rows drill into detail pages. */
 .an-table tr[data-model] { cursor: pointer; }
 .an-table tr[data-model]:hover td { background: var(--surface2); }
+.an-table tr[data-key] { cursor: pointer; }
+.an-table tr[data-key]:hover td { background: var(--surface2); }
 .an-dim { color: var(--text3); }
 /* Multi-series trend chart (renderTrendChart) — line/area colors are set
    inline per series (CSS vars resolve); these carry the geometry. */

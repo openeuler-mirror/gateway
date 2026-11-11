@@ -200,6 +200,16 @@ pub fn build_router<S: Clone + Send + Sync + 'static>(state: DashboardState) -> 
             "/dashboard/api/admin/stats/model/{model}",
             get(handlers_admin::get_model_detail),
         )
+        // Admin — Analytics consumption overview (lazy TTL cache keyed
+        // "{range}") and single-key drill-down (direct, uncached).
+        .route(
+            "/dashboard/api/admin/stats/consumption",
+            get(handlers_admin::get_consumption_stats),
+        )
+        .route(
+            "/dashboard/api/admin/stats/consumption/key/{key_hash}",
+            get(handlers_admin::get_consumption_key_detail),
+        )
         // Admin — System Pressure timeseries (1Hz ring buffer, last N minutes).
         .route(
             "/dashboard/api/admin/stress/timeseries",

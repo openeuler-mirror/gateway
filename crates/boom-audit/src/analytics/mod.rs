@@ -26,8 +26,13 @@ use std::{
 use arc_swap::ArcSwapOption;
 use chrono::Utc;
 
+mod consumption;
 mod model;
 
+pub use consumption::{
+    query_consumption, query_key_consumption_detail, ConsumptionSeriesPoint, ConsumptionSnapshot,
+    IpAgg, KeyAgg, KeyConsumptionDetail, KeySeriesPoint, TagAgg, TeamAgg,
+};
 pub use model::{query_model_detail, DeploymentAgg, ModelDetailSnapshot, ModelSeriesPoint};
 
 /// Cache slots kept before stale-entry pruning kicks in.
@@ -155,6 +160,8 @@ impl<T> TtlCache<T> {
 pub struct AnalyticsHub {
     /// Model detail snapshots, keyed `"{model}|{range}"`.
     pub model: TtlCache<ModelDetailSnapshot>,
+    /// Consumption snapshots, keyed `"{range}"`.
+    pub consumption: TtlCache<ConsumptionSnapshot>,
 }
 
 impl Default for AnalyticsHub {
@@ -167,6 +174,7 @@ impl AnalyticsHub {
     pub fn new() -> Self {
         Self {
             model: TtlCache::new(),
+            consumption: TtlCache::new(),
         }
     }
 }

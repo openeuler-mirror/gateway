@@ -445,6 +445,16 @@
     } else {
       stopModelPoll();
     }
+    // Same pattern as the model page: loadConsumption re-parses the hash,
+    // so main view ⇄ key drill-down switches inside the section work.
+    // The key drill-down is a direct query — no interval, manual refresh
+    // only; the main (cached) view polls every 60s.
+    if (section === "admin-consumption") {
+      setupConsumptionPage();
+      startConsumptionPoll();
+    } else {
+      stopConsumptionPoll();
+    }
     if (section === "admin-status") {
       loadAlerts();
       startAlertsPoll();
@@ -481,6 +491,7 @@
     // Must come AFTER "/admin/models" — that string also contains
     // "/admin/model" (hash.includes substring matching).
     if (hash.includes("/admin/model")) return "admin-model";
+    if (hash.includes("/admin/consumption")) return "admin-consumption";
     // if (hash.includes("/admin/workflows")) return "admin-workflows"; // workflow page disabled
     if (hash.includes("/admin/plans")) return "admin-plans";
     if (hash.includes("/admin/keys")) return "admin-keys";
@@ -534,11 +545,13 @@
   }
 
   function updateAnalyticsRangeUI() {
-    // Overview + model detail share the range state; keep both bars in
-    // sync (drilling in keeps the window you were looking at).
-    document.querySelectorAll("#an-range button, #md-range button").forEach((b) => {
-      b.classList.toggle("active", b.dataset.range === analyticsRange);
-    });
+    // Overview + model detail + consumption share the range state; keep
+    // the bars in sync (drilling in keeps the window you were looking at).
+    document
+      .querySelectorAll("#an-range button, #md-range button, #cs-range button")
+      .forEach((b) => {
+        b.classList.toggle("active", b.dataset.range === analyticsRange);
+      });
   }
 
   function setupAnalytics() {
@@ -1360,6 +1373,426 @@
     if (bucketSecs <= 600) return t("model.bucket.10m");
     if (bucketSecs <= 1800) return t("model.bucket.30m");
     return t("model.bucket.1h");
+  }
+
+  // ── Analytics detail: consumption page ──
+  // Main view (#/admin/consumption): token spend by key / team / end-user
+  // tag / client IP from the TTL-cached snapshot, polled every 60s.
+  // Key drill-down (#/admin/consumption/key/<hash>): direct uncached
+  // query, no polling — manual refresh only (key cardinality is
+  // unbounded, caching would only add prune pressure).
+  let consumptionTimer = null;
+  let csData = null; // main-view snapshot
+  let csKeyData = null; // key drill-down report
+
+  function currentKeyFromHash() {
+    const m = (location.hash || "").match(/\/admin\/consumption\/key\/([^/?#]+)/);
+    return m ? decodeURIComponent(m[1]) : "";
+  }
+
+  function startConsumptionPoll() {
+    stopConsumptionPoll();
+    loadConsumption(false);
+    if (!currentKeyFromHash()) {
+      consumptionTimer = setInterval(() => loadConsumption(false), 60000);
+    }
+  }
+
+  function stopConsumptionPoll() {
+    if (consumptionTimer) {
+      clearInterval(consumptionTimer);
+      consumptionTimer = null;
+    }
+  }
+
+  function setupConsumptionPage() {
+    const btn = document.getElementById("btn-refresh-consumption");
+    if (btn && !btn.dataset.bound) {
+      btn.dataset.bound = "1";
+      btn.addEventListener("click", () => loadConsumption(true));
+    }
+    const bar = document.getElementById("cs-range");
+    if (bar && !bar.dataset.bound) {
+      bar.dataset.bound = "1";
+      bar.addEventListener("click", (e) => {
+        const b = e.target.closest("button[data-range]");
+        if (!b || b.dataset.range === analyticsRange) return;
+        analyticsRange = b.dataset.range;
+        localStorage.setItem("analyticsRange", analyticsRange);
+        updateAnalyticsRangeUI();
+        loadConsumption(false);
+      });
+    }
+    // Key ranking rows navigate into the drill-down sub-view.
+    const bodyEl = document.getElementById("cs-body");
+    if (bodyEl && !bodyEl.dataset.keybound) {
+      bodyEl.dataset.keybound = "1";
+      bodyEl.addEventListener("click", (e) => {
+        const tr = e.target.closest("tr[data-key]");
+        if (tr) {
+          location.hash = "#/admin/consumption/key/" + encodeURIComponent(tr.dataset.key);
+        }
+      });
+    }
+    updateAnalyticsRangeUI();
+  }
+
+  async function loadConsumption(force) {
+    const keyHash = currentKeyFromHash();
+    const requested = (keyHash || "-") + "|" + analyticsRange;
+    try {
+      const res = keyHash
+        ? await api(
+            "/admin/stats/consumption/key/" + encodeURIComponent(keyHash) +
+              "?range=" + analyticsRange
+          )
+        : await api(
+            "/admin/stats/consumption?range=" + analyticsRange + (force ? "&force=1" : "")
+          );
+      // A hash change (main ⇄ key view, or range switch) can race an
+      // in-flight request — only render what's still on screen.
+      if (requested !== (currentKeyFromHash() || "-") + "|" + analyticsRange) return;
+      if (keyHash) csKeyData = res;
+      else csData = res;
+      renderConsumption();
+    } catch (e) {
+      // Read-only poller — api() already surfaces auth problems.
+    }
+  }
+
+  // UTC+8 "MM-DD HH:mm" from epoch seconds (first/last seen columns).
+  function fmtCstDT(epoch) {
+    if (epoch == null) return "—";
+    const d = new Date((epoch + 8 * 3600) * 1000);
+    const p2 = (x) => String(x).padStart(2, "0");
+    return (
+      p2(d.getUTCMonth() + 1) + "-" + p2(d.getUTCDate()) + " " +
+      p2(d.getUTCHours()) + ":" + p2(d.getUTCMinutes())
+    );
+  }
+
+  function keyDisplayLabel(k) {
+    return k.key_alias || k.key_name || k.key_hash || "";
+  }
+
+  function renderConsumption() {
+    const body = document.getElementById("cs-body");
+    if (!body) return;
+    if (currentKeyFromHash()) renderConsumptionKey(body);
+    else renderConsumptionMain(body);
+  }
+
+  function renderConsumptionMain(body) {
+    const sub = document.getElementById("cs-subtitle");
+    if (sub) sub.textContent = t("consumption.subtitle");
+    const data = csData;
+    if (!data || !data.ready) {
+      const detail = data && data.error ? " — " + esc(String(data.error)) : "";
+      body.innerHTML = '<p class="loading">' + esc(t("analytics.unavailable")) + detail + "</p>";
+      return;
+    }
+
+    const errRate = data.requests > 0 ? (data.errors / data.requests * 100) : 0;
+    const cards = [
+      { label: t("analytics.metrics.requests"), value: fmtFullNum(data.requests), hint: "" },
+      { label: t("analytics.metrics.input_tokens"), value: fmtCompactNum(data.input_tokens), hint: "" },
+      { label: t("analytics.metrics.output_tokens"), value: fmtCompactNum(data.output_tokens), hint: "" },
+      { label: t("analytics.metrics.errors"), value: fmtFullNum(data.errors),
+        hint: errRate.toFixed(2) + "%" },
+      { label: t("model.metrics.cache_hit"), value: fmtPct(
+          data.input_tokens > 0 ? data.cached_tokens / data.input_tokens : null),
+        hint: t("model.metrics.cache_hit_hint") },
+    ];
+    const metrics = '<div class="an-metrics">' + cards.map((c) =>
+      '<div class="an-metric">' +
+        '<div class="an-metric-label">' + esc(c.label) + "</div>" +
+        '<div class="an-metric-value">' + esc(c.value) + "</div>" +
+        (c.hint ? '<div class="an-metric-hint">' + esc(c.hint) + "</div>" : "") +
+      "</div>"
+    ).join("") + "</div>";
+
+    const chartCard = (id, titleKey, hint) =>
+      '<div class="card an-panel">' +
+        '<div class="an-card-head"><h3>' + esc(t(titleKey)) + '</h3><span class="an-hint">' + esc(hint) + "</span></div>" +
+        '<div id="' + id + '"></div>' +
+      "</div>";
+    const bucketHint = t("model.series.hint", { bucket: bucketLabel(data.bucket_secs) });
+
+    const tableCard = (id, titleKey, hint, inner) =>
+      '<div class="card an-panel">' +
+        '<div class="an-card-head"><h3>' + esc(t(titleKey)) + '</h3><span class="an-hint">' + esc(hint) + "</span></div>" +
+        '<div id="' + id + '">' + inner + "</div>" +
+      "</div>";
+
+    body.innerHTML = metrics +
+      chartCard("cs-chart-tokens", "model.series.tokens", bucketHint) +
+      chartCard("cs-chart-req", "model.series.requests", bucketHint) +
+      tableCard("cs-keys", "consumption.keys.title",
+        t("consumption.keys.hint", { n: (data.keys || []).length }), "") +
+      tableCard("cs-teams", "consumption.teams.title", "", "") +
+      tableCard("cs-tags", "consumption.tags.title", "", "") +
+      tableCard("cs-ips", "consumption.ips.title", "", "");
+
+    // ── Charts ──
+    const total = Math.max(1, Number(data.total_slots) || 144);
+    const bucket = Math.max(60, Number(data.bucket_secs) || 600);
+    const since = Number(data.since_epoch) || 0;
+    const span = data.range === "today"
+      ? Math.min(Math.max(Math.floor((Date.now() / 1000 - since) / bucket) + 1, 1), total)
+      : total;
+    const req = Array.from({ length: total }, () => 0);
+    const err = Array.from({ length: total }, () => 0);
+    const input = Array.from({ length: total }, () => 0);
+    const output = Array.from({ length: total }, () => 0);
+    (data.series || []).forEach((p) => {
+      const idx = Math.round((p.slot_epoch - since) / bucket);
+      if (idx < 0 || idx >= total) return;
+      req[idx] += p.requests || 0;
+      err[idx] += p.errors || 0;
+      input[idx] += p.input_tokens || 0;
+      output[idx] += p.output_tokens || 0;
+    });
+    const C_MAIN = "var(--primary)", C_ALT = "var(--warn)", C_ERR = "var(--danger)";
+    renderTrendChart("cs-chart-tokens", {
+      since, bucket, total, span,
+      series: [
+        { label: t("analytics.series.input"), color: C_MAIN, values: input },
+        { label: t("analytics.series.output"), color: C_ALT, values: output },
+      ],
+      tooltipRows: (i) => [
+        { label: t("analytics.series.input"), value: fmtFullNum(input[i]) },
+        { label: t("analytics.series.output"), value: fmtFullNum(output[i]) },
+      ],
+    });
+    renderTrendChart("cs-chart-req", {
+      since, bucket, total, span,
+      series: [
+        { label: t("analytics.series.requests"), color: C_MAIN, values: req },
+        { label: t("analytics.metrics.errors"), color: C_ERR, values: err },
+      ],
+      tooltipRows: (i) => [
+        { label: t("analytics.series.requests"), value: fmtFullNum(req[i]) },
+        { label: t("analytics.metrics.errors"), value: fmtFullNum(err[i]) },
+      ],
+    });
+
+    // ── Key ranking ──
+    const keysWrap = document.getElementById("cs-keys");
+    if (keysWrap) {
+      const keys = data.keys || [];
+      if (!keys.length) {
+        keysWrap.innerHTML = '<p class="loading">' + esc(t("common.no_records")) + "</p>";
+      } else {
+        const th = (labelKey, cls) =>
+          "<th" + (cls ? ' class="' + cls + '"' : "") + ">" + esc(t(labelKey)) + "</th>";
+        const head = "<tr>" +
+          th("consumption.th.rank", "num") + th("consumption.th.key") +
+          th("analytics.metrics.requests", "num") + th("analytics.metrics.input_tokens", "num") +
+          th("analytics.metrics.output_tokens", "num") + th("analytics.metrics.errors", "num") +
+          th("consumption.th.cache", "num") + th("consumption.th.first_seen") +
+          th("consumption.th.last_seen") + "</tr>";
+        const rows = keys.map((k, i) =>
+          "<tr data-key=\"" + esc(k.key_hash) + "\" title=\"" + esc(k.key_hash) + "\">" +
+            '<td class="num an-dim">' + (i + 1) + "</td>" +
+            "<td>" + esc(keyDisplayLabel(k)) + ' <span class="an-dim">' + esc(shortHash(k.key_hash)) + "</span></td>" +
+            '<td class="num">' + fmtFullNum(k.requests) + "</td>" +
+            '<td class="num">' + fmtCompactNum(k.input_tokens) + "</td>" +
+            '<td class="num">' + fmtCompactNum(k.output_tokens) + "</td>" +
+            '<td class="num' + (k.errors > 0 ? " an-err-text" : "") + '">' + fmtFullNum(k.errors) + "</td>" +
+            '<td class="num">' + fmtPct(k.cache_hit_ratio) + "</td>" +
+            "<td>" + fmtCstDT(k.first_seen_epoch) + "</td>" +
+            "<td>" + fmtCstDT(k.last_seen_epoch) + "</td>" +
+          "</tr>"
+        ).join("");
+        keysWrap.innerHTML =
+          '<table class="an-table"><thead>' + head + "</thead><tbody>" + rows + "</tbody></table>";
+      }
+    }
+
+    // ── Teams / user tags / client IPs ──
+    const renderAggTable = (wrapId, rows, cols, rowHtml) => {
+      const wrap = document.getElementById(wrapId);
+      if (!wrap) return;
+      if (!rows.length) {
+        wrap.innerHTML = '<p class="loading">' + esc(t("common.no_records")) + "</p>";
+        return;
+      }
+      const head = "<tr>" + cols.map((c) =>
+        "<th" + (c.cls ? ' class="' + c.cls + '"' : "") + ">" + esc(t(c.labelKey)) + "</th>"
+      ).join("") + "</tr>";
+      wrap.innerHTML =
+        '<table class="an-table"><thead>' + head + "</thead><tbody>" +
+        rows.map(rowHtml).join("") + "</tbody></table>";
+    };
+    const numCol = (labelKey) => ({ labelKey, cls: "num" });
+    renderAggTable(
+      "cs-teams",
+      data.teams || [],
+      [{ labelKey: "consumption.th.team" }, numCol("consumption.th.keys"),
+       numCol("analytics.metrics.requests"), numCol("analytics.metrics.input_tokens"),
+       numCol("analytics.metrics.output_tokens"), numCol("analytics.metrics.errors")],
+      (r) =>
+        "<tr>" +
+          "<td>" + (r.team_id
+            ? esc(r.team_id)
+            : '<span class="an-dim">' + esc(t("consumption.none_team")) + "</span>") + "</td>" +
+          '<td class="num">' + fmtFullNum(r.active_keys) + "</td>" +
+          '<td class="num">' + fmtFullNum(r.requests) + "</td>" +
+          '<td class="num">' + fmtCompactNum(r.input_tokens) + "</td>" +
+          '<td class="num">' + fmtCompactNum(r.output_tokens) + "</td>" +
+          '<td class="num' + (r.errors > 0 ? " an-err-text" : "") + '">' + fmtFullNum(r.errors) + "</td>" +
+        "</tr>"
+    );
+    renderAggTable(
+      "cs-tags",
+      data.user_tags || [],
+      [{ labelKey: "consumption.th.tag" }, numCol("analytics.metrics.requests"),
+       numCol("analytics.metrics.input_tokens"), numCol("analytics.metrics.output_tokens"),
+       numCol("analytics.metrics.errors")],
+      (r) =>
+        "<tr>" +
+          "<td>" + esc(r.user_tag1) + "</td>" +
+          '<td class="num">' + fmtFullNum(r.requests) + "</td>" +
+          '<td class="num">' + fmtCompactNum(r.input_tokens) + "</td>" +
+          '<td class="num">' + fmtCompactNum(r.output_tokens) + "</td>" +
+          '<td class="num' + (r.errors > 0 ? " an-err-text" : "") + '">' + fmtFullNum(r.errors) + "</td>" +
+        "</tr>"
+    );
+    renderAggTable(
+      "cs-ips",
+      data.client_ips || [],
+      [{ labelKey: "consumption.th.ip" }, numCol("analytics.metrics.requests"),
+       numCol("analytics.metrics.input_tokens"), numCol("analytics.metrics.output_tokens"),
+       numCol("analytics.metrics.errors")],
+      (r) =>
+        "<tr>" +
+          "<td>" + (r.client_ip
+            ? esc(r.client_ip)
+            : '<span class="an-dim">' + esc(t("consumption.unknown_ip")) + "</span>") + "</td>" +
+          '<td class="num">' + fmtFullNum(r.requests) + "</td>" +
+          '<td class="num">' + fmtCompactNum(r.input_tokens) + "</td>" +
+          '<td class="num">' + fmtCompactNum(r.output_tokens) + "</td>" +
+          '<td class="num' + (r.errors > 0 ? " an-err-text" : "") + '">' + fmtFullNum(r.errors) + "</td>" +
+        "</tr>"
+    );
+  }
+
+  function renderConsumptionKey(body) {
+    const sub = document.getElementById("cs-subtitle");
+    const data = csKeyData;
+    const keyHash = currentKeyFromHash();
+    if (sub) {
+      sub.textContent = data && (data.key_alias || data.key_name)
+        ? (data.key_alias || data.key_name) + " · " + shortHash(keyHash)
+        : keyHash || "—";
+    }
+    if (!data || !data.ready) {
+      const detail = data && data.error ? " — " + esc(String(data.error)) : "";
+      body.innerHTML = '<p class="loading">' + esc(t("analytics.unavailable")) + detail + "</p>";
+      return;
+    }
+
+    const errRate = data.requests > 0 ? (data.errors / data.requests * 100) : 0;
+    const cards = [
+      { label: t("analytics.metrics.requests"), value: fmtFullNum(data.requests), hint: "" },
+      { label: t("analytics.metrics.input_tokens"), value: fmtCompactNum(data.input_tokens), hint: "" },
+      { label: t("analytics.metrics.output_tokens"), value: fmtCompactNum(data.output_tokens), hint: "" },
+      { label: t("model.metrics.cache_hit"), value: fmtPct(
+          data.input_tokens > 0 ? data.cached_tokens / data.input_tokens : null),
+        hint: t("model.metrics.cache_hit_hint") },
+      { label: t("analytics.metrics.errors"), value: fmtFullNum(data.errors),
+        hint: errRate.toFixed(2) + "%" },
+      { label: t("model.metrics.avg_duration"), value: fmtMs(data.avg_duration_ms),
+        hint: t("model.metrics.avg_duration_hint") },
+      { label: t("model.metrics.avg_ttft"), value: fmtMs(data.avg_ttft_ms),
+        hint: t("model.metrics.avg_ttft_hint") },
+    ];
+    const metrics = '<div class="an-metrics">' + cards.map((c) =>
+      '<div class="an-metric">' +
+        '<div class="an-metric-label">' + esc(c.label) + "</div>" +
+        '<div class="an-metric-value">' + esc(c.value) + "</div>" +
+        (c.hint ? '<div class="an-metric-hint">' + esc(c.hint) + "</div>" : "") +
+      "</div>"
+    ).join("") + "</div>";
+
+    const chartCard = (id, titleKey, hint) =>
+      '<div class="card an-panel">' +
+        '<div class="an-card-head"><h3>' + esc(t(titleKey)) + '</h3><span class="an-hint">' + esc(hint) + "</span></div>" +
+        '<div id="' + id + '"></div>' +
+      "</div>";
+    const bucketHint = t("model.series.hint", { bucket: bucketLabel(data.bucket_secs) });
+
+    body.innerHTML =
+      '<a class="tr-back" href="#/admin/consumption">← ' + esc(t("consumption.back_keys")) + "</a>" +
+      metrics +
+      chartCard("csk-chart-req", "model.series.requests", bucketHint) +
+      chartCard("csk-chart-tokens", "model.series.tokens", bucketHint) +
+      chartCard("csk-chart-cache", "model.series.cache", bucketHint) +
+      chartCard("csk-chart-latency", "model.series.latency", bucketHint);
+
+    const total = Math.max(1, Number(data.total_slots) || 144);
+    const bucket = Math.max(60, Number(data.bucket_secs) || 600);
+    const since = Number(data.since_epoch) || 0;
+    const span = data.range === "today"
+      ? Math.min(Math.max(Math.floor((Date.now() / 1000 - since) / bucket) + 1, 1), total)
+      : total;
+    const req = Array.from({ length: total }, () => 0);
+    const err = Array.from({ length: total }, () => 0);
+    const input = Array.from({ length: total }, () => 0);
+    const output = Array.from({ length: total }, () => 0);
+    const cached = Array.from({ length: total }, () => 0);
+    const dur = Array.from({ length: total }, () => null);
+    (data.series || []).forEach((p) => {
+      const idx = Math.round((p.slot_epoch - since) / bucket);
+      if (idx < 0 || idx >= total) return;
+      req[idx] += p.requests || 0;
+      err[idx] += p.errors || 0;
+      input[idx] += p.input_tokens || 0;
+      output[idx] += p.output_tokens || 0;
+      cached[idx] += p.cached_tokens || 0;
+      if (p.avg_duration_ms != null) dur[idx] = p.avg_duration_ms;
+    });
+    const ratioAt = (i) => (input[i] > 0 ? cached[i] / input[i] : null);
+    const C_MAIN = "var(--primary)", C_ALT = "var(--warn)", C_ERR = "var(--danger)";
+    renderTrendChart("csk-chart-req", {
+      since, bucket, total, span,
+      series: [
+        { label: t("analytics.series.requests"), color: C_MAIN, values: req },
+        { label: t("analytics.metrics.errors"), color: C_ERR, values: err },
+      ],
+      tooltipRows: (i) => [
+        { label: t("analytics.series.requests"), value: fmtFullNum(req[i]) },
+        { label: t("analytics.metrics.errors"), value: fmtFullNum(err[i]) },
+      ],
+    });
+    renderTrendChart("csk-chart-tokens", {
+      since, bucket, total, span,
+      series: [
+        { label: t("analytics.series.input"), color: C_MAIN, values: input },
+        { label: t("analytics.series.output"), color: C_ALT, values: output },
+      ],
+      tooltipRows: (i) => [
+        { label: t("analytics.series.input"), value: fmtFullNum(input[i]) },
+        { label: t("analytics.series.output"), value: fmtFullNum(output[i]) },
+      ],
+    });
+    renderTrendChart("csk-chart-cache", {
+      since, bucket, total, span, yMax: 1,
+      fmtY: (v) => Math.round(v * 100) + "%",
+      series: [{ label: t("model.series.cache"), color: C_MAIN,
+        values: Array.from({ length: total }, (_, i) => ratioAt(i)) }],
+      tooltipRows: (i) => [{ label: t("model.series.cache"), value: fmtPct(ratioAt(i)) }],
+    });
+    renderTrendChart("csk-chart-latency", {
+      since, bucket, total, span,
+      series: [{ label: t("model.series.latency"), color: C_MAIN, values: dur }],
+      tooltipRows: (i) => [{ label: t("model.series.latency"), value: fmtMs(dur[i]) }],
+    });
+  }
+
+  function shortHash(hash) {
+    const s = String(hash || "");
+    return s.length > 12 ? s.slice(0, 8) + "…" : s;
   }
 
   // ── In-Flight ─────────────────────────────────────────
