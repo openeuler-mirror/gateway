@@ -111,7 +111,9 @@ async fn peek_and_commit_counts_dimension() {
     assert_eq!(d.rejected_window_secs, Some(60));
     assert!(matches!(d.rejected_kind, Some(LimitDimension::Counts)));
     let retry = d.retry_after_secs.unwrap();
-    assert!((58..=60).contains(&retry), "retry_after {retry}");
+    // Tumbling window: retry_after = distance to the wall-clock boundary,
+    // so any value in (0, 60] is valid depending on when the test runs.
+    assert!((1..=60).contains(&retry), "retry_after {retry}");
 }
 
 /// DT-LM-02：tokens / costs 维度 —— 历史累计判定（达到限值即拒下一个）。
