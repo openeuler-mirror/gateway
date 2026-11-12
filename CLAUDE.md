@@ -120,7 +120,17 @@ Dashboard 需要执行写操作（创建模型、修改配置等）时：
 
 ### 7. 热加载（Hot Reload）与配置权威模型
 
-**配置归属三判据**——新增配置项时先过这三个测试，决定它进 YAML 还是 DB：
+**配置三域模型**——每个配置项必居其一，持久化与广播语义由域决定：
+
+| 域 | 权威源 | 生效方式 | 多实例语义 | 例子 |
+|----|--------|----------|------------|------|
+| **私域配置**（实例级） | 本地 YAML | reload / 重启 | **永不广播**——各实例可异构（server ip/port、线程数、路径本就该不同） | server、master_key/database_url、router 调度参数、prompt_log、trace（OTLP endpoint/采样）、hooks、deployment_health_check、quota_sync.interval_secs |
+| **全局配置**（集群级） | 共享 DB | 写 DB + bump category → 全实例 ≤5s 增量对账 | **必须广播**（§12；广播集 == DB 权威集） | model/alias/workflow/cost、plan/assignment、key/team、blocklist、user_tag headers、decision base、trace metrics 开关 |
+| **运行时覆写**（单实例临时） | 进程内存 | 即时 | 不持久、不广播，重启回归权威源值 | Logs 页 Prompt Log / Debug 快捷开关（覆写 YAML-home 字段的内存值；持久修改走 Config 页 section editor） |
+
+判定规则：**共享 DB 的单行/KV = 集群全局**（没有按 instance_id 区分的配置行）；覆写目标 home=Yaml → 只能运行时覆写；home=Db → 禁止走覆写路径，必须写 DB + bump。将来需要按实例区分的开关不能放共享 KV——要么回 YAML，要么按 instance_id 存。字段级的域登记见 §9 manifest 的 `ConfigHome`（编译期强制）。
+
+**配置归属三判据**——新增配置项时先过这三个测试，决定它进私域（YAML）还是全局（DB）：
 
 1. **自举测试**：读取它是否必须先于"能连上 DB"？是 → 本地（db_url、master_key、监听地址必须本地，否则鸡生蛋）。
 2. **本地性测试**：语义是否绑定本机环境（文件路径、线程数、连接池大小、OTLP endpoint）？是 → 本地。多实例共用一个值恰恰是坏味道（两台机器不该共享同一个路径）。
@@ -191,7 +201,7 @@ CRUD handler（model/alias/plan/quota/blocklist/workflow/cost template 等）的
 
 多实例共享一个 DB 时的状态同步分两类，**不得混淆**：
 
-**配置类（低频，revision 广播）**：Dashboard/CRUD 写 DB 后 `bump` 对应 category 计数器（`boom_config_revision`）；每实例 revision watcher 5s 轮询，变更 category 做**增量对账**（DB→内存，永不清空 store）。现有 category：auth / plan / assignment / quota / blocklist / routing / user_tag / trace。**所有配置类写路径必须 bump**（拍板：配置类即刻广播全实例）；bump 落在 store 的 `*_db` 写方法内（boom-limiter/boom-routing/boom-audit/boom-gatekeeper 模式）或 dashboard handler 内（boom_config KV 开关模式）。**运行时健康事件不广播**：`auto_disable_db`/`auto_enable_db` 是本实例连通性视角，不是配置编辑。新增配置类广播 = boom-state 加 CATEGORY_* 常量 + watcher 加对账分支。
+**配置类 = 全局配置（ConfigHome::Db，§7 三域模型），低频，revision 广播**：广播集严格等于 DB 权威集——私域配置（YAML home，如 server/prompt_log/OTLP endpoint）与运行时覆写（Logs 页快捷开关）永不广播。Dashboard/CRUD 写 DB 后 `bump` 对应 category 计数器（`boom_config_revision`）；每实例 revision watcher 5s 轮询，变更 category 做**增量对账**（DB→内存，永不清空 store）。现有 category：auth / plan / assignment / quota / blocklist / routing / user_tag / trace。**所有全局配置写路径必须 bump**（拍板：配置类即刻广播全实例）；bump 落在 store 的 `*_db` 写方法内（boom-limiter/boom-routing/boom-audit/boom-gatekeeper 模式）或 dashboard handler 内（boom_config KV 开关模式）。**运行时健康事件不广播**：`auto_disable_db`/`auto_enable_db` 是本实例连通性视角，不是配置编辑。新增配置类广播 = boom-state 加 CATEGORY_* 常量 + watcher 加对账分支（bump 了但没有对账分支 → watcher 打 warn，传播静默失败必须可发现）。
 
 **计量类（每请求操作，增量上推）**：计费/限流计数器**不存在覆盖式同步**——旧 snapshot→UPSERT 全量路径已删除，增量是唯一路径：
 - 双值表示：内存每维度两套值——`counts/tokens/costs` = 未上推本地增量（推送后清零），`g_*` = 全局基数镜像（boot 恢复 + 自身上推 + 拉取同伴）。**判定口径 = 全局基数 + 本地增量**。

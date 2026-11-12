@@ -211,7 +211,10 @@ async fn dispatch(category: &str, state: &AppState, pool: &PgPool) {
             tracing::info!(enabled, "trace metrics switch re-adopted (revision bump)");
         }
         other => {
-            tracing::debug!(category = other, "revision bump for unknown category — ignored");
+            // warn, not debug: a bumped category without a dispatch arm means
+            // someone added a write-side bump but forgot the reconcile —
+            // propagation is silently broken and must be discoverable.
+            tracing::warn!(category = other, "revision bump for unknown category — no reconcile arm, propagation skipped");
         }
     }
 }
