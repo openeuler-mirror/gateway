@@ -1655,6 +1655,8 @@ fn build_deployments_from_config(
             &p.headers,
             deployment_id,
             entry.client_type_header,
+            p.max_context_tokens,
+            entry.rollback_enabled,
         ) {
             Ok(provider) => {
                 // Also register as wildcard catch-all if flagged.

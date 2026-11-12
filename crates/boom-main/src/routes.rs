@@ -943,34 +943,83 @@ async fn chat_completions_inner(
     req.raw_capture = prompt_log_raw_capture.clone();
 
     // 4. Route to provider (streaming or non-streaming).
+    // ── Context rollback setup (design §6): identities rebind on a
+    // successful fallback; a request clone is kept only when the pool
+    // could roll back (the feature's only steady-state cost). ──
+    let rb_patterns = &inner.config.router_settings.rollback.context.patterns;
+    let rb_route = crate::rollback::RollbackRoute {
+        model: &resolved_model,
+        key_hash: Some(&identity.key_hash),
+        input_chars: input_chars as u64,
+        prefix_bytes: &prefix_bytes,
+        candidates: candidates.as_ref().map(|c| c.as_slice()).unwrap_or(&[]),
+    };
+    let rb_capable = crate::rollback::capable(rb_patterns, rb_route.candidates);
+    let mut provider = provider;
+    let mut deployment_id = deployment_id;
+    let mut fc_guard = fc_guard;
+    let mut schedule_policy = schedule_policy;
+    let mut rollback_from: Option<String> = None;
+    macro_rules! rb_fail { ($err:expr, $stream:expr) => {{
+        // Finalize FIRST so the audit row records the client-visible status
+        // (400 passthrough for context errors), not the masked 502.
+        let rb_final = crate::rollback::finalize_error($err, rb_patterns);
+        let partial_usage = provider_billing.actual_usage();
+        settle_partial_provider_accounting(&mut plan_charge, &provider_billing);
+        log_error_with_usage(&state, &identity, &model, api_path, $stream, start, &rb_final, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()), user_tags.clone(), partial_usage.as_ref(), None);
+        write_prompt_log_error(
+            &state,
+            prompt_log_should,
+            prompt_log_req_body.as_ref(),
+            prompt_log_trace_id.clone(),
+            &request_id,
+            &identity,
+            &model,
+            api_path,
+            $stream,
+            &client_ip,
+            prompt_log_headers.as_ref(),
+            &rb_final,
+            provider_prompt_trace.as_ref(),
+            prompt_log_raw_capture.as_ref(),
+            start,
+            trace_guard.as_mut(),
+        );
+        crate::health_monitor::record_request_failure(&state, &deployment_id, &rb_final);
+        return Err(GatewayErrorReply(rb_final, $stream));
+    }} }
+
     if is_stream {
         if let Some(g) = trace_guard.as_ref() { g.note_upstream_start(); }
-        let stream = match provider.chat_stream_with_context(req, provider_context).await {
-            Ok(s) => s,
-            Err(e) => {
-                let partial_usage = provider_billing.actual_usage();
-                settle_partial_provider_accounting(&mut plan_charge, &provider_billing);
-                log_error_with_usage(&state, &identity, &model, api_path, true, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()), user_tags.clone(), partial_usage.as_ref(), None);
-                write_prompt_log_error(
-                    &state,
-                    prompt_log_should,
-                    prompt_log_req_body.as_ref(),
-                    prompt_log_trace_id.clone(),
-                    &request_id,
-                    &identity,
-                    &model,
-                    api_path,
-                    true,
-                    &client_ip,
-                    prompt_log_headers.as_ref(),
-                    &e,
-                    provider_prompt_trace.as_ref(),
-                    prompt_log_raw_capture.as_ref(),
-                    start,
-                    trace_guard.as_mut(),
-                );
-                crate::health_monitor::record_request_failure(&state, &deployment_id, &e);
-                return Err(GatewayErrorReply(e, true));
+        let stream = if rb_capable {
+            // Capable pool: first call rides a clone; the original request is
+            // reserved verbatim for the potential retry (the feature's only
+            // steady-state cost — paid per request on rollback-configured
+            // pools, never on inert pools).
+            match provider.chat_stream_with_context(req.clone(), provider_context.clone()).await {
+                Ok(s) => s,
+                Err(e) => match crate::rollback::attempt_stream(
+                    &state, &e, req, Some(provider_context),
+                    provider.clone(), deployment_id.clone(), fc_guard.take(),
+                    is_vip, identity.key_alias.clone(), &rb_route,
+                ).await {
+                    crate::rollback::RollbackOutcome::NoRetry => rb_fail!(e, true),
+                    crate::rollback::RollbackOutcome::Retried { result, provider: p2, deployment_id: d2, fc_guard: g2, from_deployment_id } => {
+                        provider = p2;
+                        deployment_id = d2;
+                        fc_guard = g2;
+                        rollback_from = from_deployment_id;
+                        match result {
+                            Ok(s) => s,
+                            Err(e2) => rb_fail!(e2, true),
+                        }
+                    }
+                },
+            }
+        } else {
+            match provider.chat_stream_with_context(req, provider_context).await {
+                Ok(s) => s,
+                Err(e) => rb_fail!(e, true),
             }
         };
         // Provider accepted the request — commit the plan charge now.
@@ -979,6 +1028,19 @@ async fn chat_completions_inner(
         // Trie learning: admission success is the "it fits" proof — record
         // only on the Ok path (Err prefixes must never learn, design §7).
         state.kvc_orchestrator.record_success(&resolved_model, provider.kv_worker_id(), &prefix_bytes);
+        // ── Rollback bookkeeping (design §6): audit label, key-binding
+        // correction (on_outcome → the deployment that actually served),
+        // trace marker. Runs only when a fallback served this request. ──
+        if let Some(ref rb_from) = rollback_from {
+            schedule_policy = schedule_policy.take().map(|p| format!("{}+rollback", p));
+            state.router.notify_outcome(Some(&identity.key_hash), &resolved_model, deployment_id.as_deref(), true);
+            if let Some(g) = trace_guard.as_ref() {
+                g.set_attribute(
+                    "boom-gateway.rollback",
+                    boom_core::trace::SpanAttributeValue::String(format!("{:?} -> {:?}", rb_from, deployment_id)),
+                );
+            }
+        }
         let usage = UsageTracker::default();
         let sse_stream = sse_stream_from_chat_stream(stream, usage.clone());
         let inflight_guard = if let Some(ref did) = deployment_id {
@@ -1139,32 +1201,31 @@ async fn chat_completions_inner(
             InFlightGuard::new(state.inflight.clone(), &inflight_model, input_chars as u64)
         };
         if let Some(g) = trace_guard.as_ref() { g.note_upstream_start(); }
-        let response = match provider.chat_with_context(req, provider_context).await {
-            Ok(r) => r,
-            Err(e) => {
-                let partial_usage = provider_billing.actual_usage();
-                settle_partial_provider_accounting(&mut plan_charge, &provider_billing);
-                log_error_with_usage(&state, &identity, &model, api_path, false, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()), user_tags.clone(), partial_usage.as_ref(), None);
-                write_prompt_log_error(
-                    &state,
-                    prompt_log_should,
-                    prompt_log_req_body.as_ref(),
-                    prompt_log_trace_id.clone(),
-                    &request_id,
-                    &identity,
-                    &model,
-                    api_path,
-                    false,
-                    &client_ip,
-                    prompt_log_headers.as_ref(),
-                    &e,
-                    provider_prompt_trace.as_ref(),
-                    prompt_log_raw_capture.as_ref(),
-                    start,
-                    trace_guard.as_mut(),
-                );
-                crate::health_monitor::record_request_failure(&state, &deployment_id, &e);
-                return Err(GatewayErrorReply(e, false));
+        let response = if rb_capable {
+            match provider.chat_with_context(req.clone(), provider_context.clone()).await {
+                Ok(r) => r,
+                Err(e) => match crate::rollback::attempt_call(
+                    &state, &e, req, Some(provider_context),
+                    provider.clone(), deployment_id.clone(), fc_guard.take(),
+                    is_vip, identity.key_alias.clone(), &rb_route,
+                ).await {
+                    crate::rollback::RollbackOutcome::NoRetry => rb_fail!(e, false),
+                    crate::rollback::RollbackOutcome::Retried { result, provider: p2, deployment_id: d2, fc_guard: g2, from_deployment_id } => {
+                        provider = p2;
+                        deployment_id = d2;
+                        fc_guard = g2;
+                        rollback_from = from_deployment_id;
+                        match result {
+                            Ok(r) => r,
+                            Err(e2) => rb_fail!(e2, false),
+                        }
+                    }
+                },
+            }
+        } else {
+            match provider.chat_with_context(req, provider_context).await {
+                Ok(r) => r,
+                Err(e) => rb_fail!(e, false),
             }
         };
         if let Some(g) = trace_guard.as_ref() { g.note_upstream_end(); }
@@ -1177,6 +1238,19 @@ async fn chat_completions_inner(
         // Trie learning: admission success is the "it fits" proof — record
         // only on the Ok path (Err prefixes must never learn, design §7).
         state.kvc_orchestrator.record_success(&resolved_model, provider.kv_worker_id(), &prefix_bytes);
+        // ── Rollback bookkeeping (design §6): audit label, key-binding
+        // correction (on_outcome → the deployment that actually served),
+        // trace marker. Runs only when a fallback served this request. ──
+        if let Some(ref rb_from) = rollback_from {
+            schedule_policy = schedule_policy.take().map(|p| format!("{}+rollback", p));
+            state.router.notify_outcome(Some(&identity.key_hash), &resolved_model, deployment_id.as_deref(), true);
+            if let Some(g) = trace_guard.as_ref() {
+                g.set_attribute(
+                    "boom-gateway.rollback",
+                    boom_core::trace::SpanAttributeValue::String(format!("{:?} -> {:?}", rb_from, deployment_id)),
+                );
+            }
+        }
 
         let duration_ms = start.elapsed().as_millis() as i32;
         // None = upstream did not report usage → log NULL, settle 0 tokens.
@@ -3482,33 +3556,76 @@ pub async fn messages(
     openai_req.raw_capture = prompt_log_raw_capture.clone();
 
     // 4. Route to provider.
+    // ── Context rollback setup (design §6; see the chat handler for the
+    // full rationale — clone reserved only on rollback-capable pools). ──
+    let rb_patterns = &inner.config.router_settings.rollback.context.patterns;
+    let rb_route = crate::rollback::RollbackRoute {
+        model: &resolved_model,
+        key_hash: Some(&identity.key_hash),
+        input_chars: input_chars as u64,
+        prefix_bytes: &prefix_bytes,
+        candidates: candidates.as_ref().map(|c| c.as_slice()).unwrap_or(&[]),
+    };
+    let rb_capable = crate::rollback::capable(rb_patterns, rb_route.candidates);
+    let mut provider = provider;
+    let mut deployment_id = deployment_id;
+    let mut fc_guard = fc_guard;
+    let mut schedule_policy = schedule_policy;
+    let mut rollback_from: Option<String> = None;
+    macro_rules! rb_fail { ($err:expr, $stream:expr) => {{
+        // Finalize FIRST so the audit row records the client-visible status.
+        let rb_final = crate::rollback::finalize_error($err, rb_patterns);
+        log_error(&state, &identity, &model, "/v1/messages", $stream, start, &rb_final, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()), user_tags.clone());
+        write_prompt_log_error(
+            &state,
+            prompt_log_should,
+            prompt_log_req_body.as_ref(),
+            prompt_log_trace_id.clone(),
+            &request_id,
+            &identity,
+            &model,
+            "/v1/messages",
+            $stream,
+            &client_ip,
+            prompt_log_headers.as_ref(),
+            &rb_final,
+            None,
+            prompt_log_raw_capture.as_ref(),
+            start,
+            trace_guard.as_mut(),
+        );
+        crate::health_monitor::record_request_failure(&state, &deployment_id, &rb_final);
+        // plan_charge drops here without commit — no quota consumed.
+        return Err(AnthropicErrorReply(rb_final, $stream));
+    }} }
+
     if is_stream {
         if let Some(g) = trace_guard.as_ref() { g.note_upstream_start(); }
-        let stream = match provider.chat_stream(openai_req).await {
-            Ok(s) => s,
-            Err(e) => {
-                log_error(&state, &identity, &model, "/v1/messages", true, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()), user_tags.clone());
-                write_prompt_log_error(
-                    &state,
-                    prompt_log_should,
-                    prompt_log_req_body.as_ref(),
-                    prompt_log_trace_id.clone(),
-                    &request_id,
-                    &identity,
-                    &model,
-                    "/v1/messages",
-                    true,
-                    &client_ip,
-                    prompt_log_headers.as_ref(),
-                    &e,
-                    None,
-                    prompt_log_raw_capture.as_ref(),
-                    start,
-                    trace_guard.as_mut(),
-                );
-                crate::health_monitor::record_request_failure(&state, &deployment_id, &e);
-                // plan_charge drops here without commit — no quota consumed.
-                return Err(AnthropicErrorReply(e, true));
+        let stream = if rb_capable {
+            match provider.chat_stream(openai_req.clone()).await {
+                Ok(s) => s,
+                Err(e) => match crate::rollback::attempt_stream(
+                    &state, &e, openai_req, None,
+                    provider.clone(), deployment_id.clone(), fc_guard.take(),
+                    is_vip, identity.key_alias.clone(), &rb_route,
+                ).await {
+                    crate::rollback::RollbackOutcome::NoRetry => rb_fail!(e, true),
+                    crate::rollback::RollbackOutcome::Retried { result, provider: p2, deployment_id: d2, fc_guard: g2, from_deployment_id } => {
+                        provider = p2;
+                        deployment_id = d2;
+                        fc_guard = g2;
+                        rollback_from = from_deployment_id;
+                        match result {
+                            Ok(s) => s,
+                            Err(e2) => rb_fail!(e2, true),
+                        }
+                    }
+                },
+            }
+        } else {
+            match provider.chat_stream(openai_req).await {
+                Ok(s) => s,
+                Err(e) => rb_fail!(e, true),
             }
         };
         // Provider accepted the request — commit the plan charge now.
@@ -3517,6 +3634,19 @@ pub async fn messages(
         // Trie learning: admission success is the "it fits" proof — record
         // only on the Ok path (Err prefixes must never learn, design §7).
         state.kvc_orchestrator.record_success(&resolved_model, provider.kv_worker_id(), &prefix_bytes);
+        // ── Rollback bookkeeping (design §6): audit label, key-binding
+        // correction (on_outcome → the deployment that actually served),
+        // trace marker. Runs only when a fallback served this request. ──
+        if let Some(ref rb_from) = rollback_from {
+            schedule_policy = schedule_policy.take().map(|p| format!("{}+rollback", p));
+            state.router.notify_outcome(Some(&identity.key_hash), &resolved_model, deployment_id.as_deref(), true);
+            if let Some(g) = trace_guard.as_ref() {
+                g.set_attribute(
+                    "boom-gateway.rollback",
+                    boom_core::trace::SpanAttributeValue::String(format!("{:?} -> {:?}", rb_from, deployment_id)),
+                );
+            }
+        }
         let usage = UsageTracker::default();
         let sse_stream = sse_stream_from_anthropic_chat_stream(stream, model.clone(), usage.clone());
         let inflight_guard = if let Some(ref did) = deployment_id {
@@ -3654,31 +3784,31 @@ pub async fn messages(
             InFlightGuard::new(state.inflight.clone(), &inflight_model, input_chars as u64)
         };
         if let Some(g) = trace_guard.as_ref() { g.note_upstream_start(); }
-        let response = match provider.chat(openai_req).await {
-            Ok(r) => r,
-            Err(e) => {
-                log_error(&state, &identity, &model, "/v1/messages", false, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()), user_tags.clone());
-                write_prompt_log_error(
-                    &state,
-                    prompt_log_should,
-                    prompt_log_req_body.as_ref(),
-                    prompt_log_trace_id.clone(),
-                    &request_id,
-                    &identity,
-                    &model,
-                    "/v1/messages",
-                    false,
-                    &client_ip,
-                    prompt_log_headers.as_ref(),
-                    &e,
-                    None,
-                    prompt_log_raw_capture.as_ref(),
-                    start,
-                    trace_guard.as_mut(),
-                );
-                crate::health_monitor::record_request_failure(&state, &deployment_id, &e);
-                // plan_charge drops here without commit — no quota consumed.
-                return Err(AnthropicErrorReply(e, false));
+        let response = if rb_capable {
+            match provider.chat(openai_req.clone()).await {
+                Ok(r) => r,
+                Err(e) => match crate::rollback::attempt_call(
+                    &state, &e, openai_req, None,
+                    provider.clone(), deployment_id.clone(), fc_guard.take(),
+                    is_vip, identity.key_alias.clone(), &rb_route,
+                ).await {
+                    crate::rollback::RollbackOutcome::NoRetry => rb_fail!(e, false),
+                    crate::rollback::RollbackOutcome::Retried { result, provider: p2, deployment_id: d2, fc_guard: g2, from_deployment_id } => {
+                        provider = p2;
+                        deployment_id = d2;
+                        fc_guard = g2;
+                        rollback_from = from_deployment_id;
+                        match result {
+                            Ok(r) => r,
+                            Err(e2) => rb_fail!(e2, false),
+                        }
+                    }
+                },
+            }
+        } else {
+            match provider.chat(openai_req).await {
+                Ok(r) => r,
+                Err(e) => rb_fail!(e, false),
             }
         };
         if let Some(g) = trace_guard.as_ref() { g.note_upstream_end(); }
@@ -3690,6 +3820,19 @@ pub async fn messages(
         // Trie learning: admission success is the "it fits" proof — record
         // only on the Ok path (Err prefixes must never learn, design §7).
         state.kvc_orchestrator.record_success(&resolved_model, provider.kv_worker_id(), &prefix_bytes);
+        // ── Rollback bookkeeping (design §6): audit label, key-binding
+        // correction (on_outcome → the deployment that actually served),
+        // trace marker. Runs only when a fallback served this request. ──
+        if let Some(ref rb_from) = rollback_from {
+            schedule_policy = schedule_policy.take().map(|p| format!("{}+rollback", p));
+            state.router.notify_outcome(Some(&identity.key_hash), &resolved_model, deployment_id.as_deref(), true);
+            if let Some(g) = trace_guard.as_ref() {
+                g.set_attribute(
+                    "boom-gateway.rollback",
+                    boom_core::trace::SpanAttributeValue::String(format!("{:?} -> {:?}", rb_from, deployment_id)),
+                );
+            }
+        }
 
         let duration_ms = start.elapsed().as_millis() as i32;
         // None = upstream did not report usage → log NULL, settle 0 tokens.
@@ -4153,7 +4296,7 @@ pub async fn responses(
 
     // when the response store is unavailable. Only completed/incomplete turns
     // are checkpointed (failed turns are not retrievable continuations).
-    let persist_ctx = if store_available && req.store != Some(false) {
+    let mut persist_ctx = if store_available && req.store != Some(false) {
         Some(ResponsesPersistCtx {
             response_id: response_id.clone(),
             previous_response_id: req.previous_response_id.clone(),
@@ -4440,55 +4583,101 @@ pub async fn responses(
 
 
     // 4. Route to provider.
+    // ── Context rollback setup (design §6; see the chat handler for the
+    // full rationale — clone reserved only on rollback-capable pools). ──
+    let rb_patterns = &inner.config.router_settings.rollback.context.patterns;
+    let rb_route = crate::rollback::RollbackRoute {
+        model: &resolved_model,
+        key_hash: Some(&identity.key_hash),
+        input_chars: input_chars as u64,
+        prefix_bytes: &prefix_bytes,
+        candidates: candidates.as_ref().map(|c| c.as_slice()).unwrap_or(&[]),
+    };
+    let rb_capable = crate::rollback::capable(rb_patterns, rb_route.candidates);
+    let mut provider = provider;
+    let mut deployment_id = deployment_id;
+    let mut fc_guard = fc_guard;
+    let mut schedule_policy = schedule_policy;
+    let mut rollback_from: Option<String> = None;
+    // Streaming failure is delivered IN-STREAM (responses_failed_sse);
+    // non-streaming is a plain error return. persist_ctx uses take() so
+    // the macro can expand on both the first-error and retry-error paths.
+    macro_rules! rb_fail { ($err:expr, $stream:expr) => {{
+        // Finalize FIRST so the audit row records the client-visible status.
+        let rb_final = crate::rollback::finalize_error($err, rb_patterns);
+        log_error(&state, &identity, &model, "/v1/responses", $stream, start, &rb_final, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()), user_tags.clone());
+        write_prompt_log_error(
+            &state,
+            prompt_log_should,
+            prompt_log_req_body.as_ref(),
+            prompt_log_trace_id.clone(),
+            &request_id,
+            &identity,
+            &model,
+            "/v1/responses",
+            $stream,
+            &client_ip,
+            prompt_log_headers.as_ref(),
+            &rb_final,
+            None,
+            prompt_log_raw_capture.as_ref(),
+            start,
+            trace_guard.as_mut(),
+        );
+        crate::health_monitor::record_request_failure(&state, &deployment_id, &rb_final);
+        if $stream {
+            // response.created was already promised on the wire — deliver
+            // the failure in-stream and checkpoint the failed turn.
+            let (mut failed_resp, final_obj) =
+                responses_failed_sse(&model, &response_id, created_at, &rb_final);
+            if let Some(v) = dropped_header.take() {
+                if let Ok(hv) = axum::http::HeaderValue::from_str(&v) {
+                    failed_resp.headers_mut().insert("x-boom-dropped-tools", hv);
+                }
+            }
+            if let Some(ctx) = persist_ctx.take() {
+                let turn = ctx.into_turn("failed", Vec::new(), final_obj);
+                if let Err(persist_err) = state.response_store.persist_turn(turn).await {
+                    tracing::warn!(
+                        response_id = %response_id,
+                        error = %persist_err,
+                        "responses store persist failed (failed turn) — next previous_response_id will 404"
+                    );
+                }
+            }
+            return Ok(failed_resp);
+        } else {
+            return Err(ResponsesErrorReply(rb_final));
+        }
+    }} }
+
     if is_stream {
         if let Some(g) = trace_guard.as_ref() { g.note_upstream_start(); }
-        let stream = match provider.chat_stream(openai_req).await {
-            Ok(s) => s,
-            Err(e) => {
-                log_error(&state, &identity, &model, "/v1/responses", true, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()), user_tags.clone());
-                write_prompt_log_error(
-                    &state,
-                    prompt_log_should,
-                    prompt_log_req_body.as_ref(),
-                    prompt_log_trace_id.clone(),
-                    &request_id,
-                    &identity,
-                    &model,
-                    "/v1/responses",
-                    true,
-                    &client_ip,
-                    prompt_log_headers.as_ref(),
-                    &e,
-                    None,
-                    prompt_log_raw_capture.as_ref(),
-                    start,
-                    trace_guard.as_mut(),
-                );
-                crate::health_monitor::record_request_failure(&state, &deployment_id, &e);
-                // plan_charge drops here without commit — no quota consumed.
-                // response.created was already promised on the wire (Response.md
-                // §6.5 rule 2), so the failure is delivered in-stream. The
-                // failed turn is STILL checkpointed — the client chains on the
-                // id carried by response.failed (real-LLM chain-break trap:
-                // an unpersisted id makes the next previous_response_id 404).
-                let (mut failed_resp, final_obj) =
-                    responses_failed_sse(&model, &response_id, created_at, &e);
-                if let Some(v) = dropped_header.take() {
-                    if let Ok(hv) = axum::http::HeaderValue::from_str(&v) {
-                        failed_resp.headers_mut().insert("x-boom-dropped-tools", hv);
+        let stream = if rb_capable {
+            match provider.chat_stream(openai_req.clone()).await {
+                Ok(s) => s,
+                Err(e) => match crate::rollback::attempt_stream(
+                    &state, &e, openai_req, None,
+                    provider.clone(), deployment_id.clone(), fc_guard.take(),
+                    is_vip, identity.key_alias.clone(), &rb_route,
+                ).await {
+                    crate::rollback::RollbackOutcome::NoRetry => rb_fail!(e, true),
+                    crate::rollback::RollbackOutcome::Retried { result, provider: p2, deployment_id: d2, fc_guard: g2, from_deployment_id } => {
+                        provider = p2;
+                        deployment_id = d2;
+                        fc_guard = g2;
+                        rollback_from = from_deployment_id;
+                        match result {
+                            Ok(s) => s,
+                            Err(e2) => rb_fail!(e2, true),
+                        }
                     }
-                }
-                if let Some(ctx) = persist_ctx {
-                    let turn = ctx.into_turn("failed", Vec::new(), final_obj);
-                    if let Err(persist_err) = state.response_store.persist_turn(turn).await {
-                        tracing::warn!(
-                            response_id = %response_id,
-                            error = %persist_err,
-                            "responses store persist failed (failed turn) — next previous_response_id will 404"
-                        );
-                    }
-                }
-                return Ok(failed_resp);
+                },
+            }
+        } else {
+            match provider.chat_stream(openai_req).await {
+                Ok(s) => s,
+                Err(e) => rb_fail!(e, true),
             }
         };
         let _decision = plan_charge.commit();
@@ -4496,6 +4685,19 @@ pub async fn responses(
         // Trie learning: admission success is the "it fits" proof — record
         // only on the Ok path (Err prefixes must never learn, design §7).
         state.kvc_orchestrator.record_success(&resolved_model, provider.kv_worker_id(), &prefix_bytes);
+        // ── Rollback bookkeeping (design §6): audit label, key-binding
+        // correction (on_outcome → the deployment that actually served),
+        // trace marker. Runs only when a fallback served this request. ──
+        if let Some(ref rb_from) = rollback_from {
+            schedule_policy = schedule_policy.take().map(|p| format!("{}+rollback", p));
+            state.router.notify_outcome(Some(&identity.key_hash), &resolved_model, deployment_id.as_deref(), true);
+            if let Some(g) = trace_guard.as_ref() {
+                g.set_attribute(
+                    "boom-gateway.rollback",
+                    boom_core::trace::SpanAttributeValue::String(format!("{:?} -> {:?}", rb_from, deployment_id)),
+                );
+            }
+        }
         let usage = UsageTracker::default();
         let sse_stream = sse_stream_from_responses_chat_stream(
             stream, model.clone(), response_id.clone(), created_at, usage.clone(),
@@ -4648,30 +4850,31 @@ pub async fn responses(
             InFlightGuard::new(state.inflight.clone(), &inflight_model, input_chars as u64)
         };
         if let Some(g) = trace_guard.as_ref() { g.note_upstream_start(); }
-        let response = match provider.chat(openai_req).await {
-            Ok(r) => r,
-            Err(e) => {
-                log_error(&state, &identity, &model, "/v1/responses", false, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()), user_tags.clone());
-                write_prompt_log_error(
-                    &state,
-                    prompt_log_should,
-                    prompt_log_req_body.as_ref(),
-                    prompt_log_trace_id.clone(),
-                    &request_id,
-                    &identity,
-                    &model,
-                    "/v1/responses",
-                    false,
-                    &client_ip,
-                    prompt_log_headers.as_ref(),
-                    &e,
-                    None,
-                    prompt_log_raw_capture.as_ref(),
-                    start,
-                    trace_guard.as_mut(),
-                );
-                crate::health_monitor::record_request_failure(&state, &deployment_id, &e);
-                return Err(ResponsesErrorReply(e));
+        let response = if rb_capable {
+            match provider.chat(openai_req.clone()).await {
+                Ok(r) => r,
+                Err(e) => match crate::rollback::attempt_call(
+                    &state, &e, openai_req, None,
+                    provider.clone(), deployment_id.clone(), fc_guard.take(),
+                    is_vip, identity.key_alias.clone(), &rb_route,
+                ).await {
+                    crate::rollback::RollbackOutcome::NoRetry => rb_fail!(e, false),
+                    crate::rollback::RollbackOutcome::Retried { result, provider: p2, deployment_id: d2, fc_guard: g2, from_deployment_id } => {
+                        provider = p2;
+                        deployment_id = d2;
+                        fc_guard = g2;
+                        rollback_from = from_deployment_id;
+                        match result {
+                            Ok(r) => r,
+                            Err(e2) => rb_fail!(e2, false),
+                        }
+                    }
+                },
+            }
+        } else {
+            match provider.chat(openai_req).await {
+                Ok(r) => r,
+                Err(e) => rb_fail!(e, false),
             }
         };
         if let Some(g) = trace_guard.as_ref() { g.note_upstream_end(); }
@@ -4681,6 +4884,19 @@ pub async fn responses(
         // Trie learning: admission success is the "it fits" proof — record
         // only on the Ok path (Err prefixes must never learn, design §7).
         state.kvc_orchestrator.record_success(&resolved_model, provider.kv_worker_id(), &prefix_bytes);
+        // ── Rollback bookkeeping (design §6): audit label, key-binding
+        // correction (on_outcome → the deployment that actually served),
+        // trace marker. Runs only when a fallback served this request. ──
+        if let Some(ref rb_from) = rollback_from {
+            schedule_policy = schedule_policy.take().map(|p| format!("{}+rollback", p));
+            state.router.notify_outcome(Some(&identity.key_hash), &resolved_model, deployment_id.as_deref(), true);
+            if let Some(g) = trace_guard.as_ref() {
+                g.set_attribute(
+                    "boom-gateway.rollback",
+                    boom_core::trace::SpanAttributeValue::String(format!("{:?} -> {:?}", rb_from, deployment_id)),
+                );
+            }
+        }
 
         let duration_ms = start.elapsed().as_millis() as i32;
         let usage = response.usage.as_ref();

@@ -210,6 +210,13 @@ pub struct DeploymentProviderRow {
     pub max_inflight_queue_len: Option<i32>,
     #[sqlx(default)]
     pub max_context_len: Option<i64>,
+    /// Context capability for rollback tiering (tokens). NULL = not
+    /// participating.
+    #[sqlx(default)]
+    pub max_context_tokens: Option<i64>,
+    /// Per-deployment rollback participation (pool semantics).
+    #[sqlx(default)]
+    pub rollback_enabled: bool,
     #[sqlx(default)]
     pub model_info: Option<serde_json::Value>,
     /// Team ACL (JSONB array of team_ids). NULL unless visibility='private'.
@@ -373,7 +380,8 @@ const PROVIDER_ROW_COLUMNS: &str = concat!(
     "model_name, litellm_model, api_key, api_key_env, api_base, api_version, ",
     "aws_region_name, timeout, headers, deployment_id, client_type_header, ",
     "serve_not_match, quota_count_ratio, max_inflight_queue_len, ",
-    "max_context_len, model_info, allowed_teams, visibility"
+    "max_context_len, max_context_tokens, rollback_enabled, ",
+    "model_info, allowed_teams, visibility"
 );
 
 /// SQL for `snapshot_db` — config export MUST include disabled rows.

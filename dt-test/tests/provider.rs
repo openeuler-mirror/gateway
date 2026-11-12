@@ -90,7 +90,7 @@ fn fake_anthropic_response() -> serde_json::Value {
 
 /// 通过 create_provider 构造 provider（覆盖 lib.rs 路径），api_base 指向 mock server。
 fn create(model: &str, key: Option<String>, base: String) -> Arc<dyn Provider> {
-    create_provider(model, key, Some(base), 5, &HashMap::new(), &HashMap::new(), None, false)
+    create_provider(model, key, Some(base), 5, &HashMap::new(), &HashMap::new(), None, false, None, false)
         .expect("create_provider")
 }
 
@@ -101,7 +101,7 @@ fn create_full(
     extra: &HashMap<String, String>,
     custom_headers: &HashMap<String, String>,
 ) -> Arc<dyn Provider> {
-    create_provider(model, key, Some(base), 5, extra, custom_headers, None, false)
+    create_provider(model, key, Some(base), 5, extra, custom_headers, None, false, None, false)
         .expect("create_provider")
 }
 
@@ -253,7 +253,7 @@ fn create_provider_protocol_per_type() {
 fn create_provider_unknown_type_errors() {
     let err = create_provider(
         "unknown_provider/m", Some("k".into()), Some("http://x".into()), 5,
-        &HashMap::new(), &HashMap::new(), None, false,
+        &HashMap::new(), &HashMap::new(), None, false, None, false,
     ).err().expect("should be Err");
     assert!(matches!(err, GatewayError::ConfigError(_)), "{err:?}");
 }
@@ -360,7 +360,7 @@ fn provider_trait_accessors() {
 fn deployment_id_passed_through() {
     let p = create_provider(
         "openai/gpt-4", Some("k".into()), Some("http://x/v1".into()), 5,
-        &HashMap::new(), &HashMap::new(), Some("dep-42".into()), false,
+        &HashMap::new(), &HashMap::new(), Some("dep-42".into()), false, None, false,
     ).unwrap();
     assert_eq!(p.deployment_id(), Some("dep-42"));
     // id 优先：有 deployment_id 时 kv_worker_id 不再从 api_base 派生。
@@ -372,7 +372,7 @@ fn deployment_id_passed_through() {
 fn client_type_header_flag_passed() {
     let p = create_provider(
         "openai/gpt-4", Some("k".into()), Some("http://x/v1".into()), 5,
-        &HashMap::new(), &HashMap::new(), None, true,
+        &HashMap::new(), &HashMap::new(), None, true, None, false,
     ).unwrap();
     assert!(p.client_type_header());
 }
@@ -401,7 +401,7 @@ fn kv_worker_id_for_id_only_semantics() {
 fn create_provider_timeout_zero_clamped() {
     let p = create_provider(
         "openai/gpt-4", Some("k".into()), Some("http://x/v1".into()), 0,
-        &HashMap::new(), &HashMap::new(), None, false,
+        &HashMap::new(), &HashMap::new(), None, false, None, false,
     );
     assert!(p.is_ok(), "timeout=0 should be clamped to 1");
 }
@@ -1262,7 +1262,7 @@ async fn anthropic_stream_upstream_and_network_errors() {
 async fn anthropic_provider_accessors() {
     let p = create_provider(
         "anthropic/claude-test", Some("k".into()), Some("http://127.0.0.1:9".into()), 5,
-        &HashMap::new(), &HashMap::new(), Some("dep-42".into()), true,
+        &HashMap::new(), &HashMap::new(), Some("dep-42".into()), true, None, false,
     ).expect("create_provider");
     assert_eq!(p.name(), "anthropic");
     assert_eq!(p.models(), &["claude-test".to_string()]);

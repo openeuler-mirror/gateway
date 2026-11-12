@@ -912,6 +912,8 @@ pub(crate) fn build_provider_from_row(
         &custom_headers,
         row.deployment_id.clone(),
         row.client_type_header.unwrap_or(false),
+        row.max_context_tokens.map(|v| v as u64),
+        row.rollback_enabled,
     ) {
         Ok(provider) => Some(provider),
         Err(e) => {
