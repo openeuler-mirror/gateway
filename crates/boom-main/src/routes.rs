@@ -1596,10 +1596,15 @@ pub async fn admin_assign_key(
     Json(body): Json<AssignRequest>,
 ) -> Result<Json<serde_json::Value>, GatewayErrorReply> {
     require_master(auth.identity())?;
-    state
-        .plan_store
-        .assign_key(&body.key_hash, &body.plan_name)
-        .map_err(|e| GatewayErrorReply(GatewayError::ConfigError(e), false))?;
+    let result = if let Some(ref pool) = state.db_pool {
+        state
+            .plan_store
+            .assign_key_db(pool, &body.key_hash, &body.plan_name)
+            .await
+    } else {
+        state.plan_store.assign_key(&body.key_hash, &body.plan_name)
+    };
+    result.map_err(|e| GatewayErrorReply(GatewayError::ConfigError(e), false))?;
     tracing::info!(key_hash = %body.key_hash, plan = %body.plan_name, "Key assigned to plan");
     Ok(Json(serde_json::json!({
         "status": "ok",
@@ -1614,7 +1619,16 @@ pub async fn admin_unassign_key(
     Path(key_hash): Path<String>,
 ) -> Result<Json<serde_json::Value>, GatewayErrorReply> {
     require_master(auth.identity())?;
-    if state.plan_store.unassign_key(&key_hash) {
+    let removed = if let Some(ref pool) = state.db_pool {
+        state
+            .plan_store
+            .unassign_key_db(pool, &key_hash)
+            .await
+            .map_err(|e| GatewayErrorReply(GatewayError::ConfigError(e), false))?
+    } else {
+        state.plan_store.unassign_key(&key_hash)
+    };
+    if removed {
         tracing::info!(key_hash = %key_hash, "Key unassigned from plan");
         Ok(Json(serde_json::json!({
             "status": "ok",

@@ -114,7 +114,9 @@ boom-trace      → leaf crate，Dashboard 经 boom-core::TraceApi（Arc<dyn Tra
 |------|------|------|
 | SIGHUP listener | 事件驱动 | 触发 reload（单槽 Mutex 防重入） |
 | admin_command_handler | channel 驱动 | 消费 AdminCommand（21 变体） |
-| 限流计数器/分配快照落库 | 600s | sync_counters_to_db / sync_assignments / cleanup_expired |
+| 配额增量同步 | 默认 60s（30–600s 可配） | sync_delta_cycle：增量上推（水位幂等）+ shared 模式拉取全局基数 + cleanup_expired |
+| 实例心跳 | 15s | boom_state::spawn_instance_heartbeat |
+| 配置 revision watcher | 5s | 轮询 boom_config_revision，按 category 增量对账 |
 | 请求量汇总日志 | 60s | request_count 分钟级摘要 |
 | FlowController 周期派发 | 1s | 防空闲容量滞留 |
 | KV trie TTL prune | ttl/2（≥5s） | 扫过期 trie 块 |

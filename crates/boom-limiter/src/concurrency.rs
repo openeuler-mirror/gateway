@@ -696,9 +696,9 @@ impl PlanStore {
 
     // ── Persistence helpers ───────────────────────────────────
 
-    /// Snapshot all key→plan assignments for DB persistence.
-    /// Returns the explicit choice (outer Option) per key — callers writing
-    /// to DB must handle `None` (write SQL NULL) distinctly from missing rows.
+    /// Snapshot all key→plan assignments (read-only inspection).
+    /// Returns the explicit choice (outer Option) per key — `None` (explicit
+    /// no-plan) is distinct from a missing row (fall back to default plan).
     pub fn snapshot_assignments(&self) -> Vec<(String, Option<String>)> {
         self.key_assignments
             .iter()
@@ -706,7 +706,7 @@ impl PlanStore {
             .collect()
     }
 
-    /// Snapshot all team→plan assignments for DB persistence.
+    /// Snapshot all team→plan assignments (read-only inspection).
     pub fn snapshot_team_assignments(&self) -> Vec<(String, String)> {
         self.team_assignments
             .iter()
@@ -1304,50 +1304,6 @@ impl PlanStore {
         } else {
             Ok(false)
         }
-    }
-
-    /// Sync in-memory key assignments to DB (periodic background task).
-    pub async fn sync_assignments_to_db(&self, pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
-        let assignments = self.snapshot_assignments();
-        for (key_hash, plan_name) in &assignments {
-            boom_core::gaussdb_upsert!(
-                pool,
-                || sqlx::query(
-                    r#"UPDATE boom_key_plan_assignment SET plan_name = $2 WHERE key_hash = $1"#,
-                )
-                .bind(key_hash)
-                .bind(plan_name),
-                || sqlx::query(
-                    r#"INSERT INTO boom_key_plan_assignment (key_hash, plan_name, assigned_at)
-                       VALUES ($1, $2, NOW())"#,
-                )
-                .bind(key_hash)
-                .bind(plan_name)
-            )?;
-        }
-        Ok(())
-    }
-
-    /// Sync in-memory team assignments to DB (periodic background task).
-    pub async fn sync_team_assignments_to_db(&self, pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
-        let assignments = self.snapshot_team_assignments();
-        for (team_id, plan_name) in &assignments {
-            boom_core::gaussdb_upsert!(
-                pool,
-                || sqlx::query(
-                    r#"UPDATE boom_team_plan_assignment SET plan_name = $2 WHERE team_id = $1"#,
-                )
-                .bind(team_id)
-                .bind(plan_name),
-                || sqlx::query(
-                    r#"INSERT INTO boom_team_plan_assignment (team_id, plan_name, assigned_at)
-                       VALUES ($1, $2, NOW())"#,
-                )
-                .bind(team_id)
-                .bind(plan_name)
-            )?;
-        }
-        Ok(())
     }
 
     /// Snapshot all plans from DB (for config export).

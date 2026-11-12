@@ -748,21 +748,7 @@ fn spawn_sync_task(state: AppState, mut shutdown: tokio::sync::broadcast::Receiv
                 }
             }
 
-            // 2. Snapshot assignments → upsert into DB (with timeout).
-            let assignments = plan_store.snapshot_assignments();
-            if !assignments.is_empty() {
-                let assign_count = assignments.len();
-                let batch_result = tokio::time::timeout(
-                    std::time::Duration::from_secs(30),
-                    plan_store.sync_assignments_to_db(&pool),
-                )
-                .await;
-                if batch_result.is_err() {
-                    tracing::warn!("Assignment sync timed out after 30s, {} entries skipped", assign_count);
-                }
-            }
-
-            // 3. Cleanup stale in-memory entries.
+            // 2. Cleanup stale in-memory entries.
             let expired = limiter.cleanup_expired();
             let concurrency_freed = plan_store.cleanup_concurrency();
             if expired > 0 || concurrency_freed > 0 {
