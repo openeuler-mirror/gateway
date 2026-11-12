@@ -332,6 +332,10 @@
   }
 
   // ── Login ─────────────────────────────────────────────
+  // The username slot's layout box is always reserved (CSS .ghost keeps the
+  // space, hides the field), so the password field, login button and mode
+  // toggle never move when switching — admin mode just fades the field in
+  // above them.
   let isAdminMode = false;
   function setAdminMode(admin) {
     isAdminMode = admin;
@@ -342,13 +346,13 @@
     const toggle = document.getElementById("admin-toggle");
     if (admin) {
       userIdInput.value = "admin";
-      userIdGroup.classList.remove("hidden");
+      userIdGroup.classList.remove("ghost");
       hint.textContent = t("login.master_subtitle");
       apiKeyInput.placeholder = t("login.master_key");
       toggle.textContent = t("login.user_link");
     } else {
       userIdInput.value = "";
-      userIdGroup.classList.add("hidden");
+      userIdGroup.classList.add("ghost");
       hint.textContent = t("login.subtitle");
       apiKeyInput.placeholder = t("login.api_key_placeholder");
       toggle.textContent = t("login.admin_link");
@@ -369,13 +373,18 @@
       btn.disabled = true;
       btn.textContent = t("login.logging_in");
       try {
-        const userId = document.getElementById("user_id").value.trim();
+        // Normal users have no username — the key alone identifies them.
+        const userId = isAdminMode
+          ? document.getElementById("user_id").value.trim()
+          : "";
         const res = await fetch(API + "/auth/login", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            user_id: userId || "",
-            api_key: document.getElementById("api_key").value,
+            user_id: userId,
+            // Copied keys often pick up surrounding whitespace — only the
+            // first through last significant characters are the key.
+            api_key: document.getElementById("api_key").value.trim(),
           }),
         });
         if (!res.ok) {
@@ -1250,6 +1259,12 @@
   function fmtMs(v) {
     return v == null ? "—" : Math.round(v).toLocaleString() + " ms";
   }
+  // Compact axis form for latency: "800 ms" / "4.5 s" — the default axis
+  // formatter is the K/M/B count scale, which is wrong for durations.
+  function fmtAxisMs(v) {
+    if (v == null) return "—";
+    return v >= 1000 ? (v / 1000).toFixed(1) + " s" : Math.round(v) + " ms";
+  }
   function fmtPct(v) {
     return v == null ? "—" : (v * 100).toFixed(1) + "%";
   }
@@ -1376,6 +1391,7 @@
     });
     renderTrendChart("md-chart-latency", {
       since, bucket, total, span,
+      fmtY: fmtAxisMs,
       series: [{ label: t("model.series.latency"), color: C_MAIN, values: dur }],
       tooltipRows: (i) => [{ label: t("model.series.latency"), value: fmtMs(dur[i]) }],
     });
@@ -1846,6 +1862,7 @@
     });
     renderTrendChart("csk-chart-latency", {
       since, bucket, total, span,
+      fmtY: fmtAxisMs,
       series: [{ label: t("model.series.latency"), color: C_MAIN, values: dur }],
       tooltipRows: (i) => [{ label: t("model.series.latency"), value: fmtMs(dur[i]) }],
     });
@@ -2669,16 +2686,23 @@
     }
 
     // Rows arrive model-sorted from the backend (alphabetical model, then
-    // deployment_id), so same-model instances are consecutive. Render the
-    // vendor logo + model name + visibility badge once per model group;
-    // continuation rows show only the instance id, aligned under the
-    // first row's id.
+    // deployment_id), so same-model instances are consecutive. Grouped-table
+    // layout (AWS/GCP-console style): the model identity cell uses rowspan
+    // to span all of that model's instance rows, and each instance id gets
+    // its own column — block = model, row = instance. Zebra alternates by
+    // GROUP (the merged cell can't follow per-row striping): one model
+    // block shares one shade, adjacent blocks alternate.
     var prevModel = null;
+    var groupIndex = -1;
+    var groupCounts = {};
+    deployments.forEach(function (d) {
+      groupCounts[d.model] = (groupCounts[d.model] || 0) + 1;
+    });
 
     wrap.innerHTML =
       errorBanner +
       '<table class="data-table"><thead><tr>' +
-      "<th>" + t("stats.inflight.col.deployment") + "</th><th class=\"num\">" + t("stats.inflight.col.fc_queue") + "</th><th class=\"num\">" + t("stats.inflight.col.in_reqs") + "</th><th class=\"num\">" + t("stats.inflight.col.in_context") + "</th>" +
+      "<th>" + t("stats.inflight.col.model") + "</th><th>" + t("stats.inflight.col.instance") + "</th><th class=\"num\">" + t("stats.inflight.col.fc_queue") + "</th><th class=\"num\">" + t("stats.inflight.col.in_reqs") + "</th><th class=\"num\">" + t("stats.inflight.col.in_context") + "</th>" +
       "<th class=\"num\">" + t("stats.inflight.col.24h_reqs") + "</th><th class=\"num\">" + t("stats.inflight.col.avg_in") + "</th><th class=\"num\">" + t("stats.inflight.col.avg_out") + "</th><th class=\"num\">" + t("stats.inflight.col.avg_ttft") + "</th><th class=\"num\">" + t("stats.inflight.col.avg_prefix_hit_rate") + "</th>" +
       "</tr></thead><tbody>" +
       deployments
@@ -2708,11 +2732,14 @@
 
           var isGroupFirst = d.model !== prevModel;
           prevModel = d.model;
-          var deployCell = isGroupFirst
-            ? renderDeployCell(d.model, d.deployment_id)
-              + (visMap ? visibilityBadgeFor(visMap[d.model]) : "")
-            : '<div class="deploy-cell deploy-cell--inst"><div class="deploy-id">' +
-              esc(d.deployment_id) + "</div></div>";
+          if (isGroupFirst) groupIndex += 1;
+          var grp = groupIndex % 2 === 0 ? "grp-a" : "grp-b";
+          var modelTd = isGroupFirst
+            ? '<td class="grp-model" rowspan="' + groupCounts[d.model] + '">' +
+              renderDeployCell(d.model, null, groupCounts[d.model]) +
+              (visMap ? visibilityBadgeFor(visMap[d.model]) : "") +
+              "</td>"
+            : "";
 
           // 24h aggregates — read from cache populated on page load / Refresh button.
           var s = d.deployment_id ? deployment24hSummary[d.deployment_id] : null;
@@ -2721,8 +2748,9 @@
           function fmtTtft(v) { return (v == null) ? "-" : Math.round(v) + "ms"; }
 
           return (
-            "<tr>" +
-            "<td>" + deployCell + "</td>" +
+            "<tr class=\"" + grp + (isGroupFirst ? " grp-start" : "") + "\">" +
+            modelTd +
+            "<td class=\"inst-id\">" + esc(d.deployment_id) + "</td>" +
             "<td class=\"num\">" + fcQueueHtml + "</td>" +
             "<td class=\"num\">" + reqsHtml + "</td>" +
             "<td class=\"num\">" + ctxDisplay + "</td>" +
@@ -5550,7 +5578,7 @@
         <div class="form-card">
           <div class="form-card-title">${t("model_card.auth")}</div>
           <div class="form-card-grid">
-            <div class="form-group"><label>${t("form.model.api_key")} ${tip(t("tip.model.api_key"))}</label><input id="m-model-key" type="password" value="${esc(p.api_key || "")}" placeholder="sk-... or os.environ/VAR"></div>
+            <div class="form-group"><label>${t("form.model.api_key")} ${tip(t("tip.model.api_key"))}</label><input id="m-model-key" type="password" autocomplete="new-password" placeholder="${p.api_key ? t("form.model.keep_hint") : "sk-... or os.environ/VAR"}"></div>
             <div class="form-group field-checkbox"><input id="m-model-key-env" type="checkbox" ${(p.api_key_env) ? "checked" : ""}><label for="m-model-key-env">${t("form.model.api_key_env")} ${tip(t("tip.model.api_key_env"))}</label></div>
             <div class="form-group field-full"><label>${t("form.model.headers")} ${tip(t("tip.model.headers"))}</label><textarea id="m-model-headers" rows="2" style="font-family:var(--mono);font-size:12px">${esc(Object.keys(headers).length ? JSON.stringify(headers, null, 2) : "")}</textarea></div>
           </div>
@@ -5560,7 +5588,7 @@
           <div class="form-card-grid">
             <div class="form-group"><label>${t("form.model.aws_region")} ${tip(t("tip.model.aws_region"))}</label><input id="m-model-aws-region" value="${esc(p.aws_region_name || "")}"></div>
             <div class="form-group"><label>${t("form.model.aws_key_id")} ${tip(t("tip.model.aws_key_id"))}</label><input id="m-model-aws-key" value="${esc(p.aws_access_key_id || "")}"></div>
-            <div class="form-group field-full"><label>${t("form.model.aws_secret")} ${tip(t("tip.model.aws_secret"))}</label><input id="m-model-aws-secret" type="password" value="${esc(p.aws_secret_access_key || "")}"></div>
+            <div class="form-group field-full"><label>${t("form.model.aws_secret")} ${tip(t("tip.model.aws_secret"))}</label><input id="m-model-aws-secret" type="password" autocomplete="new-password" placeholder="${p.aws_secret_access_key ? t("form.model.keep_hint") : ""}"></div>
           </div>
         </div>
         <div class="form-card">
@@ -5746,12 +5774,12 @@
       const data = await api("/admin/models");
       const m = (data.models || []).find((x) => x.id === id);
       if (!m) return;
-      // Backend masks api_key / aws_* as "****". Clear them so the edit
-      // form's inputs start empty — submitting empty converts to null,
-      // and update_db's COALESCE keeps the stored value untouched.
-      ["api_key", "aws_access_key_id", "aws_secret_access_key"].forEach((k) => {
-        if (m[k] === "****") m[k] = "";
-      });
+      // Backend masks api_key / aws_* as "****". The two password inputs
+      // never echo values — keep their mask as the "configured" marker
+      // driving the leave-blank-to-keep placeholder. aws_access_key_id is
+      // a text input that echoes its value, so clear the mask there
+      // (empty → null → update_db's COALESCE keeps the stored value).
+      if (m.aws_access_key_id === "****") m.aws_access_key_id = "";
       showNewModelModal(m);
     } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
   };
@@ -9464,13 +9492,18 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
 
   // Two-line deployment cell: [logo] + bold model name + faded deployment_id.
   // Replaces the old "model:deployment_id" flat concatenation.
-  function renderDeployCell(model, deploymentId) {
+  // instanceCount (optional): when a model group has >1 backend instances,
+  // append a "×N" marker so the group size is visible on the header row.
+  function renderDeployCell(model, deploymentId, instanceCount) {
     const v = vendorOf(model);
+    const countTag = instanceCount > 1
+      ? '<span class="grp-count" data-tip="' + t("stats.inflight.grp_instances", { n: instanceCount }) + '">×' + instanceCount + '</span>'
+      : '';
     return '' +
       '<div class="deploy-cell">' +
         '<img class="vendor-logo" src="/dashboard/assets/vendor/' + v + '" alt="' + v + '">' +
         '<div class="deploy-text">' +
-          '<div class="deploy-model">' + esc(model) + '</div>' +
+          '<div class="deploy-model">' + esc(model) + countTag + '</div>' +
           (deploymentId ? '<div class="deploy-id">' + esc(deploymentId) + '</div>' : '') +
         '</div>' +
       '</div>';

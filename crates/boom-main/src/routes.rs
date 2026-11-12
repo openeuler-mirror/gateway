@@ -159,6 +159,18 @@ pub(crate) fn extract_client_ip(headers: &axum::http::HeaderMap, remote_addr: Op
     "unknown".to_string()
 }
 
+/// Policy label for the request log's schedule_policy column on the
+/// non-kvc routing path. Every routed request gets its real policy name so
+/// the schedule analytics report can attribute it (NULL shows up as
+/// 'unknown' there). "kvc_aware" is normalized to the orchestrator's "kvc"
+/// short label so single-candidate fallbacks share the same series name.
+pub(crate) fn routing_policy_label(router: &Router) -> String {
+    match router.policy_name().as_str() {
+        "kvc_aware" => "kvc".to_string(),
+        other => other.to_string(),
+    }
+}
+
 /// Per-user attribution tags: one slot per configured header (max 3), stored
 /// as the independent `boom_request_log.user_tag1/2/3` columns. Slot i holds
 /// the value of configured header i — stable slot positions, so reordering
@@ -826,7 +838,7 @@ async fn chat_completions_inner(
             })?;
             let did = selection.provider.deployment_id().map(|s| s.to_string());
             let im = state.router.resolve_model_name(&resolved_model);
-            (selection.provider, did, im, None, None, None, None, None, None)
+            (selection.provider, did, im, Some(routing_policy_label(&state.router)), None, None, None, None, None)
         }
     };
     let routing_ms = route_start.elapsed().as_millis() as u64;
@@ -3396,7 +3408,7 @@ pub async fn messages(
             })?;
             let did = selection.provider.deployment_id().map(|s| s.to_string());
             let im = state.router.resolve_model_name(&resolved_model);
-            (selection.provider, did, im, None, None, None, None, None, None)
+            (selection.provider, did, im, Some(routing_policy_label(&state.router)), None, None, None, None, None)
         }
     };
     let routing_ms = route_start.elapsed().as_millis() as u64;
@@ -4314,7 +4326,7 @@ pub async fn responses(
             })?;
             let did = selection.provider.deployment_id().map(|s| s.to_string());
             let im = state.router.resolve_model_name(&resolved_model);
-            (selection.provider, did, im, None, None, None, None, None, None)
+            (selection.provider, did, im, Some(routing_policy_label(&state.router)), None, None, None, None, None)
         }
     };
     let routing_ms = route_start.elapsed().as_millis() as u64;
