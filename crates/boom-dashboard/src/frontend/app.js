@@ -6606,6 +6606,7 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
   async function loadQuotaOverview() {
     const wrap = document.getElementById("quota-overview-wrap");
     if (!wrap) return;
+    loadDecisionBaseBar();
     wrap.innerHTML = '<p class="loading">' + t("common.loading") + '</p>';
     try {
       // Load prompt-log status alongside — to know which teams are excluded.
@@ -6634,6 +6635,43 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
     } catch (err) {
       wrap.innerHTML = `<p class="error-msg">${t("common.failed_to_load", { what: t("quota.title"), message: esc(err.message) })}</p>`;
     }
+  }
+
+  // Decision-base switch (boom_config KV, DB-authoritative). Shared = every
+  // instance admits against the global base + its own unpushed increments;
+  // local = each instance enforces independently. Counter deltas push
+  // incrementally in BOTH modes — the switch only gates the pull step.
+  // No-DB mode hides the bar (endpoint 400s, quota page is DB-only anyway).
+  async function loadDecisionBaseBar() {
+    const wrap = document.getElementById("quota-decision-base-wrap");
+    if (!wrap) return;
+    let shared = false;
+    try {
+      shared = !!(await api("/admin/decision-base")).shared;
+    } catch { wrap.innerHTML = ""; return; }
+    wrap.innerHTML = `
+      <div class="decision-base-bar">
+        <label class="decision-base-label">
+          <input type="checkbox" id="quota-decision-base-chk" ${shared ? "checked" : ""}>
+          <span>${t("quota.decision_base_label")}</span>
+        </label>
+        <span class="decision-base-mode">${shared ? t("quota.decision_base_shared") : t("quota.decision_base_local")}</span>
+        <span class="decision-base-tip">${t("quota.decision_base_tip")}</span>
+      </div>`;
+    const chk = document.getElementById("quota-decision-base-chk");
+    chk.addEventListener("change", async () => {
+      const target = chk.checked;
+      try {
+        await api("/admin/decision-base", {
+          method: "PUT",
+          body: JSON.stringify({ shared: target }),
+        });
+        loadDecisionBaseBar();
+      } catch (e) {
+        chk.checked = !target;
+        if (String(e.message || "") !== t("common.canceled")) alert(e.message || "failed");
+      }
+    });
   }
 
   // Render team plan spec as a single line of compact tags.

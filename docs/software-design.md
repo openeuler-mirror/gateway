@@ -66,15 +66,16 @@
 - **并发模型**：tokio 多线程 runtime（worker 数可配，默认 4）；热路径全部无锁结构（DashMap / ArcSwap / AtomicUsize）。
 - **扩展模型**：trait 抽象（Provider / Authenticator / SchedulePolicy / KvIndexBackend / TraceApi / StressmonApi）+ 注册/工厂模式 + 动态库钩子（pre_auth .so）。
 
-### 2.2 模块清单（18 crate + 1 外部钩子工程）
+### 2.2 模块清单（19 crate + 1 外部钩子工程）
 
 | Crate | 层 | 职责 | 依赖（boom-*） | DB 表 |
 |-------|----|------|----------------|-------|
 | **boom-core** | 核心抽象 | Provider/Authenticator/KeyAliasLookup/TraceApi/KvIndexBackend 等 trait；ChatCompletionRequest/AuthIdentity/Usage 等公共类型；Anthropic↔OpenAI 双向转码；GatewayError；OtlpConfig | （叶子，无） | 无 |
+| **boom-state** | 机制叶子 | 跨实例机制原语：实例心跳注册表（15s/TTL 60s）、配置 revision changelog（category 计数器 + bump/轮询） | core | boom_instance_state / boom_config_revision |
 | **boom-config** | 功能模块 | YAML 解析、env 展开、secret 脱敏、原子写、manifest 字段注册表 | core | 无 |
 | **boom-auth** | 功能模块 | 密钥认证（SHA-256 + moka 缓存 + 主密钥）、litellm 特殊模型名解析 | core | 读 boom_verification_token / boom_team_table |
 | **boom-provider** | 功能模块 | Provider 工厂（OpenAI/Anthropic/Bedrock/Gemini/Azure...）、上游 HTTP 协议实现 | core | 无 |
-| **boom-limiter** | 功能模块 | PlanStore、SlidingWindowLimiter、ConcurrencyGuard、PlanCharge、累计配额 | core | boom_rate_limit_state / boom_rate_limit_plan / boom_key_plan_assignment / boom_team_plan_assignment / boom_rate_limit_cumulative |
+| **boom-limiter** | 功能模块 | PlanStore、SlidingWindowLimiter、ConcurrencyGuard、PlanCharge、累计配额、配额增量同步协议（双值表示 + 水位幂等推送） | core, state | boom_rate_limit_state（复合主键） / boom_rate_limit_plan / boom_key_plan_assignment / boom_team_plan_assignment / boom_rate_limit_cumulative / boom_quota_delta |
 | **boom-routing** | 功能模块 | DeploymentStore、AliasStore、调度策略族、Rebalance/InFlight、计费费率 | core | boom_model_deployment / boom_model_alias |
 | **boom-fusion** | 功能模块 | DirectSynthesis 工作流（panel 并行 + aggregator 聚合）虚拟 Provider | core | 无 |
 | **boom-flowcontrol** | 功能模块 | per-deployment in-flight 队列、max_context、VIP 优先派发 | core | 无 |
@@ -94,6 +95,7 @@
 
 ```
 boom-core（叶子）← 所有 boom-* 模块
+boom-state（第二机制叶子，只依赖 core）← gatekeeper / dashboard / limiter / main
 boom-main（根）  → 依赖全部模块
 boom-dashboard  → 不依赖 boom-provider / boom-config（硬约束）
 boom-promptlog  → 完全独立（纯 IO，可被第三方复用）
@@ -131,8 +133,8 @@ boom-trace      → leaf crate，Dashboard 经 boom-core::TraceApi（Arc<dyn Tra
 ### 2.5 部署架构
 
 - **单机**：单进程 + 外部 PG。裸 TCP 监听（默认 0.0.0.0:4000），TLS 由前置反代承担。
-- **LB 多实例**：`misc/LB` Pingora 代理在前，多 boom-main 共享 PG。限制：限流窗口/累计经 DB 共享（粗粒度可用）；inflight / kv_index / 并发 guard 为实例本地状态（细粒度有误差）；配置变更经 DB + 各实例 reload 传播。
-- **多实例演进路线**：L1 主备 → L2 请求路径解耦 → L3 全量解耦（改 limiter / kvindex / admin_command 时须评估多实例影响）。
+- **LB 多实例**：`misc/LB` Pingora 代理在前，多 boom-main 共享 PG。计费/限流计数器经增量协议同步（窗口代次墙钟对齐 + 水位幂等上推，`decision_base_shared` 决定接入判定是否计入同伴消耗，默认本地判定）；配置变更经 revision 广播 5s 内全实例对账；实例活性经心跳注册表（15s/TTL 60s）。inflight / kv_index / 并发 guard 为实例本地状态（后续调度层课题）。
+- **多实例演进路线**：L1 主备 → L2 请求路径解耦（**已落地**：配置广播 + 计量增量同步）→ L3 全量解耦（改 limiter / kvindex / admin_command 时须评估多实例影响）。
 
 ---
 
@@ -226,7 +228,7 @@ boom-trace      → leaf crate，Dashboard 经 boom-core::TraceApi（Arc<dyn Tra
 | F6.6 | 并发控制 | ConcurrencyGuard（AtomicU32 + RAII Drop）；key 与 team 双维并发槽；GuardedStream 流结束/断连时释放 | boom-limiter | try_acquire / try_acquire_team |
 | F6.7 | PlanCharge 契约 | peek_only（只读检查，不计数）→ commit_counts（provider 接受后仅计 counts）→ settle_usage（真实 usage 到账：tokens/costs + 全部累计）；未到 provider 即 Drop → 不计费；流中断无 usage → counts 留存自然过期、tokens/costs 不计 | boom-limiter / boom-main | PlanCharge 状态机 |
 | F6.8 | 时段计划 | ScheduleSlot（UTC+8，支持 "9:00-21:00" 与跨午夜 "21:00-9:00"）；生效时段字段覆盖基础限额；切档时清 stale 窗口计数；服务端校验槽位重叠 | boom-limiter | effective_limits / is_active_now |
-| F6.9 | 持久化与恢复 | 计数器 600s 周期落库（boom_rate_limit_state / cumulative）；启动 restore 回填未过期窗口 + 全部累计；多实例经 DB 粗粒度共享 | boom-limiter | sync_counters_to_db / restore_counters_from_db |
+| F6.9 | 持久化与恢复 | 计量增量协议：窗口/累计双值表示（未上推本地增量 + 全局基数镜像），单事务增量上推（UPDATE 加法 + 水位行 boom_quota_delta 幂等），窗口代次墙钟对齐使复合主键行成为集群级区间计数器；shared 判定模式下同事务拉取全局基数；过期窗口代次跳过并周期 purge；启动 restore 回填未过期窗口（作基数）+ 全部累计 | boom-limiter | sync_delta_cycle / restore_counters_from_db |
 | F6.10 | 配额运维 | 重置族 API：key/team × cumulative/windows/all；team 重置级联成员 key；重置时从 team rollup 扣减；recompute_team_cumulative SUM 重建；Dashboard 配额总览（overview/team/unassigned/key windows） | boom-limiter / boom-dashboard | clear_*_db 系列 + /admin/quota/* |
 | F6.11 | 用量查询 | per-key usage、全 key usage、peek 窗口明细；用户端自查用量 | boom-limiter / boom-dashboard | get_usage 系列 + /user/usage |
 
@@ -301,7 +303,7 @@ boom-trace      → leaf crate，Dashboard 经 boom-core::TraceApi（Arc<dyn Tra
 
 ## 4. 数据设计
 
-### 4.1 数据库表总表（17 张）
+### 4.1 数据库表总表（20 张）
 
 | 表 | 所有者（DDL） | 用途 | 关键列 |
 |----|--------------|------|--------|
@@ -315,8 +317,11 @@ boom-trace      → leaf crate，Dashboard 经 boom-core::TraceApi（Arc<dyn Tra
 | boom_rate_limit_plan | boom-limiter | 套餐定义 | name、type、member_plan、concurrency/rpm/tpm、window_limits、total_*、schedule、is_default + is_default_team（各带部分唯一索引） |
 | boom_key_plan_assignment | boom-limiter | key→plan（三态：NULL=显式无） | key_hash、plan_name |
 | boom_team_plan_assignment | boom-limiter | team→plan | team_id、plan_name |
-| boom_rate_limit_state | boom-limiter | 滑窗计数器持久化 | cache_key、counts/tokens/costs_micros、window_start/secs |
+| boom_rate_limit_state | boom-limiter | 滑窗计数器（窗口代次行，墙钟对齐） | cache_key + window_start 复合主键、counts/tokens/costs_micros（集群级该区间总量） |
 | boom_rate_limit_cumulative | boom-limiter | 累计配额（6 维） | scope/scope_id/kind/value_micros |
+| boom_quota_delta | boom-limiter | 增量推送水位（幂等重放凭据） | instance_id + seq 复合主键、window_deltas/cumulative_deltas(JSONB)、2h 修剪 |
+| boom_instance_state | boom-state | 实例心跳注册表 | instance_id(PK, per-boot UUID)、hostname/pid、heartbeat_at（DB 侧时间戳） |
+| boom_config_revision | boom-state | 配置变更 changelog（category 计数器） | category(PK)、revision |
 | boom_client_block_rule | boom-gatekeeper | 客户端拦截规则 | name(PK)、enabled、conditions(JSONB)、action(JSONB) |
 | boom_client_blocklist_state | boom-gatekeeper | 拦截总开关（单行） | enabled |
 | boom_request_log | boom-audit | 请求审计（25 列） | request_id、key/team、model、deployment_id、status、tokens 三列、duration/ttft/queue_wait、kv 指标、client_ip |
@@ -495,9 +500,9 @@ DB 写（store.*_db / AdminCommand handler 内 SQL）
 **已知边界（设计时需知）**：
 
 - 累计配额（total_*）为终身累计，无日/月周期自动重置（周期预算走 litellm budget_duration 认证路径）。
-- 单实例内存态（inflight/并发 guard/trie）不跨实例共享；多实例下细粒度限流有误差（演进中的 L2/L3 解耦方案）。
+- 单实例内存态（inflight/并发 guard/trie）不跨实例共享；计费/限流计数器已增量同步（L2），但并发上限为实例本地；配置/计量之外的跨实例面（dashboard session、审计去重）未归一（L3 课题）。
 - reload 中间步骤失败可能留下 partial-built stores（shadow-build + atomic swap 在 roadmap）。
 - 无内置 TLS（前置反代承担）；无独立用户账号体系（认证即密钥）。
 - Dashboard 前端表单为手工同步 manifest，未自动渲染 schema。
 
-**演进路线**：L4 AgentAffinity（agent 类型前置过滤池，EWMA + hysteresis，正交于现有策略）；shadow reload；多实例细粒度限流共享（Redis）；prefill 隔离池。
+**演进路线**：L4 AgentAffinity（agent 类型前置过滤池，EWMA + hysteresis，正交于现有策略）；shadow reload；L3 全量解耦（dashboard session 归一、审计跨实例去重、并发上限跨实例共享）；prefill 隔离池。
