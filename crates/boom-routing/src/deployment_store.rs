@@ -910,6 +910,8 @@ impl DeploymentStore {
             .fetch_one(pool)
             .await?;
 
+        boom_state::revision::bump_best_effort(pool, boom_state::revision::CATEGORY_ROUTING)
+            .await;
         Ok(row.get("id"))
     }
 
@@ -954,6 +956,8 @@ impl DeploymentStore {
             .fetch_one(pool)
             .await?;
 
+        boom_state::revision::bump_best_effort(pool, boom_state::revision::CATEGORY_ROUTING)
+            .await;
         Ok(row.get("id"))
     }
 
@@ -1028,6 +1032,10 @@ impl DeploymentStore {
         .fetch_optional(pool)
         .await?;
 
+        if result.is_some() {
+            boom_state::revision::bump_best_effort(pool, boom_state::revision::CATEGORY_ROUTING)
+                .await;
+        }
         Ok(result.map(|row| row.get::<Option<String>, _>("old_model_name")).flatten())
     }
 
@@ -1066,11 +1074,16 @@ impl DeploymentStore {
             .execute(pool)
             .await?;
 
+        boom_state::revision::bump_best_effort(pool, boom_state::revision::CATEGORY_ROUTING)
+            .await;
         Ok(Some((model_name, deployment_id)))
     }
 
     /// Auto-disable a deployment: set enabled=false, auto_disabled=true.
     /// Returns the actual model_name of the disabled deployment, or None if not found.
+    /// Deliberately NO revision bump: this is a runtime health event from
+    /// this instance's connectivity view, not a config edit — peers keep
+    /// their own health judgment (only the CRUD methods broadcast).
     pub async fn auto_disable_db(pool: &sqlx::PgPool, deployment_id: &str) -> Result<Option<String>, sqlx::Error> {
         let row: Option<(String,)> = sqlx::query_as(
             r#"UPDATE boom_model_deployment

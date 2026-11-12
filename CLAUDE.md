@@ -39,7 +39,7 @@ Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
 
 ```
 boom-core ← boom-auth, boom-provider, boom-config, boom-limiter, boom-audit, boom-trace
-boom-state ← boom-gatekeeper, boom-dashboard, boom-limiter, boom-main（第二机制叶子）
+boom-state ← boom-gatekeeper, boom-dashboard, boom-limiter, boom-routing, boom-audit, boom-main（第二机制叶子）
 boom-routing → boom-core, boom-config, boom-ctxaware, boom-flowcontrol, boom-fusion
 boom-main → 依赖所有 boom-* 模块（组装层）
 boom-dashboard → boom-core, boom-limiter, boom-routing, boom-audit（禁止依赖 boom-provider, boom-config）
@@ -72,7 +72,7 @@ boom-dashboard → boom-core, boom-limiter, boom-routing, boom-audit（禁止依
 
 每个模块拥有且只操作自己的表。**跨模块直接操作他人的表是禁止的**。
 
-- boom-audit: `boom_request_log`
+- boom-audit: `boom_request_log`, `boom_user_tag_config`
 - boom-routing: `boom_model_deployment`, `boom_model_alias`, `boom_workflow_definition`, `boom_workflow_model`, `boom_cost_template`
 - boom-limiter: `boom_rate_limit_state`（复合主键 cache_key+window_start，窗口代次共存）, `boom_rate_limit_cumulative`, `boom_quota_delta`（增量水位）, `boom_key_plan_assignment`, `boom_rate_limit_plan`, `boom_team_plan_assignment`
 - boom-gatekeeper: `boom_client_block_rule`, `boom_client_blocklist_state`
@@ -191,7 +191,7 @@ CRUD handler（model/alias/plan/quota/blocklist/workflow/cost template 等）的
 
 多实例共享一个 DB 时的状态同步分两类，**不得混淆**：
 
-**配置类（低频，revision 广播）**：Dashboard/CRUD 写 DB 后 `bump` 对应 category 计数器（`boom_config_revision`）；每实例 revision watcher 5s 轮询，变更 category 做**增量对账**（DB→内存，永不清空 store）。现有 category：auth / plan / assignment / quota / blocklist。新增配置类广播 = boom-state 加 CATEGORY_* 常量 + watcher 加对账分支。
+**配置类（低频，revision 广播）**：Dashboard/CRUD 写 DB 后 `bump` 对应 category 计数器（`boom_config_revision`）；每实例 revision watcher 5s 轮询，变更 category 做**增量对账**（DB→内存，永不清空 store）。现有 category：auth / plan / assignment / quota / blocklist / routing / user_tag / trace。**所有配置类写路径必须 bump**（拍板：配置类即刻广播全实例）；bump 落在 store 的 `*_db` 写方法内（boom-limiter/boom-routing/boom-audit/boom-gatekeeper 模式）或 dashboard handler 内（boom_config KV 开关模式）。**运行时健康事件不广播**：`auto_disable_db`/`auto_enable_db` 是本实例连通性视角，不是配置编辑。新增配置类广播 = boom-state 加 CATEGORY_* 常量 + watcher 加对账分支。
 
 **计量类（每请求操作，增量上推）**：计费/限流计数器**不存在覆盖式同步**——旧 snapshot→UPSERT 全量路径已删除，增量是唯一路径：
 - 双值表示：内存每维度两套值——`counts/tokens/costs` = 未上推本地增量（推送后清零），`g_*` = 全局基数镜像（boot 恢复 + 自身上推 + 拉取同伴）。**判定口径 = 全局基数 + 本地增量**。

@@ -301,6 +301,7 @@ name = "boom-audit"
 version = "0.1.0"
 dependencies = [
  "boom-core",
+ "boom-state",
  "chrono",
  "serde",
  "serde_json",
@@ -639,6 +640,7 @@ dependencies = [
  "boom-ctxaware",
  "boom-flowcontrol",
  "boom-fusion",
+ "boom-state",
  "chrono",
  "dashmap",
  "futures",

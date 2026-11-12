@@ -175,6 +175,41 @@ async fn dispatch(category: &str, state: &AppState, pool: &PgPool) {
             state.limiter.set_decision_shared(shared);
             tracing::info!(shared, "quota decision base switched (revision bump)");
         }
+        boom_state::CATEGORY_ROUTING => {
+            // Peer model/alias/workflow/cost write: apply the same diff the
+            // reload path runs. Idempotent, never clears a store.
+            if let Err(e) = crate::config_reconcile::reconcile_routing_config(&deps).await {
+                tracing::error!(error = %e, "revision reconcile (routing) failed");
+            }
+        }
+        boom_state::CATEGORY_USER_TAG => {
+            let config = state.inner.load().config.clone();
+            if let Err(e) = crate::config_reconcile::adopt_user_tag_headers_db(
+                pool,
+                &state.user_tag_store,
+                &config,
+            )
+            .await
+            {
+                tracing::error!(error = %e, "revision reconcile (user_tag) failed");
+            }
+        }
+        boom_state::CATEGORY_TRACE => {
+            let enabled = match boom_dashboard::config_kv::get_bool(
+                pool,
+                boom_dashboard::config_kv::TRACE_METRICS_ENABLED,
+            )
+            .await
+            {
+                Ok(v) => v.unwrap_or(false),
+                Err(e) => {
+                    tracing::warn!(error = %e, "trace-metrics re-adopt failed; keeping current state");
+                    return;
+                }
+            };
+            state.trace.set_metrics_enabled(enabled);
+            tracing::info!(enabled, "trace metrics switch re-adopted (revision bump)");
+        }
         other => {
             tracing::debug!(category = other, "revision bump for unknown category — ignored");
         }

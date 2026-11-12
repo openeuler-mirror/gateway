@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 boom-core = { path = "../boom-core" }
+boom-state = { path = "../boom-state" }
 sqlx = { workspace = true }
 tokio = { workspace = true }
 chrono = { workspace = true }

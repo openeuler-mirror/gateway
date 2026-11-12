@@ -218,6 +218,8 @@ impl WorkflowStore {
             || sqlx::query(WORKFLOW_DEFINITION_INSERT_SQL).bind(name).bind(&value)
         )?;
         self.upsert_definition(name, definition.clone());
+        boom_state::revision::bump_best_effort(pool, boom_state::revision::CATEGORY_ROUTING)
+            .await;
         Ok(())
     }
 
@@ -231,6 +233,8 @@ impl WorkflowStore {
         let existed = result.rows_affected() > 0;
         if existed {
             self.remove_definition(name);
+            boom_state::revision::bump_best_effort(pool, boom_state::revision::CATEGORY_ROUTING)
+                .await;
         }
         Ok(existed)
     }
@@ -248,6 +252,8 @@ impl WorkflowStore {
             || sqlx::query(WORKFLOW_MODEL_INSERT_SQL).bind(model).bind(workflow_name)
         )?;
         self.upsert_model(model, workflow_name);
+        boom_state::revision::bump_best_effort(pool, boom_state::revision::CATEGORY_ROUTING)
+            .await;
         Ok(())
     }
 
@@ -260,6 +266,8 @@ impl WorkflowStore {
         let existed = result.rows_affected() > 0;
         if existed {
             self.remove_model(model);
+            boom_state::revision::bump_best_effort(pool, boom_state::revision::CATEGORY_ROUTING)
+                .await;
         }
         Ok(existed)
     }

@@ -419,6 +419,9 @@ impl PlanStore {
         } else {
             plan_store.set_default_plan(name.map(|s| s.to_string()));
         }
+        // The default pointers are DB flags — peers re-adopt them through
+        // reconcile_plans on the next poll.
+        boom_state::revision::bump_best_effort(pool, boom_state::revision::CATEGORY_PLAN).await;
         Ok(true)
     }
 

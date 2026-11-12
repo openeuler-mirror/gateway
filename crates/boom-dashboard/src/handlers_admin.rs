@@ -515,6 +515,13 @@ pub async fn set_trace_metrics_enabled(
     {
         Ok(()) => {
             state.trace.set_metrics_enabled(req.enabled).await;
+            // Cross-instance: peers re-adopt the KV switch on their next
+            // revision poll (≤5s).
+            boom_state::revision::bump_best_effort(
+                db_pool,
+                boom_state::revision::CATEGORY_TRACE,
+            )
+            .await;
             tracing::info!(enabled = req.enabled, "Trace metrics switch updated");
             Json(json!({"ok": true, "enabled": req.enabled})).into_response()
         }
@@ -3603,12 +3610,22 @@ pub async fn create_team(
     .await;
 
     match result {
-        Ok(_) => Json(json!({
-            "ok": true,
-            "team_id": req.team_id,
-            "team_alias": req.team_alias,
-            "models": models,
-        })).into_response(),
+        Ok(_) => {
+            // No member keys exist yet, so no peer cache is stale today —
+            // the bump keeps the "every auth-class DB write broadcasts"
+            // rule uniform and future-proof.
+            boom_state::revision::bump_best_effort(
+                db_pool,
+                boom_state::revision::CATEGORY_AUTH,
+            )
+            .await;
+            Json(json!({
+                "ok": true,
+                "team_id": req.team_id,
+                "team_alias": req.team_alias,
+                "models": models,
+            })).into_response()
+        }
         Err(e) => {
             let msg = e.to_string();
             if msg.contains("duplicate key") || msg.contains("violates unique") {
@@ -3730,7 +3747,16 @@ pub async fn delete_team(
     .await;
 
     match result {
-        Ok(r) if r.rows_affected() > 0 => Json(json!({"ok": true, "team_id": team_id})).into_response(),
+        Ok(r) if r.rows_affected() > 0 => {
+            // Team had no keys (checked above), so no peer auth cache holds
+            // it — bump anyway for rule uniformity.
+            boom_state::revision::bump_best_effort(
+                db_pool,
+                boom_state::revision::CATEGORY_AUTH,
+            )
+            .await;
+            Json(json!({"ok": true, "team_id": team_id})).into_response()
+        }
         Ok(_) => (axum::http::StatusCode::NOT_FOUND, "Team not found").into_response(),
         Err(e) => {
             tracing::error!("Dashboard delete_team failed: {}", e);

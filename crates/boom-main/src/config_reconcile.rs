@@ -284,6 +284,19 @@ pub async fn reconcile_db_config(deps: &ReconcileDeps<'_>) -> anyhow::Result<()>
     Ok(())
 }
 
+/// Routing-plane section of [`reconcile_db_config`] — the reaction to a
+/// `CATEGORY_ROUTING` revision bump from a peer's model/alias/workflow/cost
+/// write. Same order (cost templates first: deployment cost derivation
+/// resolves through the CostTemplateStore), same functions, minus the
+/// plan/blocklist sections that have their own categories.
+pub(crate) async fn reconcile_routing_config(deps: &ReconcileDeps<'_>) -> anyhow::Result<()> {
+    reconcile_cost_templates(deps).await?;
+    reconcile_deployments(deps).await?;
+    reconcile_aliases(deps).await?;
+    reconcile_workflows(deps).await?;
+    Ok(())
+}
+
 async fn reconcile_deployments(deps: &ReconcileDeps<'_>) -> anyhow::Result<()> {
     // Distinct names across ALL rows (enabled and disabled): a model whose
     // rows are all disabled must keep an EMPTY provider list ("configured

@@ -18,6 +18,19 @@ pub const CATEGORY_AUTH: &str = "auth";
 /// the counter deltas themselves need no broadcast (they converge through
 /// the incremental push protocol).
 pub const CATEGORY_QUOTA: &str = "quota";
+/// Routing-plane config changed (`boom_model_deployment`, `boom_model_alias`,
+/// `boom_workflow_definition`/`boom_workflow_model`, `boom_cost_template`).
+/// One category for all four stores: the reconcile is a cheap idempotent
+/// diff, and ordering dependencies (cost templates feed deployment cost
+/// derivation) make a combined reconcile the safe shape. Runtime health
+/// writes (`auto_disable_db`/`auto_enable_db`) deliberately do NOT bump —
+/// health is per-instance connectivity state, not config.
+pub const CATEGORY_ROUTING: &str = "routing";
+/// user_tag header list changed (`boom_user_tag_config` single row).
+pub const CATEGORY_USER_TAG: &str = "user_tag";
+/// Trace observability switches changed (`boom_config` KV
+/// `trace_metrics_enabled`).
+pub const CATEGORY_TRACE: &str = "trace";
 
 /// Atomically increment a category's revision counter.
 ///

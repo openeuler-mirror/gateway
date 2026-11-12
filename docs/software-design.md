@@ -76,12 +76,12 @@
 | **boom-auth** | 功能模块 | 密钥认证（SHA-256 + moka 缓存 + 主密钥）、litellm 特殊模型名解析 | core | 读 boom_verification_token / boom_team_table |
 | **boom-provider** | 功能模块 | Provider 工厂（OpenAI/Anthropic/Bedrock/Gemini/Azure...）、上游 HTTP 协议实现 | core | 无 |
 | **boom-limiter** | 功能模块 | PlanStore、SlidingWindowLimiter、ConcurrencyGuard、PlanCharge、累计配额、配额增量同步协议（双值表示 + 水位幂等推送） | core, state | boom_rate_limit_state（复合主键） / boom_rate_limit_plan / boom_key_plan_assignment / boom_team_plan_assignment / boom_rate_limit_cumulative / boom_quota_delta |
-| **boom-routing** | 功能模块 | DeploymentStore、AliasStore、调度策略族、Rebalance/InFlight、计费费率 | core | boom_model_deployment / boom_model_alias |
+| **boom-routing** | 功能模块 | DeploymentStore、AliasStore、调度策略族、Rebalance/InFlight、计费费率 | core, state | boom_model_deployment / boom_model_alias |
 | **boom-fusion** | 功能模块 | DirectSynthesis 工作流（panel 并行 + aggregator 聚合）虚拟 Provider | core | 无 |
 | **boom-flowcontrol** | 功能模块 | per-deployment in-flight 队列、max_context、VIP 优先派发 | core | 无 |
 | **boom-kvindex** | 功能模块 | 自学习 token 前缀 trie（block 切块 + xxhash3）、LRU/TTL 驱逐 | core | 无 |
 | **boom-ctxaware** | 功能模块 | AgentStatsTracker 客户端类型统计（60min 环形） | core | 无 |
-| **boom-audit** | 功能模块 | boom_request_log 读写、分页查询 | core | boom_request_log |
+| **boom-audit** | 功能模块 | boom_request_log 读写、分页查询、user_tag header 清单（DB 权威） | core, state | boom_request_log / boom_user_tag_config |
 | **boom-promptlog** | 功能模块 | 完整 prompt/响应内容采集 + OTLP logs 导出 + 查询回放 | （独立，不依赖 core） | 无 |
 | **boom-trace** | 功能模块 | 请求级 span 链路、recent ring、OTLP traces 导出 | core | 无 |
 | **boom-stressmon** | 功能模块 | 系统压力时序（CPU/RSS/队列深度/inflight，1Hz 环形） | core | 无 |
