@@ -17,6 +17,7 @@ otlp = [
     "dep:reqwest",
     "dep:prost",
     "dep:tempfile",
+    "dep:bytes",
 ]
 
 [dependencies]
@@ -40,6 +41,7 @@ opentelemetry-otlp = { version = "0.32", optional = true, default-features = fal
 opentelemetry-proto = { version = "0.32", optional = true, default-features = false, features = ["gen-tonic", "logs"] }
 reqwest = { workspace = true, optional = true }
 prost = { version = "0.14", optional = true }
+bytes = { workspace = true, optional = true }
 # Used by replay.rs (gz decompression to a temp file). Only needed with otlp.
 tempfile = { version = "3", optional = true }
 thiserror = { workspace = true }

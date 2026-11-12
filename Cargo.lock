@@ -300,6 +300,7 @@ dependencies = [
 name = "boom-audit"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "boom-core",
  "boom-state",
  "chrono",
@@ -575,6 +576,7 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "boom-core",
+ "bytes",
  "chrono",
  "clap",
  "flate2",
@@ -686,6 +688,7 @@ dependencies = [
  "arc-swap",
  "async-trait",
  "boom-core",
+ "bytes",
  "chrono",
  "dashmap",
  "hex",

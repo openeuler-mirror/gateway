@@ -266,6 +266,20 @@ impl TraceRegistry {
         Some(f(entry.value_mut()))
     }
 
+    /// Set the response body on the active span. Called from the stream
+    /// Drop path (`PromptLogStream`'s response sink) BEFORE the inner
+    /// `LoggedStream` is dropped — once that Drop runs, the span is
+    /// finalized and removed from the active map, making this a no-op.
+    /// The body goes through the same retention cap as non-stream paths.
+    pub fn set_span_response_body(
+        &self,
+        request_id: &str,
+        body: Arc<serde_json::Value>,
+        max_body_bytes: usize,
+    ) {
+        let _ = self.with_span_mut(request_id, |s| s.set_llm_response(body, max_body_bytes));
+    }
+
     /// Mark the span as finalized-OK and remove it from the active table.
     /// Every finalized span (regardless of duration) lands in the recent
     /// ring so the dashboard can show "what just finished". OTLP traces

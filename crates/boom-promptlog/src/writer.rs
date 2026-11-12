@@ -11,6 +11,60 @@ use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 
+/// Bounded-channel capacity between handlers and the background writer.
+/// Entries hold full request/response bodies, so an unbounded channel is an
+/// unbounded memory commitment whenever the writer stalls (slow disk, OTLP
+/// backpressure). On full, producers drop the entry (oldest-data-loss is the
+/// same policy as the OTLP queues) with a warn + running drop counter.
+const CHANNEL_CAPACITY: usize = 1024;
+
+/// Counting handle to the bounded writer channel. ALL producers — the
+/// handler paths, the error path, the stream wrapper's Drop — go through
+/// this so `dropped_on_full()` reflects every entry lost to writer stalls,
+/// not just whichever path happened to count.
+///
+/// `try_send` never blocks: on Full the entry is dropped, counted once,
+/// and warned about here; the `Err` variants let callers still distinguish
+/// `Closed` (which each site logs at its own level).
+#[derive(Clone)]
+pub struct PromptLogSender {
+    sender: mpsc::Sender<PromptLogEntry>,
+    dropped_on_full: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl PromptLogSender {
+    pub fn new(
+        sender: mpsc::Sender<PromptLogEntry>,
+        dropped_on_full: Arc<std::sync::atomic::AtomicU64>,
+    ) -> Self {
+        Self {
+            sender,
+            dropped_on_full,
+        }
+    }
+
+    /// Non-blocking send. Full → drop + count + warn (here, once);
+    /// Closed → returned for the caller to log.
+    pub fn try_send(&self, entry: PromptLogEntry) -> Result<(), mpsc::error::TrySendError<PromptLogEntry>> {
+        match self.sender.try_send(entry) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(e)) => {
+                let n = self
+                    .dropped_on_full
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    + 1;
+                tracing::warn!(
+                    "Prompt log channel full (writer stalled?), dropped entry {} ({} dropped total)",
+                    e.request_id,
+                    n
+                );
+                Err(mpsc::error::TrySendError::Full(e))
+            }
+            Err(e @ mpsc::error::TrySendError::Closed(_)) => Err(e),
+        }
+    }
+}
+
 /// Handle to the background prompt log writer.
 ///
 /// Clone-safe handle that checks `should_capture()` against the live config.
@@ -23,7 +77,8 @@ use tokio::sync::mpsc;
 #[derive(Clone)]
 pub struct PromptLogWriter {
     config: Arc<ArcSwap<PromptLogConfig>>,
-    sender: mpsc::UnboundedSender<PromptLogEntry>,
+    sender: PromptLogSender,
+    dropped_on_full: Arc<std::sync::atomic::AtomicU64>,
     #[cfg(feature = "otlp")]
     otlp: Arc<ArcSwap<Option<Arc<OtelExporter>>>>,
     #[cfg(feature = "otlp")]
@@ -37,8 +92,10 @@ impl PromptLogWriter {
     /// entrypoint: it just passes `None` through to the inner writer.
     pub fn spawn(config: PromptLogConfig) -> Self {
         let config = Arc::new(ArcSwap::from_pointee(config));
-        let (sender, receiver) = mpsc::unbounded_channel();
+        let (sender, receiver) = mpsc::channel(CHANNEL_CAPACITY);
         let config_clone = config.clone();
+        let dropped_on_full = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let sender = PromptLogSender::new(sender, dropped_on_full.clone());
         #[cfg(feature = "otlp")]
         let otlp: Arc<ArcSwap<Option<Arc<OtelExporter>>>> =
             Arc::new(ArcSwap::from_pointee(None));
@@ -56,6 +113,7 @@ impl PromptLogWriter {
         Self {
             config,
             sender,
+            dropped_on_full,
             #[cfg(feature = "otlp")]
             otlp,
             #[cfg(feature = "otlp")]
@@ -71,8 +129,10 @@ impl PromptLogWriter {
     #[cfg(feature = "otlp")]
     pub fn spawn_with_otlp(config: PromptLogConfig, exporter: Arc<OtelExporter>) -> Self {
         let config = Arc::new(ArcSwap::from_pointee(config));
-        let (sender, receiver) = mpsc::unbounded_channel();
+        let (sender, receiver) = mpsc::channel(CHANNEL_CAPACITY);
         let config_clone = config.clone();
+        let dropped_on_full = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let sender = PromptLogSender::new(sender, dropped_on_full.clone());
         let flush_handle: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>> =
             Arc::new(std::sync::Mutex::new(None));
         let flush_handle_for_task = flush_handle.clone();
@@ -87,6 +147,7 @@ impl PromptLogWriter {
         Self {
             config,
             sender,
+            dropped_on_full,
             otlp,
             flush_handle,
         }
@@ -103,15 +164,24 @@ impl PromptLogWriter {
         self.config.load().should_capture(key_hash, team_id)
     }
 
-    /// Get a clone of the sender for passing to stream wrappers.
-    pub fn sender(&self) -> mpsc::UnboundedSender<PromptLogEntry> {
+    /// Get a clone of the counting sender for passing to stream wrappers.
+    pub fn sender(&self) -> PromptLogSender {
         self.sender.clone()
     }
 
+    /// Cumulative entries dropped because the bounded channel was full
+    /// (writer stalled). Surfaced for diagnostics.
+    pub fn dropped_on_full(&self) -> u64 {
+        self.dropped_on_full.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Send an entry to the background writer (non-blocking, fire-and-forget).
+    /// Never blocks: when the bounded channel is full the entry is dropped
+    /// and counted — the gateway must not stall request handling on log I/O.
     pub fn send(&self, entry: PromptLogEntry) {
-        if let Err(e) = self.sender.send(entry) {
-            tracing::warn!("Prompt log channel closed, dropping entry: {}", e.0.request_id);
+        // Full is counted + warned inside the sender; only Closed is ours.
+        if let Err(mpsc::error::TrySendError::Closed(e)) = self.sender.try_send(entry) {
+            tracing::warn!("Prompt log channel closed, dropping entry: {}", e.request_id);
         }
     }
 
@@ -286,7 +356,7 @@ fn phase_file_name(phase: &str, seq: u64) -> String {
 /// local file sink is never blocked by the remote backend.
 #[cfg(feature = "otlp")]
 async fn background_writer(
-    receiver: mpsc::UnboundedReceiver<PromptLogEntry>,
+    receiver: mpsc::Receiver<PromptLogEntry>,
     config: Arc<ArcSwap<PromptLogConfig>>,
     otlp: Arc<ArcSwap<Option<Arc<OtelExporter>>>>,
 ) {
@@ -295,7 +365,7 @@ async fn background_writer(
 
 #[cfg(not(feature = "otlp"))]
 async fn background_writer(
-    receiver: mpsc::UnboundedReceiver<PromptLogEntry>,
+    receiver: mpsc::Receiver<PromptLogEntry>,
     config: Arc<ArcSwap<PromptLogConfig>>,
 ) {
     background_writer_impl(receiver, config, ()).await
@@ -307,7 +377,7 @@ async fn background_writer(
 /// entries are enqueued to whatever exporter is current.
 #[cfg_attr(feature = "otlp", allow(clippy::type_complexity))]
 async fn background_writer_impl(
-    mut receiver: mpsc::UnboundedReceiver<PromptLogEntry>,
+    mut receiver: mpsc::Receiver<PromptLogEntry>,
     config: Arc<ArcSwap<PromptLogConfig>>,
     #[cfg(feature = "otlp")] otlp: Arc<ArcSwap<Option<Arc<OtelExporter>>>>,
     #[cfg(not(feature = "otlp"))] _otlp: (),
@@ -745,5 +815,41 @@ mod tests {
             .await
             .unwrap();
         assert!(resp2.contains("\"r2\""));
+    }
+
+    #[tokio::test]
+    async fn send_drops_and_counts_when_channel_full() {
+        // Capacity-1 channel with a receiver that's never drained: the
+        // second send must drop (not block) and bump the counter.
+        let (sender, _receiver_keep_open) = mpsc::channel::<PromptLogEntry>(1);
+        let dropped_on_full = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let writer = PromptLogWriter {
+            config: Arc::new(ArcSwap::from_pointee(PromptLogConfig::default())),
+            sender: PromptLogSender::new(sender, dropped_on_full.clone()),
+            dropped_on_full,
+            #[cfg(feature = "otlp")]
+            otlp: Arc::new(ArcSwap::from_pointee(None)),
+            #[cfg(feature = "otlp")]
+            flush_handle: Arc::new(std::sync::Mutex::new(None)),
+        };
+        let entry = |id: &str| {
+            PromptLogEntry::new_request(
+                id,
+                None,
+                "kh",
+                None,
+                None,
+                "m",
+                "/p",
+                false,
+                Arc::new(serde_json::json!({})),
+                None,
+                None,
+            )
+        };
+        writer.send(entry("r-1"));
+        assert_eq!(writer.dropped_on_full(), 0);
+        writer.send(entry("r-2")); // full → dropped, counted
+        assert_eq!(writer.dropped_on_full(), 1);
     }
 }

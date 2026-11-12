@@ -60,7 +60,7 @@ Scheduling policies are pluggable and hot-swappable (`router_settings.schedule_p
 
 ## Gateway Fundamentals
 
-Unified access to 20+ upstream providers; litellm key-system compatibility; native Anthropic `/v1/messages` (works with Claude Code / opencode); Direct Synthesis Workflow (fan out to multiple panel models, then aggregate into a standard OpenAI response); public models, model aliases, and `"*"` fallback routing; DB-authoritative business config (models / plans / aliases / block rules / workflows / cost templates are all managed via dashboard CRUD, effective immediately — YAML serves only as first-boot seed and rollback artifact); web dashboard (keys / models / plans / quotas / logs / real-time in-flight & stats); zero-downtime hot reload via SIGHUP / API / dashboard button.
+Unified access to 20+ upstream providers; litellm key-system compatibility; native Anthropic `/v1/messages` (works with Claude Code / opencode); OpenAI Responses API (`/v1/responses` + `/responses` alias — Codex CLI works out of the box: `namespace` tools auto-flattened, hosted built-ins dropped leniently with an `x-boom-dropped-tools` response header, stateful `previous_response_id` continuation); Direct Synthesis Workflow (fan out to multiple panel models, then aggregate into a standard OpenAI response); public models, model aliases, and `"*"` fallback routing; DB-authoritative business config (models / plans / aliases / block rules / workflows / cost templates are all managed via dashboard CRUD, effective immediately — YAML serves only as first-boot seed and rollback artifact); web dashboard (keys / models / plans / quotas / logs / real-time in-flight & stats); zero-downtime hot reload via SIGHUP / API / dashboard button.
 
 ---
 

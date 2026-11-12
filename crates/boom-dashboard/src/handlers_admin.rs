@@ -101,6 +101,7 @@ fn validate_key_limits(
     rpm_limit: Option<i64>,
     tpm_limit: Option<i64>,
     max_budget: Option<f64>,
+    max_parallel_requests: Option<i32>,
     budget_duration: Option<&str>,
 ) -> Result<(), String> {
     if let Some(v) = rpm_limit {
@@ -116,6 +117,11 @@ fn validate_key_limits(
     if let Some(v) = max_budget {
         if !v.is_finite() || v < 0.0 {
             return Err("Invalid max_budget: must be a finite number >= 0".to_string());
+        }
+    }
+    if let Some(v) = max_parallel_requests {
+        if v < 0 {
+            return Err("Invalid max_parallel_requests: must be >= 0".to_string());
         }
     }
     // An empty string is the dashboard's "clear this field" signal, so only
@@ -617,6 +623,7 @@ struct KeyRow {
     blocked: Option<bool>,
     rpm_limit: Option<i64>,
     tpm_limit: Option<i64>,
+    max_parallel_requests: Option<i32>,
     max_budget: Option<f64>,
     budget_duration: Option<String>,
     expires: Option<NaiveDateTime>,
@@ -675,7 +682,7 @@ pub async fn list_keys(
     let rows: Vec<KeyRow> = if let Some(ref pattern) = search_pattern {
         match sqlx::query_as(
             r#"SELECT token, key_name, key_alias, key_prefix, tag, user_id, team_id, models,
-                      blocked, rpm_limit, tpm_limit, max_budget,
+                      blocked, rpm_limit, tpm_limit, max_parallel_requests, max_budget,
                       budget_duration, expires, metadata, created_at
                FROM "boom_verification_token"
                WHERE (key_name ILIKE $1 OR key_alias ILIKE $1 OR user_id ILIKE $1 OR token ILIKE $1)"#,
@@ -697,7 +704,7 @@ pub async fn list_keys(
     } else {
         match sqlx::query_as(
             r#"SELECT token, key_name, key_alias, key_prefix, tag, user_id, team_id, models,
-                      blocked, rpm_limit, tpm_limit, max_budget,
+                      blocked, rpm_limit, tpm_limit, max_parallel_requests, max_budget,
                       budget_duration, expires, metadata, created_at
                FROM "boom_verification_token""#,
         )
@@ -855,6 +862,7 @@ pub async fn list_keys(
                 "blocked": r.blocked.unwrap_or(false),
                 "rpm_limit": r.rpm_limit,
                 "tpm_limit": r.tpm_limit,
+                "max_parallel_requests": r.max_parallel_requests,
                 "max_budget": r.max_budget,
                 "budget_duration": r.budget_duration,
                 "expires": r.expires.map(|d| d.to_string()),
@@ -944,6 +952,9 @@ pub struct CreateKeyRequest {
     pub budget_duration: Option<String>,
     pub rpm_limit: Option<i64>,
     pub tpm_limit: Option<i64>,
+    /// litellm-compatible per-key in-flight cap. 0 / empty = unlimited.
+    /// The gateway enforces min(this, plan.concurrency_limit).
+    pub max_parallel_requests: Option<i32>,
     pub expires: Option<String>,
     pub metadata: Option<serde_json::Value>,
     /// Plan assignment for the new key. Three states:
@@ -978,6 +989,7 @@ pub async fn create_key(
         req.rpm_limit,
         req.tpm_limit,
         req.max_budget,
+        req.max_parallel_requests,
         req.budget_duration.as_deref(),
     ) {
         return (StatusCode::BAD_REQUEST, msg).into_response();
@@ -1042,9 +1054,9 @@ pub async fn create_key(
     let result = sqlx::query(
         r#"INSERT INTO "boom_verification_token"
            (token, key_name, key_alias, key_prefix, tag, user_id, team_id, models, spend, blocked,
-            rpm_limit, tpm_limit, max_budget, budget_duration, expires,
+            rpm_limit, tpm_limit, max_parallel_requests, max_budget, budget_duration, expires,
             metadata, created_at, updated_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0.0, false, $9, $10, $11, $12, $13, $14, NOW(), NOW())"#,
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0.0, false, $9, $10, $11, $12, $13, $14, $15, NOW(), NOW())"#,
     )
     .bind(&token_hash)
     .bind(&key_name)
@@ -1056,6 +1068,7 @@ pub async fn create_key(
     .bind(&models_list)
     .bind(req.rpm_limit)
     .bind(req.tpm_limit)
+    .bind(req.max_parallel_requests)
     .bind(req.max_budget)
     .bind(&req.budget_duration)
     .bind(expires)
@@ -1169,6 +1182,9 @@ pub struct UpdateKeyRequest {
     pub budget_duration: Option<String>,
     pub rpm_limit: Option<i64>,
     pub tpm_limit: Option<i64>,
+    /// Per-key in-flight cap override. null keeps the current value
+    /// (COALESCE semantics, same as rpm/tpm).
+    pub max_parallel_requests: Option<i32>,
     /// Optional user-supplied classification tag (≤64 chars). Empty string
     /// clears the tag; null leaves it untouched (COALESCE semantics).
     pub tag: Option<String>,
@@ -1229,6 +1245,7 @@ pub async fn update_key(
         req.rpm_limit,
         req.tpm_limit,
         req.max_budget,
+        req.max_parallel_requests,
         req.budget_duration.as_deref(),
     ) {
         return (StatusCode::BAD_REQUEST, msg).into_response();
@@ -1324,9 +1341,10 @@ pub async fn update_key(
                budget_duration = COALESCE($8, budget_duration),
                rpm_limit = COALESCE($9, rpm_limit),
                tpm_limit = COALESCE($10, tpm_limit),
-               tag = COALESCE($11, tag),
-               expires = COALESCE($12, expires),
-               metadata = COALESCE($13, metadata),
+               max_parallel_requests = COALESCE($11, max_parallel_requests),
+               tag = COALESCE($12, tag),
+               expires = COALESCE($13, expires),
+               metadata = COALESCE($14, metadata),
                updated_at = NOW()
            WHERE token = $1"#,
     )
@@ -1340,6 +1358,7 @@ pub async fn update_key(
     .bind(&req.budget_duration)
     .bind(req.rpm_limit)
     .bind(req.tpm_limit)
+    .bind(req.max_parallel_requests)
     .bind(&req.tag)
     .bind(expires)
     .bind(&req.metadata)
@@ -1896,6 +1915,7 @@ async fn insert_single_key(
         req.rpm_limit,
         req.tpm_limit,
         req.max_budget,
+        req.max_parallel_requests,
         req.budget_duration.as_deref(),
     )
     .is_err()
@@ -1966,9 +1986,9 @@ async fn insert_single_key(
     let result = sqlx::query(
         r#"INSERT INTO "boom_verification_token"
            (token, key_name, key_alias, key_prefix, tag, user_id, team_id, models, spend, blocked,
-            rpm_limit, tpm_limit, max_budget, budget_duration, expires,
+            rpm_limit, tpm_limit, max_parallel_requests, max_budget, budget_duration, expires,
             metadata, created_at, updated_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0.0, false, $9, $10, $11, $12, $13, $14, NOW(), NOW())"#,
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0.0, false, $9, $10, $11, $12, $13, $14, $15, NOW(), NOW())"#,
     )
     .bind(&token_hash)
     .bind(&key_name)
@@ -1980,6 +2000,7 @@ async fn insert_single_key(
     .bind(&models_list)
     .bind(req.rpm_limit)
     .bind(req.tpm_limit)
+    .bind(req.max_parallel_requests)
     .bind(req.max_budget)
     .bind(&req.budget_duration)
     .bind(expires)
@@ -2224,7 +2245,8 @@ fn build_key_download(
                 let _ = wtr.write_record(&[
                     "key_alias", "key_name", "key_prefix", "tag",
                     "user_id", "team_id", "models",
-                    "rpm_limit", "tpm_limit", "max_budget", "budget_duration",
+                    "rpm_limit", "tpm_limit", "max_parallel_requests",
+                    "max_budget", "budget_duration",
                     "expires", "metadata", "plan_name", "api_key",
                 ]);
                 for (req, key) in created {
@@ -2240,6 +2262,7 @@ fn build_key_download(
                             .unwrap_or_default(),
                         req.rpm_limit.map(|v| v.to_string()).unwrap_or_default(),
                         req.tpm_limit.map(|v| v.to_string()).unwrap_or_default(),
+                        req.max_parallel_requests.map(|v| v.to_string()).unwrap_or_default(),
                         req.max_budget.map(|v| v.to_string()).unwrap_or_default(),
                         req.budget_duration.clone().unwrap_or_default(),
                         req.expires.clone().unwrap_or_default(),
@@ -2343,6 +2366,7 @@ struct CsvKeyRow {
     models: Option<String>,
     rpm_limit: Option<i64>,
     tpm_limit: Option<i64>,
+    max_parallel_requests: Option<i32>,
     max_budget: Option<f64>,
     budget_duration: Option<String>,
     expires: Option<String>,
@@ -2408,6 +2432,7 @@ fn parse_csv(bytes: &[u8]) -> (Vec<CreateKeyRequest>, Vec<Value>) {
             budget_duration: row.budget_duration.filter(|s| !s.is_empty()),
             rpm_limit: row.rpm_limit,
             tpm_limit: row.tpm_limit,
+            max_parallel_requests: row.max_parallel_requests,
             expires: row.expires.filter(|s| !s.is_empty()),
             metadata,
             // CSV is a flat-string format — can't carry the three-state
@@ -3766,6 +3791,314 @@ pub async fn delete_team(
 }
 
 // ═══════════════════════════════════════════════════════════
+// Daily Business Volume (analytics board)
+// ═══════════════════════════════════════════════════════════
+
+#[derive(Debug, Deserialize)]
+pub struct DailyStatsParams {
+    /// `?force=1` — re-aggregate from the DB before responding (manual
+    /// refresh button). String (not bool) so `force=1` works — serde's
+    /// bool only accepts literal `true`/`false` in query strings. Any
+    /// presence of the param triggers a refresh.
+    pub force: Option<String>,
+    /// `?range=today|1d|3d|7d` (default today).
+    pub range: Option<String>,
+}
+
+pub async fn get_daily_stats(
+    _session: AdminSession,
+    Query(params): Query<DailyStatsParams>,
+    Extension(state): Extension<Arc<DashboardState>>,
+) -> Response {
+    let range = match boom_audit::StatsRange::from_param(
+        params.range.as_deref().unwrap_or("today"),
+    ) {
+        Some(r) => r,
+        None => {
+            return Json(json!({
+                "ready": false,
+                "error": "invalid range (expected today|1d|3d|7d)",
+            }))
+            .into_response()
+        }
+    };
+    let Some(pool) = &state.db_pool else {
+        return Json(json!({
+            "ready": false,
+            "error": "daily stats unavailable (no database configured)",
+        }))
+        .into_response();
+    };
+    // Presence-based refresh: no background task keeps any window warm —
+    // the first request lazy-loads it, and while the page is being viewed
+    // the frontend poll re-aggregates at most once per TTL (5 min).
+    // Nobody viewing → no requests → zero DB sync.
+    let ttl = 300;
+    let snap = match state
+        .daily_stats
+        .snapshot_for(range, pool, ttl, params.force.is_some())
+        .await
+    {
+        Ok(s) => Some(s),
+        // Refresh failed: serve the last good snapshot rather than an
+        // unavailable page — stale data beats no data on a dashboard.
+        Err(e) => {
+            tracing::warn!("Daily stats refresh failed ({}): {e}", range.as_str());
+            state.daily_stats.current(range)
+        }
+    };
+    match snap {
+        Some(snap) => {
+            let mut v = serde_json::to_value(&*snap).unwrap_or_else(|_| json!({}));
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("ready".to_string(), json!(true));
+            }
+            Json(v).into_response()
+        }
+        // No snapshot yet: the first refresh is still pending or keeps
+        // failing. The frontend shows a loading/unavailable state instead
+        // of zeros — zeros here would read as "no traffic", which is a
+        // different message.
+        None => Json(json!({
+            "ready": false,
+            "error": "daily stats unavailable (refresh pending or failing)",
+        }))
+        .into_response(),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+// Analytics Detail Pages (model / consumption / schedule)
+// ═══════════════════════════════════════════════════════════
+//
+// Same presence-driven lifecycle as the daily stats above: lazy load on
+// first request, TTL 300s while the page is viewed, force=1 manual
+// refresh, stale snapshot served when a refresh fails. The caches live in
+// DashboardState.analytics (AnalyticsHub).
+
+/// Model drill-down from the analytics overview's model table.
+/// `model` is the requested model literal (the column the overview groups
+/// by — numbers reconcile exactly). Accepts `?range=today|1d|3d|7d&force=1`.
+pub async fn get_model_detail(
+    _session: AdminSession,
+    Path(model): Path<String>,
+    Query(params): Query<DailyStatsParams>,
+    Extension(state): Extension<Arc<DashboardState>>,
+) -> Response {
+    let range = match boom_audit::StatsRange::from_param(
+        params.range.as_deref().unwrap_or("today"),
+    ) {
+        Some(r) => r,
+        None => {
+            return Json(json!({
+                "ready": false,
+                "error": "invalid range (expected today|1d|3d|7d)",
+            }))
+            .into_response()
+        }
+    };
+    let Some(pool) = &state.db_pool else {
+        return Json(json!({
+            "ready": false,
+            "error": "model stats unavailable (no database configured)",
+        }))
+        .into_response();
+    };
+    let key = format!("{model}|{}", range.as_str());
+    let snap = match state
+        .analytics
+        .model
+        .get_or_refresh(&key, 300, params.force.is_some(), || {
+            boom_audit::analytics::query_model_detail(&model, range, pool)
+        })
+        .await
+    {
+        Ok(s) => Some(s),
+        // Refresh failed: serve the last good snapshot rather than an
+        // unavailable page — stale data beats no data on a dashboard.
+        Err(e) => {
+            tracing::warn!("Model detail refresh failed ({model}, {}): {e}", range.as_str());
+            state.analytics.model.current(&key)
+        }
+    };
+    match snap {
+        Some(snap) => {
+            let mut v = serde_json::to_value(&*snap).unwrap_or_else(|_| json!({}));
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("ready".to_string(), json!(true));
+            }
+            Json(v).into_response()
+        }
+        None => Json(json!({
+            "ready": false,
+            "error": "model stats unavailable (refresh pending or failing)",
+        }))
+        .into_response(),
+    }
+}
+
+/// Consumption overview: token spend by key / team / end-user tag / client
+/// IP plus a token-volume series. Accepts `?range=today|1d|3d|7d&force=1`.
+pub async fn get_consumption_stats(
+    _session: AdminSession,
+    Query(params): Query<DailyStatsParams>,
+    Extension(state): Extension<Arc<DashboardState>>,
+) -> Response {
+    let range = match boom_audit::StatsRange::from_param(
+        params.range.as_deref().unwrap_or("today"),
+    ) {
+        Some(r) => r,
+        None => {
+            return Json(json!({
+                "ready": false,
+                "error": "invalid range (expected today|1d|3d|7d)",
+            }))
+            .into_response()
+        }
+    };
+    let Some(pool) = &state.db_pool else {
+        return Json(json!({
+            "ready": false,
+            "error": "consumption stats unavailable (no database configured)",
+        }))
+        .into_response();
+    };
+    let key = range.as_str().to_string();
+    let snap = match state
+        .analytics
+        .consumption
+        .get_or_refresh(&key, 300, params.force.is_some(), || {
+            boom_audit::analytics::query_consumption(range, pool)
+        })
+        .await
+    {
+        Ok(s) => Some(s),
+        Err(e) => {
+            tracing::warn!("Consumption refresh failed ({}): {e}", range.as_str());
+            state.analytics.consumption.current(&key)
+        }
+    };
+    match snap {
+        Some(snap) => {
+            let mut v = serde_json::to_value(&*snap).unwrap_or_else(|_| json!({}));
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("ready".to_string(), json!(true));
+            }
+            Json(v).into_response()
+        }
+        None => Json(json!({
+            "ready": false,
+            "error": "consumption stats unavailable (refresh pending or failing)",
+        }))
+        .into_response(),
+    }
+}
+
+/// Single-key consumption drill-down. Direct query (no cache — key
+/// cardinality is unbounded); accepts `?range=today|1d|3d|7d`.
+pub async fn get_consumption_key_detail(
+    _session: AdminSession,
+    Path(key_hash): Path<String>,
+    Query(params): Query<DailyStatsParams>,
+    Extension(state): Extension<Arc<DashboardState>>,
+) -> Response {
+    let range = match boom_audit::StatsRange::from_param(
+        params.range.as_deref().unwrap_or("today"),
+    ) {
+        Some(r) => r,
+        None => {
+            return Json(json!({
+                "ready": false,
+                "error": "invalid range (expected today|1d|3d|7d)",
+            }))
+            .into_response()
+        }
+    };
+    let Some(pool) = &state.db_pool else {
+        return Json(json!({
+            "ready": false,
+            "error": "key stats unavailable (no database configured)",
+        }))
+        .into_response();
+    };
+    match boom_audit::analytics::query_key_consumption_detail(&key_hash, range, pool).await {
+        Ok(snap) => {
+            let mut v = serde_json::to_value(&snap).unwrap_or_else(|_| json!({}));
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("ready".to_string(), json!(true));
+            }
+            Json(v).into_response()
+        }
+        Err(e) => {
+            tracing::warn!("Key consumption detail failed ({key_hash}): {e}");
+            Json(json!({
+                "ready": false,
+                "error": "key stats query failed",
+            }))
+            .into_response()
+        }
+    }
+}
+
+/// Schedule & cache history: policy distribution trend, KV/trie/provider
+/// cache ratio trends, per-policy comparison. Accepts
+/// `?range=today|1d|3d|7d&force=1`.
+pub async fn get_schedule_stats(
+    _session: AdminSession,
+    Query(params): Query<DailyStatsParams>,
+    Extension(state): Extension<Arc<DashboardState>>,
+) -> Response {
+    let range = match boom_audit::StatsRange::from_param(
+        params.range.as_deref().unwrap_or("today"),
+    ) {
+        Some(r) => r,
+        None => {
+            return Json(json!({
+                "ready": false,
+                "error": "invalid range (expected today|1d|3d|7d)",
+            }))
+            .into_response()
+        }
+    };
+    let Some(pool) = &state.db_pool else {
+        return Json(json!({
+            "ready": false,
+            "error": "schedule stats unavailable (no database configured)",
+        }))
+        .into_response();
+    };
+    let key = range.as_str().to_string();
+    let snap = match state
+        .analytics
+        .schedule
+        .get_or_refresh(&key, 300, params.force.is_some(), || {
+            boom_audit::analytics::query_schedule(range, pool)
+        })
+        .await
+    {
+        Ok(s) => Some(s),
+        Err(e) => {
+            tracing::warn!("Schedule refresh failed ({}): {e}", range.as_str());
+            state.analytics.schedule.current(&key)
+        }
+    };
+    match snap {
+        Some(snap) => {
+            let mut v = serde_json::to_value(&*snap).unwrap_or_else(|_| json!({}));
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("ready".to_string(), json!(true));
+            }
+            Json(v).into_response()
+        }
+        None => Json(json!({
+            "ready": false,
+            "error": "schedule stats unavailable (refresh pending or failing)",
+        }))
+        .into_response(),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
 // In-Flight Request Stats (real-time)
 // ═══════════════════════════════════════════════════════════
 
@@ -4522,11 +4855,11 @@ pub async fn get_agent_stats(
             r#"SELECT
                  (FLOOR((EXTRACT(EPOCH FROM created_at) - $1) / $2) * $2 + $1)::bigint AS bucket_epoch,
                  COUNT(*)::bigint AS total,
-                 COUNT(*) FILTER (WHERE api_path LIKE '/v1/messages%')::bigint AS anthropic,
+                 COUNT(CASE WHEN api_path LIKE '/v1/messages%' THEN 1 END)::bigint AS anthropic,
                  COALESCE(SUM(input_tokens), 0)::bigint AS input_tokens_total,
-                 COALESCE(SUM(input_tokens) FILTER (WHERE api_path LIKE '/v1/messages%'), 0)::bigint AS input_tokens_anthropic,
+                 COALESCE(SUM(CASE WHEN api_path LIKE '/v1/messages%' THEN input_tokens END), 0)::bigint AS input_tokens_anthropic,
                  COALESCE(SUM(output_tokens), 0)::bigint AS output_tokens_total,
-                 COALESCE(SUM(output_tokens) FILTER (WHERE api_path LIKE '/v1/messages%'), 0)::bigint AS output_tokens_anthropic
+                 COALESCE(SUM(CASE WHEN api_path LIKE '/v1/messages%' THEN output_tokens END), 0)::bigint AS output_tokens_anthropic
                FROM boom_request_log
                WHERE created_at >= $3 AND created_at < $4
                  AND status_code = 200
@@ -6873,24 +7206,25 @@ mod tests {
     /// absent values (unlimited) and zero.
     #[test]
     fn validate_key_limits_rejects_invalid_values() {
-        assert!(validate_key_limits(None, None, None, None).is_ok());
-        assert!(validate_key_limits(Some(0), Some(0), Some(0.0), None).is_ok());
-        assert!(validate_key_limits(Some(60), Some(1000), Some(12.5), Some("30d")).is_ok());
+        assert!(validate_key_limits(None, None, None, None, None).is_ok());
+        assert!(validate_key_limits(Some(0), Some(0), Some(0.0), Some(0), None).is_ok());
+        assert!(validate_key_limits(Some(60), Some(1000), Some(12.5), Some(4), Some("30d")).is_ok());
         // Empty/blank duration means "clear the field", not invalid input.
-        assert!(validate_key_limits(None, None, None, Some("")).is_ok());
-        assert!(validate_key_limits(None, None, None, Some("   ")).is_ok());
+        assert!(validate_key_limits(None, None, None, None, Some("")).is_ok());
+        assert!(validate_key_limits(None, None, None, None, Some("   ")).is_ok());
 
-        assert!(validate_key_limits(Some(-1), None, None, None).is_err());
-        assert!(validate_key_limits(None, Some(-1), None, None).is_err());
-        assert!(validate_key_limits(None, None, Some(-0.01), None).is_err());
-        assert!(validate_key_limits(None, None, Some(f64::NAN), None).is_err());
-        assert!(validate_key_limits(None, None, Some(f64::INFINITY), None).is_err());
+        assert!(validate_key_limits(Some(-1), None, None, None, None).is_err());
+        assert!(validate_key_limits(None, Some(-1), None, None, None).is_err());
+        assert!(validate_key_limits(None, None, Some(-0.01), None, None).is_err());
+        assert!(validate_key_limits(None, None, Some(f64::NAN), None, None).is_err());
+        assert!(validate_key_limits(None, None, Some(f64::INFINITY), None, None).is_err());
+        assert!(validate_key_limits(None, None, None, Some(-1), None).is_err());
 
         // Malformed durations must fail here instead of silently becoming a
         // lifetime budget at auth time.
         for raw in ["1mo", "30", "d", "0d", "1.5d"] {
             assert!(
-                validate_key_limits(None, None, None, Some(raw)).is_err(),
+                validate_key_limits(None, None, None, None, Some(raw)).is_err(),
                 "{raw:?} must be rejected"
             );
         }
@@ -6901,6 +7235,26 @@ mod tests {
         assert_eq!(normalize_pagination(0, 0), (1, 1));
         assert_eq!(normalize_pagination(-3, -20), (1, 1));
         assert_eq!(normalize_pagination(2, 5000), (2, 1000));
+    }
+
+    /// CSV import must honor a `max_parallel_requests` column instead of
+    /// silently dropping it, while files without the column keep working
+    /// (header-based mapping → missing field = None).
+    #[test]
+    fn csv_import_reads_max_parallel_requests() {
+        let with_column =
+            "key_alias,max_parallel_requests\nalice,1\nbob,\n";
+        let (reqs, errors) = super::parse_csv(with_column.as_bytes());
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[0].max_parallel_requests, Some(1));
+        assert_eq!(reqs[1].max_parallel_requests, None);
+
+        let legacy = "key_alias,rpm_limit\ncarol,60\n";
+        let (reqs, errors) = super::parse_csv(legacy.as_bytes());
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        assert_eq!(reqs[0].max_parallel_requests, None);
+        assert_eq!(reqs[0].rpm_limit, Some(60));
     }
 
     /// Lock in the three-state JSON semantics of `CreateKeyRequest::plan_name`:

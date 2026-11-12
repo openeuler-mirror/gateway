@@ -411,8 +411,10 @@
   // ── Routing (admin) ───────────────────────────────────
   function onRoute() {
     const hash = location.hash || "#/admin/stats";
+    // Match by section, not exact href: analytics sub-page hashes
+    // (#/admin/analytics/model/<name>) must still highlight the sidebar.
     document.querySelectorAll("#page-admin .nav-link").forEach((a) => {
-      a.classList.toggle("active", a.getAttribute("href") === hash);
+      a.classList.toggle("active", a.dataset.section === sectionFromHash(hash));
     });
     document.querySelectorAll("#page-admin .section").forEach((s) => {
       s.classList.toggle("active", s.id === sectionFromHash(hash));
@@ -428,6 +430,36 @@
       startStressPoll();
     } else {
       stopStressPoll();
+    }
+    // Analytics board: one section, four panes (overview / model /
+    // consumption / schedule). The active pane comes from the hash, and
+    // ONLY that pane's poller runs — closed panes don't refresh.
+    if (section === "admin-analytics") {
+      setupAnalytics();
+      const page = analyticsPageFromHash(hash);
+      document.querySelectorAll("#admin-analytics .an-pane").forEach((p) => {
+        p.classList.toggle("active", p.dataset.anpane === page);
+      });
+      document.querySelectorAll("#admin-analytics .an-subtab").forEach((b) => {
+        b.classList.toggle("active", b.dataset.anpage === page);
+      });
+      if (page === "overview") startAnalyticsPoll();
+      else stopAnalyticsPoll();
+      // loadModel re-parses the hash each time — model A → B switches are
+      // same-pane hash changes that fire onRoute (quota-page pattern).
+      if (page === "model") { setupModelPage(); startModelPoll(); }
+      else stopModelPoll();
+      // Main (cached) consumption view polls 60s; the key drill-down is a
+      // direct query — startConsumptionPoll skips the interval there.
+      if (page === "consumption") { setupConsumptionPage(); startConsumptionPoll(); }
+      else stopConsumptionPoll();
+      if (page === "schedule") { setupSchedulePage(); startSchedulePoll(); }
+      else stopSchedulePoll();
+    } else {
+      stopAnalyticsPoll();
+      stopModelPoll();
+      stopConsumptionPoll();
+      stopSchedulePoll();
     }
     if (section === "admin-status") {
       loadAlerts();
@@ -469,9 +501,20 @@
     if (hash.includes("/admin/logs")) return "admin-logs";
     if (hash.includes("/admin/debug")) return "admin-debug";
     if (hash.includes("/admin/config")) return "admin-config";
+    if (hash.includes("/admin/analytics")) return "admin-analytics";
     if (hash.includes("/admin/stress")) return "admin-stress";
     if (hash.includes("/admin/status")) return "admin-status";
     return "admin-models";
+  }
+
+  // Active pane inside the analytics section. Sub-pages live under
+  // #/admin/analytics/<page>[/<param>]; a bare #/admin/analytics is the
+  // overview.
+  function analyticsPageFromHash(hash) {
+    if (hash.includes("/admin/analytics/model")) return "model";
+    if (hash.includes("/admin/analytics/consumption")) return "consumption";
+    if (hash.includes("/admin/analytics/schedule")) return "schedule";
+    return "overview";
   }
 
   // ── Stats ─────────────────────────────────────────────
@@ -479,6 +522,1549 @@
     loadInflight();
     loadRequestRateStats();
     loadDeployment24hSummary();
+  }
+
+  // ── Analytics Board (business volume over selectable range) ─────
+  // The server keeps in-memory snapshots per range: today is refreshed
+  // from boom_request_log by a boom-main task every 30s; rolling 24h/3d/7d
+  // windows lazy-load on request and re-aggregate at most once per ~60s.
+  // This page polls the API every 60s; the server re-aggregates from the
+  // DB at most once per 5 min, so while the page is viewed the data
+  // refreshes every ~5 min — and when nobody is on the page nothing
+  // syncs at all (no background task). Leaving the page stops polling.
+  // The Refresh button passes force=1 to trigger one extra sync before
+  // responding. All wall-clock rendering is UTC+8 to match the backend's
+  // day boundary, regardless of the browser's timezone.
+  const ANALYTICS_RANGES = ["today", "1d", "3d", "7d"];
+  let analyticsTimer = null;
+  let analyticsData = null;
+  let analyticsSortKey = "requests";
+  // Collapse state for the 100%-error phantom-model group; survives poll
+  // re-renders, resets on reload.
+  let analyticsErrExpanded = false;
+  let analyticsRange = ANALYTICS_RANGES.includes(localStorage.getItem("analyticsRange"))
+    ? localStorage.getItem("analyticsRange") : "today";
+
+  function startAnalyticsPoll() {
+    stopAnalyticsPoll();
+    loadAnalytics(false);
+    analyticsTimer = setInterval(() => loadAnalytics(false), 60000);
+  }
+
+  function stopAnalyticsPoll() {
+    if (analyticsTimer) {
+      clearInterval(analyticsTimer);
+      analyticsTimer = null;
+    }
+  }
+
+  function updateAnalyticsRangeUI() {
+    // Overview + model detail + consumption + schedule share the range
+    // state; keep the bars in sync (drilling in keeps the window you were
+    // looking at).
+    document
+      .querySelectorAll("#an-range button, #md-range button, #cs-range button, #sc-range button")
+      .forEach((b) => {
+        b.classList.toggle("active", b.dataset.range === analyticsRange);
+      });
+  }
+
+  function setupAnalytics() {
+    const btn = document.getElementById("btn-refresh-analytics");
+    if (btn && !btn.dataset.bound) {
+      btn.dataset.bound = "1";
+      btn.addEventListener("click", () => loadAnalytics(true));
+    }
+    // Sub-tabs navigate by hash — onRoute then swaps panes and pollers.
+    const tabs = document.querySelector("#admin-analytics .an-subtabs");
+    if (tabs && !tabs.dataset.bound) {
+      tabs.dataset.bound = "1";
+      tabs.addEventListener("click", (e) => {
+        const b = e.target.closest("button[data-anpage]");
+        if (!b) return;
+        const target = "#/admin/analytics/" + b.dataset.anpage;
+        if (location.hash !== target) location.hash = target;
+      });
+    }
+    const rangeBar = document.getElementById("an-range");
+    if (rangeBar && !rangeBar.dataset.bound) {
+      rangeBar.dataset.bound = "1";
+      rangeBar.addEventListener("click", (e) => {
+        const b = e.target.closest("button[data-range]");
+        if (!b || b.dataset.range === analyticsRange) return;
+        analyticsRange = b.dataset.range;
+        localStorage.setItem("analyticsRange", analyticsRange);
+        updateAnalyticsRangeUI();
+        loadAnalytics(false);
+      });
+    }
+    const tableWrap = document.getElementById("an-table-wrap");
+    if (tableWrap && !tableWrap.dataset.bound) {
+      tableWrap.dataset.bound = "1";
+      tableWrap.addEventListener("click", (e) => {
+        // 100%-error group row: toggle the collapsed phantom models.
+        if (e.target.closest("tr[data-errgroup]")) {
+          analyticsErrExpanded = !analyticsErrExpanded;
+          if (analyticsData) renderAnalyticsModels(analyticsData);
+          return;
+        }
+        const th = e.target.closest("th[data-sort]");
+        if (th) {
+          analyticsSortKey = th.dataset.sort;
+          if (analyticsData) renderAnalyticsModels(analyticsData);
+          return;
+        }
+        // Row click → model drill-down. Model names are URL path segments
+        // ("*" is a real fallback model name) — always encodeURIComponent.
+        const tr = e.target.closest("tr[data-model]");
+        if (tr) {
+          location.hash = "#/admin/analytics/model/" + encodeURIComponent(tr.dataset.model);
+        }
+      });
+    }
+    updateAnalyticsRangeUI();
+    setupAnalyticsTooltip();
+  }
+
+  async function loadAnalytics(force) {
+    const requested = analyticsRange;
+    try {
+      const res = await api(
+        "/admin/stats/daily?range=" + requested + (force ? "&force=1" : "")
+      );
+      // A range switch can race an in-flight poll — only the response
+      // matching the range still on screen gets rendered.
+      if (requested !== analyticsRange) return;
+      analyticsData = res;
+      renderAnalytics();
+    } catch (e) {
+      // Read-only page — polling errors (expired session etc.) shouldn't
+      // spam the console every 10s. api() already redirects on 401.
+    }
+  }
+
+  // ── Analytics formatting helpers ──
+  // Compact figures for card values (<10k stays exact — request counts are
+  // usually in that range and "9,876" reads better than "9.9K").
+  function fmtCompactNum(v) {
+    const n = Number(v);
+    if (!isFinite(n)) return "—";
+    if (n < 10000) return n.toLocaleString();
+    if (n < 1e6) return (n / 1e3).toFixed(n < 1e5 ? 1 : 0) + "K";
+    if (n < 1e9) return (n / 1e6).toFixed(n < 1e8 ? 1 : 0) + "M";
+    return (n / 1e9).toFixed(2) + "B";
+  }
+  function fmtFullNum(v) {
+    const n = Number(v);
+    return isFinite(n) ? n.toLocaleString() : "—";
+  }
+  // UTC+8 wall-clock from epoch seconds, independent of browser timezone.
+  function cstParts(epochSecs) {
+    const d = new Date((epochSecs + 8 * 3600) * 1000);
+    const p2 = (x) => String(x).padStart(2, "0");
+    return {
+      hour: d.getUTCHours(),
+      minute: d.getUTCMinutes(),
+      time: p2(d.getUTCHours()) + ":" + p2(d.getUTCMinutes()) + ":" + p2(d.getUTCSeconds()),
+    };
+  }
+
+  function renderAnalytics() {
+    const data = analyticsData;
+    const sub = document.getElementById("analytics-subtitle");
+    const ok = data && data.ready;
+    if (sub) {
+      sub.textContent = ok
+        ? t("analytics.subtitle." + (data.range || "today"), {
+            day: data.day,
+            time: cstParts(data.generated_at).time,
+          })
+        : "—";
+    }
+    if (!ok) {
+      // Surface the server's reason (no DB vs failed refresh) instead of
+      // one generic line — it's the first thing you need when the board
+      // won't come up.
+      const detail = data && data.error ? " — " + esc(String(data.error)) : "";
+      const msg = '<p class="loading">' + esc(t("analytics.unavailable")) + detail + "</p>";
+      ["an-metrics-wrap", "an-hourly-wrap", "an-table-wrap"].forEach((id) => {
+        const el = document.getElementById(id);
+        if (el) el.innerHTML = msg;
+      });
+      const hint = document.getElementById("an-models-hint");
+      if (hint) hint.textContent = "";
+      return;
+    }
+    renderAnalyticsMetrics(data);
+    renderAnalyticsSeries(data);
+    renderAnalyticsModels(data);
+  }
+
+  function renderAnalyticsMetrics(data) {
+    const wrap = document.getElementById("an-metrics-wrap");
+    if (!wrap) return;
+    const totals = data;
+    const errPct = totals.total_requests > 0
+      ? (totals.total_errors / totals.total_requests * 100)
+      : 0;
+    const cachePct = totals.total_input_tokens > 0
+      ? (totals.total_cached_tokens / totals.total_input_tokens * 100)
+      : 0;
+    const errHtml = totals.total_errors > 0
+      ? '<span class="an-err-text">' +
+          esc(t("analytics.metrics.errors_hint", {
+            n: fmtFullNum(totals.total_errors),
+            rate: errPct.toFixed(2) + "%",
+          })) +
+        "</span>"
+      : esc(t("analytics.no_error"));
+    const cacheHtml = totals.total_cached_tokens > 0
+      ? " · " + esc(t("analytics.metrics.cache_hint", { pct: cachePct.toFixed(1) + "%" }))
+      : "";
+
+    const cards = [
+      { label: t("analytics.metrics.requests"), value: fmtCompactNum(totals.total_requests),
+        hint: fmtFullNum(totals.total_requests) + " · " + errHtml },
+      { label: t("analytics.metrics.input_tokens"), value: fmtCompactNum(totals.total_input_tokens),
+        hint: fmtFullNum(totals.total_input_tokens) + cacheHtml },
+      { label: t("analytics.metrics.output_tokens"), value: fmtCompactNum(totals.total_output_tokens),
+        hint: fmtFullNum(totals.total_output_tokens) },
+      { label: t("analytics.metrics.active_keys"), value: fmtCompactNum(totals.active_keys),
+        hint: t("analytics.metrics.keys_hint") },
+      { label: t("analytics.metrics.active_teams"), value: fmtCompactNum(totals.active_teams),
+        hint: t("analytics.metrics.teams_hint") },
+    ];
+    wrap.innerHTML = cards.map((c) =>
+      '<div class="an-metric">' +
+        '<div class="an-metric-label">' + esc(c.label) + "</div>" +
+        '<div class="an-metric-value">' + esc(c.value) + "</div>" +
+        '<div class="an-metric-hint" title="' + esc(c.hint.replace(/<[^>]+>/g, "")) + '">' + c.hint + "</div>" +
+      "</div>"
+    ).join("");
+  }
+
+  // ── Analytics request-volume chart (SVG line over a time-bucket
+  // series). Bucket size and slot count come from the snapshot: today/24h
+  // = 10-min buckets (144 slots), 3d = 30-min (144), 7d = 1h (168) — every
+  // window renders ~144 points. Window-relative slot index =
+  // (slot_epoch − since_epoch) / bucket_secs, both from the snapshot. ──
+  const AN_W = 720, AN_H = 160;
+  let anChartCtx = null; // chart geometry shared with the hover overlay
+
+  function renderAnalyticsSeries(data) {
+    const wrap = document.getElementById("an-hourly-wrap");
+    if (!wrap) return;
+    const total = Math.max(1, Number(data.total_slots) || 144);
+    const bucket = Math.max(60, Number(data.bucket_secs) || 600);
+    const since = Number(data.since_epoch) || 0;
+    const isToday = data.range === "today";
+
+    const slots = Array.from({ length: total }, () => ({ requests: 0, input: 0, output: 0 }));
+    (data.series || []).forEach((p) => {
+      const idx = Math.round((p.slot_epoch - since) / bucket);
+      if (idx >= 0 && idx < total) {
+        slots[idx].requests += p.requests || 0;
+        slots[idx].input += p.input_tokens || 0;
+        slots[idx].output += p.output_tokens || 0;
+      }
+    });
+    // Today's chart draws only the elapsed part — the blank right side
+    // reads as "not happened yet" rather than a line diving to zero.
+    // Rolling windows are all history and draw in full.
+    const nowSecs = Math.floor(Date.now() / 1000);
+    const elapsed = Math.floor((nowSecs - since) / bucket) + 1;
+    const span = isToday ? Math.min(Math.max(elapsed, 1), total) : total;
+    const max = Math.max(1, ...slots.slice(0, span).map((s) => s.requests));
+    // Nice axis ceiling (1/2/5×10ⁿ). Fifths split it into integer steps;
+    // quarters can yield 12.5/37.5 tick labels.
+    const niceCeil = (v) => {
+      if (v <= 5) return 5;
+      const exp = Math.pow(10, Math.floor(Math.log10(v)));
+      const f = v / exp;
+      return (f <= 1 ? 1 : f <= 2 ? 2 : f <= 5 ? 5 : 10) * exp;
+    };
+    const yMax = niceCeil(max);
+    anChartCtx = { yMax, total, bucket, since, span };
+
+    const x = (i) => ((i + 0.5) / total) * AN_W; // slot center
+    const y = (v) => AN_H - (v / yMax) * AN_H;
+    let lineD = "";
+    for (let i = 0; i < span; i++) {
+      lineD += (i ? "L" : "M") + x(i).toFixed(1) + " " + y(slots[i].requests).toFixed(1);
+    }
+    const areaD = lineD +
+      "L" + x(span - 1).toFixed(1) + " " + AN_H +
+      "L" + x(0).toFixed(1) + " " + AN_H + "Z";
+
+    const yLabels = [1, 0.8, 0.6, 0.4, 0.2].map((p) =>
+      '<span style="bottom:' + p * 100 + '%">' + fmtCompactNum(yMax * p) + "</span>"
+    ).join("");
+    const gridLines = [0.2, 0.4, 0.6, 0.8, 1].map((p) => {
+      const gy = ((1 - p) * AN_H).toFixed(1);
+      return '<line class="an-grid" vector-effect="non-scaling-stroke" x1="0" x2="' + AN_W + '" y1="' + gy + '" y2="' + gy + '"></line>';
+    }).join("");
+    // X labels: CST midnight marks get a date ("MM-DD"); other aligned
+    // hours get "HH:00". Stride grows with the window — 3h for 10-min
+    // buckets, 6h for 30-min, 12h for the 7-day/1h grid.
+    const stepH = bucket <= 600 ? 3 : total > 144 ? 12 : 6;
+    const p2 = (n) => String(n).padStart(2, "0");
+    let xLabels = "";
+    for (let i = 0; i < total; i++) {
+      const d = new Date((since + i * bucket + 28800) * 1000);
+      let label = "";
+      if (d.getUTCMinutes() === 0 && d.getUTCHours() === 0) {
+        label = p2(d.getUTCMonth() + 1) + "-" + p2(d.getUTCDate());
+      } else if (d.getUTCMinutes() === 0 && d.getUTCHours() % stepH === 0) {
+        label = p2(d.getUTCHours()) + ":00";
+      }
+      if (label) {
+        xLabels += '<span style="left:' + ((i + 0.5) / total * 100) + '%">' + label + "</span>";
+      }
+    }
+
+    wrap.innerHTML =
+      '<div class="an-hchart">' +
+        '<div class="an-hplot">' +
+          '<div class="an-hy">' + yLabels + "</div>" +
+          '<div class="an-svgwrap">' +
+            '<svg class="an-svg" viewBox="0 0 ' + AN_W + " " + AN_H + '" preserveAspectRatio="none">' +
+              '<defs><linearGradient id="an-grad" x1="0" y1="0" x2="0" y2="1">' +
+                '<stop class="an-grad-a" offset="0"></stop>' +
+                '<stop class="an-grad-b" offset="1"></stop>' +
+              "</linearGradient></defs>" +
+              gridLines +
+              '<path class="an-area" d="' + areaD + '"></path>' +
+              '<path class="an-line" vector-effect="non-scaling-stroke" d="' + lineD + '"></path>' +
+              '<line class="an-hoverline" id="an-hoverline" vector-effect="non-scaling-stroke" x1="0" x2="0" y1="0" y2="' + AN_H + '"></line>' +
+              '<circle class="an-hoverdot" id="an-hoverdot" vector-effect="non-scaling-stroke" r="3.5" cx="0" cy="0"></circle>' +
+              '<circle class="an-nowdot" cx="' + x(span - 1).toFixed(1) + '" cy="' + y(slots[span - 1].requests).toFixed(1) + '" r="3"></circle>' +
+            "</svg>" +
+          "</div>" +
+        "</div>" +
+        '<div class="an-hx">' + xLabels + "</div>" +
+        '<div class="an-tip" id="an-tip"></div>' +
+      "</div>";
+  }
+
+  function setupAnalyticsTooltip() {
+    const wrap = document.getElementById("an-hourly-wrap");
+    if (!wrap || wrap.dataset.tipBound) return;
+    wrap.dataset.tipBound = "1";
+    const tip = () => document.getElementById("an-tip");
+    const hide = () => {
+      const el = tip();
+      if (el) el.style.display = "none";
+      ["an-hoverline", "an-hoverdot"].forEach((id) => {
+        const n = document.getElementById(id);
+        if (n) n.style.visibility = "hidden";
+      });
+    };
+    wrap.addEventListener("mousemove", (e) => {
+      const plot = e.target.closest(".an-svgwrap");
+      const el = tip();
+      if (!plot || !el || !analyticsData || !anChartCtx) {
+        hide();
+        return;
+      }
+      const rect = plot.getBoundingClientRect();
+      const frac = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
+      const slot = Math.min(anChartCtx.total - 1, Math.floor(frac * anChartCtx.total));
+      // Today's future slots are blank — no tooltip there.
+      if (slot > anChartCtx.span - 1) { hide(); return; }
+
+      const agg = { requests: 0, input_tokens: 0, output_tokens: 0 };
+      (analyticsData.series || []).forEach((p) => {
+        if (Math.round((p.slot_epoch - anChartCtx.since) / anChartCtx.bucket) === slot) {
+          agg.requests += p.requests || 0;
+          agg.input_tokens += p.input_tokens || 0;
+          agg.output_tokens += p.output_tokens || 0;
+        }
+      });
+
+      const vx = ((slot + 0.5) / anChartCtx.total) * AN_W;
+      const line = document.getElementById("an-hoverline");
+      const dot = document.getElementById("an-hoverdot");
+      if (line) {
+        line.setAttribute("x1", vx);
+        line.setAttribute("x2", vx);
+        line.style.visibility = "visible";
+      }
+      if (dot) {
+        dot.setAttribute("cx", vx);
+        dot.setAttribute("cy", AN_H - (agg.requests / anChartCtx.yMax) * AN_H);
+        dot.style.visibility = "visible";
+      }
+
+      // "HH:MM – HH:MM", prefixed with the date when the window spans
+      // multiple days (or the bucket crosses midnight).
+      const p2 = (n) => String(n).padStart(2, "0");
+      const multiDay = anChartCtx.total * anChartCtx.bucket > 86400;
+      const fmt = (t, withDate) => {
+        const d = new Date((t + 28800) * 1000);
+        return (withDate ? p2(d.getUTCMonth() + 1) + "-" + p2(d.getUTCDate()) + " " : "") +
+          p2(d.getUTCHours()) + ":" + p2(d.getUTCMinutes());
+      };
+      const startT = anChartCtx.since + slot * anChartCtx.bucket;
+      const endT = startT + anChartCtx.bucket;
+      const sd = new Date((startT + 28800) * 1000);
+      const ed = new Date((endT + 28800) * 1000);
+      const crossesMidnight =
+        sd.getUTCDate() !== ed.getUTCDate() || sd.getUTCMonth() !== ed.getUTCMonth();
+      const range = fmt(startT, multiDay) + " – " + fmt(endT, multiDay || crossesMidnight);
+      el.innerHTML =
+        '<div class="an-tip-head">' + range + "</div>" +
+        '<div class="an-tip-row"><span>' + esc(t("analytics.series.requests")) + "</span><b>" + fmtFullNum(agg.requests) + "</b></div>" +
+        '<div class="an-tip-row"><span>' + esc(t("analytics.series.input")) + "</span><b>" + fmtFullNum(agg.input_tokens) + "</b></div>" +
+        '<div class="an-tip-row"><span>' + esc(t("analytics.series.output")) + "</span><b>" + fmtFullNum(agg.output_tokens) + "</b></div>";
+      el.style.display = "block";
+      const gridRect = wrap.getBoundingClientRect();
+      const tipW = el.offsetWidth;
+      let left = e.clientX - gridRect.left + 14;
+      if (left + tipW > gridRect.width) left = e.clientX - gridRect.left - tipW - 14;
+      el.style.left = left + "px";
+      el.style.top = Math.max(0, e.clientY - gridRect.top - 30) + "px";
+    });
+    wrap.addEventListener("mouseleave", hide);
+  }
+
+  function renderAnalyticsModels(data) {
+    const wrap = document.getElementById("an-table-wrap");
+    if (!wrap) return;
+    const hint = document.getElementById("an-models-hint");
+    if (hint) hint.textContent = t("analytics.models.hint", { n: (data.models || []).length });
+
+    const all = (data.models || []).slice();
+    if (!all.length) {
+      wrap.innerHTML = '<p class="loading">' + esc(t("common.no_records")) + "</p>";
+      return;
+    }
+    // 100%-error rows are almost always phantom model names (client asked
+    // for a model that doesn't exist; the gateway 404s but still audits
+    // the request). Collapse them into one expandable group at the bottom
+    // so real models stay readable.
+    const isErrAll = (m) => m.requests > 0 && m.errors >= m.requests;
+    const models = all.filter((m) => !isErrAll(m));
+    const errModels = all.filter((m) => isErrAll(m));
+    const totalOf = (m) => (m.input_tokens || 0) + (m.output_tokens || 0);
+    const sortVal = (m) => analyticsSortKey === "total_tokens" ? totalOf(m) : (m[analyticsSortKey] || 0);
+    models.sort((a, b) => sortVal(b) - sortVal(a));
+    errModels.sort((a, b) => sortVal(b) - sortVal(a));
+    const totalReq = data.total_requests || 0;
+    const maxReq = Math.max(1, ...models.map((m) => m.requests));
+
+    const th = (key, labelKey, cls) => {
+      const classes = [];
+      if (cls) classes.push(cls);
+      if (key && analyticsSortKey === key) classes.push("an-sorted");
+      return "<th " + (key ? 'data-sort="' + key + '" ' : "") +
+        (classes.length ? 'class="' + classes.join(" ") + '" ' : "") + ">" +
+        esc(t(labelKey)) + (key ? ' <span class="an-sort-arrow"></span>' : "") + "</th>";
+    };
+
+    const head =
+      "<tr><th>#</th>" +
+      th(null, "analytics.models.model") +
+      th("requests", "analytics.models.requests", "num") +
+      th(null, "analytics.models.share") +
+      th(null, "analytics.models.inout", "num") +
+      th("total_tokens", "analytics.models.total", "num") +
+      th(null, "analytics.models.cached", "num") +
+      th(null, "analytics.models.errors", "num") +
+      th(null, "analytics.models.errrate", "num") +
+      "</tr>";
+
+    const rowOf = (m, rank) => {
+      const share = totalReq > 0 ? (m.requests / totalReq * 100) : 0;
+      const barW = (m.requests / maxReq * 100).toFixed(2);
+      const errRate = m.requests > 0 ? (m.errors / m.requests * 100) : 0;
+      const errRateCls = m.errors === 0 ? "an-errrate-zero" : errRate >= 5 ? "an-errrate-high" : errRate >= 1 ? "an-errrate-low" : "";
+      const total = totalOf(m);
+      return '<tr data-model="' + esc(m.model) + '">' + rank +
+        '<td class="an-model" title="' + esc(m.model) + '">' + esc(m.model) + "</td>" +
+        '<td class="num" title="' + fmtFullNum(m.requests) + '">' + fmtFullNum(m.requests) + "</td>" +
+        '<td><div class="an-share"><div class="an-share-bar"><i style="width:' + barW + '%"></i></div><span>' + share.toFixed(1) + "%</span></div></td>" +
+        '<td class="num" title="' + fmtFullNum(m.input_tokens) + " / " + fmtFullNum(m.output_tokens) + '">' +
+          fmtCompactNum(m.input_tokens) + " / " + fmtCompactNum(m.output_tokens) + "</td>" +
+        '<td class="num" title="' + fmtFullNum(total) + '">' + fmtCompactNum(total) + "</td>" +
+        '<td class="num" title="' + fmtFullNum(m.cached_tokens) + '">' + fmtCompactNum(m.cached_tokens) + "</td>" +
+        '<td class="num' + (m.errors > 0 ? " an-err-text" : "") + '">' + fmtFullNum(m.errors) + "</td>" +
+        '<td class="num ' + errRateCls + '">' + errRate.toFixed(2) + "%</td>" +
+      "</tr>";
+    };
+
+    const rows = models.map((m, i) =>
+      rowOf(m, i < 3
+        ? '<td class="an-rank an-rank--top">' + (i + 1) + "</td>"
+        : '<td class="an-rank">' + (i + 1) + "</td>")
+    ).join("");
+
+    let errHtml = "";
+    if (errModels.length) {
+      const chev = analyticsErrExpanded ? "▾" : "▸";
+      errHtml =
+        '<tr class="an-errgroup" data-errgroup="1"><td></td>' +
+          '<td colspan="8">' + chev + " " +
+          esc(t("analytics.models.errgroup", { n: errModels.length })) + "</td></tr>" +
+        (analyticsErrExpanded
+          ? errModels.map((m) => rowOf(m, '<td class="an-rank">·</td>')).join("")
+          : "");
+    }
+
+    wrap.innerHTML =
+      '<table class="an-table"><thead>' + head + "</thead><tbody>" + rows + errHtml + "</tbody></table>";
+  }
+
+  // ── Analytics detail pages: generic multi-series trend chart ──
+  // Same geometry/axes as the overview chart above (720×160 SVG, CST
+  // wall-clock x labels, niceCeil y), but supports N series and binds
+  // hover state per container so several charts can coexist on the detail
+  // pages. The overview chart is left untouched — this helper is the one
+  // new pages build on.
+  function renderTrendChart(wrapId, spec) {
+    const wrap = document.getElementById(wrapId);
+    if (!wrap) return;
+    const total = Math.max(1, Number(spec.total) || 144);
+    const bucket = Math.max(60, Number(spec.bucket) || 600);
+    const since = Number(spec.since) || 0;
+    const span = Math.max(1, Math.min(Number(spec.span) || total, total));
+    const series = (spec.series || []).filter((s) => Array.isArray(s.values));
+    const niceCeil = (v) => {
+      if (v <= 5) return 5;
+      const exp = Math.pow(10, Math.floor(Math.log10(v)));
+      const f = v / exp;
+      return (f <= 1 ? 1 : f <= 2 ? 2 : f <= 5 ? 5 : 10) * exp;
+    };
+    let max = 0;
+    series.forEach((s) => {
+      for (let i = 0; i < span; i++) {
+        const v = s.values[i];
+        if (v != null && v > max) max = v;
+      }
+    });
+    const yMax = spec.yMax != null ? spec.yMax : niceCeil(Math.max(max, 0.000001));
+    const fmtY = spec.fmtY || fmtCompactNum;
+    const ctx = { total, bucket, since, span, yMax, series, tooltipRows: spec.tooltipRows };
+    wrap._trendCtx = ctx;
+    bindTrendHover(wrap);
+
+    const x = (i) => ((i + 0.5) / total) * AN_W;
+    const y = (v) => AN_H - (Math.min(v, yMax) / yMax) * AN_H;
+    // Null values (e.g. ratio buckets with zero denominator) break the
+    // line into subpaths instead of diving to zero.
+    const pathOf = (values) => {
+      let d = "", pen = false;
+      for (let i = 0; i < span; i++) {
+        const v = values[i];
+        if (v == null) { pen = false; continue; }
+        d += (pen ? "L" : "M") + x(i).toFixed(1) + " " + y(v).toFixed(1);
+        pen = true;
+      }
+      return d;
+    };
+    const paths = series.map((s) => {
+      const d = pathOf(s.values);
+      if (!d) return "";
+      const line = '<path class="tr-line" style="stroke:' + s.color + '" vector-effect="non-scaling-stroke" d="' + d + '"></path>';
+      // Single-series charts get a soft area fill; with 2+ series the
+      // fills would stack over each other and muddy the lines.
+      if (series.length === 1) {
+        const lastIdx = (() => { for (let i = span - 1; i >= 0; i--) if (s.values[i] != null) return i; return -1; })();
+        if (lastIdx >= 0) {
+          const areaD = d +
+            "L" + x(lastIdx).toFixed(1) + " " + AN_H +
+            "L" + x(0).toFixed(1) + " " + AN_H + "Z";
+          return '<path class="tr-area" style="fill:' + s.color + '" d="' + areaD + '"></path>' + line;
+        }
+      }
+      return line;
+    }).join("");
+
+    const yLabels = [1, 0.8, 0.6, 0.4, 0.2].map((p) =>
+      '<span style="bottom:' + p * 100 + '%">' + fmtY(yMax * p) + "</span>"
+    ).join("");
+    const gridLines = [0.2, 0.4, 0.6, 0.8, 1].map((p) => {
+      const gy = ((1 - p) * AN_H).toFixed(1);
+      return '<line class="an-grid" vector-effect="non-scaling-stroke" x1="0" x2="' + AN_W + '" y1="' + gy + '" y2="' + gy + '"></line>';
+    }).join("");
+    const stepH = bucket <= 600 ? 3 : total > 144 ? 12 : 6;
+    const p2 = (n) => String(n).padStart(2, "0");
+    let xLabels = "";
+    for (let i = 0; i < total; i++) {
+      const d = new Date((since + i * bucket + 28800) * 1000);
+      let label = "";
+      if (d.getUTCMinutes() === 0 && d.getUTCHours() === 0) {
+        label = p2(d.getUTCMonth() + 1) + "-" + p2(d.getUTCDate());
+      } else if (d.getUTCMinutes() === 0 && d.getUTCHours() % stepH === 0) {
+        label = p2(d.getUTCHours()) + ":00";
+      }
+      if (label) xLabels += '<span style="left:' + ((i + 0.5) / total * 100) + '%">' + label + "</span>";
+    }
+    const legend = series.length > 1
+      ? '<div class="tr-legend">' + series.map((s) =>
+          '<span class="tr-legend-item"><i class="tr-swatch" style="background:' + s.color + '"></i>' + esc(s.label) + "</span>"
+        ).join("") + "</div>"
+      : "";
+
+    wrap.innerHTML =
+      '<div class="an-hchart">' + legend +
+        '<div class="an-hplot">' +
+          '<div class="an-hy">' + yLabels + "</div>" +
+          '<div class="an-svgwrap">' +
+            '<svg class="an-svg" viewBox="0 0 ' + AN_W + " " + AN_H + '" preserveAspectRatio="none">' +
+              gridLines + paths +
+              '<line class="an-hoverline" vector-effect="non-scaling-stroke" x1="0" x2="0" y1="0" y2="' + AN_H + '"></line>' +
+            "</svg>" +
+          "</div>" +
+        "</div>" +
+        '<div class="an-hx">' + xLabels + "</div>" +
+        '<div class="an-tip"></div>' +
+      "</div>";
+  }
+
+  // One-time hover binding per chart container; the fresh geometry lives
+  // on wrap._trendCtx and is re-pointed by every renderTrendChart call.
+  function bindTrendHover(wrap) {
+    if (!wrap || wrap.dataset.trendBound) return;
+    wrap.dataset.trendBound = "1";
+    const q = (sel) => wrap.querySelector(sel);
+    const hide = () => {
+      const tip = q(".an-tip");
+      if (tip) tip.style.display = "none";
+      const line = q(".an-hoverline");
+      if (line) line.style.visibility = "hidden";
+    };
+    wrap.addEventListener("mousemove", (e) => {
+      const ctx = wrap._trendCtx;
+      const plot = e.target.closest(".an-svgwrap");
+      const tip = q(".an-tip");
+      if (!ctx || !plot || !tip) { hide(); return; }
+      const rect = plot.getBoundingClientRect();
+      const frac = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
+      const slot = Math.min(ctx.total - 1, Math.floor(frac * ctx.total));
+      if (slot > ctx.span - 1) { hide(); return; }
+      const line = q(".an-hoverline");
+      if (line) {
+        const vx = ((slot + 0.5) / ctx.total) * AN_W;
+        line.setAttribute("x1", vx);
+        line.setAttribute("x2", vx);
+        line.style.visibility = "visible";
+      }
+      const startT = ctx.since + slot * ctx.bucket;
+      const endT = startT + ctx.bucket;
+      const multiDay = ctx.total * ctx.bucket > 86400;
+      const fmtT = (t, withDate) => {
+        const d = new Date((t + 28800) * 1000);
+        return (withDate ? p2(d.getUTCMonth() + 1) + "-" + p2(d.getUTCDate()) + " " : "") +
+          p2(d.getUTCHours()) + ":" + p2(d.getUTCMinutes());
+      };
+      const sd = new Date((startT + 28800) * 1000);
+      const ed = new Date((endT + 28800) * 1000);
+      const crossesMidnight = sd.getUTCDate() !== ed.getUTCDate() || sd.getUTCMonth() !== ed.getUTCMonth();
+      const rows = (ctx.tooltipRows ? ctx.tooltipRows(slot) : [])
+        .map((r) => '<div class="an-tip-row"><span>' + esc(r.label) + "</span><b>" + esc(r.value) + "</b></div>")
+        .join("");
+      tip.innerHTML =
+        '<div class="an-tip-head">' + fmtT(startT, multiDay) + " – " + fmtT(endT, multiDay || crossesMidnight) + "</div>" + rows;
+      tip.style.display = "block";
+      const gridRect = wrap.getBoundingClientRect();
+      const tipW = tip.offsetWidth;
+      let left = e.clientX - gridRect.left + 14;
+      if (left + tipW > gridRect.width) left = e.clientX - gridRect.left - tipW - 14;
+      tip.style.left = left + "px";
+      tip.style.top = Math.max(0, e.clientY - gridRect.top - 30) + "px";
+    });
+    wrap.addEventListener("mouseleave", hide);
+  }
+
+  // ── Analytics detail: model drill-down page ──
+  // Selected model lives in the hash (#/admin/analytics/model/<enc>) so reload,
+  // back/forward and overview row clicks all work through plain
+  // navigation. Shares the overview's range selector state
+  // (analyticsRange + localStorage) — drilling in keeps the window you
+  // were looking at.
+  let modelTimer = null;
+  let mdData = null;
+
+  function currentModelFromHash() {
+    const m = (location.hash || "").match(/\/admin\/analytics\/model\/([^/?#]+)/);
+    return m ? decodeURIComponent(m[1]) : "";
+  }
+
+  function startModelPoll() {
+    stopModelPoll();
+    loadModel(false);
+    modelTimer = setInterval(() => loadModel(false), 60000);
+  }
+
+  function stopModelPoll() {
+    if (modelTimer) {
+      clearInterval(modelTimer);
+      modelTimer = null;
+    }
+  }
+
+  function setupModelPage() {
+    const btn = document.getElementById("btn-refresh-model");
+    if (btn && !btn.dataset.bound) {
+      btn.dataset.bound = "1";
+      btn.addEventListener("click", () => loadModel(true));
+    }
+    const bar = document.getElementById("md-range");
+    if (bar && !bar.dataset.bound) {
+      bar.dataset.bound = "1";
+      bar.addEventListener("click", (e) => {
+        const b = e.target.closest("button[data-range]");
+        if (!b || b.dataset.range === analyticsRange) return;
+        analyticsRange = b.dataset.range;
+        localStorage.setItem("analyticsRange", analyticsRange);
+        updateAnalyticsRangeUI();
+        loadModel(false);
+      });
+    }
+    updateAnalyticsRangeUI();
+  }
+
+  async function loadModel(force) {
+    const model = currentModelFromHash();
+    if (!model) {
+      mdData = null;
+      renderModel();
+      return;
+    }
+    const requested = model + "|" + analyticsRange;
+    try {
+      const res = await api(
+        "/admin/stats/model/" + encodeURIComponent(model) +
+          "?range=" + analyticsRange + (force ? "&force=1" : "")
+      );
+      // A hash change (model or range switch) can race an in-flight
+      // request — only render what's still on screen.
+      if (requested !== currentModelFromHash() + "|" + analyticsRange) return;
+      mdData = res;
+      renderModel();
+    } catch (e) {
+      // Read-only poller — api() already surfaces auth problems.
+    }
+  }
+
+  function fmtMs(v) {
+    return v == null ? "—" : Math.round(v).toLocaleString() + " ms";
+  }
+  function fmtPct(v) {
+    return v == null ? "—" : (v * 100).toFixed(1) + "%";
+  }
+
+  function renderModel() {
+    const body = document.getElementById("md-body");
+    const sub = document.getElementById("md-subtitle");
+    const model = currentModelFromHash();
+    if (sub) sub.textContent = model || "—";
+    if (!body) return;
+    if (!model) {
+      body.innerHTML =
+        '<div class="card an-panel"><p class="loading">' + esc(t("model.empty")) + "</p>" +
+        '<a class="tr-back" href="#/admin/analytics/overview">← ' + esc(t("model.back_overview")) + "</a></div>";
+      return;
+    }
+    const data = mdData;
+    if (!data || !data.ready) {
+      const detail = data && data.error ? " — " + esc(String(data.error)) : "";
+      body.innerHTML = '<p class="loading">' + esc(t("analytics.unavailable")) + detail + "</p>";
+      return;
+    }
+
+    const errRate = data.requests > 0 ? (data.errors / data.requests * 100) : 0;
+    const cards = [
+      { label: t("analytics.metrics.requests"), value: fmtFullNum(data.requests), hint: "" },
+      { label: t("analytics.metrics.input_tokens"), value: fmtCompactNum(data.input_tokens), hint: "" },
+      { label: t("analytics.metrics.output_tokens"), value: fmtCompactNum(data.output_tokens), hint: "" },
+      { label: t("analytics.metrics.errors"), value: fmtFullNum(data.errors),
+        hint: errRate.toFixed(2) + "%" },
+      { label: t("model.metrics.cache_hit"), value: fmtPct(data.cache_hit_ratio),
+        hint: t("model.metrics.cache_hit_hint") },
+      { label: t("model.metrics.avg_duration"), value: fmtMs(data.avg_duration_ms),
+        hint: t("model.metrics.avg_duration_hint") },
+      { label: t("model.metrics.avg_ttft"), value: fmtMs(data.avg_ttft_ms),
+        hint: t("model.metrics.avg_ttft_hint") },
+      { label: t("model.metrics.avg_queue"), value: fmtMs(data.avg_queue_wait_ms),
+        hint: t("model.metrics.avg_queue_hint") },
+    ];
+    const metrics = '<div class="an-metrics">' + cards.map((c) =>
+      '<div class="an-metric">' +
+        '<div class="an-metric-label">' + esc(c.label) + "</div>" +
+        '<div class="an-metric-value">' + esc(c.value) + "</div>" +
+        (c.hint ? '<div class="an-metric-hint">' + esc(c.hint) + "</div>" : "") +
+      "</div>"
+    ).join("") + "</div>";
+
+    // Skeleton with empty chart containers; renderTrendChart fills them
+    // after the innerHTML assignment.
+    const chartCard = (id, titleKey, hint) =>
+      '<div class="card an-panel">' +
+        '<div class="an-card-head"><h3>' + esc(t(titleKey)) + '</h3><span class="an-hint">' + esc(hint) + "</span></div>" +
+        '<div id="' + id + '"></div>' +
+      "</div>";
+
+    body.innerHTML = metrics +
+      chartCard("md-chart-req", "model.series.requests", t("model.series.hint", { bucket: bucketLabel(data.bucket_secs) })) +
+      chartCard("md-chart-tokens", "model.series.tokens", t("model.series.hint", { bucket: bucketLabel(data.bucket_secs) })) +
+      chartCard("md-chart-cache", "model.series.cache", t("model.series.hint", { bucket: bucketLabel(data.bucket_secs) })) +
+      chartCard("md-chart-latency", "model.series.latency", t("model.series.hint", { bucket: bucketLabel(data.bucket_secs) })) +
+      '<div class="card an-panel">' +
+        '<div class="an-card-head"><h3>' + esc(t("model.hist.title")) + '</h3><span class="an-hint">' +
+          esc(t("model.hist.total", { n: fmtFullNum(data.timed_requests) })) + "</span></div>" +
+        '<div id="md-hist"></div>' +
+      "</div>" +
+      '<div class="card an-panel">' +
+        '<div class="an-card-head"><h3>' + esc(t("model.deploy.title")) + '</h3><span class="an-hint">' +
+          esc(t("model.deploy.hint", { n: (data.deployments || []).length })) + "</span></div>" +
+        '<div id="md-deploy"></div>' +
+      "</div>";
+
+    // ── Charts ──
+    const total = Math.max(1, Number(data.total_slots) || 144);
+    const bucket = Math.max(60, Number(data.bucket_secs) || 600);
+    const since = Number(data.since_epoch) || 0;
+    const span = data.range === "today"
+      ? Math.min(Math.max(Math.floor((Date.now() / 1000 - since) / bucket) + 1, 1), total)
+      : total;
+    const zeros = () => Array.from({ length: total }, () => 0);
+    const req = zeros(), err = zeros(), input = zeros(), output = zeros();
+    const cached = zeros(), inputForRatio = zeros(), dur = Array.from({ length: total }, () => null);
+    (data.series || []).forEach((p) => {
+      const idx = Math.round((p.slot_epoch - since) / bucket);
+      if (idx < 0 || idx >= total) return;
+      req[idx] += p.requests || 0;
+      err[idx] += p.errors || 0;
+      input[idx] += p.input_tokens || 0;
+      output[idx] += p.output_tokens || 0;
+      cached[idx] += p.cached_tokens || 0;
+      inputForRatio[idx] += p.input_tokens || 0;
+      if (p.avg_duration_ms != null) dur[idx] = p.avg_duration_ms;
+    });
+    const ratioAt = (i) => (inputForRatio[i] > 0 ? cached[i] / inputForRatio[i] : null);
+    const C_MAIN = "var(--primary)", C_ALT = "var(--warn)", C_ERR = "var(--danger)";
+
+    renderTrendChart("md-chart-req", {
+      since, bucket, total, span,
+      series: [
+        { label: t("analytics.series.requests"), color: C_MAIN, values: req },
+        { label: t("analytics.metrics.errors"), color: C_ERR, values: err },
+      ],
+      tooltipRows: (i) => [
+        { label: t("analytics.series.requests"), value: fmtFullNum(req[i]) },
+        { label: t("analytics.metrics.errors"), value: fmtFullNum(err[i]) },
+      ],
+    });
+    renderTrendChart("md-chart-tokens", {
+      since, bucket, total, span,
+      series: [
+        { label: t("analytics.series.input"), color: C_MAIN, values: input },
+        { label: t("analytics.series.output"), color: C_ALT, values: output },
+      ],
+      tooltipRows: (i) => [
+        { label: t("analytics.series.input"), value: fmtFullNum(input[i]) },
+        { label: t("analytics.series.output"), value: fmtFullNum(output[i]) },
+      ],
+    });
+    const ratioVals = Array.from({ length: total }, (_, i) => ratioAt(i));
+    renderTrendChart("md-chart-cache", {
+      since, bucket, total, span, yMax: 1,
+      fmtY: (v) => Math.round(v * 100) + "%",
+      series: [{ label: t("model.series.cache"), color: C_MAIN, values: ratioVals }],
+      tooltipRows: (i) => [{ label: t("model.series.cache"), value: fmtPct(ratioAt(i)) }],
+    });
+    renderTrendChart("md-chart-latency", {
+      since, bucket, total, span,
+      series: [{ label: t("model.series.latency"), color: C_MAIN, values: dur }],
+      tooltipRows: (i) => [{ label: t("model.series.latency"), value: fmtMs(dur[i]) }],
+    });
+
+    // ── Latency histogram ──
+    const hist = document.getElementById("md-hist");
+    if (hist) {
+      const labels = ["model.hist.lt100", "model.hist.lt300", "model.hist.lt1s",
+        "model.hist.lt3s", "model.hist.lt10s", "model.hist.gte10s"];
+      const counts = data.latency_hist || [0, 0, 0, 0, 0, 0];
+      const maxCnt = Math.max(1, ...counts);
+      hist.innerHTML = '<div class="md-hist">' + counts.map((c, i) =>
+        '<div class="md-hist-row">' +
+          '<span class="md-hist-label">' + esc(t(labels[i])) + "</span>" +
+          '<div class="md-hist-track"><i style="width:' + (c / maxCnt * 100).toFixed(2) + '%"></i></div>' +
+          '<span class="md-hist-val">' + fmtFullNum(c) + "</span>" +
+        "</div>"
+      ).join("") + "</div>";
+    }
+
+    // ── Deployment split table ──
+    const depWrap = document.getElementById("md-deploy");
+    if (depWrap) {
+      const deps = data.deployments || [];
+      if (!deps.length) {
+        depWrap.innerHTML = '<p class="loading">' + esc(t("common.no_records")) + "</p>";
+      } else {
+        const th = (labelKey, cls) =>
+          "<th" + (cls ? ' class="' + cls + '"' : "") + ">" + esc(t(labelKey)) + "</th>";
+        const head = "<tr>" +
+          th("model.deploy.th.deployment") + th("model.deploy.th.model_name") +
+          th("model.deploy.th.requests", "num") + th("model.deploy.th.input", "num") +
+          th("model.deploy.th.output", "num") + th("model.deploy.th.errors", "num") +
+          th("model.deploy.th.avg_duration", "num") + th("model.deploy.th.avg_ttft", "num") +
+          "</tr>";
+        const rows = deps.map((d) => {
+          const depId = d.deployment_id ? esc(d.deployment_id) : '<span class="an-dim">' + esc(t("model.deploy.unattributed")) + "</span>";
+          const modelName = d.model_name ? esc(d.model_name) : '<span class="an-dim">' + esc(t("model.deploy.unattributed")) + "</span>";
+          return "<tr>" +
+            '<td title="' + esc(d.deployment_id || "") + '">' + depId + "</td>" +
+            '<td title="' + esc(d.model_name || "") + '">' + modelName + "</td>" +
+            '<td class="num">' + fmtFullNum(d.requests) + "</td>" +
+            '<td class="num">' + fmtCompactNum(d.input_tokens) + "</td>" +
+            '<td class="num">' + fmtCompactNum(d.output_tokens) + "</td>" +
+            '<td class="num' + (d.errors > 0 ? " an-err-text" : "") + '">' + fmtFullNum(d.errors) + "</td>" +
+            '<td class="num">' + fmtMs(d.avg_duration_ms) + "</td>" +
+            '<td class="num">' + fmtMs(d.avg_ttft_ms) + "</td>" +
+          "</tr>";
+        }).join("");
+        depWrap.innerHTML = '<table class="an-table"><thead>' + head + "</thead><tbody>" + rows + "</tbody></table>";
+      }
+    }
+  }
+
+  function bucketLabel(bucketSecs) {
+    if (bucketSecs <= 600) return t("model.bucket.10m");
+    if (bucketSecs <= 1800) return t("model.bucket.30m");
+    return t("model.bucket.1h");
+  }
+
+  // ── Analytics detail: consumption page ──
+  // Main view (#/admin/consumption): token spend by key / team / end-user
+  // tag / client IP from the TTL-cached snapshot, polled every 60s.
+  // Key drill-down (#/admin/consumption/key/<hash>): direct uncached
+  // query, no polling — manual refresh only (key cardinality is
+  // unbounded, caching would only add prune pressure).
+  let consumptionTimer = null;
+  let csData = null; // main-view snapshot
+  let csKeyData = null; // key drill-down report
+
+  function currentKeyFromHash() {
+    const m = (location.hash || "").match(/\/admin\/analytics\/consumption\/key\/([^/?#]+)/);
+    return m ? decodeURIComponent(m[1]) : "";
+  }
+
+  function startConsumptionPoll() {
+    stopConsumptionPoll();
+    loadConsumption(false);
+    if (!currentKeyFromHash()) {
+      consumptionTimer = setInterval(() => loadConsumption(false), 60000);
+    }
+  }
+
+  function stopConsumptionPoll() {
+    if (consumptionTimer) {
+      clearInterval(consumptionTimer);
+      consumptionTimer = null;
+    }
+  }
+
+  function setupConsumptionPage() {
+    const btn = document.getElementById("btn-refresh-consumption");
+    if (btn && !btn.dataset.bound) {
+      btn.dataset.bound = "1";
+      btn.addEventListener("click", () => loadConsumption(true));
+    }
+    const bar = document.getElementById("cs-range");
+    if (bar && !bar.dataset.bound) {
+      bar.dataset.bound = "1";
+      bar.addEventListener("click", (e) => {
+        const b = e.target.closest("button[data-range]");
+        if (!b || b.dataset.range === analyticsRange) return;
+        analyticsRange = b.dataset.range;
+        localStorage.setItem("analyticsRange", analyticsRange);
+        updateAnalyticsRangeUI();
+        loadConsumption(false);
+      });
+    }
+    // Key ranking rows navigate into the drill-down sub-view.
+    const bodyEl = document.getElementById("cs-body");
+    if (bodyEl && !bodyEl.dataset.keybound) {
+      bodyEl.dataset.keybound = "1";
+      bodyEl.addEventListener("click", (e) => {
+        const tr = e.target.closest("tr[data-key]");
+        if (tr) {
+          location.hash = "#/admin/analytics/consumption/key/" + encodeURIComponent(tr.dataset.key);
+        }
+      });
+    }
+    updateAnalyticsRangeUI();
+  }
+
+  async function loadConsumption(force) {
+    const keyHash = currentKeyFromHash();
+    const requested = (keyHash || "-") + "|" + analyticsRange;
+    try {
+      const res = keyHash
+        ? await api(
+            "/admin/stats/consumption/key/" + encodeURIComponent(keyHash) +
+              "?range=" + analyticsRange
+          )
+        : await api(
+            "/admin/stats/consumption?range=" + analyticsRange + (force ? "&force=1" : "")
+          );
+      // A hash change (main ⇄ key view, or range switch) can race an
+      // in-flight request — only render what's still on screen.
+      if (requested !== (currentKeyFromHash() || "-") + "|" + analyticsRange) return;
+      if (keyHash) csKeyData = res;
+      else csData = res;
+      renderConsumption();
+    } catch (e) {
+      // Read-only poller — api() already surfaces auth problems.
+    }
+  }
+
+  // UTC+8 "MM-DD HH:mm" from epoch seconds (first/last seen columns).
+  function fmtCstDT(epoch) {
+    if (epoch == null) return "—";
+    const d = new Date((epoch + 8 * 3600) * 1000);
+    const p2 = (x) => String(x).padStart(2, "0");
+    return (
+      p2(d.getUTCMonth() + 1) + "-" + p2(d.getUTCDate()) + " " +
+      p2(d.getUTCHours()) + ":" + p2(d.getUTCMinutes())
+    );
+  }
+
+  function keyDisplayLabel(k) {
+    return k.key_alias || k.key_name || k.key_hash || "";
+  }
+
+  function renderConsumption() {
+    const body = document.getElementById("cs-body");
+    if (!body) return;
+    if (currentKeyFromHash()) renderConsumptionKey(body);
+    else renderConsumptionMain(body);
+  }
+
+  function renderConsumptionMain(body) {
+    const sub = document.getElementById("cs-subtitle");
+    if (sub) sub.textContent = t("consumption.subtitle");
+    const data = csData;
+    if (!data || !data.ready) {
+      const detail = data && data.error ? " — " + esc(String(data.error)) : "";
+      body.innerHTML = '<p class="loading">' + esc(t("analytics.unavailable")) + detail + "</p>";
+      return;
+    }
+
+    const errRate = data.requests > 0 ? (data.errors / data.requests * 100) : 0;
+    const cards = [
+      { label: t("analytics.metrics.requests"), value: fmtFullNum(data.requests), hint: "" },
+      { label: t("analytics.metrics.input_tokens"), value: fmtCompactNum(data.input_tokens), hint: "" },
+      { label: t("analytics.metrics.output_tokens"), value: fmtCompactNum(data.output_tokens), hint: "" },
+      { label: t("analytics.metrics.errors"), value: fmtFullNum(data.errors),
+        hint: errRate.toFixed(2) + "%" },
+      { label: t("model.metrics.cache_hit"), value: fmtPct(
+          data.input_tokens > 0 ? data.cached_tokens / data.input_tokens : null),
+        hint: t("model.metrics.cache_hit_hint") },
+    ];
+    const metrics = '<div class="an-metrics">' + cards.map((c) =>
+      '<div class="an-metric">' +
+        '<div class="an-metric-label">' + esc(c.label) + "</div>" +
+        '<div class="an-metric-value">' + esc(c.value) + "</div>" +
+        (c.hint ? '<div class="an-metric-hint">' + esc(c.hint) + "</div>" : "") +
+      "</div>"
+    ).join("") + "</div>";
+
+    const chartCard = (id, titleKey, hint) =>
+      '<div class="card an-panel">' +
+        '<div class="an-card-head"><h3>' + esc(t(titleKey)) + '</h3><span class="an-hint">' + esc(hint) + "</span></div>" +
+        '<div id="' + id + '"></div>' +
+      "</div>";
+    const bucketHint = t("model.series.hint", { bucket: bucketLabel(data.bucket_secs) });
+
+    const tableCard = (id, titleKey, hint, inner) =>
+      '<div class="card an-panel">' +
+        '<div class="an-card-head"><h3>' + esc(t(titleKey)) + '</h3><span class="an-hint">' + esc(hint) + "</span></div>" +
+        '<div id="' + id + '">' + inner + "</div>" +
+      "</div>";
+
+    body.innerHTML = metrics +
+      chartCard("cs-chart-tokens", "model.series.tokens", bucketHint) +
+      chartCard("cs-chart-req", "model.series.requests", bucketHint) +
+      tableCard("cs-keys", "consumption.keys.title",
+        t("consumption.keys.hint", { n: (data.keys || []).length }), "") +
+      tableCard("cs-teams", "consumption.teams.title", "", "") +
+      tableCard("cs-tags", "consumption.tags.title", "", "") +
+      tableCard("cs-ips", "consumption.ips.title", "", "");
+
+    // ── Charts ──
+    const total = Math.max(1, Number(data.total_slots) || 144);
+    const bucket = Math.max(60, Number(data.bucket_secs) || 600);
+    const since = Number(data.since_epoch) || 0;
+    const span = data.range === "today"
+      ? Math.min(Math.max(Math.floor((Date.now() / 1000 - since) / bucket) + 1, 1), total)
+      : total;
+    const req = Array.from({ length: total }, () => 0);
+    const err = Array.from({ length: total }, () => 0);
+    const input = Array.from({ length: total }, () => 0);
+    const output = Array.from({ length: total }, () => 0);
+    (data.series || []).forEach((p) => {
+      const idx = Math.round((p.slot_epoch - since) / bucket);
+      if (idx < 0 || idx >= total) return;
+      req[idx] += p.requests || 0;
+      err[idx] += p.errors || 0;
+      input[idx] += p.input_tokens || 0;
+      output[idx] += p.output_tokens || 0;
+    });
+    const C_MAIN = "var(--primary)", C_ALT = "var(--warn)", C_ERR = "var(--danger)";
+    renderTrendChart("cs-chart-tokens", {
+      since, bucket, total, span,
+      series: [
+        { label: t("analytics.series.input"), color: C_MAIN, values: input },
+        { label: t("analytics.series.output"), color: C_ALT, values: output },
+      ],
+      tooltipRows: (i) => [
+        { label: t("analytics.series.input"), value: fmtFullNum(input[i]) },
+        { label: t("analytics.series.output"), value: fmtFullNum(output[i]) },
+      ],
+    });
+    renderTrendChart("cs-chart-req", {
+      since, bucket, total, span,
+      series: [
+        { label: t("analytics.series.requests"), color: C_MAIN, values: req },
+        { label: t("analytics.metrics.errors"), color: C_ERR, values: err },
+      ],
+      tooltipRows: (i) => [
+        { label: t("analytics.series.requests"), value: fmtFullNum(req[i]) },
+        { label: t("analytics.metrics.errors"), value: fmtFullNum(err[i]) },
+      ],
+    });
+
+    // ── Key ranking ──
+    const keysWrap = document.getElementById("cs-keys");
+    if (keysWrap) {
+      const keys = data.keys || [];
+      if (!keys.length) {
+        keysWrap.innerHTML = '<p class="loading">' + esc(t("common.no_records")) + "</p>";
+      } else {
+        const th = (labelKey, cls) =>
+          "<th" + (cls ? ' class="' + cls + '"' : "") + ">" + esc(t(labelKey)) + "</th>";
+        const head = "<tr>" +
+          th("consumption.th.rank", "num") + th("consumption.th.key") +
+          th("analytics.metrics.requests", "num") + th("analytics.metrics.input_tokens", "num") +
+          th("analytics.metrics.output_tokens", "num") + th("analytics.metrics.errors", "num") +
+          th("consumption.th.cache", "num") + th("consumption.th.first_seen") +
+          th("consumption.th.last_seen") + "</tr>";
+        const rows = keys.map((k, i) =>
+          "<tr data-key=\"" + esc(k.key_hash) + "\" title=\"" + esc(k.key_hash) + "\">" +
+            '<td class="num an-dim">' + (i + 1) + "</td>" +
+            "<td>" + esc(keyDisplayLabel(k)) + ' <span class="an-dim">' + esc(shortHash(k.key_hash)) + "</span></td>" +
+            '<td class="num">' + fmtFullNum(k.requests) + "</td>" +
+            '<td class="num">' + fmtCompactNum(k.input_tokens) + "</td>" +
+            '<td class="num">' + fmtCompactNum(k.output_tokens) + "</td>" +
+            '<td class="num' + (k.errors > 0 ? " an-err-text" : "") + '">' + fmtFullNum(k.errors) + "</td>" +
+            '<td class="num">' + fmtPct(k.cache_hit_ratio) + "</td>" +
+            "<td>" + fmtCstDT(k.first_seen_epoch) + "</td>" +
+            "<td>" + fmtCstDT(k.last_seen_epoch) + "</td>" +
+          "</tr>"
+        ).join("");
+        keysWrap.innerHTML =
+          '<table class="an-table"><thead>' + head + "</thead><tbody>" + rows + "</tbody></table>";
+      }
+    }
+
+    // ── Teams / user tags / client IPs ──
+    const renderAggTable = (wrapId, rows, cols, rowHtml) => {
+      const wrap = document.getElementById(wrapId);
+      if (!wrap) return;
+      if (!rows.length) {
+        wrap.innerHTML = '<p class="loading">' + esc(t("common.no_records")) + "</p>";
+        return;
+      }
+      const head = "<tr>" + cols.map((c) =>
+        "<th" + (c.cls ? ' class="' + c.cls + '"' : "") + ">" + esc(t(c.labelKey)) + "</th>"
+      ).join("") + "</tr>";
+      wrap.innerHTML =
+        '<table class="an-table"><thead>' + head + "</thead><tbody>" +
+        rows.map(rowHtml).join("") + "</tbody></table>";
+    };
+    const numCol = (labelKey) => ({ labelKey, cls: "num" });
+    renderAggTable(
+      "cs-teams",
+      data.teams || [],
+      [{ labelKey: "consumption.th.team" }, numCol("consumption.th.keys"),
+       numCol("analytics.metrics.requests"), numCol("analytics.metrics.input_tokens"),
+       numCol("analytics.metrics.output_tokens"), numCol("analytics.metrics.errors")],
+      (r) =>
+        "<tr>" +
+          "<td>" + (r.team_id
+            ? esc(r.team_id)
+            : '<span class="an-dim">' + esc(t("consumption.none_team")) + "</span>") + "</td>" +
+          '<td class="num">' + fmtFullNum(r.active_keys) + "</td>" +
+          '<td class="num">' + fmtFullNum(r.requests) + "</td>" +
+          '<td class="num">' + fmtCompactNum(r.input_tokens) + "</td>" +
+          '<td class="num">' + fmtCompactNum(r.output_tokens) + "</td>" +
+          '<td class="num' + (r.errors > 0 ? " an-err-text" : "") + '">' + fmtFullNum(r.errors) + "</td>" +
+        "</tr>"
+    );
+    renderAggTable(
+      "cs-tags",
+      data.user_tags || [],
+      [{ labelKey: "consumption.th.tag" }, numCol("analytics.metrics.requests"),
+       numCol("analytics.metrics.input_tokens"), numCol("analytics.metrics.output_tokens"),
+       numCol("analytics.metrics.errors")],
+      (r) =>
+        "<tr>" +
+          "<td>" + esc(r.user_tag1) + "</td>" +
+          '<td class="num">' + fmtFullNum(r.requests) + "</td>" +
+          '<td class="num">' + fmtCompactNum(r.input_tokens) + "</td>" +
+          '<td class="num">' + fmtCompactNum(r.output_tokens) + "</td>" +
+          '<td class="num' + (r.errors > 0 ? " an-err-text" : "") + '">' + fmtFullNum(r.errors) + "</td>" +
+        "</tr>"
+    );
+    renderAggTable(
+      "cs-ips",
+      data.client_ips || [],
+      [{ labelKey: "consumption.th.ip" }, numCol("analytics.metrics.requests"),
+       numCol("analytics.metrics.input_tokens"), numCol("analytics.metrics.output_tokens"),
+       numCol("analytics.metrics.errors")],
+      (r) =>
+        "<tr>" +
+          "<td>" + (r.client_ip
+            ? esc(r.client_ip)
+            : '<span class="an-dim">' + esc(t("consumption.unknown_ip")) + "</span>") + "</td>" +
+          '<td class="num">' + fmtFullNum(r.requests) + "</td>" +
+          '<td class="num">' + fmtCompactNum(r.input_tokens) + "</td>" +
+          '<td class="num">' + fmtCompactNum(r.output_tokens) + "</td>" +
+          '<td class="num' + (r.errors > 0 ? " an-err-text" : "") + '">' + fmtFullNum(r.errors) + "</td>" +
+        "</tr>"
+    );
+  }
+
+  function renderConsumptionKey(body) {
+    const sub = document.getElementById("cs-subtitle");
+    const data = csKeyData;
+    const keyHash = currentKeyFromHash();
+    if (sub) {
+      sub.textContent = data && (data.key_alias || data.key_name)
+        ? (data.key_alias || data.key_name) + " · " + shortHash(keyHash)
+        : keyHash || "—";
+    }
+    if (!data || !data.ready) {
+      const detail = data && data.error ? " — " + esc(String(data.error)) : "";
+      body.innerHTML = '<p class="loading">' + esc(t("analytics.unavailable")) + detail + "</p>";
+      return;
+    }
+
+    const errRate = data.requests > 0 ? (data.errors / data.requests * 100) : 0;
+    const cards = [
+      { label: t("analytics.metrics.requests"), value: fmtFullNum(data.requests), hint: "" },
+      { label: t("analytics.metrics.input_tokens"), value: fmtCompactNum(data.input_tokens), hint: "" },
+      { label: t("analytics.metrics.output_tokens"), value: fmtCompactNum(data.output_tokens), hint: "" },
+      { label: t("model.metrics.cache_hit"), value: fmtPct(
+          data.input_tokens > 0 ? data.cached_tokens / data.input_tokens : null),
+        hint: t("model.metrics.cache_hit_hint") },
+      { label: t("analytics.metrics.errors"), value: fmtFullNum(data.errors),
+        hint: errRate.toFixed(2) + "%" },
+      { label: t("model.metrics.avg_duration"), value: fmtMs(data.avg_duration_ms),
+        hint: t("model.metrics.avg_duration_hint") },
+      { label: t("model.metrics.avg_ttft"), value: fmtMs(data.avg_ttft_ms),
+        hint: t("model.metrics.avg_ttft_hint") },
+    ];
+    const metrics = '<div class="an-metrics">' + cards.map((c) =>
+      '<div class="an-metric">' +
+        '<div class="an-metric-label">' + esc(c.label) + "</div>" +
+        '<div class="an-metric-value">' + esc(c.value) + "</div>" +
+        (c.hint ? '<div class="an-metric-hint">' + esc(c.hint) + "</div>" : "") +
+      "</div>"
+    ).join("") + "</div>";
+
+    const chartCard = (id, titleKey, hint) =>
+      '<div class="card an-panel">' +
+        '<div class="an-card-head"><h3>' + esc(t(titleKey)) + '</h3><span class="an-hint">' + esc(hint) + "</span></div>" +
+        '<div id="' + id + '"></div>' +
+      "</div>";
+    const bucketHint = t("model.series.hint", { bucket: bucketLabel(data.bucket_secs) });
+
+    body.innerHTML =
+      '<a class="tr-back" href="#/admin/analytics/consumption">← ' + esc(t("consumption.back_keys")) + "</a>" +
+      metrics +
+      chartCard("csk-chart-req", "model.series.requests", bucketHint) +
+      chartCard("csk-chart-tokens", "model.series.tokens", bucketHint) +
+      chartCard("csk-chart-cache", "model.series.cache", bucketHint) +
+      chartCard("csk-chart-latency", "model.series.latency", bucketHint);
+
+    const total = Math.max(1, Number(data.total_slots) || 144);
+    const bucket = Math.max(60, Number(data.bucket_secs) || 600);
+    const since = Number(data.since_epoch) || 0;
+    const span = data.range === "today"
+      ? Math.min(Math.max(Math.floor((Date.now() / 1000 - since) / bucket) + 1, 1), total)
+      : total;
+    const req = Array.from({ length: total }, () => 0);
+    const err = Array.from({ length: total }, () => 0);
+    const input = Array.from({ length: total }, () => 0);
+    const output = Array.from({ length: total }, () => 0);
+    const cached = Array.from({ length: total }, () => 0);
+    const dur = Array.from({ length: total }, () => null);
+    (data.series || []).forEach((p) => {
+      const idx = Math.round((p.slot_epoch - since) / bucket);
+      if (idx < 0 || idx >= total) return;
+      req[idx] += p.requests || 0;
+      err[idx] += p.errors || 0;
+      input[idx] += p.input_tokens || 0;
+      output[idx] += p.output_tokens || 0;
+      cached[idx] += p.cached_tokens || 0;
+      if (p.avg_duration_ms != null) dur[idx] = p.avg_duration_ms;
+    });
+    const ratioAt = (i) => (input[i] > 0 ? cached[i] / input[i] : null);
+    const C_MAIN = "var(--primary)", C_ALT = "var(--warn)", C_ERR = "var(--danger)";
+    renderTrendChart("csk-chart-req", {
+      since, bucket, total, span,
+      series: [
+        { label: t("analytics.series.requests"), color: C_MAIN, values: req },
+        { label: t("analytics.metrics.errors"), color: C_ERR, values: err },
+      ],
+      tooltipRows: (i) => [
+        { label: t("analytics.series.requests"), value: fmtFullNum(req[i]) },
+        { label: t("analytics.metrics.errors"), value: fmtFullNum(err[i]) },
+      ],
+    });
+    renderTrendChart("csk-chart-tokens", {
+      since, bucket, total, span,
+      series: [
+        { label: t("analytics.series.input"), color: C_MAIN, values: input },
+        { label: t("analytics.series.output"), color: C_ALT, values: output },
+      ],
+      tooltipRows: (i) => [
+        { label: t("analytics.series.input"), value: fmtFullNum(input[i]) },
+        { label: t("analytics.series.output"), value: fmtFullNum(output[i]) },
+      ],
+    });
+    renderTrendChart("csk-chart-cache", {
+      since, bucket, total, span, yMax: 1,
+      fmtY: (v) => Math.round(v * 100) + "%",
+      series: [{ label: t("model.series.cache"), color: C_MAIN,
+        values: Array.from({ length: total }, (_, i) => ratioAt(i)) }],
+      tooltipRows: (i) => [{ label: t("model.series.cache"), value: fmtPct(ratioAt(i)) }],
+    });
+    renderTrendChart("csk-chart-latency", {
+      since, bucket, total, span,
+      series: [{ label: t("model.series.latency"), color: C_MAIN, values: dur }],
+      tooltipRows: (i) => [{ label: t("model.series.latency"), value: fmtMs(dur[i]) }],
+    });
+  }
+
+  function shortHash(hash) {
+    const s = String(hash || "");
+    return s.length > 12 ? s.slice(0, 8) + "…" : s;
+  }
+
+  // ── Schedule & Cache History ─────────────────────────
+  // Answers "did key-affinity routing actually improve cache hit and
+  // TTFT": schedule policy distribution over time, KV prefix hit / trie
+  // utilization / provider cache ratio trends, and a per-policy
+  // comparison table. 60s poll like the other cached analytics views.
+  let scheduleTimer = null;
+  let scheduleData = null;
+
+  function startSchedulePoll() {
+    stopSchedulePoll();
+    loadSchedule(false);
+    scheduleTimer = setInterval(() => loadSchedule(false), 60000);
+  }
+
+  function stopSchedulePoll() {
+    if (scheduleTimer) {
+      clearInterval(scheduleTimer);
+      scheduleTimer = null;
+    }
+  }
+
+  function setupSchedulePage() {
+    const btn = document.getElementById("btn-refresh-schedule");
+    if (btn && !btn.dataset.bound) {
+      btn.dataset.bound = "1";
+      btn.addEventListener("click", () => loadSchedule(true));
+    }
+    const bar = document.getElementById("sc-range");
+    if (bar && !bar.dataset.bound) {
+      bar.dataset.bound = "1";
+      bar.addEventListener("click", (e) => {
+        const b = e.target.closest("button[data-range]");
+        if (!b || b.dataset.range === analyticsRange) return;
+        analyticsRange = b.dataset.range;
+        localStorage.setItem("analyticsRange", analyticsRange);
+        updateAnalyticsRangeUI();
+        loadSchedule(false);
+      });
+    }
+    updateAnalyticsRangeUI();
+  }
+
+  async function loadSchedule(force) {
+    const requested = analyticsRange;
+    try {
+      const res = await api(
+        "/admin/stats/schedule?range=" + analyticsRange + (force ? "&force=1" : "")
+      );
+      // A range switch can race the in-flight request — drop stale renders.
+      if (requested !== analyticsRange) return;
+      scheduleData = res;
+      renderSchedule();
+    } catch (e) {
+      // Read-only poller — api() already surfaces auth problems.
+    }
+  }
+
+  function renderSchedule() {
+    const body = document.getElementById("sc-body");
+    if (!body) return;
+    const sub = document.getElementById("sc-subtitle");
+    if (sub) sub.textContent = t("schedule.subtitle");
+    const data = scheduleData;
+    if (!data || !data.ready) {
+      const detail = data && data.error ? " — " + esc(String(data.error)) : "";
+      body.innerHTML = '<p class="loading">' + esc(t("analytics.unavailable")) + detail + "</p>";
+      return;
+    }
+
+    const errRate = data.requests > 0 ? (data.errors / data.requests * 100) : 0;
+    const cards = [
+      { label: t("analytics.metrics.requests"), value: fmtFullNum(data.requests), hint: "" },
+      { label: t("analytics.metrics.errors"), value: fmtFullNum(data.errors),
+        hint: errRate.toFixed(2) + "%" },
+      { label: t("schedule.metrics.kv_hit"), value: fmtPct(data.kv_hit_ratio),
+        hint: t("schedule.metrics.kv_hit_hint") },
+      { label: t("schedule.metrics.trie_util"), value: fmtPct(data.trie_util_ratio),
+        hint: t("schedule.metrics.trie_util_hint") },
+      { label: t("model.metrics.cache_hit"), value: fmtPct(data.cache_hit_ratio),
+        hint: t("model.metrics.cache_hit_hint") },
+    ];
+    const metrics = '<div class="an-metrics">' + cards.map((c) =>
+      '<div class="an-metric">' +
+        '<div class="an-metric-label">' + esc(c.label) + "</div>" +
+        '<div class="an-metric-value">' + esc(c.value) + "</div>" +
+        (c.hint ? '<div class="an-metric-hint">' + esc(c.hint) + "</div>" : "") +
+      "</div>"
+    ).join("") + "</div>";
+
+    const chartCard = (id, titleKey, hint) =>
+      '<div class="card an-panel">' +
+        '<div class="an-card-head"><h3>' + esc(t(titleKey)) + '</h3><span class="an-hint">' + esc(hint) + "</span></div>" +
+        '<div id="' + id + '"></div>' +
+      "</div>";
+    const bucketHint = t("model.series.hint", { bucket: bucketLabel(data.bucket_secs) });
+    const tableCard = (id, titleKey, hint, inner) =>
+      '<div class="card an-panel">' +
+        '<div class="an-card-head"><h3>' + esc(t(titleKey)) + '</h3><span class="an-hint">' + esc(hint) + "</span></div>" +
+        '<div id="' + id + '">' + inner + "</div>" +
+      "</div>";
+
+    body.innerHTML = metrics +
+      chartCard("sc-chart-policy", "schedule.chart.policy", bucketHint) +
+      chartCard("sc-chart-kv", "schedule.chart.kv", bucketHint) +
+      chartCard("sc-chart-trie", "schedule.chart.trie", bucketHint) +
+      chartCard("sc-chart-cache", "schedule.chart.cache", bucketHint) +
+      tableCard("sc-policy-table", "schedule.table.title",
+        t("schedule.table.hint"), "");
+
+    const total = Math.max(1, Number(data.total_slots) || 144);
+    const bucket = Math.max(60, Number(data.bucket_secs) || 600);
+    const since = Number(data.since_epoch) || 0;
+    const span = data.range === "today"
+      ? Math.min(Math.max(Math.floor((Date.now() / 1000 - since) / bucket) + 1, 1), total)
+      : total;
+    const C_MAIN = "var(--primary)";
+
+    // ── Policy trend: one line per policy, ordered by window requests ──
+    const policyTotals = new Map();
+    (data.policy_series || []).forEach((p) => {
+      policyTotals.set(p.policy, (policyTotals.get(p.policy) || 0) + (p.requests || 0));
+    });
+    const policyOrder = [...policyTotals.keys()].sort(
+      (a, b) => (policyTotals.get(b) || 0) - (policyTotals.get(a) || 0)
+    );
+    const policyGrids = new Map(policyOrder.map((p) => [p, Array.from({ length: total }, () => 0)]));
+    (data.policy_series || []).forEach((p) => {
+      const grid = policyGrids.get(p.policy);
+      if (!grid) return;
+      const idx = Math.round((p.slot_epoch - since) / bucket);
+      if (idx < 0 || idx >= total) return;
+      grid[idx] += p.requests || 0;
+    });
+    if (policyOrder.length) {
+      renderTrendChart("sc-chart-policy", {
+        since, bucket, total, span,
+        series: policyOrder.map((p, i) => ({
+          label: p, color: deploymentColor(i), values: policyGrids.get(p),
+        })),
+        tooltipRows: (i) => policyOrder.map((p) => ({
+          label: p, value: fmtFullNum(policyGrids.get(p)[i]),
+        })),
+      });
+    } else {
+      const wrap = document.getElementById("sc-chart-policy");
+      if (wrap) wrap.innerHTML = '<p class="loading">' + esc(t("common.no_records")) + "</p>";
+    }
+
+    // ── Ratio trends: null (no denominator) breaks the line ──
+    const ratioGrid = (pick) => {
+      const grid = Array.from({ length: total }, () => null);
+      (data.series || []).forEach((p) => {
+        const idx = Math.round((p.slot_epoch - since) / bucket);
+        if (idx < 0 || idx >= total) return;
+        grid[idx] = pick(p);
+      });
+      return grid;
+    };
+    const pctChart = (id, labelKey, grid) => {
+      if (!grid.some((v) => v != null)) {
+        const wrap = document.getElementById(id);
+        if (wrap) wrap.innerHTML = '<p class="loading">' + esc(t("common.no_records")) + "</p>";
+        return;
+      }
+      renderTrendChart(id, {
+        since, bucket, total, span, yMax: 1,
+        fmtY: (v) => Math.round(v * 100) + "%",
+        series: [{ label: t(labelKey), color: C_MAIN, values: grid }],
+        tooltipRows: (i) => [{ label: t(labelKey), value: fmtPct(grid[i]) }],
+      });
+    };
+    pctChart("sc-chart-kv", "schedule.chart.kv", ratioGrid((p) => p.kv_hit_ratio));
+    pctChart("sc-chart-trie", "schedule.chart.trie", ratioGrid((p) => p.trie_util_ratio));
+    pctChart("sc-chart-cache", "schedule.chart.cache",
+      ratioGrid((p) => p.cache_hit_ratio));
+
+    // ── Policy comparison table ──
+    const tableWrap = document.getElementById("sc-policy-table");
+    if (tableWrap) {
+      const policies = data.policies || [];
+      if (!policies.length) {
+        tableWrap.innerHTML = '<p class="loading">' + esc(t("common.no_records")) + "</p>";
+      } else {
+        const th = (labelKey, cls) =>
+          "<th" + (cls ? ' class="' + cls + '"' : "") + ">" + esc(t(labelKey)) + "</th>";
+        const head = "<tr>" +
+          th("schedule.th.policy") + th("analytics.metrics.requests", "num") +
+          th("analytics.metrics.errors", "num") +
+          th("schedule.th.kv", "num") + th("schedule.th.trie", "num") +
+          th("schedule.th.cache", "num") +
+          th("schedule.th.avg_duration", "num") + th("schedule.th.avg_ttft", "num") +
+          th("schedule.th.avg_queue", "num") + "</tr>";
+        const rows = policies.map((p, i) =>
+          '<tr><td><span class="tr-swatch" style="background:' + deploymentColor(i) +
+            '"></span> ' + esc(p.policy) + "</td>" +
+            '<td class="num">' + fmtFullNum(p.requests) + "</td>" +
+            '<td class="num' + (p.errors > 0 ? " an-err-text" : "") + '">' + fmtFullNum(p.errors) + "</td>" +
+            '<td class="num">' + fmtPct(p.kv_hit_ratio) + "</td>" +
+            '<td class="num">' + fmtPct(p.trie_util_ratio) + "</td>" +
+            '<td class="num">' + fmtPct(p.cache_hit_ratio) + "</td>" +
+            '<td class="num">' + fmtMs(p.avg_duration_ms) + "</td>" +
+            '<td class="num">' + fmtMs(p.avg_ttft_ms) + "</td>" +
+            '<td class="num">' + fmtMs(p.avg_queue_wait_ms) + "</td>" +
+          "</tr>"
+        ).join("");
+        tableWrap.innerHTML =
+          '<table class="an-table"><thead>' + head + "</thead><tbody>" + rows + "</tbody></table>";
+      }
+    }
   }
 
   // ── In-Flight ─────────────────────────────────────────
@@ -697,7 +2283,7 @@
       accessor: (s) => s.cpu_pct,
       yMax: "auto",
       yMinFloor: 100,
-      color: "#10b981",
+      color: cssVar("--primary") || "#0e7490",
       emptyHint: "Collecting… (first sample takes 1s)",
       formatValue: (v) => v.toFixed(1) + "%",
       formatY: (v) => v.toFixed(0) + "%",
@@ -711,7 +2297,7 @@
       accessor: (s) => s.rss_bytes,
       yMax: "auto",
       yMinFloor: 100 * 1024 * 1024,
-      color: "#a855f7",
+      color: cssVar("--primary") || "#0e7490",
       emptyHint: "—",
       formatValue: formatBytes,
       formatY: (v) => formatBytes(v, true),
@@ -724,7 +2310,7 @@
       samples,
       accessor: (s) => s.worker_queue_depth,
       yMax: "auto",
-      color: "#f59e0b",
+      color: cssVar("--primary") || "#0e7490",
       emptyHint: "—",
       formatValue: (v) => String(v),
       formatY: (v) => String(Math.round(v)),
@@ -737,7 +2323,7 @@
       samples,
       accessor: (s) => s.blocking_tasks_queued,
       yMax: "auto",
-      color: "#ef4444",
+      color: cssVar("--primary") || "#0e7490",
       emptyHint: "—",
       formatValue: (v) => String(v),
       formatY: (v) => String(Math.round(v)),
@@ -750,8 +2336,8 @@
       samples,
       accessor: (s) => s.inflight,
       yMax: "auto",
-      color: "#6366f1",
-      fill: "rgba(99,102,241,0.18)",
+      color: cssVar("--primary") || "#0e7490",
+      fill: cssVar("--primary-glow") || "rgba(14,116,144,.16)",
       emptyHint: "—",
       formatValue: (v) => String(v),
       formatY: (v) => String(Math.round(v)),
@@ -842,6 +2428,8 @@
       "--text3": styles.getPropertyValue("--text3").trim(),
       "--border": styles.getPropertyValue("--border").trim(),
       "--surface2": styles.getPropertyValue("--surface2").trim(),
+      "--primary": styles.getPropertyValue("--primary").trim(),
+      "--primary-glow": styles.getPropertyValue("--primary-glow").trim(),
     };
     return _cssVarCache[name] || "";
   }
@@ -1080,11 +2668,18 @@
       errorBanner = '<p style="color:#c00;margin:0 0 6px">' + t("stats.inflight.24h_load_failed", { error: esc(String(deployment24hSummary.__error)) }) + "</p>";
     }
 
+    // Rows arrive model-sorted from the backend (alphabetical model, then
+    // deployment_id), so same-model instances are consecutive. Render the
+    // vendor logo + model name + visibility badge once per model group;
+    // continuation rows show only the instance id, aligned under the
+    // first row's id.
+    var prevModel = null;
+
     wrap.innerHTML =
       errorBanner +
       '<table class="data-table"><thead><tr>' +
-      "<th>" + t("stats.inflight.col.deployment") + "</th><th>" + t("stats.inflight.col.fc_queue") + "</th><th>" + t("stats.inflight.col.in_reqs") + "</th><th>" + t("stats.inflight.col.in_context") + "</th>" +
-      "<th>" + t("stats.inflight.col.24h_reqs") + "</th><th>" + t("stats.inflight.col.avg_in") + "</th><th>" + t("stats.inflight.col.avg_out") + "</th><th>" + t("stats.inflight.col.avg_ttft") + "</th><th>" + t("stats.inflight.col.avg_prefix_hit_rate") + "</th>" +
+      "<th>" + t("stats.inflight.col.deployment") + "</th><th class=\"num\">" + t("stats.inflight.col.fc_queue") + "</th><th class=\"num\">" + t("stats.inflight.col.in_reqs") + "</th><th class=\"num\">" + t("stats.inflight.col.in_context") + "</th>" +
+      "<th class=\"num\">" + t("stats.inflight.col.24h_reqs") + "</th><th class=\"num\">" + t("stats.inflight.col.avg_in") + "</th><th class=\"num\">" + t("stats.inflight.col.avg_out") + "</th><th class=\"num\">" + t("stats.inflight.col.avg_ttft") + "</th><th class=\"num\">" + t("stats.inflight.col.avg_prefix_hit_rate") + "</th>" +
       "</tr></thead><tbody>" +
       deployments
         .map(function (d) {
@@ -1111,8 +2706,13 @@
             reqsHtml = '<span class="cell-tip" data-tip="' + reqItems.join("&#10;").replace(/"/g, "&quot;") + '">' + reqsDisplay + '</span>';
           }
 
-          var deployCell = renderDeployCell(d.model, d.deployment_id)
-            + (visMap ? visibilityBadgeFor(visMap[d.model]) : "");
+          var isGroupFirst = d.model !== prevModel;
+          prevModel = d.model;
+          var deployCell = isGroupFirst
+            ? renderDeployCell(d.model, d.deployment_id)
+              + (visMap ? visibilityBadgeFor(visMap[d.model]) : "")
+            : '<div class="deploy-cell deploy-cell--inst"><div class="deploy-id">' +
+              esc(d.deployment_id) + "</div></div>";
 
           // 24h aggregates — read from cache populated on page load / Refresh button.
           var s = d.deployment_id ? deployment24hSummary[d.deployment_id] : null;
@@ -1123,14 +2723,14 @@
           return (
             "<tr>" +
             "<td>" + deployCell + "</td>" +
-            "<td>" + fcQueueHtml + "</td>" +
-            "<td>" + reqsHtml + "</td>" +
-            "<td>" + ctxDisplay + "</td>" +
-            "<td>" + fmtInt(s ? s.total_requests : null) + "</td>" +
-            "<td>" + fmtToken(s ? s.avg_input_tokens : null) + "</td>" +
-            "<td>" + fmtToken(s ? s.avg_output_tokens : null) + "</td>" +
-            "<td>" + fmtTtft(s ? s.avg_ttft_ms : null) + "</td>" +
-            "<td>" + fmtPrefixHit(s ? s.avg_prefix_hit_rate : null) + "</td>" +
+            "<td class=\"num\">" + fcQueueHtml + "</td>" +
+            "<td class=\"num\">" + reqsHtml + "</td>" +
+            "<td class=\"num\">" + ctxDisplay + "</td>" +
+            "<td class=\"num\">" + fmtInt(s ? s.total_requests : null) + "</td>" +
+            "<td class=\"num\">" + fmtToken(s ? s.avg_input_tokens : null) + "</td>" +
+            "<td class=\"num\">" + fmtToken(s ? s.avg_output_tokens : null) + "</td>" +
+            "<td class=\"num\">" + fmtTtft(s ? s.avg_ttft_ms : null) + "</td>" +
+            "<td class=\"num\">" + fmtPrefixHit(s ? s.avg_prefix_hit_rate : null) + "</td>" +
             "</tr>"
           );
         })
@@ -1155,11 +2755,9 @@
     }
   }
 
-  // Throughput chart colors — cool cyan/teal palette suggesting high traffic
-  function throughputBarColor(pct) {
-    if (pct > 75) return "linear-gradient(180deg, #06b6d4, #0891b2)"; // cyan-500 → cyan-600
-    if (pct > 40) return "linear-gradient(180deg, #22d3ee, #06b6d4)"; // cyan-400 → cyan-500
-    return "linear-gradient(180deg, #67e8f9, #22d3ee)";                // cyan-300 → cyan-400
+  // Throughput chart color — the accent, flat. Height already encodes value.
+  function throughputBarColor() {
+    return "var(--primary)";
   }
 
   // ── Range controls (Agent Statistics + Request Rate) ─────
@@ -1353,7 +2951,7 @@
             var seg = segs.find(function (s) { return s.deployment_id === depId; });
             var c = seg ? (seg.count || 0) : 0;
             var segPct = total > 0 ? (c / total * 100) : 0;
-            var color = deploymentColor(depId);
+            var color = deploymentColor(segmentOrder.indexOf(depId));
             // 0-count segments still render a 1px sliver so the stack ordering
             // is visually consistent across buckets.
             var segHeight = c === 0 ? "1px" : (segPct + "%");
@@ -1376,7 +2974,7 @@
           '<div class="rb-legend">' +
             segmentOrder.map(function (depId) {
               return '<span class="rb-legend-item">' +
-                '<span class="rb-legend-swatch" style="background:' + deploymentColor(depId) + '"></span>' +
+                '<span class="rb-legend-swatch" style="background:' + deploymentColor(segmentOrder.indexOf(depId)) + '"></span>' +
                 esc(depId) +
               '</span>';
             }).join("") +
@@ -2923,7 +4521,7 @@
       return;
     }
     wrap.innerHTML = `<table>
-      <tr><th>${t("logs.col.time")}</th><th>${t("logs.col.ip")}</th><th>${t("logs.col.model")}</th><th>${t("logs.col.path")}</th><th>${t("logs.col.status")}</th><th>${t("logs.col.stream")}</th><th>${t("logs.col.in_out")}</th><th>${t("logs.col.prefix_hit_rate")}</th><th>${t("logs.col.duration")}</th><th>${t("logs.col.queue_wait")}</th><th>${t("logs.col.error")}</th></tr>
+      <tr><th>${t("logs.col.time")}</th><th>${t("logs.col.ip")}</th><th>${t("logs.col.model")}</th><th>${t("logs.col.path")}</th><th>${t("logs.col.status")}</th><th>${t("logs.col.stream")}</th><th class="num">${t("logs.col.in_out")}</th><th class="num">${t("logs.col.prefix_hit_rate")}</th><th class="num">${t("logs.col.duration")}</th><th class="num">${t("logs.col.queue_wait")}</th><th>${t("logs.col.error")}</th></tr>
       ${logs.map((l) => {
         // Prefix hit rate = cached_tokens / input_tokens * 100, truncated to
         // 1 decimal and capped at 99.9 (no rounding to 100%). "-" if missing.
@@ -2941,10 +4539,10 @@
         <td class="mono">${esc(l.api_path)}</td>
         <td>${l.status_code >= 400 ? '<span style="color:var(--danger)">' + l.status_code + '</span>' : l.status_code}</td>
         <td>${l.is_stream ? t("common.yes") : t("common.no")}</td>
-        <td class="mono">${inOutCell}</td>
-        <td class="mono">${kvCell}</td>
-        <td>${l.duration_ms != null ? l.duration_ms + "ms" : "-"}</td>
-        <td>${l.queue_wait_ms != null ? l.queue_wait_ms + "ms" : "-"}</td>
+        <td class="mono num">${inOutCell}</td>
+        <td class="mono num">${kvCell}</td>
+        <td class="num">${l.duration_ms != null ? l.duration_ms + "ms" : "-"}</td>
+        <td class="num">${l.queue_wait_ms != null ? l.queue_wait_ms + "ms" : "-"}</td>
         <td>${l.error_message ? '<span style="color:var(--danger)" title="' + esc(l.error_message) + '">' + esc((l.error_type || "").substring(0, 20)) + '</span>' : "-"}</td>
       </tr>`}).join("")}
     </table>`;
@@ -2956,7 +4554,7 @@
     // total is a bounded exact count (min(real, 50k)); append "+" when the
     // cap was hit. has_next (row probe) still enables ">" beyond the cap.
     const suffix = data.total_capped ? "+" : "";
-    const pages = Math.ceil(data.total / data.per_page);
+    const pages = Math.ceil((data.total || 0) / (data.per_page || 50));
     if (pages <= 1 && !data.has_next) { el.innerHTML = ""; return; }
     el.innerHTML = `
       <button ${data.page <= 1 ? "disabled" : ""} onclick="window._loadUserLogsPage(${data.page - 1})">&lt;</button>
@@ -3316,12 +4914,12 @@
       <tr>
         <th>${t("plans.col.name")}</th>
         <th>${t("plans.col.type")}</th>
-        <th>${t("plans.col.concurrent")}</th>
-        <th>${t("plans.col.rpm")}</th>
-        <th>${t("plans.col.tpm")}</th>
+        <th class="num">${t("plans.col.concurrent")}</th>
+        <th class="num">${t("plans.col.rpm")}</th>
+        <th class="num">${t("plans.col.tpm")}</th>
         <th>${t("plans.col.windows")}</th>
-        <th>${t("plans.col.total_token")}</th>
-        <th>${t("plans.col.total_cost")}</th>
+        <th class="num">${t("plans.col.total_token")}</th>
+        <th class="num">${t("plans.col.total_cost")}</th>
         <th>${t("plans.col.member_plan")}</th>
         <th>${t("plans.col.schedule")}</th>
         <th>${t("plans.col.actions")}</th>
@@ -3343,12 +4941,12 @@
         return `<tr>
           <td><strong>${esc(p.name)}</strong></td>
           <td>${esc(typeLabel)}</td>
-          <td>${fmtOptInt(p.concurrency_limit)}</td>
-          <td>${fmtOptInt(p.rpm_limit)}</td>
-          <td>${fmtOptInt(p.tpm_limit)}</td>
+          <td class="num">${fmtOptInt(p.concurrency_limit)}</td>
+          <td class="num">${fmtOptInt(p.rpm_limit)}</td>
+          <td class="num">${fmtOptInt(p.tpm_limit)}</td>
           <td>${wlSummary || "-"}</td>
-          <td>${fmtOptInt(p.total_token_limit)}</td>
-          <td>${fmtOptCost(p.total_cost_limit)}</td>
+          <td class="num">${fmtOptInt(p.total_token_limit)}</td>
+          <td class="num">${fmtOptCost(p.total_cost_limit)}</td>
           <td>${p.member_plan ? esc(p.member_plan) : "-"}</td>
           <td>${fmtSchedule(p.schedule)}</td>
           <td>
@@ -3598,6 +5196,7 @@
   let keysVipOnly = false;
   let keysPlanFilter = "";  // "" = all, "unassigned"/"none" = follows default, "no_plan" = explicit no-plan, otherwise plan name
   let keysDataCache = [];
+  let keysLoadToken = 0;
 
   function setupKeysSearch() {
     const el = document.getElementById("keys-search");
@@ -3641,6 +5240,9 @@
       if (!stillExists) {
         keysPlanFilter = "";
         sel.value = "";
+        // Reload with the visible filter and invalidate any in-flight query
+        // that still carries the removed plan.
+        loadKeys(1);
       } else {
         sel.value = keysPlanFilter;
       }
@@ -3649,21 +5251,29 @@
 
   async function loadKeys(page) {
     if (page !== undefined) keysPage = page;
+    const myToken = ++keysLoadToken;
     try {
-      // Load prompt log excluded keys list.
-      try {
-        const plData = await api("/admin/prompt-log/status");
-        window._promptLogExcludedKeys = plData.excluded_keys || [];
-      } catch { window._promptLogExcludedKeys = []; }
+      // Snapshot the query before awaiting the prompt-log request.
       let url = `/admin/keys?page=${keysPage}&per_page=50`;
       if (keysSearch) url += `&search=${encodeURIComponent(keysSearch)}`;
       if (keysVipOnly) url += "&vip_only=true";
       if (keysPlanFilter) url += `&plan=${encodeURIComponent(keysPlanFilter)}`;
+      // Load prompt log excluded keys list.
+      let excludedKeys = [];
+      try {
+        const plData = await api("/admin/prompt-log/status");
+        excludedKeys = plData.excluded_keys || [];
+      } catch { /* Prompt-log status is optional for listing keys. */ }
+      if (myToken !== keysLoadToken) return;
       const data = await api(url);
+      if (myToken !== keysLoadToken) return;
+      // Publish the edit metadata and rows only for the latest load.
+      window._promptLogExcludedKeys = excludedKeys;
       keysDataCache = data.keys || [];
       renderKeysTable(keysDataCache);
       renderKeysPagination(data);
     } catch (err) {
+      if (myToken !== keysLoadToken) return;
       const wrap = document.getElementById("keys-table-wrap");
       if (wrap) wrap.innerHTML = `<p class="error-msg">${t("common.failed_to_load", { what: t("keys.title"), message: esc(err.message) })}</p>`;
       console.error("loadKeys error:", err);
@@ -3702,17 +5312,17 @@
       return String(v);
     };
     wrap.innerHTML = `<table>
-      <tr><th>${t("keys.col.token")}</th><th>${t("keys.col.alias")}</th><th>${t("keys.col.user")}</th><th>${t("keys.col.plan")}</th><th>${t("keys.col.usage")}</th><th>${t("keys.col.spend")}</th><th>${t("keys.col.budget")}</th><th>${t("keys.col.status")}</th><th>${t("keys.col.actions")}</th></tr>
+      <tr><th>${t("keys.col.token")}</th><th>${t("keys.col.alias")}</th><th>${t("keys.col.user")}</th><th>${t("keys.col.plan")}</th><th class="num">${t("keys.col.usage")}</th><th class="num">${t("keys.col.spend")}</th><th class="num">${t("keys.col.budget")}</th><th>${t("keys.col.status")}</th><th>${t("keys.col.actions")}</th></tr>
       ${keys.map((k) => `<tr>
         <td class="mono">${esc(k.token_prefix)}</td>
         <td>${esc(k.key_alias || "-")}${k.key_prefix ? ' <span class="badge badge-prefix">' + esc(k.key_prefix) + "</span>" : ""}${k.tag ? ' <span class="badge badge-tag">' + esc(k.tag) + "</span>" : ""}</td>
         <td>${esc(k.user_id || "-")}</td>
         <td>${renderKeyPlanCell(k)}</td>
-        <td>${k.usage_count == null
+        <td class="num">${k.usage_count == null
               ? '<span class="mono">-/-/-</span>'
               : `<span class="mono">${k.usage_count}/${fmtTokens(k.usage_tokens)}/${fmtCost(k.usage_cost)}</span><br><span class="muted" style="font-size:11px">${formatCountdown(k.usage_reset_secs || 0)}</span>`}</td>
-        <td>${fmtCost(k.spend)}</td>
-        <td>${k.max_budget > 0
+        <td class="num">${fmtCost(k.spend)}</td>
+        <td class="num">${k.max_budget > 0
               ? `<span title="${esc(k.budget_scope || "lifetime")}">${fmtCost(k.budget_period_spend != null ? k.budget_period_spend : k.spend)} / $${k.max_budget}</span>`
               : "-"}</td>
         <td>${k.blocked
@@ -3734,7 +5344,7 @@
 
   function renderKeysPagination(data) {
     const el = document.getElementById("keys-pagination");
-    const pages = Math.ceil(data.total / data.per_page);
+    const pages = Math.ceil((data.total || 0) / (data.per_page || 50));
     if (pages <= 1) { el.innerHTML = ""; return; }
     el.innerHTML = `
       <button ${data.page <= 1 ? "disabled" : ""} onclick="window._loadKeysPage(${data.page - 1})">&lt;</button>
@@ -3826,7 +5436,7 @@
     if (models.length === 0) { wrap.innerHTML = "<p>" + t("models.empty") + "</p>"; return; }
     aliasesMap = aliasesMap || {};
     wrap.innerHTML = `<table class="models-table">
-      <tr><th>${t("models.col.model")}</th><th>${t("models.col.aliases")}</th><th>${t("models.col.litellm_model")}</th><th>${t("models.col.cost")}</th><th>${t("models.col.base_url")}</th><th>${t("models.col.ratio")}</th><th>${t("models.col.rpm")}</th><th>${t("models.col.timeout")}</th><th>${t("models.col.enabled")}</th><th>${t("models.col.source")}</th><th>${t("models.col.actions")}</th></tr>
+      <tr><th>${t("models.col.model")}</th><th>${t("models.col.aliases")}</th><th>${t("models.col.litellm_model")}</th><th class="num">${t("models.col.cost")}</th><th>${t("models.col.base_url")}</th><th class="num">${t("models.col.ratio")}</th><th class="num">${t("models.col.rpm")}</th><th class="num">${t("models.col.timeout")}</th><th>${t("models.col.enabled")}</th><th>${t("models.col.source")}</th><th>${t("models.col.actions")}</th></tr>
       ${models.map((m) => {
         const isAutoDisabled = !m.enabled && m.auto_disabled;
         const rowClass = !m.enabled ? "model-row-disabled" : "";
@@ -3866,11 +5476,11 @@
         <td>${renderDeployCell(m.model_name, m.deployment_id)} ${visBadge}</td>
         <td>${aliasCell}</td>
         <td class="mono">${esc(m.litellm_model)}</td>
-        <td>${costCell}</td>
+        <td class="num">${costCell}</td>
         <td class="mono cell-url" title="${esc(m.api_base || "")}">${esc(m.api_base || "-")}</td>
-        <td>${m.quota_count_ratio && m.quota_count_ratio !== 1 ? '<span class="badge badge-plan">x' + m.quota_count_ratio + '</span>' : 'x1'}</td>
-        <td>${m.rpm || "-"}</td>
-        <td>${m.timeout}s</td>
+        <td class="num">${m.quota_count_ratio && m.quota_count_ratio !== 1 ? '<span class="badge badge-plan">x' + m.quota_count_ratio + '</span>' : 'x1'}</td>
+        <td class="num">${m.rpm || "-"}</td>
+        <td class="num">${m.timeout}s</td>
         <td>${enabledBadge}</td>
         <td><span class="badge badge-plan">${esc(m.source || "-")}</span></td>
         <td>
@@ -4701,6 +6311,7 @@
         ${fieldNum("cfg-pl-otlp-flush-interval-secs", t("config.field.otlp_flush_interval_secs"), o.flush_interval_secs, { min: 1, tip: t("config.tip.otlp_flush_interval_secs") })}
         ${fieldNum("cfg-pl-otlp-max-attribute-bytes", t("config.field.otlp_max_attribute_bytes"), o.max_attribute_bytes, { min: 256, step: 256, tip: t("config.tip.otlp_max_attribute_bytes") })}
         ${fieldNum("cfg-pl-otlp-max-queue-size", t("config.field.otlp_max_queue_size"), o.max_queue_size, { min: 100, step: 100, tip: t("config.tip.otlp_max_queue_size") })}
+        ${fieldNum("cfg-pl-otlp-max-queue-bytes", t("config.field.otlp_max_queue_bytes"), o.max_queue_bytes ?? 67108864, { min: 0, step: 1048576, tip: t("config.tip.otlp_max_queue_bytes") })}
         ${fieldTextarea("cfg-pl-otlp-headers", t("config.field.otlp_headers"), o.headers || {}, { rows: 3, tip: t("config.tip.otlp_headers") })}
       </div>
 
@@ -4752,6 +6363,7 @@
         ${fieldNum("cfg-tr-otlp-flush-interval-secs", t("config.field.otlp_flush_interval_secs"), o.flush_interval_secs, { min: 1, tip: t("config.tip.otlp_flush_interval_secs") })}
         ${fieldNum("cfg-tr-otlp-max-attribute-bytes", t("config.field.otlp_max_attribute_bytes"), o.max_attribute_bytes, { min: 256, step: 256, tip: t("config.tip.otlp_max_attribute_bytes") })}
         ${fieldNum("cfg-tr-otlp-max-queue-size", t("config.field.otlp_max_queue_size"), o.max_queue_size, { min: 100, step: 100, tip: t("config.tip.otlp_max_queue_size") })}
+        ${fieldNum("cfg-tr-otlp-max-queue-bytes", t("config.field.otlp_max_queue_bytes"), o.max_queue_bytes ?? 67108864, { min: 0, step: 1048576, tip: t("config.tip.otlp_max_queue_bytes") })}
         ${fieldTextarea("cfg-tr-otlp-headers", t("config.field.otlp_headers"), o.headers || {}, { rows: 3, tip: t("config.tip.otlp_headers") })}
       </div>
 
@@ -4778,7 +6390,7 @@
         ${fieldSelect("cfg-rs-policy", t("config.field.schedule_policy"), buildPolicyOptions(),
           r.schedule_policy || "round_robin", { tip: t("tip.config.schedule_policy") })}
         ${fieldNum("cfg-rs-affinity-ctx", t("config.field.key_affinity_context_threshold"), r.key_affinity_context_threshold || 0, { min: 0, tip: t("tip.config.key_affinity_context_threshold") })}
-        ${fieldNum("cfg-rs-affinity-ttl", t("config.field.key_affinity_ttl_secs"), r.key_affinity_ttl_secs || 0, { min: 0, step: 1, tip: t("tip.config.key_affinity_ttl_secs") })}
+        ${fieldNum("cfg-rs-affinity-ttl", t("config.field.key_affinity_ttl_secs"), r.key_affinity_ttl_secs || 3600, { min: 0, step: 1, tip: t("tip.config.key_affinity_ttl_secs") })}
         ${fieldNum("cfg-rs-affinity-rebal", t("config.field.rebalance_threshold"), r.rebalance_threshold || 20, { min: 1, step: 1, tip: t("tip.config.rebalance_threshold") })}
         ${fieldNum("cfg-rs-flow-timeout", t("config.field.flow_control_queue_timeout_secs"), r.flow_control_queue_timeout_secs || 1200, { min: 1, step: 1, tip: t("tip.config.flow_control_queue_timeout_secs") })}
       </div>
@@ -5290,6 +6902,7 @@
             max_attribute_bytes: numOr($("cfg-pl-otlp-max-attribute-bytes"), 4096),
             headers: parseJsonInput($("cfg-pl-otlp-headers"), {}),
             max_queue_size: numOr($("cfg-pl-otlp-max-queue-size"), 10000),
+            max_queue_bytes: numOr($("cfg-pl-otlp-max-queue-bytes"), 67108864),
           },
         });
       } else if (kind === "trace") {
@@ -5333,6 +6946,7 @@
               max_attribute_bytes: numOr($("cfg-tr-otlp-max-attribute-bytes"), 4096),
               headers: parseJsonInput($("cfg-tr-otlp-headers"), {}),
               max_queue_size: numOr($("cfg-tr-otlp-max-queue-size"), 10000),
+              max_queue_bytes: numOr($("cfg-tr-otlp-max-queue-bytes"), 67108864),
             },
           }],
         ]);
@@ -5340,7 +6954,7 @@
         const routerValue = {
           schedule_policy: $("cfg-rs-policy").value,
           key_affinity_context_threshold: numOr($("cfg-rs-affinity-ctx"), 0),
-          key_affinity_ttl_secs: numOr($("cfg-rs-affinity-ttl"), 0),
+          key_affinity_ttl_secs: numOr($("cfg-rs-affinity-ttl"), 3600),
           rebalance_threshold: numOr($("cfg-rs-affinity-rebal"), 20),
           flow_control_queue_timeout_secs: numOr($("cfg-rs-flow-timeout"), 1200),
           // These three editors live on the General card; their inputs are
@@ -5462,7 +7076,7 @@
     btn.textContent = debugEnabled ? t("logs.debug.on") : t("logs.debug.off");
     if (debugEnabled) {
       btn.style.background = "var(--danger)";
-      btn.style.color = "#fff";
+      btn.style.color = "var(--text-inv)";
       btn.style.borderColor = "var(--danger)";
     } else {
       btn.style.background = "";
@@ -5510,7 +7124,7 @@
     btn.textContent = promptLogEnabled ? t("logs.prompt_log.on") : t("logs.prompt_log.off");
     if (promptLogEnabled) {
       btn.style.background = "var(--info)";
-      btn.style.color = "#fff";
+      btn.style.color = "var(--text-inv)";
       btn.style.borderColor = "var(--info)";
     } else {
       btn.style.background = "";
@@ -5663,15 +7277,7 @@
     const btnVipFilter = document.getElementById("btn-vip-filter");
     if (btnVipFilter) btnVipFilter.addEventListener("click", () => {
       keysVipOnly = !keysVipOnly;
-      if (keysVipOnly) {
-        btnVipFilter.style.background = "var(--primary)";
-        btnVipFilter.style.color = "#fff";
-        btnVipFilter.style.borderColor = "var(--primary)";
-      } else {
-        btnVipFilter.style.background = "";
-        btnVipFilter.style.color = "";
-        btnVipFilter.style.borderColor = "";
-      }
+      btnVipFilter.setAttribute("aria-pressed", String(keysVipOnly));
       keysPage = 1;
       loadKeys();
     });
@@ -6930,9 +8536,9 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
       <tr>
         <th>${t("quota.col.alias")}</th>
         <th>${t("quota.col.plan")}</th>
-        <th>${t("quota.col.concurrency")}</th>
-        <th>${t("quota.col.tokens")}</th>
-        <th>${t("quota.col.cost")}</th>
+        <th class="num">${t("quota.col.concurrency")}</th>
+        <th class="num">${t("quota.col.tokens")}</th>
+        <th class="num">${t("quota.col.cost")}</th>
         <th>${t("quota.col.actions")}</th>
       </tr>
       ${keys.map((k) => {
@@ -6947,9 +8553,9 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
             ${k.blocked ? `<br><span class="badge-danger">blocked</span>` : ""}
           </td>
           <td>${renderKeyPlanCell(k)}</td>
-          <td>${k.concurrency || 0}</td>
-          <td>${formatNumber(tokens)}</td>
-          <td>$${esc(k.total_cost || "0")}</td>
+          <td class="num">${k.concurrency || 0}</td>
+          <td class="num">${formatNumber(tokens)}</td>
+          <td class="num">$${esc(k.total_cost || "0")}</td>
           <td>
             <button class="btn-small" onclick="window._quotaToggleWindows('${esc(k.token)}', this)">${t("quota.expand_windows")}</button>
             ${removeBtn}
@@ -7413,11 +9019,11 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
         <td class="mono">${esc(l.api_path)}</td>
         <td>${l.status_code >= 400 ? '<span style="color:var(--danger)">' + l.status_code + '</span>' : l.status_code}</td>
         <td>${l.is_stream ? t("common.yes") : t("common.no")}</td>
-        <td class="mono">${inOutCell}</td>
-        <td class="mono">${kvCell}</td>
-        <td>${l.duration_ms != null ? l.duration_ms + "ms" : "-"}</td>
-        <td>${l.ttft_ms != null ? l.ttft_ms + "ms" : "-"}</td>
-        <td>${l.queue_wait_ms != null ? l.queue_wait_ms + "ms" : "-"}</td>
+        <td class="mono num">${inOutCell}</td>
+        <td class="mono num">${kvCell}</td>
+        <td class="num">${l.duration_ms != null ? l.duration_ms + "ms" : "-"}</td>
+        <td class="num">${l.ttft_ms != null ? l.ttft_ms + "ms" : "-"}</td>
+        <td class="num">${l.queue_wait_ms != null ? l.queue_wait_ms + "ms" : "-"}</td>
         <td>${errorCell}</td>
         <td>${detailCell}</td>
       </tr>`;
@@ -7429,7 +9035,7 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
     // total is a bounded exact count (min(real, 50k)); append "+" when the
     // cap was hit so "1000+" reads as "at least", not an exact figure.
     const suffix = data.total_capped ? "+" : "";
-    const pages = Math.max(1, Math.ceil(data.total / data.per_page));
+    const pages = Math.max(1, Math.ceil((data.total || 0) / (data.per_page || 50)));
     el.innerHTML = `
       <button ${data.page <= 1 ? "disabled" : ""} onclick="window._loadLogsPage(${data.page - 1})">&lt;</button>
       <span>${t("common.page_of", { page: data.page, total: pages + suffix, count: data.total + suffix, unit: t("logs.title") })}</span>
@@ -7979,24 +9585,31 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
     return v.toFixed(1) + "%";
   }
 
-  // Stable pastel color for a deployment_id. Same id → same color across all
-  // charts. Low saturation / high lightness keep it easy on the eyes; the
-  // hue is derived from a 32-bit FNV-1a hash of the id so similar ids do not
-  // collapse to the same hue.
-  var __deploymentColorCache = {};
-  function deploymentColor(deploymentId) {
-    if (__deploymentColorCache[deploymentId]) return __deploymentColorCache[deploymentId];
-    var h = 0x811c9dc5;
-    for (var i = 0; i < deploymentId.length; i++) {
-      h ^= deploymentId.charCodeAt(i);
-      h = (h + ((h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24))) >>> 0;
-    }
-    var hue = h % 360;
-    // Pastel: 38-45% saturation, 64-70% lightness.
-    var sat = 38 + (h % 8);       // 38..45
-    var light = 64 + ((h >> 4) % 7); // 64..70
-    var c = "hsl(" + hue + ", " + sat + "%, " + light + "%)";
-    __deploymentColorCache[deploymentId] = c;
-    return c;
-  }
-})();
+  // Ordered series palette for per-instance chart segments. The accent leads
+  // (single-instance models keep the brand color); the rest spread across
+  // distinct hues with mid lightness so they read on both light and dark
+  // themes. 12–15 are darker siblings of earlier hues, placed far from their
+  // bright counterpart in segment order so a >12-instance stack stays
+  // distinguishable. Index comes from the chart's fixed alphabetical
+  // segmentOrder, so colors are stable within a chart.
+  var DEPLOYMENT_SERIES = [
+    "var(--primary)", // 0  cyan — brand accent
+    "#ef4444",        // 1  red
+    "#f97316",        // 2  orange
+    "#eab308",        // 3  yellow
+    "#84cc16",        // 4  lime
+    "#16a34a",        // 5  green
+    "#14b8a6",        // 6  teal
+    "#a855f7",        // 7  purple
+    "#ec4899",        // 8  pink
+    "#4f46e5",        // 9  indigo
+    "#3b82f6",        // 10 blue
+    "#94a3b8",        // 11 slate (neutral break)
+    "#b45309",        // 12 amber-brown
+    "#a21caf",        // 13 fuchsia (deep sibling of 8)
+    "#1d4ed8",        // 14 blue-700 (deep sibling of 10)
+    "#7e22ce",        // 15 violet-700 (deep sibling of 7)
+  ];
+  function deploymentColor(index) {
+    return DEPLOYMENT_SERIES[index % DEPLOYMENT_SERIES.length];
+  }})();

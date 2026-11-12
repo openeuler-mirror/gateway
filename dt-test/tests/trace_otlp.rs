@@ -406,10 +406,10 @@ fn convert_span_maps_ids_status_and_attributes() {
     span.set_attribute("k.bool", SpanAttributeValue::Bool(true));
     span.set_attribute("k.dup", SpanAttributeValue::Int(1));
     span.set_attribute("k.dup", SpanAttributeValue::Int(2)); // 覆盖旧值
-    span.set_llm_request(Arc::new(serde_json::json!({"messages": [1]})));
+    span.set_llm_request(Arc::new(serde_json::json!({"messages": [1]})), 0);
     span.finalize_ok(2_000_000_000);
 
-    let rs = convert_span_to_resource_spans(&span, &empty_resource());
+    let rs = convert_span_to_resource_spans(&span, &empty_resource(), 0);
     let scope = &rs.scope_spans[0];
     assert_eq!(scope.scope.as_ref().unwrap().name, "boom-trace");
     let s = &scope.spans[0];
@@ -457,7 +457,7 @@ fn convert_span_maps_ids_status_and_attributes() {
     // 零 parent → 空 parent_span_id
     let w3c_zero = parse_traceparent(TP_ZERO_PARENT).unwrap();
     let span_zero = RequestSpan::new("r-z".into(), &w3c_zero, "m".into(), "/p".into(), false, 0, true);
-    let rs_zero = convert_span_to_resource_spans(&span_zero, &empty_resource());
+    let rs_zero = convert_span_to_resource_spans(&span_zero, &empty_resource(), 0);
     assert!(rs_zero.scope_spans[0].spans[0].parent_span_id.is_empty());
     // Unset 状态 + 无 deployment/trace_state 属性
     assert_eq!(rs_zero.scope_spans[0].spans[0].status.as_ref().unwrap().code, 0);
@@ -467,7 +467,7 @@ fn convert_span_maps_ids_status_and_attributes() {
     // Error 状态 → code 2 + message
     let mut span_err = RequestSpan::new("r-e".into(), &w3c, "m".into(), "/p".into(), false, 0, true);
     span_err.finalize_error(9, "boom".into());
-    let rs_err = convert_span_to_resource_spans(&span_err, &empty_resource());
+    let rs_err = convert_span_to_resource_spans(&span_err, &empty_resource(), 0);
     let st = rs_err.scope_spans[0].spans[0].status.as_ref().unwrap();
     assert_eq!(st.code, 2);
     assert_eq!(st.message, "boom");
@@ -487,7 +487,7 @@ fn convert_span_carries_resource_metadata() {
         }),
         ..Default::default()
     });
-    let rs = convert_span_to_resource_spans(&span, &res);
+    let rs = convert_span_to_resource_spans(&span, &res, 0);
     assert_eq!(resource_attr(&rs, "service.name").as_deref(), Some("boom-dt"));
     assert!(rs.resource.is_some());
 }

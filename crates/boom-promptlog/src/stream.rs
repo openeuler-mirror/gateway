@@ -51,10 +51,19 @@ pub struct ChunkDelta {
 /// we have, mark the entry with `CLIENT_DISCONNECTED`, and write a 499 status.
 pub struct PromptLogStream<S, F> {
     inner: Option<S>,
-    sender: mpsc::UnboundedSender<PromptLogEntry>,
+    /// Prompt-log channel. `None` in trace-only mode — the wrapper then
+    /// exists solely to assemble the streamed response for `response_sink`
+    /// (the trace span's `llm_response`), no entry ever ships.
+    sender: Option<crate::writer::PromptLogSender>,
     /// The Request-phase entry, kept here so `new_response_from` can clone its
     /// shared identity fields when we emit the Response-phase entry on Drop.
+    /// `None` in trace-only mode.
     request_entry: Option<PromptLogEntry>,
+    /// Standalone copies of the identity fields the assembled response needs
+    /// — with the prompt log off there is no request_entry to borrow them
+    /// from.
+    request_id: String,
+    model: String,
     start: Instant,
     /// Concatenated content deltas.
     accumulated_content: String,
@@ -72,6 +81,13 @@ pub struct PromptLogStream<S, F> {
     delta_fn: F,
     /// Adds provider-owned metadata after the wrapped stream has been dropped.
     entry_enricher: Option<Arc<dyn Fn(&mut PromptLogEntry) + Send + Sync>>,
+    /// Observer for the assembled response, called at Drop BEFORE the inner
+    /// stream is dropped. boom-main attaches a closure that stamps the
+    /// response on the still-active trace span (`llm_response`) — the inner
+    /// `LoggedStream`'s Drop finalizes the span, so anything after it would
+    /// land on a dead span. Sharing the Arc keeps stream paths zero-copy
+    /// with the prompt log entry.
+    response_sink: Option<Arc<dyn Fn(&Arc<serde_json::Value>) + Send + Sync>>,
 }
 
 impl<S: Unpin, F: Unpin> Unpin for PromptLogStream<S, F> {}
@@ -79,14 +95,16 @@ impl<S: Unpin, F: Unpin> Unpin for PromptLogStream<S, F> {}
 impl<S, F> PromptLogStream<S, F> {
     pub fn new(
         inner: S,
-        sender: mpsc::UnboundedSender<PromptLogEntry>,
+        sender: crate::writer::PromptLogSender,
         request_entry: PromptLogEntry,
         delta_fn: F,
     ) -> Self {
         let start = Instant::now();
         Self {
+            request_id: request_entry.request_id.clone(),
+            model: request_entry.model.clone(),
             inner: Some(inner),
-            sender,
+            sender: Some(sender),
             request_entry: Some(request_entry),
             start,
             accumulated_content: String::new(),
@@ -96,6 +114,36 @@ impl<S, F> PromptLogStream<S, F> {
             stream_error: None,
             delta_fn,
             entry_enricher: None,
+            response_sink: None,
+        }
+    }
+
+    /// Trace-only construction: the prompt log is off (or the key excluded)
+    /// but trace body capture is on, so the wrapper runs purely to assemble
+    /// the streamed response and hand it to `with_response_sink`. No entry
+    /// is ever sent.
+    pub fn new_trace_only(
+        inner: S,
+        request_id: String,
+        model: String,
+        delta_fn: F,
+    ) -> Self {
+        let start = Instant::now();
+        Self {
+            inner: Some(inner),
+            sender: None,
+            request_entry: None,
+            request_id,
+            model,
+            start,
+            accumulated_content: String::new(),
+            finish_reason: None,
+            usage: None,
+            end_state: None,
+            stream_error: None,
+            delta_fn,
+            entry_enricher: None,
+            response_sink: None,
         }
     }
 
@@ -106,17 +154,21 @@ impl<S, F> PromptLogStream<S, F> {
         self.entry_enricher = Some(enricher);
         self
     }
+
+    /// Attach a response observer (see `response_sink`). Builder form to
+    /// sit next to `with_entry_enricher`.
+    pub fn with_response_sink(
+        mut self,
+        sink: Arc<dyn Fn(&Arc<serde_json::Value>) + Send + Sync>,
+    ) -> Self {
+        self.response_sink = Some(sink);
+        self
+    }
 }
 
 impl<S, F> Drop for PromptLogStream<S, F> {
     fn drop(&mut self) {
-        // Nested provider streams finalize their trace state on drop.
-        self.inner.take();
-
-        let Some(req_entry) = self.request_entry.take() else {
-            return;
-        };
-        let duration_ms = self.start.elapsed().as_millis() as u64;
+        let req_entry = self.request_entry.take();
 
         // Build a ChatCompletion-style assembled response. This isn't a chunk
         // array — it's the message a client would have received if it had
@@ -124,10 +176,16 @@ impl<S, F> Drop for PromptLogStream<S, F> {
         // final assistant text without replaying chunks. Wrap in `Arc` so
         // the same allocation can be shared with `boom_trace::RequestSpan`'s
         // `boom-gateway.llm_response` attribute (single-source-of-truth).
+        //
+        // ORDERING: assembled and sunk BEFORE the inner stream drop. The
+        // inner `LoggedStream`'s Drop finalizes the trace span (guard Drop →
+        // registry finalize → span leaves the active map), so the response
+        // sink must stamp it while the span is still live — this is what
+        // wires `llm_response` for streaming requests.
         let mut response = serde_json::json!({
-            "id": req_entry.request_id,
+            "id": self.request_id,
             "object": "chat.completion",
-            "model": req_entry.model,
+            "model": self.model,
             "choices": [{
                 "index": 0,
                 "message": {
@@ -145,6 +203,20 @@ impl<S, F> Drop for PromptLogStream<S, F> {
             response["error"] = err.clone();
         }
         let response = Arc::new(response);
+        if let Some(sink) = self.response_sink.take() {
+            sink(&response);
+        }
+
+        // Nested provider streams finalize their trace state on drop. Runs
+        // AFTER the response sink (span stamping) and BEFORE the enricher
+        // (fusion snapshot needs finalization side effects).
+        self.inner.take();
+
+        // Trace-only wrappers have no entry to ship.
+        let (Some(req_entry), Some(sender)) = (req_entry, self.sender.take()) else {
+            return;
+        };
+        let duration_ms = self.start.elapsed().as_millis() as u64;
 
         let mut entry = PromptLogEntry::new_response_from(&req_entry);
         entry.set_response(response);
@@ -192,10 +264,12 @@ impl<S, F> Drop for PromptLogStream<S, F> {
             enricher(&mut entry);
         }
 
-        if let Err(e) = self.sender.send(entry) {
+        // Full is counted + warned inside the counting sender; only the
+        // closed case is site-specific.
+        if let Err(mpsc::error::TrySendError::Closed(e)) = sender.try_send(entry) {
             tracing::debug!(
                 "Prompt log channel closed on stream drop: {}",
-                e.0.request_id
+                e.request_id
             );
         }
     }
@@ -297,9 +371,18 @@ mod tests {
         })
     }
 
+    fn counting_sender(
+        sender: mpsc::Sender<PromptLogEntry>,
+    ) -> crate::writer::PromptLogSender {
+        crate::writer::PromptLogSender::new(
+            sender,
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        )
+    }
+
     #[tokio::test]
     async fn finished_stream_writes_assembled_response_with_200() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(64);
         let req = make_request_entry("req-1");
         let chunks = vec![
             FakeChunk { content: Some("Hello".to_string()), finish_reason: None, usage: None, error: None },
@@ -312,7 +395,7 @@ mod tests {
             },
         ];
         let s = stream::iter(chunks);
-        let mut wrapper = PromptLogStream::new(s, tx, req, extractor);
+        let mut wrapper = PromptLogStream::new(s, counting_sender(tx), req, extractor);
         // Drive the stream to completion so the wrapper sees the terminal chunk.
         while let Some(_) = wrapper.next().await {}
         drop(wrapper);
@@ -328,14 +411,14 @@ mod tests {
 
     #[tokio::test]
     async fn truncated_stream_records_client_disconnected_and_keeps_partial_content() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(64);
         let req = make_request_entry("req-2");
         let chunks = vec![
             FakeChunk { content: Some("partial".to_string()), finish_reason: None, usage: None, error: None },
             // No terminal chunk — stream just ends.
         ];
         let s = stream::iter(chunks);
-        let mut wrapper = PromptLogStream::new(s, tx, req, extractor);
+        let mut wrapper = PromptLogStream::new(s, counting_sender(tx), req, extractor);
         // Drive the stream to completion — but it ends without a finish_reason
         // marker, so Drop should record a truncation.
         while let Some(_) = wrapper.next().await {}
@@ -354,7 +437,7 @@ mod tests {
         // Mid-stream upstream failure (Responses response.failed): the
         // sentinel must win over both truncation (499 mislabel) and any
         // terminal marker (bogus 200) — 502 + the sentinel's code.
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(64);
         let req = make_request_entry("req-fail");
         let chunks = vec![
             FakeChunk { content: Some("partial ".to_string()), finish_reason: None, usage: None, error: None },
@@ -367,7 +450,7 @@ mod tests {
             },
         ];
         let s = stream::iter(chunks);
-        let mut wrapper = PromptLogStream::new(s, tx, req, extractor);
+        let mut wrapper = PromptLogStream::new(s, counting_sender(tx), req, extractor);
         while let Some(_) = wrapper.next().await {}
         drop(wrapper);
         let entry = rx.recv().await.expect("entry sent");
@@ -382,7 +465,7 @@ mod tests {
     async fn failure_sentinel_overrides_earlier_finish_reason() {
         // The sentinel arrives AFTER a terminal marker (producers may emit
         // both when a stream degrades late) — failure wins.
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(64);
         let req = make_request_entry("req-fail2");
         let chunks = vec![
             FakeChunk { content: Some("x".to_string()), finish_reason: Some("stop".to_string()), usage: None, error: None },
@@ -390,7 +473,7 @@ mod tests {
                 error: Some(serde_json::json!({ "code": "timeout" })) },
         ];
         let s = stream::iter(chunks);
-        let mut wrapper = PromptLogStream::new(s, tx, req, extractor);
+        let mut wrapper = PromptLogStream::new(s, counting_sender(tx), req, extractor);
         while let Some(_) = wrapper.next().await {}
         drop(wrapper);
         let entry = rx.recv().await.expect("entry sent");
@@ -404,7 +487,7 @@ mod tests {
         // into UPSTREAM_ERROR — the stream sentinel must not split that class
         // (nor admit provider vocab like server_error/overloaded_error).
         for code in ["provider_error", "upstream_parse_error", "server_error", "overloaded_error"] {
-            let (tx, mut rx) = mpsc::unbounded_channel();
+            let (tx, mut rx) = mpsc::channel(64);
             let req = make_request_entry("req-merge");
             let chunks = vec![FakeChunk {
                 content: None,
@@ -413,7 +496,7 @@ mod tests {
                 error: Some(serde_json::json!({ "code": code, "message": "boom" })),
             }];
             let s = stream::iter(chunks);
-            let mut wrapper = PromptLogStream::new(s, tx, req, extractor);
+            let mut wrapper = PromptLogStream::new(s, counting_sender(tx), req, extractor);
             while let Some(_) = wrapper.next().await {}
             drop(wrapper);
             let entry = rx.recv().await.expect("entry sent");
@@ -428,7 +511,7 @@ mod tests {
     async fn dropped_without_draining_records_truncation() {
         // A wrapper that's dropped before any chunks are consumed should be
         // treated as truncated (we never saw a terminal marker).
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(64);
         let req = make_request_entry("req-3");
         let chunks = vec![FakeChunk {
             content: Some("partial".to_string()),
@@ -437,7 +520,7 @@ mod tests {
             error: None,
         }];
         let s = stream::iter(chunks);
-        let _wrapper = PromptLogStream::new(s, tx, req, extractor);
+        let _wrapper = PromptLogStream::new(s, counting_sender(tx), req, extractor);
         drop(_wrapper);
         let entry = rx.recv().await.expect("entry sent");
         assert_eq!(entry.phase, LogPhase::Response);
@@ -472,7 +555,7 @@ mod tests {
     #[test]
     fn entry_enricher_runs_after_inner_stream_drop() {
         let dropped = Arc::new(AtomicBool::new(false));
-        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let (sender, mut receiver) = mpsc::channel(64);
         let entry = PromptLogEntry::new_request(
             "request-1",
             None,
@@ -491,7 +574,7 @@ mod tests {
             DropSignalStream {
                 dropped: dropped.clone(),
             },
-            sender,
+            counting_sender(sender),
             entry,
             |_item: &serde_json::Value| None::<ChunkDelta>,
         )
@@ -516,5 +599,80 @@ mod tests {
         assert_eq!(entry.status_code, Some(499));
         assert_eq!(entry.error_code.as_deref(), Some(error_code::CLIENT_DISCONNECTED));
         assert!(entry.error_message.is_none());
+    }
+
+    #[test]
+    fn response_sink_runs_before_inner_stream_drop() {
+        // The sink must observe the span still ACTIVE — i.e. run before the
+        // inner stream's Drop finalizes the trace. DropSignalStream records
+        // its own drop; the sink asserts the flag is still false at call
+        // time and captures the response Arc identity for equality checks.
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (sender, mut receiver) = mpsc::channel(64);
+        let entry = make_request_entry("req-sink");
+        let sink_inner_dropped = Arc::new(AtomicBool::new(true));
+        let observed_inner_dropped = sink_inner_dropped.clone();
+        let sink_saw_response = Arc::new(AtomicBool::new(false));
+        let observed_response = sink_saw_response.clone();
+        let sink_dropped_flag = dropped.clone();
+
+        let stream = PromptLogStream::new(
+            DropSignalStream {
+                dropped: dropped.clone(),
+            },
+            counting_sender(sender),
+            entry,
+            |_item: &serde_json::Value| None::<ChunkDelta>,
+        )
+        .with_response_sink(Arc::new(move |resp: &Arc<serde_json::Value>| {
+            observed_inner_dropped.store(sink_dropped_flag.load(Ordering::SeqCst), Ordering::SeqCst);
+            // Sink sees the assembled response object (content is empty —
+            // the wrapper was never polled).
+            observed_response.store(resp.get("choices").is_some(), Ordering::SeqCst);
+        }));
+
+        drop(stream);
+
+        // Inner drop did run (eventually), and the sink saw it not-yet-dropped.
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(
+            !sink_inner_dropped.load(Ordering::SeqCst),
+            "sink must run before inner stream drop"
+        );
+        assert!(sink_saw_response.load(Ordering::SeqCst));
+        // The prompt log entry carries the same assembled response.
+        let entry = receiver.try_recv().expect("prompt log entry was not sent");
+        let resp = entry.response.expect("response set");
+        assert!(resp["choices"][0]["message"]["content"].is_string());
+    }
+
+    #[test]
+    fn trace_only_wrapper_runs_sink_and_ships_nothing() {
+        // Trace-only construction (prompt log off, trace capture on): Drop
+        // must still assemble the response and run the sink — that is the
+        // whole reason the wrapper exists in this mode — while shipping no
+        // prompt log entry anywhere.
+        let dropped = Arc::new(AtomicBool::new(false));
+        let sink_ran = Arc::new(AtomicBool::new(false));
+        let sink_ran2 = sink_ran.clone();
+        let stream = PromptLogStream::new_trace_only(
+            DropSignalStream {
+                dropped: dropped.clone(),
+            },
+            "req-trace-only".to_string(),
+            "gpt-4".to_string(),
+            |_item: &serde_json::Value| None::<ChunkDelta>,
+        )
+        .with_response_sink(Arc::new(move |resp: &Arc<serde_json::Value>| {
+            assert_eq!(resp["id"], "req-trace-only");
+            assert_eq!(resp["model"], "gpt-4");
+            assert!(resp.get("choices").is_some());
+            sink_ran2.store(true, Ordering::SeqCst);
+        }));
+
+        drop(stream);
+
+        assert!(dropped.load(Ordering::SeqCst), "inner stream still drops");
+        assert!(sink_ran.load(Ordering::SeqCst), "sink must run");
     }
 }

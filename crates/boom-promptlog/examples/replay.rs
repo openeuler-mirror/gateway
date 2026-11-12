@@ -78,6 +78,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_attribute_bytes: args.max_attribute_bytes,
         headers: std::collections::HashMap::new(),
         max_queue_size: args.max_queue_size,
+        max_queue_bytes: 0,
     };
 
     // We don't need the writer — only the exporter. The PromptLogConfig we

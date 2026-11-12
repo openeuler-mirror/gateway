@@ -160,6 +160,11 @@ impl DbAuthenticator {
             // to a huge u64 (which silently disabled the limit).
             rpm_limit: token.rpm_limit.filter(|v| *v >= 0).map(|v| v as u64),
             tpm_limit: token.tpm_limit.filter(|v| *v >= 0).map(|v| v as u64),
+            // 0 / negative mean "unlimited" for the key-level in-flight cap.
+            max_parallel_requests: token
+                .max_parallel_requests
+                .and_then(|v| u32::try_from(v).ok())
+                .filter(|v| *v > 0),
             max_budget: token.max_budget.filter(|b| b.is_finite() && *b >= 0.0),
             budget_period_secs: token
                 .budget_duration
@@ -235,6 +240,7 @@ impl Authenticator for DbAuthenticator {
                 team_models: vec![],
                 rpm_limit: None,
                 tpm_limit: None,
+                max_parallel_requests: None,
                 max_budget: None,
                 budget_period_secs: None,
                 spend: 0.0,

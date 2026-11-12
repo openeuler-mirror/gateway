@@ -457,8 +457,9 @@ Responses 协议的错误载体（HTTP 非 200 或 SSE `response.failed`）：
 | 场景 | HTTP | error.code |
 |---|---|---|
 | `previous_response_id` 且存储未启用（P0）/ id 不存在 / 跨 key 归属 | 400 / 404 / 404 | `unsupported_parameter` / `response_not_found` / `response_not_found` |
-| tools 含 built-in 类型（web_search 等） | 400 | `unsupported_tool_type` |
-| input item 类型不支持 | 400 | `unsupported_input_item` |
+| tools 含 built-in 类型（web_search 等） | **200，宽容丢弃**（Codex 无条件发送 hosted 工具，400 会杀死整会话；LiteLLM/APISIX 生态同款）。丢弃项在网关日志 warn，并以响应头 `x-boom-dropped-tools` 透出（流式/非流式/早期失败三个返回点都有） | 无 error.code；头值形如 `tool web_search(<unnamed>)` |
+| input item 类型不支持（`web_search_call` 历史回放等） | **200，宽容丢弃** + warn（同上） | 无 error.code |
+| tools 含 `type:"namespace"`（Codex `multi_agent_v1`、MCP server 工具集） | **200，拍平**：每个子工具转普通 function，命名 `<ns>__<sub>`（生态惯例，Codex 可映射回）；`type:"function"/"custom"` 缺 `name` 仍 400 | — |
 | `conversation` 参数非空 / `background:true` / `tool_choice` 为 `{"type":"mcp",...}` | 400 | `unsupported_parameter` / `unsupported_tool_type` |
 | created 已发出后的流内错误（上游连接失败、上游中断） | SSE `response.failed` 终态事件 | 见 §6.5 规则 2：前置失败（认证/限流/400）仍是普通 HTTP 错误，不进流 |
 | 模型无权限 / 限流 / 上游错误（前置） | 沿用 `GatewayError` 既有映射 | 语义不变，仅包装为上述 error JSON 形状 |

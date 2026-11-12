@@ -105,6 +105,25 @@ pub struct PromptLogEntry {
     pub error_message: Option<String>,
 }
 
+/// Recursively estimate a `serde_json::Value`'s heap footprint: strings by
+/// content length (+ String header), containers by their children (+ per-node
+/// overhead). Tracks the serialized size closely enough for eviction policy
+/// without paying for a serialization pass.
+fn approx_value_size(v: &serde_json::Value) -> usize {
+    match v {
+        serde_json::Value::Null => 8,
+        serde_json::Value::Bool(_) => 1,
+        serde_json::Value::Number(_) => 24,
+        serde_json::Value::String(s) => s.len() + 16,
+        serde_json::Value::Array(a) => 16 + a.iter().map(approx_value_size).sum::<usize>(),
+        serde_json::Value::Object(o) => o
+            .iter()
+            .map(|(k, v)| k.len() + 24 + approx_value_size(v))
+            .sum::<usize>()
+            + 16,
+    }
+}
+
 /// Canonical error codes used in `PromptLogEntry::error_code`. Stored as
 /// strings (not an enum) so the JSONL schema stays open for new codes without
 /// a migration. Keep this list in sync with `boom_core::GatewayError` variants.
@@ -134,6 +153,29 @@ pub mod error_code {
 }
 
 impl PromptLogEntry {
+    /// Conservative in-memory size estimate, consumed by the OTLP queue's
+    /// byte budget (`OtlpConfig.max_queue_bytes`). JSON values are sized
+    /// recursively by node count — no serialization, just cheap pointer
+    /// walking — since this runs on every push and eviction. Over-estimating
+    /// only drops earlier (safe direction for a budget).
+    pub(crate) fn estimated_bytes(&self) -> usize {
+        512
+            + self.request.as_ref().map_or(0, |v| approx_value_size(v))
+            + self.response.as_ref().map_or(0, |v| approx_value_size(v))
+            + self.fusion.as_ref().map_or(0, |v| approx_value_size(v))
+            + self.raw_upstream_response.as_ref().map_or(0, |v| approx_value_size(v))
+            + self.bg_request.as_ref().map_or(0, |s| s.len() + 16)
+            + self.raw_response.as_ref().map_or(0, |s| s.len() + 16)
+            + self.headers.as_ref().map_or(0, |h| {
+                h.iter().map(|(k, v)| k.len() + v.len() + 32).sum::<usize>()
+            })
+            + self.request_id.len()
+            + self.model.len()
+            + self.key_hash.len()
+            + self.api_path.len()
+            + self.error_message.as_ref().map_or(0, |m| m.len() + 16)
+    }
+
     /// Build the Request-phase entry at request ingress.
     ///
     /// `trace_id` should be the W3C traceparent-derived id when available;

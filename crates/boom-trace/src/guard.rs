@@ -118,18 +118,21 @@ impl TraceGuard {
     }
 
     /// Convenience: set the `boom-gateway.llm_request` body attribute.
-    /// The Arc is shared with `PromptLogEntry.request` — zero-copy.
-    pub fn set_llm_request(&self, body: Arc<serde_json::Value>) {
+    /// The Arc is shared with `PromptLogEntry.request` — zero-copy while
+    /// under the retention cap; oversized bodies are truncated on the span
+    /// (see `RequestSpan::set_llm_request`). `max_body_bytes` comes from
+    /// `TraceConfig.max_body_bytes` (0 = unlimited).
+    pub fn set_llm_request(&self, body: Arc<serde_json::Value>, max_body_bytes: usize) {
         let _ = self.registry.with_span_mut(&self.request_id, |s: &mut RequestSpan| {
-            s.set_llm_request(body);
+            s.set_llm_request(body, max_body_bytes);
         });
     }
 
     /// Convenience: set the `boom-gateway.llm_response` body attribute.
-    /// The Arc is shared with `PromptLogEntry.response` — zero-copy.
-    pub fn set_llm_response(&self, body: Arc<serde_json::Value>) {
+    /// Same retention-cap semantics as `set_llm_request`.
+    pub fn set_llm_response(&self, body: Arc<serde_json::Value>, max_body_bytes: usize) {
         let _ = self.registry.with_span_mut(&self.request_id, |s: &mut RequestSpan| {
-            s.set_llm_response(body);
+            s.set_llm_response(body, max_body_bytes);
         });
     }
 
@@ -325,7 +328,7 @@ mod tests {
                 true,
             )
             .expect("started");
-            g.set_llm_request(body.clone());
+            g.set_llm_request(body.clone(), 16 * 1024);
             // Verify attribute was set on the live span.
             let has_attr = reg
                 .with_span_mut("req-4", |s: &mut RequestSpan| {

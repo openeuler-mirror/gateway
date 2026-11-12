@@ -16,7 +16,7 @@
 use crate::metrics::{
     operation_name, service_instance_id, truncate_bounded, ERROR_TYPE_MAX_CHARS,
 };
-use crate::span::RequestSpan;
+use crate::span::{truncate_at_byte_boundary, RequestSpan};
 use boom_core::trace::{ExporterStatusSnapshot, ProbeResult};
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::common::v1::{
@@ -55,10 +55,17 @@ pub struct TraceExporter {
     endpoint: String,
     extra_headers: Vec<(String, String)>,
     resource: Resource,
-    batch: Arc<Mutex<VecDeque<RequestSpan>>>,
+    batch: Arc<Mutex<BatchQueue>>,
     batch_size: usize,
     flush_interval: Duration,
     max_queue_size: usize,
+    /// 0 = count-only cap. Non-zero bounds the queue's in-memory bytes via
+    /// `RequestSpan::estimated_bytes` — with bodies captured, a count cap
+    /// alone can't bound memory (10000 × MB-scale spans ≈ GBs).
+    max_queue_bytes: usize,
+    /// Per-attribute wire cap applied at export time (on top of the
+    /// capture-time `max_body_bytes` retention cap). 0 = unlimited.
+    max_attribute_bytes: usize,
     dropped_count: Arc<AtomicU64>,
     status: AtomicU8,
     consecutive_probe_failures: AtomicU64,
@@ -67,6 +74,53 @@ pub struct TraceExporter {
     total_offline_episodes: AtomicU64,
     total_dropped_during_offline: AtomicU64,
     flush_permit: Arc<Semaphore>,
+}
+
+/// Pending spans with byte accounting. Push evicts from the front while
+/// either cap (count or bytes) would be exceeded — oldest-first drop, same
+/// policy as the historical count-only cap.
+#[derive(Default)]
+struct BatchQueue {
+    spans: VecDeque<RequestSpan>,
+    bytes: usize,
+}
+
+impl BatchQueue {
+    fn push(
+        &mut self,
+        span: RequestSpan,
+        max_size: usize,
+        max_bytes: usize,
+        dropped: &AtomicU64,
+    ) {
+        let incoming = span.estimated_bytes();
+        while !self.spans.is_empty()
+            && (self.spans.len() >= max_size
+                || (max_bytes > 0 && self.bytes + incoming > max_bytes))
+        {
+            match self.spans.pop_front() {
+                Some(old) => {
+                    self.bytes -= old.estimated_bytes();
+                    dropped.fetch_add(1, Ordering::Relaxed);
+                }
+                None => break,
+            }
+        }
+        self.bytes += incoming;
+        self.spans.push_back(span);
+    }
+
+    /// Pop up to `n` spans from the front, keeping `bytes` consistent.
+    fn drain_up_to(&mut self, n: usize) -> VecDeque<RequestSpan> {
+        let take = n.min(self.spans.len());
+        let drained: VecDeque<RequestSpan> = self.spans.drain(..take).collect();
+        self.bytes -= drained.iter().map(|s| s.estimated_bytes()).sum::<usize>();
+        drained
+    }
+
+    fn len(&self) -> usize {
+        self.spans.len()
+    }
 }
 
 impl TraceExporter {
@@ -86,10 +140,12 @@ impl TraceExporter {
             endpoint: config.endpoint.clone(),
             extra_headers,
             resource,
-            batch: Arc::new(Mutex::new(VecDeque::with_capacity(config.batch_size))),
+            batch: Arc::new(Mutex::new(BatchQueue::default())),
             batch_size: config.batch_size,
             flush_interval: Duration::from_secs(config.flush_interval_secs.max(1)),
             max_queue_size: config.max_queue_size,
+            max_queue_bytes: config.max_queue_bytes,
+            max_attribute_bytes: config.max_attribute_bytes,
             dropped_count: Arc::new(AtomicU64::new(0)),
             status: AtomicU8::new(STATUS_ONLINE),
             consecutive_probe_failures: AtomicU64::new(0),
@@ -136,11 +192,12 @@ impl TraceExporter {
         }
         let should_flush = {
             let mut batch = self.batch.lock().await;
-            if batch.len() >= self.max_queue_size {
-                let _dropped = batch.pop_front();
-                self.dropped_count.fetch_add(1, Ordering::Relaxed);
-            }
-            batch.push_back(span);
+            batch.push(
+                span,
+                self.max_queue_size,
+                self.max_queue_bytes,
+                &self.dropped_count,
+            );
             batch.len() >= self.batch_size
         };
         if should_flush {
@@ -154,27 +211,46 @@ impl TraceExporter {
         }
     }
 
+    /// Flush at most `batch_size` spans per POST. Draining the whole queue
+    /// in one shot builds a request body proportional to the backlog —
+    /// with bodies captured that transient alone was a 3-4× memory spike
+    /// on top of the queue. Backlog beyond one chunk flushes on the next
+    /// tick (or the next enqueue that re-triggers).
     pub async fn flush(&self) {
-        let drained: VecDeque<RequestSpan> = {
-            let mut batch = self.batch.lock().await;
-            if batch.is_empty() {
+        loop {
+            let drained: VecDeque<RequestSpan> = {
+                let mut batch = self.batch.lock().await;
+                if batch.spans.is_empty() {
+                    return;
+                }
+                batch.drain_up_to(self.batch_size)
+            };
+            match self.send_with_retry(&drained).await {
+                Ok(()) => {}
+                Err(()) => {
+                    self.transition_to_offline(drained.len() as u64);
+                    return;
+                }
+            }
+            let more = {
+                let batch = self.batch.lock().await;
+                batch.len() >= self.batch_size
+            };
+            if !more {
                 return;
             }
-            std::mem::take(&mut *batch)
-        };
-        match self.send_with_retry(&drained).await {
-            Ok(()) => {}
-            Err(()) => self.transition_to_offline(drained.len() as u64),
         }
     }
 
     async fn send_with_retry(&self, drained: &VecDeque<RequestSpan>) -> Result<(), ()> {
         let resource_spans: Vec<ResourceSpans> = drained
             .iter()
-            .map(|s| convert_span_to_resource_spans(s, &self.resource))
+            .map(|s| convert_span_to_resource_spans(s, &self.resource, self.max_attribute_bytes))
             .collect();
         let req = ExportTraceServiceRequest { resource_spans };
-        let body = req.encode_to_vec();
+        // Bytes clone is a refcount bump, not a memcpy of a potentially
+        // MB-scale payload — one encode, cheap clones per retry attempt.
+        let body: bytes::Bytes = req.encode_to_vec().into();
         let url = format!("{}/v1/traces", self.endpoint.trim_end_matches('/'));
 
         let mut attempt = 0u32;
@@ -401,6 +477,17 @@ fn extract_max_tokens(body: &serde_json::Value) -> Option<i64> {
         .and_then(|v| v.as_i64())
 }
 
+/// Apply the OTLP per-attribute wire cap. Increments `dropped` when
+/// truncation fires so the span's `dropped_attributes_count` reflects the
+/// data loss (same semantics as promptlog's logs channel).
+fn bound_attr_bytes(s: String, max_attribute_bytes: usize, dropped: &mut u32) -> String {
+    if max_attribute_bytes == 0 || s.len() <= max_attribute_bytes {
+        return s;
+    }
+    *dropped += 1;
+    truncate_at_byte_boundary(s, max_attribute_bytes)
+}
+
 /// Convert a finalized `RequestSpan` into an OTLP `ResourceSpans` envelope.
 /// Each gateway span is its own `ScopeSpans` so the InstrumentationScope
 /// fields carry the gateway's name + version.
@@ -411,7 +498,17 @@ fn extract_max_tokens(body: &serde_json::Value) -> Option<i64> {
 /// fields. Three span events are emitted: the standard `exception` event
 /// on error spans, plus `ai.gateway.request.id` / `ai.gateway.request.body`
 /// (the latter only when body capture was on).
-pub fn convert_span_to_resource_spans(span: &RequestSpan, resource: &Resource) -> ResourceSpans {
+///
+/// `max_attribute_bytes` is the OTLP wire cap (OtlpConfig, 0 = unlimited):
+/// string attributes longer than the cap are truncated and the span's
+/// `dropped_attributes_count` is incremented. This is on top of the
+/// capture-time `max_body_bytes` retention cap — wire payloads stay small
+/// even when retention allows more.
+pub fn convert_span_to_resource_spans(
+    span: &RequestSpan,
+    resource: &Resource,
+    max_attribute_bytes: usize,
+) -> ResourceSpans {
     let mut otlp_attrs: Vec<OtlpKeyValue> = Vec::with_capacity(span.attributes.len() + 12);
     // Standard semantic-convention fields (legacy key + dual-write).
     otlp_attrs.push(otlp_kv_string("url.path", &span.api_path));
@@ -441,28 +538,39 @@ pub fn convert_span_to_resource_spans(span: &RequestSpan, resource: &Resource) -
     }
 
     // Custom attributes from the span's attribute bag. Body attributes are
-    // serialized as JSON string (the Arc<serde_json::Value> derefs). Skip
-    // keys already added above (request.id / model / is_stream etc.).
+    // serialized as JSON string (the Arc<serde_json::Value> derefs) or, when
+    // capture-time truncation fired, an already-truncated String. Both get
+    // the wire cap applied here. Skip keys already added above (request.id /
+    // model / is_stream etc.).
     let mut request_body_json: Option<String> = None;
+    let mut dropped_attrs: u32 = 0;
     for (k, v) in &span.attributes {
         match v {
             SpanAttributeValue::String(s) => {
-                otlp_attrs.push(otlp_kv_string(k, s));
+                let bounded = bound_attr_bytes(s.clone(), max_attribute_bytes, &mut dropped_attrs);
+                otlp_attrs.push(otlp_kv_string(k, &bounded));
                 if k == "boom-gateway.user.id" {
-                    otlp_attrs.push(otlp_kv_string("user.id", s));
+                    otlp_attrs.push(otlp_kv_string("user.id", &bounded));
+                }
+                if k == "boom-gateway.llm_request" {
+                    request_body_json = Some(bounded);
                 }
             }
             SpanAttributeValue::Int(n) => otlp_attrs.push(otlp_kv_int(k, *n)),
             SpanAttributeValue::Bool(b) => otlp_attrs.push(otlp_kv_bool(k, *b)),
             SpanAttributeValue::Json(v) => {
-                let s = serde_json::to_string(v).unwrap_or_default();
                 if k == "boom-gateway.llm_request" {
-                    request_body_json = Some(s.clone());
                     if let Some(mt) = extract_max_tokens(v) {
                         otlp_attrs.push(otlp_kv_int("gen_ai.request.max_tokens", mt));
                     }
                 }
-                otlp_attrs.push(otlp_kv_string(k, &s));
+                let s = serde_json::to_string(v).unwrap_or_default();
+                let bounded = bound_attr_bytes(s, max_attribute_bytes, &mut dropped_attrs);
+                otlp_attrs.push(otlp_kv_string(k, &bounded));
+                if k == "boom-gateway.llm_request" {
+                    // Move, don't clone — the KV above already owns its copy.
+                    request_body_json = Some(bounded);
+                }
             }
         }
     }
@@ -518,7 +626,7 @@ pub fn convert_span_to_resource_spans(span: &RequestSpan, resource: &Resource) -
         start_time_unix_nano: span.start_time_unix_nano,
         end_time_unix_nano: span.end_time_unix_nano,
         attributes: otlp_attrs,
-        dropped_attributes_count: 0,
+        dropped_attributes_count: dropped_attrs,
         events,
         dropped_events_count: 0,
         links: Vec::new(),
@@ -608,7 +716,7 @@ mod tests {
         let span = make_span("r-1");
         let cfg = OtlpConfig::default();
         let resource = build_resource(&cfg);
-        let rs = convert_span_to_resource_spans(&span, &resource);
+        let rs = convert_span_to_resource_spans(&span, &resource, 0);
         let scope = &rs.scope_spans[0];
         let otlp_span = &scope.spans[0];
         assert_eq!(otlp_span.trace_id.len(), 16);
@@ -638,7 +746,7 @@ mod tests {
         span.finalize_error(2_000, "boom".to_string());
         let cfg = OtlpConfig::default();
         let resource = build_resource(&cfg);
-        let rs = convert_span_to_resource_spans(&span, &resource);
+        let rs = convert_span_to_resource_spans(&span, &resource, 0);
         let otlp_span = &rs.scope_spans[0].spans[0];
         assert_eq!(otlp_span.status.as_ref().unwrap().code, STATUS_CODE_ERROR);
         assert_eq!(otlp_span.status.as_ref().unwrap().message, "boom");
@@ -659,11 +767,11 @@ mod tests {
             0,
             true,
         );
-        span.set_llm_request(Arc::new(serde_json::json!({"messages": []})));
+        span.set_llm_request(Arc::new(serde_json::json!({"messages": []})), 0);
         span.finalize_ok(1);
         let cfg = OtlpConfig::default();
         let resource = build_resource(&cfg);
-        let rs = convert_span_to_resource_spans(&span, &resource);
+        let rs = convert_span_to_resource_spans(&span, &resource, 0);
         let otlp_span = &rs.scope_spans[0].spans[0];
         let req_attr = otlp_span
             .attributes
@@ -688,11 +796,11 @@ mod tests {
             "boom-gateway.user.id",
             SpanAttributeValue::String("alice".to_string()),
         );
-        span.set_llm_request(Arc::new(serde_json::json!({"messages": [], "max_tokens": 4096})));
+        span.set_llm_request(Arc::new(serde_json::json!({"messages": [], "max_tokens": 4096})), 0);
         span.finalize_ok(3_000_000_000);
         let cfg = OtlpConfig::default();
         let resource = build_resource(&cfg);
-        let rs = convert_span_to_resource_spans(&span, &resource);
+        let rs = convert_span_to_resource_spans(&span, &resource, 0);
         let otlp_span = &rs.scope_spans[0].spans[0];
         let keys: Vec<&str> = otlp_span.attributes.iter().map(|a| a.key.as_str()).collect();
         for expected in [
@@ -744,7 +852,7 @@ mod tests {
         span.finalize_error(2_000, long_msg);
         let cfg = OtlpConfig::default();
         let resource = build_resource(&cfg);
-        let rs = convert_span_to_resource_spans(&span, &resource);
+        let rs = convert_span_to_resource_spans(&span, &resource, 0);
         let otlp_span = &rs.scope_spans[0].spans[0];
         let error_type = otlp_span
             .attributes
@@ -809,5 +917,93 @@ mod tests {
         assert_eq!(batch_len, 0);
         let snap = exp.status_snapshot();
         assert_eq!(snap.total_dropped_during_offline, 3);
+    }
+
+    #[test]
+    fn wire_cap_truncates_body_and_sets_dropped_count() {
+        let mut span = make_span("r-wire");
+        // Retention cap 0 = unlimited, so the span holds the full Arc;
+        // the wire cap must still bound what goes into the OTLP payload.
+        span.set_llm_request(
+            Arc::new(serde_json::json!({"prompt": "x".repeat(500)})),
+            0,
+        );
+        let cfg = OtlpConfig::default();
+        let resource = build_resource(&cfg);
+        let rs = convert_span_to_resource_spans(&span, &resource, 64);
+        let otlp_span = &rs.scope_spans[0].spans[0];
+        let req_attr = otlp_span
+            .attributes
+            .iter()
+            .find(|a| a.key == "boom-gateway.llm_request")
+            .expect("llm_request attribute present");
+        let OtlpAnyValue::StringValue(s) =
+            req_attr.value.as_ref().unwrap().value.as_ref().unwrap()
+        else {
+            panic!("body attribute should be string");
+        };
+        assert!(s.len() <= 64, "wire-capped body is {} bytes", s.len());
+        assert!(otlp_span.dropped_attributes_count >= 1);
+        // The request.body event reuses the bounded string — bounded too.
+        let body_event = otlp_span
+            .events
+            .iter()
+            .find(|e| e.name == "ai.gateway.request.body")
+            .expect("request.body event present");
+        let ev_attr = &body_event.attributes[0];
+        let OtlpAnyValue::StringValue(ev) =
+            ev_attr.value.as_ref().unwrap().value.as_ref().unwrap()
+        else {
+            panic!("event body should be string");
+        };
+        assert!(ev.len() <= 64);
+    }
+
+    #[test]
+    fn batch_queue_byte_budget_drops_oldest() {
+        let mut q = BatchQueue::default();
+        let dropped = AtomicU64::new(0);
+        // Each span ≈ 950 estimated bytes; budget 1000 → the second push
+        // must evict the first.
+        for i in 0..2 {
+            let mut s = make_span(&format!("r-{i}"));
+            s.set_llm_request(
+                Arc::new(serde_json::json!({"prompt": "y".repeat(400)})),
+                0,
+            );
+            q.push(s, 10_000, 1_000, &dropped);
+        }
+        assert_eq!(q.len(), 1);
+        assert!(q.bytes <= 1_000);
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+        // Count cap still enforced independently of the byte cap.
+        let mut q2 = BatchQueue::default();
+        let dropped2 = AtomicU64::new(0);
+        for i in 0..3 {
+            q2.push(make_span(&format!("c-{i}")), 2, 0, &dropped2);
+        }
+        assert_eq!(q2.len(), 2);
+        assert_eq!(dropped2.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn batch_queue_drain_up_to_chunks_and_keeps_bytes_consistent() {
+        let mut q = BatchQueue::default();
+        let dropped = AtomicU64::new(0);
+        for i in 0..5 {
+            q.push(make_span(&format!("r-{i}")), 100, 0, &dropped);
+        }
+        let first = q.drain_up_to(2);
+        assert_eq!(first.len(), 2);
+        assert_eq!(q.len(), 3);
+        assert_eq!(
+            q.bytes,
+            q.spans.iter().map(|s| s.estimated_bytes()).sum::<usize>()
+        );
+        // Draining more than what remains takes exactly what's left.
+        let rest = q.drain_up_to(10);
+        assert_eq!(rest.len(), 3);
+        assert_eq!(q.bytes, 0);
+        assert!(q.spans.is_empty());
     }
 }

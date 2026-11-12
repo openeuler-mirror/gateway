@@ -9,7 +9,19 @@
 //! 3. guard       — `previous_response_id` must fail fast with 400 (P0 has
 //!                  no response store; silent-ignore is the anti-pattern)
 //! 4. tool loop   — a real agent turn: function_call → local execution →
-//!                  function_call_output replay → final message
+//!                  function_call_output replay → final message. A tool
+//!                  call takes precedence over a same-turn message (which
+//!                  is a preamble, not the final answer). Real LLMs: a
+//!                  turn=1 direct answer or a natural-language final
+//!                  answer PASS; only an empty final or 3 unterminated
+//!                  turns FAIL. --strict (mock CI) asserts the tool-result
+//!                  echo instead — the deterministic round-trip proof.
+//! 5. store       — previous_response_id continuation + GET retrieval
+//!                  (skipped when the response store is disabled)
+//! 6. custom tool — type:"custom" MUST surface as custom_tool_call with
+//!                  freeform input; a leaked function_call is a FAIL
+//!                  (P0.5: coercion breaks Codex, vLLM #49724)
+//! 7. passthrough — native reasoning item fidelity on protocol:responses
 //!
 //! Usage:
 //!   agent --base-url http://127.0.0.1:18400 --key smoke-master-key --model test-model
@@ -25,6 +37,12 @@ struct Config {
     base_url: String,
     key: String,
     model: String,
+    /// `--strict` (or BOOM_AGENT_STRICT=1): assert the tool-result ECHO in
+    /// terminal answers (`unix_time_` / `PATCH_RESULT`) — the deterministic
+    /// proof that the call_id round-trip survived the gateway conversion.
+    /// Mock CI MUST run strict; default (real LLMs) only requires a non-empty
+    /// terminal answer, because models paraphrase instead of quoting.
+    strict: bool,
 }
 
 fn main() {
@@ -32,6 +50,7 @@ fn main() {
         base_url: "http://127.0.0.1:18400".to_string(),
         key: "smoke-master-key".to_string(),
         model: "test-model".to_string(),
+        strict: std::env::var_os("BOOM_AGENT_STRICT").is_some_and(|v| v != "0"),
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -46,6 +65,7 @@ fn main() {
             "--base-url" => cfg.base_url = value(),
             "--key" => cfg.key = value(),
             "--model" => cfg.model = value(),
+            "--strict" => cfg.strict = true,
             "-h" | "--help" => {
                 println!(
                     "agent --base-url URL --key KEY --model MODEL\n  defaults: {} / {} / {}",
@@ -337,44 +357,64 @@ async fn check_tool_loop(client: &Client, cfg: &Config) -> Result<String, String
 
         let output = v["output"].as_array().cloned().unwrap_or_default();
 
-        // Terminal message → done. The mock upstream echoes the tool result,
-        // which proves the call_id round-trip survived the gateway conversion.
-        if let Some(message) = output
+        // A tool call takes precedence over any message: models may emit a
+        // preamble message AND a function_call in the same turn — the loop
+        // only ends once no call remains to execute.
+        let tool_call = output
+            .iter()
+            .find(|item| item["type"].as_str() == Some("function_call"));
+        if let Some(call) = tool_call {
+            if call["name"].as_str() != Some("get_current_time") {
+                return Err(format!("unexpected tool name: {}", call["name"]));
+            }
+            let call_id = call["call_id"].as_str().unwrap_or_default().to_string();
+            if call_id.is_empty() {
+                return Err("function_call missing call_id".to_string());
+            }
+            let result = get_current_time();
+            input.push(json!({
+                "type": "function_call",
+                "call_id": call_id,
+                "name": "get_current_time",
+                "arguments": "{}",
+            }));
+            input.push(json!({
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": result,
+            }));
+            println!("      turn {turn}: executed tool → {result}");
+            continue; // a same-turn message was a preamble, not the final answer
+        }
+
+        // No call → the message is terminal. STRICT mode asserts the mock's
+        // `unix_time_` echo — the deterministic proof that the call_id
+        // round-trip survived the gateway conversion (a dropped
+        // function_call_output or rewritten call_id turns the mock's round 2
+        // into plain text and MUST fail the check). Default (real LLM)
+        // tolerates natural-language answers — models paraphrase the tool
+        // result instead of quoting it — and only requires a non-empty
+        // terminal; round-trip proof is mock CI's strict run.
+        let message = output
             .iter()
             .find(|item| item["type"].as_str() == Some("message"))
             .and_then(|item| item["content"][0]["text"].as_str())
-        {
+            .unwrap_or_default();
+        if message.is_empty() {
+            return Err(format!("turn {turn}: terminal message empty or missing: {v}"));
+        }
+        if cfg.strict {
             if !message.contains("unix_time_") {
-                return Err(format!("final message lacks tool result echo: {message:?}"));
+                return Err(format!(
+                    "strict: final message lacks tool result echo (call_id round-trip broken?): {message:?}"
+                ));
             }
             return Ok(format!("turns={turn} final={message:?}"));
         }
-
-        // function_call → execute locally, replay both items next turn.
-        let Some(call) = output.iter().find(|item| item["type"].as_str() == Some("function_call"))
-        else {
-            return Err(format!("turn {turn}: neither message nor function_call in output: {v}"));
-        };
-        if call["name"].as_str() != Some("get_current_time") {
-            return Err(format!("unexpected tool name: {}", call["name"]));
+        if turn == 1 {
+            return Ok("turns=1 model answered directly (tool not called)".into());
         }
-        let call_id = call["call_id"].as_str().unwrap_or_default().to_string();
-        if call_id.is_empty() {
-            return Err("function_call missing call_id".to_string());
-        }
-        let result = get_current_time();
-        input.push(json!({
-            "type": "function_call",
-            "call_id": call_id,
-            "name": "get_current_time",
-            "arguments": "{}",
-        }));
-        input.push(json!({
-            "type": "function_call_output",
-            "call_id": call_id,
-            "output": result,
-        }));
-        println!("      turn {turn}: executed tool → {result}");
+        return Ok(format!("turns={turn} final={message:?}"));
     }
     Err("tool loop did not terminate in 3 turns".to_string())
 }
@@ -474,8 +514,13 @@ async fn check_store_continuation(client: &Client, cfg: &Config) -> Result<Strin
 // ---------------------------------------------------------------
 
 async fn check_custom_tool_loop(client: &Client, cfg: &Config) -> Result<String, String> {
-    let mut input: Vec<Value> =
-        vec![json!({ "role": "user", "content": "Apply the demo patch." })];
+    // The patch-format instruction makes the `Begin Patch` assertion below
+    // hold for real LLMs too — the mock hardcodes it regardless.
+    let mut input: Vec<Value> = vec![json!({
+        "role": "user",
+        "content": "Apply the demo patch: call apply_patch with a Codex-style patch \
+                    that begins with '*** Begin Patch'."
+    })];
 
     for turn in 1..=3 {
         let body = json!({
@@ -495,53 +540,83 @@ async fn check_custom_tool_loop(client: &Client, cfg: &Config) -> Result<String,
         }
         let output = v["output"].as_array().cloned().unwrap_or_default();
 
-        // Terminal message (mock echoes the tool result) → done.
-        if let Some(message) = output
+        // The strict P0.5 contract: the client must see custom_tool_call
+        // items. A leaked function_call means the gateway coerced the custom
+        // tool on the way out — the exact Codex-breaking failure this check
+        // exists to catch. NOT tolerated, even for real LLMs: a correct
+        // gateway always restores the custom shape (it wraps for upstream
+        // and unwraps on return; the wrapper must never reach the client).
+        if output
+            .iter()
+            .any(|item| item["type"].as_str() == Some("function_call"))
+        {
+            return Err(format!(
+                "turn {turn}: custom tool leaked as function_call (contract coerced): {v}"
+            ));
+        }
+
+        // A tool call takes precedence over any message: models may emit a
+        // preamble message AND a custom_tool_call in the same turn.
+        if let Some(call) = output
+            .iter()
+            .find(|item| item["type"].as_str() == Some("custom_tool_call"))
+        {
+            let call_id = call["call_id"].as_str().unwrap_or_default().to_string();
+            if call_id.is_empty() || call["name"].as_str() != Some("apply_patch") {
+                return Err(format!("bad custom_tool_call identity: {call}"));
+            }
+            // `input` must be the freeform string unwrapped from the function
+            // args — a non-string (or empty) value means the unwrap broke.
+            let patch_input = call["input"]
+                .as_str()
+                .ok_or_else(|| format!("custom_tool_call input is not a freeform string: {call}"))?
+                .to_string();
+            if !patch_input.contains("Begin Patch") {
+                return Err(format!(
+                    "custom input not unwrapped from function args: {patch_input:?}"
+                ));
+            }
+
+            // Execute: echo the patch back as the freeform output.
+            let result = format!("PATCH_RESULT:ok:{patch_input}");
+            input.push(json!({
+                "type": "custom_tool_call", "call_id": call_id,
+                "name": "apply_patch", "input": patch_input,
+            }));
+            input.push(json!({
+                "type": "custom_tool_call_output", "call_id": call_id, "output": result,
+            }));
+            println!("      turn {turn}: executed custom tool ({} bytes)", patch_input.len());
+            continue; // a same-turn message was a preamble, not the final answer
+        }
+
+        // No call → the message is terminal. STRICT mode asserts the mock's
+        // `PATCH_RESULT` echo — the deterministic proof that the
+        // custom_tool_call_output round-trip survived the gateway's
+        // wrap/unwrap (a dropped output or broken unwrap turns round 2 into
+        // plain text and MUST fail the check; the model cannot know the
+        // PATCH_RESULT string unless our tool output reached it). Default
+        // (real LLM) tolerates natural-language answers.
+        let message = output
             .iter()
             .find(|item| item["type"].as_str() == Some("message"))
             .and_then(|item| item["content"][0]["text"].as_str())
-        {
+            .unwrap_or_default();
+        if message.is_empty() {
+            return Err(format!("turn {turn}: terminal message empty or missing: {v}"));
+        }
+        if cfg.strict {
             if !message.contains("PATCH_RESULT") {
-                return Err(format!("final message lacks tool result echo: {message:?}"));
+                return Err(format!(
+                    "strict: final message lacks PATCH_RESULT echo (custom output round-trip broken?): {message:?}"
+                ));
             }
             return Ok(format!("turns={turn} final={message:?}"));
         }
-
-        // The strict contract: a custom_tool_call item — NOT function_call.
-        let Some(call) = output
-            .iter()
-            .find(|item| item["type"].as_str() == Some("custom_tool_call"))
-        else {
-            let types: Vec<&str> = output
-                .iter()
-                .filter_map(|i| i["type"].as_str())
-                .collect();
-            return Err(format!(
-                "turn {turn}: expected custom_tool_call, got output types {types:?} (contract coerced?)"
-            ));
-        };
-        if output.iter().any(|i| i["type"] == "function_call") {
-            return Err("custom tool leaked as function_call in the same turn".to_string());
+        if turn == 1 {
+            return Ok("turns=1 model answered directly (tool not called)".into());
         }
-        let call_id = call["call_id"].as_str().unwrap_or_default().to_string();
-        if call_id.is_empty() || call["name"].as_str() != Some("apply_patch") {
-            return Err(format!("bad custom_tool_call identity: {call}"));
-        }
-        let patch_input = call["input"].as_str().unwrap_or_default().to_string();
-        if !patch_input.contains("Begin Patch") {
-            return Err(format!("custom input not unwrapped from function args: {patch_input:?}"));
-        }
-
-        // Execute: echo the patch back as the freeform output.
-        let result = format!("PATCH_RESULT:ok:{patch_input}");
-        input.push(json!({
-            "type": "custom_tool_call", "call_id": call_id,
-            "name": "apply_patch", "input": patch_input,
-        }));
-        input.push(json!({
-            "type": "custom_tool_call_output", "call_id": call_id, "output": result,
-        }));
-        println!("      turn {turn}: executed custom tool ({} bytes)", patch_input.len());
+        return Ok(format!("turns={turn} final={message:?}"));
     }
     Err("custom tool loop did not terminate in 3 turns".to_string())
 }

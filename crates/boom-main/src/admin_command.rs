@@ -163,6 +163,7 @@ pub async fn admin_command_handler(mut rx: tokio::sync::mpsc::Receiver<AdminComm
                     max_attribute_bytes: 4096,
                     headers,
                     max_queue_size: 10000,
+                    max_queue_bytes: 0,
                 };
                 let result = boom_promptlog::ping_endpoint(&probe_config).await;
                 let _ = reply.send(result);
@@ -183,6 +184,7 @@ pub async fn admin_command_handler(mut rx: tokio::sync::mpsc::Receiver<AdminComm
                     max_attribute_bytes: 4096,
                     headers,
                     max_queue_size: 10000,
+                    max_queue_bytes: 0,
                 };
                 let result = boom_trace::ping_endpoint(&probe_config).await;
                 let _ = reply.send(result);

@@ -77,12 +77,6 @@ fn first_tool_name(req: &Value) -> Option<String> {
         .find_map(|t| t["function"]["name"].as_str().map(String::from))
 }
 
-/// Only declare a tool call when the client actually offered tools — a plain
-/// prompt (like the agent's non-stream smoke) gets a plain answer.
-fn has_tools(req: &Value) -> bool {
-    req["tools"].as_array().is_some_and(|t| !t.is_empty())
-}
-
 /// Echo the FIRST user message. Gives the agent's continuation check its
 /// discriminating power: with previous_response_id honored, turn 2's upstream
 /// history starts at turn 1's user message; without it, only turn 2's message

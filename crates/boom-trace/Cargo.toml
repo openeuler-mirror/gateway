@@ -16,6 +16,7 @@ otlp = [
     "dep:reqwest",
     "dep:prost",
     "dep:sha2",
+    "dep:bytes",
 ]
 
 [dependencies]
@@ -27,6 +28,7 @@ serde_json = { workspace = true }
 async-trait = { workspace = true }
 dashmap = { workspace = true }
 arc-swap = { workspace = true }
+bytes = { workspace = true, optional = true }
 chrono = { workspace = true }
 # hex is non-optional — `trace_filter_matches` (always compiled) encodes the
 # W3C trace_id as 32-char lowercase hex for pattern matching.

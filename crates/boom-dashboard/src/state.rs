@@ -262,6 +262,15 @@ pub struct DashboardState {
     /// alert reconciler. Erased to `Arc<dyn boom_core::AlertApi>` so
     /// boom-dashboard doesn't depend on boom-alert. Read by the status page.
     pub alerts: Arc<dyn boom_core::AlertApi>,
+    /// Daily business-volume snapshot for the analytics board (overview
+    /// page). Lazy TTL snapshots — refreshed only while someone is viewing
+    /// the page; no background task.
+    pub daily_stats: Arc<boom_audit::DailyStatsTracker>,
+    /// Snapshot caches for the analytics detail pages (model / consumption
+    /// / schedule). Self-contained: built once here, lazily refreshed on
+    /// dashboard requests only — nothing outside the dashboard touches
+    /// these, so (unlike daily_stats) there is no AppState wiring.
+    pub analytics: Arc<boom_audit::AnalyticsHub>,
 }
 
 impl DashboardState {
@@ -291,6 +300,7 @@ impl DashboardState {
         stressmon: Arc<dyn boom_core::StressmonApi>,
         trace: Arc<dyn boom_core::TraceApi>,
         alerts: Arc<dyn boom_core::AlertApi>,
+        daily_stats: Arc<boom_audit::DailyStatsTracker>,
     ) -> Self {
         // The session signing key must NOT be derived from the master key:
         // anyone who knows the master key (API clients, a leaked config file)
@@ -325,6 +335,8 @@ impl DashboardState {
             stressmon,
             trace,
             alerts,
+            daily_stats,
+            analytics: Arc::new(boom_audit::AnalyticsHub::new()),
         }
     }
 }
