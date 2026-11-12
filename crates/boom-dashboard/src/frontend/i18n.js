@@ -193,7 +193,8 @@
       "stress.info.help.sample_rate": "How often tokio runtime metrics and /proc/self/stat are read. 1 Hz = once per second.",
 
       "stats.inflight.title": "In-Flight Requests",
-      "stats.inflight.col.deployment": "Deployment",
+      "stats.inflight.col.model": "Model",
+      "stats.inflight.col.instance": "Instance",
       "stats.inflight.col.fc_queue": "FC queue",
       "stats.inflight.col.in_reqs": "In-model reqs",
       "stats.inflight.col.in_context": "In-model context",
@@ -204,6 +205,7 @@
       "stats.inflight.col.avg_prefix_hit_rate": "Avg prefix hit",
       "stats.inflight.no_inflight": "No in-flight requests.",
       "stats.inflight.24h_load_failed": "24h summary load failed: {error}",
+      "stats.inflight.grp_instances": "{n} backend instances of this model",
 
       "stats.rate.title": "Request Rate (per model)",
       "stats.rate.no_data": "No data.",
@@ -823,6 +825,7 @@
       "form.model.id": "Model ID",
       "form.model.deployment_id": "Deployment ID",
       "form.model.api_key": "API Key",
+      "form.model.keep_hint": "Configured — leave blank to keep current value",
       "form.model.api_key_env": "API Key is env reference",
       "form.model.base": "API Base URL",
       "form.model.version": "API Version",
@@ -1383,7 +1386,8 @@
       "stress.info.help.sample_rate": "读取 tokio 运行时指标和 /proc/self/stat 的频率。1 Hz = 每秒一次。",
 
       "stats.inflight.title": "在途请求",
-      "stats.inflight.col.deployment": "部署",
+      "stats.inflight.col.model": "模型",
+      "stats.inflight.col.instance": "实例",
       "stats.inflight.col.fc_queue": "流控队列",
       "stats.inflight.col.in_reqs": "模型在途",
       "stats.inflight.col.in_context": "上下文长度",
@@ -1394,6 +1398,7 @@
       "stats.inflight.col.avg_prefix_hit_rate": "平均前缀命中率",
       "stats.inflight.no_inflight": "暂无在途请求。",
       "stats.inflight.24h_load_failed": "24小时汇总加载失败：{error}",
+      "stats.inflight.grp_instances": "该模型共 {n} 个后端实例",
 
       "stats.rate.title": "请求速率（按模型）",
       "stats.rate.no_data": "暂无数据。",
@@ -2014,6 +2019,7 @@
       "form.model.id": "模型 ID",
       "form.model.deployment_id": "部署 ID",
       "form.model.api_key": "API Key",
+      "form.model.keep_hint": "已配置，留空保持不变",
       "form.model.api_key_env": "API Key 为环境变量引用",
       "form.model.base": "API Base URL",
       "form.model.version": "API 版本",
