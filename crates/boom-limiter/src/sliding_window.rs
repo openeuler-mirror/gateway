@@ -155,6 +155,17 @@ fn now_epoch_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Wall-clock aligned window start (tumbling window). All instances map the
+/// same wall interval of a cache_key onto the same generation, so the
+/// composite-PK DB row is the cluster-wide counter for that interval and a
+/// shared-mode pull always matches the local generation. Raw first-request
+/// anchoring would give each instance its own generation — peers would pull
+/// rows their generation check skips and under-count admission.
+fn aligned_window_start(now: u64, window_secs: u64) -> u64 {
+    let w = window_secs.max(1);
+    now - now % w
+}
+
 /// Partition a lifetime cost counter into the current budget period.
 ///
 /// Returns `(period_start, baseline, period_spend)`:
@@ -519,7 +530,7 @@ impl SlidingWindowLimiter {
                     c.g_counts = 0;
                     c.g_tokens = 0;
                     c.g_costs_micros = 0;
-                    c.window_start = now_epoch_secs();
+                    c.window_start = aligned_window_start(now, c.window_secs);
                 } else {
                     c.counts += weight;
                 }
@@ -531,7 +542,7 @@ impl SlidingWindowLimiter {
                 g_counts: 0,
                 g_tokens: 0,
                 g_costs_micros: 0,
-                window_start: now,
+                window_start: aligned_window_start(now, window_secs),
                 window_secs,
             });
     }
@@ -616,7 +627,7 @@ impl SlidingWindowLimiter {
                     c.g_counts = 0;
                     c.g_tokens = 0;
                     c.g_costs_micros = 0;
-                    c.window_start = now_epoch_secs();
+                    c.window_start = aligned_window_start(now, c.window_secs);
                 } else {
                     c.tokens += tokens;
                     c.costs_micros += costs_micros;
@@ -629,7 +640,7 @@ impl SlidingWindowLimiter {
                 g_counts: 0,
                 g_tokens: 0,
                 g_costs_micros: 0,
-                window_start: now,
+                window_start: aligned_window_start(now, window_secs),
                 window_secs,
             });
     }
@@ -2442,7 +2453,7 @@ mod tests {
         let c = limiter.windows.get(&ck).unwrap();
         assert_eq!(c.counts, 4);
         assert_eq!(c.g_counts, 0, "fresh generation starts from a zero base");
-        assert_eq!(c.window_start, now);
+        assert_eq!(c.window_start, aligned_window_start(now, 60));
     }
 
     #[tokio::test]
