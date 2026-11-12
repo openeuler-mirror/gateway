@@ -947,23 +947,30 @@ async fn chat_completions_inner(
     // successful fallback; a request clone is kept only when the pool
     // could roll back (the feature's only steady-state cost). ──
     let rb_patterns = &inner.config.router_settings.rollback.context.patterns;
-    let rb_route = crate::rollback::RollbackRoute {
+    let rb_route = boom_rollback::RollbackRoute {
         model: &resolved_model,
         key_hash: Some(&identity.key_hash),
         input_chars: input_chars as u64,
         prefix_bytes: &prefix_bytes,
         candidates: candidates.as_ref().map(|c| c.as_slice()).unwrap_or(&[]),
     };
-    let rb_capable = crate::rollback::capable(rb_patterns, rb_route.candidates);
+    let rb_capable = boom_rollback::capable(rb_patterns, rb_route.candidates);
     let mut provider = provider;
     let mut deployment_id = deployment_id;
     let mut fc_guard = fc_guard;
     let mut schedule_policy = schedule_policy;
     let mut rollback_from: Option<String> = None;
+    let rb_ctx = boom_rollback::RollbackCtx {
+        router: &state.router,
+        flow_controller: &state.flow_controller,
+        stats: &state.rollback_stats,
+        patterns: rb_patterns,
+        fc_queue_timeout_secs: inner.config.router_settings.flow_control_queue_timeout_secs(),
+    };
     macro_rules! rb_fail { ($err:expr, $stream:expr) => {{
         // Finalize FIRST so the audit row records the client-visible status
         // (400 passthrough for context errors), not the masked 502.
-        let rb_final = crate::rollback::finalize_error($err, rb_patterns, Some(&state.rollback_stats));
+        let rb_final = boom_rollback::finalize_error($err, rb_patterns, Some(&state.rollback_stats));
         let partial_usage = provider_billing.actual_usage();
         settle_partial_provider_accounting(&mut plan_charge, &provider_billing);
         log_error_with_usage(&state, &identity, &model, api_path, $stream, start, &rb_final, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()), user_tags.clone(), partial_usage.as_ref(), None);
@@ -998,13 +1005,13 @@ async fn chat_completions_inner(
             // pools, never on inert pools).
             match provider.chat_stream_with_context(req.clone(), provider_context.clone()).await {
                 Ok(s) => s,
-                Err(e) => match crate::rollback::attempt_stream(
-                    &state, &e, req, Some(provider_context),
+                Err(e) => match boom_rollback::attempt_stream(
+                    &rb_ctx, &e, req, Some(provider_context),
                     provider.clone(), deployment_id.clone(), fc_guard.take(),
                     is_vip, identity.key_alias.clone(), &rb_route,
                 ).await {
-                    crate::rollback::RollbackOutcome::NoRetry => rb_fail!(e, true),
-                    crate::rollback::RollbackOutcome::Retried { result, provider: p2, deployment_id: d2, fc_guard: g2, from_deployment_id } => {
+                    boom_rollback::RollbackOutcome::NoRetry => rb_fail!(e, true),
+                    boom_rollback::RollbackOutcome::Retried { result, provider: p2, deployment_id: d2, fc_guard: g2, from_deployment_id } => {
                         provider = p2;
                         deployment_id = d2;
                         fc_guard = g2;
@@ -1204,13 +1211,13 @@ async fn chat_completions_inner(
         let response = if rb_capable {
             match provider.chat_with_context(req.clone(), provider_context.clone()).await {
                 Ok(r) => r,
-                Err(e) => match crate::rollback::attempt_call(
-                    &state, &e, req, Some(provider_context),
+                Err(e) => match boom_rollback::attempt_call(
+                    &rb_ctx, &e, req, Some(provider_context),
                     provider.clone(), deployment_id.clone(), fc_guard.take(),
                     is_vip, identity.key_alias.clone(), &rb_route,
                 ).await {
-                    crate::rollback::RollbackOutcome::NoRetry => rb_fail!(e, false),
-                    crate::rollback::RollbackOutcome::Retried { result, provider: p2, deployment_id: d2, fc_guard: g2, from_deployment_id } => {
+                    boom_rollback::RollbackOutcome::NoRetry => rb_fail!(e, false),
+                    boom_rollback::RollbackOutcome::Retried { result, provider: p2, deployment_id: d2, fc_guard: g2, from_deployment_id } => {
                         provider = p2;
                         deployment_id = d2;
                         fc_guard = g2;
@@ -3559,22 +3566,29 @@ pub async fn messages(
     // ── Context rollback setup (design §6; see the chat handler for the
     // full rationale — clone reserved only on rollback-capable pools). ──
     let rb_patterns = &inner.config.router_settings.rollback.context.patterns;
-    let rb_route = crate::rollback::RollbackRoute {
+    let rb_route = boom_rollback::RollbackRoute {
         model: &resolved_model,
         key_hash: Some(&identity.key_hash),
         input_chars: input_chars as u64,
         prefix_bytes: &prefix_bytes,
         candidates: candidates.as_ref().map(|c| c.as_slice()).unwrap_or(&[]),
     };
-    let rb_capable = crate::rollback::capable(rb_patterns, rb_route.candidates);
+    let rb_capable = boom_rollback::capable(rb_patterns, rb_route.candidates);
     let mut provider = provider;
     let mut deployment_id = deployment_id;
     let mut fc_guard = fc_guard;
     let mut schedule_policy = schedule_policy;
     let mut rollback_from: Option<String> = None;
+    let rb_ctx = boom_rollback::RollbackCtx {
+        router: &state.router,
+        flow_controller: &state.flow_controller,
+        stats: &state.rollback_stats,
+        patterns: rb_patterns,
+        fc_queue_timeout_secs: inner.config.router_settings.flow_control_queue_timeout_secs(),
+    };
     macro_rules! rb_fail { ($err:expr, $stream:expr) => {{
         // Finalize FIRST so the audit row records the client-visible status.
-        let rb_final = crate::rollback::finalize_error($err, rb_patterns, Some(&state.rollback_stats));
+        let rb_final = boom_rollback::finalize_error($err, rb_patterns, Some(&state.rollback_stats));
         log_error(&state, &identity, &model, "/v1/messages", $stream, start, &rb_final, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()), user_tags.clone());
         write_prompt_log_error(
             &state,
@@ -3604,13 +3618,13 @@ pub async fn messages(
         let stream = if rb_capable {
             match provider.chat_stream(openai_req.clone()).await {
                 Ok(s) => s,
-                Err(e) => match crate::rollback::attempt_stream(
-                    &state, &e, openai_req, None,
+                Err(e) => match boom_rollback::attempt_stream(
+                    &rb_ctx, &e, openai_req, None,
                     provider.clone(), deployment_id.clone(), fc_guard.take(),
                     is_vip, identity.key_alias.clone(), &rb_route,
                 ).await {
-                    crate::rollback::RollbackOutcome::NoRetry => rb_fail!(e, true),
-                    crate::rollback::RollbackOutcome::Retried { result, provider: p2, deployment_id: d2, fc_guard: g2, from_deployment_id } => {
+                    boom_rollback::RollbackOutcome::NoRetry => rb_fail!(e, true),
+                    boom_rollback::RollbackOutcome::Retried { result, provider: p2, deployment_id: d2, fc_guard: g2, from_deployment_id } => {
                         provider = p2;
                         deployment_id = d2;
                         fc_guard = g2;
@@ -3787,13 +3801,13 @@ pub async fn messages(
         let response = if rb_capable {
             match provider.chat(openai_req.clone()).await {
                 Ok(r) => r,
-                Err(e) => match crate::rollback::attempt_call(
-                    &state, &e, openai_req, None,
+                Err(e) => match boom_rollback::attempt_call(
+                    &rb_ctx, &e, openai_req, None,
                     provider.clone(), deployment_id.clone(), fc_guard.take(),
                     is_vip, identity.key_alias.clone(), &rb_route,
                 ).await {
-                    crate::rollback::RollbackOutcome::NoRetry => rb_fail!(e, false),
-                    crate::rollback::RollbackOutcome::Retried { result, provider: p2, deployment_id: d2, fc_guard: g2, from_deployment_id } => {
+                    boom_rollback::RollbackOutcome::NoRetry => rb_fail!(e, false),
+                    boom_rollback::RollbackOutcome::Retried { result, provider: p2, deployment_id: d2, fc_guard: g2, from_deployment_id } => {
                         provider = p2;
                         deployment_id = d2;
                         fc_guard = g2;
@@ -4586,25 +4600,32 @@ pub async fn responses(
     // ── Context rollback setup (design §6; see the chat handler for the
     // full rationale — clone reserved only on rollback-capable pools). ──
     let rb_patterns = &inner.config.router_settings.rollback.context.patterns;
-    let rb_route = crate::rollback::RollbackRoute {
+    let rb_route = boom_rollback::RollbackRoute {
         model: &resolved_model,
         key_hash: Some(&identity.key_hash),
         input_chars: input_chars as u64,
         prefix_bytes: &prefix_bytes,
         candidates: candidates.as_ref().map(|c| c.as_slice()).unwrap_or(&[]),
     };
-    let rb_capable = crate::rollback::capable(rb_patterns, rb_route.candidates);
+    let rb_capable = boom_rollback::capable(rb_patterns, rb_route.candidates);
     let mut provider = provider;
     let mut deployment_id = deployment_id;
     let mut fc_guard = fc_guard;
     let mut schedule_policy = schedule_policy;
     let mut rollback_from: Option<String> = None;
+    let rb_ctx = boom_rollback::RollbackCtx {
+        router: &state.router,
+        flow_controller: &state.flow_controller,
+        stats: &state.rollback_stats,
+        patterns: rb_patterns,
+        fc_queue_timeout_secs: inner.config.router_settings.flow_control_queue_timeout_secs(),
+    };
     // Streaming failure is delivered IN-STREAM (responses_failed_sse);
     // non-streaming is a plain error return. persist_ctx uses take() so
     // the macro can expand on both the first-error and retry-error paths.
     macro_rules! rb_fail { ($err:expr, $stream:expr) => {{
         // Finalize FIRST so the audit row records the client-visible status.
-        let rb_final = crate::rollback::finalize_error($err, rb_patterns, Some(&state.rollback_stats));
+        let rb_final = boom_rollback::finalize_error($err, rb_patterns, Some(&state.rollback_stats));
         log_error(&state, &identity, &model, "/v1/responses", $stream, start, &rb_final, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()), user_tags.clone());
         write_prompt_log_error(
             &state,
@@ -4656,13 +4677,13 @@ pub async fn responses(
         let stream = if rb_capable {
             match provider.chat_stream(openai_req.clone()).await {
                 Ok(s) => s,
-                Err(e) => match crate::rollback::attempt_stream(
-                    &state, &e, openai_req, None,
+                Err(e) => match boom_rollback::attempt_stream(
+                    &rb_ctx, &e, openai_req, None,
                     provider.clone(), deployment_id.clone(), fc_guard.take(),
                     is_vip, identity.key_alias.clone(), &rb_route,
                 ).await {
-                    crate::rollback::RollbackOutcome::NoRetry => rb_fail!(e, true),
-                    crate::rollback::RollbackOutcome::Retried { result, provider: p2, deployment_id: d2, fc_guard: g2, from_deployment_id } => {
+                    boom_rollback::RollbackOutcome::NoRetry => rb_fail!(e, true),
+                    boom_rollback::RollbackOutcome::Retried { result, provider: p2, deployment_id: d2, fc_guard: g2, from_deployment_id } => {
                         provider = p2;
                         deployment_id = d2;
                         fc_guard = g2;
@@ -4853,13 +4874,13 @@ pub async fn responses(
         let response = if rb_capable {
             match provider.chat(openai_req.clone()).await {
                 Ok(r) => r,
-                Err(e) => match crate::rollback::attempt_call(
-                    &state, &e, openai_req, None,
+                Err(e) => match boom_rollback::attempt_call(
+                    &rb_ctx, &e, openai_req, None,
                     provider.clone(), deployment_id.clone(), fc_guard.take(),
                     is_vip, identity.key_alias.clone(), &rb_route,
                 ).await {
-                    crate::rollback::RollbackOutcome::NoRetry => rb_fail!(e, false),
-                    crate::rollback::RollbackOutcome::Retried { result, provider: p2, deployment_id: d2, fc_guard: g2, from_deployment_id } => {
+                    boom_rollback::RollbackOutcome::NoRetry => rb_fail!(e, false),
+                    boom_rollback::RollbackOutcome::Retried { result, provider: p2, deployment_id: d2, fc_guard: g2, from_deployment_id } => {
                         provider = p2;
                         deployment_id = d2;
                         fc_guard = g2;

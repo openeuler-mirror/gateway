@@ -7,7 +7,6 @@ mod hooks;
 mod kvc;
 mod migrations;
 mod request_log;
-mod rollback;
 mod rewrite;
 mod routes;
 mod state;
