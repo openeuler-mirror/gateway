@@ -20,6 +20,7 @@ members = [
     "crates/boom-alert",
     "crates/boom-trace",
     "crates/boom-gatekeeper",
+    "crates/boom-state",
     "crates/example-hooks",
     "crates/boom-responses",
     "dt-test",

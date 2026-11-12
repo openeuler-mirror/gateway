@@ -489,7 +489,7 @@ async fn reconcile_aliases(deps: &ReconcileDeps<'_>) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn reconcile_plans(deps: &ReconcileDeps<'_>) -> anyhow::Result<()> {
+pub(crate) async fn reconcile_plans(deps: &ReconcileDeps<'_>) -> anyhow::Result<()> {
     let rows = PlanStore::snapshot_plans_db(deps.pool).await?;
     let desired: Vec<String> = rows.iter().map(|r| r.name.clone()).collect();
 
@@ -524,7 +524,7 @@ async fn reconcile_plans(deps: &ReconcileDeps<'_>) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn reconcile_block_rules(deps: &ReconcileDeps<'_>) -> anyhow::Result<()> {
+pub(crate) async fn reconcile_block_rules(deps: &ReconcileDeps<'_>) -> anyhow::Result<()> {
     let rows = BlockRuleStore::list_all_db(deps.pool).await?;
     let desired: Vec<String> = rows.iter().map(|r| r.rule_name.clone()).collect();
 

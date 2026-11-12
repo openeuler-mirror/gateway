@@ -7,6 +7,7 @@ mod hooks;
 mod kvc;
 mod migrations;
 mod request_log;
+mod revision_watcher;
 mod rewrite;
 mod routes;
 mod state;
@@ -125,6 +126,12 @@ async fn async_main(
 
     // Spawn background sync task (persist rate limit state + cleanup memory).
     spawn_sync_task(state.clone(), shutdown_tx.subscribe());
+
+    // Cross-instance mechanisms: liveness heartbeat + config revision
+    // watcher (multi-instance propagation; single-instance no-ops into a
+    // cheap self-reconcile loop).
+    revision_watcher::spawn_instance_heartbeat(state.clone(), shutdown_tx.subscribe());
+    revision_watcher::spawn_revision_watcher(state.clone(), shutdown_tx.subscribe());
 
     // Spawn request summary logger (every 60s).
     spawn_request_summary(state.request_count.clone(), shutdown_tx.subscribe());

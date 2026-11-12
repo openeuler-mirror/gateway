@@ -1288,6 +1288,10 @@ pub async fn update_key(
                     token_hashes: vec![token_hash.clone()],
                 })
                 .await;
+            // Cross-instance: peers drop their auth caches on the next
+            // revision poll (≤5s); the 60s TTL remains the backstop.
+            boom_state::revision::bump_best_effort(db_pool, boom_state::revision::CATEGORY_AUTH)
+                .await;
             Json(json!({"ok": true})).into_response()
         }
         Ok(_) => (
@@ -1333,6 +1337,10 @@ pub async fn block_key(
                     token_hashes: vec![token_hash.clone()],
                 })
                 .await;
+            // Cross-instance: peers drop their auth caches on the next
+            // revision poll (≤5s); the 60s TTL remains the backstop.
+            boom_state::revision::bump_best_effort(db_pool, boom_state::revision::CATEGORY_AUTH)
+                .await;
             Json(json!({"ok": true})).into_response()
         }
         Ok(_) => (
@@ -1377,6 +1385,10 @@ pub async fn unblock_key(
                 .send(crate::state::AdminCommand::InvalidateAuthCache {
                     token_hashes: vec![token_hash.clone()],
                 })
+                .await;
+            // Cross-instance: peers drop their auth caches on the next
+            // revision poll (≤5s); the 60s TTL remains the backstop.
+            boom_state::revision::bump_best_effort(db_pool, boom_state::revision::CATEGORY_AUTH)
                 .await;
             Json(json!({"ok": true})).into_response()
         }
@@ -1442,6 +1454,10 @@ pub async fn delete_key(
                 .send(crate::state::AdminCommand::InvalidateAuthCache {
                     token_hashes: vec![token_hash.clone()],
                 })
+                .await;
+            // Cross-instance: peers drop their auth caches on the next
+            // revision poll (≤5s); the 60s TTL remains the backstop.
+            boom_state::revision::bump_best_effort(db_pool, boom_state::revision::CATEGORY_AUTH)
                 .await;
             Json(json!({"ok": true})).into_response()
         }
@@ -3603,6 +3619,13 @@ pub async fn update_team(
                         token_hashes: member_tokens,
                     })
                     .await;
+                // Cross-instance: team edit changes resolved identity for
+                // every member key — peers drop caches on next poll.
+                boom_state::revision::bump_best_effort(
+                    db_pool,
+                    boom_state::revision::CATEGORY_AUTH,
+                )
+                .await;
             }
             Json(json!({"ok": true})).into_response()
         }

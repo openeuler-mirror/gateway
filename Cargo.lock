@@ -380,6 +380,7 @@ dependencies = [
  "boom-limiter",
  "boom-promptlog",
  "boom-routing",
+ "boom-state",
  "chrono",
  "csv",
  "dashmap",
@@ -462,6 +463,7 @@ version = "0.1.0"
 dependencies = [
  "boom-config",
  "boom-core",
+ "boom-state",
  "chrono",
  "regex",
  "serde",
@@ -503,6 +505,7 @@ dependencies = [
  "async-trait",
  "boom-config",
  "boom-core",
+ "boom-state",
  "chrono",
  "dashmap",
  "futures",
@@ -539,6 +542,7 @@ dependencies = [
  "boom-provider",
  "boom-responses",
  "boom-routing",
+ "boom-state",
  "boom-stressmon",
  "boom-trace",
  "chrono",
@@ -646,6 +650,17 @@ dependencies = [
  "serde_yaml",
  "sqlx",
  "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "boom-state"
+version = "0.1.0"
+dependencies = [
+ "boom-core",
+ "chrono",
+ "sqlx",
  "tracing",
  "uuid",
 ]

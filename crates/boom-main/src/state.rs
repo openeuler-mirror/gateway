@@ -37,6 +37,10 @@ pub struct AppState {
     /// config). The write-back button generates `./config.yaml` from this
     /// state; a restart with that file adopts file mode.
     pub config_path: Option<String>,
+    /// Process identity for multi-instance mechanisms (heartbeat row,
+    /// later: quota-delta idempotency key). Fresh UUID per boot — a
+    /// restarted process is a new instance; never persisted.
+    pub instance_id: Arc<str>,
     /// Hot-swappable inner state (config + auth + health only).
     pub inner: Arc<ArcSwap<AppStateInner>>,
     /// DB pool survives reloads (avoids reconnection).
@@ -326,6 +330,11 @@ impl AppState {
             if let Err(e) = boom_responses::migrations::run(pool).await {
                 tracing::error!("Failed to run responses-store migration: {}", e);
             }
+            // Cross-instance mechanism tables (boom-state owns
+            // boom_instance_state / boom_config_revision). Fatal like the
+            // dashboard migrations: the revision watcher and heartbeat
+            // depend on them existing.
+            boom_state::migrations::run(pool).await?;
 
             crate::migrations::ensure_config_meta_table(pool).await?;
 
@@ -467,6 +476,7 @@ impl AppState {
         let state = Self {
             response_store,
             config_path,
+            instance_id: boom_state::generate_instance_id().into(),
             inner: Arc::new(ArcSwap::from_pointee(inner)),
             db_pool,
             dashboard_db_pool,
