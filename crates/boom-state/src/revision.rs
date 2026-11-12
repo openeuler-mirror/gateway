@@ -13,6 +13,11 @@ pub const CATEGORY_BLOCKLIST: &str = "blocklist";
 /// Verification-token rows changed — other instances must drop their auth
 /// cache (`boom_verification_token` writes).
 pub const CATEGORY_AUTH: &str = "auth";
+/// Quota decision-base switch flipped (`boom_config` KV
+/// `decision_base_shared`). Covers only the shared/local enforcement view —
+/// the counter deltas themselves need no broadcast (they converge through
+/// the incremental push protocol).
+pub const CATEGORY_QUOTA: &str = "quota";
 
 /// Atomically increment a category's revision counter.
 ///

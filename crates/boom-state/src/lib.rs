@@ -23,7 +23,7 @@ pub mod revision;
 pub use registry::{generate_instance_id, heartbeat, live_instances, InstanceInfo, InstanceRow};
 pub use revision::{
     bump, bump_best_effort, snapshot, CATEGORY_ASSIGNMENT, CATEGORY_AUTH, CATEGORY_BLOCKLIST,
-    CATEGORY_PLAN,
+    CATEGORY_PLAN, CATEGORY_QUOTA,
 };
 
 /// Heartbeat cadence for `spawn_instance_heartbeat`.

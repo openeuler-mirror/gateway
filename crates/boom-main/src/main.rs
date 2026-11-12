@@ -673,8 +673,8 @@ fn spawn_periodic_fc_dispatch(
     tracing::info!("Periodic FC dispatch task spawned (every 1s)");
 }
 
-/// Background task: every 10 minutes, snapshot in-memory state to DB and cleanup.
-/// Also persists cumulative token/cost counters (formerly owned by boom-quota).
+/// Background task: run the limiter's incremental delta sync cycle
+/// (default 60s, `quota_sync.interval_secs` 30–600s) and clean up memory.
 fn spawn_sync_task(state: AppState, mut shutdown: tokio::sync::broadcast::Receiver<()>) {
     let db_pool = state.db_pool.clone();
     let limiter = state.limiter.clone();
@@ -696,28 +696,55 @@ fn spawn_sync_task(state: AppState, mut shutdown: tokio::sync::broadcast::Receiv
         }
 
         loop {
-            // Wait for next sync cycle or shutdown signal.
+            // Interval is re-read each cycle so a reload (SIGHUP / config
+            // section write) adjusts the cadence without a restart. Clamped
+            // to 30–600s by the config getter.
+            let interval_secs = {
+                let inner = state.inner.load();
+                inner.config.quota_sync.effective_interval_secs()
+            };
             tokio::select! {
-                _ = tokio::time::sleep(std::time::Duration::from_secs(600)) => {}
+                _ = tokio::time::sleep(std::time::Duration::from_secs(interval_secs)) => {}
                 _ = shutdown.recv() => {
                     tracing::debug!("Sync task shutting down");
                     return;
                 }
             }
 
-            // 1. Snapshot rate limit counters (windows + cumulative) → upsert into DB (with timeout).
-            let entries = limiter.snapshot();
-            if !entries.is_empty() {
-                let count = entries.len();
-                let batch_result = tokio::time::timeout(
-                    std::time::Duration::from_secs(30),
-                    limiter.sync_counters_to_db(&pool),
-                )
-                .await;
-                if batch_result.is_err() {
-                    tracing::warn!("Rate limit state sync timed out after 30s, {} entries skipped", count);
-                } else {
-                    tracing::debug!("Synced {} rate limit counter(s) to DB", count);
+            // 1. Incremental delta cycle: purge expired rows, push local
+            //    deltas (watermarked, idempotent), pull peer globals when
+            //    decisions are shared. An ambiguous outcome (timeout) is
+            //    safe: the watermark row makes the retry skip a committed
+            //    batch instead of double-applying it.
+            let cycle_result = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                limiter.sync_delta_cycle(&pool),
+            )
+            .await;
+            match cycle_result {
+                Ok(Ok(stats)) => {
+                    if stats.window_deltas > 0
+                        || stats.cumulative_deltas > 0
+                        || stats.recovered_from_watermark
+                    {
+                        tracing::debug!(
+                            window_deltas = stats.window_deltas,
+                            cumulative_deltas = stats.cumulative_deltas,
+                            pulled_windows = stats.pulled_windows,
+                            pulled_cumulative = stats.pulled_cumulative,
+                            recovered = stats.recovered_from_watermark,
+                            "Quota delta sync cycle"
+                        );
+                    }
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("Quota delta sync failed (will retry): {}", e);
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "Quota delta sync timed out after 30s — next cycle checks the \
+                         watermark and recovers a committed-but-unmirrored push"
+                    );
                 }
             }
 
@@ -747,7 +774,7 @@ fn spawn_sync_task(state: AppState, mut shutdown: tokio::sync::broadcast::Receiv
             }
         }
     });
-    tracing::info!("Background sync task spawned (every 10 min)");
+    tracing::info!("Background quota delta sync task spawned (default 60s, 30-600s configurable)");
 }
 
 /// Spawn the TTL prune task if kvc_aware is enabled. Delegates to

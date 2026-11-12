@@ -8,7 +8,8 @@ pub use concurrency::{
 };
 pub use migrations::{
     assignment_alter_ddl, assignment_ddl, cumulative_ddl, plan_alter_ddl, plan_ddl,
-    rate_limit_state_ddl, state_alter_ddl, team_assignment_ddl,
+    quota_delta_ddl, rate_limit_state_ddl, state_alter_ddl, state_pk_alter_ddl,
+    team_assignment_ddl,
 };
 pub use sliding_window::{
     decimal_to_micros, micros_to_decimal, CumulativeKind, CumulativeSnapshot, QuotaScope,

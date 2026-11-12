@@ -156,6 +156,25 @@ async fn dispatch(category: &str, state: &AppState, pool: &PgPool) {
             state.inner.load().auth.invalidate_all().await;
             tracing::info!("auth cache invalidated (revision bump)");
         }
+        boom_state::CATEGORY_QUOTA => {
+            // Decision-base flip: re-adopt the KV and switch the limiter's
+            // enforcement view. Counter data itself needs no action — the
+            // incremental push protocol converges it regardless of mode.
+            let shared = match boom_dashboard::config_kv::get_bool(
+                pool,
+                boom_dashboard::config_kv::DECISION_BASE_SHARED,
+            )
+            .await
+            {
+                Ok(v) => v.unwrap_or(false),
+                Err(e) => {
+                    tracing::warn!(error = %e, "decision-base re-adopt failed; keeping current mode");
+                    return;
+                }
+            };
+            state.limiter.set_decision_shared(shared);
+            tracing::info!(shared, "quota decision base switched (revision bump)");
+        }
         other => {
             tracing::debug!(category = other, "revision bump for unknown category — ignored");
         }

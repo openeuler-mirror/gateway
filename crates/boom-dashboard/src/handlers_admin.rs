@@ -530,6 +530,65 @@ pub async fn set_trace_metrics_enabled(
 }
 
 // ═══════════════════════════════════════════════════════════
+// Quota decision base (boom_config KV)
+// ═══════════════════════════════════════════════════════════
+
+/// GET /admin/decision-base — current enforcement view.
+pub async fn get_decision_base(
+    _session: AdminSession,
+    Extension(state): Extension<std::sync::Arc<DashboardState>>,
+) -> Response {
+    Json(json!({ "shared": state.limiter.decision_shared() })).into_response()
+}
+
+/// PUT /admin/decision-base — flip the DB-authoritative quota decision base
+/// (`boom_config` KV `decision_base_shared`). Body: `{ "shared": bool }`.
+/// DB write first, local memory second, then a revision bump so peer
+/// instances re-adopt on their next poll (≤5s). Counter data is unaffected —
+/// the incremental push protocol runs in both modes.
+#[derive(Debug, Deserialize)]
+pub struct SetDecisionBaseRequest {
+    pub shared: bool,
+}
+
+pub async fn set_decision_base(
+    _session: AdminSession,
+    Extension(state): Extension<std::sync::Arc<DashboardState>>,
+    Json(req): Json<SetDecisionBaseRequest>,
+) -> Response {
+    let db_pool = match &state.db_pool {
+        Some(pool) => pool,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "Database not available — decision base is a DB-backed cluster switch"
+                })),
+            )
+                .into_response()
+        }
+    };
+    match crate::config_kv::set_bool(db_pool, crate::config_kv::DECISION_BASE_SHARED, req.shared)
+        .await
+    {
+        Ok(()) => {
+            state.limiter.set_decision_shared(req.shared);
+            boom_state::revision::bump_best_effort(db_pool, boom_state::CATEGORY_QUOTA).await;
+            tracing::info!(shared = req.shared, "Quota decision base updated");
+            Json(json!({"ok": true, "shared": req.shared})).into_response()
+        }
+        Err(e) => {
+            tracing::error!("set_decision_base failed: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "Internal error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
 // Key management (DB operations)
 // ═══════════════════════════════════════════════════════════
 

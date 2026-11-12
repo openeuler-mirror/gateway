@@ -17,6 +17,12 @@ use sqlx::PgPool;
 /// Metrics channel switch (`trace.metrics.enabled` YAML field is seed-only).
 pub const TRACE_METRICS_ENABLED: &str = "trace_metrics_enabled";
 
+/// Quota decision base: `true` = shared (admission checks use global base +
+/// local increment, bases refreshed from peer pushes at each sync cycle),
+/// `false` = local (instances enforce independently; counter deltas still
+/// push incrementally for billing convergence in both modes).
+pub const DECISION_BASE_SHARED: &str = "decision_base_shared";
+
 fn value_to_bool(v: serde_json::Value) -> Option<bool> {
     match v {
         serde_json::Value::Bool(b) => Some(b),

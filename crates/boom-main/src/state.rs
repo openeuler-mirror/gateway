@@ -244,8 +244,12 @@ impl AppState {
             None => None,
         };
 
-        // 2. Limiter survives across reloads.
+        // 2. Limiter survives across reloads. Its instance identity (delta
+        // protocol watermark namespace) is assigned once per boot, before
+        // any traffic can touch the counters.
+        let instance_id: Arc<str> = boom_state::generate_instance_id().into();
         let limiter = Arc::new(SlidingWindowLimiter::new());
+        limiter.set_instance_id(instance_id.to_string());
 
         // 3. Plan store survives across reloads.
         let plan_store = Arc::new(PlanStore::new());
@@ -380,6 +384,19 @@ impl AppState {
                 .await?,
             );
 
+            // Quota decision base: shared (global) vs local (per-instance)
+            // enforcement view. DB-authoritative, seeded local on first
+            // boot — the conservative default keeps multi-instance rate
+            // enforcement independent until an operator opts in. Counter
+            // deltas push incrementally in BOTH modes.
+            let decision_shared = boom_dashboard::config_kv::adopt_bool(
+                pool,
+                boom_dashboard::config_kv::DECISION_BASE_SHARED,
+                false,
+            )
+            .await?;
+            limiter.set_decision_shared(decision_shared);
+
             // Restore runtime state.
             plan_store.restore_assignments_from_db(pool).await;
             plan_store.restore_team_assignments_from_db(pool).await;
@@ -476,7 +493,7 @@ impl AppState {
         let state = Self {
             response_store,
             config_path,
-            instance_id: boom_state::generate_instance_id().into(),
+            instance_id: instance_id.clone(),
             inner: Arc::new(ArcSwap::from_pointee(inner)),
             db_pool,
             dashboard_db_pool,
@@ -774,6 +791,15 @@ impl AppState {
                 )
                 .await?,
             );
+            // Quota decision base re-adopt on reload (same DB-wins pattern;
+            // normally propagated by the revision watcher's quota category).
+            let decision_shared = boom_dashboard::config_kv::adopt_bool(
+                pool,
+                boom_dashboard::config_kv::DECISION_BASE_SHARED,
+                false,
+            )
+            .await?;
+            self.limiter.set_decision_shared(decision_shared);
         }
 
         self.register_fusion_models(&new_config).await?;

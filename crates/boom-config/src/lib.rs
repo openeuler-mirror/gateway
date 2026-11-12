@@ -41,6 +41,9 @@ pub struct Config {
     pub server: ServerSettings,
     #[serde(default)]
     pub rate_limit: RateLimitSettings,
+    /// Limiter delta-sync cadence (multi-instance incremental protocol).
+    #[serde(default)]
+    pub quota_sync: QuotaSyncSettings,
     #[serde(default)]
     pub plan_settings: PlanSettings,
     /// Reusable billing templates — referenced by `model_info.cost_template`.
@@ -932,6 +935,36 @@ fn default_port() -> u16 {
 }
 fn default_workers() -> usize {
     4
+}
+
+/// Cadence of the limiter's incremental delta sync (windows + cumulative
+/// counters → DB). Process-level (per-instance) parameter: reload-effective,
+/// not business config. Clamped to 30–600s at read time; default 60s.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct QuotaSyncSettings {
+    #[serde(default = "default_quota_sync_interval_secs")]
+    pub interval_secs: u64,
+}
+
+fn default_quota_sync_interval_secs() -> u64 {
+    60
+}
+
+impl Default for QuotaSyncSettings {
+    fn default() -> Self {
+        Self {
+            interval_secs: default_quota_sync_interval_secs(),
+        }
+    }
+}
+
+impl QuotaSyncSettings {
+    /// Effective interval, clamped to the supported 30s–600s band. A YAML
+    /// value outside the band clamps (not rejects) — the sync must never be
+    /// turned into a hot-loop or silently disabled by a typo.
+    pub fn effective_interval_secs(&self) -> u64 {
+        self.interval_secs.clamp(30, 600)
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -2285,5 +2318,22 @@ client_blocklist:
       action: { message: "no" }
 "#;
         assert!(serde_yaml::from_str::<Config>(yaml).is_err());
+    }
+
+    #[test]
+    fn quota_sync_defaults_and_clamp() {
+        // Absent section → default interval 60s.
+        let cfg: Config = serde_yaml::from_str("server: {}\n").unwrap();
+        assert_eq!(cfg.quota_sync.effective_interval_secs(), 60);
+        // In-band value passes through; out-of-band values clamp to the
+        // 30–600s boundaries (never a hot loop, never silently disabled).
+        let cfg: Config =
+            serde_yaml::from_str("quota_sync: { interval_secs: 45 }\n").unwrap();
+        assert_eq!(cfg.quota_sync.effective_interval_secs(), 45);
+        let cfg: Config = serde_yaml::from_str("quota_sync: { interval_secs: 1 }\n").unwrap();
+        assert_eq!(cfg.quota_sync.effective_interval_secs(), 30);
+        let cfg: Config =
+            serde_yaml::from_str("quota_sync: { interval_secs: 99999 }\n").unwrap();
+        assert_eq!(cfg.quota_sync.effective_interval_secs(), 600);
     }
 }

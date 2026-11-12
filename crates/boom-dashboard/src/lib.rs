@@ -366,6 +366,11 @@ pub fn build_router<S: Clone + Send + Sync + 'static>(state: DashboardState) -> 
             get(handlers_admin::get_trace_metrics_enabled)
                 .put(handlers_admin::set_trace_metrics_enabled),
         )
+        // Admin — Quota decision base (shared vs local enforcement view).
+        .route(
+            "/dashboard/api/admin/decision-base",
+            get(handlers_admin::get_decision_base).put(handlers_admin::set_decision_base),
+        )
         // Admin — Hot-reload config.
         .route(
             "/dashboard/api/admin/config/reload",

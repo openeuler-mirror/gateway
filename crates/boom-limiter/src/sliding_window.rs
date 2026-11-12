@@ -184,19 +184,41 @@ fn budget_period_partition(
 
 /// In-memory rate limiter + quota store. Survives config reloads.
 /// Persisted to `boom_rate_limit_state` (windows) and `boom_rate_limit_cumulative`.
+///
+/// Multi-instance counter model (delta protocol): each in-memory counter is
+/// split into a global base (`g_*` — mirror of the shared DB row, refreshed
+/// at boot-restore, by our own pushes, and by pulls) plus the local unpushed
+/// increment (`counts`/`tokens`/`costs_micros`, zeroed on every successful
+/// push). Admission checks and dashboard reads use the sum — the 判定口径 is
+/// 全局基数 + 本地增量. `decision_shared=false` (the default) freezes the
+/// base at boot + own pushes, i.e. instances enforce independently while
+/// billing data still converges in the DB via pushes.
 pub struct SlidingWindowLimiter {
     /// Window counters: `{kh}:{model}:{secs}` → WindowCounter (three dimensions).
     windows: Arc<DashMap<String, WindowCounter>>,
-    /// Permanent counters: `kc:{kh}:{kind}` / `tc:{tid}:{kind}` → value.
+    /// Permanent counters: `kc:{kh}:{kind}` / `tc:{tid}:{kind}` → entry.
     /// Value is tokens for tin/tout, micros (1e-6 USD) for cost kinds.
-    cumulative: Arc<DashMap<String, i64>>,
-    /// Entries touched since last sync.
-    dirty_windows: Arc<RwLock<HashSet<String>>>,
+    cumulative: Arc<DashMap<String, CumulativeEntry>>,
+    /// Cumulative keys touched since last push (windows derive dirtiness
+    /// from non-zero unpushed dims; the cumulative map can hold every key
+    /// that ever had traffic, so a precise set avoids full scans).
     dirty_cumulative: Arc<RwLock<HashSet<String>>>,
+    /// Snapshot-class cumulative keys (budget-period anchors) pending a
+    /// full-value upsert — unlike delta counters these are overwritten, so
+    /// a retried push is naturally idempotent.
+    dirty_snapshots: Arc<RwLock<HashSet<String>>>,
     /// Budget-period anchors keyed by the `BudgetPeriodStart` cache_key.
     /// Kept in a single map entry so the start/baseline pair is read and
     /// updated atomically (the two cumulative rows are the persisted mirror).
     budget_periods: Arc<DashMap<String, BudgetPeriod>>,
+    /// Instance identity for the delta protocol's watermark rows. Set once
+    /// at boot by boom-main (before traffic); `None` disables pushes.
+    instance_id: RwLock<Option<String>>,
+    /// Monotonic push sequence within this boot's instance_id namespace.
+    push_seq: std::sync::atomic::AtomicI64,
+    /// When true, the sync cycle also pulls peer deltas into the global
+    /// bases (shared enforcement). Default false → per-instance decisions.
+    decision_shared: std::sync::atomic::AtomicBool,
 }
 
 /// Current `max_budget` period for one scope.
@@ -208,17 +230,54 @@ struct BudgetPeriod {
     baseline: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 struct WindowCounter {
-    /// Request-count dimension (RPM, custom-window counts).
+    /// Unpushed local request-count increments (RPM, custom-window counts).
     counts: u64,
-    /// Token-rate dimension (TPM, custom-window tokens).
+    /// Unpushed local token increments (TPM, custom-window tokens).
     tokens: u64,
-    /// Cost-rate dimension (cost-per-window, stored as micros 1e-6 USD).
+    /// Unpushed local cost increments (micros 1e-6 USD).
     costs_micros: u64,
+    /// Global base for the counts dimension (DB row mirror, this generation).
+    g_counts: u64,
+    /// Global base for the tokens dimension.
+    g_tokens: u64,
+    /// Global base for the costs dimension (micros).
+    g_costs_micros: u64,
     /// Unix epoch seconds when this window started.
     window_start: u64,
     window_secs: u64,
+}
+
+impl WindowCounter {
+    /// Effective counts dimension: global base + local unpushed increment.
+    fn eff_counts(&self) -> u64 {
+        self.g_counts.saturating_add(self.counts)
+    }
+    fn eff_tokens(&self) -> u64 {
+        self.g_tokens.saturating_add(self.tokens)
+    }
+    fn eff_costs_micros(&self) -> u64 {
+        self.g_costs_micros.saturating_add(self.costs_micros)
+    }
+    /// True when there is nothing to push in any dimension.
+    fn has_unpushed(&self) -> bool {
+        self.counts != 0 || self.tokens != 0 || self.costs_micros != 0
+    }
+}
+
+/// One permanent counter: local unpushed delta on top of a global base.
+/// Signed because admin team-rollup adjustments can locally subtract.
+#[derive(Debug, Clone, Copy, Default)]
+struct CumulativeEntry {
+    value: i64,
+    g: i64,
+}
+
+impl CumulativeEntry {
+    fn effective(&self) -> i64 {
+        self.g.saturating_add(self.value)
+    }
 }
 
 impl SlidingWindowLimiter {
@@ -226,10 +285,34 @@ impl SlidingWindowLimiter {
         Self {
             windows: Arc::new(DashMap::new()),
             cumulative: Arc::new(DashMap::new()),
-            dirty_windows: Arc::new(RwLock::new(HashSet::new())),
             dirty_cumulative: Arc::new(RwLock::new(HashSet::new())),
+            dirty_snapshots: Arc::new(RwLock::new(HashSet::new())),
             budget_periods: Arc::new(DashMap::new()),
+            instance_id: RwLock::new(None),
+            push_seq: std::sync::atomic::AtomicI64::new(0),
+            decision_shared: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Assign the instance identity used for delta-push watermark rows.
+    /// Called once at boot, before any traffic.
+    pub fn set_instance_id(&self, instance_id: String) {
+        if let Ok(mut guard) = self.instance_id.write() {
+            *guard = Some(instance_id);
+        }
+    }
+
+    /// Flip the decision base: `true` = global (pull peer deltas into the
+    /// bases at each sync cycle), `false` = per-instance independent
+    /// enforcement. Pushes (billing convergence) happen in both modes.
+    pub fn set_decision_shared(&self, shared: bool) {
+        self.decision_shared
+            .store(shared, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn decision_shared(&self) -> bool {
+        self.decision_shared
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Build the internal window cache_key from rate limit key and window duration.
@@ -266,7 +349,7 @@ impl SlidingWindowLimiter {
                     if elapsed >= c.window_secs {
                         (0u64, 0u64, 0u64)
                     } else {
-                        (c.counts, c.tokens, c.costs_micros)
+                        (c.eff_counts(), c.eff_tokens(), c.eff_costs_micros())
                     }
                 }
                 None => (0u64, 0u64, 0u64),
@@ -351,7 +434,7 @@ impl SlidingWindowLimiter {
                     .get(&k)
                     .map(|c| {
                         let elapsed = now.saturating_sub(c.window_start);
-                        if elapsed >= c.window_secs { 0 } else { c.counts }
+                        if elapsed >= c.window_secs { 0 } else { c.eff_counts() }
                     })
                     .unwrap_or(0);
                 limit.saturating_sub(cur).saturating_sub(weight)
@@ -405,7 +488,7 @@ impl SlidingWindowLimiter {
                 let k = Self::cache_key(key, secs);
                 self.windows
                     .get(&k)
-                    .map(|c| limit.saturating_sub(c.counts))
+                    .map(|c| limit.saturating_sub(c.eff_counts()))
                     .unwrap_or(limit)
             })
             .unwrap_or(u64::MAX);
@@ -427,9 +510,15 @@ impl SlidingWindowLimiter {
             .and_modify(|c| {
                 let elapsed = now_epoch_secs().saturating_sub(c.window_start);
                 if elapsed >= c.window_secs {
+                    // Rollover into a fresh generation: local unpushed AND the
+                    // global bases reset together — the new generation's DB row
+                    // is created by the next push, keyed by the new window_start.
                     c.counts = weight;
                     c.tokens = 0;
                     c.costs_micros = 0;
+                    c.g_counts = 0;
+                    c.g_tokens = 0;
+                    c.g_costs_micros = 0;
                     c.window_start = now_epoch_secs();
                 } else {
                     c.counts += weight;
@@ -439,10 +528,12 @@ impl SlidingWindowLimiter {
                 counts: weight,
                 tokens: 0,
                 costs_micros: 0,
+                g_counts: 0,
+                g_tokens: 0,
+                g_costs_micros: 0,
                 window_start: now,
                 window_secs,
             });
-        self.mark_dirty_window(cache_key);
     }
 
     /// Phase 3: settle real token/cost usage after upstream returns.
@@ -522,6 +613,9 @@ impl SlidingWindowLimiter {
                     c.counts = 0;
                     c.tokens = tokens;
                     c.costs_micros = costs_micros;
+                    c.g_counts = 0;
+                    c.g_tokens = 0;
+                    c.g_costs_micros = 0;
                     c.window_start = now_epoch_secs();
                 } else {
                     c.tokens += tokens;
@@ -532,10 +626,12 @@ impl SlidingWindowLimiter {
                 counts: 0,
                 tokens,
                 costs_micros,
+                g_counts: 0,
+                g_tokens: 0,
+                g_costs_micros: 0,
                 window_start: now,
                 window_secs,
             });
-        self.mark_dirty_window(cache_key);
     }
 
     // ── Cumulative: peek / add / reset ──
@@ -545,7 +641,7 @@ impl SlidingWindowLimiter {
         let key = cumulative_cache_key(scope, kind);
         self.cumulative
             .get(&key)
-            .map(|r| (*r.value()).max(0) as u64)
+            .map(|r| r.value().effective().max(0) as u64)
             .unwrap_or(0)
     }
 
@@ -605,19 +701,32 @@ impl SlidingWindowLimiter {
         }
         let key = cumulative_cache_key(scope, kind);
         {
-            let mut entry = self.cumulative.entry(key.clone()).or_insert_with(|| 0i64);
-            *entry += delta as i64;
+            let mut entry = self
+                .cumulative
+                .entry(key.clone())
+                .or_insert_with(CumulativeEntry::default);
+            entry.value_mut().value += delta as i64;
         }
         self.mark_dirty_cumulative(&key);
     }
 
+    /// Snapshot-class write (budget-period anchors): full-value overwrite of
+    /// the global base. Retried pushes rewrite the same value — idempotent
+    /// without a watermark entry.
     fn overwrite_cumulative(&self, scope: &QuotaScope, kind: CumulativeKind, value: u64) {
         let key = cumulative_cache_key(scope, kind);
         {
-            let mut entry = self.cumulative.entry(key.clone()).or_insert_with(|| 0i64);
-            *entry = value as i64;
+            let mut entry = self
+                .cumulative
+                .entry(key.clone())
+                .or_insert_with(CumulativeEntry::default);
+            let e = entry.value_mut();
+            e.g = value as i64;
+            e.value = 0;
         }
-        self.mark_dirty_cumulative(&key);
+        if let Ok(mut s) = self.dirty_snapshots.write() {
+            s.insert(key);
+        }
     }
 
     /// Reset all cumulative counters for a scope to zero (in-memory only).
@@ -645,8 +754,8 @@ impl SlidingWindowLimiter {
         let key = cumulative_cache_key(scope, kind);
         let prev = match self.cumulative.get_mut(&key) {
             Some(mut entry) => {
-                let prev = (*entry).max(0) as u64;
-                *entry = 0;
+                let prev = entry.value().effective().max(0) as u64;
+                *entry.value_mut() = CumulativeEntry::default();
                 prev
             }
             None => 0,
@@ -664,9 +773,9 @@ impl SlidingWindowLimiter {
             let elapsed = now.saturating_sub(counter.window_start);
             WindowUsage {
                 cache_key: cache_key.to_string(),
-                counts: counter.counts,
-                tokens: counter.tokens,
-                costs_micros: counter.costs_micros,
+                counts: counter.eff_counts(),
+                tokens: counter.eff_tokens(),
+                costs_micros: counter.eff_costs_micros(),
                 window_secs: counter.window_secs,
                 elapsed_secs: elapsed,
             }
@@ -684,9 +793,9 @@ impl SlidingWindowLimiter {
                 let elapsed = now.saturating_sub(entry.value().window_start);
                 WindowUsage {
                     cache_key: entry.key().clone(),
-                    counts: entry.value().counts,
-                    tokens: entry.value().tokens,
-                    costs_micros: entry.value().costs_micros,
+                    counts: entry.value().eff_counts(),
+                    tokens: entry.value().eff_tokens(),
+                    costs_micros: entry.value().eff_costs_micros(),
                     window_secs: entry.value().window_secs,
                     elapsed_secs: elapsed,
                 }
@@ -722,9 +831,9 @@ impl SlidingWindowLimiter {
                 let counter = entry.value();
                 WindowUsage {
                     cache_key: entry.key().clone(),
-                    counts: counter.counts,
-                    tokens: counter.tokens,
-                    costs_micros: counter.costs_micros,
+                    counts: counter.eff_counts(),
+                    tokens: counter.eff_tokens(),
+                    costs_micros: counter.eff_costs_micros(),
                     window_secs: counter.window_secs,
                     elapsed_secs: now.saturating_sub(counter.window_start),
                 }
@@ -763,23 +872,25 @@ impl SlidingWindowLimiter {
                 Err(_) => continue,
             };
             let remaining_secs = counter.window_secs.saturating_sub(elapsed);
+            let eff_tokens = counter.eff_tokens();
+            let eff_costs = counter.eff_costs_micros();
 
-            if counter.tokens > 0 {
+            if eff_tokens > 0 {
                 out.push(WindowInfo {
                     kind: WindowKind::Tokens,
                     model: model.to_string(),
                     window_secs: secs,
-                    count: counter.tokens,
+                    count: eff_tokens,
                     elapsed_secs: elapsed,
                     remaining_secs,
                 });
             }
-            if counter.costs_micros > 0 {
+            if eff_costs > 0 {
                 out.push(WindowInfo {
                     kind: WindowKind::CostMicros,
                     model: model.to_string(),
                     window_secs: secs,
-                    count: counter.costs_micros,
+                    count: eff_costs,
                     elapsed_secs: elapsed,
                     remaining_secs,
                 });
@@ -795,9 +906,7 @@ impl SlidingWindowLimiter {
     pub fn clear_windows(&self, key: &RateLimitKey, window_secs_list: &[u64]) {
         for &window_secs in window_secs_list {
             let win_key = Self::cache_key(key, window_secs);
-            if self.windows.remove(&win_key).is_some() {
-                self.mark_dirty_window(&win_key);
-            }
+            self.windows.remove(&win_key);
         }
     }
 
@@ -814,8 +923,6 @@ impl SlidingWindowLimiter {
                 true
             }
         });
-        // Dirty tracking: caller will sync whole windows table on next reset,
-        // so we don't bother marking individual keys dirty here.
         removed
     }
 
@@ -827,40 +934,21 @@ impl SlidingWindowLimiter {
     pub fn clear_all_windows(&self) -> usize {
         let count = self.windows.len();
         self.windows.clear();
-        self.dirty_windows.write().expect("dirty lock poisoned").clear();
         count
     }
 
-    // ── Snapshot / restore (in-memory ↔ DB) ──
+    // ── Restore (DB → in-memory, boot path) ──
 
-    /// Snapshot all non-expired window entries for DB persistence.
-    pub fn snapshot(&self) -> Vec<WindowSnapshot> {
-        let now = now_epoch_secs();
-        self.windows
-            .iter()
-            .filter(|entry| {
-                let elapsed = now.saturating_sub(entry.value().window_start);
-                elapsed < entry.value().window_secs
-            })
-            .map(|entry| WindowSnapshot {
-                cache_key: entry.key().clone(),
-                counts: entry.value().counts,
-                tokens: entry.value().tokens,
-                costs_micros: entry.value().costs_micros,
-                window_start: entry.value().window_start,
-                window_secs: entry.value().window_secs,
-            })
-            .collect()
-    }
-
-    /// Restore a window counter entry from DB into memory.
-    /// Only restores if the window hasn't expired yet.
+    /// Restore a window counter's global base from DB (boot path).
+    /// Only restores if the window hasn't expired yet. The DB row holds the
+    /// GLOBAL counter — an instance joining mid-window adopts it as its base
+    /// with zero local unpushed increments.
     pub fn restore_counter(
         &self,
         cache_key: String,
-        counts: u64,
-        tokens: u64,
-        costs_micros: u64,
+        g_counts: u64,
+        g_tokens: u64,
+        g_costs_micros: u64,
         window_start: u64,
         window_secs: u64,
     ) {
@@ -869,9 +957,12 @@ impl SlidingWindowLimiter {
             self.windows.insert(
                 cache_key,
                 WindowCounter {
-                    counts,
-                    tokens,
-                    costs_micros,
+                    counts: 0,
+                    tokens: 0,
+                    costs_micros: 0,
+                    g_counts,
+                    g_tokens,
+                    g_costs_micros,
                     window_start,
                     window_secs,
                 },
@@ -879,9 +970,15 @@ impl SlidingWindowLimiter {
         }
     }
 
-    /// Restore a cumulative counter from DB.
+    /// Restore a cumulative counter's global base from DB (boot path).
     pub fn restore_cumulative(&self, cache_key: String, value: i64) {
-        self.cumulative.insert(cache_key, value);
+        self.cumulative.insert(
+            cache_key,
+            CumulativeEntry {
+                value: 0,
+                g: value,
+            },
+        );
     }
 
     /// Remove all expired window entries. Returns count removed.
@@ -897,12 +994,6 @@ impl SlidingWindowLimiter {
 
     // ── Dirty tracking ──
 
-    fn mark_dirty_window(&self, key: &str) {
-        if let Ok(mut s) = self.dirty_windows.write() {
-            s.insert(key.to_string());
-        }
-    }
-
     fn mark_dirty_cumulative(&self, key: &str) {
         if let Ok(mut s) = self.dirty_cumulative.write() {
             s.insert(key.to_string());
@@ -912,6 +1003,10 @@ impl SlidingWindowLimiter {
     fn take_dirty_cumulative(&self) -> HashSet<String> {
         std::mem::take(&mut *self.dirty_cumulative.write().expect("dirty lock poisoned"))
     }
+
+    fn take_dirty_snapshots(&self) -> HashSet<String> {
+        std::mem::take(&mut *self.dirty_snapshots.write().expect("dirty lock poisoned"))
+    }
 }
 
 impl Default for SlidingWindowLimiter {
@@ -920,21 +1015,47 @@ impl Default for SlidingWindowLimiter {
     }
 }
 
-/// Snapshot of a window entry, used for DB persistence.
-#[derive(Debug, Clone)]
-pub struct WindowSnapshot {
-    pub cache_key: String,
-    pub counts: u64,
-    pub tokens: u64,
-    pub costs_micros: u64,
-    pub window_start: u64,
-    pub window_secs: u64,
+// ═══════════════════════════════════════════════════════════
+// Incremental delta sync (multi-instance protocol)
+//
+// boom_limiter owns boom_rate_limit_state (per-generation global window
+// counters), boom_rate_limit_cumulative (global cumulative counters) and
+// boom_quota_delta (push watermark).
+// ═══════════════════════════════════════════════════════════
+
+/// One window-dimension delta, serialized into the watermark row.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WindowDeltaJson {
+    k: String,
+    /// Window generation (window_start) the delta belongs to.
+    ws: i64,
+    /// Delta of the counts dimension.
+    c: i64,
+    /// Delta of the tokens dimension.
+    t: i64,
+    /// Delta of the costs dimension (micros).
+    m: i64,
+    /// Window length, needed when this generation's row is first inserted.
+    w: i64,
 }
 
-// ═══════════════════════════════════════════════════════════
-// DB operations (boom_limiter owns boom_rate_limit_state AND
-// boom_rate_limit_cumulative tables)
-// ═══════════════════════════════════════════════════════════
+/// One cumulative delta, serialized into the watermark row.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CumulativeDeltaJson {
+    k: String,
+    v: i64,
+}
+
+/// Per-cycle sync statistics.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SyncStats {
+    pub window_deltas: usize,
+    pub cumulative_deltas: usize,
+    pub snapshot_upserts: usize,
+    pub pulled_windows: usize,
+    pub pulled_cumulative: usize,
+    pub recovered_from_watermark: bool,
+}
 
 impl SlidingWindowLimiter {
     /// Restore active window counters + cumulative counters from DB.
@@ -990,58 +1111,343 @@ impl SlidingWindowLimiter {
         }
     }
 
-    /// Sync dirty window + dirty cumulative entries to DB (background task).
-    pub async fn sync_counters_to_db(&self, pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
-        // 1. Windows: write all current entries (simpler than tracking exactly
-        //    which keys changed — the snapshot is cheap and GaussDB upsert is
-        //    idempotent). Use the snapshot() filter to skip expired entries.
-        let entries = self.snapshot();
-        for entry in &entries {
-            let c = entry.counts as i64;
-            let tok = entry.tokens as i64;
-            let cst = entry.costs_micros as i64;
-            let ws = entry.window_start as i64;
-            let wsec = entry.window_secs as i64;
-            boom_core::gaussdb_upsert!(
-                pool,
-                || sqlx::query(
-                    r#"UPDATE boom_rate_limit_state
-                       SET count = $2, tokens = $3, costs_micros = $4,
-                           window_start = $5, window_secs = $6, updated_at = NOW()
-                       WHERE cache_key = $1"#,
-                )
-                .bind(&entry.cache_key)
-                .bind(c)
-                .bind(tok)
-                .bind(cst)
-                .bind(ws)
-                .bind(wsec),
-                || sqlx::query(
+    /// One incremental sync cycle:
+    ///
+    /// 0. Housekeeping — purge expired window rows and old watermark rows.
+    /// 1. Recovery — if the watermark row for the current seq exists, the
+    ///    previous ambiguous attempt actually committed; replay its mirror
+    ///    effects (from the stored batch) without re-applying to the DB.
+    /// 2. Collect local unpushed deltas (windows by full-map scan, cumulative
+    ///    via the precise dirty set) + snapshot-class anchor overwrites.
+    /// 3. In ONE transaction: apply `value = value + delta` updates, insert
+    ///    the watermark row, and (decision_shared) read back global rows so
+    ///    the bases absorb peer deltas atomically with our own push.
+    /// 4. Post-commit mirror updates — subtract pushed deltas from the local
+    ///    unpushed slots (requests that landed mid-tx keep their increments),
+    ///    then overwrite bases with pulled values where available.
+    ///
+    /// Single-instance deployments run the exact same path: the deltas land
+    /// on rows nobody else touches and pulls read back our own writes.
+    pub async fn sync_delta_cycle(&self, pool: &sqlx::PgPool) -> Result<SyncStats, sqlx::Error> {
+        let mut stats = SyncStats::default();
+
+        // 0a. Purge fully-expired window rows — unbounded-growth guard. The
+        // delete runs before the delta applies so a live row caught on the
+        // clock boundary is re-pushed in this same cycle.
+        match sqlx::query(
+            r#"DELETE FROM boom_rate_limit_state
+               WHERE window_start + window_secs <= EXTRACT(EPOCH FROM NOW())::BIGINT"#,
+        )
+        .execute(pool)
+        .await
+        {
+            Ok(res) => {
+                let n = res.rows_affected();
+                if n > 0 {
+                    tracing::info!(purged = n, "Removed expired rows from boom_rate_limit_state");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Purging expired boom_rate_limit_state rows failed (continuing): {}",
+                    e
+                );
+            }
+        }
+
+        // 0b. Prune watermark rows — any retry horizon is far shorter than 2h.
+        match sqlx::query(
+            r#"DELETE FROM boom_quota_delta WHERE applied_at < NOW() - INTERVAL '2 hours'"#,
+        )
+        .execute(pool)
+        .await
+        {
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!("Pruning boom_quota_delta failed (continuing): {}", e);
+            }
+        }
+
+        let instance_id = match self.instance_id.read() {
+            Ok(guard) => guard.clone(),
+            Err(_) => None,
+        };
+        let Some(instance_id) = instance_id else {
+            // No identity assigned (no-DB mode / tests): counters are purely
+            // in-memory this boot; nothing to push or pull.
+            return Ok(stats);
+        };
+
+        let mut seq = self.push_seq.load(std::sync::atomic::Ordering::Relaxed);
+
+        // 1. Recovery: watermark present ⇒ the previous cycle's ambiguous
+        // attempt committed. Re-apply only its mirror effects.
+        let committed: Option<(serde_json::Value, serde_json::Value)> =
+            sqlx::query_as::<_, (serde_json::Value, serde_json::Value)>(
+                r#"SELECT window_deltas, cumulative_deltas FROM boom_quota_delta
+                   WHERE instance_id = $1 AND seq = $2"#,
+            )
+            .bind(&instance_id)
+            .bind(seq)
+            .fetch_optional(pool)
+            .await?;
+        if let Some((wd, cd)) = committed {
+            let wd: Vec<WindowDeltaJson> = serde_json::from_value(wd).unwrap_or_default();
+            let cd: Vec<CumulativeDeltaJson> = serde_json::from_value(cd).unwrap_or_default();
+            tracing::warn!(
+                seq,
+                windows = wd.len(),
+                cumulative = cd.len(),
+                "Recovering committed-but-unmirrored delta push from watermark"
+            );
+            self.apply_push_mirrors(&wd, &cd);
+            seq += 1;
+            self.push_seq.store(seq, std::sync::atomic::Ordering::Relaxed);
+            stats.recovered_from_watermark = true;
+        }
+
+        // 2. Collect deltas.
+        let mut win_deltas: Vec<WindowDeltaJson> = Vec::new();
+        let mut pull_window_keys: Vec<String> = Vec::new();
+        {
+            let now = now_epoch_secs();
+            for entry in self.windows.iter() {
+                let c = entry.value();
+                if now.saturating_sub(c.window_start) >= c.window_secs {
+                    continue; // expired generation — its deltas are dropped
+                }
+                pull_window_keys.push(entry.key().clone());
+                if c.has_unpushed() {
+                    win_deltas.push(WindowDeltaJson {
+                        k: entry.key().clone(),
+                        ws: c.window_start as i64,
+                        c: c.counts as i64,
+                        t: c.tokens as i64,
+                        m: c.costs_micros as i64,
+                        w: c.window_secs as i64,
+                    });
+                }
+            }
+        }
+
+        let dirty_cum = self.take_dirty_cumulative();
+        let mut cum_deltas: Vec<CumulativeDeltaJson> = Vec::new();
+        for ck in &dirty_cum {
+            if let Some(e) = self.cumulative.get(ck) {
+                if e.value().value != 0 {
+                    cum_deltas.push(CumulativeDeltaJson {
+                        k: ck.clone(),
+                        v: e.value().value,
+                    });
+                }
+            }
+        }
+
+        let snapshot_keys = self.take_dirty_snapshots();
+        let mut snapshot_writes: Vec<(String, i64)> = Vec::new();
+        for ck in &snapshot_keys {
+            if let Some(e) = self.cumulative.get(ck) {
+                snapshot_writes.push((ck.clone(), e.value().g));
+            }
+        }
+
+        stats.window_deltas = win_deltas.len();
+        stats.cumulative_deltas = cum_deltas.len();
+        stats.snapshot_upserts = snapshot_writes.len();
+
+        let pull = self.decision_shared();
+        if win_deltas.is_empty()
+            && cum_deltas.is_empty()
+            && snapshot_writes.is_empty()
+            && (!pull || pull_window_keys.is_empty())
+        {
+            return Ok(stats);
+        }
+
+        // 3. Apply + watermark + read-back in one transaction.
+        let mut tx = pool.begin().await?;
+
+        for d in &win_deltas {
+            let res = sqlx::query(
+                r#"UPDATE boom_rate_limit_state
+                   SET count = count + $3,
+                       tokens = COALESCE(tokens, 0) + $4,
+                       costs_micros = COALESCE(costs_micros, 0) + $5,
+                       updated_at = NOW()
+                   WHERE cache_key = $1 AND window_start = $2"#,
+            )
+            .bind(&d.k)
+            .bind(d.ws)
+            .bind(d.c)
+            .bind(d.t)
+            .bind(d.m)
+            .execute(&mut *tx)
+            .await?;
+            if res.rows_affected() == 0 {
+                // First push of this generation — create its row.
+                sqlx::query(
                     r#"INSERT INTO boom_rate_limit_state
                        (cache_key, count, tokens, costs_micros, window_start, window_secs, updated_at)
                        VALUES ($1, $2, $3, $4, $5, $6, NOW())"#,
                 )
-                .bind(&entry.cache_key)
-                .bind(c)
-                .bind(tok)
-                .bind(cst)
-                .bind(ws)
-                .bind(wsec)
-            )?;
+                .bind(&d.k)
+                .bind(d.c)
+                .bind(d.t)
+                .bind(d.m)
+                .bind(d.ws)
+                .bind(d.w)
+                .execute(&mut *tx)
+                .await?;
+            }
         }
 
-        // 2. Cumulative: write only dirty entries (cheap).
-        let dirty_cum = self.take_dirty_cumulative();
-        for ck in &dirty_cum {
-            let value = self.cumulative.get(ck).map(|r| *r.value()).unwrap_or(0);
-            upsert_cumulative_db(pool, ck, value).await?;
+        for d in &cum_deltas {
+            let res = sqlx::query(
+                r#"UPDATE boom_rate_limit_cumulative
+                   SET value = value + $2, updated_at = NOW()
+                   WHERE cache_key = $1"#,
+            )
+            .bind(&d.k)
+            .bind(d.v)
+            .execute(&mut *tx)
+            .await?;
+            if res.rows_affected() == 0 {
+                sqlx::query(
+                    r#"INSERT INTO boom_rate_limit_cumulative (cache_key, value, updated_at)
+                       VALUES ($1, $2, NOW())"#,
+                )
+                .bind(&d.k)
+                .bind(d.v)
+                .execute(&mut *tx)
+                .await?;
+            }
         }
 
-        // 3. Window dirty-set is informational only (we always sync full
-        //    snapshot above) — clear it so it doesn't grow without bound.
-        self.dirty_windows.write().expect("dirty lock poisoned").clear();
+        for (k, v) in &snapshot_writes {
+            let res = sqlx::query(
+                r#"UPDATE boom_rate_limit_cumulative
+                   SET value = $2, updated_at = NOW()
+                   WHERE cache_key = $1"#,
+            )
+            .bind(k)
+            .bind(*v)
+            .execute(&mut *tx)
+            .await?;
+            if res.rows_affected() == 0 {
+                sqlx::query(
+                    r#"INSERT INTO boom_rate_limit_cumulative (cache_key, value, updated_at)
+                       VALUES ($1, $2, NOW())"#,
+                )
+                .bind(k)
+                .bind(*v)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
 
-        Ok(())
+        let wd_value = serde_json::to_value(&win_deltas).unwrap_or(serde_json::json!([]));
+        let cd_value = serde_json::to_value(&cum_deltas).unwrap_or(serde_json::json!([]));
+        sqlx::query(
+            r#"INSERT INTO boom_quota_delta (instance_id, seq, window_deltas, cumulative_deltas)
+               VALUES ($1, $2, $3, $4)"#,
+        )
+        .bind(&instance_id)
+        .bind(seq)
+        .bind(&wd_value)
+        .bind(&cd_value)
+        .execute(&mut *tx)
+        .await?;
+
+        // Read back global rows inside the same transaction — the bases then
+        // absorb peer deltas atomically with our own push.
+        let mut pulled_win: Vec<(String, i64, Option<i64>, Option<i64>, i64)> = Vec::new();
+        let mut pulled_cum: Vec<(String, i64)> = Vec::new();
+        if pull {
+            if !pull_window_keys.is_empty() {
+                pulled_win = sqlx::query_as::<_, (String, i64, Option<i64>, Option<i64>, i64)>(
+                    r#"SELECT cache_key, count, tokens, costs_micros, window_start
+                       FROM boom_rate_limit_state
+                       WHERE window_start + window_secs > EXTRACT(EPOCH FROM NOW())::BIGINT
+                         AND cache_key = ANY($1)"#,
+                )
+                .bind(&pull_window_keys)
+                .fetch_all(&mut *tx)
+                .await?;
+            }
+            if !cum_deltas.is_empty() {
+                let keys: Vec<&str> = cum_deltas.iter().map(|d| d.k.as_str()).collect();
+                pulled_cum = sqlx::query_as::<_, (String, i64)>(
+                    r#"SELECT cache_key, value FROM boom_rate_limit_cumulative
+                       WHERE cache_key = ANY($1)"#,
+                )
+                .bind(&keys)
+                .fetch_all(&mut *tx)
+                .await?;
+            }
+        }
+
+        tx.commit().await?;
+
+        // 4. Post-commit mirror updates. Entries that rolled to a new
+        // generation (or were admin-cleared) mid-transaction are skipped:
+        // their deltas landed on the old generation's row, whose base died
+        // with the entry. Cumulative mirrors subtract with signed math — a
+        // concurrent admin adjustment can leave a small negative unpushed
+        // slot that self-corrects on the next push.
+        self.apply_push_mirrors(&win_deltas, &cum_deltas);
+
+        for (k, count, tokens, costs_micros, ws) in &pulled_win {
+            if let Some(mut c) = self.windows.get_mut(k.as_str()) {
+                let c = c.value_mut();
+                if c.window_start as i64 == *ws {
+                    c.g_counts = (*count).max(0) as u64;
+                    c.g_tokens = tokens.unwrap_or(0).max(0) as u64;
+                    c.g_costs_micros = costs_micros.unwrap_or(0).max(0) as u64;
+                }
+            }
+        }
+        for (k, v) in &pulled_cum {
+            if let Some(mut e) = self.cumulative.get_mut(k.as_str()) {
+                e.value_mut().g = *v;
+            }
+        }
+        stats.pulled_windows = pulled_win.len();
+        stats.pulled_cumulative = pulled_cum.len();
+
+        self.push_seq
+            .store(seq + 1, std::sync::atomic::Ordering::Relaxed);
+
+        Ok(stats)
+    }
+
+    /// Fold a committed batch into the in-memory mirrors: the deltas are in
+    /// the DB global rows, so move them from the unpushed slots into the
+    /// bases. Shared by the post-commit path and watermark recovery.
+    fn apply_push_mirrors(&self, wd: &[WindowDeltaJson], cd: &[CumulativeDeltaJson]) {
+        for d in wd {
+            if let Some(mut c) = self.windows.get_mut(&d.k) {
+                let c = c.value_mut();
+                if c.window_start as i64 != d.ws {
+                    continue;
+                }
+                let dc = d.c.max(0) as u64;
+                let dt = d.t.max(0) as u64;
+                let dm = d.m.max(0) as u64;
+                c.g_counts = c.g_counts.saturating_add(dc);
+                c.g_tokens = c.g_tokens.saturating_add(dt);
+                c.g_costs_micros = c.g_costs_micros.saturating_add(dm);
+                c.counts = c.counts.saturating_sub(dc);
+                c.tokens = c.tokens.saturating_sub(dt);
+                c.costs_micros = c.costs_micros.saturating_sub(dm);
+            }
+        }
+        for d in cd {
+            if let Some(mut e) = self.cumulative.get_mut(&d.k) {
+                let e = e.value_mut();
+                e.g = e.g.saturating_add(d.v);
+                e.value -= d.v;
+            }
+        }
     }
 }
 
@@ -1233,8 +1639,11 @@ impl SlidingWindowLimiter {
         }
         let key = cumulative_cache_key(scope, kind);
         {
-            let mut entry = self.cumulative.entry(key.clone()).or_insert_with(|| 0i64);
-            *entry += delta;
+            let mut entry = self
+                .cumulative
+                .entry(key.clone())
+                .or_insert_with(CumulativeEntry::default);
+            entry.value_mut().value += delta;
         }
         self.mark_dirty_cumulative(&key);
     }
@@ -1819,24 +2228,33 @@ mod tests {
         limiter.commit_counts(&key, &windows, 1);
         limiter.commit_counts(&key, &windows, 1);
 
-        let snap = limiter.snapshot();
-        assert!(!snap.is_empty());
+        // Push the local deltas (global rows = the pushed values here), then
+        // restore those values into a fresh limiter as global bases.
+        let pushed: Vec<(String, u64, u64, u64, u64, u64)> = limiter
+            .windows
+            .iter()
+            .map(|e| {
+                let c = e.value();
+                (
+                    e.key().clone(),
+                    c.counts,
+                    c.tokens,
+                    c.costs_micros,
+                    c.window_start,
+                    c.window_secs,
+                )
+            })
+            .collect();
+        assert!(!pushed.is_empty());
 
         let limiter2 = SlidingWindowLimiter::new();
-        for entry in &snap {
-            limiter2.restore_counter(
-                entry.cache_key.clone(),
-                entry.counts,
-                entry.tokens,
-                entry.costs_micros,
-                entry.window_start,
-                entry.window_secs,
-            );
+        for (ck, counts, tokens, costs, ws, wsec) in &pushed {
+            limiter2.restore_counter(ck.clone(), *counts, *tokens, *costs, *ws, *wsec);
         }
 
         let usage = limiter2.get_usage_for_key("snap_key");
         assert!(!usage.is_empty());
-        assert_eq!(usage[0].counts, 2);
+        assert_eq!(usage[0].counts, 2, "restored global base must be visible");
     }
 
     #[tokio::test]
@@ -1850,6 +2268,9 @@ mod tests {
                 counts: 5,
                 tokens: 0,
                 costs_micros: 0,
+                g_counts: 0,
+                g_tokens: 0,
+                g_costs_micros: 0,
                 window_start: now_epoch_secs() - 120,
                 window_secs: 60,
             },
@@ -1899,5 +2320,154 @@ mod tests {
 
         // After reset, peek returns 0.
         assert_eq!(limiter.peek_cumulative(&scope, CumulativeKind::TotalInputTokens), 0);
+    }
+
+    // ── Delta protocol invariants (pure in-memory parts) ──
+
+    #[test]
+    fn push_mirrors_move_unpushed_into_base_preserving_effective() {
+        let limiter = SlidingWindowLimiter::new();
+        let ck = "mirror:gpt-4:60".to_string();
+        let ws = now_epoch_secs();
+        limiter.windows.insert(
+            ck.clone(),
+            WindowCounter {
+                counts: 3,
+                tokens: 700,
+                costs_micros: 9_000,
+                g_counts: 5,
+                g_tokens: 100,
+                g_costs_micros: 1_000,
+                window_start: ws,
+                window_secs: 60,
+            },
+        );
+        let before = limiter.get_usage(&ck).unwrap();
+        assert_eq!(before.counts, 8);
+        assert_eq!(before.tokens, 800);
+
+        let batch = vec![WindowDeltaJson {
+            k: ck.clone(),
+            ws: ws as i64,
+            c: 3,
+            t: 700,
+            m: 9_000,
+            w: 60,
+        }];
+        limiter.apply_push_mirrors(&batch, &[]);
+
+        let after = limiter.windows.get(&ck).unwrap();
+        assert_eq!(after.counts, 0, "unpushed counts zeroed");
+        assert_eq!(after.tokens, 0);
+        assert_eq!(after.g_counts, 8, "base absorbed the delta");
+        assert_eq!(after.g_tokens, 800);
+        let eff = limiter.get_usage(&ck).unwrap();
+        assert_eq!(eff.counts, 8, "effective value unchanged by the push");
+        assert_eq!(eff.tokens, 800);
+    }
+
+    #[test]
+    fn push_mirrors_skip_rolled_generation() {
+        let limiter = SlidingWindowLimiter::new();
+        let ck = "rolled:gpt-4:60".to_string();
+        let old_ws = now_epoch_secs() - 120;
+        limiter.windows.insert(
+            ck.clone(),
+            WindowCounter {
+                counts: 2,
+                tokens: 0,
+                costs_micros: 0,
+                g_counts: 0,
+                g_tokens: 0,
+                g_costs_micros: 0,
+                window_start: now_epoch_secs(), // generation rolled mid-push
+                window_secs: 60,
+            },
+        );
+        let batch = vec![WindowDeltaJson {
+            k: ck.clone(),
+            ws: old_ws as i64,
+            c: 2,
+            t: 0,
+            m: 0,
+            w: 60,
+        }];
+        limiter.apply_push_mirrors(&batch, &[]);
+        let c = limiter.windows.get(&ck).unwrap();
+        assert_eq!(c.counts, 2, "new generation's unpushed kept untouched");
+        assert_eq!(c.g_counts, 0);
+    }
+
+    #[test]
+    fn cumulative_mirror_allows_signed_self_correction() {
+        let limiter = SlidingWindowLimiter::new();
+        let ck = "kc:sign:tcost".to_string();
+        limiter.cumulative.insert(
+            ck.clone(),
+            CumulativeEntry {
+                value: 1_000,
+                g: 5_000,
+            },
+        );
+        // Push mirrors for a delta larger than the current unpushed slot
+        // (admin team-adjust subtracted in between): the slot goes negative
+        // and the NEXT push sends a negative delta, converging back.
+        let batch = vec![CumulativeDeltaJson { k: ck.clone(), v: 2_000 }];
+        limiter.apply_push_mirrors(&[], &batch);
+        let e = limiter.cumulative.get(&ck).unwrap();
+        assert_eq!(e.g, 7_000);
+        assert_eq!(e.value, -1_000);
+        assert_eq!(e.effective(), 6_000);
+    }
+
+    #[test]
+    fn rollover_resets_global_bases() {
+        let limiter = SlidingWindowLimiter::new();
+        let ck = "rollbase:gpt-4:60".to_string();
+        let now = now_epoch_secs();
+        limiter.windows.insert(
+            ck.clone(),
+            WindowCounter {
+                counts: 1,
+                tokens: 10,
+                costs_micros: 100,
+                g_counts: 99,
+                g_tokens: 990,
+                g_costs_micros: 9_900,
+                window_start: now - 120, // expired generation
+                window_secs: 60,
+            },
+        );
+        limiter.bump_counts(&ck, 60, 4, now);
+        let c = limiter.windows.get(&ck).unwrap();
+        assert_eq!(c.counts, 4);
+        assert_eq!(c.g_counts, 0, "fresh generation starts from a zero base");
+        assert_eq!(c.window_start, now);
+    }
+
+    #[tokio::test]
+    async fn decisions_use_global_base_plus_local_increment() {
+        // Peer instance pushed 8 requests into the global row; this instance
+        // restored it at boot and adds its own traffic on top. Limit 10 →
+        // the 9th global request (3rd local) must be rejected.
+        let limiter = SlidingWindowLimiter::new();
+        let key = RateLimitKey {
+            key_hash: "shared_view".to_string(),
+            model: "gpt-4".to_string(),
+        };
+        let windows = vec![WindowLimit {
+            counts: Some(10),
+            tokens: None,
+            costs: None,
+            window_secs: 3600,
+        }];
+        limiter.restore_counter("shared_view:gpt-4:3600".to_string(), 8, 0, 0, now_epoch_secs(), 3600);
+
+        assert!(limiter.peek_only(&key, &windows, 1).await.allowed);
+        limiter.commit_counts(&key, &windows, 1);
+        assert!(limiter.peek_only(&key, &windows, 1).await.allowed);
+        limiter.commit_counts(&key, &windows, 1);
+        let d = limiter.peek_only(&key, &windows, 1).await;
+        assert!(!d.allowed, "global base (8) + local (2) = 10 must reject");
     }
 }

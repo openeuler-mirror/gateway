@@ -199,9 +199,10 @@ async fn window_expiry_resets_counters() {
 
     // 过期 → peek 把三维度当 0 → 放行
     assert!(l.peek_only(&ka, &wins1, 1).await.allowed);
-    // 列表 / 快照跳过过期项
+    // 列表 / 扫描跳过过期项
     assert!(l.peek_key_windows("expA").is_empty());
-    assert!(l.snapshot().iter().all(|s| !s.cache_key.starts_with("exp")));
+    assert!(l.peek_key_windows("expB").is_empty());
+    assert!(l.peek_key_windows("expC").is_empty());
 
     // 过期后 commit → 复位为 weight（and_modify 过期分支：tokens/costs 清零）
     l.commit_counts(&ka, &wins1, 1);
@@ -319,12 +320,12 @@ async fn snapshot_restore_and_scan_edge_keys() {
     l.restore_counter("dead:m:60".to_string(), 5, 5, 5, 0, 10);
     assert!(l.get_usage("dead:m:60").is_none());
 
-    // 有效 restore → 落位且进 snapshot
+    // 有效 restore → 落位（dead 已跳过，live 可见）
     let ws = now_epoch().saturating_sub(5);
     l.restore_counter("live:m:60".to_string(), 1, 2, 3, ws, 60);
     let u = l.get_usage("live:m:60").unwrap();
     assert_eq!((u.counts, u.tokens, u.costs_micros, u.window_secs), (1, 2, 3, 60));
-    assert_eq!(l.snapshot().len(), 1);
+    assert_eq!(l.get_usage_for_key("live").len(), 1);
 
     // 畸形 key：tail 无 ':' → rsplit 失败；secs 非数字 → parse 失败
     l.restore_counter("kh1:weird".to_string(), 0, 9, 0, now_epoch(), 60);
@@ -354,7 +355,8 @@ async fn clear_operations() {
     assert!(l.get_usage("khC:m:300").is_none());
 
     assert!(l.clear_all_windows() >= 1);
-    assert!(l.snapshot().is_empty());
+    assert!(l.get_usage_for_key("khC").is_empty());
+    assert!(l.get_usage_for_key("other").is_empty());
     // 累计计量保留（settle 的 input_tokens=1 仍在）
     assert_eq!(l.peek_cumulative(&kscope("khC"), CumulativeKind::TotalInputTokens), 1);
 }

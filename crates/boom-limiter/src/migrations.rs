@@ -5,16 +5,73 @@
 /// so pre-migration rows (counts-only) round-trip cleanly. `state_alter_ddl`
 /// adds them idempotently on existing databases; fresh databases get them
 /// from this base DDL.
+///
+/// PK is `(cache_key, window_start)`: rows hold per-window-generation global
+/// counters and the multi-instance delta protocol applies add-deltas keyed by
+/// generation, so an old generation's row survives alongside the new one
+/// until the expiry purge removes it.
 pub fn rate_limit_state_ddl() -> &'static str {
     r#"
 CREATE TABLE IF NOT EXISTS boom_rate_limit_state (
-    cache_key     TEXT PRIMARY KEY,
+    cache_key     TEXT NOT NULL,
     count         BIGINT NOT NULL DEFAULT 0,
     tokens        BIGINT,
     costs_micros  BIGINT,
     window_start  BIGINT NOT NULL,
     window_secs   BIGINT NOT NULL,
-    updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (cache_key, window_start)
+);
+"#
+}
+
+/// Idempotent ALTER: widen the legacy single-column PK (cache_key) to the
+/// composite (cache_key, window_start). Guarded by an information_schema
+/// check so it is a true no-op on databases already migrated or freshly
+/// created by the composite base DDL. Errors propagate (not swallowed): a
+/// silently-skipped PK change would surface later as duplicate-key failures
+/// on every window rollover push.
+pub fn state_pk_alter_ddl() -> &'static str {
+    r#"
+DO $$
+DECLARE pk_name TEXT;
+BEGIN
+    SELECT tc.constraint_name INTO pk_name
+    FROM information_schema.table_constraints tc
+    JOIN information_schema.key_column_usage k
+      ON k.constraint_name = tc.constraint_name
+     AND k.table_name = tc.table_name
+    WHERE tc.table_name = 'boom_rate_limit_state'
+      AND tc.constraint_type = 'PRIMARY KEY'
+      AND tc.table_schema = current_schema()
+    GROUP BY tc.constraint_name
+    HAVING COUNT(*) = 1 AND BOOL_AND(k.column_name = 'cache_key');
+
+    IF pk_name IS NOT NULL THEN
+        EXECUTE format('ALTER TABLE boom_rate_limit_state DROP CONSTRAINT %I', pk_name);
+        ALTER TABLE boom_rate_limit_state
+            ADD PRIMARY KEY (cache_key, window_start);
+    END IF;
+END $$;
+"#
+}
+
+/// DDL for the delta-push watermark table (multi-instance incremental sync).
+///
+/// One row per committed push batch. PK (instance_id, seq) makes pushes
+/// idempotent: a retry after an ambiguous commit finds the row, skips the
+/// DB re-apply, and replays only the in-memory mirror fix from the stored
+/// batch. instance_id is a per-boot UUID, so seq restarts at 0 each boot and
+/// rows are pruned after 2h (any retry horizon is far shorter).
+pub fn quota_delta_ddl() -> &'static str {
+    r#"
+CREATE TABLE IF NOT EXISTS boom_quota_delta (
+    instance_id       TEXT NOT NULL,
+    seq               BIGINT NOT NULL,
+    window_deltas     JSONB NOT NULL DEFAULT '[]',
+    cumulative_deltas JSONB NOT NULL DEFAULT '[]',
+    applied_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (instance_id, seq)
 );
 "#
 }
