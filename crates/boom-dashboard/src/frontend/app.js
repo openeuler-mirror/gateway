@@ -157,6 +157,7 @@
       // them if the pane is visible so they aren't stuck in the old language.
       const activePane = document.querySelector(".debug-pane.active");
       if (activePane && activePane.dataset.pane === "kvc") loadKvcAwarePane();
+      if (activePane && activePane.dataset.pane === "rollback") loadRollbackStats();
       // User sidebar title is dynamic (key alias), not in the i18n dict —
       // re-apply after applyI18n() so it isn't stuck on the default label.
       applyUserSidebarTitle();
@@ -487,6 +488,7 @@
       // persists across section re-entries, so refresh it if visible.
       const activePane = document.querySelector(".debug-pane.active");
       if (activePane && activePane.dataset.pane === "kvc") loadKvcAwarePane();
+      if (activePane && activePane.dataset.pane === "rollback") loadRollbackStats();
     }
     else if (section === "admin-config") loadConfigPage();
   }
@@ -3028,6 +3030,60 @@
       }) + '</p>';
   }
 
+  // ── Rollback Stats (debug pane) ─────────────────────────────
+  async function loadRollbackStats() {
+    try {
+      const data = await api("/admin/stats/rollback");
+      renderRollbackStats(data || {});
+    } catch (err) {
+      console.error("loadRollbackStats error:", err);
+    }
+  }
+
+  function renderRollbackStats(data) {
+    const wrap = document.getElementById("rollback-stats-wrap");
+    if (!wrap) return;
+    const total = Number(data.identify_total || 0);
+    if (!total) {
+      wrap.innerHTML = '<p class="muted">' + t("debug.rollback.no_data") + '</p>';
+      return;
+    }
+    const miss = Number(data.identify_miss || 0);
+    const inert = Number(data.pool_inert || 0);
+    const noTarget = Number(data.no_target || 0);
+    const selected = Number(data.fallback_selected || 0);
+    const success = Number(data.retry_success || 0);
+    const retryErr = Number(data.retry_error || 0);
+    const guardErr = Number(data.guard_error || 0);
+    const pass400 = Number(data.passthrough_400 || 0);
+    // Invariants
+    const inv1ok = total === miss + inert + noTarget + selected;
+    const inv2ok = selected === success + retryErr + guardErr;
+    const cell = (label, val, cls) =>
+      '<div class="kcs-cell' + (cls ? " " + cls : "") + '">' +
+        '<div class="kcs-value">' + val.toLocaleString() + '</div>' +
+        '<div class="kcs-label">' + esc(label) + '</div>' +
+      '</div>';
+    let html = '<div class="kcs-grid">' +
+      cell(t("debug.rollback.total"), total) +
+      cell(t("debug.rollback.miss"), miss) +
+      cell(t("debug.rollback.inert"), inert, "kcs-warn") +
+      cell(t("debug.rollback.no_target"), noTarget, "kcs-warn") +
+      cell(t("debug.rollback.selected"), selected) +
+      cell(t("debug.rollback.success"), success) +
+      cell(t("debug.rollback.retry_error"), retryErr, "kcs-warn") +
+      cell(t("debug.rollback.guard_error"), guardErr, "kcs-warn") +
+      cell(t("debug.rollback.pass400"), pass400) +
+    '</div>';
+    html += '<p class="kcs-breakdown">' + (inv1ok ? "✓" : "✗") + " " +
+      t("debug.rollback.inv1") + '</p>';
+    html += '<p class="kcs-breakdown">' + (inv2ok ? "✓" : "✗") + " " +
+      t("debug.rollback.inv2") + '</p>';
+    html += '<p class="kcs-breakdown" style="color:var(--text3)">' +
+      t("debug.rollback.hint") + '</p>';
+    wrap.innerHTML = html;
+  }
+
   // ── KVC Hit Calibration (predicted trie hit vs actual cached_tokens) ──
   // Loads every block on the KVC AWARE pane. Called on pane entry and
   // on language re-render while the pane is visible; nothing is polled.
@@ -3269,6 +3325,7 @@
         if (target === "trace") startTracePanePoll();
         else stopTracePanePoll();
         if (target === "kvc") loadKvcAwarePane();
+        if (target === "rollback") loadRollbackStats();
       });
     });
   }

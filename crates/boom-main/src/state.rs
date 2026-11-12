@@ -96,6 +96,9 @@ pub struct AppState {
     /// lowest-load fallback / rebalance (debug page; survives reloads).
     /// The policy is recreated on every reload, so the counters must live here.
     pub kvc_stats: Arc<KvcSchedulerStats>,
+    /// Rollback observability counters (debug page). Top-level Arc:
+    /// survives reloads; the rollback module's functions are stateless.
+    pub rollback_stats: Arc<crate::rollback::RollbackStats>,
     /// Per-deployment request rate tracker (survives reloads).
     pub request_rate: Arc<RequestRateTracker>,
     /// Agent (client-type) statistics tracker (survives reloads).
@@ -282,6 +285,7 @@ impl AppState {
         // Global kvc scheduling counters survive across reloads (the policy is
         // recreated on every reload — per-policy counters would reset).
         let kvc_stats = Arc::new(KvcSchedulerStats::new());
+        let rollback_stats = Arc::new(crate::rollback::RollbackStats::new());
         let request_rate = Arc::new(RequestRateTracker::new());
         let agent_stats = Arc::new(AgentStatsTracker::new());
 
@@ -495,6 +499,7 @@ impl AppState {
             prompt_log_query,
             rebalance_move_tracker,
             kvc_stats,
+            rollback_stats,
             request_rate,
             agent_stats,
             kv_index,

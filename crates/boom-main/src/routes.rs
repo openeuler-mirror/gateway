@@ -963,7 +963,7 @@ async fn chat_completions_inner(
     macro_rules! rb_fail { ($err:expr, $stream:expr) => {{
         // Finalize FIRST so the audit row records the client-visible status
         // (400 passthrough for context errors), not the masked 502.
-        let rb_final = crate::rollback::finalize_error($err, rb_patterns);
+        let rb_final = crate::rollback::finalize_error($err, rb_patterns, Some(&state.rollback_stats));
         let partial_usage = provider_billing.actual_usage();
         settle_partial_provider_accounting(&mut plan_charge, &provider_billing);
         log_error_with_usage(&state, &identity, &model, api_path, $stream, start, &rb_final, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()), user_tags.clone(), partial_usage.as_ref(), None);
@@ -1019,7 +1019,7 @@ async fn chat_completions_inner(
         } else {
             match provider.chat_stream_with_context(req, provider_context).await {
                 Ok(s) => s,
-                Err(e) => rb_fail!(e, true),
+                Err(e) => { state.rollback_stats.record_pool_inert_if_context_error(&e, rb_patterns); rb_fail!(e, true) }
             }
         };
         // Provider accepted the request — commit the plan charge now.
@@ -1225,7 +1225,7 @@ async fn chat_completions_inner(
         } else {
             match provider.chat_with_context(req, provider_context).await {
                 Ok(r) => r,
-                Err(e) => rb_fail!(e, false),
+                Err(e) => { state.rollback_stats.record_pool_inert_if_context_error(&e, rb_patterns); rb_fail!(e, false) }
             }
         };
         if let Some(g) = trace_guard.as_ref() { g.note_upstream_end(); }
@@ -3574,7 +3574,7 @@ pub async fn messages(
     let mut rollback_from: Option<String> = None;
     macro_rules! rb_fail { ($err:expr, $stream:expr) => {{
         // Finalize FIRST so the audit row records the client-visible status.
-        let rb_final = crate::rollback::finalize_error($err, rb_patterns);
+        let rb_final = crate::rollback::finalize_error($err, rb_patterns, Some(&state.rollback_stats));
         log_error(&state, &identity, &model, "/v1/messages", $stream, start, &rb_final, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()), user_tags.clone());
         write_prompt_log_error(
             &state,
@@ -3625,7 +3625,7 @@ pub async fn messages(
         } else {
             match provider.chat_stream(openai_req).await {
                 Ok(s) => s,
-                Err(e) => rb_fail!(e, true),
+                Err(e) => { state.rollback_stats.record_pool_inert_if_context_error(&e, rb_patterns); rb_fail!(e, true) }
             }
         };
         // Provider accepted the request — commit the plan charge now.
@@ -3808,7 +3808,7 @@ pub async fn messages(
         } else {
             match provider.chat(openai_req).await {
                 Ok(r) => r,
-                Err(e) => rb_fail!(e, false),
+                Err(e) => { state.rollback_stats.record_pool_inert_if_context_error(&e, rb_patterns); rb_fail!(e, false) }
             }
         };
         if let Some(g) = trace_guard.as_ref() { g.note_upstream_end(); }
@@ -4604,7 +4604,7 @@ pub async fn responses(
     // the macro can expand on both the first-error and retry-error paths.
     macro_rules! rb_fail { ($err:expr, $stream:expr) => {{
         // Finalize FIRST so the audit row records the client-visible status.
-        let rb_final = crate::rollback::finalize_error($err, rb_patterns);
+        let rb_final = crate::rollback::finalize_error($err, rb_patterns, Some(&state.rollback_stats));
         log_error(&state, &identity, &model, "/v1/responses", $stream, start, &rb_final, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()), user_tags.clone());
         write_prompt_log_error(
             &state,
@@ -4677,7 +4677,7 @@ pub async fn responses(
         } else {
             match provider.chat_stream(openai_req).await {
                 Ok(s) => s,
-                Err(e) => rb_fail!(e, true),
+                Err(e) => { state.rollback_stats.record_pool_inert_if_context_error(&e, rb_patterns); rb_fail!(e, true) }
             }
         };
         let _decision = plan_charge.commit();
@@ -4874,7 +4874,7 @@ pub async fn responses(
         } else {
             match provider.chat(openai_req).await {
                 Ok(r) => r,
-                Err(e) => rb_fail!(e, false),
+                Err(e) => { state.rollback_stats.record_pool_inert_if_context_error(&e, rb_patterns); rb_fail!(e, false) }
             }
         };
         if let Some(g) = trace_guard.as_ref() { g.note_upstream_end(); }

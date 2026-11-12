@@ -4304,6 +4304,20 @@ pub async fn get_rebalance_moves(
 }
 
 // ═══════════════════════════════════════════════════════════
+// Rollback Stats (global counters, process lifetime)
+// ═══════════════════════════════════════════════════════════
+
+pub async fn get_rollback_stats(
+    _session: AdminSession,
+    Extension(state): Extension<Arc<DashboardState>>,
+) -> Response {
+    // Snapshot field names are the API contract. Invariants:
+    //   identify_total == identify_miss + pool_inert + no_target + fallback_selected
+    //   fallback_selected == retry_success + retry_error + guard_error
+    Json(json!(state.rollback_stats.snapshot())).into_response()
+}
+
+// ═══════════════════════════════════════════════════════════
 // KVC Scheduler Stats (global counters, process lifetime)
 // ═══════════════════════════════════════════════════════════
 

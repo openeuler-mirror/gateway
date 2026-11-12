@@ -237,6 +237,10 @@ pub fn build_router<S: Clone + Send + Sync + 'static>(state: DashboardState) -> 
         )
         // Admin — KVC Scheduler Stats (global counters, process lifetime).
         .route(
+            "/dashboard/api/admin/stats/rollback",
+            get(handlers_admin::get_rollback_stats),
+        )
+        .route(
             "/dashboard/api/admin/stats/kvc-scheduler",
             get(handlers_admin::get_kvc_scheduler_stats),
         )

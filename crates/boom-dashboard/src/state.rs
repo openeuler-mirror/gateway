@@ -246,6 +246,8 @@ pub struct DashboardState {
     /// Global kvc_aware scheduling counters (total / affinity / cold /
     /// lowest-load fallback / rebalance) for dashboard debug page.
     pub kvc_stats: Arc<KvcSchedulerStats>,
+    /// Rollback observability counters (debug page `GET /admin/stats/rollback`).
+    pub rollback_stats: Arc<boom_core::context_error::RollbackStats>,
     /// Per-deployment request rate tracker for dashboard stats.
     pub request_rate: Arc<RequestRateTracker>,
     /// Agent (client-type) statistics tracker for dashboard stats.
@@ -302,6 +304,7 @@ impl DashboardState {
         prompt_log_query: Arc<dyn PromptLogQueryApi>,
         rebalance_move_tracker: Arc<RebalanceMoveTracker>,
         kvc_stats: Arc<KvcSchedulerStats>,
+        rollback_stats: Arc<boom_core::context_error::RollbackStats>,
         request_rate: Arc<RequestRateTracker>,
         agent_stats: Arc<AgentStatsTracker>,
         auth: Arc<dyn KeyAliasLookup>,
@@ -337,6 +340,7 @@ impl DashboardState {
             prompt_log_query,
             rebalance_move_tracker,
             kvc_stats,
+            rollback_stats,
             request_rate,
             agent_stats,
             auth,

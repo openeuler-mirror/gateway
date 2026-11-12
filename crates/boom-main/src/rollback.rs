@@ -32,11 +32,13 @@
 //! semantics as normal routing, confined to the tier.
 
 use crate::state::AppState;
+pub use boom_core::context_error::RollbackStats;
 use boom_core::error::GatewayError;
 use boom_core::provider::{Provider, ProviderCallContext};
 use boom_core::types::{ChatCompletionRequest, ChatCompletionResponse, ChatStream};
 use boom_routing::Router;
 use std::sync::Arc;
+
 
 /// Routing context for the fallback's second select — everything the
 /// normal first select used, so the retry rides the identical policy
@@ -95,21 +97,43 @@ pub fn capable(patterns: &[String], candidates: &[Arc<dyn Provider>]) -> bool {
     tiers.len() >= 2
 }
 
+/// Decision outcome from [`select_fallback`] — every exit is a named
+/// reason so the stats can count exactly why fallbacks do or don't fire.
+pub enum FallbackDecision {
+    /// A fallback target was selected; retry should proceed.
+    Target(Arc<dyn Provider>),
+    /// L1 miss: not an identified context error.
+    MissIdentify,
+    /// L2 gate: pool not participating (not enrolled / mixed / single tier).
+    PoolInert,
+    /// L2 gate: pool active but no larger tier online.
+    NoTarget,
+}
+
+impl FallbackDecision {
+    pub fn target(self) -> Option<Arc<dyn Provider>> {
+        match self {
+            Self::Target(p) => Some(p),
+            _ => None,
+        }
+    }
+}
+
 /// L1 + L2 decision: identify the error, gate the pool, pick the target
 /// tier, run the second select through the router (full policy pipeline).
-/// Returns the fallback provider, or None (caller keeps the original
-/// error). Flat: identify → gates → tier → one select; no recursion.
+/// Every exit is a named [`FallbackDecision`] reason. Flat: identify →
+/// gates → tier → one select; no recursion.
 pub fn select_fallback(
     error: &GatewayError,
     patterns: &[String],
     route: &RollbackRoute<'_>,
     router: &Router,
     failed_provider: &Arc<dyn Provider>,
-) -> Option<Arc<dyn Provider>> {
+) -> FallbackDecision {
     // ── L1: identification (status gate + code/message patterns). ──
     let m = error.context_error_match(patterns);
     if !m.matched {
-        return None;
+        return FallbackDecision::MissIdentify;
     }
 
     // ── L2 gates: pool participation (all-or-nothing on both fields). ──
@@ -117,17 +141,17 @@ pub fn select_fallback(
     let mut tiers = std::collections::BTreeSet::new();
     for c in route.candidates {
         if !c.rollback_enabled() {
-            return None;
+            return FallbackDecision::PoolInert;
         }
         match c.max_context_tokens() {
             Some(v) => {
                 tiers.insert(v);
             }
-            None => return None,
+            None => return FallbackDecision::PoolInert,
         }
     }
     if tiers.len() < 2 {
-        return None; // single tier: nowhere to fall back to
+        return FallbackDecision::PoolInert; // single tier: nowhere to fall back to
     }
 
     // ── Target tier: strictly larger than the failed tier; smallest tier
@@ -139,7 +163,7 @@ pub fn select_fallback(
         None => tiers.iter().copied().collect(),
     };
     if larger.is_empty() {
-        return None;
+        return FallbackDecision::NoTarget;
     }
     let target_tier = match m.requested_tokens {
         Some(r) => larger
@@ -159,18 +183,20 @@ pub fn select_fallback(
         .cloned()
         .collect();
     if tier_candidates.is_empty() {
-        return None;
+        return FallbackDecision::NoTarget;
     }
 
     // ── Second select: the FULL policy pipeline on the tier's list. ──
-    let selection = router.select_with_candidates(
+    match router.select_with_candidates(
         route.model,
         &tier_candidates,
         route.key_hash,
         route.input_chars,
         route.prefix_bytes,
-    )?;
-    Some(selection.provider)
+    ) {
+        Some(selection) => FallbackDecision::Target(selection.provider),
+        None => FallbackDecision::NoTarget,
+    }
 }
 
 /// Release the failed deployment's slot, acquire one for the fallback.
@@ -266,7 +292,15 @@ pub async fn attempt_stream(
         .context
         .patterns
         .clone();
-    let Some(target) = select_fallback(first_error, &patterns, route, &state.router, &failed_provider)
+    let decision = select_fallback(first_error, &patterns, route, &state.router, &failed_provider);
+    state.rollback_stats.record_identify_total();
+    match &decision {
+        FallbackDecision::Target(_) => state.rollback_stats.record_fallback_selected(),
+        FallbackDecision::MissIdentify => state.rollback_stats.record_identify_miss(),
+        FallbackDecision::PoolInert => state.rollback_stats.record_pool_inert(),
+        FallbackDecision::NoTarget => state.rollback_stats.record_no_target(),
+    }
+    let Some(target) = decision.target()
     else {
         return RollbackOutcome::NoRetry;
     };
@@ -282,6 +316,9 @@ pub async fn attempt_stream(
         route.model,
     )
     .await;
+    if guard_err.is_err() {
+        state.rollback_stats.record_guard_error();
+    }
     let result = match guard_err {
         Err(e) => Err(e),
         Ok(()) => match call_ctx {
@@ -289,6 +326,10 @@ pub async fn attempt_stream(
             None => target.chat_stream(req).await,
         },
     };
+    match &result {
+        Ok(_) => state.rollback_stats.record_retry_success(),
+        Err(_) => state.rollback_stats.record_retry_error(),
+    }
     RollbackOutcome::Retried {
         result,
         provider: target,
@@ -320,7 +361,15 @@ pub async fn attempt_call(
         .context
         .patterns
         .clone();
-    let Some(target) = select_fallback(first_error, &patterns, route, &state.router, &failed_provider)
+    let decision = select_fallback(first_error, &patterns, route, &state.router, &failed_provider);
+    state.rollback_stats.record_identify_total();
+    match &decision {
+        FallbackDecision::Target(_) => state.rollback_stats.record_fallback_selected(),
+        FallbackDecision::MissIdentify => state.rollback_stats.record_identify_miss(),
+        FallbackDecision::PoolInert => state.rollback_stats.record_pool_inert(),
+        FallbackDecision::NoTarget => state.rollback_stats.record_no_target(),
+    }
+    let Some(target) = decision.target()
     else {
         return RollbackOutcome::NoRetry;
     };
@@ -336,6 +385,9 @@ pub async fn attempt_call(
         route.model,
     )
     .await;
+    if guard_err.is_err() {
+        state.rollback_stats.record_guard_error();
+    }
     let result = match guard_err {
         Err(e) => Err(e),
         Ok(()) => match call_ctx {
@@ -343,6 +395,10 @@ pub async fn attempt_call(
             None => target.chat(req).await,
         },
     };
+    match &result {
+        Ok(_) => state.rollback_stats.record_retry_success(),
+        Err(_) => state.rollback_stats.record_retry_error(),
+    }
     RollbackOutcome::Retried {
         result,
         provider: target,
@@ -357,12 +413,19 @@ pub async fn attempt_call(
 /// reply error so clients see the upstream's 400 semantics instead of the
 /// misleading 502 (agents retry 5xx). The original error is preserved for
 /// logging; only the reply carries the conversion.
-pub fn finalize_error(e: GatewayError, patterns: &[String]) -> GatewayError {
+pub fn finalize_error(
+    e: GatewayError,
+    patterns: &[String],
+    stats: Option<&RollbackStats>,
+) -> GatewayError {
     if patterns.is_empty() {
         return e;
     }
     if let GatewayError::UpstreamError { status, message } = &e {
         if boom_core::context_error::identify(*status, message, patterns).matched {
+            if let Some(stats) = stats {
+                stats.record_passthrough_400();
+            }
             return GatewayError::ContextLengthExceeded(message.clone());
         }
     }
@@ -474,7 +537,7 @@ mod tests {
         let failed = cands[0].clone(); // 200K
         let r = router();
         let target = select_fallback(&ctx_error(Some(250_000)), &patterns(), &route(&cands), &r, &failed)
-            .expect("fallback exists");
+            .target().expect("fallback exists");
         assert_eq!(max_of(&target), 500_000);
         assert_ne!(target.deployment_id(), Some("d200a"));
     }
@@ -485,7 +548,7 @@ mod tests {
         let failed = cands[0].clone();
         let r = router();
         let target = select_fallback(&ctx_error(Some(2_000_000)), &patterns(), &route(&cands), &r, &failed)
-            .expect("fallback exists");
+            .target().expect("fallback exists");
         assert_eq!(max_of(&target), 1_000_000);
     }
 
@@ -495,7 +558,7 @@ mod tests {
         let failed = cands[0].clone();
         let r = router();
         let target = select_fallback(&ctx_error(None), &patterns(), &route(&cands), &r, &failed)
-            .expect("fallback exists");
+            .target().expect("fallback exists");
         assert_eq!(max_of(&target), 1_000_000);
     }
 
@@ -507,6 +570,7 @@ mod tests {
         let r = router();
         assert!(
             select_fallback(&ctx_error(Some(2_000_000)), &patterns(), &route(&cands), &r, &failed)
+                .target()
                 .is_none()
         );
     }
@@ -517,20 +581,20 @@ mod tests {
         // ① 池里有实例未配 max_context → mixed → NoRetry
         let mut mixed = pool();
         mixed.push(Arc::new(FakeProvider { dep: "dx", max_ctx: None, rb: true }));
-        assert!(select_fallback(&ctx_error(Some(250_000)), &patterns(), &route(&mixed), &r, &mixed[0]).is_none());
+        assert!(select_fallback(&ctx_error(Some(250_000)), &patterns(), &route(&mixed), &r, &mixed[0]).target().is_none());
         // ② 有实例未开 rollback → NoRetry
         let mut off = pool();
         off.push(Arc::new(FakeProvider { dep: "dy", max_ctx: Some(300_000), rb: false }));
-        assert!(select_fallback(&ctx_error(Some(250_000)), &patterns(), &route(&off), &r, &off[0]).is_none());
+        assert!(select_fallback(&ctx_error(Some(250_000)), &patterns(), &route(&off), &r, &off[0]).target().is_none());
         // ③ 非上下文错误 → NoRetry
         let cands = pool();
         let not_ctx = GatewayError::UpstreamError { status: 400, message: r#"{"error":{"code":"BadModel"}}"#.into() };
-        assert!(select_fallback(&not_ctx, &patterns(), &route(&cands), &r, &cands[0]).is_none());
+        assert!(select_fallback(&not_ctx, &patterns(), &route(&cands), &r, &cands[0]).target().is_none());
         // ④ 非 400 → NoRetry
         let e401 = GatewayError::UpstreamError { status: 401, message: "nope".into() };
-        assert!(select_fallback(&e401, &patterns(), &route(&cands), &r, &cands[0]).is_none());
+        assert!(select_fallback(&e401, &patterns(), &route(&cands), &r, &cands[0]).target().is_none());
         // ⑤ 空模式表 → NoRetry
-        assert!(select_fallback(&ctx_error(Some(250_000)), &[], &route(&cands), &r, &cands[0]).is_none());
+        assert!(select_fallback(&ctx_error(Some(250_000)), &[], &route(&cands), &r, &cands[0]).target().is_none());
     }
 
     #[test]
@@ -542,11 +606,13 @@ mod tests {
         let failed = cands[0].clone(); // d200a
         let r = router();
         let target = select_fallback(&ctx_error(Some(500_000)), &patterns(), &route(&cands), &r, &failed)
+            .target()
             .expect("500K tier reachable");
         assert_eq!(target.deployment_id(), Some("d500"));
         // 失败实例 = d500 本身（同层重试场景：requested 解析偏小）→ 排除后
         // 500K 层空 → 升到 1M
         let target2 = select_fallback(&ctx_error(Some(500_000)), &patterns(), &route(&cands), &r, &cands[2])
+            .target()
             .expect("fallback skips the failed 500K instance");
         assert_eq!(max_of(&target2), 1_000_000);
     }
@@ -569,7 +635,7 @@ mod tests {
     #[test]
     fn finalize_error_converts_and_preserves() {
         let e = ctx_error(Some(250_000));
-        let converted = finalize_error(e, &patterns());
+        let converted = finalize_error(e, &patterns(), None);
         match converted {
             GatewayError::ContextLengthExceeded(ref msg) => {
                 assert!(msg.contains("InputTokenExceeded"));
@@ -579,10 +645,10 @@ mod tests {
         assert_eq!(converted.status_code(), 400);
         // 特性关闭（空 patterns）：原样保留 502 语义
         let e2 = ctx_error(Some(250_000));
-        let kept = finalize_error(e2, &[]);
+        let kept = finalize_error(e2, &[], None);
         assert_eq!(kept.status_code(), 502);
         // 非上下文错误：原样
         let e3 = GatewayError::UpstreamError { status: 400, message: "other".into() };
-        assert_eq!(finalize_error(e3, &patterns()).status_code(), 502);
+        assert_eq!(finalize_error(e3, &patterns(), None).status_code(), 502);
     }
 }

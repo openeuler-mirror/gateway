@@ -380,6 +380,7 @@
               <button class="debug-subtab" data-subtab="anomalies" data-i18n="debug.subtab.anomalies">Anomalies</button>
               <button class="debug-subtab" data-subtab="trace" data-i18n="debug.subtab.trace">OTEL Trace</button>
               <button class="debug-subtab" data-subtab="kvc" data-i18n="debug.subtab.kvc">KVC AWARE</button>
+              <button class="debug-subtab" data-subtab="rollback" data-i18n="debug.subtab.rollback">Rollback</button>
             </div>
 
             <!-- Overview pane: audit writer + agent stats -->
@@ -475,6 +476,15 @@
                 <button class="btn-small" id="btn-trace-refresh" data-i18n="action.refresh">Refresh</button>
               </div>
               <div id="trace-recent-wrap"><p class="muted" data-i18n="debug.trace.empty">No spans.</p></div>
+            </div>
+
+            <!-- Rollback pane: decision breakdown + retry outcomes -->
+            <div class="debug-pane" data-pane="rollback">
+              <div class="section-header" style="margin-top:1.5rem">
+                <h2 data-i18n="debug.rollback.title">Rollback Stats (global)</h2>
+                <span style="font-size:.85em;color:var(--text3)" data-i18n="debug.rollback.subtitle">Process lifetime cumulative</span>
+              </div>
+              <div id="rollback-stats-wrap"><p class="loading" data-i18n="common.loading">Loading...</p></div>
             </div>
 
             <!-- KVC AWARE pane: scheduler stats + rebalance moves + hit calibration + per-request DFX -->

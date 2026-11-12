@@ -361,3 +361,114 @@ mod tests {
         assert_eq!(number_before("nothing", " tokens > "), None);
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// RollbackStats — global counters for the debug page (design §10)
+// ═══════════════════════════════════════════════════════════════════
+
+/// Process-lifetime rollback counters, mirroring the KvcSchedulerStats
+/// pattern: held at AppState top level (survives config reloads — the
+/// module's functions are stateless, so per-module fields would reset).
+///
+/// Two invariants hold by construction (the debug pane displays them):
+///   identify_total == identify_miss + pool_inert + no_target + fallback_selected
+///   fallback_selected == retry_success + retry_error + guard_error
+#[derive(Default)]
+pub struct RollbackStats {
+    identify_total: std::sync::atomic::AtomicU64,
+    identify_miss: std::sync::atomic::AtomicU64,
+    pool_inert: std::sync::atomic::AtomicU64,
+    no_target: std::sync::atomic::AtomicU64,
+    fallback_selected: std::sync::atomic::AtomicU64,
+    retry_success: std::sync::atomic::AtomicU64,
+    retry_error: std::sync::atomic::AtomicU64,
+    guard_error: std::sync::atomic::AtomicU64,
+    passthrough_400: std::sync::atomic::AtomicU64,
+}
+
+/// Serializable point-in-time snapshot. Field names are the dashboard API
+/// contract (`GET /admin/stats/rollback`).
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct RollbackStatsSnapshot {
+    pub identify_total: u64,
+    pub identify_miss: u64,
+    pub pool_inert: u64,
+    pub no_target: u64,
+    pub fallback_selected: u64,
+    pub retry_success: u64,
+    pub retry_error: u64,
+    pub guard_error: u64,
+    pub passthrough_400: u64,
+}
+
+impl RollbackStats {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn bump(field: &std::sync::atomic::AtomicU64) {
+        field.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Observability-only: classify an error on a NON-capable pool (the
+    /// handler's else branch — no retry will be attempted). Only context
+    /// errors are interesting: they indicate a pool that COULD have rolled
+    /// back but isn't configured for it.
+    pub fn record_identify_total(&self) {
+        Self::bump(&self.identify_total);
+    }
+
+    pub fn record_identify_miss(&self) {
+        Self::bump(&self.identify_miss);
+    }
+
+    pub fn record_pool_inert(&self) {
+        Self::bump(&self.pool_inert);
+    }
+
+    pub fn record_no_target(&self) {
+        Self::bump(&self.no_target);
+    }
+
+    pub fn record_fallback_selected(&self) {
+        Self::bump(&self.fallback_selected);
+    }
+
+    pub fn record_pool_inert_if_context_error(&self, error: &GatewayError, patterns: &[String]) {
+        if error.context_error_match(patterns).matched {
+            Self::bump(&self.pool_inert);
+        }
+    }
+
+    pub fn record_retry_success(&self) {
+        Self::bump(&self.retry_success);
+    }
+
+    pub fn record_retry_error(&self) {
+        Self::bump(&self.retry_error);
+    }
+
+    pub fn record_guard_error(&self) {
+        Self::bump(&self.guard_error);
+    }
+
+    pub fn record_passthrough_400(&self) {
+        Self::bump(&self.passthrough_400);
+    }
+
+    pub fn snapshot(&self) -> RollbackStatsSnapshot {
+        use std::sync::atomic::Ordering::Relaxed;
+        RollbackStatsSnapshot {
+            identify_total: self.identify_total.load(Relaxed),
+            identify_miss: self.identify_miss.load(Relaxed),
+            pool_inert: self.pool_inert.load(Relaxed),
+            no_target: self.no_target.load(Relaxed),
+            fallback_selected: self.fallback_selected.load(Relaxed),
+            retry_success: self.retry_success.load(Relaxed),
+            retry_error: self.retry_error.load(Relaxed),
+            guard_error: self.guard_error.load(Relaxed),
+            passthrough_400: self.passthrough_400.load(Relaxed),
+        }
+    }
+}
+

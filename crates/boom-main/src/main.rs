@@ -301,6 +301,7 @@ fn build_router(state: AppState) -> Router {
         state.prompt_log_query.clone(),
         state.rebalance_move_tracker.clone(),
         state.kvc_stats.clone(),
+        state.rollback_stats.clone(),
         state.request_rate.clone(),
         state.agent_stats.clone(),
         key_alias_lookup,
