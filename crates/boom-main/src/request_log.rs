@@ -510,6 +510,14 @@ pub fn log_error_with_usage(
         );
     }
 
+    // deployment_id discriminates routed vs rejected: errors with a
+    // deployment got past routing, so label them with the live policy;
+    // pre-routing failures (auth/limits/model-not-found) never consulted
+    // the policy and stay NULL.
+    let schedule_policy = deployment_id
+        .as_ref()
+        .map(|_| crate::routes::routing_policy_label(&state.router));
+
     log_request(
         state.log_writer.as_deref(),
         RequestLog {
@@ -539,7 +547,7 @@ pub fn log_error_with_usage(
                 .and_then(|usage| usage.prompt_tokens_details.as_ref())
                 .and_then(|details| details.cached_tokens)
                 .map(i64::from),
-            schedule_policy: None,
+            schedule_policy,
             kv_hit_blocks: None,
             kv_input_blocks: None,
             trie_blocks: None,
