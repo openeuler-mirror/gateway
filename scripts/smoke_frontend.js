@@ -21,6 +21,7 @@ const t = (k, o) => (o ? k.replace(/\{(\w+)\}/g, (_, n) => o[n]) : k);
 const esc = (s) => String(s);
 const renderDeployCell = (name) => esc(name);
 const visibilityBadgeFor = () => '';
+const vendorOf = () => 'default';
 const tip = (k) => `[${k}]`;
 const el = { innerHTML: '', checked: false, indeterminate: false, disabled: false, closest: () => null };
 const document = { getElementById: () => el, querySelectorAll: () => [] };
@@ -33,9 +34,9 @@ function loadBlock(startMarker, endMarker, returns) {
   const end = src.indexOf(endMarker);
   if (start < 0 || end < 0 || end <= start) fail(`block not found: ${startMarker}`);
   const block = src.slice(start, end);
-  return new Function('t', 'esc', 'tip', 'renderDeployCell', 'visibilityBadgeFor', 'document',
+  return new Function('t', 'esc', 'tip', 'renderDeployCell', 'visibilityBadgeFor', 'vendorOf', 'document',
     block + `\nreturn { ${returns} };`
-  )(t, esc, tip, renderDeployCell, visibilityBadgeFor, document);
+  )(t, esc, tip, renderDeployCell, visibilityBadgeFor, vendorOf, document);
 }
 
 const pool = loadBlock('  function rollbackPoolBadge', '  async function showNewModelModal',
@@ -50,55 +51,36 @@ const models = [
   { id: '4', model_name: 'qwen3', litellm_model: 'openai/qwen3', enabled: true, quota_count_ratio: 1, timeout: 1200, source: 'db' }, // 未开启 → 无徽标
 ];
 
-// ── 1. rollback 列（模型列后，每池一个 rowspan 勾选框居中）────────
+// ── 1. 池头行 + 缩进行结构（无独立 rollback 列）────────────────
 pool.renderModelsTable(models, {});
 const html = el.innerHTML;
-// 列序：模型列在 rollback 列之前
-const hdrModel = html.indexOf('models.col.model');
-const hdrRollback = html.indexOf('models.col.rollback');
-if (!(hdrModel >= 0 && hdrRollback > hdrModel)) fail('rollback column must come AFTER the model column');
-// 每池一个勾选框（rowspan 居中），4 行部署只有 2 个
-const cbs = html.match(/_togglePoolRollback\('([^']+)', this\.checked\)/g) || [];
-if (cbs.length !== 2) fail(`one checkbox per pool, got ${cbs.length}`);
-if (html.includes('_toggleRowRollback')) fail('per-row toggle should be removed');
-// 每行自己的 rollback td（跟随行底色）——无 rowspan、无 span 类
-if (html.includes('rowspan=')) fail('rowspan removed: per-row cells keep row stripes');
-if (html.includes('cell-rollback-span')) fail('span class removed');
-if ((html.match(/class="cell-rollback"/g) || []).length !== 4) fail('every row keeps its own rollback td');
-// 勾选框在池的中间行：glm 池（3 行，奇数）→ id=2 那行，input 在 badge 前
-const trs = html.split('<tr');
-const glmCbRow = trs.find((x) => x.includes("_togglePoolRollback('glm-5.3'"));
-if (!glmCbRow || !glmCbRow.includes("_editModel('2'")) fail('3-row pool: checkbox on the MIDDLE row (id 2)');
-if (glmCbRow && !(glmCbRow.indexOf('<input type="checkbox"') < glmCbRow.indexOf('badge'))) fail('odd pool: input before badge');
-const qwCbRow = trs.find((x) => x.includes("_togglePoolRollback('qwen3'"));
-if (!qwCbRow || !qwCbRow.includes("_editModel('4'")) fail('1-row pool: checkbox on its only row');
+// 无独立 rollback 列
+if (html.includes('col-rollback')) fail('dedicated rollback column removed');
+if (html.includes('cell-rollback')) fail('per-row rollback cells removed');
+// 池头行：每池一个，含开关+名称+计数+徽标
+const headers = html.match(/class="pool-header"/g) || [];
+if (headers.length !== 2) fail(`2 pools → 2 header rows, got ${headers.length}`);
+if (!html.includes('pool-header-inner')) fail('header has inner layout div');
+if (!html.includes('rb-switch')) fail('iOS switch present');
+if (!html.includes('rb-slider')) fail('slider present');
+if (!html.includes('pool-name')) fail('pool name span present');
+if (!html.includes('pool-count')) fail('instance count present');
+// 勾选状态在池头行的 checkbox
+if (!html.includes("window._togglePoolRollback('glm-5.3'")) fail('glm toggle wired');
+if (!html.includes('checked')) fail('on pool has checked switch');
+// 激活徽标在池头行
+if (!html.includes('models.rollback.active')) fail('active badge in header');
+// 部署行缩进
+if (!html.includes('pool-dep')) fail('indented deployment rows');
+// 黑框分隔已删（池头行就是分隔）
+if (html.includes('pool-start')) fail('old border separator removed');
 
-// 偶数池（2 行）：勾选框底边对齐首行底边（cell-rollback-bottom），badge 在 input 上方
-pool.renderModelsTable([models[0], models[1]], {});
-const evenHtml = el.innerHTML;
-const evenRow = evenHtml.split('<tr').find((x) => x.includes("_togglePoolRollback('glm-5.3'"));
-if (!evenRow) fail('2-row pool: checkbox present');
-if (!evenRow.includes('cell-rollback-bottom')) fail('even pool: bottom-aligned cell class');
-if (!(evenRow.indexOf('<input type="checkbox"') < evenRow.indexOf('badge'))) fail('uniform order: input before badge (even pool)');
-// glm 池全开 → 勾选；徽标在 rowspan 格内
-if (!html.includes("checked onchange=\"window._togglePoolRollback('glm-5.3'")) fail('glm pool (all on) checked');
-if (!html.includes('models.rollback.active')) fail('glm-5.3 should be active');
-if (html.includes('models.rollback.no_target')) fail('qwen3 off → no badge');
-// 黑框分隔：非首池首行
-if ((html.match(/pool-start/g) || []).length !== 1) fail('only the 2nd pool gets the separator border');
-
-// 开启 + 混配 → mixed（tooltip）
-pool.renderModelsTable([models[0], { ...models[3], rollback_enabled: true }], {});
-if (!el.innerHTML.includes('models.rollback.mixed')) fail('on + unconfigured → mixed');
-if (!el.innerHTML.includes('tip.badge.rb_mixed')) fail('mixed badge carries tooltip');
-
-// 开启 + 全配 + 单层 → no_target（tooltip）
-pool.renderModelsTable([models[0], models[1]], {});
-if (!el.innerHTML.includes('models.rollback.no_target')) fail('on + full + single tier → no_target');
-if (!el.innerHTML.includes('tip.badge.rb_no_target')) fail('no_target badge carries tooltip');
-
-// 价格列头不再右对齐
-if (html.includes('<th class="num">models.col.cost</th>')) fail('cost header must not carry .num');
+// 开关关的池无徽标
+pool.renderModelsTable([models[3]], {});  // qwen3 off
+if (el.innerHTML.includes('models.rollback.no_target')) fail('off pool → no badge');
+// 开关开的池有徽标
+pool.renderModelsTable([models[0], models[1], models[2]], {});
+if (!el.innerHTML.includes('models.rollback.active')) fail('on pool → badge');
 
 // 主开关三态：混合（glm 开、qwen3 关）→ indeterminate
 pool.renderModelsTable(models, {});
@@ -116,4 +98,125 @@ if (html.includes('<th class="num">models.col.cost</th>')) fail('cost header mus
 // ── 2. Config 卡片已移除（回落配置全部在模型部署页）───────────────
 if (src.includes('renderCardRollback')) fail('renderCardRollback should be removed from app.js');
 
-console.log('SMOKE OK: per-row cells, middle-row checkbox (bottom-aligned on even pools), badges, master toggle');
+// ── 3. Rollback 统计树：错误码子行 × 全部 9 个标题 ────────────────
+// fixture 是 boom-core/examples/dump_snapshot.rs 的真实输出（后端
+// error_codes key 形态的唯一真相源），勿手改 —— 重新生成：
+//   cargo run -p boom-core --example dump_snapshot
+const rb = loadBlock('  function renderRollbackStats(data) {', '  // ── KVC Hit Calibration',
+  'renderRollbackStats');
+const rbSnapshot = {
+  identify_total: 6, identify_miss: 1, pool_inert: 1, no_target: 1, fallback_selected: 3,
+  retry_success: 1, retry_error: 1, guard_error: 1, no_fallback_return: 1, affinity_direct: 1,
+  models: {
+    'glm-5.3': {
+      identify_miss: 1, pool_inert: 1, no_target: 1, fallback_selected: 3, retry_success: 1,
+      retry_error: 1, guard_error: 1, no_fallback_return: 1, affinity_direct: 1,
+      error_codes: {
+        'guard_error:flow_control_timeout': 1,
+        'identify_miss:WeirdModelError': 1,
+        'no_fallback_return:InputTokenExceeded': 1,
+        'no_target:InputTokenExceeded': 1,
+        'pool_inert:InputTokenExceeded': 1,
+        'retry_error:internal HTTP(500)': 1,
+        'retry_success:InputTokenExceeded': 1,
+      },
+      avg_retry_ms: 42,
+    },
+  },
+};
+rb.renderRollbackStats(rbSnapshot);
+const rbHtml = el.innerHTML;
+// 9 个 treeNode 按渲染顺序切分
+const nodes = rbHtml.split('<div class="rb-tree-node">').slice(1);
+if (nodes.length !== 9) fail(`9 tree nodes expected, got ${nodes.length}`);
+// (标题, 该节点的错误码子行期望; null = 成功指标，不应有子行)
+// (标题, 该节点的错误码子行期望; null = 无码指标[已选目标/亲和直达])
+// 键名=快照字段名,与后端 error_codes 前缀构造性一致,无别名层。
+// 重试成功节点展示"修复了什么错误"(原始上下文错误的码)+ 个数。
+const rbExpect = [
+  ['debug.rollback.miss',        'WeirdModelError'],
+  ['debug.rollback.inert',       'InputTokenExceeded'],
+  ['debug.rollback.no_target',   'InputTokenExceeded'],
+  ['debug.rollback.selected',    null],
+  ['debug.rollback.success',     'InputTokenExceeded'],
+  ['debug.rollback.retry_error', 'internal HTTP(500)'],
+  ['debug.rollback.guard_error', 'flow_control_timeout'],
+  ['debug.rollback.no_fallback', 'InputTokenExceeded'],
+  ['debug.rollback.affinity_direct', null],
+];
+nodes.forEach((seg, i) => {
+  const [label, code] = rbExpect[i];
+  if (!seg.includes(label)) fail(`node ${i}: expected label ${label}`);
+  if (!seg.includes('glm-5.3')) fail(`node ${i} (${label}): model row missing`);
+  if (!seg.includes('▸')) fail(`node ${i} (${label}): expandable arrow missing`);
+  if (code !== null) {
+    if (!seg.includes('rb-tree-sub')) fail(`node ${i} (${label}): error-code sub-row missing`);
+    if (!seg.includes(code)) fail(`node ${i} (${label}): expected code ${code}`);
+  } else if (seg.includes('rb-tree-sub')) {
+    fail(`node ${i} (${label}): success metric must not have error-code sub-rows`);
+  }
+});
+// 全量数据下不允许出现占位行
+if (rbHtml.includes('no per-model data')) fail('placeholder shown despite per-model data');
+// 两条不变量均成立（fixture 满足 identify_total = miss+inert+no_target+selected 等）
+if (!rbHtml.includes('✓')) fail('invariant checkmarks missing');
+
+console.log('SMOKE OK: pool header rows with switches, indented dep rows, no rollback column');
+console.log('SMOKE OK: rollback tree — codes under all 6 error headers + retry-success fixed-error sub-rows, alias-free keys');
+
+// ── 4. KVC DFX 表:Detail 列 + 错误详情链接(与主日志页同款) ─────
+// 提取块引用闭包变量 debugEnabled / promptLogEnabled → 以参数注入。
+const fmtPrefixHit = (v) => v.toFixed(1) + '%';
+const formatNumber = (v) => String(v);
+const formatTimestamp = (v) => String(v);
+function loadKvcBlock(debugEnabled, promptLogEnabled) {
+  return new Function('t', 'esc', 'formatTimestamp', 'formatNumber', 'fmtPrefixHit',
+    'debugEnabled', 'promptLogEnabled',
+    src.slice(src.indexOf('  function kvcDfxShellHtml() {'), src.indexOf('  function setupKvcFilters() {')) +
+    '\nreturn { kvcDfxShellHtml, renderKvcDfxRow };'
+  )(t, esc, formatTimestamp, formatNumber, fmtPrefixHit, debugEnabled, promptLogEnabled);
+}
+// 表头:16 列,Detail 在末尾;筛选行 16 格,10 个输入框不变
+const kvcShell = loadKvcBlock(false, false).kvcDfxShellHtml();
+if (!kvcShell.includes('<th>Detail</th>')) fail('KVC DFX header lacks Detail column');
+const shellCells = (kvcShell.match(/<td[>\s]/g) || []).length;
+if (shellCells !== 16) fail(`filter row must have 16 cells, got ${shellCells}`);
+if ((kvcShell.match(/col-filter/g) || []).length !== 9) fail('filter input count changed');
+// debug 开 + prompt log 开:错误类型可点 → _showDebugError;Detail 有 View 按钮
+const kvcOn = loadKvcBlock(true, true);
+const errRow = kvcOn.renderKvcDfxRow({
+  request_id: 'rid-1', key_hash: 'kh', team_alias: 'team-a', model: 'm1:d1', api_path: '/v1/chat/completions',
+  status_code: 502, error_type: 'upstream_error', error_message: 'boom', is_stream: true,
+  input_tokens: 10, output_tokens: 2, cached_tokens: 4, kv_hit_blocks: 1, kv_input_blocks: 2,
+  trie_blocks: 3, trie_max_blocks: 100, request_tokens: 100, duration_ms: 5, ttft_ms: 1, policy: 'rr+rollback',
+});
+if (!errRow.includes("window._showDebugError('rid-1')")) fail('error cell must link _showDebugError when debug on');
+if (!errRow.includes("window._viewPromptLog('rid-1'")) fail('detail cell must offer prompt-log view');
+if (!errRow.includes('action.view')) fail('detail cell button label');
+// 两个开关都关:无链接、Detail 为 "-"
+const errRowOff = loadKvcBlock(false, false).renderKvcDfxRow({
+  request_id: 'rid-2', error_type: 'upstream_error', error_message: 'x', status_code: 500, model: 'm', api_path: '/p',
+});
+if (errRowOff.includes('_showDebugError')) fail('no debug link when debug off');
+if (errRowOff.includes('_viewPromptLog')) fail('no view button when prompt log off');
+// 回退 400 透传行(error_type=context_length_exceeded)同样可点——
+// 后端 debug store 已把该类型纳入记录集
+const ctxRow = kvcOn.renderKvcDfxRow({
+  request_id: 'rid-ctx', key_hash: 'kh', model: 'm2:d1', api_path: '/v1/chat/completions',
+  status_code: 400, error_type: 'context_length_exceeded', error_message: 'InputTokenExceeded', policy: 'rr',
+});
+if (!ctxRow.includes("window._showDebugError('rid-ctx')")) fail('context-length rows must link the debug viewer');
+// 成功行:无错误 → Error 列 "-",Detail 仍有按钮
+const okRow = kvcOn.renderKvcDfxRow({
+  request_id: 'rid-3', key_hash: 'kh', model: 'm1:d2', api_path: '/v1/chat/completions',
+  status_code: 200, is_stream: false, policy: 'rr',
+});
+if (!okRow.includes('>-</td>')) fail('success row renders');
+if (!okRow.includes("window._viewPromptLog('rid-3'")) fail('success row detail cell present');
+// 列数:每行 16 个 <td>
+for (const row of [errRow, errRowOff, okRow]) {
+  const tds = (row.match(/<td/g) || []).length;
+  if (tds !== 16) fail(`row must render 16 cells, got ${tds}`);
+}
+
+console.log('SMOKE OK: KVC DFX detail column + debug-error link mirror the logs page');

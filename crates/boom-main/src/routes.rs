@@ -826,7 +826,17 @@ async fn chat_completions_inner(
             })?;
             let did = selection.provider.deployment_id().map(|s| s.to_string());
             let im = state.router.resolve_model_name(&resolved_model);
-            (selection.provider, did, im, None, None, None, None, None, None, Vec::new())
+            // Policy label, same mapping as the kvc path (kvc_aware → "kvc").
+            // This arm used to drop the label entirely, so rr / key-affinity
+            // pools (and single-candidate kvc pools) wrote NULL
+            // schedule_policy — the audit Policy column showed "-" and the
+            // policy filter (e.g. "+rollback") never matched. e2e-caught.
+            let policy_name = state.router.policy_name();
+            let policy_label = match policy_name.as_str() {
+                "kvc_aware" => "kvc",
+                other => other,
+            };
+            (selection.provider, did, im, Some(policy_label.to_string()), None, None, None, None, None, Vec::new())
         }
     };
     let routing_ms = route_start.elapsed().as_millis() as u64;
@@ -970,10 +980,10 @@ async fn chat_completions_inner(
     macro_rules! rb_fail { ($err:expr, $stream:expr) => {{
         // Finalize FIRST so the audit row records the client-visible status
         // (400 passthrough for context errors), not the masked 502.
-        let rb_final = boom_rollback::finalize_error($err, rb_patterns, Some(&state.rollback_stats));
+        let rb_final = boom_rollback::finalize_error($err, rb_patterns, Some(&state.rollback_stats), Some(&resolved_model));
         let partial_usage = provider_billing.actual_usage();
         settle_partial_provider_accounting(&mut plan_charge, &provider_billing);
-        log_error_with_usage(&state, &identity, &model, api_path, $stream, start, &rb_final, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()), user_tags.clone(), partial_usage.as_ref(), None);
+        log_error_with_usage(&state, &identity, &model, api_path, $stream, start, &rb_final, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()), user_tags.clone(), partial_usage.as_ref(), None, schedule_policy.clone());
         write_prompt_log_error(
             &state,
             prompt_log_should,
@@ -1026,7 +1036,19 @@ async fn chat_completions_inner(
         } else {
             match provider.chat_stream_with_context(req, provider_context).await {
                 Ok(s) => s,
-                Err(e) => { state.rollback_stats.record_pool_inert_if_context_error(&e, rb_patterns); rb_fail!(e, true) }
+                Err(e) => { {
+          // Unified with attempt.rs / finalize.rs: L1 via the GatewayError
+          // helper (actual upstream status + raw body — not the Display
+          // string, and not a hardcoded 400) and the same error_code_of
+          // extraction. The bespoke match here produced "unknown" for
+          // wrapper-shaped bodies ("Context length exceeded: {json}")
+          // while the other paths recorded "HTTP_400" — one request,
+          // two different codes across tree sections.
+          if e.context_error_match(rb_patterns).matched {
+            state.rollback_stats.record_pool_inert_identified(&resolved_model, &e);
+          }
+        }
+        rb_fail!(e, true) }
             }
         };
         // Provider accepted the request — commit the plan charge now.
@@ -1047,6 +1069,11 @@ async fn chat_completions_inner(
                     boom_core::trace::SpanAttributeValue::String(format!("{:?} -> {:?}", rb_from, deployment_id)),
                 );
             }
+        } else if rb_capable && kv_hit_blocks.map(|b| b > 0).unwrap_or(false) {
+            // Converged: affinity direct hit on a capable pool, no rollback
+            // needed — the memory-follow is working (debug pane convergence
+            // rate numerator).
+            state.rollback_stats.record_affinity_direct(&resolved_model);
         }
         let usage = UsageTracker::default();
         let sse_stream = sse_stream_from_chat_stream(stream, usage.clone());
@@ -1232,7 +1259,19 @@ async fn chat_completions_inner(
         } else {
             match provider.chat_with_context(req, provider_context).await {
                 Ok(r) => r,
-                Err(e) => { state.rollback_stats.record_pool_inert_if_context_error(&e, rb_patterns); rb_fail!(e, false) }
+                Err(e) => { {
+          // Unified with attempt.rs / finalize.rs: L1 via the GatewayError
+          // helper (actual upstream status + raw body — not the Display
+          // string, and not a hardcoded 400) and the same error_code_of
+          // extraction. The bespoke match here produced "unknown" for
+          // wrapper-shaped bodies ("Context length exceeded: {json}")
+          // while the other paths recorded "HTTP_400" — one request,
+          // two different codes across tree sections.
+          if e.context_error_match(rb_patterns).matched {
+            state.rollback_stats.record_pool_inert_identified(&resolved_model, &e);
+          }
+        }
+        rb_fail!(e, false) }
             }
         };
         if let Some(g) = trace_guard.as_ref() { g.note_upstream_end(); }
@@ -1257,6 +1296,11 @@ async fn chat_completions_inner(
                     boom_core::trace::SpanAttributeValue::String(format!("{:?} -> {:?}", rb_from, deployment_id)),
                 );
             }
+        } else if rb_capable && kv_hit_blocks.map(|b| b > 0).unwrap_or(false) {
+            // Converged: affinity direct hit on a capable pool, no rollback
+            // needed — the memory-follow is working (debug pane convergence
+            // rate numerator).
+            state.rollback_stats.record_affinity_direct(&resolved_model);
         }
 
         let duration_ms = start.elapsed().as_millis() as i32;
@@ -1951,6 +1995,7 @@ fn check_client_block_rules(
         None,
         Some(client_ip.to_string()),
         user_tags,
+        None,
         None,
         None,
     );
@@ -3469,7 +3514,17 @@ pub async fn messages(
             })?;
             let did = selection.provider.deployment_id().map(|s| s.to_string());
             let im = state.router.resolve_model_name(&resolved_model);
-            (selection.provider, did, im, None, None, None, None, None, None, Vec::new())
+            // Policy label, same mapping as the kvc path (kvc_aware → "kvc").
+            // This arm used to drop the label entirely, so rr / key-affinity
+            // pools (and single-candidate kvc pools) wrote NULL
+            // schedule_policy — the audit Policy column showed "-" and the
+            // policy filter (e.g. "+rollback") never matched. e2e-caught.
+            let policy_name = state.router.policy_name();
+            let policy_label = match policy_name.as_str() {
+                "kvc_aware" => "kvc",
+                other => other,
+            };
+            (selection.provider, did, im, Some(policy_label.to_string()), None, None, None, None, None, Vec::new())
         }
     };
     let routing_ms = route_start.elapsed().as_millis() as u64;
@@ -3588,8 +3643,8 @@ pub async fn messages(
     };
     macro_rules! rb_fail { ($err:expr, $stream:expr) => {{
         // Finalize FIRST so the audit row records the client-visible status.
-        let rb_final = boom_rollback::finalize_error($err, rb_patterns, Some(&state.rollback_stats));
-        log_error(&state, &identity, &model, "/v1/messages", $stream, start, &rb_final, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()), user_tags.clone());
+        let rb_final = boom_rollback::finalize_error($err, rb_patterns, Some(&state.rollback_stats), Some(&resolved_model));
+        crate::request_log::log_error_with_policy(&state, &identity, &model, "/v1/messages", $stream, start, &rb_final, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()), user_tags.clone(), schedule_policy.clone());
         write_prompt_log_error(
             &state,
             prompt_log_should,
@@ -3639,7 +3694,19 @@ pub async fn messages(
         } else {
             match provider.chat_stream(openai_req).await {
                 Ok(s) => s,
-                Err(e) => { state.rollback_stats.record_pool_inert_if_context_error(&e, rb_patterns); rb_fail!(e, true) }
+                Err(e) => { {
+          // Unified with attempt.rs / finalize.rs: L1 via the GatewayError
+          // helper (actual upstream status + raw body — not the Display
+          // string, and not a hardcoded 400) and the same error_code_of
+          // extraction. The bespoke match here produced "unknown" for
+          // wrapper-shaped bodies ("Context length exceeded: {json}")
+          // while the other paths recorded "HTTP_400" — one request,
+          // two different codes across tree sections.
+          if e.context_error_match(rb_patterns).matched {
+            state.rollback_stats.record_pool_inert_identified(&resolved_model, &e);
+          }
+        }
+        rb_fail!(e, true) }
             }
         };
         // Provider accepted the request — commit the plan charge now.
@@ -3660,6 +3727,11 @@ pub async fn messages(
                     boom_core::trace::SpanAttributeValue::String(format!("{:?} -> {:?}", rb_from, deployment_id)),
                 );
             }
+        } else if rb_capable && kv_hit_blocks.map(|b| b > 0).unwrap_or(false) {
+            // Converged: affinity direct hit on a capable pool, no rollback
+            // needed — the memory-follow is working (debug pane convergence
+            // rate numerator).
+            state.rollback_stats.record_affinity_direct(&resolved_model);
         }
         let usage = UsageTracker::default();
         let sse_stream = sse_stream_from_anthropic_chat_stream(stream, model.clone(), usage.clone());
@@ -3822,7 +3894,19 @@ pub async fn messages(
         } else {
             match provider.chat(openai_req).await {
                 Ok(r) => r,
-                Err(e) => { state.rollback_stats.record_pool_inert_if_context_error(&e, rb_patterns); rb_fail!(e, false) }
+                Err(e) => { {
+          // Unified with attempt.rs / finalize.rs: L1 via the GatewayError
+          // helper (actual upstream status + raw body — not the Display
+          // string, and not a hardcoded 400) and the same error_code_of
+          // extraction. The bespoke match here produced "unknown" for
+          // wrapper-shaped bodies ("Context length exceeded: {json}")
+          // while the other paths recorded "HTTP_400" — one request,
+          // two different codes across tree sections.
+          if e.context_error_match(rb_patterns).matched {
+            state.rollback_stats.record_pool_inert_identified(&resolved_model, &e);
+          }
+        }
+        rb_fail!(e, false) }
             }
         };
         if let Some(g) = trace_guard.as_ref() { g.note_upstream_end(); }
@@ -3846,6 +3930,11 @@ pub async fn messages(
                     boom_core::trace::SpanAttributeValue::String(format!("{:?} -> {:?}", rb_from, deployment_id)),
                 );
             }
+        } else if rb_capable && kv_hit_blocks.map(|b| b > 0).unwrap_or(false) {
+            // Converged: affinity direct hit on a capable pool, no rollback
+            // needed — the memory-follow is working (debug pane convergence
+            // rate numerator).
+            state.rollback_stats.record_affinity_direct(&resolved_model);
         }
 
         let duration_ms = start.elapsed().as_millis() as i32;
@@ -4469,7 +4558,17 @@ pub async fn responses(
             })?;
             let did = selection.provider.deployment_id().map(|s| s.to_string());
             let im = state.router.resolve_model_name(&resolved_model);
-            (selection.provider, did, im, None, None, None, None, None, None, Vec::new())
+            // Policy label, same mapping as the kvc path (kvc_aware → "kvc").
+            // This arm used to drop the label entirely, so rr / key-affinity
+            // pools (and single-candidate kvc pools) wrote NULL
+            // schedule_policy — the audit Policy column showed "-" and the
+            // policy filter (e.g. "+rollback") never matched. e2e-caught.
+            let policy_name = state.router.policy_name();
+            let policy_label = match policy_name.as_str() {
+                "kvc_aware" => "kvc",
+                other => other,
+            };
+            (selection.provider, did, im, Some(policy_label.to_string()), None, None, None, None, None, Vec::new())
         }
     };
     let routing_ms = route_start.elapsed().as_millis() as u64;
@@ -4625,8 +4724,8 @@ pub async fn responses(
     // the macro can expand on both the first-error and retry-error paths.
     macro_rules! rb_fail { ($err:expr, $stream:expr) => {{
         // Finalize FIRST so the audit row records the client-visible status.
-        let rb_final = boom_rollback::finalize_error($err, rb_patterns, Some(&state.rollback_stats));
-        log_error(&state, &identity, &model, "/v1/responses", $stream, start, &rb_final, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()), user_tags.clone());
+        let rb_final = boom_rollback::finalize_error($err, rb_patterns, Some(&state.rollback_stats), Some(&resolved_model));
+        crate::request_log::log_error_with_policy(&state, &identity, &model, "/v1/responses", $stream, start, &rb_final, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()), user_tags.clone(), schedule_policy.clone());
         write_prompt_log_error(
             &state,
             prompt_log_should,
@@ -4698,7 +4797,19 @@ pub async fn responses(
         } else {
             match provider.chat_stream(openai_req).await {
                 Ok(s) => s,
-                Err(e) => { state.rollback_stats.record_pool_inert_if_context_error(&e, rb_patterns); rb_fail!(e, true) }
+                Err(e) => { {
+          // Unified with attempt.rs / finalize.rs: L1 via the GatewayError
+          // helper (actual upstream status + raw body — not the Display
+          // string, and not a hardcoded 400) and the same error_code_of
+          // extraction. The bespoke match here produced "unknown" for
+          // wrapper-shaped bodies ("Context length exceeded: {json}")
+          // while the other paths recorded "HTTP_400" — one request,
+          // two different codes across tree sections.
+          if e.context_error_match(rb_patterns).matched {
+            state.rollback_stats.record_pool_inert_identified(&resolved_model, &e);
+          }
+        }
+        rb_fail!(e, true) }
             }
         };
         let _decision = plan_charge.commit();
@@ -4718,6 +4829,11 @@ pub async fn responses(
                     boom_core::trace::SpanAttributeValue::String(format!("{:?} -> {:?}", rb_from, deployment_id)),
                 );
             }
+        } else if rb_capable && kv_hit_blocks.map(|b| b > 0).unwrap_or(false) {
+            // Converged: affinity direct hit on a capable pool, no rollback
+            // needed — the memory-follow is working (debug pane convergence
+            // rate numerator).
+            state.rollback_stats.record_affinity_direct(&resolved_model);
         }
         let usage = UsageTracker::default();
         let sse_stream = sse_stream_from_responses_chat_stream(
@@ -4895,7 +5011,19 @@ pub async fn responses(
         } else {
             match provider.chat(openai_req).await {
                 Ok(r) => r,
-                Err(e) => { state.rollback_stats.record_pool_inert_if_context_error(&e, rb_patterns); rb_fail!(e, false) }
+                Err(e) => { {
+          // Unified with attempt.rs / finalize.rs: L1 via the GatewayError
+          // helper (actual upstream status + raw body — not the Display
+          // string, and not a hardcoded 400) and the same error_code_of
+          // extraction. The bespoke match here produced "unknown" for
+          // wrapper-shaped bodies ("Context length exceeded: {json}")
+          // while the other paths recorded "HTTP_400" — one request,
+          // two different codes across tree sections.
+          if e.context_error_match(rb_patterns).matched {
+            state.rollback_stats.record_pool_inert_identified(&resolved_model, &e);
+          }
+        }
+        rb_fail!(e, false) }
             }
         };
         if let Some(g) = trace_guard.as_ref() { g.note_upstream_end(); }
@@ -4917,6 +5045,11 @@ pub async fn responses(
                     boom_core::trace::SpanAttributeValue::String(format!("{:?} -> {:?}", rb_from, deployment_id)),
                 );
             }
+        } else if rb_capable && kv_hit_blocks.map(|b| b > 0).unwrap_or(false) {
+            // Converged: affinity direct hit on a capable pool, no rollback
+            // needed — the memory-follow is working (debug pane convergence
+            // rate numerator).
+            state.rollback_stats.record_affinity_direct(&resolved_model);
         }
 
         let duration_ms = start.elapsed().as_millis() as i32;

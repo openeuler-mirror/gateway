@@ -134,12 +134,21 @@ pub async fn attempt_stream(
 ) -> RollbackOutcome<ChatStream> {
     let patterns = ctx.patterns.to_vec();
     let decision = select_fallback(first_error, &patterns, route, &ctx.router, &failed_provider);
-    ctx.stats.record_identify_total();
+    // Composite event methods: each bumps its counters + per-model entry +
+    // error code derived INTERNALLY from the error (error_code_of) — no
+    // caller-side extraction, no hand-crafted codes, one request → one
+    // identical code string in every tree section.
     match &decision {
-        FallbackDecision::Target(_) => ctx.stats.record_fallback_selected(),
-        FallbackDecision::MissIdentify => ctx.stats.record_identify_miss(),
-        FallbackDecision::PoolInert => ctx.stats.record_pool_inert(),
-        FallbackDecision::NoTarget => ctx.stats.record_no_target(),
+        FallbackDecision::Target(_) => ctx.stats.record_selected(route.model),
+        FallbackDecision::MissIdentify => {
+            ctx.stats.record_miss_identified(route.model, first_error)
+        }
+        FallbackDecision::PoolInert => {
+            ctx.stats.record_pool_inert_identified(route.model, first_error)
+        }
+        FallbackDecision::NoTarget => {
+            ctx.stats.record_no_target_identified(route.model, first_error)
+        }
     }
     let Some(target) = decision.target()
     else {
@@ -157,9 +166,11 @@ pub async fn attempt_stream(
         route.model,
     )
     .await;
-    if guard_err.is_err() {
-        ctx.stats.record_guard_error();
+    if let Some(ref ge) = guard_err.as_ref().err() {
+        ctx.stats.record_guard_error(route.model, ge);
     }
+    let retry_start = std::time::Instant::now();
+    let guard_failed = guard_err.is_err();
     let result = match guard_err {
         Err(e) => Err(e),
         Ok(()) => match call_ctx {
@@ -168,8 +179,21 @@ pub async fn attempt_stream(
         },
     };
     match &result {
-        Ok(_) => ctx.stats.record_retry_success(),
-        Err(_) => ctx.stats.record_retry_error(),
+        Ok(_) => {
+            let ms = retry_start.elapsed().as_millis() as u64;
+            // `first_error` = the ORIGINAL context error the retry FIXED —
+            // its code feeds the retry-success tree's sub-rows ("成功修复
+            // 了什么错误、各多少次").
+            ctx.stats.record_retry_success_fixed(route.model, first_error, ms);
+        }
+        // Guard-swap failure is already counted as guard_error (terminal:
+        // no retry call was made) — bumping retry_error here too would
+        // double-count and break invariant ② selected = success +
+        // retry_error + guard_error.
+        Err(ref e) if !guard_failed => {
+            ctx.stats.record_retry_error(route.model, e);
+        }
+        Err(_) => {}
     }
     RollbackOutcome::Retried {
         result,
@@ -195,12 +219,21 @@ pub async fn attempt_call(
 ) -> RollbackOutcome<ChatCompletionResponse> {
     let patterns = ctx.patterns.to_vec();
     let decision = select_fallback(first_error, &patterns, route, &ctx.router, &failed_provider);
-    ctx.stats.record_identify_total();
+    // Composite event methods: each bumps its counters + per-model entry +
+    // error code derived INTERNALLY from the error (error_code_of) — no
+    // caller-side extraction, no hand-crafted codes, one request → one
+    // identical code string in every tree section.
     match &decision {
-        FallbackDecision::Target(_) => ctx.stats.record_fallback_selected(),
-        FallbackDecision::MissIdentify => ctx.stats.record_identify_miss(),
-        FallbackDecision::PoolInert => ctx.stats.record_pool_inert(),
-        FallbackDecision::NoTarget => ctx.stats.record_no_target(),
+        FallbackDecision::Target(_) => ctx.stats.record_selected(route.model),
+        FallbackDecision::MissIdentify => {
+            ctx.stats.record_miss_identified(route.model, first_error)
+        }
+        FallbackDecision::PoolInert => {
+            ctx.stats.record_pool_inert_identified(route.model, first_error)
+        }
+        FallbackDecision::NoTarget => {
+            ctx.stats.record_no_target_identified(route.model, first_error)
+        }
     }
     let Some(target) = decision.target()
     else {
@@ -218,9 +251,11 @@ pub async fn attempt_call(
         route.model,
     )
     .await;
-    if guard_err.is_err() {
-        ctx.stats.record_guard_error();
+    if let Some(ref ge) = guard_err.as_ref().err() {
+        ctx.stats.record_guard_error(route.model, ge);
     }
+    let retry_start = std::time::Instant::now();
+    let guard_failed = guard_err.is_err();
     let result = match guard_err {
         Err(e) => Err(e),
         Ok(()) => match call_ctx {
@@ -229,8 +264,21 @@ pub async fn attempt_call(
         },
     };
     match &result {
-        Ok(_) => ctx.stats.record_retry_success(),
-        Err(_) => ctx.stats.record_retry_error(),
+        Ok(_) => {
+            let ms = retry_start.elapsed().as_millis() as u64;
+            // `first_error` = the ORIGINAL context error the retry FIXED —
+            // its code feeds the retry-success tree's sub-rows ("成功修复
+            // 了什么错误、各多少次").
+            ctx.stats.record_retry_success_fixed(route.model, first_error, ms);
+        }
+        // Guard-swap failure is already counted as guard_error (terminal:
+        // no retry call was made) — bumping retry_error here too would
+        // double-count and break invariant ② selected = success +
+        // retry_error + guard_error.
+        Err(ref e) if !guard_failed => {
+            ctx.stats.record_retry_error(route.model, e);
+        }
+        Err(_) => {}
     }
     RollbackOutcome::Retried {
         result,

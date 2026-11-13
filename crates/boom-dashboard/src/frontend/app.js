@@ -3044,10 +3044,6 @@
     const wrap = document.getElementById("rollback-stats-wrap");
     if (!wrap) return;
     const total = Number(data.identify_total || 0);
-    if (!total) {
-      wrap.innerHTML = '<p class="muted">' + t("debug.rollback.no_data") + '</p>';
-      return;
-    }
     const miss = Number(data.identify_miss || 0);
     const inert = Number(data.pool_inert || 0);
     const noTarget = Number(data.no_target || 0);
@@ -3055,32 +3051,117 @@
     const success = Number(data.retry_success || 0);
     const retryErr = Number(data.retry_error || 0);
     const guardErr = Number(data.guard_error || 0);
-    const pass400 = Number(data.passthrough_400 || 0);
-    // Invariants
+    const pass400 = Number(data.no_fallback_return || 0);
+    const direct = Number(data.affinity_direct || 0);
+    const denom = direct + success;
+    const conv = denom > 0 ? Math.round(direct * 100 / denom) : null;
     const inv1ok = total === miss + inert + noTarget + selected;
     const inv2ok = selected === success + retryErr + guardErr;
+    const models = data.models || {};
+
     const cell = (label, val, cls) =>
       '<div class="kcs-cell' + (cls ? " " + cls : "") + '">' +
-        '<div class="kcs-value">' + val.toLocaleString() + '</div>' +
+        '<div class="kcs-value">' + val + '</div>' +
         '<div class="kcs-label">' + esc(label) + '</div>' +
       '</div>';
+
+    // Tree node: label + total + per-model rows. For "miss" nodes, each
+    // model row further breaks down by error type (two-level tree). For
+    // "success" nodes, each model row shows avg retry duration inline.
+    const treeNode = (label, count, eventKey, models) => {
+      const entries = Object.entries(models)
+        .map(([m, stats]) => {
+          const v = Number(stats[eventKey] || 0);
+          const avg = stats.avg_retry_ms;
+          const errorCodes = stats.error_codes || {};
+          return { m, v, avg, errorCodes };
+        })
+        .filter(e => e.v > 0)
+        .sort((a, b) => b.v - a.v);
+      let html = '<div class="rb-tree-node">' +
+        '<div class="rb-tree-head" onclick="this.parentElement.classList.toggle(\'rb-open\')">' +
+          '<span class="rb-tree-arrow">' + (count > 0 ? '▸' : '·') + '</span>' +
+          '<span class="rb-tree-label">' + esc(label) + '</span>' +
+          '<span class="rb-tree-count">' + count.toLocaleString() + '</span>' +
+        '</div>';
+      html += '<div class="rb-tree-children">';
+      if (entries.length) {
+        for (const e of entries) {
+          // Main model row — for success, append avg duration
+          let suffix = '';
+          if (eventKey === 'retry_success' && e.avg != null) {
+            suffix = ' <span class="rb-tree-avg">' + t("debug.rollback.avg_ms", { ms: e.avg }) + '</span>';
+          }
+          html += '<div class="rb-tree-child">' +
+            '<span class="rb-tree-model">' + esc(e.m) + suffix + '</span>' +
+            '<span class="rb-tree-val">' + e.v.toLocaleString() + '</span>' +
+          '</div>';
+          // Error-code sub-rows: ALL error counters, unified.
+          // Backend stores as "{event}:{code}" in one map; frontend
+          // filters by "{eventKey}:" prefix and strips it for display.
+          {
+            // Backend error_codes keys are the SNAPSHOT FIELD NAMES
+            // ("identify_miss:InputTokenExceeded", "retry_success:…" …) —
+            // exactly this tree's eventKey, so the prefix match is by
+            // construction (no alias layer; the composite recording methods
+            // on RollbackStats are the only producers).
+            const prefix = eventKey + ':';
+            const codes = Object.entries(e.errorCodes)
+              .filter(([k, v]) => k.startsWith(prefix) && v > 0)
+              .map(([k, v]) => [k.slice(prefix.length), v])
+              .sort((a, b) => b[1] - a[1]);
+            for (const [code, cv] of codes) {
+              html += '<div class="rb-tree-child rb-tree-sub">' +
+                '<span class="rb-tree-model">' + esc(code) + '</span>' +
+                '<span class="rb-tree-val">' + cv + '</span>' +
+              '</div>';
+            }
+          }
+
+
+        }
+        
+      }
+      if (!entries.length && count > 0) {
+        html += '<div class="rb-tree-child rb-tree-sub"><span class="rb-tree-model" style="color:var(--text3)">no per-model data</span></div>';
+      }
+      html += '</div>';
+      return html + '</div>';
+    };
+
+    // Header: 2 big numbers
     let html = '<div class="kcs-grid">' +
-      cell(t("debug.rollback.total"), total) +
-      cell(t("debug.rollback.miss"), miss) +
-      cell(t("debug.rollback.inert"), inert, "kcs-warn") +
-      cell(t("debug.rollback.no_target"), noTarget, "kcs-warn") +
-      cell(t("debug.rollback.selected"), selected) +
-      cell(t("debug.rollback.success"), success) +
-      cell(t("debug.rollback.retry_error"), retryErr, "kcs-warn") +
-      cell(t("debug.rollback.guard_error"), guardErr, "kcs-warn") +
-      cell(t("debug.rollback.pass400"), pass400) +
+      cell(t("debug.rollback.total"), total.toLocaleString()) +
+      cell(t("debug.rollback.convergence"), conv === null ? "—" : conv + "%", "kcs-highlight") +
     '</div>';
-    html += '<p class="kcs-breakdown">' + (inv1ok ? "✓" : "✗") + " " +
-      t("debug.rollback.inv1") + '</p>';
-    html += '<p class="kcs-breakdown">' + (inv2ok ? "✓" : "✗") + " " +
-      t("debug.rollback.inv2") + '</p>';
-    html += '<p class="kcs-breakdown" style="color:var(--text3)">' +
-      t("debug.rollback.hint") + '</p>';
+
+    // Decision tree
+    html += '<div class="rb-tree-section">' + t("debug.rollback.decision_tree") + '</div>';
+    html += '<div class="rb-tree">' +
+      treeNode(t("debug.rollback.miss"), miss, "identify_miss", models) +
+      treeNode(t("debug.rollback.inert"), inert, "pool_inert", models) +
+      treeNode(t("debug.rollback.no_target"), noTarget, "no_target", models) +
+      treeNode(t("debug.rollback.selected"), selected, "fallback_selected", models) +
+    '</div>';
+
+    // Outcome tree
+    html += '<div class="rb-tree-section">' + t("debug.rollback.outcome_tree") + '</div>';
+    html += '<div class="rb-tree">' +
+      treeNode(t("debug.rollback.success"), success, "retry_success", models) +
+      treeNode(t("debug.rollback.retry_error"), retryErr, "retry_error", models) +
+      treeNode(t("debug.rollback.guard_error"), guardErr, "guard_error", models) +
+      treeNode(t("debug.rollback.no_fallback"), pass400, "no_fallback_return", models) +
+      treeNode(t("debug.rollback.affinity_direct"), direct, "affinity_direct", models) +
+    '</div>';
+
+    // Invariants
+    html += '<p class="kcs-breakdown">' + (inv1ok ? "✓" : "✗") + " " + t("debug.rollback.inv1") + '</p>';
+    html += '<p class="kcs-breakdown">' + (inv2ok ? "✓" : "✗") + " " + t("debug.rollback.inv2") + '</p>';
+    if (conv !== null) {
+      html += '<p class="kcs-breakdown">' + t("debug.rollback.conv_detail", {
+        direct: direct.toLocaleString(), success: success.toLocaleString(),
+      }) + '</p>';
+    }
     wrap.innerHTML = html;
   }
 
@@ -5513,93 +5594,95 @@
 
   function renderModelsTable(models, aliasesMap) {
     const wrap = document.getElementById("models-table-wrap");
-    syncRollbackMaster(models); // sync BEFORE the empty early-return
+    syncRollbackMaster(models);
     if (models.length === 0) { wrap.innerHTML = "<p>" + t("models.empty") + "</p>"; return; }
     aliasesMap = aliasesMap || {};
-    // Group by model_name, preserving first-appearance order.
     const order = [];
     const byName = {};
     models.forEach((m) => {
       if (!byName[m.model_name]) { byName[m.model_name] = []; order.push(m.model_name); }
       byName[m.model_name].push(m);
     });
+
     wrap.innerHTML = `<table class="models-table">
-      <tr><th>${t("models.col.model")}</th><th class="col-rollback">${t("models.col.rollback")}</th><th>${t("models.col.aliases")}</th><th>${t("models.col.litellm_model")}</th><th>${t("models.col.cost")}</th><th>${t("models.col.base_url")}</th><th class="num">${t("models.col.ratio")}</th><th class="num">${t("models.col.rpm")}</th><th class="num">${t("models.col.timeout")}</th><th>${t("models.col.enabled")}</th><th>${t("models.col.source")}</th><th>${t("models.col.actions")}</th></tr>
-      ${order.map((name, poolIdx) => {
+      <thead><tr><th>${t("models.col.deploy_id")}</th><th>${t("models.col.aliases")}</th><th>${t("models.col.cost")}</th><th>${t("models.col.base_url")}</th><th class="num">${t("models.col.ratio")}</th><th class="num">${t("models.col.rpm")}</th><th class="num">${t("models.col.timeout")}</th><th>${t("models.col.enabled")}</th><th>${t("models.col.source")}</th><th>${t("models.col.actions")}</th></tr></thead>
+      <tbody>
+      ${order.map((name) => {
         const rows = byName[name];
         const poolOn = rows.every((m) => m.rollback_enabled);
-        // ONE checkbox per POOL in the rollback column (after the model
-        // column), rendered in the pool's MIDDLE row so it reads as
-        // centered. Every row keeps its OWN rollback td — zebra stripes
-        // stay per-row. (A rowspan cell paints ONE background across all
-        // spanned rows: it always fights the stripes, whichever color you
-        // pick — verified by headless-Chrome repro.) The checkbox writes
-        // the WHOLE group. Pools are separated by a strong top border on
-        // the first row of every pool after the first.
-        const midRow = Math.floor((rows.length - 1) / 2);
-        // Uniform content order: checkbox on top, activation badge BELOW.
-        // Even pools: the pool's visual center falls ON a row boundary —
-        // bottom-align the stack so the badge text sits on the center line.
-        // Odd pools: middle row, vertically centered.
-        const evenPool = rows.length % 2 === 0;
-        const cbAttrs = `title="${esc(t("tip.pool.rollback"))}" ${poolOn ? "checked" : ""} onchange="window._togglePoolRollback('${esc(name)}', this.checked)"`;
-        const controlTd = `<td class="cell-rollback${evenPool ? " cell-rollback-bottom" : ""}"><input type="checkbox" ${cbAttrs}>${rollbackPoolBadge(rows)}</td>`;
-        return rows.map((m, rowIdx) => {
-          const poolStart = rowIdx === 0 && poolIdx > 0 ? " pool-start" : "";
 
-        const isAutoDisabled = !m.enabled && m.auto_disabled;
-        const rowClass = !m.enabled ? "model-row-disabled" : "";
-        const enabledBadge = m.enabled
-          ? '<span class="badge badge-active">' + t("common.yes") + '</span>'
-          : isAutoDisabled
-            ? '<span class="badge badge-blocked">' + t("common.no") + '</span><br><span style="color:var(--danger);font-size:0.8em">' + t("status.auto_disabled") + '</span>'
-            : '<span class="badge badge-blocked">' + t("common.no") + '</span>';
-        const warningRow = isAutoDisabled
-          ? `<tr class="model-row-warning"><td colspan="11">${t("models.fault_disabled")}</td></tr>`
-          : '';
-        // Cost cell: inline "label:$value" per line, three rows. Compact so
-        // the column stays narrow even when EN headers squeeze the table.
-        const c = m.cost_per_million || {};
-        const fmtCost = (v) => (v == null || v === "0" || v === "") ? "-" : "¥" + v;
-        const costCell = '<div class="cost-cell">'
-          + '<div class="cost-line"><span class="cost-label">' + esc(t("plan.dim.regular_input_cost")) + ':</span><span class="cost-value">' + fmtCost(c.input) + '</span></div>'
-          + '<div class="cost-line"><span class="cost-label">' + esc(t("plan.dim.cached_input_cost")) + ':</span><span class="cost-value">' + fmtCost(c.cached_input) + '</span></div>'
-          + '<div class="cost-line"><span class="cost-label">' + esc(t("plan.dim.output_cost")) + ':</span><span class="cost-value">' + fmtCost(c.output) + '</span></div>'
-          + '</div>';
-        // Alias cell: 0 → "-"; 1 → clickable chip; ≥2 → "View N aliases".
-        // Management (add/delete/toggle) lives in the model edit modal;
-        // these only open the read-only listing.
-        const aliases = aliasesMap[m.model_name] || [];
-        let aliasCell;
-        if (aliases.length === 0) {
-          aliasCell = '<span class="muted">-</span>';
-        } else if (aliases.length === 1) {
-          aliasCell = '<button class="alias-chip alias-chip-btn" onclick="window._showModelAliases(\'' + esc(m.model_name) + '\')">' + esc(aliases[0]) + '</button>';
-        } else {
-          aliasCell = '<button class="btn-small" onclick="window._showModelAliases(\'' + esc(m.model_name) + '\')">'
-            + esc(t("models.aliases.view_detail", { n: aliases.length })) + '</button>';
-        }
-        // Visibility badge on the model name cell: 🌐 public / 🔒 private + team count.
-        const visBadge = visibilityBadgeFor(m);
-        return `<tr class="${rowClass}${poolStart}">
-        <td>${renderDeployCell(m.model_name, m.deployment_id)} ${visBadge}</td>
-        ${rowIdx === midRow ? controlTd : '<td class="cell-rollback"></td>'}
-        <td>${aliasCell}</td>
-        <td class="mono">${esc(m.litellm_model)}</td>
-        <td>${costCell}</td>
-        <td class="mono cell-url" title="${esc(m.api_base || "")}">${esc(m.api_base || "-")}</td>
-        <td class="num">${m.quota_count_ratio && m.quota_count_ratio !== 1 ? '<span class="badge badge-plan">x' + m.quota_count_ratio + '</span>' : 'x1'}</td>
-        <td class="num">${m.rpm || "-"}</td>
-        <td class="num">${m.timeout}s</td>
-        <td>${enabledBadge}</td>
-        <td><span class="badge badge-plan">${esc(m.source || "-")}</span></td>
-        <td>
-          <button class="btn-small" onclick="window._editModel('${m.id}')">${t("action.edit")}</button>
-          <button class="btn-danger" onclick="window._deleteModel('${m.id}','${esc(m.model_name)}')">${t("action.delete")}</button>
-        </td>
-      </tr>${warningRow}`;
-      }).join("");
+        // Pool header: switch + name + count + badge (full-width row)
+        const badge = rollbackPoolBadge(rows);
+        const vendor = vendorOf(name);
+        const headerRow = `<tr class="pool-header">
+          <td colspan="10">
+            <div class="pool-header-inner">
+              <img class="vendor-logo pool-vendor-logo" src="/dashboard/assets/vendor/${vendor}" alt="${vendor}">
+              <div class="pool-id-block">
+                <span class="pool-name">${esc(name)}</span>
+                <span class="pool-count">${rows.length} ${esc(t("models.pool.instances"))}</span>
+              </div>
+              <div class="pool-actions">
+              ${badge}
+              <label class="rb-switch" title="${esc(t("tip.pool.rollback"))}">
+                <input type="checkbox" ${poolOn ? "checked" : ""} onchange="window._togglePoolRollback('${esc(name)}', this.checked)">
+                <span class="rb-slider"></span>
+              </label>
+              </div>
+            </div>
+          </td>
+        </tr>`;
+
+        const depRows = rows.map((m, rowIdx) => {
+          const isAutoDisabled = !m.enabled && m.auto_disabled;
+          const rowClass = !m.enabled ? "model-row-disabled" : "";
+          const enabledBadge = m.enabled
+            ? '<span class="badge badge-active">' + t("common.yes") + '</span>'
+            : isAutoDisabled
+              ? '<span class="badge badge-blocked">' + t("common.no") + '</span><br><span style="color:var(--danger);font-size:0.8em">' + t("status.auto_disabled") + '</span>'
+              : '<span class="badge badge-blocked">' + t("common.no") + '</span>';
+          const warningRow = isAutoDisabled
+            ? `<tr class="model-row-warning"><td colspan="10">${t("models.fault_disabled")}</td></tr>`
+            : '';
+          const c = m.cost_per_million || {};
+          const fmtCost = (v) => (v == null || v === "0" || v === "") ? "-" : "¥" + v;
+          const costCell = '<div class="cost-cell">'
+            + '<div class="cost-line"><span class="cost-label">' + esc(t("plan.dim.regular_input_cost")) + ':</span><span class="cost-value">' + fmtCost(c.input) + '</span></div>'
+            + '<div class="cost-line"><span class="cost-label">' + esc(t("plan.dim.cached_input_cost")) + ':</span><span class="cost-value">' + fmtCost(c.cached_input) + '</span></div>'
+            + '<div class="cost-line"><span class="cost-label">' + esc(t("plan.dim.output_cost")) + ':</span><span class="cost-value">' + fmtCost(c.output) + '</span></div>'
+            + '</div>';
+          const aliases = aliasesMap[m.model_name] || [];
+          let aliasCell;
+          if (aliases.length === 0) {
+            aliasCell = '<span class="muted">-</span>';
+          } else if (aliases.length === 1) {
+            aliasCell = '<button class="alias-chip alias-chip-btn" onclick="window._showModelAliases(\'' + esc(m.model_name) + '\')">' + esc(aliases[0]) + '</button>';
+          } else {
+            aliasCell = '<button class="btn-small" onclick="window._showModelAliases(\'' + esc(m.model_name) + '\')">'
+              + esc(t("models.aliases.view_detail", { n: aliases.length })) + '</button>';
+          }
+          const visBadge = visibilityBadgeFor(m);
+        const zebra = rowIdx % 2 === 1 ? " dep-alt" : "";
+        return `<tr class="pool-dep${zebra} ${rowClass}">
+          <td><div class="dep-id-block"><span class="dep-id">${esc(m.deployment_id || "-")}</span><span class="dep-vis">${visBadge}</span></div></td>
+          <td>${aliasCell}</td>
+          <td>${costCell}</td>
+          <td class="mono cell-url" title="${esc(m.api_base || "")}">${esc(m.api_base || "-")}</td>
+          <td class="num">${m.quota_count_ratio && m.quota_count_ratio !== 1 ? '<span class="badge badge-plan">x' + m.quota_count_ratio + '</span>' : 'x1'}</td>
+          <td class="num">${m.rpm || "-"}</td>
+          <td class="num">${m.timeout}s</td>
+          <td>${enabledBadge}</td>
+          <td><span class="badge badge-plan">${esc(m.source || "-")}</span></td>
+          <td>
+            <button class="btn-small" onclick="window._editModel('${m.id}')">${t("action.edit")}</button>
+            <button class="btn-danger" onclick="window._deleteModel('${m.id}','${esc(m.model_name)}')">${t("action.delete")}</button>
+          </td>
+        </tr>${warningRow}`;
+        }).join("");
+
+        return headerRow + depRows;
       }).join("")}
+      </tbody>
     </table>`;
   }
 
@@ -5677,7 +5760,7 @@
         <div class="form-card">
           <div class="form-card-title">${t("model_card.auth")}</div>
           <div class="form-card-grid">
-            <div class="form-group"><label>${t("form.model.api_key")} ${tip(t("tip.model.api_key"))}</label><input id="m-model-key" type="password" value="${esc(p.api_key || "")}" placeholder="sk-... or os.environ/VAR"></div>
+            <div class="form-group"><label>${t("form.model.api_key")} ${tip(t("tip.model.api_key"))}</label><input id="m-model-key" name="boom-deploy-key" type="password" autocomplete="new-password" value="${esc(p.api_key || "")}" placeholder="sk-... or os.environ/VAR"></div>
             <div class="form-group field-checkbox"><input id="m-model-key-env" type="checkbox" ${(p.api_key_env) ? "checked" : ""}><label for="m-model-key-env">${t("form.model.api_key_env")} ${tip(t("tip.model.api_key_env"))}</label></div>
             <div class="form-group field-full"><label>${t("form.model.headers")} ${tip(t("tip.model.headers"))}</label><textarea id="m-model-headers" rows="2" style="font-family:var(--mono);font-size:12px">${esc(Object.keys(headers).length ? JSON.stringify(headers, null, 2) : "")}</textarea></div>
           </div>
@@ -5686,8 +5769,8 @@
           <div class="form-card-title">${t("model_card.aws")}</div>
           <div class="form-card-grid">
             <div class="form-group"><label>${t("form.model.aws_region")} ${tip(t("tip.model.aws_region"))}</label><input id="m-model-aws-region" value="${esc(p.aws_region_name || "")}"></div>
-            <div class="form-group"><label>${t("form.model.aws_key_id")} ${tip(t("tip.model.aws_key_id"))}</label><input id="m-model-aws-key" value="${esc(p.aws_access_key_id || "")}"></div>
-            <div class="form-group field-full"><label>${t("form.model.aws_secret")} ${tip(t("tip.model.aws_secret"))}</label><input id="m-model-aws-secret" type="password" value="${esc(p.aws_secret_access_key || "")}"></div>
+            <div class="form-group"><label>${t("form.model.aws_key_id")} ${tip(t("tip.model.aws_key_id"))}</label><input id="m-model-aws-key" name="boom-deploy-aws" autocomplete="off" value="${esc(p.aws_access_key_id || "")}"></div>
+            <div class="form-group field-full"><label>${t("form.model.aws_secret")} ${tip(t("tip.model.aws_secret"))}</label><input id="m-model-aws-secret" name="boom-deploy-aws-secret" type="password" autocomplete="new-password" value="${esc(p.aws_secret_access_key || "")}"></div>
           </div>
         </div>
         <div class="form-card">
@@ -5868,6 +5951,19 @@
           headers,
         };
         if (Object.keys(modelInfo).length > 0) body.model_info = modelInfo;
+
+        // Guard: browsers autofill saved passwords into credential fields;
+        // empty = keep existing (COALESCE), non-empty = replace. Warn on update.
+        if (p.id) {
+          const chg = [];
+          if (document.getElementById("m-model-key").value.trim()) chg.push("API Key");
+          if (document.getElementById("m-model-aws-key").value.trim()) chg.push("AWS Access Key");
+          if (document.getElementById("m-model-aws-secret").value.trim()) chg.push("AWS Secret Key");
+          if (chg.length > 0 && !confirm(
+            t("form.model.credential_change_confirm", { fields: chg.join(", ") })
+          )) return;
+        }
+
         const url = p.id ? `/admin/models/${p.id}` : "/admin/models";
         const method = p.id ? "PUT" : "POST";
         await api(url, { method, body: JSON.stringify(body) });
@@ -9114,7 +9210,7 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
     tbody.innerHTML = logs.map((l) => {
         const etype = l.error_type || "";
         const isDebuggable = debugEnabled && l.request_id && (
-          etype === "upstream_error" || etype === "provider_error" || etype === "timeout" || etype === "client_blocked"
+          etype === "upstream_error" || etype === "provider_error" || etype === "timeout" || etype === "client_blocked" || etype === "context_length_exceeded"
         );
         const errorCell = l.error_message
           ? (isDebuggable
@@ -9209,7 +9305,7 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
       '<tr>' +
         '<th>Time</th><th>IP</th><th>Team</th><th>Key</th><th>Model</th><th>Path</th>' +
         '<th>Status</th><th>Stream</th><th>IN/OUT</th><th>Prefix Hit</th>' +
-        '<th>Policy</th><th>Req Bytes</th><th>Duration</th><th>TTFT</th><th>Error</th>' +
+        '<th>Policy</th><th>Req Bytes</th><th>Duration</th><th>TTFT</th><th>Error</th><th>Detail</th>' +
       '</tr>' +
       '<tr class="filter-row">' +
         '<td></td>' +
@@ -9220,8 +9316,11 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
         '<td><input class="col-filter" data-col="api_path" placeholder="filter"></td>' +
         '<td><input class="col-filter" data-col="status_code" placeholder="filter"></td>' +
         '<td><input class="col-filter" data-col="stream" placeholder="filter"></td>' +
-        '<td></td><td></td><td></td><td></td><td></td><td></td>' +
+        '<td></td><td></td>' +
+        '<td><input class="col-filter" data-col="policy" placeholder="filter"></td>' +
+        '<td></td><td></td><td></td>' +
         '<td><input class="col-filter" data-col="error" placeholder="filter"></td>' +
+        '<td></td>' +
       '</tr>' +
       '</thead><tbody id="kvc-dfx-tbody"></tbody></table>' +
       '<div id="kvc-dfx-pagination" class="pagination"></div>';
@@ -9241,6 +9340,22 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
       var mp = l.model.split(":");
       modelVal = '<span class="log-model-name">' + esc(mp[0]) + '</span><span class="log-model-sep">:</span><span class="log-model-deploy">' + esc(mp.slice(1).join(":")) + '</span>';
     }
+    // Error + Detail cells mirror the main Logs page so a filtered problem
+    // row can jump straight to the full error detail / request body: the
+    // error type links to the debug error viewer when the debug toggle is
+    // on; the Detail column opens the prompt-log entry.
+    var etype = l.error_type || "";
+    var isDebuggable = debugEnabled && l.request_id && (
+      etype === "upstream_error" || etype === "provider_error" || etype === "timeout" || etype === "client_blocked" || etype === "context_length_exceeded"
+    );
+    var errorCell = l.error_message
+      ? (isDebuggable
+        ? '<a href="#" onclick="event.preventDefault();window._showDebugError(\'' + esc(l.request_id) + '\')" style="color:var(--primary);text-decoration:underline;cursor:pointer" title="' + esc(l.error_message) + '">' + esc(etype.substring(0, 20)) + '</a>'
+        : '<span style="color:var(--danger)" title="' + esc(l.error_message) + '">' + esc(etype.substring(0, 20)) + '</span>')
+      : "-";
+    var detailCell = promptLogEnabled && l.request_id
+      ? '<button class="btn-small" onclick="window._viewPromptLog(\'' + esc(l.request_id) + '\',\'' + esc(l.key_hash) + '\',\'' + esc(l.team_alias || "") + '\')">' + t("action.view") + '</button>'
+      : "-";
     // Trie-Hit and Trie Fill are folded into the Prefix Hit cell.
     var prefixCell =
       '<div class="kvc-pct">' + esc(pct) + '</div>' +
@@ -9261,7 +9376,8 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
       '<td class="mono">' + (l.request_tokens != null ? formatNumber(l.request_tokens) : "-") + '</td>' +
       '<td>' + (l.duration_ms != null ? l.duration_ms + "ms" : "-") + '</td>' +
       '<td>' + (l.ttft_ms != null ? l.ttft_ms + "ms" : "-") + '</td>' +
-      '<td>' + (l.error_message ? '<span style="color:var(--danger)" title="' + esc(l.error_message) + '">' + esc((l.error_type || "").substring(0, 20)) + '</span>' : "-") + '</td>' +
+      '<td class="mono">' + errorCell + '</td>' +
+      '<td>' + detailCell + '</td>' +
       '</tr>';
   }
 
@@ -9313,10 +9429,10 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
       var rows = data.logs || [];
       tbody.innerHTML = rows.length
         ? rows.map(renderKvcDfxRow).join("")
-        : '<tr><td colspan="15" class="muted">No logs.</td></tr>';
+        : '<tr><td colspan="16" class="muted">No logs.</td></tr>';
       renderKvcPagination(data);
     } catch (e) {
-      tbody.innerHTML = '<tr><td colspan="15" class="muted">Failed to load: ' + esc(String(e)) + '</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="16" class="muted">Failed to load: ' + esc(String(e)) + '</td></tr>';
     }
   }
 

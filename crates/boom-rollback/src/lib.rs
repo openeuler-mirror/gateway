@@ -237,7 +237,7 @@ mod tests {
     #[test]
     fn finalize_error_converts_and_preserves() {
         let e = ctx_error(Some(250_000));
-        let converted = finalize_error(e, &patterns(), None);
+        let converted = finalize_error(e, &patterns(), None, None);
         match converted {
             GatewayError::ContextLengthExceeded(ref msg) => {
                 assert!(msg.contains("InputTokenExceeded"));
@@ -247,10 +247,10 @@ mod tests {
         assert_eq!(converted.status_code(), 400);
         // 特性关闭（空 patterns）：原样保留 502 语义
         let e2 = ctx_error(Some(250_000));
-        let kept = finalize_error(e2, &[], None);
+        let kept = finalize_error(e2, &[], None, None);
         assert_eq!(kept.status_code(), 502);
         // 非上下文错误：原样
         let e3 = GatewayError::UpstreamError { status: 400, message: "other".into() };
-        assert_eq!(finalize_error(e3, &patterns(), None).status_code(), 502);
+        assert_eq!(finalize_error(e3, &patterns(), None, None).status_code(), 502);
     }
 }

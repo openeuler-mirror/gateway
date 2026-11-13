@@ -753,6 +753,11 @@ impl DeploymentStore {
                 .bind(d.model_info.as_ref().unwrap_or(&serde_json::Value::Null))
                 .bind(allowed_teams_json(&d.allowed_teams))
                 .bind(visibility_str(d.visibility))
+                // DEPLOYMENT_CORE_COLUMNS tail (positions 26-27). Missing
+                // here = "bind supplies 25 parameters but statement requires
+                // 27" on every fresh-DB YAML boot (e2e-caught).
+                .bind(d.max_context_tokens)
+                .bind(d.rollback_enabled)
                 .execute(&mut *conn)
                 .await?;
         }
@@ -1331,6 +1336,40 @@ mod tests {
                     || DEPLOYMENT_ROW_SELECT_COLUMNS.contains(&format!(" {}", col)),
                 "column `{}` missing from DEPLOYMENT_ROW_SELECT_COLUMNS",
                 col,
+            );
+        }
+    }
+
+    /// Bind-count guard: the INSERT statements carry one placeholder per core
+    /// column, and a missing `.bind()` in the chain is only caught at RUNTIME
+    /// ("bind message supplies N parameters, but prepared statement requires
+    /// M") on a fresh-DB YAML boot — the column-mention tests above cannot see
+    /// it. Scrape this file's own source and count `.bind(` between each
+    /// INSERT executor and its `.execute(`.
+    #[test]
+    fn insert_bind_chains_match_core_column_count() {
+        let src = include_str!("deployment_store.rs");
+        for fname in ["fn seed_rows_db", "fn create_db"] {
+            let start = src.find(fname).unwrap_or_else(|| {
+                panic!("function `{}` not found in source", fname)
+            });
+            let body = &src[start..];
+            // The bind chain ends at the first terminal call — different
+            // executors are used across the INSERT paths (.execute / .fetch_*).
+            let end = [".execute(", ".fetch_one(", ".fetch_all(", ".fetch_optional("]
+                .iter()
+                .filter_map(|t| body.find(t))
+                .min()
+                .unwrap_or_else(|| panic!("no executor call after `{}`", fname));
+            let chain = &body[..end];
+            let binds = chain.matches(".bind(").count();
+            assert_eq!(
+                binds,
+                DEPLOYMENT_CORE_COLUMNS.len(),
+                "`{}` binds {} value(s) but INSERT has {} column(s) — add the missing .bind() (CLAUDE.md §9)",
+                fname,
+                binds,
+                DEPLOYMENT_CORE_COLUMNS.len(),
             );
         }
     }

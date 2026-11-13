@@ -3190,6 +3190,7 @@ pub struct ListLogsQuery {
     pub stream: Option<String>,
     pub error: Option<String>,
     pub team_alias: Option<String>,
+    pub policy: Option<String>,
     pub client_ip: Option<String>,
     /// Time window: "3d" (default) / "7d" / "30d" / "all". Bounds the scan to
     /// the created_at index range so the ILIKE filters only apply within the
@@ -3298,6 +3299,7 @@ pub async fn list_logs(
     let error_param      = slot!(query.error);
     let team_alias_param = slot!(query.team_alias);
     let client_ip_param   = slot!(query.client_ip);
+    let policy_param     = slot!(query.policy);
 
     if let Some(i) = range_param {
         where_clauses.push(format!("rl.created_at >= ${i}"));
@@ -3340,6 +3342,11 @@ pub async fn list_logs(
     if query.team_alias.is_some() {
         where_clauses.push(format!("bt.team_alias ILIKE ${}", team_alias_param.unwrap()));
     }
+    if query.policy.is_some() {
+        // Filter against the RAW schedule_policy column (e.g. "kvc_aware+rollback")
+        // so both the raw name and display labels match via ILIKE.
+        where_clauses.push(format!("rl.schedule_policy ILIKE ${}", policy_param.unwrap()));
+    }
     if query.client_ip.is_some() {
         where_clauses.push(format!("rl.client_ip ILIKE ${}", client_ip_param.unwrap()));
     }
@@ -3381,6 +3388,7 @@ pub async fn list_logs(
     let error_pattern      = query.error.as_ref().map(|v| format!("%{}%", escape_like(v)));
     let team_alias_pattern = query.team_alias.as_ref().map(|v| format!("%{}%", escape_like(v)));
     let client_ip_pattern  = query.client_ip.as_ref().map(|v| format!("%{}%", escape_like(v)));
+    let policy_pattern     = query.policy.as_ref().map(|v| format!("%{}%", escape_like(v)));
 
     // Bind parameters (order must match slot allocation above).
     if let Some(from) = range_from {
@@ -3415,6 +3423,9 @@ pub async fn list_logs(
         q = q.bind(p.clone());
     }
     if let Some(ref p) = client_ip_pattern {
+        q = q.bind(p.clone());
+    }
+    if let Some(ref p) = policy_pattern {
         q = q.bind(p.clone());
     }
 
@@ -3467,6 +3478,9 @@ pub async fn list_logs(
         cq = cq.bind(p.clone());
     }
     if let Some(ref p) = client_ip_pattern {
+        cq = cq.bind(p.clone());
+    }
+    if let Some(ref p) = policy_pattern {
         cq = cq.bind(p.clone());
     }
     cq = cq.bind(LOGS_COUNT_CAP);
@@ -3538,16 +3552,9 @@ pub async fn list_logs(
                 "ttft_ms": r.ttft_ms,
                 "created_at": r.created_at.map(|d| d.to_rfc3339()),
                 "client_ip": r.client_ip,
-                // DFX: scheduling observability. policy shown as short code:
-                // kvc=kvc_aware, key=key_affinity, rr=round_robin.
-                "policy": match r.schedule_policy.as_deref() {
-                    Some("kvc_aware") => "kvc",
-                    Some("kvc_aware→key_affinity") => "kvc→key",
-                    Some("key_affinity") => "key",
-                    Some("round_robin") => "rr",
-                    Some(other) => other,
-                    None => "",
-                },
+                // DFX: scheduling observability. Raw schedule_policy value —
+                // WYSIWYG: what you see is what you can filter on (ILIKE).
+                "policy": r.schedule_policy.clone().unwrap_or_default(),
                 "kv_hit_blocks": r.kv_hit_blocks,
                 "kv_input_blocks": r.kv_input_blocks,
                 "trie_blocks": r.trie_blocks,
