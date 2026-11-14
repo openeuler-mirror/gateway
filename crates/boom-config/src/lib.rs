@@ -1002,6 +1002,13 @@ pub struct ServerSettings {
     pub port: u16,
     #[serde(default = "default_workers")]
     pub workers: usize,
+    /// Stable instance identity (private domain — per-instance config,
+    /// never broadcast). Unset → derived "host:port", so the id always
+    /// exists. With a shared DB, boot fails loudly when two instances
+    /// resolve the same id (see boom_state::registry::register) — a
+    /// multi-instance deployment therefore needs explicit unique ids.
+    #[serde(default)]
+    pub instance_id: Option<String>,
 }
 
 impl Default for ServerSettings {
@@ -1010,6 +1017,7 @@ impl Default for ServerSettings {
             host: default_host(),
             port: default_port(),
             workers: default_workers(),
+            instance_id: None,
         }
     }
 }

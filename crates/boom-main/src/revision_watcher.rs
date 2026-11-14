@@ -19,29 +19,49 @@ use boom_state::registry::{heartbeat, InstanceInfo};
 
 /// Upsert the heartbeat row every 15s. First beat fires immediately so a
 /// freshly-booted instance is visible in `boom_instance_state` at once.
+///
+/// The UPDATE is pid-guarded, so a beat whose row was taken over (another
+/// process registered the same id) or deleted reports it instead of
+/// silently refreshing a row we no longer own — a duplicate identity is
+/// never silent.
 pub fn spawn_instance_heartbeat(state: AppState, mut shutdown: Receiver<()>) {
     let Some(pool) = state.db_pool.clone() else {
         return; // No DB — no cluster to be visible in.
     };
-    let (host, port) = {
+    let info = {
         let server = &state.inner.load().config.server;
-        (server.host.clone(), server.port)
-    };
-    let info = InstanceInfo {
-        instance_id: state.instance_id.to_string(),
-        hostname: std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".into()),
-        pid: std::process::id(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        // The configured bind address. When bound to 0.0.0.0 this is not
-        // directly routable — operators set a real host for scatter
-        // drill-down; refinement (auto-detect pod IP) is dashboard-phase.
-        advertise_addr: Some(format!("{}:{}", host, port)),
+        InstanceInfo::current(&state.instance_id, &server.host, server.port)
     };
 
     tokio::spawn(async move {
+        let mut identity_lost = false;
         loop {
-            if let Err(e) = heartbeat(&pool, &info).await {
-                tracing::warn!(error = %e, "instance heartbeat failed (will retry)");
+            match heartbeat(&pool, &info).await {
+                Ok(boom_state::registry::Heartbeat::Own) => {}
+                Ok(boom_state::registry::Heartbeat::ReRegistered) => {
+                    tracing::warn!("instance heartbeat row had vanished — re-registered");
+                }
+                Ok(boom_state::registry::Heartbeat::TakenOver { holder_pid }) => {
+                    if !identity_lost {
+                        tracing::error!(
+                            instance_id = %info.instance_id,
+                            holder_pid,
+                            "our instance registration was taken over by another process — \
+                             duplicate instance id: restart one of them with a unique \
+                             server.instance_id"
+                        );
+                    } else {
+                        tracing::debug!(
+                            instance_id = %info.instance_id,
+                            holder_pid,
+                            "instance registration still held by another process"
+                        );
+                    }
+                    identity_lost = true;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "instance heartbeat failed (will retry)");
+                }
             }
             tokio::select! {
                 _ = tokio::time::sleep(std::time::Duration::from_secs(

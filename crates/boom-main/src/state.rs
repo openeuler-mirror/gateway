@@ -255,7 +255,19 @@ impl AppState {
         // 2. Limiter survives across reloads. Its instance identity (delta
         // protocol watermark namespace) is assigned once per boot, before
         // any traffic can touch the counters.
-        let instance_id: Arc<str> = boom_state::generate_instance_id().into();
+        //
+        // The id is STABLE across restarts — configured explicitly, or
+        // derived from the bind address so it always exists — so historical
+        // rows stay attributable to the same logical instance. Duplicate
+        // detection happens below (registration) and fails the boot.
+        let instance_id: Arc<str> = match config.server.instance_id.as_deref() {
+            Some(raw) if !raw.trim().is_empty() => raw.trim().to_string().into(),
+            Some(_) => anyhow::bail!(
+                "server.instance_id is set but empty — configure a real id or remove the field"
+            ),
+            None => format!("{}:{}", config.server.host, config.server.port).into(),
+        };
+        tracing::info!(instance_id = %instance_id, "instance identity resolved");
         let limiter = Arc::new(SlidingWindowLimiter::new());
         limiter.set_instance_id(instance_id.to_string());
 
@@ -348,6 +360,37 @@ impl AppState {
             // dashboard migrations: the revision watcher and heartbeat
             // depend on them existing.
             boom_state::migrations::run(pool).await?;
+
+            // Register the stable instance id BEFORE any heartbeat or
+            // traffic: a duplicate id (copy-paste YAML, loopback + same
+            // port) fails the boot here with the holder's coordinates,
+            // instead of silently splitting cluster state. A provably
+            // dead holder (stale heartbeat, or same-host dead pid) is
+            // taken over in place — crash-restart does not wait out the
+            // TTL.
+            let info = boom_state::registry::InstanceInfo::current(
+                &instance_id,
+                &config.server.host,
+                config.server.port,
+            );
+            match boom_state::registry::register(pool, &info).await {
+                Ok(boom_state::registry::Registration::Registered) => {
+                    tracing::info!(instance_id = %instance_id, "instance id registered");
+                }
+                Ok(boom_state::registry::Registration::TookOver { previous }) => {
+                    tracing::info!(
+                        instance_id = %instance_id,
+                        previous_pid = previous.pid,
+                        previous_started_at = %previous.started_at,
+                        "took over stale instance registration"
+                    );
+                }
+                Err(e) => anyhow::bail!("instance id registration failed: {e}"),
+            }
+
+            // Stable id ⇒ the watermark namespace spans boots: continue the
+            // push sequence after the last committed row (MAX(seq)).
+            limiter.hydrate_push_seq(pool).await?;
 
             crate::migrations::ensure_config_meta_table(pool).await?;
 

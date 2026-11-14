@@ -4,9 +4,10 @@
 //! (instance liveness, config-revision changelog); business modules own
 //! their reactions to those signals:
 //!
-//! - [`registry`]: instance heartbeat + liveness. One row per live
-//!   process, all timestamps DB-side so liveness never trusts instance
-//!   clocks.
+//! - [`registry`]: stable instance identity (configured or derived), boot
+//!   registration with duplicate-id detection, and pid-guarded heartbeat.
+//!   All liveness timestamps are DB-side so liveness never trusts
+//!   instance clocks.
 //! - [`revision`]: DB-as-changelog. Writers bump a category counter after
 //!   committing a business write; every instance polls the counters and
 //!   reconciles changed categories. Reconciles are idempotent, so a
@@ -20,7 +21,10 @@ pub mod migrations;
 pub mod registry;
 pub mod revision;
 
-pub use registry::{generate_instance_id, heartbeat, live_instances, InstanceInfo, InstanceRow};
+pub use registry::{
+    heartbeat, live_instances, register, resolve_hostname, Heartbeat, InstanceInfo, InstanceRow,
+    Registration, RegisterError,
+};
 pub use revision::{
     bump, bump_best_effort, snapshot, CATEGORY_ASSIGNMENT, CATEGORY_AUTH, CATEGORY_BLOCKLIST,
     CATEGORY_PLAN, CATEGORY_QUOTA, CATEGORY_ROUTING, CATEGORY_TRACE, CATEGORY_USER_TAG,

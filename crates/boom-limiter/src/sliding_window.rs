@@ -225,7 +225,9 @@ pub struct SlidingWindowLimiter {
     /// Instance identity for the delta protocol's watermark rows. Set once
     /// at boot by boom-main (before traffic); `None` disables pushes.
     instance_id: RwLock<Option<String>>,
-    /// Monotonic push sequence within this boot's instance_id namespace.
+    /// Monotonic push sequence in this instance id's watermark namespace.
+    /// Stable ids make the namespace span restarts — hydrate_push_seq
+    /// continues after the last committed row at boot.
     push_seq: std::sync::atomic::AtomicI64,
     /// When true, the sync cycle also pulls peer deltas into the global
     /// bases (shared enforcement). Default false → per-instance decisions.
@@ -311,6 +313,33 @@ impl SlidingWindowLimiter {
         if let Ok(mut guard) = self.instance_id.write() {
             *guard = Some(instance_id);
         }
+    }
+
+    /// Continue the push sequence after this id's last committed watermark
+    /// row. With stable instance ids the (instance_id, seq) namespace spans
+    /// boots: restarting from 0 would collide with the previous
+    /// incarnation's rows (PK) and break every push. Aggregate MAX always
+    /// answers exactly one row — GaussDB INTO-safe. Pruned rows (instance
+    /// down > 2h) restarting from 0 is safe: the pruned namespace cannot
+    /// collide, and boot-time mirror restoration comes from the counter
+    /// rows, not from the watermark.
+    pub async fn hydrate_push_seq(&self, pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
+        let instance_id = match self.instance_id.read() {
+            Ok(guard) => guard.clone(),
+            Err(_) => None,
+        };
+        let Some(instance_id) = instance_id else {
+            return Ok(()); // No identity assigned — pushes are disabled anyway.
+        };
+        let (max_seq,): (Option<i64>,) =
+            sqlx::query_as(r#"SELECT MAX(seq) FROM boom_quota_delta WHERE instance_id = $1"#)
+                .bind(&instance_id)
+                .fetch_one(pool)
+                .await?;
+        let next = max_seq.map_or(0, |m| m.saturating_add(1));
+        self.push_seq.store(next, std::sync::atomic::Ordering::Relaxed);
+        tracing::debug!(instance_id, next_seq = next, "push sequence hydrated");
+        Ok(())
     }
 
     /// Flip the decision base: `true` = global (pull peer deltas into the
