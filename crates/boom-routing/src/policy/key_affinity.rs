@@ -287,6 +287,32 @@ impl SchedulePolicy for KeyAffinityPolicy {
         Some(provider)
     }
 
+    /// Outcome callback: on admission success, rebind the key to the FINAL
+    /// deployment (idempotent — same binding just refreshes the idle clock).
+    /// This is the memory-follow for out-of-band reroutes: after a capacity
+    /// hand-off or (later) a rollback fallback, the second select's len==1
+    /// short-circuit may skip the rebind, leaving the binding pointing at
+    /// the deployment that rejected the request — every subsequent request
+    /// would re-hit it (design doc §7, the binding trap). The rerouting
+    /// executor calls this with the deployment that actually succeeded.
+    fn on_outcome(
+        &self,
+        key_hash: Option<&str>,
+        model: &str,
+        deployment_id: Option<&str>,
+        success: bool,
+    ) {
+        if !success {
+            return; // failures don't touch bindings — existing paths own them
+        }
+        let (Some(key), Some(did)) = (key_hash, deployment_id) else {
+            return;
+        };
+        // Same path as the rebalance migration: rebind handles both the
+        // move (decrement old / increment new) and the refresh cases.
+        self.rebind(&format!("{}:{}", key, model), did);
+    }
+
     fn sweep_expired(&self, now: Instant) -> usize {
         if self.ttl.is_zero() {
             return 0;
@@ -407,6 +433,77 @@ mod tests {
 
     fn counts(p: &KeyAffinityPolicy) -> Vec<(String, u64)> {
         p.affinity_binding_counts()
+    }
+
+    #[test]
+    fn select_writes_binding_immediately() {
+        // PR2 non-regression pin: bindings are still written at SELECT time
+        // (the anti-magnet concurrency-spreading semantics PR2 preserved).
+        // on_outcome is an additive correction path, NOT a replacement —
+        // this test fails if anyone moves binding writes to on_outcome.
+        let (policy, candidates) = make_policy(&[("d1", 10), ("d2", 10)], 0, Duration::ZERO);
+        let pick = policy.select("m", &candidates, Some("k1"), 100).expect("select");
+        let bound = pick.deployment_id().unwrap().to_string();
+        let counts = policy.affinity_binding_counts();
+        assert!(
+            counts.iter().any(|(id, n)| id == &bound && *n == 1),
+            "binding must exist right after select: {:?}",
+            counts
+        );
+    }
+
+    #[test]
+    fn binding_is_sticky_across_selects() {
+        // PR2 non-regression pin: same key keeps hitting its bound
+        // deployment across selects (no load difference → no rebalance).
+        let (policy, candidates) = make_policy(&[("d1", 10), ("d2", 10)], 0, Duration::ZERO);
+        let p1 = policy.select("m", &candidates, Some("k1"), 100).unwrap();
+        let p2 = policy.select("m", &candidates, Some("k1"), 100).unwrap();
+        let p3 = policy.select("m", &candidates, Some("k1"), 100).unwrap();
+        assert_eq!(p1.deployment_id(), p2.deployment_id());
+        assert_eq!(p2.deployment_id(), p3.deployment_id());
+    }
+
+    #[test]
+    fn on_outcome_success_binds_key_to_final_deployment() {
+        let (policy, candidates) = make_policy(&[("d1", 10), ("d2", 10)], 0, Duration::ZERO);
+        // 初始 select 绑定（模拟首跳选中 d1）
+        let first = policy
+            .select("m", &candidates, Some("k1"), 100)
+            .expect("select");
+        assert_eq!(first.deployment_id(), Some("d1"));
+        // 回落/换手后在 d2 成功 → on_outcome 迁移绑定
+        policy.on_outcome(Some("k1"), "m", Some("d2"), true);
+        let second = policy
+            .select("m", &candidates, Some("k1"), 100)
+            .expect("select");
+        assert_eq!(
+            second.deployment_id(),
+            Some("d2"),
+            "binding must follow the final (successful) deployment"
+        );
+    }
+
+    #[test]
+    fn on_outcome_is_idempotent() {
+        let (policy, _candidates) = make_policy(&[("d1", 10), ("d2", 10)], 0, Duration::ZERO);
+        policy.on_outcome(Some("k1"), "m", Some("d2"), true);
+        policy.on_outcome(Some("k1"), "m", Some("d2"), true);
+        let counts = policy.affinity_binding_counts();
+        let d2 = counts.iter().find(|(id, _)| id == "d2").expect("d2 bound");
+        assert_eq!(d2.1, 1, "double on_outcome must not double-count the binding");
+    }
+
+    #[test]
+    fn on_outcome_failure_and_missing_fields_are_noops() {
+        let (policy, _candidates) = make_policy(&[("d1", 10)], 0, Duration::ZERO);
+        policy.on_outcome(Some("k1"), "m", Some("d1"), false); // 失败不写
+        policy.on_outcome(None, "m", Some("d1"), true);        // 无 key 不写
+        policy.on_outcome(Some("k1"), "m", None, true);        // 无 deployment 不写
+        assert!(
+            policy.affinity_binding_counts().is_empty(),
+            "no on_outcome variant above may write a binding"
+        );
     }
 
     #[test]

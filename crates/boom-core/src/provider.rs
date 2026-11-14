@@ -176,6 +176,7 @@ pub enum ProviderProtocol {
 
 /// Gateway context attached to a provider call after parent-request
 /// authentication and quota admission have completed.
+#[derive(Clone)]
 pub struct ProviderCallContext {
     pub key_hash: String,
     pub key_alias: Option<String>,
@@ -252,6 +253,21 @@ pub trait Provider: Send + Sync + 'static {
     /// KV-cache matching (e.g. managed endpoints like Bedrock/Gemini).
     fn kv_worker_id(&self) -> Option<&str> {
         None
+    }
+
+    /// Context capability declaration for rollback tiering (tokens).
+    /// `None` = not participating (default — fusion virtual providers,
+    /// non-OpenAI-compatible providers, test fakes). Stored per deployment
+    /// from `boom_model_deployment.max_context_tokens`.
+    fn max_context_tokens(&self) -> Option<u64> {
+        None
+    }
+
+    /// Per-deployment rollback participation (pool semantics: the model
+    /// group participates when every candidate returns true). Default
+    /// false.
+    fn rollback_enabled(&self) -> bool {
+        false
     }
 
     /// Whether to attach the `X-BooM-Client-Type` header to outgoing

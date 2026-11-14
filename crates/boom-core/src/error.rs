@@ -78,6 +78,13 @@ pub enum GatewayError {
     #[error("Upstream error ({status}): {message}")]
     UpstreamError { status: u16, message: String },
 
+    /// Context-length rejection passthrough (rollback L1 identified, no
+    /// fallback available or the fallback also rejected). Carries the
+    /// upstream 400 semantics + the original message so agents don't treat
+    /// it as a retryable 5xx (the UpstreamError→502 masking defect).
+    #[error("Context length exceeded: {0}")]
+    ContextLengthExceeded(String),
+
     #[error("Endpoint not supported: {0}")]
     NotSupported(String),
 
@@ -116,6 +123,7 @@ impl GatewayError {
             Self::ClientBlocked { status, .. } => *status,
             Self::UpstreamTimeout => 504,
             Self::UpstreamError { .. } => 502,
+            Self::ContextLengthExceeded(_) => 400,
             Self::NotSupported(_) => 404,
             Self::ResponseNotFound(_) => 404,
             Self::UnsupportedMode(_) => 400,
@@ -192,6 +200,7 @@ impl GatewayError {
             Self::KeyBlocked => "key_blocked",
             Self::ModelNotAllowed(_) => "model_not_allowed",
             Self::ClientBlocked { .. } => "client_blocked",
+            Self::ContextLengthExceeded(_) => "context_length_exceeded",
             Self::UpstreamTimeout => "timeout",
             Self::UpstreamError { .. } => "upstream_error",
             Self::NotSupported(_) => "not_supported",

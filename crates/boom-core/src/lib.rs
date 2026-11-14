@@ -1,5 +1,6 @@
 pub mod alert;
 pub mod anthropic;
+pub mod context_error;
 pub mod db_util;
 pub mod debug_store;
 pub mod error;

@@ -84,6 +84,24 @@ impl Router {
         self.policy.load().inner.sweep_expired(now)
     }
 
+    /// Outcome notification: delegates to the current policy's `on_outcome`
+    /// (post-ArcSwap, same pattern as sweep_affinity). Called by the
+    /// rollback chain after a successful fallback so key_affinity can
+    /// migrate the binding to the deployment that actually served the
+    /// request. Idempotent; no-op for policies without outcome state.
+    pub fn notify_outcome(
+        &self,
+        key_hash: Option<&str>,
+        model: &str,
+        deployment_id: Option<&str>,
+        success: bool,
+    ) {
+        self.policy
+            .load()
+            .inner
+            .on_outcome(key_hash, model, deployment_id, success);
+    }
+
     /// Snapshot of per-deployment affinity binding counts for
     /// logging/observability.
     pub fn affinity_binding_counts(&self) -> Vec<(String, u64)> {

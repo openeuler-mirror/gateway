@@ -124,6 +124,8 @@ pub fn create_provider(
     custom_headers: &HashMap<String, String>,
     deployment_id: Option<String>,
     client_type_header: bool,
+    max_context_tokens: Option<u64>,
+    rollback_enabled: bool,
 ) -> Result<Arc<dyn Provider>, GatewayError> {
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(timeout.max(1)))
@@ -182,13 +184,15 @@ pub fn create_provider(
                 }
             });
             Ok(Arc::new(
-                openai::OpenAIProvider::new(
+                openai::OpenAIProvider::with_rollback(
                     client,
                     key,
                     api_base,
                     &actual_model,
                     deployment_id,
                     client_type_header,
+                    max_context_tokens,
+                    rollback_enabled,
                 )
                 .with_custom_headers(attached),
             ))
@@ -363,6 +367,8 @@ mod tests {
                 &HashMap::new(),
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap()
         };
@@ -406,6 +412,8 @@ mod tests {
             &headers,
             None,
             false,
+            None,
+            false,
         )
         .unwrap();
         let attached = provider.custom_headers();
@@ -428,6 +436,8 @@ mod tests {
             1,
             &HashMap::new(),
             &headers,
+            None,
+            false,
             None,
             false,
         )

@@ -145,6 +145,10 @@ pub fn model_deployment_fields() -> &'static [FieldMeta] {
         FieldMeta { field: "model_info.cost_template", section: "cost", input_type: "select",
                     label_key: "form.model.cost_template", tip_key: "tip.model.cost_template",
                     home: ConfigHome::Db },
+        // ── rollback ──
+        FieldMeta { field: "max_context_tokens", section: "rollback", input_type: "number",
+                    label_key: "form.model.max_context_tokens", tip_key: "tip.model.max_context_tokens",
+                    home: ConfigHome::Db },
     ]
 }
 
@@ -364,6 +368,7 @@ mod tests {
             "model", "api_key", "api_base", "api_version",
             "aws_region_name", "aws_access_key_id", "aws_secret_access_key",
             "rpm", "tpm", "timeout", "headers", "temperature", "max_tokens",
+            "max_context_tokens",
             // ModelEntry (top-level)
             "model_name", "enabled", "serve_not_match", "client_type_header",
             "allowed_teams", "visibility",

@@ -175,6 +175,8 @@ pub struct OpenAIProvider {
     kv_worker_id: Option<String>,
     client_type_header: bool,
     custom_headers: Vec<(String, String)>,
+    max_context_tokens: Option<u64>,
+    rollback_enabled: bool,
 }
 
 impl OpenAIProvider {
@@ -185,6 +187,30 @@ impl OpenAIProvider {
         model: &str,
         deployment_id: Option<String>,
         client_type_header: bool,
+    ) -> Self {
+        Self::with_rollback(
+            client,
+            api_key,
+            api_base,
+            model,
+            deployment_id,
+            client_type_header,
+            None,
+            false,
+        )
+    }
+
+    /// Full constructor carrying the rollback identity surface
+    /// (`max_context_tokens` / `rollback_enabled` from the deployment row).
+    pub fn with_rollback(
+        client: Client,
+        api_key: Option<String>,
+        api_base: Option<String>,
+        model: &str,
+        deployment_id: Option<String>,
+        client_type_header: bool,
+        max_context_tokens: Option<u64>,
+        rollback_enabled: bool,
     ) -> Self {
         let kv_worker_id = crate::kv_worker_id_for(deployment_id.as_deref(), api_base.as_deref());
         Self {
@@ -197,6 +223,8 @@ impl OpenAIProvider {
             kv_worker_id,
             client_type_header,
             custom_headers: Vec::new(),
+            max_context_tokens,
+            rollback_enabled,
         }
     }
 
@@ -580,6 +608,14 @@ impl Provider for OpenAIProvider {
 
     fn client_type_header(&self) -> bool {
         self.client_type_header
+    }
+
+    fn max_context_tokens(&self) -> Option<u64> {
+        self.max_context_tokens
+    }
+
+    fn rollback_enabled(&self) -> bool {
+        self.rollback_enabled
     }
 
     fn custom_headers(&self) -> &[(String, String)] {

@@ -1,0 +1,10 @@
+[package]
+name = "boom-rollback"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+boom-core = { path = "../boom-core" }
+boom-routing = { path = "../boom-routing" }
+boom-flowcontrol = { path = "../boom-flowcontrol" }
+async-trait = { workspace = true }

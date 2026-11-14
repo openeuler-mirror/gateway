@@ -125,6 +125,10 @@ pub fn build_router<S: Clone + Send + Sync + 'static>(state: DashboardState) -> 
             "/dashboard/api/admin/models/import-from-yaml",
             post(handlers_admin::import_models_from_yaml),
         )
+        .route(
+            "/dashboard/api/admin/models/rollback",
+            post(handlers_admin::set_model_rollback),
+        )
         // Admin — Model alias CRUD (new).
         .route(
             "/dashboard/api/admin/aliases",
@@ -232,6 +236,10 @@ pub fn build_router<S: Clone + Send + Sync + 'static>(state: DashboardState) -> 
             get(handlers_admin::get_rebalance_moves),
         )
         // Admin — KVC Scheduler Stats (global counters, process lifetime).
+        .route(
+            "/dashboard/api/admin/stats/rollback",
+            get(handlers_admin::get_rollback_stats),
+        )
         .route(
             "/dashboard/api/admin/stats/kvc-scheduler",
             get(handlers_admin::get_kvc_scheduler_stats),

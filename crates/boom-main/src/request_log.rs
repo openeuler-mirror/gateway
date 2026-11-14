@@ -363,6 +363,46 @@ pub fn log_error(
         user_tags,
         None,
         None,
+        None,
+    );
+}
+
+/// [`log_error`] + the scheduling-policy label — for error paths that
+/// already went through routing (e.g. rollback finalize). Plain error rows
+/// used to persist NULL schedule_policy, so the audit Policy column showed
+/// "-" and the policy filter came up empty exactly for the requests one
+/// wants to filter by (miss / inert / retry-error rows).
+pub fn log_error_with_policy(
+    state: &AppState,
+    identity: &AuthIdentity,
+    model: &str,
+    api_path: &str,
+    is_stream: bool,
+    start: Instant,
+    error: &GatewayError,
+    request_id: Option<String>,
+    deployment_id: Option<String>,
+    request_body: Option<String>,
+    client_ip: Option<String>,
+    user_tags: crate::routes::UserTags,
+    schedule_policy: Option<String>,
+) {
+    log_error_with_usage(
+        state,
+        identity,
+        model,
+        api_path,
+        is_stream,
+        start,
+        error,
+        request_id,
+        deployment_id,
+        request_body,
+        client_ip,
+        user_tags,
+        None,
+        None,
+        schedule_policy,
     );
 }
 
@@ -402,6 +442,7 @@ pub fn log_error_with_queue_wait(
         user_tags,
         None,
         queue_wait_ms,
+        None,
     );
 }
 
@@ -466,6 +507,7 @@ pub fn log_auth_error(
         user_tags,
         None,
         None,
+        None,
     );
 
 }
@@ -491,6 +533,7 @@ pub fn log_error_with_usage(
     user_tags: crate::routes::UserTags,
     usage: Option<&Usage>,
     queue_wait_ms: Option<i32>,
+    schedule_policy: Option<String>,
 ) {
     if error.should_dedup_log() {
         let dedup_key = format!("{}:{}:{}", error.error_type(), identity.key_hash, model);
@@ -510,13 +553,17 @@ pub fn log_error_with_usage(
         );
     }
 
+    // Explicit label wins (rollback finalize paths pass the captured label,
+    // with "+rollback" provenance after a successful fallback). Otherwise
     // deployment_id discriminates routed vs rejected: errors with a
     // deployment got past routing, so label them with the live policy;
     // pre-routing failures (auth/limits/model-not-found) never consulted
     // the policy and stay NULL.
-    let schedule_policy = deployment_id
-        .as_ref()
-        .map(|_| crate::routes::routing_policy_label(&state.router));
+    let schedule_policy = schedule_policy.or_else(|| {
+        deployment_id
+            .as_ref()
+            .map(|_| crate::routes::routing_policy_label(&state.router))
+    });
 
     log_request(
         state.log_writer.as_deref(),
@@ -559,12 +606,24 @@ pub fn log_error_with_usage(
     );
 
     // Debug recording — capture upstream errors with full request body.
+    // `context_length_exceeded` is included: rollback passthrough rows are
+    // exactly the ones an operator filters for and drills into — without
+    // it the Debug-page error viewer 404s on those request_ids.
     if state.debug_store.is_enabled() && error.should_log_to_db() {
         let error_type = error.error_type();
-        if error_type == "upstream_error" || error_type == "provider_error" || error_type == "timeout" {
+        if error_type == "upstream_error"
+            || error_type == "provider_error"
+            || error_type == "timeout"
+            || error_type == "context_length_exceeded"
+        {
             let (upstream_status, upstream_body) = match error {
                 GatewayError::UpstreamError { status, message } => {
                     (Some(*status), Some(message.clone()))
+                }
+                // Rollback 502→400 passthrough: the variant carries the raw
+                // upstream message (the original status was 400).
+                GatewayError::ContextLengthExceeded(message) => {
+                    (Some(400), Some(message.clone()))
                 }
                 _ => (None, None),
             };
