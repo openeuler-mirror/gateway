@@ -504,7 +504,6 @@ impl PerModelRollback {
     }
 
     pub fn record(&self, event: &str) {
-        use std::sync::atomic::Ordering::Relaxed;
         match event {
             "miss" => Self::bump(&self.identify_miss),
             "inert" => Self::bump(&self.pool_inert),

@@ -73,7 +73,7 @@ mod tests {
     use boom_core::GatewayError;
     use std::collections::HashMap;
 
-    struct FakeProvider(usize);
+    struct FakeProvider;
     #[async_trait]
     impl Provider for FakeProvider {
         async fn chat(
@@ -100,7 +100,7 @@ mod tests {
     fn test_shuffle_picks_uniformly_over_many_draws() {
         let policy = ShufflePolicy::new();
         let candidates: Vec<Arc<dyn Provider>> = (0..3)
-            .map(|i| Arc::new(FakeProvider(i)) as Arc<dyn Provider>)
+            .map(|_| Arc::new(FakeProvider) as Arc<dyn Provider>)
             .collect();
         let mut counts: HashMap<usize, usize> = HashMap::new();
         for _ in 0..30_000 {
@@ -127,7 +127,7 @@ mod tests {
     fn test_shuffle_empty_and_single() {
         let policy = ShufflePolicy::new();
         assert!(policy.select("m", &[], None, 0).is_none());
-        let single: Vec<Arc<dyn Provider>> = vec![Arc::new(FakeProvider(0))];
+        let single: Vec<Arc<dyn Provider>> = vec![Arc::new(FakeProvider)];
         assert!(policy.select("m", &single, None, 0).is_some());
     }
 

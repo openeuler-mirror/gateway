@@ -22,7 +22,7 @@ use boom_core::normalize::{
 };
 use boom_core::provider::{ProviderBilling, ProviderCost, RawCaptureChannel};
 use boom_core::types::{
-    deserialize_window_limit_vec, is_hard_blocked_header, AuthIdentity, CompletionPrompt,
+    is_hard_blocked_header, AuthIdentity, CompletionPrompt,
     CompletionRequest, ContentPart, ImageUrl, Message, MessageContent, MessageRole, Usage,
     WindowLimit,
 };

@@ -118,11 +118,6 @@ impl FakeProvider {
         self
     }
 
-    fn with_rich_usage_stream(mut self) -> Self {
-        self.rich_usage_stream = true;
-        self
-    }
-
     fn with_rich_usage_stream_cond(mut self, on: bool) -> Self {
         self.rich_usage_stream = on;
         self

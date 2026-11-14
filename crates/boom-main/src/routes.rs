@@ -650,6 +650,10 @@ pub async fn chat_completions(
 }
 
 /// Shared inner logic for chat completions and legacy completions.
+// The non-stream rollback Retried arm reassigns fc_guard without a later
+// read — the assignment itself is load-bearing (holds the fallback's fc
+// slot until scope end), so the dead-store lint is suppressed here.
+#[allow(unused_assignments)]
 async fn chat_completions_inner(
     state: AppState,
     mut auth: RequiredAuth,
@@ -3345,6 +3349,9 @@ fn sse_stream_from_chat_stream(
 // Anthropic Messages
 // ============================================================
 
+// See chat_completions_inner for the unused_assignments rationale (the
+// non-stream rollback Retried arm's load-bearing fc_guard reassignment).
+#[allow(unused_assignments)]
 pub async fn messages(
     State(state): State<AppState>,
     mut auth: RequiredAuth,
@@ -4320,6 +4327,9 @@ fn prepare_edge_request<T: serde::Serialize>(
     })
 }
 
+// See chat_completions_inner for the unused_assignments rationale (the
+// non-stream rollback Retried arm's load-bearing fc_guard reassignment).
+#[allow(unused_assignments)]
 pub async fn responses(
     State(state): State<AppState>,
     mut auth: RequiredAuth,

@@ -16,8 +16,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use boom_core::types::{
     ChatCompletionRequest, ChatCompletionResponse, ChatStream, ChatStreamChunk, Choice, FunctionCall,
-    FunctionCallDelta, Message, MessageContent, MessageRole, PromptTokensDetails, StreamChoice,
-    StreamDelta, StreamUsage, Tool, ToolCall, ToolCallDelta, ToolFunction, Usage,
+    Message, MessageContent, MessageRole, PromptTokensDetails, StreamChoice,
+    StreamDelta, StreamUsage, Tool, ToolCall, ToolFunction, Usage,
 };
 use boom_core::GatewayError;
 use boom_fusion::{
@@ -788,7 +788,6 @@ async fn execute_stream_aggregator_error_wraps_with_workflow_id() {
 #[tokio::test]
 async fn response_stream_passes_tool_calls_and_reasoning() {
     // 构造一个带 tool_calls + reasoning 的 panel 响应，走 Single 路径（tools 请求）
-    let inv = Arc::new(StubInvoker::new(vec![PanelBehavior::Valid, PanelBehavior::Error]));
     // 给 panel-0 的响应加 tool_calls：用自定义 invoker
     struct ToolCallInvoker;
     #[async_trait]
@@ -839,7 +838,6 @@ async fn execute_tools_request_uses_reference_context_template() {
     // 用一个捕获 aggregator 请求的 invoker
     struct CapturingInvoker {
         agg_request: Mutex<Option<ChatCompletionRequest>>,
-        panels: Vec<PanelBehavior>,
     }
     #[async_trait]
     impl ModelInvoker for CapturingInvoker {
@@ -865,7 +863,6 @@ async fn execute_tools_request_uses_reference_context_template() {
     }
     let inv = Arc::new(CapturingInvoker {
         agg_request: Mutex::new(None),
-        panels: vec![PanelBehavior::Valid, PanelBehavior::Valid],
     });
     workflow().execute(ctx(true, inv.clone())).await.expect("ok");
     let agg_req = inv.agg_request.lock().unwrap().clone().expect("aggregator called");
