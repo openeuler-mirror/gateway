@@ -31,21 +31,28 @@ CREATE TABLE IF NOT EXISTS boom_rate_limit_state (
 /// created by the composite base DDL. Errors propagate (not swallowed): a
 /// silently-skipped PK change would surface later as duplicate-key failures
 /// on every window rollover push.
+///
+/// The candidate SELECT is wrapped in MAX() so it returns exactly one row
+/// in ALL cases: vanilla PostgreSQL tolerates a 0-row SELECT INTO (the
+/// variable stays NULL), but GaussDB's PL/pgSQL raises "query does not
+/// return rows when INTO processed" — which aborted startup on databases
+/// whose PK was already composite.
 pub fn state_pk_alter_ddl() -> &'static str {
     r#"
 DO $$
 DECLARE pk_name TEXT;
 BEGIN
-    SELECT tc.constraint_name INTO pk_name
-    FROM information_schema.table_constraints tc
-    JOIN information_schema.key_column_usage k
-      ON k.constraint_name = tc.constraint_name
-     AND k.table_name = tc.table_name
-    WHERE tc.table_name = 'boom_rate_limit_state'
-      AND tc.constraint_type = 'PRIMARY KEY'
-      AND tc.table_schema = current_schema()
-    GROUP BY tc.constraint_name
-    HAVING COUNT(*) = 1 AND BOOL_AND(k.column_name = 'cache_key');
+    SELECT MAX(constraint_name) INTO pk_name
+    FROM (SELECT tc.constraint_name
+          FROM information_schema.table_constraints tc
+          JOIN information_schema.key_column_usage k
+            ON k.constraint_name = tc.constraint_name
+           AND k.table_name = tc.table_name
+          WHERE tc.table_name = 'boom_rate_limit_state'
+            AND tc.constraint_type = 'PRIMARY KEY'
+            AND tc.table_schema = current_schema()
+          GROUP BY tc.constraint_name
+          HAVING COUNT(*) = 1 AND BOOL_AND(k.column_name = 'cache_key')) c;
 
     IF pk_name IS NOT NULL THEN
         EXECUTE format('ALTER TABLE boom_rate_limit_state DROP CONSTRAINT %I', pk_name);
