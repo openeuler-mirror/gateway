@@ -27,6 +27,7 @@ use arc_swap::ArcSwapOption;
 use chrono::Utc;
 
 mod consumption;
+mod instance;
 mod model;
 mod schedule;
 
@@ -34,6 +35,7 @@ pub use consumption::{
     query_consumption, query_key_consumption_detail, ConsumptionSeriesPoint, ConsumptionSnapshot,
     IpAgg, KeyAgg, KeyConsumptionDetail, KeySeriesPoint, TagAgg, TeamAgg,
 };
+pub use instance::{query_instances, InstanceAgg, InstanceSnapshot};
 pub use model::{query_model_detail, DeploymentAgg, ModelDetailSnapshot, ModelSeriesPoint};
 pub use schedule::{
     query_schedule, PolicyAgg, PolicyBucketPoint, ScheduleSeriesPoint, ScheduleSnapshot,
@@ -168,6 +170,8 @@ pub struct AnalyticsHub {
     pub consumption: TtlCache<ConsumptionSnapshot>,
     /// Schedule & cache snapshots, keyed `"{range}"`.
     pub schedule: TtlCache<ScheduleSnapshot>,
+    /// Per-instance usage snapshots, keyed `"{range}"`.
+    pub instance: TtlCache<InstanceSnapshot>,
 }
 
 impl Default for AnalyticsHub {
@@ -182,6 +186,7 @@ impl AnalyticsHub {
             model: TtlCache::new(),
             consumption: TtlCache::new(),
             schedule: TtlCache::new(),
+            instance: TtlCache::new(),
         }
     }
 }

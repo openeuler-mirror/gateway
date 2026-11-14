@@ -114,6 +114,10 @@ pub async fn run_request_log_migration(conn: &mut sqlx::PgConnection) -> Result<
     execute_alter(conn, r#"ALTER TABLE boom_request_log ADD COLUMN IF NOT EXISTS user_tag1 TEXT"#).await;
     execute_alter(conn, r#"ALTER TABLE boom_request_log ADD COLUMN IF NOT EXISTS user_tag2 TEXT"#).await;
     execute_alter(conn, r#"ALTER TABLE boom_request_log ADD COLUMN IF NOT EXISTS user_tag3 TEXT"#).await;
+    // instance_id: stable id (server.instance_id or derived host:port) of
+    // the gateway instance that recorded the row — per-instance attribution
+    // on the analytics board. NULL on rows written by older binaries.
+    execute_alter(conn, r#"ALTER TABLE boom_request_log ADD COLUMN IF NOT EXISTS instance_id TEXT"#).await;
     // Composite index for per-key log pagination (user dashboard logs page):
     // WHERE key_hash = $1 ORDER BY created_at DESC LIMIT/OFFSET. Without it
     // the planner fetches ALL of a busy key's rows and sorts them on every

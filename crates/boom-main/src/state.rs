@@ -233,6 +233,21 @@ impl AppState {
             None => None,
         };
 
+        // Instance identity — resolved before anything that stamps it: the
+        // audit-log writer below and the limiter's delta-protocol watermark
+        // namespace. STABLE across restarts (configured explicitly, or
+        // derived from the bind address so it always exists) so historical
+        // rows stay attributable to the same logical instance. Duplicate
+        // detection happens in the registration below and fails the boot.
+        let instance_id: Arc<str> = match config.server.instance_id.as_deref() {
+            Some(raw) if !raw.trim().is_empty() => raw.trim().to_string().into(),
+            Some(_) => anyhow::bail!(
+                "server.instance_id is set but empty — configure a real id or remove the field"
+            ),
+            None => format!("{}:{}", config.server.host, config.server.port).into(),
+        };
+        tracing::info!(instance_id = %instance_id, "instance identity resolved");
+
         // Audit log writer: dedicated 8-conn pool + single batch-INSERT task.
         // See `request_log::LogWriter` for architecture. Replaces the old
         // per-request `tokio::spawn + sqlx::query` pattern which competed
@@ -247,7 +262,10 @@ impl AppState {
                     .max_lifetime(std::time::Duration::from_secs(1800))
                     .connect(url)
                     .await?;
-                Some(crate::request_log::start_log_writer(log_pool))
+                Some(crate::request_log::start_log_writer(
+                    log_pool,
+                    instance_id.clone(),
+                ))
             }
             None => None,
         };
@@ -255,19 +273,6 @@ impl AppState {
         // 2. Limiter survives across reloads. Its instance identity (delta
         // protocol watermark namespace) is assigned once per boot, before
         // any traffic can touch the counters.
-        //
-        // The id is STABLE across restarts — configured explicitly, or
-        // derived from the bind address so it always exists — so historical
-        // rows stay attributable to the same logical instance. Duplicate
-        // detection happens below (registration) and fails the boot.
-        let instance_id: Arc<str> = match config.server.instance_id.as_deref() {
-            Some(raw) if !raw.trim().is_empty() => raw.trim().to_string().into(),
-            Some(_) => anyhow::bail!(
-                "server.instance_id is set but empty — configure a real id or remove the field"
-            ),
-            None => format!("{}:{}", config.server.host, config.server.port).into(),
-        };
-        tracing::info!(instance_id = %instance_id, "instance identity resolved");
         let limiter = Arc::new(SlidingWindowLimiter::new());
         limiter.set_instance_id(instance_id.to_string());
 

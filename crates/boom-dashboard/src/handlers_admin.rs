@@ -4172,6 +4172,64 @@ pub async fn get_schedule_stats(
     }
 }
 
+/// Per-instance usage breakdown: how the window's traffic splits across
+/// gateway instances (stable ids), each with its own error rate and
+/// latency. Accepts `?range=today|1d|3d|7d&force=1`.
+pub async fn get_instance_stats(
+    _session: AdminSession,
+    Query(params): Query<DailyStatsParams>,
+    Extension(state): Extension<Arc<DashboardState>>,
+) -> Response {
+    let range = match boom_audit::StatsRange::from_param(
+        params.range.as_deref().unwrap_or("today"),
+    ) {
+        Some(r) => r,
+        None => {
+            return Json(json!({
+                "ready": false,
+                "error": "invalid range (expected today|1d|3d|7d)",
+            }))
+            .into_response()
+        }
+    };
+    let Some(pool) = &state.db_pool else {
+        return Json(json!({
+            "ready": false,
+            "error": "instance stats unavailable (no database configured)",
+        }))
+        .into_response();
+    };
+    let key = range.as_str().to_string();
+    let snap = match state
+        .analytics
+        .instance
+        .get_or_refresh(&key, 300, params.force.is_some(), || {
+            boom_audit::analytics::query_instances(range, pool)
+        })
+        .await
+    {
+        Ok(s) => Some(s),
+        Err(e) => {
+            tracing::warn!("Instance stats refresh failed ({}): {e}", range.as_str());
+            state.analytics.instance.current(&key)
+        }
+    };
+    match snap {
+        Some(snap) => {
+            let mut v = serde_json::to_value(&*snap).unwrap_or_else(|_| json!({}));
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("ready".to_string(), json!(true));
+            }
+            Json(v).into_response()
+        }
+        None => Json(json!({
+            "ready": false,
+            "error": "instance stats unavailable (refresh pending or failing)",
+        }))
+        .into_response(),
+    }
+}
+
 // ═══════════════════════════════════════════════════════════
 // In-Flight Request Stats (real-time)
 // ═══════════════════════════════════════════════════════════

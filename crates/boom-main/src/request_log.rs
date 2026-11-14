@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 /// Channel capacity — sized to absorb ~2s of DB outage at 50K QPS.
 /// Single RequestLog ≈ 850 bytes → 100K slots × 850B ≈ 85 MB peak.
 const LOG_CHANNEL_CAPACITY: usize = 100_000;
-/// Max rows per batch INSERT. PG parameter limit (65535) / 30 columns ≈ 2184.
+/// Max rows per batch INSERT. PG parameter limit (65535) / 31 columns ≈ 2114.
 /// 2000 leaves headroom and aligns with flush interval at 50K QPS.
 const LOG_BATCH_SIZE: usize = 2_000;
 /// Flush window. At 50K QPS this batches ~5000 rows (3 INSERTs).
@@ -133,14 +133,17 @@ impl LogDroppedCounter for LogWriter {
 ///
 /// `pool` should be a *dedicated* PgPool (not the shared main pool) — log
 /// writes must not compete with auth/routing for connections.
-pub fn start_log_writer(pool: PgPool) -> Arc<LogWriter> {
+/// `instance_id` is stamped onto every row at flush time — the single
+/// injection point, so every RequestLog construction site (route handlers
+/// and error helpers) is automatically covered.
+pub fn start_log_writer(pool: PgPool, instance_id: Arc<str>) -> Arc<LogWriter> {
     let (tx, rx) = mpsc::channel(LOG_CHANNEL_CAPACITY);
     let dropped = Arc::new(AtomicU64::new(0));
     let writer = Arc::new(LogWriter {
         tx,
         dropped: dropped.clone(),
     });
-    tokio::spawn(log_writer_task(rx, pool, dropped));
+    tokio::spawn(log_writer_task(rx, pool, dropped, instance_id));
     writer
 }
 
@@ -148,6 +151,7 @@ async fn log_writer_task(
     mut rx: mpsc::Receiver<RequestLog>,
     pool: PgPool,
     dropped: Arc<AtomicU64>,
+    instance_id: Arc<str>,
 ) {
     tracing::info!(
         channel_capacity = LOG_CHANNEL_CAPACITY,
@@ -178,12 +182,12 @@ async fn log_writer_task(
             Some(log) = rx.recv() => {
                 buffer.push(log);
                 if buffer.len() >= LOG_BATCH_SIZE {
-                    flush_batch(&pool, &mut buffer, &dropped).await;
+                    flush_batch(&pool, &mut buffer, &dropped, &instance_id).await;
                 }
             }
             _ = flush_timer.tick() => {
                 if !buffer.is_empty() {
-                    flush_batch(&pool, &mut buffer, &dropped).await;
+                    flush_batch(&pool, &mut buffer, &dropped, &instance_id).await;
                 }
             }
             _ = stats_timer.tick() => {
@@ -203,7 +207,12 @@ async fn log_writer_task(
 
 /// Drain `buffer` and INSERT all rows in a single batch statement.
 /// One retry on transient failure; second failure drops the batch + counts.
-async fn flush_batch(pool: &PgPool, buffer: &mut Vec<RequestLog>, dropped: &AtomicU64) {
+async fn flush_batch(
+    pool: &PgPool,
+    buffer: &mut Vec<RequestLog>,
+    dropped: &AtomicU64,
+    instance_id: &str,
+) {
     // Drain into an owned Vec — leaves `buffer` empty (capacity preserved)
     // so the next batch doesn't reallocate.
     let batch: Vec<RequestLog> = buffer.drain(..).collect();
@@ -212,7 +221,7 @@ async fn flush_batch(pool: &PgPool, buffer: &mut Vec<RequestLog>, dropped: &Atom
     for attempt in 0..=1 {
         let result = tokio::time::timeout(
             LOG_INSERT_TIMEOUT,
-            batch_insert(pool, &batch),
+            batch_insert(pool, &batch, instance_id),
         ).await;
 
         match result {
@@ -268,10 +277,14 @@ async fn flush_batch(pool: &PgPool, buffer: &mut Vec<RequestLog>, dropped: &Atom
 
 /// Build and execute a multi-row INSERT via sqlx QueryBuilder.
 ///
-/// Uses `push_values` to construct `VALUES ($1,$2,...), ($30,...), ...` with
-/// 30 placeholders per row. At LOG_BATCH_SIZE=2000, this is 60000 placeholders
+/// Uses `push_values` to construct `VALUES ($1,$2,...), ($31,...), ...` with
+/// 31 placeholders per row. At LOG_BATCH_SIZE=2000, this is 62000 placeholders
 /// — under PG's 65535 protocol limit.
-async fn batch_insert(pool: &PgPool, batch: &[RequestLog]) -> Result<u64, sqlx::Error> {
+async fn batch_insert(
+    pool: &PgPool,
+    batch: &[RequestLog],
+    instance_id: &str,
+) -> Result<u64, sqlx::Error> {
     use sqlx::QueryBuilder;
 
     let mut qb: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
@@ -281,7 +294,7 @@ async fn batch_insert(pool: &PgPool, batch: &[RequestLog]) -> Result<u64, sqlx::
           input_tokens, output_tokens, duration_ms, deployment_id, client_ip, ttft_ms, \
           cached_tokens, schedule_policy, kv_hit_blocks, kv_input_blocks, \
           trie_blocks, trie_max_blocks, request_tokens, queue_wait_ms, \
-          user_tag1, user_tag2, user_tag3) "
+          user_tag1, user_tag2, user_tag3, instance_id) "
     );
     qb.push_values(batch.iter(), |mut b, log| {
         b.push_bind(log.request_id.clone())
@@ -312,7 +325,8 @@ async fn batch_insert(pool: &PgPool, batch: &[RequestLog]) -> Result<u64, sqlx::
             .push_bind(log.queue_wait_ms)
             .push_bind(log.user_tags[0].clone())
             .push_bind(log.user_tags[1].clone())
-            .push_bind(log.user_tags[2].clone());
+            .push_bind(log.user_tags[2].clone())
+            .push_bind(instance_id);
     });
 
     let result = qb.build().execute(pool).await?;

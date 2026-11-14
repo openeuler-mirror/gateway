@@ -220,6 +220,12 @@ pub fn build_router<S: Clone + Send + Sync + 'static>(state: DashboardState) -> 
             "/dashboard/api/admin/stats/schedule",
             get(handlers_admin::get_schedule_stats),
         )
+        // Admin — Per-Instance usage breakdown (stable instance ids,
+        // lazy TTL snapshots like the schedule report).
+        .route(
+            "/dashboard/api/admin/stats/instances",
+            get(handlers_admin::get_instance_stats),
+        )
         // Admin — System Pressure timeseries (1Hz ring buffer, last N minutes).
         .route(
             "/dashboard/api/admin/stress/timeseries",

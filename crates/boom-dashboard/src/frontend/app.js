@@ -549,6 +549,8 @@
   const ANALYTICS_RANGES = ["today", "1d", "3d", "7d"];
   let analyticsTimer = null;
   let analyticsData = null;
+  // Per-instance usage breakdown (separate endpoint, same range window).
+  let instancesData = null;
   let analyticsSortKey = "requests";
   // Collapse state for the 100%-error phantom-model group; survives poll
   // re-renders, resets on reload.
@@ -639,14 +641,20 @@
 
   async function loadAnalytics(force) {
     const requested = analyticsRange;
+    const qs = "?range=" + requested + (force ? "&force=1" : "");
     try {
-      const res = await api(
-        "/admin/stats/daily?range=" + requested + (force ? "&force=1" : "")
-      );
+      // Both endpoints share the range window; the instances fetch is
+      // fault-isolated so an older backend without it leaves the overview
+      // intact.
+      const [res, inst] = await Promise.all([
+        api("/admin/stats/daily" + qs),
+        api("/admin/stats/instances" + qs).catch(() => null),
+      ]);
       // A range switch can race an in-flight poll — only the response
       // matching the range still on screen gets rendered.
       if (requested !== analyticsRange) return;
       analyticsData = res;
+      instancesData = inst;
       renderAnalytics();
     } catch (e) {
       // Read-only page — polling errors (expired session etc.) shouldn't
@@ -698,17 +706,20 @@
       // won't come up.
       const detail = data && data.error ? " — " + esc(String(data.error)) : "";
       const msg = '<p class="loading">' + esc(t("analytics.unavailable")) + detail + "</p>";
-      ["an-metrics-wrap", "an-hourly-wrap", "an-table-wrap"].forEach((id) => {
+      ["an-metrics-wrap", "an-hourly-wrap", "an-table-wrap", "an-instances-wrap"].forEach((id) => {
         const el = document.getElementById(id);
         if (el) el.innerHTML = msg;
       });
       const hint = document.getElementById("an-models-hint");
       if (hint) hint.textContent = "";
+      const instHint = document.getElementById("an-instances-hint");
+      if (instHint) instHint.textContent = "";
       return;
     }
     renderAnalyticsMetrics(data);
     renderAnalyticsSeries(data);
     renderAnalyticsModels(data);
+    renderAnalyticsInstances();
   }
 
   function renderAnalyticsMetrics(data) {
@@ -1023,6 +1034,74 @@
 
     wrap.innerHTML =
       '<table class="an-table"><thead>' + head + "</thead><tbody>" + rows + errHtml + "</tbody></table>";
+  }
+
+  // ── Analytics per-instance usage table: how the window's traffic splits
+  // across stable instance ids, each with its own error rate and latency.
+  // Server sorts by request volume; "unknown" = rows written by older
+  // binaries before the instance_id column existed. ──
+  function renderAnalyticsInstances() {
+    const wrap = document.getElementById("an-instances-wrap");
+    if (!wrap) return;
+    const hint = document.getElementById("an-instances-hint");
+    const data = instancesData;
+    if (!data || !data.ready) {
+      if (hint) hint.textContent = "";
+      wrap.innerHTML = '<p class="loading">' + esc(t("analytics.unavailable")) + "</p>";
+      return;
+    }
+    const rows = data.instances || [];
+    if (hint) hint.textContent = t("analytics.instances.hint", { n: rows.length });
+    if (!rows.length) {
+      wrap.innerHTML = '<p class="loading">' + esc(t("common.no_records")) + "</p>";
+      return;
+    }
+    const totalReq = data.requests || 0;
+    const maxReq = Math.max(1, ...rows.map((r) => r.requests || 0));
+    const nameOf = (r) =>
+      r.instance_id === "unknown" ? t("analytics.instances.unknown") : r.instance_id;
+    const lastOf = (r) => {
+      const secs = Number(r.last_active_epoch) || 0;
+      if (!secs) return "—";
+      const d = new Date((secs + 8 * 3600) * 1000);
+      const p2 = (x) => String(x).padStart(2, "0");
+      return d.getUTCFullYear() + "-" + p2(d.getUTCMonth() + 1) + "-" + p2(d.getUTCDate()) +
+        " " + p2(d.getUTCHours()) + ":" + p2(d.getUTCMinutes());
+    };
+
+    const head =
+      "<tr><th>" + esc(t("analytics.instances.instance")) + "</th>" +
+      '<th class="num">' + esc(t("analytics.models.requests")) + "</th>" +
+      "<th>" + esc(t("analytics.models.share")) + "</th>" +
+      '<th class="num">' + esc(t("analytics.models.inout")) + "</th>" +
+      '<th class="num">' + esc(t("analytics.models.errors")) + "</th>" +
+      '<th class="num">' + esc(t("analytics.models.errrate")) + "</th>" +
+      '<th class="num">' + esc(t("analytics.instances.avg_duration")) + "</th>" +
+      '<th class="num">' + esc(t("analytics.instances.last_active")) + "</th>" +
+      "</tr>";
+
+    const rowOf = (r) => {
+      const share = totalReq > 0 ? (r.requests / totalReq * 100) : 0;
+      const barW = (r.requests / maxReq * 100).toFixed(2);
+      const errRate = r.requests > 0 ? (r.errors / r.requests * 100) : 0;
+      const errRateCls = r.errors === 0 ? "an-errrate-zero" : errRate >= 5 ? "an-errrate-high" : errRate >= 1 ? "an-errrate-low" : "";
+      const dur = r.avg_duration_ms == null ? "—" : Math.round(r.avg_duration_ms).toLocaleString() + " ms";
+      return "<tr>" +
+        '<td class="an-model" title="' + esc(nameOf(r)) + '">' + esc(nameOf(r)) + "</td>" +
+        '<td class="num" title="' + fmtFullNum(r.requests) + '">' + fmtFullNum(r.requests) + "</td>" +
+        '<td><div class="an-share"><div class="an-share-bar"><i style="width:' + barW + '%"></i></div><span>' + share.toFixed(1) + "%</span></div></td>" +
+        '<td class="num" title="' + fmtFullNum(r.input_tokens) + " / " + fmtFullNum(r.output_tokens) + '">' +
+          fmtCompactNum(r.input_tokens) + " / " + fmtCompactNum(r.output_tokens) + "</td>" +
+        '<td class="num' + (r.errors > 0 ? " an-err-text" : "") + '">' + fmtFullNum(r.errors) + "</td>" +
+        '<td class="num ' + errRateCls + '">' + errRate.toFixed(2) + "%</td>" +
+        '<td class="num">' + esc(dur) + "</td>" +
+        '<td class="num">' + esc(lastOf(r)) + "</td>" +
+      "</tr>";
+    };
+
+    wrap.innerHTML =
+      '<table class="an-table"><thead>' + head + "</thead><tbody>" +
+      rows.map(rowOf).join("") + "</tbody></table>";
   }
 
   // ── Analytics detail pages: generic multi-series trend chart ──
