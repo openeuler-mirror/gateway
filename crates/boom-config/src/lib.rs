@@ -727,6 +727,7 @@ impl Default for ContextRollbackSettings {
 fn default_context_rollback_patterns() -> Vec<String> {
     vec![
         "code:InputTokenExceeded".to_string(),
+        "code:context_length_exceeded".to_string(),
         "maximum input length".to_string(),
         "maximum context length".to_string(),
         "prompt is too long".to_string(),

@@ -1180,6 +1180,9 @@ impl DeploymentStore {
         .bind(enabled)
         .fetch_optional(pool)
         .await?;
+
+        boom_state::revision::bump_best_effort(pool, boom_state::revision::CATEGORY_ROUTING)
+            .await;
         Ok(row.map(|(name,)| name))
     }
 
@@ -1200,6 +1203,9 @@ impl DeploymentStore {
         .bind(enabled)
         .execute(pool)
         .await?;
+
+        boom_state::revision::bump_best_effort(pool, boom_state::revision::CATEGORY_ROUTING)
+            .await;
         Ok(result.rows_affected())
     }
 
@@ -1225,6 +1231,9 @@ impl DeploymentStore {
                 names.push(name);
             }
         }
+
+        boom_state::revision::bump_best_effort(pool, boom_state::revision::CATEGORY_ROUTING)
+            .await;
         Ok(names)
     }
 
