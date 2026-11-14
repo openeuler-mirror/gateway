@@ -2402,6 +2402,15 @@ pub struct CreateDeploymentRequest {
     /// Max total input context chars across in-flight requests (flow control, 0 = no limit).
     #[serde(default)]
     pub max_context_len: Option<i64>,
+    /// Context capability declaration for rollback tiering (tokens, NULL =
+    /// not participating). Distinct from max_context_len (flow-control chars).
+    #[serde(default)]
+    pub max_context_tokens: Option<i64>,
+    /// Per-deployment rollback participation (pool semantics: group
+    /// participates when every row is set). None = false (create) / the
+    /// frontend echoes the current value on update.
+    #[serde(default)]
+    pub rollback_enabled: Option<bool>,
     /// Attach `X-BooM-Client-Type` header to outgoing requests (default false).
     #[serde(default)]
     pub client_type_header: bool,
@@ -2487,6 +2496,8 @@ pub async fn list_models(
                 "quota_count_ratio": r.quota_count_ratio.unwrap_or(1),
                 "max_inflight_queue_len": r.max_inflight_queue_len,
                 "max_context_len": r.max_context_len,
+                "max_context_tokens": r.max_context_tokens,
+                "rollback_enabled": r.rollback_enabled,
                 "client_type_header": r.client_type_header.unwrap_or(false),
                 "serve_not_match": r.serve_not_match,
                 "allowed_teams": r.allowed_teams,
@@ -2519,6 +2530,62 @@ pub async fn list_models(
         .collect();
 
     Json(json!({"models": models})).into_response()
+}
+
+/// Body for `POST /admin/models/rollback`. Exactly one granularity:
+/// `deployment_id` (one row), `model_name` (one pool), or neither (ALL
+/// pools — the toolbar master toggle).
+#[derive(Debug, serde::Deserialize)]
+pub struct SetRollbackRequest {
+    /// Single deployment row (per-row checkbox in the models table).
+    pub deployment_id: Option<String>,
+    /// Whole model group.
+    pub model_name: Option<String>,
+    pub enabled: bool,
+}
+
+/// POST /dashboard/api/admin/models/rollback — set rollback participation
+/// at one of three granularities: a single deployment row (deployment_id),
+/// one pool (model_name), or every pool (neither). Boom-main writes
+/// `rollback_enabled` on the affected rows and reloads routing.
+pub async fn set_model_rollback(
+    _session: AdminSession,
+    Extension(state): Extension<std::sync::Arc<DashboardState>>,
+    Json(req): Json<SetRollbackRequest>,
+) -> Response {
+    if req.deployment_id.is_some() && req.model_name.is_some() {
+        return Json(json!({"error": "specify either deployment_id or model_name, not both"})).into_response();
+    }
+    let deployment_id = match req.deployment_id.as_deref() {
+        None => None,
+        Some(raw) => match raw.parse::<uuid::Uuid>() {
+            Ok(id) => Some(id),
+            Err(_) => return Json(json!({"error": format!("invalid deployment_id '{}'", raw)})).into_response(),
+        },
+    };
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let cmd = crate::state::AdminCommand::SetModelRollback {
+        deployment_id,
+        model_name: req.model_name,
+        enabled: req.enabled,
+        reply: reply_tx,
+    };
+    if state.admin_tx.send(cmd).await.is_err() {
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "Admin command handler unavailable",
+        )
+            .into_response();
+    }
+    match reply_rx.await {
+        Ok(Ok(value)) => Json(value).into_response(),
+        Ok(Err(msg)) => Json(json!({"error": msg})).into_response(),
+        Err(_) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "Admin command handler dropped reply",
+        )
+            .into_response(),
+    }
 }
 
 pub async fn create_model(
@@ -3123,6 +3190,7 @@ pub struct ListLogsQuery {
     pub stream: Option<String>,
     pub error: Option<String>,
     pub team_alias: Option<String>,
+    pub policy: Option<String>,
     pub client_ip: Option<String>,
     /// Time window: "3d" (default) / "7d" / "30d" / "all". Bounds the scan to
     /// the created_at index range so the ILIKE filters only apply within the
@@ -3231,6 +3299,7 @@ pub async fn list_logs(
     let error_param      = slot!(query.error);
     let team_alias_param = slot!(query.team_alias);
     let client_ip_param   = slot!(query.client_ip);
+    let policy_param     = slot!(query.policy);
 
     if let Some(i) = range_param {
         where_clauses.push(format!("rl.created_at >= ${i}"));
@@ -3273,6 +3342,11 @@ pub async fn list_logs(
     if query.team_alias.is_some() {
         where_clauses.push(format!("bt.team_alias ILIKE ${}", team_alias_param.unwrap()));
     }
+    if query.policy.is_some() {
+        // Filter against the RAW schedule_policy column (e.g. "kvc_aware+rollback")
+        // so both the raw name and display labels match via ILIKE.
+        where_clauses.push(format!("rl.schedule_policy ILIKE ${}", policy_param.unwrap()));
+    }
     if query.client_ip.is_some() {
         where_clauses.push(format!("rl.client_ip ILIKE ${}", client_ip_param.unwrap()));
     }
@@ -3314,6 +3388,7 @@ pub async fn list_logs(
     let error_pattern      = query.error.as_ref().map(|v| format!("%{}%", escape_like(v)));
     let team_alias_pattern = query.team_alias.as_ref().map(|v| format!("%{}%", escape_like(v)));
     let client_ip_pattern  = query.client_ip.as_ref().map(|v| format!("%{}%", escape_like(v)));
+    let policy_pattern     = query.policy.as_ref().map(|v| format!("%{}%", escape_like(v)));
 
     // Bind parameters (order must match slot allocation above).
     if let Some(from) = range_from {
@@ -3348,6 +3423,9 @@ pub async fn list_logs(
         q = q.bind(p.clone());
     }
     if let Some(ref p) = client_ip_pattern {
+        q = q.bind(p.clone());
+    }
+    if let Some(ref p) = policy_pattern {
         q = q.bind(p.clone());
     }
 
@@ -3400,6 +3478,9 @@ pub async fn list_logs(
         cq = cq.bind(p.clone());
     }
     if let Some(ref p) = client_ip_pattern {
+        cq = cq.bind(p.clone());
+    }
+    if let Some(ref p) = policy_pattern {
         cq = cq.bind(p.clone());
     }
     cq = cq.bind(LOGS_COUNT_CAP);
@@ -3471,16 +3552,9 @@ pub async fn list_logs(
                 "ttft_ms": r.ttft_ms,
                 "created_at": r.created_at.map(|d| d.to_rfc3339()),
                 "client_ip": r.client_ip,
-                // DFX: scheduling observability. policy shown as short code:
-                // kvc=kvc_aware, key=key_affinity, rr=round_robin.
-                "policy": match r.schedule_policy.as_deref() {
-                    Some("kvc_aware") => "kvc",
-                    Some("kvc_aware→key_affinity") => "kvc→key",
-                    Some("key_affinity") => "key",
-                    Some("round_robin") => "rr",
-                    Some(other) => other,
-                    None => "",
-                },
+                // DFX: scheduling observability. Raw schedule_policy value —
+                // WYSIWYG: what you see is what you can filter on (ILIKE).
+                "policy": r.schedule_policy.clone().unwrap_or_default(),
                 "kv_hit_blocks": r.kv_hit_blocks,
                 "kv_input_blocks": r.kv_input_blocks,
                 "trie_blocks": r.trie_blocks,
@@ -4234,6 +4308,20 @@ pub async fn get_rebalance_moves(
 ) -> Response {
     let moves = state.rebalance_move_tracker.snapshot();
     Json(json!({ "moves": moves })).into_response()
+}
+
+// ═══════════════════════════════════════════════════════════
+// Rollback Stats (global counters, process lifetime)
+// ═══════════════════════════════════════════════════════════
+
+pub async fn get_rollback_stats(
+    _session: AdminSession,
+    Extension(state): Extension<Arc<DashboardState>>,
+) -> Response {
+    // Snapshot field names are the API contract. Invariants:
+    //   identify_total == identify_miss + pool_inert + no_target + fallback_selected
+    //   fallback_selected == retry_success + retry_error + guard_error
+    Json(json!(state.rollback_stats.snapshot())).into_response()
 }
 
 // ═══════════════════════════════════════════════════════════

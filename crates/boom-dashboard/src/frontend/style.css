@@ -3465,3 +3465,179 @@ input[list] {
 .md-hist-track { height: 12px; border-radius: 3px; background: var(--surface2); overflow: hidden; }
 .md-hist-track i { display: block; height: 100%; border-radius: 3px; background: var(--primary); }
 .md-hist-val { color: var(--text2); text-align: right; font-variant-numeric: tabular-nums; }
+
+
+
+
+
+
+
+.kcs-highlight .kcs-value { color: var(--primary, #00a1e0); font-size: 1.3em; }
+
+/* ── Rollback pane: tree breakdown ─────────────────────────── */
+.rb-tree-section {
+  font-size: 13px; font-weight: 600; color: var(--text2);
+  margin: 16px 0 6px; letter-spacing: .3px;
+}
+.rb-tree {
+  background: var(--surface2); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); overflow: hidden;
+}
+.rb-tree-node { border-bottom: 1px solid var(--border); }
+.rb-tree-node:last-child { border-bottom: none; }
+.rb-tree-head {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 12px; cursor: pointer; user-select: none;
+}
+.rb-tree-head:hover { background: var(--surface3); }
+.rb-tree-arrow {
+  width: 14px; color: var(--text3); transition: transform .15s;
+  display: inline-block;
+}
+.rb-open > .rb-tree-head .rb-tree-arrow { transform: rotate(90deg); }
+.rb-tree-label { flex: 1; font-size: 13px; color: var(--text); }
+.rb-tree-count {
+  font-size: 14px; font-weight: 600; color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.rb-tree-children { display: none; }
+.rb-open > .rb-tree-children { display: block; }
+.rb-tree-child {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 5px 12px 5px 34px; font-size: 12px;
+}
+.rb-tree-child:hover { background: var(--surface3); }
+.rb-tree-model { color: var(--text2); }
+.rb-tree-val {
+  color: var(--text); font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+.rb-tree-sub { padding-left: 52px; }
+.rb-tree-sub .rb-tree-model { color: var(--text3); font-size: 11px; }
+.rb-tree-avg {
+  font-size: 11px; color: var(--primary); margin-left: 6px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ═══ Models page: pool header + switch + indented rows ═════════ */
+
+/* iOS-style toggle switch (shared: master + per-pool) */
+.rb-switch {
+  position: relative; display: inline-block;
+  width: 34px; height: 18px; flex-shrink: 0;
+}
+.rb-switch input { opacity: 0; width: 0; height: 0; position: absolute; }
+.rb-slider {
+  position: absolute; cursor: pointer;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background: var(--border2);
+  border-radius: 18px;
+  transition: background .25s;
+  box-shadow: inset 0 0 0 1px rgba(0,0,0,.08);
+}
+.rb-slider::before {
+  position: absolute; content: "";
+  height: 14px; width: 14px;
+  left: 2px; bottom: 2px;
+  background: #fff;
+  border-radius: 50%;
+  transition: transform .25s;
+  box-shadow: 0 1px 2px rgba(0,0,0,.2);
+}
+.rb-switch input:checked + .rb-slider { background: var(--primary); }
+.rb-switch input:checked + .rb-slider::before { transform: translateX(16px); }
+.rb-switch input:disabled + .rb-slider { opacity: .4; cursor: not-allowed; }
+
+/* Toolbar master toggle: pill-shaped with switch inside */
+.rb-master {
+  display: inline-flex; align-items: center; gap: 7px;
+  padding: 5px 12px;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: var(--surface);
+  cursor: pointer;
+  user-select: none;
+  transition: border-color .2s;
+}
+.rb-master:hover { border-color: var(--primary); }
+.rb-master:has(input:checked) { border-color: var(--primary); }
+.rb-master-label {
+  font-size: 11px; font-weight: 500; color: var(--text3);
+}
+.rb-master:has(input:checked) .rb-master-label { color: var(--primary); font-weight: 600; }
+
+/* ═══ Models table: per-pool zebra (explicit classes, not nth-child) ═══
+   The global tbody tr:nth-child(even) zebra counts ALL rows including
+   pool headers — headers flip color depending on position. Here we
+   override with explicit classes: pool-header always one color, pool-dep
+   alternates within each pool (JS assigns dep-alt on odd rowIdx). */
+.models-table tbody tr td { background: var(--surface); }
+.models-table tbody tr:nth-child(even) td { background: var(--surface); } /* kill global */
+.models-table tbody tr:nth-child(odd) td { background: var(--surface); }
+
+/* Pool header: unified single color regardless of position */
+.models-table tr.pool-header > td {
+  padding: 7px 14px;
+  background: var(--surface3) !important;
+  border-left: 3px solid var(--primary);
+}
+.pool-vendor-logo { width: 22px; height: 22px; }
+
+/* Per-pool zebra: JS-assigned class, restarts at each pool header */
+.models-table tr.pool-dep > td { background: var(--surface); }
+.models-table tr.pool-dep.dep-alt > td { background: var(--surface2); }
+.models-table tr.pool-dep:hover > td { background: var(--surface3); }
+.models-table tr.pool-dep.dep-alt:hover > td { background: var(--surface3); }
+
+/* Disabled / warning rows keep their tints */
+.models-table tr.pool-dep.model-row-disabled > td {
+  background: var(--surface2) !important;
+  color: var(--text3); opacity: .55;
+}
+.models-table tr.pool-dep.model-row-warning > td {
+  background: rgba(255,80,80,.08) !important;
+  padding: 3px 14px; font-size: 11px; color: var(--danger);
+}
+
+/* Font sizes: tighter for density */
+.models-table th { font-size: 11px; }
+.models-table td { font-size: 12px; }
+.dep-id {
+  font-family: var(--mono); font-size: 11px; color: var(--text2);
+  max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  display: inline-block; vertical-align: middle;
+}
+thead + tbody tr.pool-header:first-child > td { border-top: none; }
+tr.pool-header + tr.pool-dep > td { border-top: none; }
+
+/* Pool header layout: logo + stacked(name/count) + switch + badge */
+.pool-header-inner {
+  display: flex; align-items: center; gap: 8px;
+}
+.pool-id-block {
+  display: flex; flex-direction: column; gap: 0;
+  line-height: 1.3;
+  flex: 1;    /* expand → pushes pool-actions to the right edge */
+}
+.pool-name {
+  font-size: 12px; font-weight: 600; color: var(--text);
+}
+.pool-count {
+  font-size: 10px; color: var(--text3);
+}
+.pool-actions {
+  display: flex; align-items: center; gap: 10px;
+  flex-shrink: 0;
+}
+
+
+/* Data row: stacked(deploy_id / visibility) */
+.dep-id-block {
+  display: flex; flex-direction: column; gap: 0;
+  line-height: 1.3;
+}
+.dep-vis {
+  font-size: 10px; color: var(--text3);
+}
+.dep-vis .badge { font-size: 9px; padding: 1px 5px; }
+

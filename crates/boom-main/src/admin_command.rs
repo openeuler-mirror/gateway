@@ -27,6 +27,10 @@ pub async fn admin_command_handler(mut rx: tokio::sync::mpsc::Receiver<AdminComm
                 let result = handle_import_models_from_yaml(&state).await;
                 let _ = reply.send(result);
             }
+            AdminCommand::SetModelRollback { deployment_id, model_name, enabled, reply } => {
+                let result = handle_set_model_rollback(&state, deployment_id, model_name, enabled).await;
+                let _ = reply.send(result);
+            }
             AdminCommand::UpsertWorkflow { req, reply } => {
                 let result = handle_upsert_workflow(&state, req).await;
                 let _ = reply.send(result);
@@ -288,6 +292,51 @@ fn parse_model_visibility(s: &Option<String>) -> Result<boom_config::ModelVisibi
     }
 }
 
+/// Set rollback participation for one pool (Some) or all pools (None),
+/// then reload routing for the affected model group(s). Single transaction
+/// per UPDATE statement; the wildcard "*" group (when present) reloads like
+/// any other group.
+async fn handle_set_model_rollback(
+    state: &AppState,
+    deployment_id: Option<Uuid>,
+    model_name: Option<String>,
+    enabled: bool,
+) -> Result<Value, String> {
+    let db_pool = state.db_pool.as_ref().ok_or("Database not available")?;
+    if let Some(id) = deployment_id {
+        // Row-level: one deployment checkbox in the models table.
+        let name = DeploymentStore::set_rollback_enabled_row_db(db_pool, id, enabled)
+            .await
+            .map_err(|e| format!("DB update failed: {}", e))?;
+        let Some(name) = name else {
+            return Err(format!("deployment {} not found", id));
+        };
+        reload_model_deployments(state, &name).await;
+        return Ok(json!({"ok": true, "model_name": name, "enabled": enabled}));
+    }
+    match model_name {
+        Some(name) => {
+            let n = DeploymentStore::set_rollback_enabled_db(db_pool, &name, enabled)
+                .await
+                .map_err(|e| format!("DB update failed: {}", e))?;
+            if n == 0 {
+                return Err(format!("model '{}' has no deployments", name));
+            }
+            reload_model_deployments(state, &name).await;
+            Ok(json!({"ok": true, "model_name": name, "rows": n, "enabled": enabled}))
+        }
+        None => {
+            let names = DeploymentStore::set_rollback_enabled_all_db(db_pool, enabled)
+                .await
+                .map_err(|e| format!("DB update failed: {}", e))?;
+            for name in &names {
+                reload_model_deployments(state, name).await;
+            }
+            Ok(json!({"ok": true, "models": names.len(), "enabled": enabled}))
+        }
+    }
+}
+
 async fn handle_create_model(
     state: &AppState,
     req: boom_dashboard::handlers_admin::CreateDeploymentRequest,
@@ -318,6 +367,8 @@ async fn handle_create_model(
         quota_count_ratio: req.quota_count_ratio.unwrap_or(1),
         max_inflight_queue_len: req.max_inflight_queue_len,
         max_context_len: req.max_context_len,
+        max_context_tokens: req.max_context_tokens,
+        rollback_enabled: req.rollback_enabled.unwrap_or(false),
         client_type_header: req.client_type_header,
         serve_not_match: req.serve_not_match,
         model_info: req.model_info.clone(),
@@ -374,6 +425,8 @@ async fn handle_update_model(
         quota_count_ratio: req.quota_count_ratio.unwrap_or(1),
         max_inflight_queue_len: req.max_inflight_queue_len,
         max_context_len: req.max_context_len,
+        max_context_tokens: req.max_context_tokens,
+        rollback_enabled: req.rollback_enabled.unwrap_or(false),
         client_type_header: req.client_type_header,
         serve_not_match: req.serve_not_match,
         model_info: req.model_info.clone(),

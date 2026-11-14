@@ -380,6 +380,7 @@
               <button class="debug-subtab" data-subtab="anomalies" data-i18n="debug.subtab.anomalies">Anomalies</button>
               <button class="debug-subtab" data-subtab="trace" data-i18n="debug.subtab.trace">OTEL Trace</button>
               <button class="debug-subtab" data-subtab="kvc" data-i18n="debug.subtab.kvc">KVC AWARE</button>
+              <button class="debug-subtab" data-subtab="rollback" data-i18n="debug.subtab.rollback">Rollback</button>
             </div>
 
             <!-- Overview pane: audit writer + agent stats -->
@@ -477,6 +478,15 @@
               <div id="trace-recent-wrap"><p class="muted" data-i18n="debug.trace.empty">No spans.</p></div>
             </div>
 
+            <!-- Rollback pane: decision breakdown + retry outcomes -->
+            <div class="debug-pane" data-pane="rollback">
+              <div class="section-header" style="margin-top:1.5rem">
+                <h2 data-i18n="debug.rollback.title">Rollback Stats (global)</h2>
+                <span style="font-size:.85em;color:var(--text3)" data-i18n="debug.rollback.subtitle">Process lifetime cumulative</span>
+              </div>
+              <div id="rollback-stats-wrap"><p class="loading" data-i18n="common.loading">Loading...</p></div>
+            </div>
+
             <!-- KVC AWARE pane: scheduler stats + rebalance moves + hit calibration + per-request DFX -->
             <div class="debug-pane" data-pane="kvc">
               <div class="section-header" style="margin-top:1.5rem">
@@ -521,7 +531,15 @@
           <section id="admin-models" class="section">
             <div class="section-header">
               <h2 data-i18n="models.title">Model Deployments</h2>
-              <div style="display:flex;gap:8px">
+              <div style="display:flex;gap:10px;align-items:center">
+                <label class="rb-master" data-i18n-tip="tip.master.rollback" title="Enable / disable rollback for ALL model pools">
+                  <span class="rb-switch">
+                    <input type="checkbox" id="rb-master" onchange="window._masterRollback(this)">
+                    <span class="rb-slider"></span>
+                  </span>
+                  <span class="rb-master-label" data-i18n="models.rollback.label">Auto Fallback</span>
+                </label>
+                <span style="width:1px;height:24px;background:var(--border)"></span>
                 <button class="btn-small" id="btn-import-yaml-models" data-i18n="models.import_yaml">Import from YAML</button>
                 <button class="btn-small btn-primary" id="btn-new-model" data-i18n="models.add">+ Add Model</button>
               </div>

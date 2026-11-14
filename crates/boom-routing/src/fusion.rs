@@ -488,16 +488,22 @@ impl RoutingModelInvoker {
             .runtime
             .deployment_store
             .get_cost_rate(&billing_model);
-        if record_prefix {
-            if let (Some(index), Some(worker_id)) = (kv_index, provider.kv_worker_id()) {
-                index.record_request_prefix(
-                    &resolved_model,
-                    worker_id,
-                    &prefix_bytes,
-                    StorageTier::Gpu,
-                );
+        // Deferred trie learning — see PreparedModelCall::record_prefix.
+        // worker_id is extracted BEFORE the provider moves into the call
+        // struct; prefix_bytes moves here (the select borrow ended above).
+        let record_prefix = if record_prefix {
+            match (kv_index, provider.kv_worker_id()) {
+                (Some(index), Some(worker_id)) => Some((
+                    index,
+                    resolved_model.clone(),
+                    worker_id.to_string(),
+                    prefix_bytes,
+                )),
+                _ => None,
             }
-        }
+        } else {
+            None
+        };
         request.gateway_headers = build_gateway_headers(
             self.context.is_vip,
             self.runtime.enable_priority_header,
@@ -573,6 +579,7 @@ impl RoutingModelInvoker {
             cost_rate,
             flow_guard,
             inflight,
+            record_prefix,
         })
     }
 
@@ -664,6 +671,11 @@ struct PreparedModelCall {
     cost_rate: ModelCostRate,
     flow_guard: Option<FlowControlGuard>,
     inflight: InFlightGuard,
+    /// Deferred trie learning: (index, resolved_model, worker_id, prefix).
+    /// Recorded ONLY after the provider accepts the call (Ok) — Err paths
+    /// (incl. context rejections) must not learn, or failed prefixes stay
+    /// pinned to the rejecting worker (tie trap, design doc §7).
+    record_prefix: Option<(Arc<dyn KvIndexBackend>, String, String, Vec<u8>)>,
 }
 
 #[async_trait]
@@ -692,6 +704,7 @@ impl ModelInvoker for RoutingModelInvoker {
             cost_rate,
             flow_guard: _flow_guard,
             inflight: _inflight,
+            record_prefix,
         } = prepared;
         self.route_prompt_call(
             prompt_call,
@@ -723,6 +736,10 @@ impl ModelInvoker for RoutingModelInvoker {
             }
         };
         self.record_success(deployment_id.as_deref(), &requested_model);
+        // Trie learning on admission success only (Ok path) — see §7.
+        if let Some((index, model, worker_id, prefix)) = record_prefix {
+            index.record_request_prefix(&model, &worker_id, &prefix, StorageTier::Gpu);
+        }
         if let Some(ref usage) = response.usage {
             self.context.billing.add_actual_usage(usage);
             let cost = response_cost(&cost_rate, usage);
@@ -756,6 +773,7 @@ impl ModelInvoker for RoutingModelInvoker {
             cost_rate,
             flow_guard,
             inflight,
+            record_prefix,
         } = prepared;
         self.route_prompt_call(
             prompt_call,
@@ -791,6 +809,10 @@ impl ModelInvoker for RoutingModelInvoker {
             }
         };
         self.record_success(deployment_id.as_deref(), &requested_model);
+        // Trie learning on admission success only (Ok path) — see §7.
+        if let Some((index, model, worker_id, prefix)) = record_prefix {
+            index.record_request_prefix(&model, &worker_id, &prefix, StorageTier::Gpu);
+        }
         let prompt_trace = prompt_call.and_then(|call_index| {
             self.context
                 .prompt_trace

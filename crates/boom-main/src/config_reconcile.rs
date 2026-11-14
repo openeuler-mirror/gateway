@@ -745,6 +745,8 @@ pub(crate) fn deployment_inputs_from_config(config: &Config) -> Vec<DeploymentIn
                 .as_ref()
                 .and_then(|fc| fc.model_context_limit)
                 .map(|v| v as i64),
+            max_context_tokens: p.max_context_tokens.map(|v| v as i64),
+            rollback_enabled: entry.rollback_enabled,
             enabled: entry.enabled,
             client_type_header: entry.client_type_header,
             serve_not_match: entry.serve_not_match,
@@ -910,6 +912,8 @@ pub(crate) fn build_provider_from_row(
         &custom_headers,
         row.deployment_id.clone(),
         row.client_type_header.unwrap_or(false),
+        row.max_context_tokens.map(|v| v as u64),
+        row.rollback_enabled,
     ) {
         Ok(provider) => Some(provider),
         Err(e) => {

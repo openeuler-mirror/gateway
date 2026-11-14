@@ -539,6 +539,7 @@ dependencies = [
  "boom-promptlog",
  "boom-provider",
  "boom-responses",
+ "boom-rollback",
  "boom-routing",
  "boom-stressmon",
  "boom-trace",
@@ -624,6 +625,16 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "boom-rollback"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "boom-core",
+ "boom-flowcontrol",
+ "boom-routing",
 ]
 
 [[package]]

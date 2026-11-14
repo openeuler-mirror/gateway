@@ -166,6 +166,14 @@ pub struct DeploymentRow {
     /// Unified access-control state: 'normal' | 'public' | 'private'.
     #[sqlx(default)]
     pub visibility: Option<String>,
+    /// Context capability declaration for rollback tiering (tokens).
+    /// NULL = not participating.
+    #[sqlx(default)]
+    pub max_context_tokens: Option<i64>,
+    /// Per-deployment rollback participation (pool semantics: group
+    /// participates when every row is true).
+    #[sqlx(default)]
+    pub rollback_enabled: bool,
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
 }
@@ -202,6 +210,13 @@ pub struct DeploymentProviderRow {
     pub max_inflight_queue_len: Option<i32>,
     #[sqlx(default)]
     pub max_context_len: Option<i64>,
+    /// Context capability for rollback tiering (tokens). NULL = not
+    /// participating.
+    #[sqlx(default)]
+    pub max_context_tokens: Option<i64>,
+    /// Per-deployment rollback participation (pool semantics).
+    #[sqlx(default)]
+    pub rollback_enabled: bool,
     #[sqlx(default)]
     pub model_info: Option<serde_json::Value>,
     /// Team ACL (JSONB array of team_ids). NULL unless visibility='private'.
@@ -265,6 +280,8 @@ pub const DEPLOYMENT_CORE_COLUMNS: &[&str] = &[
     "model_info",
     "allowed_teams",
     "visibility",
+    "max_context_tokens",
+    "rollback_enabled",
 ];
 
 /// Build an INSERT statement for `boom_model_deployment` from the canonical
@@ -353,7 +370,7 @@ const DEPLOYMENT_ROW_SELECT_COLUMNS: &str = concat!(
     "source, deployment_id, quota_count_ratio, ",
     "max_inflight_queue_len, max_context_len, client_type_header, ",
     "serve_not_match, model_info, allowed_teams, visibility, ",
-    "created_at, updated_at"
+    "max_context_tokens, rollback_enabled, created_at, updated_at"
 );
 
 /// Canonical SELECT column list for provider-building reads
@@ -363,7 +380,8 @@ const PROVIDER_ROW_COLUMNS: &str = concat!(
     "model_name, litellm_model, api_key, api_key_env, api_base, api_version, ",
     "aws_region_name, timeout, headers, deployment_id, client_type_header, ",
     "serve_not_match, quota_count_ratio, max_inflight_queue_len, ",
-    "max_context_len, model_info, allowed_teams, visibility"
+    "max_context_len, max_context_tokens, rollback_enabled, ",
+    "model_info, allowed_teams, visibility"
 );
 
 /// SQL for `snapshot_db` — config export MUST include disabled rows.
@@ -372,7 +390,7 @@ const PROVIDER_ROW_COLUMNS: &str = concat!(
 /// statically verify the absence of `enabled IS NOT FALSE`. Putting the filter
 /// back here would silently turn "disable" into "delete" on the next
 /// `persist_config_in_place` → `sync_yaml_to_db` round-trip.
-const SNAPSHOT_DB_SQL: &str = "SELECT id, model_name, litellm_model, api_key, api_key_env, api_base, api_version, aws_region_name, aws_access_key_id, aws_secret_access_key, rpm, tpm, timeout, headers, temperature, max_tokens, enabled, auto_disabled, source, deployment_id, quota_count_ratio, max_inflight_queue_len, max_context_len, client_type_header, serve_not_match, model_info, allowed_teams, visibility, created_at, updated_at FROM boom_model_deployment ORDER BY model_name, created_at";
+const SNAPSHOT_DB_SQL: &str = "SELECT id, model_name, litellm_model, api_key, api_key_env, api_base, api_version, aws_region_name, aws_access_key_id, aws_secret_access_key, rpm, tpm, timeout, headers, temperature, max_tokens, enabled, auto_disabled, source, deployment_id, quota_count_ratio, max_inflight_queue_len, max_context_len, client_type_header, serve_not_match, model_info, allowed_teams, visibility, max_context_tokens, rollback_enabled, created_at, updated_at FROM boom_model_deployment ORDER BY model_name, created_at";
 
 /// Input for creating/updating a deployment in DB.
 ///
@@ -409,6 +427,11 @@ pub struct DeploymentInput {
     /// Unified access-control state. Private consumes `allowed_teams`;
     /// Normal/Public ignore it (and should carry None).
     pub visibility: boom_config::ModelVisibility,
+    /// Context capability declaration for rollback tiering (tokens).
+    /// NULL = not participating.
+    pub max_context_tokens: Option<i64>,
+    /// Per-deployment rollback participation (pool semantics).
+    pub rollback_enabled: bool,
 }
 
 impl DeploymentStore {
@@ -730,6 +753,11 @@ impl DeploymentStore {
                 .bind(d.model_info.as_ref().unwrap_or(&serde_json::Value::Null))
                 .bind(allowed_teams_json(&d.allowed_teams))
                 .bind(visibility_str(d.visibility))
+                // DEPLOYMENT_CORE_COLUMNS tail (positions 26-27). Missing
+                // here = "bind supplies 25 parameters but statement requires
+                // 27" on every fresh-DB YAML boot (e2e-caught).
+                .bind(d.max_context_tokens)
+                .bind(d.rollback_enabled)
                 .execute(&mut *conn)
                 .await?;
         }
@@ -907,6 +935,8 @@ impl DeploymentStore {
             .bind(input.model_info.as_ref().unwrap_or(&serde_json::Value::Null))
             .bind(allowed_teams_json(&input.allowed_teams))
             .bind(visibility_str(input.visibility))
+            .bind(input.max_context_tokens)
+            .bind(input.rollback_enabled)
             .fetch_one(pool)
             .await?;
 
@@ -951,6 +981,8 @@ impl DeploymentStore {
             .bind(input.model_info.as_ref().unwrap_or(&serde_json::Value::Null))
             .bind(allowed_teams_json(&input.allowed_teams))
             .bind(visibility_str(input.visibility))
+            .bind(input.max_context_tokens)
+            .bind(input.rollback_enabled)
             .fetch_one(pool)
             .await?;
 
@@ -995,6 +1027,8 @@ impl DeploymentStore {
                    model_info = COALESCE($24, model_info),
                    allowed_teams = $25,
                    visibility = $26,
+                   max_context_tokens = $27,
+                   rollback_enabled = $28,
                    updated_at = NOW()
                WHERE id = $1
                RETURNING (SELECT model_name FROM old) AS old_model_name"#,
@@ -1025,6 +1059,8 @@ impl DeploymentStore {
         .bind(input.model_info.as_ref().unwrap_or(&serde_json::Value::Null))
         .bind(allowed_teams_json(&input.allowed_teams))
         .bind(visibility_str(input.visibility))
+        .bind(input.max_context_tokens)
+        .bind(input.rollback_enabled)
         .fetch_optional(pool)
         .await?;
 
@@ -1113,6 +1149,72 @@ impl DeploymentStore {
         Ok(row.map(|(name,)| name))
     }
 
+    /// Set `rollback_enabled` on ONE deployment row (the per-row checkbox
+    /// in the models table). Returns the row's model_name (None = row not
+    /// found) so the caller can reload that model group's routing.
+    pub async fn set_rollback_enabled_row_db(
+        pool: &sqlx::PgPool,
+        id: uuid::Uuid,
+        enabled: bool,
+    ) -> Result<Option<String>, sqlx::Error> {
+        let row: Option<(String,)> = sqlx::query_as(
+            "UPDATE boom_model_deployment
+             SET rollback_enabled = $2, updated_at = NOW()
+             WHERE id = $1
+             RETURNING model_name",
+        )
+        .bind(id)
+        .bind(enabled)
+        .fetch_optional(pool)
+        .await?;
+        Ok(row.map(|(name,)| name))
+    }
+
+    /// Set `rollback_enabled` on every deployment of one model group (the
+    /// Models page pool toggle). Returns the affected row count — 0 means
+    /// the model has no deployments (caller surfaces the error).
+    pub async fn set_rollback_enabled_db(
+        pool: &sqlx::PgPool,
+        model_name: &str,
+        enabled: bool,
+    ) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query(
+            "UPDATE boom_model_deployment
+             SET rollback_enabled = $2, updated_at = NOW()
+             WHERE model_name = $1",
+        )
+        .bind(model_name)
+        .bind(enabled)
+        .execute(pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Set `rollback_enabled` on ALL deployments (the Models page global
+    /// select-all / deselect-all). Returns the distinct model_name list
+    /// affected, so the caller can reload routing for each group.
+    pub async fn set_rollback_enabled_all_db(
+        pool: &sqlx::PgPool,
+        enabled: bool,
+    ) -> Result<Vec<String>, sqlx::Error> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "UPDATE boom_model_deployment
+             SET rollback_enabled = $1, updated_at = NOW()
+             RETURNING model_name",
+        )
+        .bind(enabled)
+        .fetch_all(pool)
+        .await?;
+        let mut names: Vec<String> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for (name,) in rows {
+            if seen.insert(name.clone()) {
+                names.push(name);
+            }
+        }
+        Ok(names)
+    }
+
     /// List all deployments from DB (for dashboard).
     pub async fn list_all_db(pool: &sqlx::PgPool) -> Result<Vec<DeploymentRow>, sqlx::Error> {
         sqlx::query_as::<_, DeploymentRow>(&format!(
@@ -1174,7 +1276,9 @@ mod tests {
                 serve_not_match = $23,
                 model_info = COALESCE($24, model_info),
                 allowed_teams = $25,
-                visibility = $26
+                visibility = $26,
+                max_context_tokens = $27,
+                rollback_enabled = $28
         "#;
         for col in DEPLOYMENT_CORE_COLUMNS {
             let needle = format!(" {} ", col);
@@ -1232,6 +1336,40 @@ mod tests {
                     || DEPLOYMENT_ROW_SELECT_COLUMNS.contains(&format!(" {}", col)),
                 "column `{}` missing from DEPLOYMENT_ROW_SELECT_COLUMNS",
                 col,
+            );
+        }
+    }
+
+    /// Bind-count guard: the INSERT statements carry one placeholder per core
+    /// column, and a missing `.bind()` in the chain is only caught at RUNTIME
+    /// ("bind message supplies N parameters, but prepared statement requires
+    /// M") on a fresh-DB YAML boot — the column-mention tests above cannot see
+    /// it. Scrape this file's own source and count `.bind(` between each
+    /// INSERT executor and its `.execute(`.
+    #[test]
+    fn insert_bind_chains_match_core_column_count() {
+        let src = include_str!("deployment_store.rs");
+        for fname in ["fn seed_rows_db", "fn create_db"] {
+            let start = src.find(fname).unwrap_or_else(|| {
+                panic!("function `{}` not found in source", fname)
+            });
+            let body = &src[start..];
+            // The bind chain ends at the first terminal call — different
+            // executors are used across the INSERT paths (.execute / .fetch_*).
+            let end = [".execute(", ".fetch_one(", ".fetch_all(", ".fetch_optional("]
+                .iter()
+                .filter_map(|t| body.find(t))
+                .min()
+                .unwrap_or_else(|| panic!("no executor call after `{}`", fname));
+            let chain = &body[..end];
+            let binds = chain.matches(".bind(").count();
+            assert_eq!(
+                binds,
+                DEPLOYMENT_CORE_COLUMNS.len(),
+                "`{}` binds {} value(s) but INSERT has {} column(s) — add the missing .bind() (CLAUDE.md §9)",
+                fname,
+                binds,
+                DEPLOYMENT_CORE_COLUMNS.len(),
             );
         }
     }

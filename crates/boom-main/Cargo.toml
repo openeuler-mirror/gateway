@@ -28,6 +28,7 @@ boom-auth = { path = "../boom-auth" }
 boom-provider = { path = "../boom-provider" }
 boom-limiter = { path = "../boom-limiter" }
 boom-routing = { path = "../boom-routing" }
+boom-rollback = { path = "../boom-rollback" }
 boom-audit = { path = "../boom-audit" }
 boom-dashboard = { path = "../boom-dashboard", default-features = false }
 boom-ctxaware = { path = "../boom-ctxaware" }

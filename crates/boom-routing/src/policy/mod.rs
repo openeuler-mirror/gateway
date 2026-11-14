@@ -73,6 +73,22 @@ pub trait SchedulePolicy: Send + Sync {
             .map(|provider| Selection { provider, kv_hit_ratio: 0.0, kv_hit_blocks: 0, kv_input_blocks: 0, kv_match_attempted: false, degraded: false })
     }
 
+    /// Result callback: invoked after the provider call's outcome is known.
+    /// `success = true` means admission succeeded (the provider accepted the
+    /// request). Default no-op — most policies have nothing to correct;
+    /// key_affinity uses it to migrate bindings after out-of-band reroutes
+    /// (capacity hand-offs, rollback fallbacks) via an idempotent rebind.
+    /// The regular success path does NOT call it (select already wrote the
+    /// binding); only rerouting executors call it with the FINAL deployment.
+    fn on_outcome(
+        &self,
+        _key_hash: Option<&str>,
+        _model: &str,
+        _deployment_id: Option<&str>,
+        _success: bool,
+    ) {
+    }
+
     /// Policy name (for display / config validation).
     fn name(&self) -> &str;
 

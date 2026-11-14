@@ -96,6 +96,9 @@ pub struct AppState {
     /// lowest-load fallback / rebalance (debug page; survives reloads).
     /// The policy is recreated on every reload, so the counters must live here.
     pub kvc_stats: Arc<KvcSchedulerStats>,
+    /// Rollback observability counters (debug page). Top-level Arc:
+    /// survives reloads; the rollback module's functions are stateless.
+    pub rollback_stats: Arc<boom_rollback::RollbackStats>,
     /// Per-deployment request rate tracker (survives reloads).
     pub request_rate: Arc<RequestRateTracker>,
     /// Agent (client-type) statistics tracker (survives reloads).
@@ -282,6 +285,7 @@ impl AppState {
         // Global kvc scheduling counters survive across reloads (the policy is
         // recreated on every reload — per-policy counters would reset).
         let kvc_stats = Arc::new(KvcSchedulerStats::new());
+        let rollback_stats = Arc::new(boom_rollback::RollbackStats::new());
         let request_rate = Arc::new(RequestRateTracker::new());
         let agent_stats = Arc::new(AgentStatsTracker::new());
 
@@ -495,6 +499,7 @@ impl AppState {
             prompt_log_query,
             rebalance_move_tracker,
             kvc_stats,
+            rollback_stats,
             request_rate,
             agent_stats,
             kv_index,
@@ -1655,6 +1660,8 @@ fn build_deployments_from_config(
             &p.headers,
             deployment_id,
             entry.client_type_header,
+            p.max_context_tokens,
+            entry.rollback_enabled,
         ) {
             Ok(provider) => {
                 // Also register as wildcard catch-all if flagged.
@@ -2162,6 +2169,12 @@ pub(crate) async fn build_config_snapshot_value(pool: &PgPool) -> Result<serde_j
             if let Some(m) = r.max_tokens {
                 litellm_params.insert("max_tokens".into(), serde_json::Value::Number(m.into()));
             }
+            if let Some(m) = r.max_context_tokens {
+                litellm_params.insert(
+                    "max_context_tokens".into(),
+                    serde_json::Value::Number(m.into()),
+                );
+            }
             // NOTE: max_inflight_queue_len / max_context_len are deliberately
             // NOT placed under litellm_params — ProviderParams doesn't have
             // those fields, so serde would silently drop them on reload,
@@ -2179,6 +2192,15 @@ pub(crate) async fn build_config_snapshot_value(pool: &PgPool) -> Result<serde_j
                 "model_name": r.model_name,
                 "litellm_params": litellm_params,
             });
+
+            // rollback participation (ModelEntry top-level field): emit only
+            // when set, keeping opted-out rows clean in the YAML snapshot.
+            if r.rollback_enabled {
+                entry.as_object_mut().unwrap().insert(
+                    "rollback_enabled".into(),
+                    serde_json::Value::Bool(true),
+                );
+            }
 
             // ── flow_control: emit as a dedicated node. Include only when
             // at least one limit is set so we don't litter YAML with empty

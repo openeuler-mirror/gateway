@@ -25,6 +25,7 @@ fn provider_params(model: &str) -> ProviderParams {
         headers: HashMap::new(),
         temperature: None,
         max_tokens: None,
+        max_context_tokens: None,
     }
 }
 

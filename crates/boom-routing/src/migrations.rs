@@ -18,6 +18,8 @@ CREATE TABLE IF NOT EXISTS boom_model_deployment (
     headers           JSONB   NOT NULL DEFAULT '{}',
     temperature       DOUBLE PRECISION,
     max_tokens        INTEGER,
+    max_context_tokens BIGINT,
+    rollback_enabled  BOOLEAN NOT NULL DEFAULT false,
     enabled           BOOLEAN NOT NULL DEFAULT true,
     auto_disabled     BOOLEAN NOT NULL DEFAULT false,
     source            TEXT    NOT NULL DEFAULT 'yaml',
@@ -45,6 +47,26 @@ ALTER TABLE boom_model_deployment ADD COLUMN IF NOT EXISTS auto_disabled BOOLEAN
 pub fn migration_add_allowed_teams() -> &'static str {
     r#"
 ALTER TABLE boom_model_deployment ADD COLUMN IF NOT EXISTS allowed_teams JSONB;
+"#
+}
+
+/// Migration: add `max_context_tokens` — context capability declaration for
+/// rollback tiering (tokens, per-request ceiling; NULL = not participating).
+/// Distinct from `max_context_len` (flow-control: chars, aggregate in-flight
+/// budget for queue admission).
+pub fn migration_add_max_context_tokens() -> &'static str {
+    r#"
+ALTER TABLE boom_model_deployment ADD COLUMN IF NOT EXISTS max_context_tokens BIGINT;
+"#
+}
+
+/// Migration: add `rollback_enabled` — per-deployment participation in
+/// context rollback (pool semantics: a model group participates when every
+/// row is set; the Models page pool toggle / global select-all writes the
+/// whole group). NOT NULL DEFAULT false keeps legacy rows opted out.
+pub fn migration_add_rollback_enabled() -> &'static str {
+    r#"
+ALTER TABLE boom_model_deployment ADD COLUMN IF NOT EXISTS rollback_enabled BOOLEAN NOT NULL DEFAULT false;
 "#
 }
 

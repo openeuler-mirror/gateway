@@ -50,6 +50,17 @@ pub enum AdminCommand {
     ImportModelsFromYaml {
         reply: oneshot::Sender<Result<Value, String>>,
     },
+    /// Set rollback participation at one of three granularities: a single
+    /// deployment row (`deployment_id`), one pool (`model_name`), or every
+    /// pool (both None — the toolbar master toggle). Writes
+    /// `rollback_enabled` on the affected rows, then reloads routing for
+    /// the affected model group(s).
+    SetModelRollback {
+        deployment_id: Option<Uuid>,
+        model_name: Option<String>,
+        enabled: bool,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
     /// Save a workflow definition (create or replace). Boom-main parses the
     /// raw definition JSON against `WorkflowDefinitionConfig`, validates the
     /// resulting settings snapshot, writes DB, then re-registers fusion.
@@ -235,6 +246,8 @@ pub struct DashboardState {
     /// Global kvc_aware scheduling counters (total / affinity / cold /
     /// lowest-load fallback / rebalance) for dashboard debug page.
     pub kvc_stats: Arc<KvcSchedulerStats>,
+    /// Rollback observability counters (debug page `GET /admin/stats/rollback`).
+    pub rollback_stats: Arc<boom_core::context_error::RollbackStats>,
     /// Per-deployment request rate tracker for dashboard stats.
     pub request_rate: Arc<RequestRateTracker>,
     /// Agent (client-type) statistics tracker for dashboard stats.
@@ -291,6 +304,7 @@ impl DashboardState {
         prompt_log_query: Arc<dyn PromptLogQueryApi>,
         rebalance_move_tracker: Arc<RebalanceMoveTracker>,
         kvc_stats: Arc<KvcSchedulerStats>,
+        rollback_stats: Arc<boom_core::context_error::RollbackStats>,
         request_rate: Arc<RequestRateTracker>,
         agent_stats: Arc<AgentStatsTracker>,
         auth: Arc<dyn KeyAliasLookup>,
@@ -326,6 +340,7 @@ impl DashboardState {
             prompt_log_query,
             rebalance_move_tracker,
             kvc_stats,
+            rollback_stats,
             request_rate,
             agent_stats,
             auth,

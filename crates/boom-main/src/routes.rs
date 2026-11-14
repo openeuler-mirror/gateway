@@ -809,11 +809,11 @@ async fn chat_completions_inner(
 
     let (provider, deployment_id, inflight_model,
         schedule_policy, kv_hit_blocks, kv_input_blocks,
-        trie_blocks, trie_max_blocks, request_bytes) = match kvc_route {
+        trie_blocks, trie_max_blocks, request_bytes, prefix_bytes) = match kvc_route {
         Some(r) => {
             (r.provider, r.deployment_id, r.inflight_model.unwrap_or_default(),
              r.schedule_policy, r.kv_hit_blocks, r.kv_input_blocks,
-             r.trie_blocks, r.trie_max_blocks, r.request_bytes)
+             r.trie_blocks, r.trie_max_blocks, r.request_bytes, r.prefix_bytes)
         }
         None => {
             // kvc disabled / no match — fallback to default routing
@@ -826,7 +826,17 @@ async fn chat_completions_inner(
             })?;
             let did = selection.provider.deployment_id().map(|s| s.to_string());
             let im = state.router.resolve_model_name(&resolved_model);
-            (selection.provider, did, im, None, None, None, None, None, None)
+            // Policy label, same mapping as the kvc path (kvc_aware → "kvc").
+            // This arm used to drop the label entirely, so rr / key-affinity
+            // pools (and single-candidate kvc pools) wrote NULL
+            // schedule_policy — the audit Policy column showed "-" and the
+            // policy filter (e.g. "+rollback") never matched. e2e-caught.
+            let policy_name = state.router.policy_name();
+            let policy_label = match policy_name.as_str() {
+                "kvc_aware" => "kvc",
+                other => other,
+            };
+            (selection.provider, did, im, Some(policy_label.to_string()), None, None, None, None, None, Vec::new())
         }
     };
     let routing_ms = route_start.elapsed().as_millis() as u64;
@@ -943,39 +953,128 @@ async fn chat_completions_inner(
     req.raw_capture = prompt_log_raw_capture.clone();
 
     // 4. Route to provider (streaming or non-streaming).
+    // ── Context rollback setup (design §6): identities rebind on a
+    // successful fallback; a request clone is kept only when the pool
+    // could roll back (the feature's only steady-state cost). ──
+    let rb_patterns = &inner.config.router_settings.rollback.context.patterns;
+    let rb_route = boom_rollback::RollbackRoute {
+        model: &resolved_model,
+        key_hash: Some(&identity.key_hash),
+        input_chars: input_chars as u64,
+        prefix_bytes: &prefix_bytes,
+        candidates: candidates.as_ref().map(|c| c.as_slice()).unwrap_or(&[]),
+    };
+    let rb_capable = boom_rollback::capable(rb_patterns, rb_route.candidates);
+    let mut provider = provider;
+    let mut deployment_id = deployment_id;
+    let mut fc_guard = fc_guard;
+    let mut schedule_policy = schedule_policy;
+    let mut rollback_from: Option<String> = None;
+    let rb_ctx = boom_rollback::RollbackCtx {
+        router: &state.router,
+        flow_controller: &state.flow_controller,
+        stats: &state.rollback_stats,
+        patterns: rb_patterns,
+        fc_queue_timeout_secs: inner.config.router_settings.flow_control_queue_timeout_secs(),
+    };
+    macro_rules! rb_fail { ($err:expr, $stream:expr) => {{
+        // Finalize FIRST so the audit row records the client-visible status
+        // (400 passthrough for context errors), not the masked 502.
+        let rb_final = boom_rollback::finalize_error($err, rb_patterns, Some(&state.rollback_stats), Some(&resolved_model));
+        let partial_usage = provider_billing.actual_usage();
+        settle_partial_provider_accounting(&mut plan_charge, &provider_billing);
+        log_error_with_usage(&state, &identity, &model, api_path, $stream, start, &rb_final, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()), user_tags.clone(), partial_usage.as_ref(), None, schedule_policy.clone());
+        write_prompt_log_error(
+            &state,
+            prompt_log_should,
+            prompt_log_req_body.as_ref(),
+            prompt_log_trace_id.clone(),
+            &request_id,
+            &identity,
+            &model,
+            api_path,
+            $stream,
+            &client_ip,
+            prompt_log_headers.as_ref(),
+            &rb_final,
+            provider_prompt_trace.as_ref(),
+            prompt_log_raw_capture.as_ref(),
+            start,
+            trace_guard.as_mut(),
+        );
+        crate::health_monitor::record_request_failure(&state, &deployment_id, &rb_final);
+        return Err(GatewayErrorReply(rb_final, $stream));
+    }} }
+
     if is_stream {
         if let Some(g) = trace_guard.as_ref() { g.note_upstream_start(); }
-        let stream = match provider.chat_stream_with_context(req, provider_context).await {
-            Ok(s) => s,
-            Err(e) => {
-                let partial_usage = provider_billing.actual_usage();
-                settle_partial_provider_accounting(&mut plan_charge, &provider_billing);
-                log_error_with_usage(&state, &identity, &model, api_path, true, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()), user_tags.clone(), partial_usage.as_ref(), None);
-                write_prompt_log_error(
-                    &state,
-                    prompt_log_should,
-                    prompt_log_req_body.as_ref(),
-                    prompt_log_trace_id.clone(),
-                    &request_id,
-                    &identity,
-                    &model,
-                    api_path,
-                    true,
-                    &client_ip,
-                    prompt_log_headers.as_ref(),
-                    &e,
-                    provider_prompt_trace.as_ref(),
-                    prompt_log_raw_capture.as_ref(),
-                    start,
-                    trace_guard.as_mut(),
-                );
-                crate::health_monitor::record_request_failure(&state, &deployment_id, &e);
-                return Err(GatewayErrorReply(e, true));
+        let stream = if rb_capable {
+            // Capable pool: first call rides a clone; the original request is
+            // reserved verbatim for the potential retry (the feature's only
+            // steady-state cost — paid per request on rollback-configured
+            // pools, never on inert pools).
+            match provider.chat_stream_with_context(req.clone(), provider_context.clone()).await {
+                Ok(s) => s,
+                Err(e) => match boom_rollback::attempt_stream(
+                    &rb_ctx, &e, req, Some(provider_context),
+                    provider.clone(), deployment_id.clone(), fc_guard.take(),
+                    is_vip, identity.key_alias.clone(), &rb_route,
+                ).await {
+                    boom_rollback::RollbackOutcome::NoRetry => rb_fail!(e, true),
+                    boom_rollback::RollbackOutcome::Retried { result, provider: p2, deployment_id: d2, fc_guard: g2, from_deployment_id } => {
+                        provider = p2;
+                        deployment_id = d2;
+                        fc_guard = g2;
+                        rollback_from = from_deployment_id;
+                        match result {
+                            Ok(s) => s,
+                            Err(e2) => rb_fail!(e2, true),
+                        }
+                    }
+                },
+            }
+        } else {
+            match provider.chat_stream_with_context(req, provider_context).await {
+                Ok(s) => s,
+                Err(e) => { {
+          // Unified with attempt.rs / finalize.rs: L1 via the GatewayError
+          // helper (actual upstream status + raw body — not the Display
+          // string, and not a hardcoded 400) and the same error_code_of
+          // extraction. The bespoke match here produced "unknown" for
+          // wrapper-shaped bodies ("Context length exceeded: {json}")
+          // while the other paths recorded "HTTP_400" — one request,
+          // two different codes across tree sections.
+          if e.context_error_match(rb_patterns).matched {
+            state.rollback_stats.record_pool_inert_identified(&resolved_model, &e);
+          }
+        }
+        rb_fail!(e, true) }
             }
         };
         // Provider accepted the request — commit the plan charge now.
         let _decision = plan_charge.commit();
         crate::health_monitor::reset_request_failure(&state, &deployment_id);
+        // Trie learning: admission success is the "it fits" proof — record
+        // only on the Ok path (Err prefixes must never learn, design §7).
+        state.kvc_orchestrator.record_success(&resolved_model, provider.kv_worker_id(), &prefix_bytes);
+        // ── Rollback bookkeeping (design §6): audit label, key-binding
+        // correction (on_outcome → the deployment that actually served),
+        // trace marker. Runs only when a fallback served this request. ──
+        if let Some(ref rb_from) = rollback_from {
+            schedule_policy = schedule_policy.take().map(|p| format!("{}+rollback", p));
+            state.router.notify_outcome(Some(&identity.key_hash), &resolved_model, deployment_id.as_deref(), true);
+            if let Some(g) = trace_guard.as_ref() {
+                g.set_attribute(
+                    "boom-gateway.rollback",
+                    boom_core::trace::SpanAttributeValue::String(format!("{:?} -> {:?}", rb_from, deployment_id)),
+                );
+            }
+        } else if rb_capable && kv_hit_blocks.map(|b| b > 0).unwrap_or(false) {
+            // Converged: affinity direct hit on a capable pool, no rollback
+            // needed — the memory-follow is working (debug pane convergence
+            // rate numerator).
+            state.rollback_stats.record_affinity_direct(&resolved_model);
+        }
         let usage = UsageTracker::default();
         let sse_stream = sse_stream_from_chat_stream(stream, usage.clone());
         let inflight_guard = if let Some(ref did) = deployment_id {
@@ -1136,32 +1235,43 @@ async fn chat_completions_inner(
             InFlightGuard::new(state.inflight.clone(), &inflight_model, input_chars as u64)
         };
         if let Some(g) = trace_guard.as_ref() { g.note_upstream_start(); }
-        let response = match provider.chat_with_context(req, provider_context).await {
-            Ok(r) => r,
-            Err(e) => {
-                let partial_usage = provider_billing.actual_usage();
-                settle_partial_provider_accounting(&mut plan_charge, &provider_billing);
-                log_error_with_usage(&state, &identity, &model, api_path, false, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()), user_tags.clone(), partial_usage.as_ref(), None);
-                write_prompt_log_error(
-                    &state,
-                    prompt_log_should,
-                    prompt_log_req_body.as_ref(),
-                    prompt_log_trace_id.clone(),
-                    &request_id,
-                    &identity,
-                    &model,
-                    api_path,
-                    false,
-                    &client_ip,
-                    prompt_log_headers.as_ref(),
-                    &e,
-                    provider_prompt_trace.as_ref(),
-                    prompt_log_raw_capture.as_ref(),
-                    start,
-                    trace_guard.as_mut(),
-                );
-                crate::health_monitor::record_request_failure(&state, &deployment_id, &e);
-                return Err(GatewayErrorReply(e, false));
+        let response = if rb_capable {
+            match provider.chat_with_context(req.clone(), provider_context.clone()).await {
+                Ok(r) => r,
+                Err(e) => match boom_rollback::attempt_call(
+                    &rb_ctx, &e, req, Some(provider_context),
+                    provider.clone(), deployment_id.clone(), fc_guard.take(),
+                    is_vip, identity.key_alias.clone(), &rb_route,
+                ).await {
+                    boom_rollback::RollbackOutcome::NoRetry => rb_fail!(e, false),
+                    boom_rollback::RollbackOutcome::Retried { result, provider: p2, deployment_id: d2, fc_guard: g2, from_deployment_id } => {
+                        provider = p2;
+                        deployment_id = d2;
+                        fc_guard = g2;
+                        rollback_from = from_deployment_id;
+                        match result {
+                            Ok(r) => r,
+                            Err(e2) => rb_fail!(e2, false),
+                        }
+                    }
+                },
+            }
+        } else {
+            match provider.chat_with_context(req, provider_context).await {
+                Ok(r) => r,
+                Err(e) => { {
+          // Unified with attempt.rs / finalize.rs: L1 via the GatewayError
+          // helper (actual upstream status + raw body — not the Display
+          // string, and not a hardcoded 400) and the same error_code_of
+          // extraction. The bespoke match here produced "unknown" for
+          // wrapper-shaped bodies ("Context length exceeded: {json}")
+          // while the other paths recorded "HTTP_400" — one request,
+          // two different codes across tree sections.
+          if e.context_error_match(rb_patterns).matched {
+            state.rollback_stats.record_pool_inert_identified(&resolved_model, &e);
+          }
+        }
+        rb_fail!(e, false) }
             }
         };
         if let Some(g) = trace_guard.as_ref() { g.note_upstream_end(); }
@@ -1171,6 +1281,27 @@ async fn chat_completions_inner(
         // concurrency slot no longer needed once we have the full response).
         drop(plan_charge.take_concurrency_guard());
         crate::health_monitor::reset_request_failure(&state, &deployment_id);
+        // Trie learning: admission success is the "it fits" proof — record
+        // only on the Ok path (Err prefixes must never learn, design §7).
+        state.kvc_orchestrator.record_success(&resolved_model, provider.kv_worker_id(), &prefix_bytes);
+        // ── Rollback bookkeeping (design §6): audit label, key-binding
+        // correction (on_outcome → the deployment that actually served),
+        // trace marker. Runs only when a fallback served this request. ──
+        if let Some(ref rb_from) = rollback_from {
+            schedule_policy = schedule_policy.take().map(|p| format!("{}+rollback", p));
+            state.router.notify_outcome(Some(&identity.key_hash), &resolved_model, deployment_id.as_deref(), true);
+            if let Some(g) = trace_guard.as_ref() {
+                g.set_attribute(
+                    "boom-gateway.rollback",
+                    boom_core::trace::SpanAttributeValue::String(format!("{:?} -> {:?}", rb_from, deployment_id)),
+                );
+            }
+        } else if rb_capable && kv_hit_blocks.map(|b| b > 0).unwrap_or(false) {
+            // Converged: affinity direct hit on a capable pool, no rollback
+            // needed — the memory-follow is working (debug pane convergence
+            // rate numerator).
+            state.rollback_stats.record_affinity_direct(&resolved_model);
+        }
 
         let duration_ms = start.elapsed().as_millis() as i32;
         // None = upstream did not report usage → log NULL, settle 0 tokens.
@@ -1864,6 +1995,7 @@ fn check_client_block_rules(
         None,
         Some(client_ip.to_string()),
         user_tags,
+        None,
         None,
         None,
     );
@@ -3365,11 +3497,11 @@ pub async fn messages(
 
     let (provider, deployment_id, inflight_model,
         schedule_policy, kv_hit_blocks, kv_input_blocks,
-        trie_blocks, trie_max_blocks, request_bytes) = match kvc_route {
+        trie_blocks, trie_max_blocks, request_bytes, prefix_bytes) = match kvc_route {
         Some(r) => {
             (r.provider, r.deployment_id, r.inflight_model.unwrap_or_default(),
              r.schedule_policy, r.kv_hit_blocks, r.kv_input_blocks,
-             r.trie_blocks, r.trie_max_blocks, r.request_bytes)
+             r.trie_blocks, r.trie_max_blocks, r.request_bytes, r.prefix_bytes)
         }
         None => {
             // kvc disabled / no match — fallback to default routing
@@ -3382,7 +3514,17 @@ pub async fn messages(
             })?;
             let did = selection.provider.deployment_id().map(|s| s.to_string());
             let im = state.router.resolve_model_name(&resolved_model);
-            (selection.provider, did, im, None, None, None, None, None, None)
+            // Policy label, same mapping as the kvc path (kvc_aware → "kvc").
+            // This arm used to drop the label entirely, so rr / key-affinity
+            // pools (and single-candidate kvc pools) wrote NULL
+            // schedule_policy — the audit Policy column showed "-" and the
+            // policy filter (e.g. "+rollback") never matched. e2e-caught.
+            let policy_name = state.router.policy_name();
+            let policy_label = match policy_name.as_str() {
+                "kvc_aware" => "kvc",
+                other => other,
+            };
+            (selection.provider, did, im, Some(policy_label.to_string()), None, None, None, None, None, Vec::new())
         }
     };
     let routing_ms = route_start.elapsed().as_millis() as u64;
@@ -3476,38 +3618,121 @@ pub async fn messages(
     openai_req.raw_capture = prompt_log_raw_capture.clone();
 
     // 4. Route to provider.
+    // ── Context rollback setup (design §6; see the chat handler for the
+    // full rationale — clone reserved only on rollback-capable pools). ──
+    let rb_patterns = &inner.config.router_settings.rollback.context.patterns;
+    let rb_route = boom_rollback::RollbackRoute {
+        model: &resolved_model,
+        key_hash: Some(&identity.key_hash),
+        input_chars: input_chars as u64,
+        prefix_bytes: &prefix_bytes,
+        candidates: candidates.as_ref().map(|c| c.as_slice()).unwrap_or(&[]),
+    };
+    let rb_capable = boom_rollback::capable(rb_patterns, rb_route.candidates);
+    let mut provider = provider;
+    let mut deployment_id = deployment_id;
+    let mut fc_guard = fc_guard;
+    let mut schedule_policy = schedule_policy;
+    let mut rollback_from: Option<String> = None;
+    let rb_ctx = boom_rollback::RollbackCtx {
+        router: &state.router,
+        flow_controller: &state.flow_controller,
+        stats: &state.rollback_stats,
+        patterns: rb_patterns,
+        fc_queue_timeout_secs: inner.config.router_settings.flow_control_queue_timeout_secs(),
+    };
+    macro_rules! rb_fail { ($err:expr, $stream:expr) => {{
+        // Finalize FIRST so the audit row records the client-visible status.
+        let rb_final = boom_rollback::finalize_error($err, rb_patterns, Some(&state.rollback_stats), Some(&resolved_model));
+        crate::request_log::log_error_with_policy(&state, &identity, &model, "/v1/messages", $stream, start, &rb_final, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()), user_tags.clone(), schedule_policy.clone());
+        write_prompt_log_error(
+            &state,
+            prompt_log_should,
+            prompt_log_req_body.as_ref(),
+            prompt_log_trace_id.clone(),
+            &request_id,
+            &identity,
+            &model,
+            "/v1/messages",
+            $stream,
+            &client_ip,
+            prompt_log_headers.as_ref(),
+            &rb_final,
+            None,
+            prompt_log_raw_capture.as_ref(),
+            start,
+            trace_guard.as_mut(),
+        );
+        crate::health_monitor::record_request_failure(&state, &deployment_id, &rb_final);
+        // plan_charge drops here without commit — no quota consumed.
+        return Err(AnthropicErrorReply(rb_final, $stream));
+    }} }
+
     if is_stream {
         if let Some(g) = trace_guard.as_ref() { g.note_upstream_start(); }
-        let stream = match provider.chat_stream(openai_req).await {
-            Ok(s) => s,
-            Err(e) => {
-                log_error(&state, &identity, &model, "/v1/messages", true, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()), user_tags.clone());
-                write_prompt_log_error(
-                    &state,
-                    prompt_log_should,
-                    prompt_log_req_body.as_ref(),
-                    prompt_log_trace_id.clone(),
-                    &request_id,
-                    &identity,
-                    &model,
-                    "/v1/messages",
-                    true,
-                    &client_ip,
-                    prompt_log_headers.as_ref(),
-                    &e,
-                    None,
-                    prompt_log_raw_capture.as_ref(),
-                    start,
-                    trace_guard.as_mut(),
-                );
-                crate::health_monitor::record_request_failure(&state, &deployment_id, &e);
-                // plan_charge drops here without commit — no quota consumed.
-                return Err(AnthropicErrorReply(e, true));
+        let stream = if rb_capable {
+            match provider.chat_stream(openai_req.clone()).await {
+                Ok(s) => s,
+                Err(e) => match boom_rollback::attempt_stream(
+                    &rb_ctx, &e, openai_req, None,
+                    provider.clone(), deployment_id.clone(), fc_guard.take(),
+                    is_vip, identity.key_alias.clone(), &rb_route,
+                ).await {
+                    boom_rollback::RollbackOutcome::NoRetry => rb_fail!(e, true),
+                    boom_rollback::RollbackOutcome::Retried { result, provider: p2, deployment_id: d2, fc_guard: g2, from_deployment_id } => {
+                        provider = p2;
+                        deployment_id = d2;
+                        fc_guard = g2;
+                        rollback_from = from_deployment_id;
+                        match result {
+                            Ok(s) => s,
+                            Err(e2) => rb_fail!(e2, true),
+                        }
+                    }
+                },
+            }
+        } else {
+            match provider.chat_stream(openai_req).await {
+                Ok(s) => s,
+                Err(e) => { {
+          // Unified with attempt.rs / finalize.rs: L1 via the GatewayError
+          // helper (actual upstream status + raw body — not the Display
+          // string, and not a hardcoded 400) and the same error_code_of
+          // extraction. The bespoke match here produced "unknown" for
+          // wrapper-shaped bodies ("Context length exceeded: {json}")
+          // while the other paths recorded "HTTP_400" — one request,
+          // two different codes across tree sections.
+          if e.context_error_match(rb_patterns).matched {
+            state.rollback_stats.record_pool_inert_identified(&resolved_model, &e);
+          }
+        }
+        rb_fail!(e, true) }
             }
         };
         // Provider accepted the request — commit the plan charge now.
         let _decision = plan_charge.commit();
         crate::health_monitor::reset_request_failure(&state, &deployment_id);
+        // Trie learning: admission success is the "it fits" proof — record
+        // only on the Ok path (Err prefixes must never learn, design §7).
+        state.kvc_orchestrator.record_success(&resolved_model, provider.kv_worker_id(), &prefix_bytes);
+        // ── Rollback bookkeeping (design §6): audit label, key-binding
+        // correction (on_outcome → the deployment that actually served),
+        // trace marker. Runs only when a fallback served this request. ──
+        if let Some(ref rb_from) = rollback_from {
+            schedule_policy = schedule_policy.take().map(|p| format!("{}+rollback", p));
+            state.router.notify_outcome(Some(&identity.key_hash), &resolved_model, deployment_id.as_deref(), true);
+            if let Some(g) = trace_guard.as_ref() {
+                g.set_attribute(
+                    "boom-gateway.rollback",
+                    boom_core::trace::SpanAttributeValue::String(format!("{:?} -> {:?}", rb_from, deployment_id)),
+                );
+            }
+        } else if rb_capable && kv_hit_blocks.map(|b| b > 0).unwrap_or(false) {
+            // Converged: affinity direct hit on a capable pool, no rollback
+            // needed — the memory-follow is working (debug pane convergence
+            // rate numerator).
+            state.rollback_stats.record_affinity_direct(&resolved_model);
+        }
         let usage = UsageTracker::default();
         let sse_stream = sse_stream_from_anthropic_chat_stream(stream, model.clone(), usage.clone());
         let inflight_guard = if let Some(ref did) = deployment_id {
@@ -3645,31 +3870,43 @@ pub async fn messages(
             InFlightGuard::new(state.inflight.clone(), &inflight_model, input_chars as u64)
         };
         if let Some(g) = trace_guard.as_ref() { g.note_upstream_start(); }
-        let response = match provider.chat(openai_req).await {
-            Ok(r) => r,
-            Err(e) => {
-                log_error(&state, &identity, &model, "/v1/messages", false, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()), user_tags.clone());
-                write_prompt_log_error(
-                    &state,
-                    prompt_log_should,
-                    prompt_log_req_body.as_ref(),
-                    prompt_log_trace_id.clone(),
-                    &request_id,
-                    &identity,
-                    &model,
-                    "/v1/messages",
-                    false,
-                    &client_ip,
-                    prompt_log_headers.as_ref(),
-                    &e,
-                    None,
-                    prompt_log_raw_capture.as_ref(),
-                    start,
-                    trace_guard.as_mut(),
-                );
-                crate::health_monitor::record_request_failure(&state, &deployment_id, &e);
-                // plan_charge drops here without commit — no quota consumed.
-                return Err(AnthropicErrorReply(e, false));
+        let response = if rb_capable {
+            match provider.chat(openai_req.clone()).await {
+                Ok(r) => r,
+                Err(e) => match boom_rollback::attempt_call(
+                    &rb_ctx, &e, openai_req, None,
+                    provider.clone(), deployment_id.clone(), fc_guard.take(),
+                    is_vip, identity.key_alias.clone(), &rb_route,
+                ).await {
+                    boom_rollback::RollbackOutcome::NoRetry => rb_fail!(e, false),
+                    boom_rollback::RollbackOutcome::Retried { result, provider: p2, deployment_id: d2, fc_guard: g2, from_deployment_id } => {
+                        provider = p2;
+                        deployment_id = d2;
+                        fc_guard = g2;
+                        rollback_from = from_deployment_id;
+                        match result {
+                            Ok(r) => r,
+                            Err(e2) => rb_fail!(e2, false),
+                        }
+                    }
+                },
+            }
+        } else {
+            match provider.chat(openai_req).await {
+                Ok(r) => r,
+                Err(e) => { {
+          // Unified with attempt.rs / finalize.rs: L1 via the GatewayError
+          // helper (actual upstream status + raw body — not the Display
+          // string, and not a hardcoded 400) and the same error_code_of
+          // extraction. The bespoke match here produced "unknown" for
+          // wrapper-shaped bodies ("Context length exceeded: {json}")
+          // while the other paths recorded "HTTP_400" — one request,
+          // two different codes across tree sections.
+          if e.context_error_match(rb_patterns).matched {
+            state.rollback_stats.record_pool_inert_identified(&resolved_model, &e);
+          }
+        }
+        rb_fail!(e, false) }
             }
         };
         if let Some(g) = trace_guard.as_ref() { g.note_upstream_end(); }
@@ -3678,6 +3915,27 @@ pub async fn messages(
         // Release concurrency guard now (non-streaming: response is already complete).
         drop(plan_charge.take_concurrency_guard());
         crate::health_monitor::reset_request_failure(&state, &deployment_id);
+        // Trie learning: admission success is the "it fits" proof — record
+        // only on the Ok path (Err prefixes must never learn, design §7).
+        state.kvc_orchestrator.record_success(&resolved_model, provider.kv_worker_id(), &prefix_bytes);
+        // ── Rollback bookkeeping (design §6): audit label, key-binding
+        // correction (on_outcome → the deployment that actually served),
+        // trace marker. Runs only when a fallback served this request. ──
+        if let Some(ref rb_from) = rollback_from {
+            schedule_policy = schedule_policy.take().map(|p| format!("{}+rollback", p));
+            state.router.notify_outcome(Some(&identity.key_hash), &resolved_model, deployment_id.as_deref(), true);
+            if let Some(g) = trace_guard.as_ref() {
+                g.set_attribute(
+                    "boom-gateway.rollback",
+                    boom_core::trace::SpanAttributeValue::String(format!("{:?} -> {:?}", rb_from, deployment_id)),
+                );
+            }
+        } else if rb_capable && kv_hit_blocks.map(|b| b > 0).unwrap_or(false) {
+            // Converged: affinity direct hit on a capable pool, no rollback
+            // needed — the memory-follow is working (debug pane convergence
+            // rate numerator).
+            state.rollback_stats.record_affinity_direct(&resolved_model);
+        }
 
         let duration_ms = start.elapsed().as_millis() as i32;
         // None = upstream did not report usage → log NULL, settle 0 tokens.
@@ -4141,7 +4399,7 @@ pub async fn responses(
 
     // when the response store is unavailable. Only completed/incomplete turns
     // are checkpointed (failed turns are not retrievable continuations).
-    let persist_ctx = if store_available && req.store != Some(false) {
+    let mut persist_ctx = if store_available && req.store != Some(false) {
         Some(ResponsesPersistCtx {
             response_id: response_id.clone(),
             previous_response_id: req.previous_response_id.clone(),
@@ -4284,11 +4542,11 @@ pub async fn responses(
 
     let (provider, deployment_id, inflight_model,
         schedule_policy, kv_hit_blocks, kv_input_blocks,
-        trie_blocks, trie_max_blocks, request_bytes) = match kvc_route {
+        trie_blocks, trie_max_blocks, request_bytes, prefix_bytes) = match kvc_route {
         Some(r) => {
             (r.provider, r.deployment_id, r.inflight_model.unwrap_or_default(),
              r.schedule_policy, r.kv_hit_blocks, r.kv_input_blocks,
-             r.trie_blocks, r.trie_max_blocks, r.request_bytes)
+             r.trie_blocks, r.trie_max_blocks, r.request_bytes, r.prefix_bytes)
         }
         None => {
             let selection = state.router.select_provider_with_prefix(
@@ -4300,7 +4558,17 @@ pub async fn responses(
             })?;
             let did = selection.provider.deployment_id().map(|s| s.to_string());
             let im = state.router.resolve_model_name(&resolved_model);
-            (selection.provider, did, im, None, None, None, None, None, None)
+            // Policy label, same mapping as the kvc path (kvc_aware → "kvc").
+            // This arm used to drop the label entirely, so rr / key-affinity
+            // pools (and single-candidate kvc pools) wrote NULL
+            // schedule_policy — the audit Policy column showed "-" and the
+            // policy filter (e.g. "+rollback") never matched. e2e-caught.
+            let policy_name = state.router.policy_name();
+            let policy_label = match policy_name.as_str() {
+                "kvc_aware" => "kvc",
+                other => other,
+            };
+            (selection.provider, did, im, Some(policy_label.to_string()), None, None, None, None, None, Vec::new())
         }
     };
     let routing_ms = route_start.elapsed().as_millis() as u64;
@@ -4428,59 +4696,145 @@ pub async fn responses(
 
 
     // 4. Route to provider.
+    // ── Context rollback setup (design §6; see the chat handler for the
+    // full rationale — clone reserved only on rollback-capable pools). ──
+    let rb_patterns = &inner.config.router_settings.rollback.context.patterns;
+    let rb_route = boom_rollback::RollbackRoute {
+        model: &resolved_model,
+        key_hash: Some(&identity.key_hash),
+        input_chars: input_chars as u64,
+        prefix_bytes: &prefix_bytes,
+        candidates: candidates.as_ref().map(|c| c.as_slice()).unwrap_or(&[]),
+    };
+    let rb_capable = boom_rollback::capable(rb_patterns, rb_route.candidates);
+    let mut provider = provider;
+    let mut deployment_id = deployment_id;
+    let mut fc_guard = fc_guard;
+    let mut schedule_policy = schedule_policy;
+    let mut rollback_from: Option<String> = None;
+    let rb_ctx = boom_rollback::RollbackCtx {
+        router: &state.router,
+        flow_controller: &state.flow_controller,
+        stats: &state.rollback_stats,
+        patterns: rb_patterns,
+        fc_queue_timeout_secs: inner.config.router_settings.flow_control_queue_timeout_secs(),
+    };
+    // Streaming failure is delivered IN-STREAM (responses_failed_sse);
+    // non-streaming is a plain error return. persist_ctx uses take() so
+    // the macro can expand on both the first-error and retry-error paths.
+    macro_rules! rb_fail { ($err:expr, $stream:expr) => {{
+        // Finalize FIRST so the audit row records the client-visible status.
+        let rb_final = boom_rollback::finalize_error($err, rb_patterns, Some(&state.rollback_stats), Some(&resolved_model));
+        crate::request_log::log_error_with_policy(&state, &identity, &model, "/v1/responses", $stream, start, &rb_final, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()), user_tags.clone(), schedule_policy.clone());
+        write_prompt_log_error(
+            &state,
+            prompt_log_should,
+            prompt_log_req_body.as_ref(),
+            prompt_log_trace_id.clone(),
+            &request_id,
+            &identity,
+            &model,
+            "/v1/responses",
+            $stream,
+            &client_ip,
+            prompt_log_headers.as_ref(),
+            &rb_final,
+            None,
+            prompt_log_raw_capture.as_ref(),
+            start,
+            trace_guard.as_mut(),
+        );
+        crate::health_monitor::record_request_failure(&state, &deployment_id, &rb_final);
+        if $stream {
+            // response.created was already promised on the wire — deliver
+            // the failure in-stream and checkpoint the failed turn.
+            let (mut failed_resp, final_obj) =
+                responses_failed_sse(&model, &response_id, created_at, &rb_final);
+            if let Some(v) = dropped_header.take() {
+                if let Ok(hv) = axum::http::HeaderValue::from_str(&v) {
+                    failed_resp.headers_mut().insert("x-boom-dropped-tools", hv);
+                }
+            }
+            if let Some(ctx) = persist_ctx.take() {
+                let turn = ctx.into_turn("failed", Vec::new(), final_obj);
+                if let Err(persist_err) = state.response_store.persist_turn(turn).await {
+                    tracing::warn!(
+                        response_id = %response_id,
+                        error = %persist_err,
+                        "responses store persist failed (failed turn) — next previous_response_id will 404"
+                    );
+                }
+            }
+            return Ok(failed_resp);
+        } else {
+            return Err(ResponsesErrorReply(rb_final));
+        }
+    }} }
+
     if is_stream {
         if let Some(g) = trace_guard.as_ref() { g.note_upstream_start(); }
-        let stream = match provider.chat_stream(openai_req).await {
-            Ok(s) => s,
-            Err(e) => {
-                log_error(&state, &identity, &model, "/v1/responses", true, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()), user_tags.clone());
-                write_prompt_log_error(
-                    &state,
-                    prompt_log_should,
-                    prompt_log_req_body.as_ref(),
-                    prompt_log_trace_id.clone(),
-                    &request_id,
-                    &identity,
-                    &model,
-                    "/v1/responses",
-                    true,
-                    &client_ip,
-                    prompt_log_headers.as_ref(),
-                    &e,
-                    None,
-                    prompt_log_raw_capture.as_ref(),
-                    start,
-                    trace_guard.as_mut(),
-                );
-                crate::health_monitor::record_request_failure(&state, &deployment_id, &e);
-                // plan_charge drops here without commit — no quota consumed.
-                // response.created was already promised on the wire (Response.md
-                // §6.5 rule 2), so the failure is delivered in-stream. The
-                // failed turn is STILL checkpointed — the client chains on the
-                // id carried by response.failed (real-LLM chain-break trap:
-                // an unpersisted id makes the next previous_response_id 404).
-                let (mut failed_resp, final_obj) =
-                    responses_failed_sse(&model, &response_id, created_at, &e);
-                if let Some(v) = dropped_header.take() {
-                    if let Ok(hv) = axum::http::HeaderValue::from_str(&v) {
-                        failed_resp.headers_mut().insert("x-boom-dropped-tools", hv);
+        let stream = if rb_capable {
+            match provider.chat_stream(openai_req.clone()).await {
+                Ok(s) => s,
+                Err(e) => match boom_rollback::attempt_stream(
+                    &rb_ctx, &e, openai_req, None,
+                    provider.clone(), deployment_id.clone(), fc_guard.take(),
+                    is_vip, identity.key_alias.clone(), &rb_route,
+                ).await {
+                    boom_rollback::RollbackOutcome::NoRetry => rb_fail!(e, true),
+                    boom_rollback::RollbackOutcome::Retried { result, provider: p2, deployment_id: d2, fc_guard: g2, from_deployment_id } => {
+                        provider = p2;
+                        deployment_id = d2;
+                        fc_guard = g2;
+                        rollback_from = from_deployment_id;
+                        match result {
+                            Ok(s) => s,
+                            Err(e2) => rb_fail!(e2, true),
+                        }
                     }
-                }
-                if let Some(ctx) = persist_ctx {
-                    let turn = ctx.into_turn("failed", Vec::new(), final_obj);
-                    if let Err(persist_err) = state.response_store.persist_turn(turn).await {
-                        tracing::warn!(
-                            response_id = %response_id,
-                            error = %persist_err,
-                            "responses store persist failed (failed turn) — next previous_response_id will 404"
-                        );
-                    }
-                }
-                return Ok(failed_resp);
+                },
+            }
+        } else {
+            match provider.chat_stream(openai_req).await {
+                Ok(s) => s,
+                Err(e) => { {
+          // Unified with attempt.rs / finalize.rs: L1 via the GatewayError
+          // helper (actual upstream status + raw body — not the Display
+          // string, and not a hardcoded 400) and the same error_code_of
+          // extraction. The bespoke match here produced "unknown" for
+          // wrapper-shaped bodies ("Context length exceeded: {json}")
+          // while the other paths recorded "HTTP_400" — one request,
+          // two different codes across tree sections.
+          if e.context_error_match(rb_patterns).matched {
+            state.rollback_stats.record_pool_inert_identified(&resolved_model, &e);
+          }
+        }
+        rb_fail!(e, true) }
             }
         };
         let _decision = plan_charge.commit();
         crate::health_monitor::reset_request_failure(&state, &deployment_id);
+        // Trie learning: admission success is the "it fits" proof — record
+        // only on the Ok path (Err prefixes must never learn, design §7).
+        state.kvc_orchestrator.record_success(&resolved_model, provider.kv_worker_id(), &prefix_bytes);
+        // ── Rollback bookkeeping (design §6): audit label, key-binding
+        // correction (on_outcome → the deployment that actually served),
+        // trace marker. Runs only when a fallback served this request. ──
+        if let Some(ref rb_from) = rollback_from {
+            schedule_policy = schedule_policy.take().map(|p| format!("{}+rollback", p));
+            state.router.notify_outcome(Some(&identity.key_hash), &resolved_model, deployment_id.as_deref(), true);
+            if let Some(g) = trace_guard.as_ref() {
+                g.set_attribute(
+                    "boom-gateway.rollback",
+                    boom_core::trace::SpanAttributeValue::String(format!("{:?} -> {:?}", rb_from, deployment_id)),
+                );
+            }
+        } else if rb_capable && kv_hit_blocks.map(|b| b > 0).unwrap_or(false) {
+            // Converged: affinity direct hit on a capable pool, no rollback
+            // needed — the memory-follow is working (debug pane convergence
+            // rate numerator).
+            state.rollback_stats.record_affinity_direct(&resolved_model);
+        }
         let usage = UsageTracker::default();
         let sse_stream = sse_stream_from_responses_chat_stream(
             stream, model.clone(), response_id.clone(), created_at, usage.clone(),
@@ -4633,36 +4987,70 @@ pub async fn responses(
             InFlightGuard::new(state.inflight.clone(), &inflight_model, input_chars as u64)
         };
         if let Some(g) = trace_guard.as_ref() { g.note_upstream_start(); }
-        let response = match provider.chat(openai_req).await {
-            Ok(r) => r,
-            Err(e) => {
-                log_error(&state, &identity, &model, "/v1/responses", false, start, &e, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()), user_tags.clone());
-                write_prompt_log_error(
-                    &state,
-                    prompt_log_should,
-                    prompt_log_req_body.as_ref(),
-                    prompt_log_trace_id.clone(),
-                    &request_id,
-                    &identity,
-                    &model,
-                    "/v1/responses",
-                    false,
-                    &client_ip,
-                    prompt_log_headers.as_ref(),
-                    &e,
-                    None,
-                    prompt_log_raw_capture.as_ref(),
-                    start,
-                    trace_guard.as_mut(),
-                );
-                crate::health_monitor::record_request_failure(&state, &deployment_id, &e);
-                return Err(ResponsesErrorReply(e));
+        let response = if rb_capable {
+            match provider.chat(openai_req.clone()).await {
+                Ok(r) => r,
+                Err(e) => match boom_rollback::attempt_call(
+                    &rb_ctx, &e, openai_req, None,
+                    provider.clone(), deployment_id.clone(), fc_guard.take(),
+                    is_vip, identity.key_alias.clone(), &rb_route,
+                ).await {
+                    boom_rollback::RollbackOutcome::NoRetry => rb_fail!(e, false),
+                    boom_rollback::RollbackOutcome::Retried { result, provider: p2, deployment_id: d2, fc_guard: g2, from_deployment_id } => {
+                        provider = p2;
+                        deployment_id = d2;
+                        fc_guard = g2;
+                        rollback_from = from_deployment_id;
+                        match result {
+                            Ok(r) => r,
+                            Err(e2) => rb_fail!(e2, false),
+                        }
+                    }
+                },
+            }
+        } else {
+            match provider.chat(openai_req).await {
+                Ok(r) => r,
+                Err(e) => { {
+          // Unified with attempt.rs / finalize.rs: L1 via the GatewayError
+          // helper (actual upstream status + raw body — not the Display
+          // string, and not a hardcoded 400) and the same error_code_of
+          // extraction. The bespoke match here produced "unknown" for
+          // wrapper-shaped bodies ("Context length exceeded: {json}")
+          // while the other paths recorded "HTTP_400" — one request,
+          // two different codes across tree sections.
+          if e.context_error_match(rb_patterns).matched {
+            state.rollback_stats.record_pool_inert_identified(&resolved_model, &e);
+          }
+        }
+        rb_fail!(e, false) }
             }
         };
         if let Some(g) = trace_guard.as_ref() { g.note_upstream_end(); }
         let _decision = plan_charge.commit();
         drop(plan_charge.take_concurrency_guard());
         crate::health_monitor::reset_request_failure(&state, &deployment_id);
+        // Trie learning: admission success is the "it fits" proof — record
+        // only on the Ok path (Err prefixes must never learn, design §7).
+        state.kvc_orchestrator.record_success(&resolved_model, provider.kv_worker_id(), &prefix_bytes);
+        // ── Rollback bookkeeping (design §6): audit label, key-binding
+        // correction (on_outcome → the deployment that actually served),
+        // trace marker. Runs only when a fallback served this request. ──
+        if let Some(ref rb_from) = rollback_from {
+            schedule_policy = schedule_policy.take().map(|p| format!("{}+rollback", p));
+            state.router.notify_outcome(Some(&identity.key_hash), &resolved_model, deployment_id.as_deref(), true);
+            if let Some(g) = trace_guard.as_ref() {
+                g.set_attribute(
+                    "boom-gateway.rollback",
+                    boom_core::trace::SpanAttributeValue::String(format!("{:?} -> {:?}", rb_from, deployment_id)),
+                );
+            }
+        } else if rb_capable && kv_hit_blocks.map(|b| b > 0).unwrap_or(false) {
+            // Converged: affinity direct hit on a capable pool, no rollback
+            // needed — the memory-follow is working (debug pane convergence
+            // rate numerator).
+            state.rollback_stats.record_affinity_direct(&resolved_model);
+        }
 
         let duration_ms = start.elapsed().as_millis() as i32;
         let usage = response.usage.as_ref();
