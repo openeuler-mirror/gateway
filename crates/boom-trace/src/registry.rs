@@ -521,9 +521,9 @@ mod tests {
         );
         reg.finalize_ok("r-metrics", 2_000_000_000);
         let text = reg.prometheus_text().expect("metrics enabled");
-        assert!(text.contains("http_server_request_duration_seconds_count"));
+        assert!(text.contains("http.server.request.duration_seconds_count"));
         // start/finalize pairing leaves a zero-valued gauge series behind.
-        assert!(text.contains("http_server_active_requests"));
+        assert!(text.contains("http.server.active_requests"));
 
         reg.set_metrics_enabled(false);
         assert!(reg.prometheus_text().is_none());

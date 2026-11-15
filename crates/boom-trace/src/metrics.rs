@@ -17,17 +17,20 @@
 //!
 //! ## Metric names (issue #49, not litellm's namespace)
 //!
-//! OTel name → Prometheus exposition name (dots→underscores, unit "s" →
-//! `_seconds` suffix):
+//! Names keep the OTel dotted namespace (parent.child fields, dots only
+//! between fields — intra-field underscores like `gen_ai` /
+//! `time_to_first_chunk` stay); the unit "s" appends as an `_seconds`
+//! suffix. Deliberate deviation from Prometheus text-format naming
+//! (`[a-zA-Z_:][a-zA-Z0-9_:]*`, dots→underscores) — scrapers must
+//! tolerate dotted names:
 //!
-//! - `http.server.request.duration` → `http_server_request_duration_seconds`
-//!   / `http.server.active_requests` → `http_server_active_requests` (gauge)
-//! - `ai.gateway.queue.duration` / `ai.gateway.routing.duration` →
-//!   `ai_gateway_{queue,routing}_duration_seconds`
-//! - `gen_ai.client.operation.time_to_first_chunk` / `.time_per_output_chunk`
-//!   → `gen_ai_client_operation_time_{to_first_chunk,per_output_chunk}_seconds`
-//! - `http.client.request.duration` → `http_client_request_duration_seconds`
-//!   / `http.client.active_requests` → `http_client_active_requests` (gauge)
+//! - `http.server.request.duration_seconds` /
+//!   `http.server.active_requests` (gauge)
+//! - `ai.gateway.queue.duration_seconds` / `ai.gateway.routing.duration_seconds`
+//! - `gen_ai.client.operation.time_to_first_chunk_seconds` /
+//!   `gen_ai.client.operation.time_per_output_chunk_seconds`
+//! - `http.client.request.duration_seconds` /
+//!   `http.client.active_requests` (gauge)
 //!
 //! `http.client.open_connections` is NOT reported: reqwest does not expose
 //! connection-pool statistics and wrapping the hyper connector is out of
@@ -35,9 +38,9 @@
 //!
 //! ## Cardinality
 //!
-//! Labels are restricted to a bounded set: `gen_ai_operation_name`
-//! (chat|messages|responses), `gen_ai_request_model`,
-//! `ai_gateway_target_deployment_id`, and `error_type` (truncated, error
+//! Labels are restricted to a bounded set: `gen_ai.operation.name`
+//! (chat|messages|responses), `gen_ai.request.model`,
+//! `ai.gateway.target.deployment.id`, and `error.type` (truncated, error
 //! series only). Never `user.id` / `request_id` / client IP.
 
 use crate::span::RequestSpan;
@@ -223,55 +226,55 @@ impl MetricsRecorder {
         let mut out = String::new();
         render_histogram(
             &mut out,
-            "http_server_request_duration_seconds",
+            "http.server.request.duration_seconds",
             "Gateway server-side request duration (ingress to response completion).",
             DURATION_BUCKETS,
             &self.server_duration,
         );
         render_gauge(
             &mut out,
-            "http_server_active_requests",
+            "http.server.active_requests",
             "In-flight gateway requests.",
             &self.server_active,
         );
         render_histogram(
             &mut out,
-            "ai_gateway_queue_duration_seconds",
+            "ai.gateway.queue.duration_seconds",
             "Time spent waiting in per-deployment flow control before dispatch.",
             FAST_BUCKETS,
             &self.queue_duration,
         );
         render_histogram(
             &mut out,
-            "ai_gateway_routing_duration_seconds",
+            "ai.gateway.routing.duration_seconds",
             "Time spent selecting the target deployment (kvc-aware or fallback routing).",
             FAST_BUCKETS,
             &self.routing_duration,
         );
         render_histogram(
             &mut out,
-            "gen_ai_client_operation_time_to_first_chunk_seconds",
+            "gen_ai.client.operation.time_to_first_chunk_seconds",
             "Time from request start to the first response chunk. Non-stream requests fall back to total duration.",
             DURATION_BUCKETS,
             &self.ttft,
         );
         render_histogram(
             &mut out,
-            "gen_ai_client_operation_time_per_output_chunk_seconds",
+            "gen_ai.client.operation.time_per_output_chunk_seconds",
             "Mean inter-chunk generation time: (last chunk − first chunk) / chunk count.",
             DURATION_BUCKETS,
             &self.time_per_output_chunk,
         );
         render_histogram(
             &mut out,
-            "http_client_request_duration_seconds",
+            "http.client.request.duration_seconds",
             "Upstream provider call duration (request dispatch to last byte received).",
             DURATION_BUCKETS,
             &self.client_duration,
         );
         render_gauge(
             &mut out,
-            "http_client_active_requests",
+            "http.client.active_requests",
             "In-flight upstream provider calls.",
             &self.client_active,
         );
@@ -299,18 +302,18 @@ impl AttrKey {
     /// dimensions omitted.
     fn prom_label_string(&self) -> String {
         let mut s = format!(
-            "gen_ai_operation_name=\"{}\",gen_ai_request_model=\"{}\"",
+            "gen_ai.operation.name=\"{}\",gen_ai.request.model=\"{}\"",
             escape_label_value(&self.operation),
             escape_label_value(&self.model)
         );
         if let Some(d) = &self.deployment_id {
             s.push_str(&format!(
-                ",ai_gateway_target_deployment_id=\"{}\"",
+                ",ai.gateway.target.deployment.id=\"{}\"",
                 escape_label_value(d)
             ));
         }
         if let Some(e) = &self.error_type {
-            s.push_str(&format!(",error_type=\"{}\"", escape_label_value(e)));
+            s.push_str(&format!(",error.type=\"{}\"", escape_label_value(e)));
         }
         s
     }
@@ -456,7 +459,7 @@ mod tests {
         span.finalize_error(2_000_000_000, "quote \" backslash \\ newline \n".to_string());
         recorder.record_request_done(&span);
         let text = recorder.render();
-        assert!(text.contains("error_type=\"quote \\\" backslash \\\\ newline \\n\""));
+        assert!(text.contains("error.type=\"quote \\\" backslash \\\\ newline \\n\""));
     }
 
     // ---- Recorder-level render assertions ----
@@ -492,28 +495,28 @@ mod tests {
         recorder.record_request_done(&span);
 
         let text = recorder.render();
-        let labels = "gen_ai_operation_name=\"chat\",gen_ai_request_model=\"gpt-4\",ai_gateway_target_deployment_id=\"dep-1\"";
-        assert!(text.contains("# TYPE http_server_request_duration_seconds histogram\n"));
+        let labels = "gen_ai.operation.name=\"chat\",gen_ai.request.model=\"gpt-4\",ai.gateway.target.deployment.id=\"dep-1\"";
+        assert!(text.contains("# TYPE http.server.request.duration_seconds histogram\n"));
         assert!(text.contains(&format!(
-            "http_server_request_duration_seconds_count{{{labels}}} 1\n"
+            "http.server.request.duration_seconds_count{{{labels}}} 1\n"
         )));
         assert!(text.contains(&format!(
-            "http_server_request_duration_seconds_sum{{{labels}}} 1\n"
+            "http.server.request.duration_seconds_sum{{{labels}}} 1\n"
         )));
         assert!(text.contains(&format!(
-            "ai_gateway_queue_duration_seconds_sum{{{labels}}} 0.1\n"
+            "ai.gateway.queue.duration_seconds_sum{{{labels}}} 0.1\n"
         )));
         assert!(text.contains(&format!(
-            "ai_gateway_routing_duration_seconds_sum{{{labels}}} 0.005\n"
+            "ai.gateway.routing.duration_seconds_sum{{{labels}}} 0.005\n"
         )));
         assert!(text.contains(&format!(
-            "gen_ai_client_operation_time_to_first_chunk_seconds_sum{{{labels}}} 0.25\n"
+            "gen_ai.client.operation.time_to_first_chunk_seconds_sum{{{labels}}} 0.25\n"
         )));
         assert!(text.contains(&format!(
-            "gen_ai_client_operation_time_per_output_chunk_seconds_sum{{{labels}}} 0.09\n"
+            "gen_ai.client.operation.time_per_output_chunk_seconds_sum{{{labels}}} 0.09\n"
         )));
         assert!(text.contains(&format!(
-            "http_client_request_duration_seconds_sum{{{labels}}} 0.5\n"
+            "http.client.request.duration_seconds_sum{{{labels}}} 0.5\n"
         )));
     }
 
@@ -527,18 +530,18 @@ mod tests {
             recorder.record_request_done(&span);
         }
         let text = recorder.render();
-        let labels = "gen_ai_operation_name=\"chat\",gen_ai_request_model=\"gpt-4\"";
+        let labels = "gen_ai.operation.name=\"chat\",gen_ai.request.model=\"gpt-4\"";
         assert!(text.contains(&format!(
-            "http_server_request_duration_seconds_bucket{{{labels},le=\"0.005\"}} 1\n"
+            "http.server.request.duration_seconds_bucket{{{labels},le=\"0.005\"}} 1\n"
         )));
         assert!(text.contains(&format!(
-            "http_server_request_duration_seconds_bucket{{{labels},le=\"0.01\"}} 2\n"
+            "http.server.request.duration_seconds_bucket{{{labels},le=\"0.01\"}} 2\n"
         )));
         assert!(text.contains(&format!(
-            "http_server_request_duration_seconds_bucket{{{labels},le=\"+Inf\"}} 2\n"
+            "http.server.request.duration_seconds_bucket{{{labels},le=\"+Inf\"}} 2\n"
         )));
         assert!(text.contains(&format!(
-            "http_server_request_duration_seconds_count{{{labels}}} 2\n"
+            "http.server.request.duration_seconds_count{{{labels}}} 2\n"
         )));
     }
 
@@ -549,12 +552,12 @@ mod tests {
         span.finalize_ok(1_005_000_000); // exactly 5ms == the le="0.005" boundary
         recorder.record_request_done(&span);
         let text = recorder.render();
-        let labels = "gen_ai_operation_name=\"chat\",gen_ai_request_model=\"gpt-4\"";
+        let labels = "gen_ai.operation.name=\"chat\",gen_ai.request.model=\"gpt-4\"";
         assert!(text.contains(&format!(
-            "http_server_request_duration_seconds_bucket{{{labels},le=\"0.005\"}} 1\n"
+            "http.server.request.duration_seconds_bucket{{{labels},le=\"0.005\"}} 1\n"
         )));
         assert!(text.contains(&format!(
-            "http_server_request_duration_seconds_bucket{{{labels},le=\"0.01\"}} 1\n"
+            "http.server.request.duration_seconds_bucket{{{labels},le=\"0.01\"}} 1\n"
         )));
     }
 
@@ -565,9 +568,9 @@ mod tests {
         span.finalize_error(2_000_000_000, "x".repeat(64));
         recorder.record_request_done(&span);
         let text = recorder.render();
-        assert!(text.contains(&format!("error_type=\"{}\"", "x".repeat(32))));
-        assert!(!text.contains(&format!("error_type=\"{}\"", "x".repeat(33))));
-        assert!(text.contains("gen_ai_operation_name=\"messages\""));
+        assert!(text.contains(&format!("error.type=\"{}\"", "x".repeat(32))));
+        assert!(!text.contains(&format!("error.type=\"{}\"", "x".repeat(33))));
+        assert!(text.contains("gen_ai.operation.name=\"messages\""));
     }
 
     #[test]
@@ -581,9 +584,9 @@ mod tests {
         span.finalize_error(2_000_000_000, "upstream 500".to_string());
         recorder.record_request_done(&span);
         let text = recorder.render();
-        let labels = "gen_ai_operation_name=\"chat\",gen_ai_request_model=\"gpt-4\"";
+        let labels = "gen_ai.operation.name=\"chat\",gen_ai.request.model=\"gpt-4\"";
         assert!(text.contains(&format!(
-            "http_client_active_requests{{{labels}}} 0\n"
+            "http.client.active_requests{{{labels}}} 0\n"
         )));
     }
 
@@ -593,9 +596,9 @@ mod tests {
         recorder.add_server_active(1, "gpt-4", "/v1/chat/completions");
         recorder.add_server_active(-1, "gpt-4", "/v1/chat/completions");
         let text = recorder.render();
-        assert!(text.contains("# TYPE http_server_active_requests gauge\n"));
+        assert!(text.contains("# TYPE http.server.active_requests gauge\n"));
         assert!(text.contains(
-            "http_server_active_requests{gen_ai_operation_name=\"chat\",gen_ai_request_model=\"gpt-4\"} 0\n"
+            "http.server.active_requests{gen_ai.operation.name=\"chat\",gen_ai.request.model=\"gpt-4\"} 0\n"
         ));
     }
 
@@ -611,27 +614,27 @@ mod tests {
         let mut span = make_span("/v1/chat/completions", false);
         span.finalize_ok(2_000_000_000); // 1s
         recorder.record_request_done(&span);
-        let l = "gen_ai_operation_name=\"chat\",gen_ai_request_model=\"gpt-4\"";
+        let l = "gen_ai.operation.name=\"chat\",gen_ai.request.model=\"gpt-4\"";
         let expected = format!(
             concat!(
-                "# HELP http_server_request_duration_seconds Gateway server-side request duration (ingress to response completion).\n",
-                "# TYPE http_server_request_duration_seconds histogram\n",
-                "http_server_request_duration_seconds_bucket{{{l},le=\"0.005\"}} 0\n",
-                "http_server_request_duration_seconds_bucket{{{l},le=\"0.01\"}} 0\n",
-                "http_server_request_duration_seconds_bucket{{{l},le=\"0.025\"}} 0\n",
-                "http_server_request_duration_seconds_bucket{{{l},le=\"0.05\"}} 0\n",
-                "http_server_request_duration_seconds_bucket{{{l},le=\"0.1\"}} 0\n",
-                "http_server_request_duration_seconds_bucket{{{l},le=\"0.25\"}} 0\n",
-                "http_server_request_duration_seconds_bucket{{{l},le=\"0.5\"}} 0\n",
-                "http_server_request_duration_seconds_bucket{{{l},le=\"1\"}} 1\n",
-                "http_server_request_duration_seconds_bucket{{{l},le=\"2.5\"}} 1\n",
-                "http_server_request_duration_seconds_bucket{{{l},le=\"5\"}} 1\n",
-                "http_server_request_duration_seconds_bucket{{{l},le=\"10\"}} 1\n",
-                "http_server_request_duration_seconds_bucket{{{l},le=\"30\"}} 1\n",
-                "http_server_request_duration_seconds_bucket{{{l},le=\"60\"}} 1\n",
-                "http_server_request_duration_seconds_bucket{{{l},le=\"+Inf\"}} 1\n",
-                "http_server_request_duration_seconds_sum{{{l}}} 1\n",
-                "http_server_request_duration_seconds_count{{{l}}} 1\n",
+                "# HELP http.server.request.duration_seconds Gateway server-side request duration (ingress to response completion).\n",
+                "# TYPE http.server.request.duration_seconds histogram\n",
+                "http.server.request.duration_seconds_bucket{{{l},le=\"0.005\"}} 0\n",
+                "http.server.request.duration_seconds_bucket{{{l},le=\"0.01\"}} 0\n",
+                "http.server.request.duration_seconds_bucket{{{l},le=\"0.025\"}} 0\n",
+                "http.server.request.duration_seconds_bucket{{{l},le=\"0.05\"}} 0\n",
+                "http.server.request.duration_seconds_bucket{{{l},le=\"0.1\"}} 0\n",
+                "http.server.request.duration_seconds_bucket{{{l},le=\"0.25\"}} 0\n",
+                "http.server.request.duration_seconds_bucket{{{l},le=\"0.5\"}} 0\n",
+                "http.server.request.duration_seconds_bucket{{{l},le=\"1\"}} 1\n",
+                "http.server.request.duration_seconds_bucket{{{l},le=\"2.5\"}} 1\n",
+                "http.server.request.duration_seconds_bucket{{{l},le=\"5\"}} 1\n",
+                "http.server.request.duration_seconds_bucket{{{l},le=\"10\"}} 1\n",
+                "http.server.request.duration_seconds_bucket{{{l},le=\"30\"}} 1\n",
+                "http.server.request.duration_seconds_bucket{{{l},le=\"60\"}} 1\n",
+                "http.server.request.duration_seconds_bucket{{{l},le=\"+Inf\"}} 1\n",
+                "http.server.request.duration_seconds_sum{{{l}}} 1\n",
+                "http.server.request.duration_seconds_count{{{l}}} 1\n",
             ),
             l = l,
         );
