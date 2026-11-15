@@ -312,6 +312,7 @@ impl GeminiProvider {
                 cache_creation_input_tokens: None,
                 cache_read_input_tokens: None,
                 prompt_tokens_details: None,
+                completion_tokens_details: None,
             }),
             system_fingerprint: None,
             raw_response: None,
@@ -436,6 +437,7 @@ impl Provider for GeminiProvider {
                                                 completion_tokens: Some(ct),
                                                 total_tokens: None,
                                                 prompt_tokens_details: None,
+                                                ..Default::default()
                                             }
                                         });
 

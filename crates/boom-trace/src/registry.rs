@@ -195,8 +195,9 @@ impl TraceRegistry {
     }
 
     /// Test-only: flip the enabled flag without going through `replace_otlp`.
-    /// Lets unit tests start spans without spinning up an OTLP exporter.
-    #[cfg(test)]
+    /// Lets unit tests start spans without spinning up an OTLP exporter
+    /// (boom-main's routes tests rely on this too).
+    #[doc(hidden)]
     pub fn set_enabled_for_test(&self, on: bool) {
         self.enabled.store(on, Ordering::Relaxed);
     }

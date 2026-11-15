@@ -438,6 +438,48 @@ struct UsageTrackerState {
     /// Real KV-cache hit reported by vLLM in the final usage chunk
     /// (prompt_tokens_details.cached_tokens). None if the chunk didn't carry it.
     cached_tokens: Option<i32>,
+    /// Anthropic-style explicit prompt-cache split (issue #57). Carried on
+    /// StreamUsage's internal-only slots by the Anthropic stream converter.
+    cache_read_input_tokens: Option<i32>,
+    cache_creation_input_tokens: Option<i32>,
+    /// Reasoning tokens (OpenAI completion_tokens_details.reasoning_tokens).
+    reasoning_tokens: Option<i32>,
+}
+
+impl UsageTrackerState {
+    /// Merge one stream chunk's usage. Per-field last-value-wins, but a
+    /// chunk that omits a field (None) never erases an earlier value:
+    /// Anthropic reports input tokens in message_start and output tokens in
+    /// the final message_delta, so a naive "overwrite everything" merge
+    /// would null out input_tokens once the last chunk landed.
+    fn note_chunk_usage(&mut self, u: &StreamUsage) {
+        if u.prompt_tokens.is_some() {
+            self.prompt_tokens = u.prompt_tokens;
+        }
+        if u.completion_tokens.is_some() {
+            self.completion_tokens = u.completion_tokens;
+        }
+        if let Some(cached) = u
+            .prompt_tokens_details
+            .as_ref()
+            .and_then(|d| d.cached_tokens)
+        {
+            self.cached_tokens = Some(cached as i32);
+        }
+        if u.cache_read_input_tokens.is_some() {
+            self.cache_read_input_tokens = u.cache_read_input_tokens;
+        }
+        if u.cache_creation_input_tokens.is_some() {
+            self.cache_creation_input_tokens = u.cache_creation_input_tokens;
+        }
+        if let Some(reasoning) = u
+            .completion_tokens_details
+            .as_ref()
+            .and_then(|d| d.reasoning_tokens)
+        {
+            self.reasoning_tokens = Some(reasoning as i32);
+        }
+    }
 }
 
 /// Wrapper stream that writes the request log when dropped (i.e. when the
@@ -521,9 +563,21 @@ impl<S> LoggedStream<S> {
 
 impl<S> Drop for LoggedStream<S> {
     fn drop(&mut self) {
-        // Stamp the stream-shaped metrics fields before the trace guard's
-        // own Drop (fields drop after this method) finalizes the span —
-        // this is where TTFT / chunk stats / upstream end become known.
+        let observed_usage = self
+            .usage
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+        let provider_usage = self
+            .provider_billing
+            .as_ref()
+            .and_then(ProviderBilling::actual_usage);
+        let preferred = preferred_stream_usage(&observed_usage, provider_usage.as_ref());
+
+        // Stamp the stream-shaped metrics fields + the gen_ai usage
+        // attributes before the trace guard's own Drop (fields drop after
+        // this method) finalizes the span — this is where TTFT / chunk
+        // stats / upstream end / final usage become known.
         if let Some(g) = self.trace_guard.as_ref() {
             g.set_duration_ms(self.start.elapsed().as_millis() as u64);
             if let Some(first) = self.first_token_at {
@@ -535,26 +589,15 @@ impl<S> Drop for LoggedStream<S> {
             };
             g.set_chunk_stats(self.chunk_count, gen_ms);
             g.note_upstream_end();
+            stamp_gen_ai_usage_attrs(g, &preferred);
         }
-
-        let observed_usage = self
-            .usage
-            .lock()
-            .map(|guard| guard.clone())
-            .unwrap_or_default();
-        let provider_usage = self
-            .provider_billing
-            .as_ref()
-            .and_then(ProviderBilling::actual_usage);
-        let (input_tokens, output_tokens, cached_tokens) =
-            preferred_stream_usage(&observed_usage, provider_usage.as_ref());
 
         if let Some(mut log) = self.log.take() {
             log.duration_ms = Some(self.start.elapsed().as_millis() as i32);
             log.ttft_ms = self.first_token_at.map(|t| (t - self.start).as_millis() as i32);
-            log.input_tokens = input_tokens;
-            log.output_tokens = output_tokens;
-            log.cached_tokens = cached_tokens;
+            log.input_tokens = preferred.input_tokens;
+            log.output_tokens = preferred.output_tokens;
+            log.cached_tokens = preferred.cached_tokens;
             // Account tokens to agent stats before moving log into log_request.
             if let Some(tracker) = &self.agent_stats {
                 let input = log.input_tokens.unwrap_or(0) as u64;
@@ -575,11 +618,58 @@ impl<S> Drop for LoggedStream<S> {
                 .as_ref()
                 .and_then(ProviderBilling::actual_cost);
             charge.settle(
-                input_tokens.unwrap_or(0).max(0) as u64,
-                cached_tokens.unwrap_or(0).max(0) as u64,
-                output_tokens.unwrap_or(0).max(0) as u64,
+                preferred.input_tokens.unwrap_or(0).max(0) as u64,
+                preferred.cached_tokens.unwrap_or(0).max(0) as u64,
+                preferred.output_tokens.unwrap_or(0).max(0) as u64,
                 actual_cost,
             );
+        }
+    }
+}
+
+/// Preferred usage view consumed by the request log, quota settle and the
+/// `gen_ai.usage.*` trace attributes: the provider-billing view wins when
+/// it totals higher than what the stream observed (composite providers
+/// report the union of successful child calls).
+#[derive(Default, Debug, Clone, PartialEq)]
+struct PreferredUsage {
+    input_tokens: Option<i32>,
+    output_tokens: Option<i32>,
+    /// vLLM-style cache hit (`prompt_tokens_details.cached_tokens`) — the
+    /// audit column / quota discount basis (unchanged semantics).
+    cached_tokens: Option<i64>,
+    /// Anthropic-style explicit prompt-cache split (issue #57, trace attrs).
+    cache_read_input_tokens: Option<i32>,
+    cache_creation_input_tokens: Option<i32>,
+    /// Reasoning-token subset of output (OpenAI wire field, issue #57).
+    reasoning_tokens: Option<i32>,
+}
+
+impl PreferredUsage {
+    /// Build the view for the non-stream paths from the response's `Usage`
+    /// (the provider already parsed it out of the upstream body). `None`
+    /// (upstream reported no usage) yields an all-absent view.
+    fn from_response_usage(usage: Option<&Usage>) -> Self {
+        let Some(u) = usage else {
+            return Self::default();
+        };
+        Self {
+            input_tokens: Some(u.prompt_tokens.min(i32::MAX as u32) as i32),
+            output_tokens: Some(u.completion_tokens.min(i32::MAX as u32) as i32),
+            cached_tokens: u
+                .prompt_tokens_details
+                .as_ref()
+                .and_then(|d| d.cached_tokens)
+                .map(i64::from),
+            cache_read_input_tokens: u.cache_read_input_tokens.map(|v| v.min(i32::MAX as u32) as i32),
+            cache_creation_input_tokens: u
+                .cache_creation_input_tokens
+                .map(|v| v.min(i32::MAX as u32) as i32),
+            reasoning_tokens: u
+                .completion_tokens_details
+                .as_ref()
+                .and_then(|d| d.reasoning_tokens)
+                .map(|v| v.min(i32::MAX as u32) as i32),
         }
     }
 }
@@ -587,34 +677,86 @@ impl<S> Drop for LoggedStream<S> {
 fn preferred_stream_usage(
     observed: &UsageTrackerState,
     provider: Option<&Usage>,
-) -> (Option<i32>, Option<i32>, Option<i64>) {
+) -> PreferredUsage {
     let observed_total = i64::from(observed.prompt_tokens.unwrap_or(0).max(0))
         + i64::from(observed.completion_tokens.unwrap_or(0).max(0));
     let provider_total = provider.map_or(0, |usage| {
         i64::from(usage.prompt_tokens) + i64::from(usage.completion_tokens)
     });
     if provider_total > observed_total {
-        let usage = provider.expect("provider_total is positive only when usage exists");
-        (
-            Some(usage.prompt_tokens.min(i32::MAX as u32) as i32),
-            Some(usage.completion_tokens.min(i32::MAX as u32) as i32),
-            usage
-                .prompt_tokens_details
-                .as_ref()
-                .and_then(|details| details.cached_tokens)
-                .map(i64::from),
-        )
+        PreferredUsage::from_response_usage(provider)
     } else {
         let provider_cached = provider
             .and_then(|usage| usage.prompt_tokens_details.as_ref())
             .and_then(|details| details.cached_tokens)
             .map(i64::from);
-        (
-            observed.prompt_tokens,
-            observed.completion_tokens,
-            observed.cached_tokens.map(i64::from).or(provider_cached),
-        )
+        PreferredUsage {
+            input_tokens: observed.prompt_tokens,
+            output_tokens: observed.completion_tokens,
+            cached_tokens: observed.cached_tokens.map(i64::from).or(provider_cached),
+            // Explicit Anthropic split first; vLLM's cached_tokens is also a
+            // cache-read subset of input, so it stands in when the upstream
+            // only reports the OpenAI-style field.
+            cache_read_input_tokens: observed
+                .cache_read_input_tokens
+                .or(observed.cached_tokens),
+            cache_creation_input_tokens: observed.cache_creation_input_tokens,
+            reasoning_tokens: observed.reasoning_tokens,
+        }
     }
+}
+
+/// Stamp the OpenTelemetry gen_ai usage attributes (issue #57) onto the
+/// request span. Absent fields stay absent — "upstream didn't report" is
+/// the same NULL semantics as the request log columns.
+fn stamp_gen_ai_usage_attrs(g: &boom_trace::TraceGuard, u: &PreferredUsage) {
+    use boom_core::trace::SpanAttributeValue as V;
+    if let Some(v) = u.input_tokens {
+        g.set_attribute("gen_ai.usage.input_tokens", V::Int(i64::from(v)));
+    }
+    if let Some(v) = u.output_tokens {
+        g.set_attribute("gen_ai.usage.output_tokens", V::Int(i64::from(v)));
+    }
+    if let Some(v) = u.cache_read_input_tokens {
+        g.set_attribute("gen_ai.usage.cache_read.input_tokens", V::Int(i64::from(v)));
+    }
+    if let Some(v) = u.cache_creation_input_tokens {
+        g.set_attribute("gen_ai.usage.cache_creation.input_tokens", V::Int(i64::from(v)));
+    }
+    if let Some(v) = u.reasoning_tokens {
+        g.set_attribute("gen_ai.usage.reasoning.output_tokens", V::Int(i64::from(v)));
+    }
+}
+
+/// Stamp the OpenTelemetry gen_ai sampling params (issue #57) from the typed
+/// client request. Absent params stay absent (OTel semconv: don't emit what
+/// the caller didn't set).
+fn stamp_gen_ai_request_params(
+    g: &boom_trace::TraceGuard,
+    max_tokens: Option<u32>,
+    temperature: Option<f64>,
+    top_p: Option<f64>,
+    top_k: Option<u64>,
+) {
+    use boom_core::trace::SpanAttributeValue as V;
+    if let Some(v) = max_tokens {
+        g.set_attribute("gen_ai.request.max_tokens", V::Int(i64::from(v)));
+    }
+    if let Some(v) = temperature {
+        g.set_attribute("gen_ai.request.temperature", V::Double(v));
+    }
+    if let Some(v) = top_p {
+        g.set_attribute("gen_ai.request.top_p", V::Double(v));
+    }
+    if let Some(v) = top_k {
+        g.set_attribute("gen_ai.request.top_k", V::Int(v.min(i64::MAX as u64) as i64));
+    }
+}
+
+/// `top_k` has no typed slot on the request structs (it is not an OpenAI
+/// chat field) — clients that send it land in the `extra` catch-all.
+fn top_k_from_extra(extra: &serde_json::Map<String, serde_json::Value>) -> Option<u64> {
+    extra.get("top_k").and_then(|v| v.as_u64())
 }
 
 impl<S: futures::Stream + Unpin> futures::Stream for LoggedStream<S> {
@@ -894,6 +1036,16 @@ async fn chat_completions_inner(
                 g.set_attribute("boom-gateway.user.id", SpanAttributeValue::String(uid));
             }
         }
+        // gen_ai.request.* sampling params from the typed client request
+        // (issue #57) — stamped from the request itself, not the captured
+        // body, so they survive capture_body=false and body truncation.
+        stamp_gen_ai_request_params(
+            g,
+            req.max_tokens.or(req.max_completion_tokens),
+            req.temperature,
+            req.top_p,
+            top_k_from_extra(&req.extra),
+        );
     }
 
     // Attach gateway-internal headers (e.g. X-Gateway-Priority), the
@@ -1318,6 +1470,9 @@ async fn chat_completions_inner(
         let usage = response.usage.as_ref();
         let input_tokens = usage.map(|u| u.prompt_tokens as i32);
         let output_tokens = usage.map(|u| u.completion_tokens as i32);
+        if let Some(g) = trace_guard.as_ref() {
+            stamp_gen_ai_usage_attrs(g, &PreferredUsage::from_response_usage(usage));
+        }
         // Settle quota: real token counts from vLLM go to key + team cumulative
         // and 1-min TPM windows. Cost is computed from the model's cost_rate;
         // cached_tokens get the discounted rate when configured.
@@ -3316,13 +3471,7 @@ fn sse_stream_from_chat_stream(
                 Ok(chunk) => {
                     if let Some(ref u) = chunk.usage {
                         if let Ok(mut g) = usage.lock() {
-                            g.prompt_tokens = u.prompt_tokens;
-                            g.completion_tokens = u.completion_tokens;
-                            g.cached_tokens = u
-                                .prompt_tokens_details
-                                .as_ref()
-                                .and_then(|d| d.cached_tokens)
-                                .map(|c| c as i32);
+                            g.note_chunk_usage(u);
                         }
                     }
 
@@ -3589,6 +3738,15 @@ pub async fn messages(
                 g.set_attribute("boom-gateway.user.id", SpanAttributeValue::String(uid));
             }
         }
+        // gen_ai.request.* from the original Anthropic wire request (top_k
+        // only exists in this protocol's `extra`). issue #57.
+        stamp_gen_ai_request_params(
+            g,
+            req.max_tokens,
+            req.temperature,
+            req.top_p,
+            top_k_from_extra(&req.extra),
+        );
     }
 
     // Attach gateway-internal headers (e.g. X-Gateway-Priority), the
@@ -3963,6 +4121,9 @@ pub async fn messages(
         let usage = response.usage.as_ref();
         let input_tokens = usage.map(|u| u.prompt_tokens as i32);
         let output_tokens = usage.map(|u| u.completion_tokens as i32);
+        if let Some(g) = trace_guard.as_ref() {
+            stamp_gen_ai_usage_attrs(g, &PreferredUsage::from_response_usage(usage));
+        }
         // Settle quota: real token counts from vLLM go to key + team cumulative
         // and 1-min TPM windows. Cost is computed from the model's cost_rate;
         // cached_tokens get the discounted rate when configured.
@@ -4091,16 +4252,12 @@ fn sse_stream_from_anthropic_chat_stream(
         while let Some(result) = stream.next().await {
             match result {
                 Ok(chunk) => {
-                    // Extract usage from the chunk (OpenAI sends usage in the final chunk).
+                    // Extract usage from the chunk (OpenAI sends usage in
+                    // the final chunk; Anthropic spreads it across
+                    // message_start / message_delta).
                     if let Some(ref u) = chunk.usage {
                         if let Ok(mut g) = usage.lock() {
-                            g.prompt_tokens = u.prompt_tokens;
-                            g.completion_tokens = u.completion_tokens;
-                            g.cached_tokens = u
-                                .prompt_tokens_details
-                                .as_ref()
-                                .and_then(|d| d.cached_tokens)
-                                .map(|c| c as i32);
+                            g.note_chunk_usage(u);
                         }
                     }
                     let events = transcoder.transcode(&chunk);
@@ -4627,6 +4784,15 @@ pub async fn responses(
                 g.set_attribute("boom-gateway.user.id", SpanAttributeValue::String(uid));
             }
         }
+        // gen_ai.request.* from the original Responses wire request
+        // (max_output_tokens maps to gen_ai.request.max_tokens). issue #57.
+        stamp_gen_ai_request_params(
+            g,
+            req.max_output_tokens,
+            req.temperature,
+            req.top_p,
+            top_k_from_extra(&req.extra),
+        );
     }
 
     // Gateway-internal + deployment custom + client-whitelisted headers.
@@ -5074,6 +5240,9 @@ pub async fn responses(
         let usage = response.usage.as_ref();
         let input_tokens = usage.map(|u| u.prompt_tokens as i32);
         let output_tokens = usage.map(|u| u.completion_tokens as i32);
+        if let Some(g) = trace_guard.as_ref() {
+            stamp_gen_ai_usage_attrs(g, &PreferredUsage::from_response_usage(usage));
+        }
         let provider_cached = usage
             .and_then(|u| u.prompt_tokens_details.as_ref())
             .and_then(|d| d.cached_tokens);
@@ -5258,13 +5427,7 @@ fn sse_stream_from_responses_chat_stream(
                     Ok(chunk) => {
                         if let Some(ref u) = chunk.usage {
                             if let Ok(mut g) = usage.lock() {
-                                g.prompt_tokens = u.prompt_tokens;
-                                g.completion_tokens = u.completion_tokens;
-                                g.cached_tokens = u
-                                    .prompt_tokens_details
-                                    .as_ref()
-                                    .and_then(|d| d.cached_tokens)
-                                    .map(|c| c as i32);
+                                g.note_chunk_usage(u);
                             }
                         }
                         for ev in transcoder.transcode(&chunk) {
@@ -5854,14 +6017,15 @@ mod tests {
     use super::{
         build_gateway_headers, compose_gateway_headers, done_sse_item,
         extract_user_tags, forward_client_headers, insert_header_ci, is_vip_key,
-        new_streamed_response_id_slot, preferred_stream_usage, sse_anthropic_extractor,
-        sse_raw_data_extractor, sse_stream_from_chat_stream, stamp_streamed_response_id,
-        UsageTracker, UsageTrackerState, UserTags,
+        new_streamed_response_id_slot, parse_traceparent, preferred_stream_usage,
+        sse_anthropic_extractor, sse_raw_data_extractor, sse_stream_from_chat_stream,
+        stamp_gen_ai_request_params, stamp_gen_ai_usage_attrs, stamp_streamed_response_id,
+        PreferredUsage, UsageTracker, UsageTrackerState, UserTags,
     };
     use axum::http::{HeaderMap, HeaderName, HeaderValue};
     use boom_core::types::{
         ChatStream, ChatStreamChunk, FunctionCallDelta, MessageRole, PromptTokensDetails,
-        StreamChoice, StreamDelta, ToolCallDelta, Usage,
+        StreamChoice, StreamDelta, StreamUsage, ToolCallDelta, Usage,
     };
     use boom_core::GatewayError;
     use boom_promptlog::{LogPhase, PromptLogEntry, PromptLogStream};
@@ -6414,7 +6578,12 @@ trace:
 
         assert_eq!(
             preferred_stream_usage(&observed, Some(&provider)),
-            (Some(7), Some(3), Some(2))
+            PreferredUsage {
+                input_tokens: Some(7),
+                output_tokens: Some(3),
+                cached_tokens: Some(2),
+                ..PreferredUsage::default()
+            }
         );
     }
 
@@ -6423,7 +6592,7 @@ trace:
         let observed = UsageTrackerState {
             prompt_tokens: Some(7),
             completion_tokens: Some(3),
-            cached_tokens: None,
+            ..UsageTrackerState::default()
         };
         let provider = Usage {
             prompt_tokens: 7,
@@ -6437,8 +6606,121 @@ trace:
 
         assert_eq!(
             preferred_stream_usage(&observed, Some(&provider)),
-            (Some(7), Some(3), Some(2))
+            PreferredUsage {
+                input_tokens: Some(7),
+                output_tokens: Some(3),
+                cached_tokens: Some(2),
+                ..PreferredUsage::default()
+            }
         );
+    }
+
+    #[test]
+    fn anthropic_chunk_sequence_preserves_input_tokens() {
+        // message_start reports input tokens, the final message_delta reports
+        // output tokens and omits the input — the delta chunk must not erase
+        // the input recorded at start.
+        let mut tracker = UsageTrackerState::default();
+        tracker.note_chunk_usage(&StreamUsage {
+            prompt_tokens: Some(120),
+            completion_tokens: Some(0),
+            cache_read_input_tokens: Some(64),
+            cache_creation_input_tokens: Some(32),
+            ..StreamUsage::default()
+        });
+        tracker.note_chunk_usage(&StreamUsage {
+            prompt_tokens: None,
+            completion_tokens: Some(80),
+            ..StreamUsage::default()
+        });
+        assert_eq!(tracker.prompt_tokens, Some(120));
+        assert_eq!(tracker.completion_tokens, Some(80));
+        assert_eq!(tracker.cache_read_input_tokens, Some(64));
+        assert_eq!(tracker.cache_creation_input_tokens, Some(32));
+    }
+
+    #[test]
+    fn openai_final_chunk_reasoning_and_cache_flow_through() {
+        // OpenAI-compatible final usage chunk carries the KV-cache hit in
+        // prompt_tokens_details and reasoning in completion_tokens_details.
+        let raw = r#"{"id":"x","object":"chat.completion.chunk","created":0,"model":"m",
+            "choices":[],"usage":{"prompt_tokens":100,"completion_tokens":50,
+            "prompt_tokens_details":{"cached_tokens":40},
+            "completion_tokens_details":{"reasoning_tokens":12}}}"#;
+        let chunk: ChatStreamChunk = serde_json::from_str(raw).unwrap();
+        let mut tracker = UsageTrackerState::default();
+        tracker.note_chunk_usage(chunk.usage.as_ref().unwrap());
+        assert_eq!(tracker.prompt_tokens, Some(100));
+        assert_eq!(tracker.completion_tokens, Some(50));
+        assert_eq!(tracker.cached_tokens, Some(40));
+        assert_eq!(tracker.reasoning_tokens, Some(12));
+        // vLLM-style cached_tokens doubles as the cache-read subset.
+        let preferred = preferred_stream_usage(&tracker, None);
+        assert_eq!(preferred.cache_read_input_tokens, Some(40));
+        assert_eq!(preferred.reasoning_tokens, Some(12));
+        assert_eq!(preferred.cache_creation_input_tokens, None);
+    }
+
+    #[test]
+    fn gen_ai_request_params_stamped_on_span() {
+        let registry = boom_trace::TraceRegistry::new();
+        registry.set_enabled_for_test(true);
+        let w3c = parse_traceparent(
+            "00-0af76598164860bd9a43d7c1a31725ab-00f067aa0ba902b7-01",
+        )
+        .unwrap();
+        let guard = boom_trace::TraceGuard::start(
+            registry.clone(),
+            "req-params".to_string(),
+            &w3c,
+            "m".to_string(),
+            "/v1/chat/completions".to_string(),
+            false,
+            0,
+            true,
+        )
+        .expect("guard");
+        stamp_gen_ai_request_params(&guard, Some(4096), Some(0.7), Some(0.9), Some(50));
+        stamp_gen_ai_usage_attrs(
+            &guard,
+            &PreferredUsage {
+                input_tokens: Some(120),
+                output_tokens: Some(80),
+                cache_read_input_tokens: Some(64),
+                cache_creation_input_tokens: Some(32),
+                reasoning_tokens: Some(12),
+                cached_tokens: None,
+            },
+        );
+        let attrs = registry
+            .with_span_mut("req-params", |s| s.attributes.clone())
+            .expect("span alive");
+        let get = |key: &str| {
+            attrs
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+        };
+        use boom_core::trace::SpanAttributeValue as V;
+        assert_eq!(get("gen_ai.request.max_tokens"), Some(V::Int(4096)));
+        assert_eq!(get("gen_ai.request.temperature"), Some(V::Double(0.7)));
+        assert_eq!(get("gen_ai.request.top_p"), Some(V::Double(0.9)));
+        assert_eq!(get("gen_ai.request.top_k"), Some(V::Int(50)));
+        assert_eq!(get("gen_ai.usage.input_tokens"), Some(V::Int(120)));
+        assert_eq!(get("gen_ai.usage.output_tokens"), Some(V::Int(80)));
+        assert_eq!(
+            get("gen_ai.usage.cache_read.input_tokens"),
+            Some(V::Int(64))
+        );
+        assert_eq!(
+            get("gen_ai.usage.cache_creation.input_tokens"),
+            Some(V::Int(32))
+        );
+        assert_eq!(
+            get("gen_ai.usage.reasoning.output_tokens"),
+            Some(V::Int(12))
+        );
+        drop(guard);
     }
 
     fn terminal_chunk() -> ChatStreamChunk {

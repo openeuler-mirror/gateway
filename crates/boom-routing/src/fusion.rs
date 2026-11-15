@@ -1073,6 +1073,23 @@ fn usage_delta(current: &Usage, previous: &Usage) -> Usage {
         cache_read_input_tokens: current.cache_read_input_tokens.map(|value| {
             value.saturating_sub(previous.cache_read_input_tokens.unwrap_or(0))
         }),
+        completion_tokens_details: current
+            .completion_tokens_details
+            .as_ref()
+            .and_then(|current_details| {
+                current_details.reasoning_tokens.map(|reasoning_tokens| {
+                    let previous_reasoning = previous
+                        .completion_tokens_details
+                        .as_ref()
+                        .and_then(|details| details.reasoning_tokens)
+                        .unwrap_or(0);
+                    boom_core::types::CompletionTokensDetails {
+                        reasoning_tokens: Some(
+                            reasoning_tokens.saturating_sub(previous_reasoning),
+                        ),
+                    }
+                })
+            }),
     }
 }
 
@@ -1265,6 +1282,7 @@ mod tests {
                     completion_tokens: Some(1),
                     total_tokens: Some(3),
                     prompt_tokens_details: None,
+                    ..Default::default()
                 }),
                 raw_data: None,
             })])))

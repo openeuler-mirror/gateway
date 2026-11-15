@@ -459,6 +459,16 @@ fn otlp_kv_int(key: &str, value: i64) -> OtlpKeyValue {
     }
 }
 
+fn otlp_kv_double(key: &str, value: f64) -> OtlpKeyValue {
+    OtlpKeyValue {
+        key: key.to_string(),
+        value: Some(AnyValue {
+            value: Some(OtlpAnyValue::DoubleValue(value)),
+        }),
+        ..Default::default()
+    }
+}
+
 fn otlp_kv_bool(key: &str, value: bool) -> OtlpKeyValue {
     OtlpKeyValue {
         key: key.to_string(),
@@ -467,14 +477,6 @@ fn otlp_kv_bool(key: &str, value: bool) -> OtlpKeyValue {
         }),
         ..Default::default()
     }
-}
-
-/// `gen_ai.request.max_tokens` from the captured request body. Chat path
-/// uses `max_tokens`; the responses API uses `max_output_tokens`.
-fn extract_max_tokens(body: &serde_json::Value) -> Option<i64> {
-    body.get("max_tokens")
-        .or_else(|| body.get("max_output_tokens"))
-        .and_then(|v| v.as_i64())
 }
 
 /// Apply the OTLP per-attribute wire cap. Increments `dropped` when
@@ -495,9 +497,12 @@ fn bound_attr_bytes(s: String, max_attribute_bytes: usize, dropped: &mut u32) ->
 /// Attributes are dual-written (issue #49): the legacy `boom-gateway.*`
 /// keys are kept, and the semconv-standard `gen_ai.*` / `http.*` /
 /// `ai.gateway.*` names are added alongside from the span's structured
-/// fields. Three span events are emitted: the standard `exception` event
-/// on error spans, plus `ai.gateway.request.id` / `ai.gateway.request.body`
-/// (the latter only when body capture was on).
+/// fields. Request params (`gen_ai.request.temperature` / `top_p` /
+/// `top_k` / `max_tokens`) and usage (`gen_ai.usage.*`) arrive as regular
+/// attributes stamped by the route layer (issue #57) and pass through
+/// the bag loop unchanged. Three span events are emitted: the standard
+/// `exception` event on error spans, plus `ai.gateway.request.id` /
+/// `ai.gateway.request.body` (the latter only when body capture was on).
 ///
 /// `max_attribute_bytes` is the OTLP wire cap (OtlpConfig, 0 = unlimited):
 /// string attributes longer than the cap are truncated and the span's
@@ -557,13 +562,9 @@ pub fn convert_span_to_resource_spans(
                 }
             }
             SpanAttributeValue::Int(n) => otlp_attrs.push(otlp_kv_int(k, *n)),
+            SpanAttributeValue::Double(d) => otlp_attrs.push(otlp_kv_double(k, *d)),
             SpanAttributeValue::Bool(b) => otlp_attrs.push(otlp_kv_bool(k, *b)),
             SpanAttributeValue::Json(v) => {
-                if k == "boom-gateway.llm_request" {
-                    if let Some(mt) = extract_max_tokens(v) {
-                        otlp_attrs.push(otlp_kv_int("gen_ai.request.max_tokens", mt));
-                    }
-                }
                 let s = serde_json::to_string(v).unwrap_or_default();
                 let bounded = bound_attr_bytes(s, max_attribute_bytes, &mut dropped_attrs);
                 otlp_attrs.push(otlp_kv_string(k, &bounded));
@@ -796,6 +797,17 @@ mod tests {
             "boom-gateway.user.id",
             SpanAttributeValue::String("alice".to_string()),
         );
+        // Request params + usage are stamped by the route layer (issue #57)
+        // as regular attributes — the exporter passes them through.
+        span.set_attribute("gen_ai.request.max_tokens", SpanAttributeValue::Int(4096));
+        span.set_attribute("gen_ai.request.temperature", SpanAttributeValue::Double(0.7));
+        span.set_attribute("gen_ai.request.top_p", SpanAttributeValue::Double(0.9));
+        span.set_attribute("gen_ai.request.top_k", SpanAttributeValue::Int(40));
+        span.set_attribute("gen_ai.usage.input_tokens", SpanAttributeValue::Int(120));
+        span.set_attribute("gen_ai.usage.output_tokens", SpanAttributeValue::Int(80));
+        span.set_attribute("gen_ai.usage.cache_read.input_tokens", SpanAttributeValue::Int(64));
+        span.set_attribute("gen_ai.usage.cache_creation.input_tokens", SpanAttributeValue::Int(32));
+        span.set_attribute("gen_ai.usage.reasoning.output_tokens", SpanAttributeValue::Int(12));
         span.set_llm_request(Arc::new(serde_json::json!({"messages": [], "max_tokens": 4096})), 0);
         span.finalize_ok(3_000_000_000);
         let cfg = OtlpConfig::default();
@@ -811,11 +823,29 @@ mod tests {
             "gen_ai.response.time_to_first_chunk",
             "ai.gateway.target.deployment.id",
             "gen_ai.request.max_tokens",
+            "gen_ai.request.temperature",
+            "gen_ai.request.top_p",
+            "gen_ai.request.top_k",
+            "gen_ai.usage.input_tokens",
+            "gen_ai.usage.output_tokens",
+            "gen_ai.usage.cache_read.input_tokens",
+            "gen_ai.usage.cache_creation.input_tokens",
+            "gen_ai.usage.reasoning.output_tokens",
             "user.id",
             "http.route",
         ] {
             assert!(keys.contains(&expected), "missing dual-write key {expected}");
         }
+        // Doubles survive as OTLP DoubleValue (not stringified).
+        let temp = otlp_span
+            .attributes
+            .iter()
+            .find(|a| a.key == "gen_ai.request.temperature")
+            .unwrap();
+        assert!(matches!(
+            temp.value.as_ref().unwrap().value.as_ref().unwrap(),
+            OtlpAnyValue::DoubleValue(d) if (*d - 0.7).abs() < f64::EPSILON
+        ));
         // Resource carries the instance identity shared with the metrics channel.
         let res_keys: Vec<&str> = rs
             .resource
@@ -880,19 +910,6 @@ mod tests {
             panic!("exception.message should be string");
         };
         assert_eq!(full.chars().count(), 64);
-    }
-
-    #[test]
-    fn extract_max_tokens_supports_both_field_names() {
-        assert_eq!(
-            extract_max_tokens(&serde_json::json!({"max_tokens": 100})),
-            Some(100)
-        );
-        assert_eq!(
-            extract_max_tokens(&serde_json::json!({"max_output_tokens": 200})),
-            Some(200)
-        );
-        assert_eq!(extract_max_tokens(&serde_json::json!({"messages": []})), None);
     }
 
     #[test]

@@ -553,6 +553,11 @@ pub struct Usage {
     /// cache + external KV transfer), used by the gateway for DFX.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_tokens_details: Option<PromptTokensDetails>,
+    /// OpenAI-style completion token breakdown (o1/o3-style reasoning
+    /// models report `reasoning_tokens` here). Consumed by the trace
+    /// channel (`gen_ai.usage.reasoning.output_tokens`, issue #57).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_tokens_details: Option<CompletionTokensDetails>,
 }
 
 /// Breakdown of prompt tokens (OpenAI `prompt_tokens_details`).
@@ -562,6 +567,15 @@ pub struct PromptTokensDetails {
     /// real cache hit (HBM + external store).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cached_tokens: Option<u32>,
+}
+
+/// Breakdown of completion tokens (OpenAI `completion_tokens_details`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CompletionTokensDetails {
+    /// Reasoning tokens produced before the visible output (o1/o3-style
+    /// reasoning models). None = upstream did not report the breakdown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u32>,
 }
 
 // ============================================================
@@ -595,7 +609,7 @@ pub struct ChatStreamChunk {
 }
 
 /// Usage stats returned in the last SSE chunk of a stream.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StreamUsage {
     pub prompt_tokens: Option<i32>,
     pub completion_tokens: Option<i32>,
@@ -603,6 +617,20 @@ pub struct StreamUsage {
     pub total_tokens: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_tokens_details: Option<PromptTokensDetails>,
+    /// Reasoning-token subset of `completion_tokens` (OpenAI wire field;
+    /// consumed by the trace channel, issue #57). Serialized back to
+    /// clients — it is OpenAI's own schema.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_tokens_details: Option<CompletionTokensDetails>,
+    /// Anthropic prompt-caching split. There is no OpenAI wire slot for
+    /// these, so they are carried as internal-only fields (never serialized
+    /// to clients, never parsed from upstream JSON) — set programmatically
+    /// by the Anthropic stream converter, read by the gateway's usage
+    /// tracker for `gen_ai.usage.cache_*` trace attributes.
+    #[serde(skip)]
+    pub cache_read_input_tokens: Option<i32>,
+    #[serde(skip)]
+    pub cache_creation_input_tokens: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

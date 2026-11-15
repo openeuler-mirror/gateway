@@ -1979,6 +1979,7 @@ mod tests {
             cache_creation_input_tokens: None,
             cache_read_input_tokens: None,
             prompt_tokens_details: Some(PromptTokensDetails { cached_tokens: Some(4) }),
+            completion_tokens_details: None,
         });
         let obj = openai_chat_to_responses(&resp, "m", "resp_1", 0);
         let v = serde_json::to_value(&obj).unwrap();
@@ -2062,6 +2063,9 @@ mod tests {
             completion_tokens: Some(4),
             total_tokens: Some(12),
             prompt_tokens_details: None,
+            completion_tokens_details: None,
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: None,
         });
         let events = collect_events(&mut t, &[finish]);
         assert_invariants(&events);
