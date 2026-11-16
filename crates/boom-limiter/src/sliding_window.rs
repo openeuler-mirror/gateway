@@ -20,7 +20,7 @@ use boom_core::types::{LimitDimension, RateLimitDecision, RateLimitKey, WindowLi
 use dashmap::DashMap;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 // ═══════════════════════════════════════════════════════════
@@ -1064,8 +1064,11 @@ impl SlidingWindowLimiter {
     // sync only ever SNAPSHOTS the sets and removes keys after the push
     // commits, so every failure path — DB error, watchdog timeout, a
     // future dropped mid-transaction — leaves the schedule untouched and
-    // the batch retried next cycle. Payload and schedule are cleared
-    // together, only on confirmation.
+    // the batch retried next cycle. Retirement is payload-aware: a key
+    // whose slot refilled while the push was in flight stays scheduled
+    // (traffic on a key already in the snapshot re-marks a set that still
+    // contains it — a no-op insert — so unconditional retirement would
+    // strand that delta until the key's next request).
 
     fn mark_dirty_cumulative(&self, key: &str) {
         if let Ok(mut s) = self.dirty_cumulative.write() {
@@ -1081,22 +1084,36 @@ impl SlidingWindowLimiter {
         self.dirty_snapshots.read().expect("dirty lock poisoned").clone()
     }
 
-    /// Retire snapshot keys whose push resolved (committed, or provably
-    /// carried no payload). Keys marked mid-push by new traffic are not in
-    /// the snapshot and stay scheduled for the next cycle.
-    fn confirm_pushed_dirty(&self, cumulative: &HashSet<String>, snapshots: &HashSet<String>) {
-        if !cumulative.is_empty() {
-            self.dirty_cumulative
-                .write()
-                .expect("dirty lock poisoned")
-                .retain(|k| !cumulative.contains(k));
-        }
-        if !snapshots.is_empty() {
-            self.dirty_snapshots
-                .write()
-                .expect("dirty lock poisoned")
-                .retain(|k| !snapshots.contains(k));
-        }
+    /// Retire dirty keys whose push resolved — committed, or provably
+    /// carried no payload. Cumulative keys retire only when their unpushed
+    /// slot drained to zero; snapshot anchors only when the current base
+    /// still equals the value this cycle wrote. Keys not in the batch and
+    /// keys whose entry vanished (no possible payload) pass through.
+    fn confirm_pushed_dirty(
+        &self,
+        cumulative: &HashSet<String>,
+        snapshot_pushed: &HashMap<String, i64>,
+    ) {
+        self.dirty_cumulative
+            .write()
+            .expect("dirty lock poisoned")
+            .retain(|k| {
+                !cumulative.contains(k)
+                    || self
+                        .cumulative
+                        .get(k)
+                        .map_or(false, |e| e.value().value != 0)
+            });
+        self.dirty_snapshots
+            .write()
+            .expect("dirty lock poisoned")
+            .retain(|k| match snapshot_pushed.get(k) {
+                None => self.cumulative.get(k).is_some(),
+                Some(v) => self
+                    .cumulative
+                    .get(k)
+                    .map_or(false, |e| e.value().g != *v),
+            });
     }
 }
 
@@ -1371,12 +1388,15 @@ impl SlidingWindowLimiter {
         if win_deltas.is_empty()
             && cum_deltas.is_empty()
             && snapshot_writes.is_empty()
-            && (!pull || pull_window_keys.is_empty())
+            && (!pull || (pull_window_keys.is_empty() && self.cumulative.is_empty()))
         {
-            // Nothing to push this cycle. Retire the snapshot anyway: every
-            // key in it carried no payload (zero-valued or entry gone), so
-            // leaving it dirty would only accumulate idle keys.
-            self.confirm_pushed_dirty(&dirty_cum, &snapshot_keys);
+            // Nothing to push this cycle. Retire the batch anyway: every key
+            // in it carried no payload (zero-valued or entry gone), so
+            // leaving it dirty would only accumulate idle keys. Cumulative
+            // keys count as pull work in shared mode — an idle instance
+            // (windows all expired/cleaned) still refreshes its bases.
+            let pushed: HashMap<String, i64> = snapshot_writes.iter().cloned().collect();
+            self.confirm_pushed_dirty(&dirty_cum, &pushed);
             return Ok(stats);
         }
 
@@ -1384,11 +1404,12 @@ impl SlidingWindowLimiter {
         let mut tx = pool.begin().await?;
 
         for d in &win_deltas {
-            // UPDATE-first upsert: on a concurrent first-push race the macro's
-            // INSERT falls back to re-running the UPDATE — with delta
-            // semantics (value = value + δ) both orders land correctly.
-            boom_core::gaussdb_upsert!(
-                &mut *tx,
+            // UPDATE-first upsert; the tx variant's savepoint keeps a
+            // concurrent first-push race (unique violation on INSERT) from
+            // aborting the whole batch — with delta semantics (value =
+            // value + δ) both orders land correctly.
+            boom_core::gaussdb_upsert_tx!(
+                tx,
                 || sqlx::query(
                     r#"UPDATE boom_rate_limit_state
                        SET count = count + $3,
@@ -1417,8 +1438,8 @@ impl SlidingWindowLimiter {
         }
 
         for d in &cum_deltas {
-            boom_core::gaussdb_upsert!(
-                &mut *tx,
+            boom_core::gaussdb_upsert_tx!(
+                tx,
                 || sqlx::query(
                     r#"UPDATE boom_rate_limit_cumulative
                        SET value = value + $2, updated_at = NOW()
@@ -1436,8 +1457,8 @@ impl SlidingWindowLimiter {
         }
 
         for (k, v) in &snapshot_writes {
-            boom_core::gaussdb_upsert!(
-                &mut *tx,
+            boom_core::gaussdb_upsert_tx!(
+                tx,
                 || sqlx::query(
                     r#"UPDATE boom_rate_limit_cumulative
                        SET value = $2, updated_at = NOW()
@@ -1510,10 +1531,12 @@ impl SlidingWindowLimiter {
         // slot that self-corrects on the next push.
         self.apply_push_mirrors(&win_deltas, &cum_deltas);
         // Payload cleared above, schedule cleared here — the confirmation
-        // halves of one action. Watchdog-killed cycles never reach this
-        // point: the watermark row replays the mirrors and the dirty keys
-        // stay scheduled.
-        self.confirm_pushed_dirty(&dirty_cum, &snapshot_keys);
+        // halves of one action, and only for keys whose slot actually
+        // drained: a mid-push refill stays scheduled. Watchdog-killed
+        // cycles never reach this point: the watermark row replays the
+        // mirrors and the dirty keys stay scheduled.
+        let snapshot_pushed: HashMap<String, i64> = snapshot_writes.iter().cloned().collect();
+        self.confirm_pushed_dirty(&dirty_cum, &snapshot_pushed);
 
         for (k, count, tokens, costs_micros, ws) in &pulled_win {
             if let Some(mut c) = self.windows.get_mut(k.as_str()) {
@@ -2588,5 +2611,90 @@ mod tests {
         limiter.commit_counts(&key, &windows, 1);
         let d = limiter.peek_only(&key, &windows, 1).await;
         assert!(!d.allowed, "global base (8) + local (2) = 10 must reject");
+    }
+
+    #[test]
+    fn confirm_retires_only_drained_cumulative_keys() {
+        let limiter = SlidingWindowLimiter::new();
+        let scope = QuotaScope::Key {
+            key_hash: "confirm_drained".to_string(),
+        };
+        let ckey = cumulative_cache_key(&scope, CumulativeKind::TotalCost);
+        let batch = HashSet::from([ckey.clone()]);
+
+        // Slot drained by the push mirrors → retire.
+        limiter.add_cumulative(&scope, CumulativeKind::TotalCost, 10);
+        limiter.cumulative.get_mut(&ckey).unwrap().value_mut().value = 0;
+        limiter.confirm_pushed_dirty(&batch, &HashMap::new());
+        assert!(
+            !limiter.dirty_cumulative.read().unwrap().contains(&ckey),
+            "drained key must retire"
+        );
+
+        // Mid-push refill (request landed inside the tx; its mark was a
+        // no-op because the key never left the set) → stay scheduled, or
+        // that delta strands until the key's next request.
+        limiter.add_cumulative(&scope, CumulativeKind::TotalCost, 7);
+        limiter.confirm_pushed_dirty(&batch, &HashMap::new());
+        assert!(
+            limiter.dirty_cumulative.read().unwrap().contains(&ckey),
+            "refilled key must stay scheduled"
+        );
+
+        // Entry vanished (reset/clear) → no possible payload, retire.
+        limiter.cumulative.remove(&ckey);
+        limiter.confirm_pushed_dirty(&batch, &HashMap::new());
+        assert!(
+            !limiter.dirty_cumulative.read().unwrap().contains(&ckey),
+            "key without an entry must retire"
+        );
+    }
+
+    #[test]
+    fn confirm_retires_only_unchanged_snapshot_anchors() {
+        let limiter = SlidingWindowLimiter::new();
+        let scope = QuotaScope::Key {
+            key_hash: "confirm_anchor".to_string(),
+        };
+        let akey = cumulative_cache_key(&scope, CumulativeKind::BudgetPeriodStart);
+
+        // Anchor unchanged since collection → retire.
+        limiter.overwrite_cumulative(&scope, CumulativeKind::BudgetPeriodStart, 100);
+        let pushed = HashMap::from([(akey.clone(), 100_i64)]);
+        limiter.confirm_pushed_dirty(&HashSet::new(), &pushed);
+        assert!(
+            !limiter.dirty_snapshots.read().unwrap().contains(&akey),
+            "unchanged anchor must retire"
+        );
+
+        // Anchor overwritten mid-push (g moved past the pushed value) →
+        // stay scheduled so the new value goes up next cycle.
+        limiter.overwrite_cumulative(&scope, CumulativeKind::BudgetPeriodStart, 200);
+        limiter.confirm_pushed_dirty(&HashSet::new(), &pushed);
+        assert!(
+            limiter.dirty_snapshots.read().unwrap().contains(&akey),
+            "mid-push anchor overwrite must stay scheduled"
+        );
+
+        // Key marked after the snapshot (not in this batch) with a live
+        // entry → untouched; without an entry → retire.
+        let bkey = cumulative_cache_key(&scope, CumulativeKind::BudgetPeriodBaseCost);
+        limiter.add_cumulative(&scope, CumulativeKind::BudgetPeriodBaseCost, 5);
+        limiter
+            .dirty_snapshots
+            .write()
+            .unwrap()
+            .insert(bkey.clone());
+        limiter.confirm_pushed_dirty(&HashSet::new(), &pushed);
+        assert!(
+            limiter.dirty_snapshots.read().unwrap().contains(&bkey),
+            "post-snapshot mark with a live entry must stay scheduled"
+        );
+        limiter.cumulative.remove(&bkey);
+        limiter.confirm_pushed_dirty(&HashSet::new(), &pushed);
+        assert!(
+            !limiter.dirty_snapshots.read().unwrap().contains(&bkey),
+            "post-snapshot mark without an entry must retire"
+        );
     }
 }
