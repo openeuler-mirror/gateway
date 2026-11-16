@@ -46,7 +46,6 @@ async fn provider_chat_roundtrip_via_mock_upstream() {
         None,
         false,
         None,
-        false,
     )
     .expect("create_provider");
 
@@ -79,7 +78,6 @@ async fn deployment_store_round_robin_rotates() {
         None,
         false,
         None,
-        false,
     )
     .unwrap();
     let p2 = boom_provider::create_provider(
@@ -92,7 +90,6 @@ async fn deployment_store_round_robin_rotates() {
         Some("deploy-2".to_string()),
         false,
         None,
-        false,
     )
     .unwrap();
 
