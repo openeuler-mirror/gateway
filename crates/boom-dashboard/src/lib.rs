@@ -243,6 +243,10 @@ pub fn build_router<S: Clone + Send + Sync + 'static>(state: DashboardState) -> 
             get(handlers_admin::get_rollback_stats),
         )
         .route(
+            "/dashboard/api/admin/stats/rollback/self-test",
+            post(handlers_admin::rollback_self_test),
+        )
+        .route(
             "/dashboard/api/admin/stats/kvc-scheduler",
             get(handlers_admin::get_kvc_scheduler_stats),
         )

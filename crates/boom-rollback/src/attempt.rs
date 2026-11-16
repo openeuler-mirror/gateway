@@ -137,15 +137,27 @@ pub async fn attempt_stream(
     // caller-side extraction, no hand-crafted codes, one request → one
     // identical code string in every tree section.
     match &decision {
-        FallbackDecision::Target(_) => ctx.stats.record_selected(route.model),
+        // Composite methods record counters + per-model + code + DEPLOY
+        // dimension (from / from→to) in one call — the tree sub-rows come
+        // from the same recording, no separate event log.
+        FallbackDecision::Target(target) => {
+            ctx.stats.record_selected(
+                route.model,
+                failed_deployment_id.as_deref(),
+                target.deployment_id(),
+            );
+        }
         FallbackDecision::MissIdentify => {
-            ctx.stats.record_miss_identified(route.model, first_error)
+            ctx.stats
+                .record_miss_identified(route.model, first_error, failed_deployment_id.as_deref());
         }
         FallbackDecision::PoolInert => {
-            ctx.stats.record_pool_inert_identified(route.model, first_error)
+            ctx.stats
+                .record_pool_inert_identified(route.model, first_error, failed_deployment_id.as_deref());
         }
         FallbackDecision::NoTarget => {
-            ctx.stats.record_no_target_identified(route.model, first_error)
+            ctx.stats
+                .record_no_target_identified(route.model, first_error, failed_deployment_id.as_deref());
         }
     }
     let Some(target) = decision.target()
@@ -165,7 +177,8 @@ pub async fn attempt_stream(
     )
     .await;
     if let Some(ref ge) = guard_err.as_ref().err() {
-        ctx.stats.record_guard_error(route.model, ge);
+        ctx.stats
+            .record_guard_error(route.model, ge, failed_deployment_id.as_deref(), new_id.as_deref());
     }
     let retry_start = std::time::Instant::now();
     let guard_failed = guard_err.is_err();
@@ -182,14 +195,25 @@ pub async fn attempt_stream(
             // `first_error` = the ORIGINAL context error the retry FIXED —
             // its code feeds the retry-success tree's sub-rows ("成功修复
             // 了什么错误、各多少次").
-            ctx.stats.record_retry_success_fixed(route.model, first_error, ms);
+            ctx.stats.record_retry_success_fixed(
+                route.model,
+                first_error,
+                ms,
+                failed_deployment_id.as_deref(),
+                new_id.as_deref(),
+            );
         }
         // Guard-swap failure is already counted as guard_error (terminal:
         // no retry call was made) — bumping retry_error here too would
         // double-count and break invariant ② selected = success +
         // retry_error + guard_error.
         Err(ref e) if !guard_failed => {
-            ctx.stats.record_retry_error(route.model, e);
+            ctx.stats.record_retry_error(
+                route.model,
+                e,
+                failed_deployment_id.as_deref(),
+                new_id.as_deref(),
+            );
         }
         Err(_) => {}
     }
@@ -222,15 +246,27 @@ pub async fn attempt_call(
     // caller-side extraction, no hand-crafted codes, one request → one
     // identical code string in every tree section.
     match &decision {
-        FallbackDecision::Target(_) => ctx.stats.record_selected(route.model),
+        // Composite methods record counters + per-model + code + DEPLOY
+        // dimension (from / from→to) in one call — the tree sub-rows come
+        // from the same recording, no separate event log.
+        FallbackDecision::Target(target) => {
+            ctx.stats.record_selected(
+                route.model,
+                failed_deployment_id.as_deref(),
+                target.deployment_id(),
+            );
+        }
         FallbackDecision::MissIdentify => {
-            ctx.stats.record_miss_identified(route.model, first_error)
+            ctx.stats
+                .record_miss_identified(route.model, first_error, failed_deployment_id.as_deref());
         }
         FallbackDecision::PoolInert => {
-            ctx.stats.record_pool_inert_identified(route.model, first_error)
+            ctx.stats
+                .record_pool_inert_identified(route.model, first_error, failed_deployment_id.as_deref());
         }
         FallbackDecision::NoTarget => {
-            ctx.stats.record_no_target_identified(route.model, first_error)
+            ctx.stats
+                .record_no_target_identified(route.model, first_error, failed_deployment_id.as_deref());
         }
     }
     let Some(target) = decision.target()
@@ -250,7 +286,8 @@ pub async fn attempt_call(
     )
     .await;
     if let Some(ref ge) = guard_err.as_ref().err() {
-        ctx.stats.record_guard_error(route.model, ge);
+        ctx.stats
+            .record_guard_error(route.model, ge, failed_deployment_id.as_deref(), new_id.as_deref());
     }
     let retry_start = std::time::Instant::now();
     let guard_failed = guard_err.is_err();
@@ -267,14 +304,25 @@ pub async fn attempt_call(
             // `first_error` = the ORIGINAL context error the retry FIXED —
             // its code feeds the retry-success tree's sub-rows ("成功修复
             // 了什么错误、各多少次").
-            ctx.stats.record_retry_success_fixed(route.model, first_error, ms);
+            ctx.stats.record_retry_success_fixed(
+                route.model,
+                first_error,
+                ms,
+                failed_deployment_id.as_deref(),
+                new_id.as_deref(),
+            );
         }
         // Guard-swap failure is already counted as guard_error (terminal:
         // no retry call was made) — bumping retry_error here too would
         // double-count and break invariant ② selected = success +
         // retry_error + guard_error.
         Err(ref e) if !guard_failed => {
-            ctx.stats.record_retry_error(route.model, e);
+            ctx.stats.record_retry_error(
+                route.model,
+                e,
+                failed_deployment_id.as_deref(),
+                new_id.as_deref(),
+            );
         }
         Err(_) => {}
     }

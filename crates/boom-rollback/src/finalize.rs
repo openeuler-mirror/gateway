@@ -16,6 +16,7 @@ pub fn finalize_error(
     patterns: &[String],
     stats: Option<&RollbackStats>,
     model: Option<&str>,
+    from: Option<&str>,
 ) -> GatewayError {
     if patterns.is_empty() {
         return e;
@@ -23,9 +24,9 @@ pub fn finalize_error(
     if let GatewayError::UpstreamError { status, message } = &e {
         if boom_core::context_error::identify(*status, message, patterns).matched {
             if let Some(stats) = stats {
-                // Composite method — code derived internally, identical to
-                // every other recording path.
-                stats.record_no_fallback_return(model, &e);
+                // Composite method — counters + per-model + code + deploy
+                // dimension in one call.
+                stats.record_no_fallback_return(model, &e, from);
             }
             return GatewayError::ContextLengthExceeded(message.clone());
         }

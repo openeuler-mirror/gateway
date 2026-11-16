@@ -237,6 +237,11 @@ pub struct DashboardState {
     pub kvc_stats: Arc<KvcSchedulerStats>,
     /// Rollback observability counters (debug page `GET /admin/stats/rollback`).
     pub rollback_stats: Arc<boom_core::context_error::RollbackStats>,
+    /// Current context-rollback identification patterns (YAML home —
+    /// injected by boom-main at assembly and refreshed on reload; the
+    /// dashboard itself must not depend on boom-config). Feeds the
+    /// rollback self-test endpoint.
+    pub rollback_patterns: Arc<std::sync::RwLock<Vec<String>>>,
     /// Per-deployment request rate tracker for dashboard stats.
     pub request_rate: Arc<RequestRateTracker>,
     /// Agent (client-type) statistics tracker for dashboard stats.
@@ -294,6 +299,7 @@ impl DashboardState {
         rebalance_move_tracker: Arc<RebalanceMoveTracker>,
         kvc_stats: Arc<KvcSchedulerStats>,
         rollback_stats: Arc<boom_core::context_error::RollbackStats>,
+        rollback_patterns: Arc<std::sync::RwLock<Vec<String>>>,
         request_rate: Arc<RequestRateTracker>,
         agent_stats: Arc<AgentStatsTracker>,
         auth: Arc<dyn KeyAliasLookup>,
@@ -330,6 +336,7 @@ impl DashboardState {
             rebalance_move_tracker,
             kvc_stats,
             rollback_stats,
+            rollback_patterns,
             request_rate,
             agent_stats,
             auth,

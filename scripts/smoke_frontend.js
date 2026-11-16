@@ -34,13 +34,13 @@ function loadBlock(startMarker, endMarker, returns) {
   const end = src.indexOf(endMarker);
   if (start < 0 || end < 0 || end <= start) fail(`block not found: ${startMarker}`);
   const block = src.slice(start, end);
-  return new Function('t', 'esc', 'tip', 'renderDeployCell', 'visibilityBadgeFor', 'vendorOf', 'document',
+  return new Function('t', 'esc', 'tip', 'renderDeployCell', 'visibilityBadgeFor', 'vendorOf', 'document', 'window',
     block + `\nreturn { ${returns} };`
-  )(t, esc, tip, renderDeployCell, visibilityBadgeFor, vendorOf, document);
+  )(t, esc, tip, renderDeployCell, visibilityBadgeFor, vendorOf, document, globalThis);
 }
 
-const pool = loadBlock('  function fmtTier(', '  async function showNewModelModal',
-  'renderModelsTable, rollbackPoolState, fmtTier');
+const pool = loadBlock('  function renderModelsTable', '  async function showNewModelModal',
+  'renderModelsTable');
 
 
 // ── fixtures（API 行不再含 rollback_enabled——声明是唯一参与信号）──
@@ -64,27 +64,21 @@ const blocks = html.match(/class="model-block[^"]*"/g) || [];
 if (blocks.length !== 2) fail(`2 pools → 2 model-block cells, got ${blocks.length}`);
 if (!html.includes('rowspan="4"')) fail('glm block spans 3 dep rows + 1 warning row');
 if (!html.includes('rowspan="1"')) fail('qwen block spans its single row');
-// 状态行:glm 2 层(205K→1049K)激活;qwen 未配置
-if (!html.includes('models.rollback.state_active')) fail('2 declared tiers → active state');
-if (!html.includes('models.rollback.state_unconfigured')) fail('no declarations → unconfigured');
+// 状态行已移至 Debug → Rollback(模型页不再渲染任何回退状态键)
+if (html.includes('state_active') || html.includes('state_unconfigured')
+  || html.includes('rollbackPoolState') || html.includes('rb-state')) {
+  fail('rollback state line must live in the Debug pane, not the models table');
+}
+// 模型格内容存在(名称+计数),无状态行
+if (!html.includes('model-name')) fail('model name span present');
+if (!html.includes('model-count')) fail('instance count present');
 // 斑马按块:qwen(第二块)行带 dep-alt,glm 行不带
-const altRows = html.match(/class="pool-dep dep-alt/g) || [];
-if (altRows.length !== 1) fail(`zebra by GROUP: only qwen rows carry dep-alt, got ${altRows.length}`);
+const bRows = html.match(/class="pool-dep grp-b/g) || [];
+if (bRows.length !== 1) fail(`zebra by GROUP: only qwen rows carry grp-b, got ${bRows.length}`);
+const aRows = html.match(/class="pool-dep grp-a/g) || [];
+if (aRows.length !== 3) fail(`first group rows carry grp-a, got ${aRows.length}`);
 // 告警行跟随块色且 colspan=11
 if (!html.includes('colspan="11"')) fail('warning row colspan follows 11 columns');
-// fmtTier 紧凑格式
-if (pool.fmtTier(200000) !== '200K') fail('fmtTier K');
-if (pool.fmtTier(1000000) !== '1M') fail('fmtTier M');
-if (pool.fmtTier(500) !== '500') fail('fmtTier raw');
-
-// 状态四态
-const state = (rows) => { pool.renderModelsTable(rows, {}); return el.innerHTML; };
-if (!state([{ id: 'a', model_name: 'x', enabled: true, max_context_tokens: 200000, timeout: 1 }, { id: 'b', model_name: 'x', enabled: true, timeout: 1 }])
-  .includes('models.rollback.state_rescue')) fail('1 declared tier + undeclared → rescue state');
-if (!state([{ id: 'a', model_name: 'x', enabled: true, max_context_tokens: 200000, timeout: 1 }, { id: 'b', model_name: 'x', enabled: true, max_context_tokens: 200000, timeout: 1 }])
-  .includes('models.rollback.state_single')) fail('all declared single tier → no-larger-tier state');
-const rescueHtml = state([{ id: 'a', model_name: 'x', enabled: true, max_context_tokens: 200000, timeout: 1 }, { id: 'b', model_name: 'x', enabled: true, timeout: 1 }]);
-if (!rescueHtml.includes('models.rollback.mixed_note')) fail('undeclared count note rendered');
 
 // 空表不崩
 pool.renderModelsTable([], {});
@@ -103,39 +97,86 @@ if (src.includes('renderCardRollback')) fail('renderCardRollback should be remov
 const rb = loadBlock('  function renderRollbackStats(data) {', '  // ── KVC Hit Calibration',
   'renderRollbackStats');
 const rbSnapshot = {
-  identify_total: 6, identify_miss: 1, pool_inert: 1, no_target: 1, fallback_selected: 3,
-  retry_success: 1, retry_error: 1, guard_error: 1, no_fallback_return: 1, affinity_direct: 1,
-  models: {
-    'glm-5.3': {
-      identify_miss: 1, pool_inert: 1, no_target: 1, fallback_selected: 3, retry_success: 1,
-      retry_error: 1, guard_error: 1, no_fallback_return: 1, affinity_direct: 1,
-      error_codes: {
-        'guard_error:flow_control_timeout': 1,
-        'identify_miss:WeirdModelError': 1,
-        'no_fallback_return:InputTokenExceeded': 1,
-        'no_target:InputTokenExceeded': 1,
-        'pool_inert:InputTokenExceeded': 1,
-        'retry_error:internal HTTP(500)': 1,
-        'retry_success:InputTokenExceeded': 1,
+  "identify_total": 6,
+  "identify_miss": 1,
+  "pool_inert": 1,
+  "no_target": 1,
+  "fallback_selected": 3,
+  "retry_success": 1,
+  "retry_error": 1,
+  "guard_error": 1,
+  "no_fallback_return": 1,
+  "affinity_direct": 1,
+  "convergence_windows": [
+    {
+      "hour": 498564,
+      "direct": 1,
+      "retry": 1
+    }
+  ],
+  "models": {
+    "glm-5.3": {
+      "identify_miss": 1,
+      "pool_inert": 1,
+      "no_target": 1,
+      "fallback_selected": 3,
+      "retry_success": 1,
+      "retry_error": 1,
+      "guard_error": 1,
+      "no_fallback_return": 1,
+      "affinity_direct": 1,
+      "error_codes": {
+        "guard_error:flow_control_timeout": 1,
+        "identify_miss:WeirdModelError": 1,
+        "no_fallback_return:InputTokenExceeded": 1,
+        "no_target:InputTokenExceeded": 1,
+        "pool_inert:InputTokenExceeded": 1,
+        "retry_error:internal HTTP(500)": 1,
+        "retry_success:InputTokenExceeded": 1
       },
-      avg_retry_ms: 42,
-    },
+      "deploys": {
+        "fallback_selected:|d-small→d-bad": 1,
+        "fallback_selected:|d-small→d-big": 1,
+        "fallback_selected:|d-small→d-queue": 1,
+        "guard_error:flow_control_timeout|d-small→d-queue": 1,
+        "identify_miss:WeirdModelError|d-small": 1,
+        "no_fallback_return:InputTokenExceeded|d-small": 1,
+        "no_target:InputTokenExceeded|d-small": 1,
+        "pool_inert:InputTokenExceeded|d-small": 1,
+        "retry_error:internal HTTP(500)|d-small→d-bad": 1,
+        "retry_success:InputTokenExceeded|d-small→d-big": 1
+      },
+      "avg_retry_ms": 42
+    }
   },
+  "pools": [
+    { "model": "glm-5.3", "state": "active", "deployments": [
+      { "deployment_id": "d-200k-a", "max_context_tokens": 204800, "enabled": true },
+      { "deployment_id": "d-200k-b", "max_context_tokens": 204800, "enabled": true },
+      { "deployment_id": "d-1m", "max_context_tokens": 1048576, "enabled": true }
+    ] },
+    { "model": "qwen3.8", "state": "rescue", "deployments": [
+      { "deployment_id": "d-200k", "max_context_tokens": 200000, "enabled": true },
+      { "deployment_id": "d-undecl", "max_context_tokens": null, "enabled": false }
+    ] }
+  ]
 };
 rb.renderRollbackStats(rbSnapshot);
 const rbHtml = el.innerHTML;
-// 9 个 treeNode 按渲染顺序切分
-const nodes = rbHtml.split('<div class="rb-tree-node">').slice(1);
-if (nodes.length !== 9) fail(`9 tree nodes expected, got ${nodes.length}`);
+// 9 个统计 treeNode 按渲染顺序切分;池状态节(rb-tree 同款结构)在
+// 其后渲染,不在计数内。
+const statsHtml = rbHtml.split('debug.rollback.pools_title')[0];
+const nodes = statsHtml.split('<div class="rb-tree-node">').slice(1);
+if (nodes.length !== 9) fail(`9 stats tree nodes expected, got ${nodes.length}`);
 // (标题, 该节点的错误码子行期望; null = 成功指标，不应有子行)
-// (标题, 该节点的错误码子行期望; null = 无码指标[已选目标/亲和直达])
-// 键名=快照字段名,与后端 error_codes 前缀构造性一致,无别名层。
-// 重试成功节点展示"修复了什么错误"(原始上下文错误的码)+ 个数。
+// (标题, 该节点的子行期望; null = 无子行[仅亲和直达])
+// 键名=快照字段名,与后端 error_codes/deploys 前缀构造性一致,无别名层。
+// 重试节点的子行 = 错误码 + from→to 边;无重试节点的子行 = 错误码 + 失败部署。
 const rbExpect = [
   ['debug.rollback.miss',        'WeirdModelError'],
   ['debug.rollback.inert',       'InputTokenExceeded'],
   ['debug.rollback.no_target',   'InputTokenExceeded'],
-  ['debug.rollback.selected',    null],
+  ['debug.rollback.selected',    'd-small→d-big'],
   ['debug.rollback.success',     'InputTokenExceeded'],
   ['debug.rollback.retry_error', 'internal HTTP(500)'],
   ['debug.rollback.guard_error', 'flow_control_timeout'],
@@ -159,8 +200,51 @@ if (rbHtml.includes('no per-model data')) fail('placeholder shown despite per-mo
 // 两条不变量均成立（fixture 满足 identify_total = miss+inert+no_target+selected 等）
 if (!rbHtml.includes('✓')) fail('invariant checkmarks missing');
 
-console.log('SMOKE OK: rowspan grouped table (in-flight style), static rollback state line, toggle fully removed');
-console.log('SMOKE OK: rollback tree — codes under all 6 error headers + retry-success fixed-error sub-rows, alias-free keys');
+console.log('SMOKE OK: rowspan grouped table (in-flight style), state line moved to Debug pane, toggle fully removed');
+// 事件表/迁移矩阵已撤销(信息并入各标题的部署子行)——断言其绝迹
+if (rbHtml.includes('events_title') || rbHtml.includes('matrix_title')) fail('events/matrix sections must be gone');
+if (src.includes('_rbEvData') || src.includes('_rbEventsApply')) fail('events handlers must be gone');
+
+// 维测渲染:窗口收敛率 / 池状态 / 自检表单
+if (!rbHtml.includes('debug.rollback.conv_windows')) fail('convergence windows section missing');
+if (!rbHtml.includes('debug.rollback.selftest_title')) fail('self-test form missing');
+if (!src.includes('window._rbSelfTest')) fail('self-test handler missing');
+
+// 部署维度子行(事件表撤销后信息的去向):
+// 无重试节记失败部署(mono d-xxx);重试节记 from→to 边
+const nodeWith = (label) => nodes.find((n) => n.includes(label)) || '';
+if (!nodeWith('debug.rollback.miss').includes('>d-small<')) fail('miss node: failed-deployment sub-row missing');
+if (!nodeWith('debug.rollback.inert').includes('>d-small<')) fail('inert node: failed-deployment sub-row missing');
+if (!nodeWith('debug.rollback.success').includes('d-small→d-big')) fail('success node: from→to edge sub-row missing');
+if (!nodeWith('debug.rollback.retry_error').includes('d-small→d-bad')) fail('retry_error node: from→to edge sub-row missing');
+if (!nodeWith('debug.rollback.guard_error').includes('d-small→d-queue')) fail('guard_error node: from→to edge sub-row missing');
+if (!nodeWith('debug.rollback.no_fallback').includes('>d-small<')) fail('no_fallback node: failed-deployment sub-row missing');
+// 嵌套层级:有码节的边带 rb-tree-edge(归属该错误码,深一层);
+// 已选目标(无码决策)的边留在码层级(无 rb-tree-edge)
+if (!/rb-tree-edge[^>]*>.*d-small→d-big/.test(nodeWith('debug.rollback.success'))) fail('success edge must nest under its code (rb-tree-edge)');
+if (nodeWith('debug.rollback.selected').includes('rb-tree-edge')) fail('selected edges sit at code level (no rb-tree-edge)');
+console.log('SMOKE OK: rollback tree — code sub-rows + deploy sub-rows (from / from→to) under all headers, alias-free keys');
+// 池状态节(可折叠树):池头带 总/已配置/未配置 计数,子行按部署;
+// 数值为紧凑格式(200K/1M),未配置显示 —,停用带标记
+if (!rbHtml.includes('debug.rollback.pools_title')) fail('pool states section missing');
+if (!rbHtml.includes('debug.rollback.state_active')) fail('active state rendered');
+if (!rbHtml.includes('debug.rollback.state_rescue')) fail('rescue state rendered');
+if (!rbHtml.includes('debug.rollback.pool_counts')) fail('pool counts line missing');
+// 池头计数行存在(桩返回 key 原文;真实插值文案由 e2e 用真 i18n 验证)
+if (!rbHtml.includes('debug.rollback.pool_counts')) fail('pool counts line rendered');
+// 200K 紧凑值 + 原始行
+if (!rbHtml.includes('205K') && !rbHtml.includes('200K')) fail('compact 200K value rendered');
+if (!rbHtml.includes('1M') && !rbHtml.includes('1049K')) fail('compact 1M value rendered');
+if (!rbHtml.includes('d-undecl')) fail('per-deployment rows rendered');
+if (!rbHtml.includes('rb-field-name')) fail('field-name label missing on instance rows');
+if (!rbHtml.includes('max_context_tokens</span> 200K') && !rbHtml.includes('max_context_tokens</span> 205K')) fail('field name prefixes the value');
+if (!rbHtml.includes('—')) fail('unconfigured dash rendered');
+if (!rbHtml.includes('debug.rollback.disabled')) fail('disabled marker rendered');
+// 可折叠结构:池状态节内 rb-tree-node(树已在其它节存在,校验本节 head 含 onclick)
+const poolsSeg = rbHtml.split('debug.rollback.pools_title')[1] || '';
+if (!poolsSeg.includes('rb-tree-head')) fail('collapsible pool head missing');
+if (!poolsSeg.includes("toggle('rb-open')") && !poolsSeg.includes('toggle(\'rb-open\')')) fail('collapse toggle wired');
+console.log('SMOKE OK: diagnostics — pool states (collapsible), hourly convergence, deploy sub-rows, self-test form');
 
 // ── 4. KVC DFX 表:Detail 列 + 错误详情链接(与主日志页同款) ─────
 // 提取块引用闭包变量 debugEnabled / promptLogEnabled → 以参数注入。

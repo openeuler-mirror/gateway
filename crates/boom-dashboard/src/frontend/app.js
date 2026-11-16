@@ -3187,7 +3187,8 @@
           const v = Number(stats[eventKey] || 0);
           const avg = stats.avg_retry_ms;
           const errorCodes = stats.error_codes || {};
-          return { m, v, avg, errorCodes };
+          const deploys = stats.deploys || {};
+          return { m, v, avg, errorCodes, deploys };
         })
         .filter(e => e.v > 0)
         .sort((a, b) => b.v - a.v);
@@ -3213,20 +3214,50 @@
           // Backend stores as "{event}:{code}" in one map; frontend
           // filters by "{eventKey}:" prefix and strips it for display.
           {
-            // Backend error_codes keys are the SNAPSHOT FIELD NAMES
-            // ("identify_miss:InputTokenExceeded", "retry_success:…" …) —
-            // exactly this tree's eventKey, so the prefix match is by
-            // construction (no alias layer; the composite recording methods
-            // on RollbackStats are the only producers).
+            // Backend keys are the SNAPSHOT FIELD NAMES — exactly this
+            // tree's eventKey, so the prefix match is by construction.
+            // error_codes: "{event}:{code}"; deploys (JOINT): "{event}:
+            // {code}|{from}→{to}" — edges nest UNDER their error code
+            // (truthful attribution in multi-code nodes). Codeless edges
+            // (fallback_selected decision) sit at the code level.
             const prefix = eventKey + ':';
+            const parseDeploys = () => Object.entries(e.deploys || {})
+              .filter(([k, v]) => k.startsWith(prefix) && v > 0)
+              .map(([k, v]) => {
+                const rest = k.slice(prefix.length);
+                const bar = rest.indexOf('|');
+                return bar < 0 ? [rest, '', v] : [rest.slice(0, bar), rest.slice(bar + 1), v];
+              });
+            const edgeRows = parseDeploys();
             const codes = Object.entries(e.errorCodes)
               .filter(([k, v]) => k.startsWith(prefix) && v > 0)
               .map(([k, v]) => [k.slice(prefix.length), v])
               .sort((a, b) => b[1] - a[1]);
+            const renderedCodes = new Set(codes.map(([c]) => c));
             for (const [code, cv] of codes) {
               html += '<div class="rb-tree-child rb-tree-sub">' +
                 '<span class="rb-tree-model">' + esc(code) + '</span>' +
                 '<span class="rb-tree-val">' + cv + '</span>' +
+              '</div>';
+              // 归属于此错误码的部署边:嵌套一层(mono)
+              const nested = edgeRows
+                .filter(([c]) => c === code)
+                .sort((a, b) => b[2] - a[2]);
+              for (const [, edge, dv] of nested) {
+                html += '<div class="rb-tree-child rb-tree-sub rb-tree-edge">' +
+                  '<span class="rb-tree-model mono">' + esc(edge) + '</span>' +
+                  '<span class="rb-tree-val">' + dv + '</span>' +
+                '</div>';
+              }
+            }
+            // 无码边(selected 决策)与孤儿边(码被封顶丢弃):码层级展示
+            const topEdges = edgeRows
+              .filter(([c]) => !renderedCodes.has(c))
+              .sort((a, b) => b[2] - a[2]);
+            for (const [, edge, dv] of topEdges) {
+              html += '<div class="rb-tree-child rb-tree-sub">' +
+                '<span class="rb-tree-model mono rb-tree-deploy">' + esc(edge) + '</span>' +
+                '<span class="rb-tree-val">' + dv + '</span>' +
               '</div>';
             }
           }
@@ -3275,8 +3306,104 @@
         direct: direct.toLocaleString(), success: success.toLocaleString(),
       }) + '</p>';
     }
+
+    // ── 池状态(可折叠树,rb-tree 同款交互):池头 = 模型+状态+
+    // 总数/已配置/未配置(为后续 rollback 策略预留同构计数位——
+    // 届时每策略一组计数);展开 = 每个部署的原始声明配置。
+    // 数值用紧凑格式(200K/1M);状态判定仅计启用行,原始行展示全部。
+    const pools = data.pools || [];
+    if (pools.length) {
+      const stateKey = { active: "debug.rollback.state_active", rescue: "debug.rollback.state_rescue", single: "debug.rollback.state_single", unconfigured: "debug.rollback.state_unconfigured" };
+      const fmtCtx = (v) => v == null ? null
+        : (v >= 1000000 && v % 1000000 === 0) ? (v / 1000000) + "M"
+        : v >= 1000 ? Math.round(v / 1000) + "K"
+        : String(v);
+      html += '<div class="rb-tree-section">' + t("debug.rollback.pools_title") + '</div>';
+      html += '<div class="rb-tree">';
+      for (const p of pools) {
+        const deps = p.deployments || [];
+        const configured = deps.filter((d) => d.max_context_tokens != null).length;
+        const label = stateKey[p.state] ? t(stateKey[p.state]) : p.state;
+        const cls = (p.state === "active" || p.state === "rescue") ? "rb-state-on" : "rb-state-dim";
+        html += '<div class="rb-tree-node">' +
+          '<div class="rb-tree-head" onclick="this.parentElement.classList.toggle(\'rb-open\')">' +
+            '<span class="rb-tree-arrow">' + (deps.length ? '▸' : '·') + '</span>' +
+            '<span class="rb-tree-label">' + esc(p.model) +
+              ' <span class="rb-state ' + cls + '">' + esc(label) + '</span></span>' +
+            '<span class="rb-tree-count">' + esc(t("debug.rollback.pool_counts", {
+              total: deps.length, configured, unconfigured: deps.length - configured,
+            })) + '</span>' +
+          '</div><div class="rb-tree-children">';
+        for (const d of deps) {
+          const val = fmtCtx(d.max_context_tokens);
+          // 字段名:值 —— 维测形态,后续策略新增字段按同构行追加
+          html += '<div class="rb-tree-child">' +
+            '<span class="rb-tree-model mono">' + esc(d.deployment_id || "-") +
+              (d.enabled === false ? ' <span class="badge badge-blocked">' + esc(t("debug.rollback.disabled")) + '</span>' : '') + '</span>' +
+            '<span class="rb-tree-val">' + (val != null
+              ? '<span class="rb-field-name">max_context_tokens</span> ' + esc(val)
+              : '<span class="muted">—</span>') + '</span>' +
+          '</div>';
+        }
+        html += '</div></div>';
+      }
+      html += '</div>';
+    }
+
+    // ── 维测①:窗口化收敛率(1h 槽,墙钟对齐)── 生命周期累计值会被
+    // 冷 trie 期的重试长期压低;窗口化回答"现在是否在改善"。
+    const wins = (data.convergence_windows || []).slice(-24);
+    if (wins.length) {
+      html += '<div class="rb-tree-section">' + t("debug.rollback.conv_windows") + '</div>';
+      html += '<table class="data-table rb-mini-table"><thead><tr>' +
+        '<th>' + t("debug.rollback.conv_hour") + '</th><th class="num">' + t("debug.rollback.conv_direct") + '</th>' +
+        '<th class="num">' + t("debug.rollback.conv_retry") + '</th><th class="num">' + t("debug.rollback.convergence") + '</th></tr></thead><tbody>';
+      for (const w of wins) {
+        const total = w.direct + w.retry;
+        const pct = total > 0 ? Math.round(w.direct * 100 / total) : null;
+        const hourLabel = new Date(w.hour * 3600 * 1000).toISOString().slice(11, 13) + ":00";
+        html += '<tr><td class="mono">' + hourLabel + '</td><td class="num">' + w.direct + '</td><td class="num">' + w.retry + '</td>' +
+          '<td class="num">' + (pct === null ? "—" : pct + '%') + '</td></tr>';
+      }
+      html += '</tbody></table>';
+    }
+
+    // ── 维测④:识别自检——新报错形态离线验证,零副作用。
+    html += '<div class="rb-tree-section">' + t("debug.rollback.selftest_title") + '</div>';
+    html += '<div class="rb-selftest"><p class="kcs-breakdown">' + t("debug.rollback.selftest_hint") + '</p>' +
+      '<textarea id="rb-st-body" rows="3" style="width:100%;font-family:var(--mono);font-size:12px" placeholder="' + t("debug.rollback.selftest_placeholder") + '"></textarea>' +
+      '<div style="display:flex;gap:8px;margin-top:6px;align-items:center">' +
+      '<input id="rb-st-status" type="number" value="400" min="100" max="599" style="width:80px" class="search-input">' +
+      '<button class="btn-small btn-primary" onclick="window._rbSelfTest()">' + t("debug.rollback.selftest_run") + '</button>' +
+      '<span id="rb-st-result" style="font-size:12px"></span></div></div>';
+
     wrap.innerHTML = html;
   }
+
+  // 维测④的后端调用:POST /admin/stats/rollback/self-test(零副作用)。
+  window._rbSelfTest = async () => {
+    const body = document.getElementById("rb-st-body");
+    const statusEl = document.getElementById("rb-st-status");
+    const out = document.getElementById("rb-st-result");
+    if (!body || !out) return;
+    try {
+      const d = await api("/admin/stats/rollback/self-test", {
+        method: "POST", skipConfirm: true,
+        body: JSON.stringify({ status: Number(statusEl.value) || 400, body: body.value }),
+      });
+      if (d.matched) {
+        out.innerHTML = '<span style="color:var(--primary)">✓ ' + esc(t("debug.rollback.selftest_matched", {
+          req: d.requested_tokens == null ? "?" : d.requested_tokens,
+          max: d.max_tokens == null ? "?" : d.max_tokens,
+        })) + '</span>';
+      } else {
+        out.innerHTML = '<span style="color:var(--danger)">✗ ' + esc(t("debug.rollback.selftest_unmatched")) + '</span>';
+      }
+      out.title = t("debug.rollback.selftest_code_title", { code: d.code || "-" });
+    } catch (err) {
+      out.textContent = err.message;
+    }
+  };
 
   // ── KVC Hit Calibration (predicted trie hit vs actual cached_tokens) ──
   // Loads every block on the KVC AWARE pane. Called on pane entry and
@@ -5690,42 +5817,10 @@
   //   fully configured + multiple tiers → "active"; single tier → "no
   //   fallback target". Pure display layer — data stays one row per
   //   deployment, row rendering unchanged.
-  // Rollback pool STATE LINE (static — no toggle). The max_context_tokens
-  // declaration is the sole participation signal. Four states:
-  //   active · N tiers A→B     ≥2 distinct declared tiers
-  //   rescue · 1 tier           1 declared tier + undeclared instances
-  //                             (their failures are rescued; they are
-  //                             never fallback targets)
-  //   no larger tier            all declared, single tier
-  //   unconfigured              no instance declared
-  function fmtTier(v) {
-    if (v >= 1000000 && v % 1000000 === 0) return (v / 1000000) + "M";
-    if (v >= 1000) return Math.round(v / 1000) + "K";
-    return String(v);
-  }
-  function rollbackPoolState(rows) {
-    const declared = rows.filter((m) => m.max_context_tokens != null);
-    if (declared.length === 0) {
-      return '<span class="rb-state rb-state-dim">' + esc(t("models.rollback.state_unconfigured")) + '</span>';
-    }
-    const tiers = [...new Set(declared.map((m) => m.max_context_tokens))].sort((a, b) => a - b);
-    const undeclared = rows.length - declared.length;
-    const suffix = undeclared > 0
-      ? ' <span class="rb-state-note">' + esc(t("models.rollback.mixed_note", { n: undeclared })) + '</span>'
-      : '';
-    if (tiers.length >= 2) {
-      return '<span class="rb-state rb-state-on">'
-        + esc(t("models.rollback.state_active", { n: tiers.length, tiers: tiers.map(fmtTier).join("→") }))
-        + suffix + '</span>';
-    }
-    if (undeclared > 0) {
-      return '<span class="rb-state rb-state-on">'
-        + esc(t("models.rollback.state_rescue", { tier: fmtTier(tiers[0]) }))
-        + suffix + '</span>';
-    }
-    return '<span class="rb-state rb-state-dim">'
-      + esc(t("models.rollback.state_single", { tier: fmtTier(tiers[0]) })) + '</span>';
-  }
+  // NOTE: the per-pool rollback state line LIVES IN THE DEBUG → ROLLBACK
+  // pane now ("池状态" section, computed server-side by the stats
+  // endpoint from the deployment rows) — the Models page shows only the
+  // model identity. See renderRollbackStats.
 
   function renderModelsTable(models, aliasesMap) {
     // In-flight-table style (Stats page): block = model (rowspan identity
@@ -5747,16 +5842,14 @@
       <tbody>
       ${order.map((name, groupIdx) => {
         const rows = byName[name];
-        const zebra = groupIdx % 2 === 1 ? " dep-alt" : "";
+        const zebra = groupIdx % 2 === 1 ? " grp-b" : " grp-a";
         const vendor = vendorOf(name);
-        const state = rollbackPoolState(rows);
         const warnCount = rows.filter((m) => !m.enabled && m.auto_disabled).length;
         const modelCell = `<td rowspan="${rows.length + warnCount}" class="model-block${zebra}">
           <img class="vendor-logo model-vendor-logo" src="/dashboard/assets/vendor/${vendor}" alt="${vendor}">
           <div class="model-id-block">
             <span class="model-name">${esc(name)}</span>
             <span class="model-count">${rows.length} ${esc(t("models.pool.instances"))}</span>
-            ${state}
           </div>
         </td>`;
 

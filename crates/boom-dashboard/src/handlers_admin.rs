@@ -4417,6 +4417,42 @@ pub async fn get_rebalance_moves(
 // Rollback Stats (global counters, process lifetime)
 // ═══════════════════════════════════════════════════════════
 
+/// 维测:识别自检——把上游报错 body 对着当前生效 patterns 跑一遍识别
+/// 与码提取,离线验证新报错形态是否会被命中,零副作用(不写任何计数)。
+#[derive(serde::Deserialize)]
+pub struct RollbackSelfTestRequest {
+    /// Upstream HTTP status (default 400 — the L1 status gate).
+    pub status: Option<u16>,
+    /// Raw upstream error body.
+    pub body: String,
+}
+
+pub async fn rollback_self_test(
+    _session: AdminSession,
+    Extension(state): Extension<std::sync::Arc<DashboardState>>,
+    axum::Json(req): axum::Json<RollbackSelfTestRequest>,
+) -> Response {
+    let status = req.status.unwrap_or(400);
+    let patterns = state
+        .rollback_patterns
+        .read()
+        .map(|g| g.clone())
+        .unwrap_or_default();
+    let m = boom_core::context_error::identify(status, &req.body, &patterns);
+    let e = boom_core::GatewayError::UpstreamError { status, message: req.body.clone() };
+    let code = boom_core::context_error::error_code_of(&e);
+    Json(json!({
+        "matched": m.matched,
+        "requested_tokens": m.requested_tokens,
+        "max_tokens": m.max_tokens,
+        "code": code,
+        "pattern_count": patterns.len(),
+    }))
+    .into_response()
+}
+
+
+
 pub async fn get_rollback_stats(
     _session: AdminSession,
     Extension(state): Extension<Arc<DashboardState>>,
@@ -4424,7 +4460,82 @@ pub async fn get_rollback_stats(
     // Snapshot field names are the API contract. Invariants:
     //   identify_total == identify_miss + pool_inert + no_target + fallback_selected
     //   fallback_selected == retry_success + retry_error + guard_error
-    Json(json!(state.rollback_stats.snapshot())).into_response()
+    //
+    // `pools` carries the per-model rollback POOL STATE (moved here from
+    // the Models page): declaration is the sole participation signal, so
+    // the state is derived from the deployment rows — enabled rows only
+    // (a disabled instance is not routable, it is neither a tier nor a
+    // rescue target). Computed server-side; absent rows → empty list.
+    let mut v = serde_json::to_value(state.rollback_stats.snapshot())
+        .unwrap_or_else(|_| serde_json::json!({}));
+    let pools: Vec<serde_json::Value> = match &state.db_pool {
+        Some(db_pool) => match boom_routing::DeploymentStore::list_all_db(db_pool).await {
+            Ok(rows) => {
+                // Group by model (rows arrive model-sorted), enabled only.
+                use std::collections::BTreeMap;
+                let mut by_model: BTreeMap<String, Vec<&boom_routing::DeploymentRow>> =
+                    BTreeMap::new();
+                for r in &rows {
+                    if r.enabled.unwrap_or(true) {
+                        by_model.entry(r.model_name.clone()).or_default().push(r);
+                    }
+                }
+                by_model
+                    .into_iter()
+                    .map(|(model, rs)| {
+                        // State verdict from ROUTABLE rows only (a disabled
+                        // instance is neither a tier nor a rescue target);
+                        // the deployment list is RAW — every row shown with
+                        // its original declaration value.
+                        let enabled_rows: Vec<&boom_routing::DeploymentRow> =
+                            rs.iter().copied().filter(|r| r.enabled.unwrap_or(true)).collect();
+                        let tiers: Vec<i64> = {
+                            let mut v: Vec<i64> = enabled_rows
+                                .iter()
+                                .filter_map(|r| r.max_context_tokens)
+                                .collect();
+                            v.sort_unstable();
+                            v.dedup();
+                            v
+                        };
+                        let undeclared = enabled_rows.len() - declared_len(&enabled_rows);
+                        let state = if tiers.is_empty() {
+                            "unconfigured"
+                        } else if tiers.len() >= 2 {
+                            "active"
+                        } else if undeclared > 0 {
+                            "rescue"
+                        } else {
+                            "single"
+                        };
+                        let deployments: Vec<serde_json::Value> = rs
+                            .iter()
+                            .map(|r| {
+                                json!({
+                                    "deployment_id": r.deployment_id.clone().unwrap_or_else(|| r.id.to_string()),
+                                    "max_context_tokens": r.max_context_tokens,
+                                    "enabled": r.enabled.unwrap_or(true),
+                                })
+                            })
+                            .collect();
+                        json!({
+                            "model": model,
+                            "state": state,
+                            "deployments": deployments,
+                        })
+                    })
+                    .collect()
+            }
+            Err(_) => Vec::new(),
+        },
+        None => Vec::new(),
+    };
+    v["pools"] = json!(pools);
+    Json(v).into_response()
+}
+
+fn declared_len<'a>(rows: &[&'a boom_routing::DeploymentRow]) -> usize {
+    rows.iter().filter(|r| r.max_context_tokens.is_some()).count()
 }
 
 // ═══════════════════════════════════════════════════════════

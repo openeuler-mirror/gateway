@@ -1142,7 +1142,7 @@ async fn chat_completions_inner(
     macro_rules! rb_fail { ($err:expr, $stream:expr) => {{
         // Finalize FIRST so the audit row records the client-visible status
         // (400 passthrough for context errors), not the masked 502.
-        let rb_final = boom_rollback::finalize_error($err, rb_patterns, Some(&state.rollback_stats), Some(&resolved_model));
+        let rb_final = boom_rollback::finalize_error($err, rb_patterns, Some(&state.rollback_stats), Some(&resolved_model), deployment_id.as_deref());
         let partial_usage = provider_billing.actual_usage();
         settle_partial_provider_accounting(&mut plan_charge, &provider_billing);
         log_error_with_usage(&state, &identity, &model, api_path, $stream, start, &rb_final, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()), user_tags.clone(), partial_usage.as_ref(), None, schedule_policy.clone());
@@ -1207,7 +1207,8 @@ async fn chat_completions_inner(
           // while the other paths recorded "HTTP_400" — one request,
           // two different codes across tree sections.
           if e.context_error_match(rb_patterns).matched {
-            state.rollback_stats.record_pool_inert_identified(&resolved_model, &e);
+            state.rollback_stats
+                .record_pool_inert_identified(&resolved_model, &e, deployment_id.as_deref());
           }
         }
         rb_fail!(e, true) }
@@ -1430,7 +1431,8 @@ async fn chat_completions_inner(
           // while the other paths recorded "HTTP_400" — one request,
           // two different codes across tree sections.
           if e.context_error_match(rb_patterns).matched {
-            state.rollback_stats.record_pool_inert_identified(&resolved_model, &e);
+            state.rollback_stats
+                .record_pool_inert_identified(&resolved_model, &e, deployment_id.as_deref());
           }
         }
         rb_fail!(e, false) }
@@ -3824,7 +3826,7 @@ pub async fn messages(
     };
     macro_rules! rb_fail { ($err:expr, $stream:expr) => {{
         // Finalize FIRST so the audit row records the client-visible status.
-        let rb_final = boom_rollback::finalize_error($err, rb_patterns, Some(&state.rollback_stats), Some(&resolved_model));
+        let rb_final = boom_rollback::finalize_error($err, rb_patterns, Some(&state.rollback_stats), Some(&resolved_model), deployment_id.as_deref());
         crate::request_log::log_error_with_policy(&state, &identity, &model, "/v1/messages", $stream, start, &rb_final, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()), user_tags.clone(), schedule_policy.clone());
         write_prompt_log_error(
             &state,
@@ -3884,7 +3886,8 @@ pub async fn messages(
           // while the other paths recorded "HTTP_400" — one request,
           // two different codes across tree sections.
           if e.context_error_match(rb_patterns).matched {
-            state.rollback_stats.record_pool_inert_identified(&resolved_model, &e);
+            state.rollback_stats
+                .record_pool_inert_identified(&resolved_model, &e, deployment_id.as_deref());
           }
         }
         rb_fail!(e, true) }
@@ -4084,7 +4087,8 @@ pub async fn messages(
           // while the other paths recorded "HTTP_400" — one request,
           // two different codes across tree sections.
           if e.context_error_match(rb_patterns).matched {
-            state.rollback_stats.record_pool_inert_identified(&resolved_model, &e);
+            state.rollback_stats
+                .record_pool_inert_identified(&resolved_model, &e, deployment_id.as_deref());
           }
         }
         rb_fail!(e, false) }
@@ -4910,7 +4914,7 @@ pub async fn responses(
     // the macro can expand on both the first-error and retry-error paths.
     macro_rules! rb_fail { ($err:expr, $stream:expr) => {{
         // Finalize FIRST so the audit row records the client-visible status.
-        let rb_final = boom_rollback::finalize_error($err, rb_patterns, Some(&state.rollback_stats), Some(&resolved_model));
+        let rb_final = boom_rollback::finalize_error($err, rb_patterns, Some(&state.rollback_stats), Some(&resolved_model), deployment_id.as_deref());
         crate::request_log::log_error_with_policy(&state, &identity, &model, "/v1/responses", $stream, start, &rb_final, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()), user_tags.clone(), schedule_policy.clone());
         write_prompt_log_error(
             &state,
@@ -4992,7 +4996,8 @@ pub async fn responses(
           // while the other paths recorded "HTTP_400" — one request,
           // two different codes across tree sections.
           if e.context_error_match(rb_patterns).matched {
-            state.rollback_stats.record_pool_inert_identified(&resolved_model, &e);
+            state.rollback_stats
+                .record_pool_inert_identified(&resolved_model, &e, deployment_id.as_deref());
           }
         }
         rb_fail!(e, true) }
@@ -5206,7 +5211,8 @@ pub async fn responses(
           // while the other paths recorded "HTTP_400" — one request,
           // two different codes across tree sections.
           if e.context_error_match(rb_patterns).matched {
-            state.rollback_stats.record_pool_inert_identified(&resolved_model, &e);
+            state.rollback_stats
+                .record_pool_inert_identified(&resolved_model, &e, deployment_id.as_deref());
           }
         }
         rb_fail!(e, false) }

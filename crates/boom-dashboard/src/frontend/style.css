@@ -3556,6 +3556,8 @@ input[list] {
   font-variant-numeric: tabular-nums;
 }
 .rb-tree-sub { padding-left: 52px; }
+/* 归属于错误码的部署边:再深一层 */
+.rb-tree-edge { padding-left: 74px; }
 .rb-tree-sub .rb-tree-model { color: var(--text3); font-size: 11px; }
 .rb-tree-avg {
   font-size: 11px; color: var(--primary); margin-left: 6px;
@@ -3571,11 +3573,10 @@ input[list] {
 .models-table tbody tr:nth-child(even) td { background: var(--surface); } /* kill global */
 .models-table tbody tr:nth-child(odd) td { background: var(--surface); }
 
-/* Model identity cell (rowspan block, in-flight-table style) */
+/* Model identity cell (rowspan block) — zebra shares the GROUP shade
+   (same grp-a/grp-b scheme as the Stats inflight table), no accent line. */
 .models-table td.model-block {
-  background: var(--surface3) !important;
-  border-left: 3px solid var(--primary);
-  vertical-align: top;
+  vertical-align: middle;   /* 池名称在 rowspan 块内竖向居中 */
   width: 1%;
   white-space: nowrap;
 }
@@ -3583,21 +3584,29 @@ input[list] {
 .model-id-block {
   display: inline-flex; flex-direction: column; gap: 1px;
   line-height: 1.3; vertical-align: middle; margin-left: 6px;
+  justify-content: center;
 }
 .model-name { font-size: 12px; font-weight: 600; color: var(--text); }
 .model-count { font-size: 10px; color: var(--text3); }
 
-/* Rollback state line — static text (no toggle): declaration-driven */
-.rb-state { font-size: 10px; color: var(--text2); white-space: nowrap; }
+/* Rollback state text — raw-data pool table (block = model, row = deploy) */
+/* 池状态标签:加大加粗(池头核心信息,需一眼可辨) */
+.rb-state { font-size: 13px; font-weight: 700; color: var(--text2); white-space: nowrap; }
 .rb-state-on { color: var(--primary); }
 .rb-state-dim { color: var(--text3); }
-.rb-state-note { color: var(--text3); }
+/* 池状态实例行的字段名标签(field: value 维测形态) */
+.rb-field-name {
+  color: var(--text3); font-family: var(--mono);
+  font-size: 10px; margin-right: 4px;
+}
 
-/* Group zebra: JS-assigned class alternating per model block */
-.models-table tr.pool-dep > td { background: var(--surface); }
-.models-table tr.pool-dep.dep-alt > td { background: var(--surface2); }
+/* Group zebra — SAME classes and shades as the Stats inflight table
+   (grp-a/grp-b alternate per model block, model-block cell included). */
+.models-table tr.pool-dep.grp-a > td,
+.models-table tr.pool-dep.grp-a td.model-block { background: var(--surface); }
+.models-table tr.pool-dep.grp-b > td,
+.models-table tr.pool-dep.grp-b td.model-block { background: var(--surface2); }
 .models-table tr.pool-dep:hover > td { background: var(--surface3); }
-.models-table tr.pool-dep.dep-alt:hover > td { background: var(--surface3); }
 
 /* Disabled / warning rows keep their tints */
 .models-table tr.pool-dep.model-row-disabled > td {
@@ -3608,6 +3617,7 @@ input[list] {
   background: rgba(255,80,80,.08) !important;
   padding: 3px 14px; font-size: 11px; color: var(--danger);
 }
+.models-table tr.model-row-warning td { background: rgba(255,80,80,.08) !important; }
 
 /* Font sizes: tighter for density */
 .models-table th { font-size: 11px; }
