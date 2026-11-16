@@ -165,7 +165,10 @@
     checkSession();
   });
 
-  // Fetch /health once on load and inject the version into both sidebars.
+  // Fetch /health once on load and inject the version into both sidebars
+  // and the instance id into the admin sidebar — behind an LB each page
+  // load can land on a different instance, and the admin sidebar's
+  // per-instance stats pages need the "which instance am I on" context.
   // /health is unauthenticated (liveness endpoint), so this works pre-login.
   async function initSidebarVersion() {
     try {
@@ -176,6 +179,9 @@
       const v = "v" + String(data.version);
       document.getElementById("sidebar-version-user").textContent = v;
       document.getElementById("sidebar-version-admin").textContent = v;
+      if (data.instance_id) {
+        document.getElementById("sidebar-instance-admin").textContent = data.instance_id;
+      }
     } catch {
       // Network/probe failure — leave the placeholder; not worth surfacing.
     }

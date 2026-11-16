@@ -60,7 +60,13 @@
 
 ## 网关基础能力
 
-统一接入 20+ 上游服务商；litellm 密钥体系兼容；Anthropic 原生 `/v1/messages`（Claude Code / opencode 可直连）；OpenAI Responses API（`/v1/responses` + `/responses` 别名，Codex CLI 可直连——`namespace` 工具自动拍平、托管工具宽容丢弃并以 `x-boom-dropped-tools` 响应头透出信号、`previous_response_id` 有状态续接）；Direct Synthesis Workflow（并发调用多个 panel 模型后由 aggregator 合成标准 OpenAI 响应）；公开模型、模型别名与 `"*"` 兜底路由；业务配置 DB 权威（模型 / 套餐 / 别名 / 拦截规则 / Workflow / 计费模板全部面板 CRUD，写完即生效，YAML 仅作首次 seed 与回滚工件）；Web 管理面板（密钥 / 模型 / 套餐 / 配额 / 日志 / 实时在途与统计）；SIGHUP / API / 面板按钮零停机热加载。
+- **多协议接入**：统一接入 20+ 上游服务商；litellm 密钥体系兼容
+- **原生协议端点**：Anthropic `/v1/messages`（Claude Code / opencode 直连）；OpenAI Responses API `/v1/responses`（Codex CLI 直连）
+- **模型路由**：公开模型、模型别名与 `"*"` 兜底路由；Direct Synthesis Workflow（多 panel 模型并发调用后聚合）
+- **配置 DB 权威**：模型 / 套餐 / 别名 / 拦截规则 / Workflow / 计费模板全部面板 CRUD、写完即生效；YAML 仅作首次 seed 与回滚工件
+- **Web 管理面板**：密钥 / 模型 / 套餐 / 配额 / 日志 / 实时在途与统计
+- **零停机热加载**：SIGHUP / API / 面板按钮触发
+- **多实例**：共享 DB 零配置自适应（详见下方专节）
 
 ---
 
@@ -190,6 +196,35 @@ curl http://localhost:4000/v1/chat/completions \
 ### 容器部署
 
 容器化部署方案正在完善中，当前请使用源码部署。
+
+---
+
+## 多实例部署
+
+多个网关实例指向同一个 `database_url` 即自动组成多实例：实例注册、配置广播、限流计费同步零配置开启，单实例部署行为不变。
+
+> **当前一致性边界（如实说明）**：限流 / 计费当前为**基础定时增量同步**（默认 60s，`quota_sync.interval_secs` 可调 30–600s），**不支持实时一致性**——同步周期内各实例的本地增量互不可见，跨实例超限判定存在至多一个周期的宽限窗口。判定口径默认取本地增量 + 自身上推的全局基数，需要纳入同伴增量时在面板 Quota 页打开 `decision_base_shared`（同样滞后至多一个周期）。业务配置广播 ≤5s，同为最终一致。
+
+### 实例 id 与启动判重
+
+- id 默认派生 `server.host:server.port`，跨重启保持稳定，承载配额水位与审计归因；`host: 0.0.0.0` 时派生值无机器区分度，多实例建议显式命名
+- 启动时经共享 DB 单事务判重（心跳 15s、60s 判定过期）：与存活实例同 id → 启动失败并报出持有者信息；持有者已死 → 自动接管，无需人工清理
+
+```yaml
+server:
+  host: 0.0.0.0
+  port: 4000
+  instance_id: gw-node-1   # 可选；缺省派生为 "host:port"
+```
+
+### 共享与本地
+
+- **自动共享**：业务配置（≤5s 广播）、审计日志与数据看板（按实例归因与分解）、限流计费增量上推
+- **实例本地**：并发上限、KVC 调度 trie、调度 / 流控统计、Logs 页运行时开关
+
+### 接入新实例
+
+复制部署 → 改 `server.host/port` 或显式配 `instance_id`（保证唯一）→ 指向同一 DB 启动，数据看板随即出现新实例条目。
 
 ---
 

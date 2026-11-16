@@ -156,6 +156,24 @@ type InstanceTuple = (
     chrono::DateTime<chrono::Utc>,
 );
 
+/// InstanceTuple + the DB-side staleness verdict appended last. Must stay a
+/// TOP-LEVEL tuple: sqlx decodes a nested tuple as a PG RECORD/composite,
+/// which a flat multi-column SELECT never produces — a row actually
+/// returning from these queries is the only path that exercises the decode,
+/// so the mismatch only surfaces against a warm table (empty-table boots
+/// fetch zero rows and never decode).
+type InstanceReadTuple = (
+    String,
+    String,
+    i64,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    chrono::DateTime<chrono::Utc>,
+    chrono::DateTime<chrono::Utc>,
+    bool,
+);
+
 /// Boot-time registration of the stable instance id. Exactly one boot owns
 /// an id: fresh ids insert, provably dead holders are taken over (row
 /// rewritten in place — the id never accumulates one row per restart),
@@ -168,7 +186,7 @@ type InstanceTuple = (
 pub async fn register(pool: &PgPool, info: &InstanceInfo) -> Result<Registration, RegisterError> {
     let mut tx = pool.begin().await.map_err(RegisterError::Db)?;
 
-    let existing: Option<(InstanceTuple, bool)> = sqlx::query_as::<_, (InstanceTuple, bool)>(
+    let existing: Option<InstanceReadTuple> = sqlx::query_as::<_, InstanceReadTuple>(
         &format!(
             r#"SELECT {}, (heartbeat_at < NOW() - ($2 * interval '1 second'))
                FROM boom_instance_state
@@ -213,8 +231,8 @@ pub async fn register(pool: &PgPool, info: &InstanceInfo) -> Result<Registration
         return Ok(Registration::Registered);
     };
 
-    let (t, stale) = existing;
-    let (instance_id, hostname, pid, version, advertise_addr, snapshot, started_at, heartbeat_at) = t;
+    let (instance_id, hostname, pid, version, advertise_addr, snapshot, started_at, heartbeat_at, stale) =
+        existing;
     let read = InstanceRead {
         row: InstanceRow {
             instance_id,
@@ -279,7 +297,7 @@ async fn fetch_instance(
     pool: &PgPool,
     instance_id: &str,
 ) -> Result<Option<InstanceRead>, sqlx::Error> {
-    let row: Option<(InstanceTuple, bool)> = sqlx::query_as::<_, (InstanceTuple, bool)>(
+    let row: Option<InstanceReadTuple> = sqlx::query_as::<_, InstanceReadTuple>(
         &format!(
             r#"SELECT {}, (heartbeat_at < NOW() - ($2 * interval '1 second'))
                FROM boom_instance_state
@@ -291,22 +309,33 @@ async fn fetch_instance(
     .bind(INSTANCE_TTL_SECS as i64)
     .fetch_optional(pool)
     .await?;
-    Ok(row.map(|(t, stale)| {
-        let (instance_id, hostname, pid, version, advertise_addr, snapshot, started_at, heartbeat_at) = t;
-        InstanceRead {
-            row: InstanceRow {
-                instance_id,
-                hostname,
-                pid,
-                version,
-                advertise_addr,
-                snapshot,
-                started_at,
-                heartbeat_at,
-            },
+    Ok(row.map(
+        |(
+            instance_id,
+            hostname,
+            pid,
+            version,
+            advertise_addr,
+            snapshot,
+            started_at,
+            heartbeat_at,
             stale,
-        }
-    }))
+        )| {
+            InstanceRead {
+                row: InstanceRow {
+                    instance_id,
+                    hostname,
+                    pid,
+                    version,
+                    advertise_addr,
+                    snapshot,
+                    started_at,
+                    heartbeat_at,
+                },
+                stale,
+            }
+        },
+    ))
 }
 
 /// Outcome of a successful [`register`].

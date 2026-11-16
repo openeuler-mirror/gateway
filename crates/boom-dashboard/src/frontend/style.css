@@ -356,6 +356,15 @@ p.error { color: var(--danger); font-style: italic; margin: 0; }
   font-variant-numeric: tabular-nums;
   margin-bottom: 2px;
 }
+.sidebar-instance {
+  flex-basis: 100%;
+  font-size: 10px;
+  color: var(--sidebar-text);
+  opacity: .6;
+  font-variant-numeric: tabular-nums;
+  word-break: break-all;
+  margin-bottom: 2px;
+}
 
 /* ── Theme Toggle ───────────────────────────────────────── */
 .theme-toggle {
