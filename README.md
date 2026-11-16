@@ -60,7 +60,7 @@
 
 ## 网关基础能力
 
-统一接入 20+ 上游服务商；litellm 密钥体系兼容；Anthropic 原生 `/v1/messages`（Claude Code / opencode 可直连）；OpenAI Responses API（`/v1/responses` + `/responses` 别名，Codex CLI 可直连——`namespace` 工具自动拍平、托管工具宽容丢弃并以 `x-boom-dropped-tools` 响应头透出信号、`previous_response_id` 有状态续接）；Direct Synthesis Workflow（并发调用多个 panel 模型后由 aggregator 合成标准 OpenAI 响应）；公开模型、模型别名与 `"*"` 兜底路由；业务配置 DB 权威（模型 / 套餐 / 别名 / 拦截规则 / Workflow / 计费模板全部面板 CRUD，写完即生效，YAML 仅作首次 seed 与回滚工件）；Web 管理面板（密钥 / 模型 / 套餐 / 配额 / 日志 / 实时在途与统计）；SIGHUP / API / 面板按钮零停机热加载。
+统一接入 20+ 上游服务商；litellm 密钥体系兼容；Anthropic 原生 `/v1/messages`（Claude Code / opencode 可直连）；OpenAI Responses API（`/v1/responses` + `/responses` 别名，Codex CLI 可直连——`namespace` 工具自动拍平、托管工具宽容丢弃并以 `x-boom-dropped-tools` 响应头透出信号、`previous_response_id` 有状态续接）；Direct Synthesis Workflow（并发调用多个 panel 模型后由 aggregator 合成标准 OpenAI 响应）；公开模型、模型别名与 `"*"` 兜底路由；业务配置 DB 权威（模型 / 套餐 / 别名 / 拦截规则 / Workflow / 计费模板全部面板 CRUD，写完即生效，YAML 仅作首次 seed 与回滚工件）；Web 管理面板（密钥 / 模型 / 套餐 / 配额 / 日志 / 实时在途与统计）；SIGHUP / API / 面板按钮零停机热加载；多实例共享 DB 零配置自适应（实例注册判重、配置广播、配额增量同步，审计按实例归因，看板按实例分解）。
 
 ---
 
@@ -190,6 +190,56 @@ curl http://localhost:4000/v1/chat/completions \
 ### 容器部署
 
 容器化部署方案正在完善中，当前请使用源码部署。
+
+---
+
+## 多实例部署
+
+多实例机制**零配置自适应**：没有"集群模式"开关——多个网关实例指向同一个 `database_url`，实例注册、配置广播、配额同步即自动生效；单实例部署行为不变（也会在心跳表注册一行，无任何影响）。
+
+### 实例标识
+
+实例 id 用于配额同步水位、审计归属与按实例用量统计，**跨重启保持稳定**（每次启动换随机 id 会让历史用量无法归因，因此 id 从设计上就是稳定的）：
+
+- **默认自动派生**：`server.host:server.port`（YAML 监听地址拼装），单实例无需配置
+- **显式配置**：`server.instance_id`（可选）。生产多实例建议显式命名（如 `gw-shanghai-1`）——尤其 `host: 0.0.0.0` 时派生 id 没有机器区分度，两台同端口机器会得到相同 id；配置为空串会在启动时报错
+
+```yaml
+server:
+  host: 0.0.0.0
+  port: 4000
+  instance_id: gw-node-1   # 可选；缺省派生为 "host:port"
+```
+
+### 启动判重与自动接管
+
+实例启动时在共享 DB 上以单事务注册（`boom_instance_state` 心跳表，心跳 15s、60s 判定过期）：
+
+- 与**存活**实例 id 冲突（持有者心跳新鲜，或同主机且 pid 仍在运行）→ **启动失败**，报错包含持有者主机名 / pid / 最后心跳时间与处置指引
+- 持有者已死（心跳过期 ≥60s，或同主机 pid 已退出）→ **自动接管**该 id 并正常启动——崩溃重启的快速路径，无需人工清理残留行
+
+```
+Error: instance id registration failed: instance id '0.0.0.0:4000' is already
+held by hostname=worker-2 pid=12345 (last heartbeat 3s ago, ...). ... every
+instance needs a unique server.instance_id.
+```
+
+### 多实例下共享什么、各自独立什么
+
+| 连同一 DB 即自动共享 | 实例本地 |
+|---|---|
+| 业务配置（模型 / 套餐 / 密钥 / 拦截规则 / Workflow / 计费模板）：DB 权威，变更 ≤5s 广播全实例 | 并发上限 |
+| 审计日志与数据看板：请求日志按实例打标，看板天然全实例聚合，总览页可按实例分解 | KVC 调度 trie（各实例自学习） |
+| 限流 / 配额计数增量上推：每 `quota_sync.interval_secs`（默认 60s，钳制 30–600s） | 统计页调度 / 流控指标（本实例视角） |
+| 实例注册 / 心跳 | 运行时覆写开关（Logs 页快捷开关） |
+
+> 配额**判定**口径默认为本地（本地增量 + 自身上推的全局基数）；需要严格集群级配额判定时，在面板 Quota 页打开 `decision_base_shared`。
+
+### 接入一个新实例
+
+1. 复制部署（代码 + 配置）到新机器
+2. 修改 `server.host` / `server.port`，或显式配置 `server.instance_id`，确保 id 唯一
+3. `database_url` 指向同一个 DB，启动——数据看板的 "By Instance" 面板随即出现新实例的独立条目
 
 ---
 
