@@ -40,8 +40,9 @@ pub const CATEGORY_TRACE: &str = "trace";
 /// is atomic at row level so concurrent bumps never lose a count.
 ///
 /// A crash between business write and bump only delays propagation until
-/// the next bump of that category — the local instance already applied
-/// the change in memory, only peers lag.
+/// the next bump of that category (or the next periodic full reconcile,
+/// which re-asserts every category regardless of the counters) — the
+/// local instance already applied the change in memory, only peers lag.
 pub async fn bump(pool: &PgPool, category: &str) -> Result<(), sqlx::Error> {
     boom_core::gaussdb_upsert!(
         pool,

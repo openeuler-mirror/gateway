@@ -932,73 +932,59 @@ impl PlanStore {
     /// reading the survivors, so admission decisions continue on the old
     /// state while the diff applies. Explicit no-plan rows
     /// (plan_name NULL → Some(None)) keep their three-state meaning.
-    pub async fn reconcile_assignments_from_db(&self, pool: &sqlx::PgPool) {
-        match sqlx::query_as::<_, (String, Option<String>)>(
+    pub async fn reconcile_assignments_from_db(&self, pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
+        let rows = sqlx::query_as::<_, (String, Option<String>)>(
             r#"SELECT key_hash, plan_name FROM boom_key_plan_assignment"#,
         )
         .fetch_all(pool)
-        .await
-        {
-            Ok(rows) => {
-                let desired: std::collections::HashMap<String, Option<String>> =
-                    rows.into_iter().collect();
-                let stale: Vec<String> = self
-                    .key_assignments
-                    .iter()
-                    .map(|e| e.key().clone())
-                    .filter(|k| !desired.contains_key(k))
-                    .collect();
-                for key_hash in &stale {
-                    self.key_assignments.remove(key_hash);
-                }
-                for (key_hash, plan_name) in &desired {
-                    self.restore_assignment(key_hash, plan_name.as_deref());
-                }
-                tracing::info!(
-                    applied = desired.len(),
-                    removed = stale.len(),
-                    "Reconciled key→plan assignments from DB"
-                );
-            }
-            Err(e) => {
-                tracing::error!("Failed to reconcile key assignments: {}", e);
-            }
+        .await?;
+        let desired: std::collections::HashMap<String, Option<String>> =
+            rows.into_iter().collect();
+        let stale: Vec<String> = self
+            .key_assignments
+            .iter()
+            .map(|e| e.key().clone())
+            .filter(|k| !desired.contains_key(k))
+            .collect();
+        for key_hash in &stale {
+            self.key_assignments.remove(key_hash);
         }
+        for (key_hash, plan_name) in &desired {
+            self.restore_assignment(key_hash, plan_name.as_deref());
+        }
+        tracing::info!(
+            applied = desired.len(),
+            removed = stale.len(),
+            "Reconciled key→plan assignments from DB"
+        );
 
-        match sqlx::query_as::<_, (String, String)>(
+        let rows = sqlx::query_as::<_, (String, String)>(
             r#"SELECT team_id, plan_name FROM boom_team_plan_assignment"#,
         )
         .fetch_all(pool)
-        .await
-        {
-            Ok(rows) => {
-                let desired: std::collections::HashMap<String, String> =
-                    rows.into_iter().collect();
-                let stale: Vec<String> = self
-                    .team_assignments
-                    .iter()
-                    .map(|e| e.key().clone())
-                    .filter(|k| !desired.contains_key(k))
-                    .collect();
-                for team_id in &stale {
-                    self.team_assignments.remove(team_id);
-                }
-                for (team_id, plan_name) in &desired {
-                    self.restore_team_assignment(team_id, plan_name);
-                }
-                tracing::info!(
-                    applied = desired.len(),
-                    removed = stale.len(),
-                    "Reconciled team→plan assignments from DB"
-                );
-            }
-            Err(e) => {
-                tracing::error!("Failed to reconcile team assignments: {}", e);
-            }
+        .await?;
+        let desired: std::collections::HashMap<String, String> = rows.into_iter().collect();
+        let stale: Vec<String> = self
+            .team_assignments
+            .iter()
+            .map(|e| e.key().clone())
+            .filter(|k| !desired.contains_key(k))
+            .collect();
+        for team_id in &stale {
+            self.team_assignments.remove(team_id);
         }
+        for (team_id, plan_name) in &desired {
+            self.restore_team_assignment(team_id, plan_name);
+        }
+        tracing::info!(
+            applied = desired.len(),
+            removed = stale.len(),
+            "Reconciled team→plan assignments from DB"
+        );
 
         // Rows may have vanished with their plan (delete_plan_db cascades).
         self.cleanup_assignments();
+        Ok(())
     }
 
     /// Upsert a plan in DB (source='db') and update memory.

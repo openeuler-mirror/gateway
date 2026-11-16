@@ -232,6 +232,14 @@ pub struct SlidingWindowLimiter {
     /// When true, the sync cycle also pulls peer deltas into the global
     /// bases (shared enforcement). Default false → per-instance decisions.
     decision_shared: std::sync::atomic::AtomicBool,
+    /// Set when the heartbeat detects our instance registration was taken
+    /// over by another process. The id no longer belongs to this process;
+    /// writing delta/watermark rows under it would interleave two processes'
+    /// seq namespaces and break each other's ambiguous-failure recovery.
+    /// A sealed instance keeps serving traffic (that is the LB's call) but
+    /// never writes shared state again. Sticky by design — a process that
+    /// lost its identity does not get it back.
+    sealed: std::sync::atomic::AtomicBool,
 }
 
 /// Current `max_budget` period for one scope.
@@ -304,6 +312,7 @@ impl SlidingWindowLimiter {
             instance_id: RwLock::new(None),
             push_seq: std::sync::atomic::AtomicI64::new(0),
             decision_shared: std::sync::atomic::AtomicBool::new(false),
+            sealed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -353,6 +362,22 @@ impl SlidingWindowLimiter {
     pub fn decision_shared(&self) -> bool {
         self.decision_shared
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Permanently seal all shared-state writes after losing the instance
+    /// id (registration taken over by another process). Idempotent; called
+    /// by the heartbeat task. The sync cycle checks this on entry.
+    pub fn seal_push(&self) {
+        if !self.sealed.swap(true, std::sync::atomic::Ordering::Release) {
+            tracing::error!(
+                "quota delta pushes sealed — this process lost its instance \
+                 registration and must not write shared state anymore"
+            );
+        }
+    }
+
+    fn is_sealed(&self) -> bool {
+        self.sealed.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Build the internal window cache_key from rate limit key and window duration.
@@ -1033,6 +1058,14 @@ impl SlidingWindowLimiter {
     }
 
     // ── Dirty tracking ──
+    //
+    // The dirty sets are the "push me" schedule for the delta sync; the
+    // unpushed slots on the entries (e.value / e.g) are the payload. The
+    // sync only ever SNAPSHOTS the sets and removes keys after the push
+    // commits, so every failure path — DB error, watchdog timeout, a
+    // future dropped mid-transaction — leaves the schedule untouched and
+    // the batch retried next cycle. Payload and schedule are cleared
+    // together, only on confirmation.
 
     fn mark_dirty_cumulative(&self, key: &str) {
         if let Ok(mut s) = self.dirty_cumulative.write() {
@@ -1040,12 +1073,30 @@ impl SlidingWindowLimiter {
         }
     }
 
-    fn take_dirty_cumulative(&self) -> HashSet<String> {
-        std::mem::take(&mut *self.dirty_cumulative.write().expect("dirty lock poisoned"))
+    fn snapshot_dirty_cumulative(&self) -> HashSet<String> {
+        self.dirty_cumulative.read().expect("dirty lock poisoned").clone()
     }
 
-    fn take_dirty_snapshots(&self) -> HashSet<String> {
-        std::mem::take(&mut *self.dirty_snapshots.write().expect("dirty lock poisoned"))
+    fn snapshot_dirty_snapshots(&self) -> HashSet<String> {
+        self.dirty_snapshots.read().expect("dirty lock poisoned").clone()
+    }
+
+    /// Retire snapshot keys whose push resolved (committed, or provably
+    /// carried no payload). Keys marked mid-push by new traffic are not in
+    /// the snapshot and stay scheduled for the next cycle.
+    fn confirm_pushed_dirty(&self, cumulative: &HashSet<String>, snapshots: &HashSet<String>) {
+        if !cumulative.is_empty() {
+            self.dirty_cumulative
+                .write()
+                .expect("dirty lock poisoned")
+                .retain(|k| !cumulative.contains(k));
+        }
+        if !snapshots.is_empty() {
+            self.dirty_snapshots
+                .write()
+                .expect("dirty lock poisoned")
+                .retain(|k| !snapshots.contains(k));
+        }
     }
 }
 
@@ -1158,13 +1209,18 @@ impl SlidingWindowLimiter {
     ///    previous ambiguous attempt actually committed; replay its mirror
     ///    effects (from the stored batch) without re-applying to the DB.
     /// 2. Collect local unpushed deltas (windows by full-map scan, cumulative
-    ///    via the precise dirty set) + snapshot-class anchor overwrites.
+    ///    via the precise dirty set — snapshotted, never taken) +
+    ///    snapshot-class anchor overwrites.
     /// 3. In ONE transaction: apply `value = value + delta` updates, insert
     ///    the watermark row, and (decision_shared) read back global rows so
     ///    the bases absorb peer deltas atomically with our own push.
     /// 4. Post-commit mirror updates — subtract pushed deltas from the local
     ///    unpushed slots (requests that landed mid-tx keep their increments),
-    ///    then overwrite bases with pulled values where available.
+    ///    retire the dirty snapshot, then overwrite bases with pulled values
+    ///    where available. A cycle that dies before this point (DB error,
+    ///    watchdog timeout) loses nothing: payload and schedule both survive
+    ///    untouched and the batch retries next cycle; a cycle that died
+    ///    AFTER commit is replayed from the watermark row.
     ///
     /// Single-instance deployments run the exact same path: the deltas land
     /// on rows nobody else touches and pulls read back our own writes.
@@ -1174,9 +1230,17 @@ impl SlidingWindowLimiter {
         // 0a. Purge fully-expired window rows — unbounded-growth guard. The
         // delete runs before the delta applies so a live row caught on the
         // clock boundary is re-pushed in this same cycle.
+        //
+        // The grace clause protects the row a clock-skewed instance still
+        // considers CURRENT: deleting it would make the next push UPDATE
+        // zero rows, re-INSERT a row holding only that instance's delta,
+        // and silently evaporate every peer's contribution to the shared
+        // decision base. 20 minutes covers the max sync interval (600s)
+        // three times over — expired rows linger briefly, then go.
         match sqlx::query(
             r#"DELETE FROM boom_rate_limit_state
-               WHERE window_start + window_secs <= EXTRACT(EPOCH FROM NOW())::BIGINT"#,
+               WHERE window_start + window_secs <= EXTRACT(EPOCH FROM NOW())::BIGINT
+                 AND updated_at < NOW() - INTERVAL '20 minutes'"#,
         )
         .execute(pool)
         .await
@@ -1217,6 +1281,14 @@ impl SlidingWindowLimiter {
             // in-memory this boot; nothing to push or pull.
             return Ok(stats);
         };
+
+        if self.is_sealed() {
+            // Our registration was taken over by another process: two
+            // writers in one watermark namespace interleave seq rows and
+            // break each other's ambiguous-failure recovery. Keep serving
+            // traffic; never write shared state again.
+            return Ok(stats);
+        }
 
         let mut seq = self.push_seq.load(std::sync::atomic::Ordering::Relaxed);
 
@@ -1270,7 +1342,7 @@ impl SlidingWindowLimiter {
             }
         }
 
-        let dirty_cum = self.take_dirty_cumulative();
+        let dirty_cum = self.snapshot_dirty_cumulative();
         let mut cum_deltas: Vec<CumulativeDeltaJson> = Vec::new();
         for ck in &dirty_cum {
             if let Some(e) = self.cumulative.get(ck) {
@@ -1283,7 +1355,7 @@ impl SlidingWindowLimiter {
             }
         }
 
-        let snapshot_keys = self.take_dirty_snapshots();
+        let snapshot_keys = self.snapshot_dirty_snapshots();
         let mut snapshot_writes: Vec<(String, i64)> = Vec::new();
         for ck in &snapshot_keys {
             if let Some(e) = self.cumulative.get(ck) {
@@ -1301,6 +1373,10 @@ impl SlidingWindowLimiter {
             && snapshot_writes.is_empty()
             && (!pull || pull_window_keys.is_empty())
         {
+            // Nothing to push this cycle. Retire the snapshot anyway: every
+            // key in it carried no payload (zero-valued or entry gone), so
+            // leaving it dirty would only accumulate idle keys.
+            self.confirm_pushed_dirty(&dirty_cum, &snapshot_keys);
             return Ok(stats);
         }
 
@@ -1308,24 +1384,25 @@ impl SlidingWindowLimiter {
         let mut tx = pool.begin().await?;
 
         for d in &win_deltas {
-            let res = sqlx::query(
-                r#"UPDATE boom_rate_limit_state
-                   SET count = count + $3,
-                       tokens = COALESCE(tokens, 0) + $4,
-                       costs_micros = COALESCE(costs_micros, 0) + $5,
-                       updated_at = NOW()
-                   WHERE cache_key = $1 AND window_start = $2"#,
-            )
-            .bind(&d.k)
-            .bind(d.ws)
-            .bind(d.c)
-            .bind(d.t)
-            .bind(d.m)
-            .execute(&mut *tx)
-            .await?;
-            if res.rows_affected() == 0 {
-                // First push of this generation — create its row.
-                sqlx::query(
+            // UPDATE-first upsert: on a concurrent first-push race the macro's
+            // INSERT falls back to re-running the UPDATE — with delta
+            // semantics (value = value + δ) both orders land correctly.
+            boom_core::gaussdb_upsert!(
+                &mut *tx,
+                || sqlx::query(
+                    r#"UPDATE boom_rate_limit_state
+                       SET count = count + $3,
+                           tokens = COALESCE(tokens, 0) + $4,
+                           costs_micros = COALESCE(costs_micros, 0) + $5,
+                           updated_at = NOW()
+                       WHERE cache_key = $1 AND window_start = $2"#,
+                )
+                .bind(&d.k)
+                .bind(d.ws)
+                .bind(d.c)
+                .bind(d.t)
+                .bind(d.m),
+                || sqlx::query(
                     r#"INSERT INTO boom_rate_limit_state
                        (cache_key, count, tokens, costs_micros, window_start, window_secs, updated_at)
                        VALUES ($1, $2, $3, $4, $5, $6, NOW())"#,
@@ -1336,53 +1413,45 @@ impl SlidingWindowLimiter {
                 .bind(d.m)
                 .bind(d.ws)
                 .bind(d.w)
-                .execute(&mut *tx)
-                .await?;
-            }
+            )?;
         }
 
         for d in &cum_deltas {
-            let res = sqlx::query(
-                r#"UPDATE boom_rate_limit_cumulative
-                   SET value = value + $2, updated_at = NOW()
-                   WHERE cache_key = $1"#,
-            )
-            .bind(&d.k)
-            .bind(d.v)
-            .execute(&mut *tx)
-            .await?;
-            if res.rows_affected() == 0 {
-                sqlx::query(
+            boom_core::gaussdb_upsert!(
+                &mut *tx,
+                || sqlx::query(
+                    r#"UPDATE boom_rate_limit_cumulative
+                       SET value = value + $2, updated_at = NOW()
+                       WHERE cache_key = $1"#,
+                )
+                .bind(&d.k)
+                .bind(d.v),
+                || sqlx::query(
                     r#"INSERT INTO boom_rate_limit_cumulative (cache_key, value, updated_at)
                        VALUES ($1, $2, NOW())"#,
                 )
                 .bind(&d.k)
                 .bind(d.v)
-                .execute(&mut *tx)
-                .await?;
-            }
+            )?;
         }
 
         for (k, v) in &snapshot_writes {
-            let res = sqlx::query(
-                r#"UPDATE boom_rate_limit_cumulative
-                   SET value = $2, updated_at = NOW()
-                   WHERE cache_key = $1"#,
-            )
-            .bind(k)
-            .bind(*v)
-            .execute(&mut *tx)
-            .await?;
-            if res.rows_affected() == 0 {
-                sqlx::query(
+            boom_core::gaussdb_upsert!(
+                &mut *tx,
+                || sqlx::query(
+                    r#"UPDATE boom_rate_limit_cumulative
+                       SET value = $2, updated_at = NOW()
+                       WHERE cache_key = $1"#,
+                )
+                .bind(k)
+                .bind(*v),
+                || sqlx::query(
                     r#"INSERT INTO boom_rate_limit_cumulative (cache_key, value, updated_at)
                        VALUES ($1, $2, NOW())"#,
                 )
                 .bind(k)
                 .bind(*v)
-                .execute(&mut *tx)
-                .await?;
-            }
+            )?;
         }
 
         let wd_value = serde_json::to_value(&win_deltas).unwrap_or(serde_json::json!([]));
@@ -1414,8 +1483,13 @@ impl SlidingWindowLimiter {
                 .fetch_all(&mut *tx)
                 .await?;
             }
-            if !cum_deltas.is_empty() {
-                let keys: Vec<&str> = cum_deltas.iter().map(|d| d.k.as_str()).collect();
+            if !self.cumulative.is_empty() {
+                // Refresh every cumulative key we track locally, not just
+                // this cycle's dirty set: a key can be pushed only by peers
+                // (we took it over from them, or traffic is lopsided), and
+                // a stale base silently undercounts budget/total limits.
+                let keys: Vec<String> =
+                    self.cumulative.iter().map(|e| e.key().clone()).collect();
                 pulled_cum = sqlx::query_as::<_, (String, i64)>(
                     r#"SELECT cache_key, value FROM boom_rate_limit_cumulative
                        WHERE cache_key = ANY($1)"#,
@@ -1435,6 +1509,11 @@ impl SlidingWindowLimiter {
         // concurrent admin adjustment can leave a small negative unpushed
         // slot that self-corrects on the next push.
         self.apply_push_mirrors(&win_deltas, &cum_deltas);
+        // Payload cleared above, schedule cleared here — the confirmation
+        // halves of one action. Watchdog-killed cycles never reach this
+        // point: the watermark row replays the mirrors and the dirty keys
+        // stay scheduled.
+        self.confirm_pushed_dirty(&dirty_cum, &snapshot_keys);
 
         for (k, count, tokens, costs_micros, ws) in &pulled_win {
             if let Some(mut c) = self.windows.get_mut(k.as_str()) {

@@ -154,6 +154,12 @@ pub struct AppState {
     /// by `spawn_daily_stats_sync` (startup + every 30s). Survives reloads
     /// (top-level Arc). None until the first successful refresh.
     pub daily_stats: Arc<boom_audit::DailyStatsTracker>,
+    /// Serializes reloads across ALL trigger sources (SIGHUP, HTTP
+    /// `/admin/config/reload`, config-section editor) — they funnel through
+    /// `AppState::reload`'s try-lock. Two interleaved `reload_inner` passes
+    /// would race (double inner swap, duplicate prune-task spawns), so a
+    /// concurrent reload is rejected, not queued.
+    pub reload_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// The state that gets swapped on config reload.
@@ -584,6 +590,7 @@ impl AppState {
             trace: trace_registry,
             alerts: Arc::new(boom_alert::AlertManager::new()),
             daily_stats: Arc::new(boom_audit::DailyStatsTracker::new()),
+            reload_lock: Arc::new(tokio::sync::Mutex::new(())),
         };
         state.register_fusion_models(&state.inner.load().config).await?;
         Ok(state)
@@ -603,6 +610,16 @@ impl AppState {
     pub async fn reload(&self) -> anyhow::Result<String> {
         use futures::future::FutureExt;
         use std::panic::AssertUnwindSafe;
+
+        // Serialize across ALL trigger sources (SIGHUP / HTTP reload /
+        // section editor). try_lock, not await: queuing would only stack a
+        // redundant reconcile, and awaiting would park HTTP handlers for up
+        // to 60s behind a hung reload. Rejections are the benign case —
+        // warn and let the caller's log line carry it.
+        let _guard = self.reload_lock.try_lock().map_err(|_| {
+            tracing::warn!("Reload already in progress — concurrent trigger rejected");
+            anyhow::anyhow!("another reload is already in progress")
+        })?;
 
         let started = std::time::Instant::now();
         let inner = AssertUnwindSafe(self.reload_inner()).catch_unwind();

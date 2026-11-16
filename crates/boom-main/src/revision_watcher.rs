@@ -9,6 +9,9 @@
 //!   instance already applied its own writes in memory (dashboard handlers
 //!   mutate memory directly); this path is how PEERS converge. All
 //!   reconciles are idempotent diffs, so a redundant trigger is harmless.
+//!   Convergence is signal-driven but not signal-dependent: a failed
+//!   reconcile withholds its revision (retried next poll) and a periodic
+//!   full re-assertion bounds the staleness of any lost signal.
 
 use sqlx::PgPool;
 use tokio::sync::broadcast::Receiver;
@@ -58,6 +61,13 @@ pub fn spawn_instance_heartbeat(state: AppState, mut shutdown: Receiver<()>) {
                         );
                     }
                     identity_lost = true;
+                    // Fencing: the id now belongs to the other process. This
+                    // one must stop writing shared state (quota deltas and
+                    // watermarks especially) — two writers in one seq
+                    // namespace corrupt each other's ambiguous-failure
+                    // recovery. Sticky: a process that lost its identity
+                    // does not get it back.
+                    state.limiter.seal_push();
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "instance heartbeat failed (will retry)");
@@ -79,6 +89,14 @@ pub fn spawn_instance_heartbeat(state: AppState, mut shutdown: Receiver<()>) {
 /// Poll the revision counters and reconcile changed categories. The
 /// baseline snapshot is taken AFTER startup seed/reconcile finished (this
 /// task spawns later), so boot-time bumps do not trigger redundant work.
+///
+/// Two guarantees keep convergence bounded:
+/// - A failed reconcile withholds the baseline for that category — the
+///   next poll (5s) retries instead of waiting for the next bump.
+/// - Every [`boom_state::FULL_RECONCILE_EVERY_POLLS`] polls all
+///   signal-driven categories (auth excluded) re-read the DB regardless
+///   of the counters, so a lost signal (failed bump after the business
+///   write, a deleted revision row) self-heals within one interval.
 pub fn spawn_revision_watcher(state: AppState, mut shutdown: Receiver<()>) {
     let Some(pool) = state.db_pool.clone() else {
         return; // No DB — nothing is shared, nothing to watch.
@@ -103,6 +121,7 @@ pub fn spawn_revision_watcher(state: AppState, mut shutdown: Receiver<()>) {
             }
         };
 
+        let mut polls: u64 = 0;
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(std::time::Duration::from_secs(
@@ -120,20 +139,49 @@ pub fn spawn_revision_watcher(state: AppState, mut shutdown: Receiver<()>) {
                     continue;
                 }
             };
+            polls += 1;
+            // Periodic full re-assert: the revision signal only accelerates
+            // convergence, it is not the sole carrier. Every Nth poll all
+            // signal-driven categories (auth excepted — invalidating the
+            // whole auth cache is too costly to run unconditionally) are
+            // reconciled regardless of the counters, bounding the staleness
+            // of any lost signal (failed bump, failed dispatch, a deleted
+            // revision row) to one full-reconcile interval.
+            let full = polls % boom_state::FULL_RECONCILE_EVERY_POLLS == 0;
             for (category, rev) in &current {
-                if last.get(category) != Some(rev) {
-                    dispatch(category, &state, &pool).await;
+                let changed = last.get(category) != Some(rev);
+                let force = full && category != boom_state::CATEGORY_AUTH;
+                if !changed && !force {
+                    continue;
+                }
+                match dispatch(category, &state, &pool).await {
+                    Ok(()) => {
+                        // Consume the signal only after a successful
+                        // reconcile: a failure withholds the baseline, so
+                        // the next poll still sees it changed and retries.
+                        last.insert(category.clone(), *rev);
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            category,
+                            error = %e,
+                            "revision reconcile failed — signal withheld, will retry next poll"
+                        );
+                    }
                 }
             }
-            last = current;
+            // A category whose row vanished from the table carries no
+            // signal anymore; drop it so a recreated row counts as changed.
+            last.retain(|k, _| current.contains_key(k));
         }
     });
 }
 
 /// React to one changed category. Each branch re-reads the DB and applies
-/// a diff to memory; failures log and wait for the next bump of that
-/// category (the counter already moved, so the next change re-triggers).
-async fn dispatch(category: &str, state: &AppState, pool: &PgPool) {
+/// an idempotent diff to memory. Errors propagate to the caller, which
+/// withholds the baseline — the retry happens on the next poll, not on
+/// the next bump of the category.
+async fn dispatch(category: &str, state: &AppState, pool: &PgPool) -> anyhow::Result<()> {
     let deps = ReconcileDeps {
         pool,
         deployment_store: &state.deployment_store,
@@ -147,27 +195,20 @@ async fn dispatch(category: &str, state: &AppState, pool: &PgPool) {
     };
     match category {
         boom_state::CATEGORY_PLAN => {
-            if let Err(e) = crate::config_reconcile::reconcile_plans(&deps).await {
-                tracing::error!(error = %e, "revision reconcile (plan) failed");
-            }
+            crate::config_reconcile::reconcile_plans(&deps).await?;
         }
         boom_state::CATEGORY_ASSIGNMENT => {
-            state.plan_store.reconcile_assignments_from_db(pool).await;
+            state.plan_store.reconcile_assignments_from_db(pool).await?;
         }
         boom_state::CATEGORY_BLOCKLIST => {
-            if let Err(e) = crate::config_reconcile::reconcile_block_rules(&deps).await {
-                tracing::error!(error = %e, "revision reconcile (blocklist rules) failed");
-            }
+            crate::config_reconcile::reconcile_block_rules(&deps).await?;
             let config = state.inner.load().config.clone();
-            if let Err(e) = crate::config_reconcile::adopt_blocklist_enabled_db(
+            crate::config_reconcile::adopt_blocklist_enabled_db(
                 pool,
                 &state.block_rule_store,
                 &config,
             )
-            .await
-            {
-                tracing::error!(error = %e, "revision reconcile (blocklist switch) failed");
-            }
+            .await?;
         }
         boom_state::CATEGORY_AUTH => {
             // Coarse by design: which key changed is not encoded in the
@@ -180,53 +221,36 @@ async fn dispatch(category: &str, state: &AppState, pool: &PgPool) {
             // Decision-base flip: re-adopt the KV and switch the limiter's
             // enforcement view. Counter data itself needs no action — the
             // incremental push protocol converges it regardless of mode.
-            let shared = match boom_dashboard::config_kv::get_bool(
+            let shared = boom_dashboard::config_kv::get_bool(
                 pool,
                 boom_dashboard::config_kv::DECISION_BASE_SHARED,
             )
-            .await
-            {
-                Ok(v) => v.unwrap_or(false),
-                Err(e) => {
-                    tracing::warn!(error = %e, "decision-base re-adopt failed; keeping current mode");
-                    return;
-                }
-            };
+            .await?
+            .unwrap_or(false);
             state.limiter.set_decision_shared(shared);
             tracing::info!(shared, "quota decision base switched (revision bump)");
         }
         boom_state::CATEGORY_ROUTING => {
             // Peer model/alias/workflow/cost write: apply the same diff the
             // reload path runs. Idempotent, never clears a store.
-            if let Err(e) = crate::config_reconcile::reconcile_routing_config(&deps).await {
-                tracing::error!(error = %e, "revision reconcile (routing) failed");
-            }
+            crate::config_reconcile::reconcile_routing_config(&deps).await?;
         }
         boom_state::CATEGORY_USER_TAG => {
             let config = state.inner.load().config.clone();
-            if let Err(e) = crate::config_reconcile::adopt_user_tag_headers_db(
+            crate::config_reconcile::adopt_user_tag_headers_db(
                 pool,
                 &state.user_tag_store,
                 &config,
             )
-            .await
-            {
-                tracing::error!(error = %e, "revision reconcile (user_tag) failed");
-            }
+            .await?;
         }
         boom_state::CATEGORY_TRACE => {
-            let enabled = match boom_dashboard::config_kv::get_bool(
+            let enabled = boom_dashboard::config_kv::get_bool(
                 pool,
                 boom_dashboard::config_kv::TRACE_METRICS_ENABLED,
             )
-            .await
-            {
-                Ok(v) => v.unwrap_or(false),
-                Err(e) => {
-                    tracing::warn!(error = %e, "trace-metrics re-adopt failed; keeping current state");
-                    return;
-                }
-            };
+            .await?
+            .unwrap_or(false);
             state.trace.set_metrics_enabled(enabled);
             tracing::info!(enabled, "trace metrics switch re-adopted (revision bump)");
         }
@@ -234,7 +258,10 @@ async fn dispatch(category: &str, state: &AppState, pool: &PgPool) {
             // warn, not debug: a bumped category without a dispatch arm means
             // someone added a write-side bump but forgot the reconcile —
             // propagation is silently broken and must be discoverable.
+            // Ok, not Err: there is no reconcile action that could succeed
+            // later, so withholding the baseline would only spam the warn.
             tracing::warn!(category = other, "revision bump for unknown category — no reconcile arm, propagation skipped");
         }
     }
+    Ok(())
 }
