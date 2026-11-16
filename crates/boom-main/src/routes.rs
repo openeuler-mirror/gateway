@@ -1732,6 +1732,7 @@ unsupported_handler!(moderations, "The /v1/moderations endpoint is not supported
 pub struct HealthResponse {
     pub status: String,
     pub version: String,
+    pub instance_id: String,
     pub uptime_secs: u64,
     pub db_connected: bool,
     pub models_count: usize,
@@ -1748,6 +1749,7 @@ pub async fn health_check(State(state): State<AppState>) -> Json<HealthResponse>
     Json(HealthResponse {
         status: "ok".to_string(),
         version: boom_core::BOOM_VERSION.to_string(),
+        instance_id: state.instance_id.to_string(),
         uptime_secs: uptime as u64,
         db_connected: inner.health.db_connected,
         models_count: state.deployment_store.len(),
