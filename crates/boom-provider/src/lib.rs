@@ -352,7 +352,7 @@ pub(crate) fn now_timestamp() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::create_provider;
-    use boom_core::provider::{Provider, ProviderProtocol};
+    use boom_core::provider::ProviderProtocol;
     use std::collections::HashMap;
 
     #[test]

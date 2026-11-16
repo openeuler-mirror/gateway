@@ -144,6 +144,12 @@ pub async fn admin_command_handler(mut rx: tokio::sync::mpsc::Receiver<AdminComm
                 // Hot-swap the live prompt-log config. The writer's
                 // `Arc<ArcSwap<_>>` makes this observable to the dashboard's
                 // `PromptLogQueryApi` handle on the next read.
+                //
+                // Runtime override (CLAUDE.md §7 三域模型): prompt_log is a
+                // YAML-home (instance-scoped) section — this toggle mutates
+                // local memory only. Not persisted, not broadcast; restart
+                // reverts to the YAML value. Persistent edits go through the
+                // Config page section editor.
                 state.prompt_log_writer.update_config(config);
                 let _ = reply.send(Ok(()));
             }

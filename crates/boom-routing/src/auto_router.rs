@@ -257,7 +257,7 @@ impl AutoRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use boom_core::types::{ContentPart, MessageRole};
+    use boom_core::types::MessageRole;
 
     fn make_messages(texts: Vec<(&str, &str)>) -> Vec<Message> {
         texts

@@ -41,6 +41,9 @@ pub struct Config {
     pub server: ServerSettings,
     #[serde(default)]
     pub rate_limit: RateLimitSettings,
+    /// Limiter delta-sync cadence (multi-instance incremental protocol).
+    #[serde(default)]
+    pub quota_sync: QuotaSyncSettings,
     #[serde(default)]
     pub plan_settings: PlanSettings,
     /// Reusable billing templates — referenced by `model_info.cost_template`.
@@ -724,6 +727,7 @@ impl Default for ContextRollbackSettings {
 fn default_context_rollback_patterns() -> Vec<String> {
     vec![
         "code:InputTokenExceeded".to_string(),
+        "code:context_length_exceeded".to_string(),
         "maximum input length".to_string(),
         "maximum context length".to_string(),
         "prompt is too long".to_string(),
@@ -998,6 +1002,13 @@ pub struct ServerSettings {
     pub port: u16,
     #[serde(default = "default_workers")]
     pub workers: usize,
+    /// Stable instance identity (private domain — per-instance config,
+    /// never broadcast). Unset → derived "host:port", so the id always
+    /// exists. With a shared DB, boot fails loudly when two instances
+    /// resolve the same id (see boom_state::registry::register) — a
+    /// multi-instance deployment therefore needs explicit unique ids.
+    #[serde(default)]
+    pub instance_id: Option<String>,
 }
 
 impl Default for ServerSettings {
@@ -1006,6 +1017,7 @@ impl Default for ServerSettings {
             host: default_host(),
             port: default_port(),
             workers: default_workers(),
+            instance_id: None,
         }
     }
 }
@@ -1018,6 +1030,36 @@ fn default_port() -> u16 {
 }
 fn default_workers() -> usize {
     4
+}
+
+/// Cadence of the limiter's incremental delta sync (windows + cumulative
+/// counters → DB). Process-level (per-instance) parameter: reload-effective,
+/// not business config. Clamped to 30–600s at read time; default 60s.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct QuotaSyncSettings {
+    #[serde(default = "default_quota_sync_interval_secs")]
+    pub interval_secs: u64,
+}
+
+fn default_quota_sync_interval_secs() -> u64 {
+    60
+}
+
+impl Default for QuotaSyncSettings {
+    fn default() -> Self {
+        Self {
+            interval_secs: default_quota_sync_interval_secs(),
+        }
+    }
+}
+
+impl QuotaSyncSettings {
+    /// Effective interval, clamped to the supported 30s–600s band. A YAML
+    /// value outside the band clamps (not rejects) — the sync must never be
+    /// turned into a hot-loop or silently disabled by a typo.
+    pub fn effective_interval_secs(&self) -> u64 {
+        self.interval_secs.clamp(30, 600)
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -2401,5 +2443,22 @@ client_blocklist:
       action: { message: "no" }
 "#;
         assert!(serde_yaml::from_str::<Config>(yaml).is_err());
+    }
+
+    #[test]
+    fn quota_sync_defaults_and_clamp() {
+        // Absent section → default interval 60s.
+        let cfg: Config = serde_yaml::from_str("server: {}\n").unwrap();
+        assert_eq!(cfg.quota_sync.effective_interval_secs(), 60);
+        // In-band value passes through; out-of-band values clamp to the
+        // 30–600s boundaries (never a hot loop, never silently disabled).
+        let cfg: Config =
+            serde_yaml::from_str("quota_sync: { interval_secs: 45 }\n").unwrap();
+        assert_eq!(cfg.quota_sync.effective_interval_secs(), 45);
+        let cfg: Config = serde_yaml::from_str("quota_sync: { interval_secs: 1 }\n").unwrap();
+        assert_eq!(cfg.quota_sync.effective_interval_secs(), 30);
+        let cfg: Config =
+            serde_yaml::from_str("quota_sync: { interval_secs: 99999 }\n").unwrap();
+        assert_eq!(cfg.quota_sync.effective_interval_secs(), 600);
     }
 }

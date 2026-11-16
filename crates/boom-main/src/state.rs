@@ -37,6 +37,10 @@ pub struct AppState {
     /// config). The write-back button generates `./config.yaml` from this
     /// state; a restart with that file adopts file mode.
     pub config_path: Option<String>,
+    /// Process identity for multi-instance mechanisms (heartbeat row,
+    /// later: quota-delta idempotency key). Fresh UUID per boot — a
+    /// restarted process is a new instance; never persisted.
+    pub instance_id: Arc<str>,
     /// Hot-swappable inner state (config + auth + health only).
     pub inner: Arc<ArcSwap<AppStateInner>>,
     /// DB pool survives reloads (avoids reconnection).
@@ -229,6 +233,21 @@ impl AppState {
             None => None,
         };
 
+        // Instance identity — resolved before anything that stamps it: the
+        // audit-log writer below and the limiter's delta-protocol watermark
+        // namespace. STABLE across restarts (configured explicitly, or
+        // derived from the bind address so it always exists) so historical
+        // rows stay attributable to the same logical instance. Duplicate
+        // detection happens in the registration below and fails the boot.
+        let instance_id: Arc<str> = match config.server.instance_id.as_deref() {
+            Some(raw) if !raw.trim().is_empty() => raw.trim().to_string().into(),
+            Some(_) => anyhow::bail!(
+                "server.instance_id is set but empty — configure a real id or remove the field"
+            ),
+            None => format!("{}:{}", config.server.host, config.server.port).into(),
+        };
+        tracing::info!(instance_id = %instance_id, "instance identity resolved");
+
         // Audit log writer: dedicated 8-conn pool + single batch-INSERT task.
         // See `request_log::LogWriter` for architecture. Replaces the old
         // per-request `tokio::spawn + sqlx::query` pattern which competed
@@ -243,13 +262,19 @@ impl AppState {
                     .max_lifetime(std::time::Duration::from_secs(1800))
                     .connect(url)
                     .await?;
-                Some(crate::request_log::start_log_writer(log_pool))
+                Some(crate::request_log::start_log_writer(
+                    log_pool,
+                    instance_id.clone(),
+                ))
             }
             None => None,
         };
 
-        // 2. Limiter survives across reloads.
+        // 2. Limiter survives across reloads. Its instance identity (delta
+        // protocol watermark namespace) is assigned once per boot, before
+        // any traffic can touch the counters.
         let limiter = Arc::new(SlidingWindowLimiter::new());
+        limiter.set_instance_id(instance_id.to_string());
 
         // 3. Plan store survives across reloads.
         let plan_store = Arc::new(PlanStore::new());
@@ -335,6 +360,42 @@ impl AppState {
             if let Err(e) = boom_responses::migrations::run(pool).await {
                 tracing::error!("Failed to run responses-store migration: {}", e);
             }
+            // Cross-instance mechanism tables (boom-state owns
+            // boom_instance_state / boom_config_revision). Fatal like the
+            // dashboard migrations: the revision watcher and heartbeat
+            // depend on them existing.
+            boom_state::migrations::run(pool).await?;
+
+            // Register the stable instance id BEFORE any heartbeat or
+            // traffic: a duplicate id (copy-paste YAML, loopback + same
+            // port) fails the boot here with the holder's coordinates,
+            // instead of silently splitting cluster state. A provably
+            // dead holder (stale heartbeat, or same-host dead pid) is
+            // taken over in place — crash-restart does not wait out the
+            // TTL.
+            let info = boom_state::registry::InstanceInfo::current(
+                &instance_id,
+                &config.server.host,
+                config.server.port,
+            );
+            match boom_state::registry::register(pool, &info).await {
+                Ok(boom_state::registry::Registration::Registered) => {
+                    tracing::info!(instance_id = %instance_id, "instance id registered");
+                }
+                Ok(boom_state::registry::Registration::TookOver { previous }) => {
+                    tracing::info!(
+                        instance_id = %instance_id,
+                        previous_pid = previous.pid,
+                        previous_started_at = %previous.started_at,
+                        "took over stale instance registration"
+                    );
+                }
+                Err(e) => anyhow::bail!("instance id registration failed: {e}"),
+            }
+
+            // Stable id ⇒ the watermark namespace spans boots: continue the
+            // push sequence after the last committed row (MAX(seq)).
+            limiter.hydrate_push_seq(pool).await?;
 
             crate::migrations::ensure_config_meta_table(pool).await?;
 
@@ -379,6 +440,19 @@ impl AppState {
                 )
                 .await?,
             );
+
+            // Quota decision base: shared (global) vs local (per-instance)
+            // enforcement view. DB-authoritative, seeded local on first
+            // boot — the conservative default keeps multi-instance rate
+            // enforcement independent until an operator opts in. Counter
+            // deltas push incrementally in BOTH modes.
+            let decision_shared = boom_dashboard::config_kv::adopt_bool(
+                pool,
+                boom_dashboard::config_kv::DECISION_BASE_SHARED,
+                false,
+            )
+            .await?;
+            limiter.set_decision_shared(decision_shared);
 
             // Restore runtime state.
             plan_store.restore_assignments_from_db(pool).await;
@@ -476,6 +550,7 @@ impl AppState {
         let state = Self {
             response_store,
             config_path,
+            instance_id: instance_id.clone(),
             inner: Arc::new(ArcSwap::from_pointee(inner)),
             db_pool,
             dashboard_db_pool,
@@ -775,6 +850,15 @@ impl AppState {
                 )
                 .await?,
             );
+            // Quota decision base re-adopt on reload (same DB-wins pattern;
+            // normally propagated by the revision watcher's quota category).
+            let decision_shared = boom_dashboard::config_kv::adopt_bool(
+                pool,
+                boom_dashboard::config_kv::DECISION_BASE_SHARED,
+                false,
+            )
+            .await?;
+            self.limiter.set_decision_shared(decision_shared);
         }
 
         self.register_fusion_models(&new_config).await?;

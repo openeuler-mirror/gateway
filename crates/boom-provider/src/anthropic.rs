@@ -527,6 +527,7 @@ impl AnthropicProvider {
                 cache_creation_input_tokens: cache_creation,
                 cache_read_input_tokens: cache_read,
                 prompt_tokens_details: None,
+                completion_tokens_details: None,
             }),
             system_fingerprint: None,
             raw_response: None,
@@ -820,6 +821,18 @@ impl Provider for AnthropicProvider {
                                         .and_then(|u| u.get("output_tokens"))
                                         .and_then(|t| t.as_u64())
                                         .unwrap_or(0) as i32;
+                                    // Anthropic message_delta usage is cumulative
+                                    // and (newer API versions) re-reports the
+                                    // prompt-cache split — carry it for the
+                                    // trace channel's gen_ai.usage.cache_*.
+                                    let as_i32 = |key: &str| {
+                                        usage_data
+                                            .and_then(|u| u.get(key))
+                                            .and_then(|t| t.as_u64())
+                                            .map(|t| t.min(i32::MAX as u64) as i32)
+                                    };
+                                    let cache_read = as_i32("cache_read_input_tokens");
+                                    let cache_creation = as_i32("cache_creation_input_tokens");
 
                                     let chunk = ChatStreamChunk {
                                         id: response_id.clone(),
@@ -841,6 +854,9 @@ impl Provider for AnthropicProvider {
                                             completion_tokens: Some(output_tokens),
                                             total_tokens: None,
                                             prompt_tokens_details: None,
+                                            cache_read_input_tokens: cache_read,
+                                            cache_creation_input_tokens: cache_creation,
+                                            ..Default::default()
                                         }),
                                         raw_data: None,
                                     };
@@ -850,12 +866,22 @@ impl Provider for AnthropicProvider {
                                 }
                                 "message_start" => {
                                     // Extract input_tokens from message_start event.
-                                    let input_tokens = data
+                                    let usage = data
                                         .get("message")
-                                        .and_then(|m| m.get("usage"))
-                                        .and_then(|u| u.get("input_tokens"))
-                                        .and_then(|t| t.as_u64())
-                                        .map(|t| t as i32);
+                                        .and_then(|m| m.get("usage"));
+                                    let as_i32 = |key: &str| {
+                                        usage
+                                            .and_then(|u| u.get(key))
+                                            .and_then(|t| t.as_u64())
+                                            .map(|t| t.min(i32::MAX as u64) as i32)
+                                    };
+                                    let input_tokens = as_i32("input_tokens");
+                                    // Prompt-cache split is only reported here
+                                    // (older API versions) — carried on the
+                                    // internal-only StreamUsage slots for the
+                                    // trace channel's gen_ai.usage.cache_*.
+                                    let cache_read = as_i32("cache_read_input_tokens");
+                                    let cache_creation = as_i32("cache_creation_input_tokens");
 
                                     // Emit a role chunk so OpenAI clients see `role: "assistant"`
                                     // in the first SSE chunk (matching litellm behavior).
@@ -877,8 +903,9 @@ impl Provider for AnthropicProvider {
                                         usage: input_tokens.map(|it| StreamUsage {
                                             prompt_tokens: Some(it),
                                             completion_tokens: Some(0),
-                                            total_tokens: None,
-                                            prompt_tokens_details: None,
+                                            cache_read_input_tokens: cache_read,
+                                            cache_creation_input_tokens: cache_creation,
+                                            ..Default::default()
                                         }),
                                         raw_data: None,
                                     };

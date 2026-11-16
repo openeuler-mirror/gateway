@@ -302,6 +302,7 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "boom-core",
+ "boom-state",
  "chrono",
  "serde",
  "serde_json",
@@ -381,6 +382,7 @@ dependencies = [
  "boom-limiter",
  "boom-promptlog",
  "boom-routing",
+ "boom-state",
  "chrono",
  "csv",
  "dashmap",
@@ -463,6 +465,7 @@ version = "0.1.0"
 dependencies = [
  "boom-config",
  "boom-core",
+ "boom-state",
  "chrono",
  "regex",
  "serde",
@@ -504,6 +507,7 @@ dependencies = [
  "async-trait",
  "boom-config",
  "boom-core",
+ "boom-state",
  "chrono",
  "dashmap",
  "futures",
@@ -541,6 +545,7 @@ dependencies = [
  "boom-responses",
  "boom-rollback",
  "boom-routing",
+ "boom-state",
  "boom-stressmon",
  "boom-trace",
  "chrono",
@@ -648,6 +653,7 @@ dependencies = [
  "boom-ctxaware",
  "boom-flowcontrol",
  "boom-fusion",
+ "boom-state",
  "chrono",
  "dashmap",
  "futures",
@@ -661,6 +667,17 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "boom-state"
+version = "0.1.0"
+dependencies = [
+ "boom-core",
+ "chrono",
+ "libc",
+ "sqlx",
+ "tracing",
 ]
 
 [[package]]

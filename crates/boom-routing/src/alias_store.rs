@@ -186,6 +186,8 @@ impl AliasStore {
             input.target_model.clone(),
             input.hidden,
         );
+        boom_state::revision::bump_best_effort(pool, boom_state::revision::CATEGORY_ROUTING)
+            .await;
         Ok(())
     }
 
@@ -209,6 +211,8 @@ impl AliasStore {
                 input.target_model.clone(),
                 input.hidden,
             );
+            boom_state::revision::bump_best_effort(pool, boom_state::revision::CATEGORY_ROUTING)
+                .await;
             Ok(true)
         } else {
             Ok(false)
@@ -226,6 +230,8 @@ impl AliasStore {
 
         if result.rows_affected() > 0 {
             self.remove_alias(alias_name);
+            boom_state::revision::bump_best_effort(pool, boom_state::revision::CATEGORY_ROUTING)
+                .await;
             Ok(true)
         } else {
             Ok(false)

@@ -147,6 +147,8 @@ impl BlockRuleStore {
         )?;
 
         self.sync_memory_from_input(input);
+        boom_state::revision::bump_best_effort(pool, boom_state::revision::CATEGORY_BLOCKLIST)
+            .await;
         Ok(())
     }
 
@@ -174,6 +176,11 @@ impl BlockRuleStore {
                 self.remove(rule_name);
             }
             self.sync_memory_from_input(input);
+            boom_state::revision::bump_best_effort(
+                pool,
+                boom_state::revision::CATEGORY_BLOCKLIST,
+            )
+            .await;
             Ok(true)
         } else {
             Ok(false)
@@ -188,6 +195,11 @@ impl BlockRuleStore {
             .await?;
         if result.rows_affected() > 0 {
             self.remove(rule_name);
+            boom_state::revision::bump_best_effort(
+                pool,
+                boom_state::revision::CATEGORY_BLOCKLIST,
+            )
+            .await;
             Ok(true)
         } else {
             Ok(false)
@@ -269,6 +281,8 @@ impl BlockRuleStore {
             .bind(enabled)
         )?;
         self.set_enabled(enabled);
+        boom_state::revision::bump_best_effort(pool, boom_state::revision::CATEGORY_BLOCKLIST)
+            .await;
         Ok(())
     }
 }

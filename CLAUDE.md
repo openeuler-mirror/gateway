@@ -39,12 +39,14 @@ Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
 
 ```
 boom-core ← boom-auth, boom-provider, boom-config, boom-limiter, boom-audit, boom-trace
+boom-state ← boom-gatekeeper, boom-dashboard, boom-limiter, boom-routing, boom-audit, boom-main（第二机制叶子）
 boom-routing → boom-core, boom-config, boom-ctxaware, boom-flowcontrol, boom-fusion
 boom-main → 依赖所有 boom-* 模块（组装层）
 boom-dashboard → boom-core, boom-limiter, boom-routing, boom-audit（禁止依赖 boom-provider, boom-config）
 ```
 
-- **boom-core 是唯一的叶子依赖**。所有功能模块只依赖 boom-core，不互相依赖。
+- **boom-core 是唯一的业务/机制叶子之外的存在**——所有功能模块只依赖 boom-core，不互相依赖。
+- **boom-state 是第二机制叶子**（只依赖 boom-core）：跨实例机制原语——实例心跳注册表 + 配置 revision 广播。机制 only、无业务语义；功能 crate 可依赖它收发信号，业务反应归各模块（见 §12）。
 - **boom-main 是唯一的根**。它负责组装所有模块、管理生命周期、处理路由。其他模块之间不直接通信。
 - **boom-dashboard 不依赖 boom-provider 和 boom-config**。Dashboard 需要操作模型/配置时，通过 AdminCommand channel 异步通知 boom-main 处理。
 - **boom-trace 是 leaf crate**（与 boom-stressmon 同款），只依赖 boom-core。`TraceApi` trait 定义在 boom-core（§5 trait-over-concrete-type 模式），让 boom-dashboard 用 `Arc<dyn TraceApi>` 消费而不依赖本 crate。
@@ -57,22 +59,24 @@ boom-dashboard → boom-core, boom-limiter, boom-routing, boom-audit（禁止依
 | boom-auth | 密钥认证（SHA-256 + DB 查询 + 主密钥） | 不做路由、不做速率限制 |
 | boom-config | YAML 配置解析、环境变量展开 | 不持有运行时状态 |
 | boom-provider | 构建 Provider 实例（OpenAI/Anthropic/Bedrock 等） | 不做密钥校验、不做计费 |
-| boom-limiter | 滑动窗口限流、并发控制、PlanStore | 不感知 Provider |
+| boom-limiter | 滑动窗口限流、并发控制、PlanStore、配额增量同步协议（§12） | 不感知 Provider |
 | boom-routing | DeploymentStore、AliasStore、调度策略、Fusion 虚拟 Provider 编排 | 不实现上游 HTTP 协议；只调用 `Provider` trait |
 | boom-gatekeeper | 客户端拦截（client blocklist 规则匹配 + enabled 开关，DB 权威） | 不做密钥校验、不做路由 |
 | boom-audit | 请求日志读写（boom_request_log 表） | 不做路由决策 |
 | boom-trace | 请求级 trace 链路 + 延迟分布（in-memory 直方图、慢请求 ring buffer、OTLP traces 导出） | 不写 DB 表（持久化归 boom-audit）、不记 prompt 内容（归 boom-promptlog）、不做路由决策 |
 | boom-dashboard | Web UI + REST API + JWT 认证 | 不直接操作 Provider/Config |
+| boom-state | 跨实例机制原语：心跳注册表（实例活性）、revision changelog（配置变更广播） | 无业务语义；不持有热路径请求状态 |
 | boom-main | 路由处理、状态组装、热加载、后台任务 | 不在 handler 里写业务逻辑 |
 
 ### 3. DB 表所有权（DDL Ownership）
 
 每个模块拥有且只操作自己的表。**跨模块直接操作他人的表是禁止的**。
 
-- boom-audit: `boom_request_log`
+- boom-audit: `boom_request_log`, `boom_user_tag_config`
 - boom-routing: `boom_model_deployment`, `boom_model_alias`, `boom_workflow_definition`, `boom_workflow_model`, `boom_cost_template`
-- boom-limiter: `boom_rate_limit_state`, `boom_rate_limit_cumulative`, `boom_key_plan_assignment`, `boom_rate_limit_plan`, `boom_team_plan_assignment`
+- boom-limiter: `boom_rate_limit_state`（复合主键 cache_key+window_start，窗口代次共存）, `boom_rate_limit_cumulative`, `boom_quota_delta`（增量水位）, `boom_key_plan_assignment`, `boom_rate_limit_plan`, `boom_team_plan_assignment`
 - boom-gatekeeper: `boom_client_block_rule`, `boom_client_blocklist_state`
+- boom-state: `boom_instance_state`（心跳）, `boom_config_revision`（category 计数器）
 - boom-dashboard: `boom_config`
 - boom-main: `boom_config_meta`（seed 幂等标记 — 唯一例外：表本身属于启动编排层，由 from_config/reload 的 seed_if_empty 读写）
 - boom-auth: 读取 `LiteLLM_VerificationToken`, `LiteLLM_TeamTable`（litellm 兼容，只读）
@@ -116,7 +120,17 @@ Dashboard 需要执行写操作（创建模型、修改配置等）时：
 
 ### 7. 热加载（Hot Reload）与配置权威模型
 
-**配置归属三判据**——新增配置项时先过这三个测试，决定它进 YAML 还是 DB：
+**配置三域模型**——每个配置项必居其一，持久化与广播语义由域决定：
+
+| 域 | 权威源 | 生效方式 | 多实例语义 | 例子 |
+|----|--------|----------|------------|------|
+| **私域配置**（实例级） | 本地 YAML | reload / 重启 | **永不广播**——各实例可异构（server ip/port、线程数、路径本就该不同） | server、master_key/database_url、router 调度参数、prompt_log、trace（OTLP endpoint/采样）、hooks、deployment_health_check、quota_sync.interval_secs |
+| **全局配置**（集群级） | 共享 DB | 写 DB + bump category → 全实例 ≤5s 增量对账 | **必须广播**（§12；广播集 == DB 权威集） | model/alias/workflow/cost、plan/assignment、key/team、blocklist、user_tag headers、decision base、trace metrics 开关 |
+| **运行时覆写**（单实例临时） | 进程内存 | 即时 | 不持久、不广播，重启回归权威源值 | Logs 页 Prompt Log / Debug 快捷开关（覆写 YAML-home 字段的内存值；持久修改走 Config 页 section editor） |
+
+判定规则：**共享 DB 的单行/KV = 集群全局**（没有按 instance_id 区分的配置行）；覆写目标 home=Yaml → 只能运行时覆写；home=Db → 禁止走覆写路径，必须写 DB + bump。将来需要按实例区分的开关不能放共享 KV——要么回 YAML，要么按 instance_id 存。字段级的域登记见 §9 manifest 的 `ConfigHome`（编译期强制）。
+
+**配置归属三判据**——新增配置项时先过这三个测试，决定它进私域（YAML）还是全局（DB）：
 
 1. **自举测试**：读取它是否必须先于"能连上 DB"？是 → 本地（db_url、master_key、监听地址必须本地，否则鸡生蛋）。
 2. **本地性测试**：语义是否绑定本机环境（文件路径、线程数、连接池大小、OTLP endpoint）？是 → 本地。多实例共用一个值恰恰是坏味道（两台机器不该共享同一个路径）。
@@ -183,6 +197,21 @@ CRUD handler（model/alias/plan/quota/blocklist/workflow/cost template 等）的
 
 **plan_settings.default_plan / default_team_plan / client_blocklist.enabled 三个原 YAML 项**已 DB 化（`boom_rate_limit_plan.is_default_team` 部分唯一索引 + `boom_client_blocklist_state` 单行表），各有专属 Dashboard 端点。
 
+### 12. 多实例状态协议（boom-state + 增量同步）
+
+多实例共享一个 DB 时的状态同步分两类，**不得混淆**：
+
+**配置类 = 全局配置（ConfigHome::Db，§7 三域模型），低频，revision 广播**：广播集严格等于 DB 权威集——私域配置（YAML home，如 server/prompt_log/OTLP endpoint）与运行时覆写（Logs 页快捷开关）永不广播。Dashboard/CRUD 写 DB 后 `bump` 对应 category 计数器（`boom_config_revision`）；每实例 revision watcher 5s 轮询，变更 category 做**增量对账**（DB→内存，永不清空 store）。现有 category：auth / plan / assignment / quota / blocklist / routing / user_tag / trace。**所有全局配置写路径必须 bump**（拍板：配置类即刻广播全实例）；bump 落在 store 的 `*_db` 写方法内（boom-limiter/boom-routing/boom-audit/boom-gatekeeper 模式）或 dashboard handler 内（boom_config KV 开关模式）。**运行时健康事件不广播**：`auto_disable_db`/`auto_enable_db` 是本实例连通性视角，不是配置编辑。新增配置类广播 = boom-state 加 CATEGORY_* 常量 + watcher 加对账分支（bump 了但没有对账分支 → watcher 打 warn，传播静默失败必须可发现）。
+
+**计量类（每请求操作，增量上推）**：计费/限流计数器**不存在覆盖式同步**——旧 snapshot→UPSERT 全量路径已删除，增量是唯一路径：
+- 双值表示：内存每维度两套值——`counts/tokens/costs` = 未上推本地增量（推送后清零），`g_*` = 全局基数镜像（boot 恢复 + 自身上推 + 拉取同伴）。**判定口径 = 全局基数 + 本地增量**。
+- 窗口代次墙钟对齐（tumbling）：`window_start = now - now % window_secs`，所有实例把同一墙钟区间映射到同一代次，复合主键行（cache_key, window_start）成为该区间的集群级计数器。过期代次在收集时跳过（速率类数据不上推），每周期 purge。
+- 单事务推送：`UPDATE value=value+δ`（0 行 → INSERT）→ 写水位行（`boom_quota_delta`，instance_id+seq）→ shared 模式同事务读回全局值 → commit → 内存镜像更新（事务中落地的请求增量不丢）。模糊失败（超时）后重试凭水位行识别已提交批次，只重放镜像效果不重复入库。
+- cumulative 符号数学：管理员负数调整自纠。预算锚点（bpstart/bpbase）走快照类全值覆写（天然幂等）。
+- **`decision_base_shared`**（`boom_config` KV，默认 false=本地）：只门控**拉取**步骤；上推两种模式都执行。单实例两模式行为一致。切换走 CATEGORY_QUOTA 广播，Quota 页有开关。
+- `quota_sync.interval_secs`（YAML 进程级）：默认 60s，钳制 30–600s，reload 生效。
+- 并发限制为实例本地（后续调度层课题）。assignment 写路径全 DB-first（`*_db` 方法 + 广播），无内存→DB 回写。
+
 ## Key Patterns
 
 - **配置共享**：`Arc<ArcSwap<T>>` 原子交换，零停机热加载
@@ -197,10 +226,11 @@ CRUD handler（model/alias/plan/quota/blocklist/workflow/cost template 等）的
 ```
 crates/                 — 全部 workspace 成员 crate
   boom-core/            — 核心 trait 和公共类型
+  boom-state/           — 跨实例机制原语（心跳注册表 + revision 广播，第二机制叶子）
   boom-auth/            — 密钥认证（litellm 兼容）
   boom-config/          — YAML 配置解析
   boom-provider/        — LLM Provider 实现（OpenAI/Anthropic/Bedrock 等）
-  boom-limiter/         — 速率限制 + 并发控制 + PlanStore
+  boom-limiter/         — 速率限制 + 并发控制 + PlanStore + 配额增量同步协议
   boom-routing/         — DeploymentStore + AliasStore
   boom-audit/           — 请求日志读写
   boom-trace/           — 请求级 trace 链路 + 延迟分布

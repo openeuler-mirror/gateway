@@ -5,7 +5,8 @@ use crate::{
 use async_trait::async_trait;
 use boom_core::types::{
     ChatCompletionRequest, ChatCompletionResponse, ChatStream, ChatStreamChunk, FunctionCallDelta,
-    Message, MessageContent, MessageRole, PromptTokensDetails, StreamChoice, StreamDelta,
+    Message, MessageContent, MessageRole, PromptTokensDetails, CompletionTokensDetails,
+    StreamChoice, StreamDelta,
     StreamUsage, ToolCallDelta, Usage,
 };
 use boom_core::GatewayError;
@@ -712,6 +713,18 @@ fn combined_stream_usage(aggregator: &Usage, panel: &Usage) -> StreamUsage {
         (None, None) => None,
         (left, right) => Some(left.unwrap_or(0).saturating_add(right.unwrap_or(0))),
     };
+    let aggregator_reasoning = aggregator
+        .completion_tokens_details
+        .as_ref()
+        .and_then(|details| details.reasoning_tokens);
+    let panel_reasoning = panel
+        .completion_tokens_details
+        .as_ref()
+        .and_then(|details| details.reasoning_tokens);
+    let reasoning_tokens = match (aggregator_reasoning, panel_reasoning) {
+        (None, None) => None,
+        (left, right) => Some(left.unwrap_or(0).saturating_add(right.unwrap_or(0))),
+    };
 
     StreamUsage {
         prompt_tokens: Some(stream_token(prompt_tokens)),
@@ -720,6 +733,12 @@ fn combined_stream_usage(aggregator: &Usage, panel: &Usage) -> StreamUsage {
         prompt_tokens_details: cached_tokens.map(|cached_tokens| PromptTokensDetails {
             cached_tokens: Some(cached_tokens),
         }),
+        completion_tokens_details: reasoning_tokens.map(|reasoning_tokens| {
+            CompletionTokensDetails {
+                reasoning_tokens: Some(reasoning_tokens),
+            }
+        }),
+        ..Default::default()
     }
 }
 

@@ -27,12 +27,13 @@ pub enum SpanStatus {
 }
 
 /// A single key-value attribute on a span. Mirrors OTLP's AnyValue::Value but
-/// trimmed to the variants we actually emit (string / int / bool / json).
-#[derive(Debug, Clone, Serialize)]
+/// trimmed to the variants we actually emit (string / int / double / bool / json).
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum SpanAttributeValue {
     String(String),
     Int(i64),
+    Double(f64),
     Bool(bool),
     /// Raw JSON body (request/response). Serialized as-is; the producer
     /// holds the original `Arc<serde_json::Value>` and we deref to serialize.

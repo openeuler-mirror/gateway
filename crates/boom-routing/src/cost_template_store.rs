@@ -150,6 +150,8 @@ impl CostTemplateStore {
             }
         )?;
         self.upsert(template.clone());
+        boom_state::revision::bump_best_effort(pool, boom_state::revision::CATEGORY_ROUTING)
+            .await;
         Ok(())
     }
 
@@ -162,6 +164,8 @@ impl CostTemplateStore {
         let existed = result.rows_affected() > 0;
         if existed {
             self.remove(name);
+            boom_state::revision::bump_best_effort(pool, boom_state::revision::CATEGORY_ROUTING)
+                .await;
         }
         Ok(existed)
     }

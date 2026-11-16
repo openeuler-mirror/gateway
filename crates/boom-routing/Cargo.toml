@@ -9,6 +9,7 @@ boom-config = { path = "../boom-config" }
 boom-ctxaware = { path = "../boom-ctxaware" }
 boom-flowcontrol = { path = "../boom-flowcontrol" }
 boom-fusion = { path = "../boom-fusion" }
+boom-state = { path = "../boom-state" }
 arc-swap = { workspace = true }
 async-trait = { workspace = true }
 dashmap = { workspace = true }

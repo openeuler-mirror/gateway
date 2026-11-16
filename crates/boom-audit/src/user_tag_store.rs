@@ -128,6 +128,8 @@ impl UserTagStore {
             .bind(&json)
         )?;
         self.set(headers);
+        boom_state::revision::bump_best_effort(pool, boom_state::revision::CATEGORY_USER_TAG)
+            .await;
         Ok(())
     }
 }

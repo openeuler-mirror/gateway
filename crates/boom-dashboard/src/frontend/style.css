@@ -169,26 +169,18 @@ input, select, textarea { font-family: var(--font); font-size: 14px; }
   max-width: calc(100% - 48px);
 }
 .login-hero { display: flex; align-items: center; justify-content: center; }
-/* Matted print: the frame matches the login card (surface, border, radius,
-   shadow) so the two read as siblings; the artwork keeps its own background
-   with a small radius + hairline, like a print mounted in a mat. */
-.hero-frame {
+/* Bare artwork — no frame, the illustration carries itself. */
+.login-hero img {
+  display: block;
   width: 520px;
   max-width: calc(58vw - 80px);
-  padding: 12px;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  box-shadow: var(--shadow-md);
-}
-.hero-frame img {
-  display: block;
-  width: 100%;
   height: auto;
-  border: 1px solid var(--border);
-  border-radius: 4px;
   user-select: none;
 }
+/* Username slot: the layout box is always reserved so the password field,
+   login button and mode toggle stay pinned; toggling only fades the field. */
+#user-id-group { transition: opacity .15s ease, visibility .15s ease; }
+#user-id-group.ghost { visibility: hidden; opacity: 0; }
 @media (max-width: 960px) {
   .login-shell { grid-template-columns: 1fr; width: 100%; padding: 0 24px; gap: 0; }
   .login-hero { display: none; }
@@ -1844,11 +1836,35 @@ input[list] {
   color: var(--text3);
   margin-top: 2px;
 }
-/* Continuation rows of a multi-instance model group in the inflight
-   table: the logo + model name render once on the group's first row;
-   these rows carry only the instance id, aligned under the first id. */
-.deploy-cell--inst { padding-left: 32px; }
-.deploy-cell--inst .deploy-id { margin-top: 0; }
+/* ── Inflight model-group merged cell (rowspan layout) ────── */
+/* Industry-standard grouped table (AWS/GCP console style): the model
+   identity cell spans all of the model's instance rows; instance ids
+   live in their own column. Zebra alternates by GROUP, not by row —
+   the merged cell and all of its instance rows share one shade, so the
+   left column never falls out of phase with the data columns. */
+#inflight-table-wrap tbody tr.grp-a td { background: var(--surface); }
+#inflight-table-wrap tbody tr.grp-b td { background: var(--surface2); }
+#inflight-table-wrap tbody tr:hover td { background: var(--surface3); }
+#inflight-table-wrap td.grp-model {
+  border-right: 1px solid var(--border);
+  min-width: 180px;
+}
+#inflight-table-wrap td.inst-id {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text2);
+}
+/* Stronger rule between model groups; the weaker row borders separate
+   instances inside a group. */
+#inflight-table-wrap tbody tr.grp-start td { border-top: 1px solid var(--border2); }
+#inflight-table-wrap tbody tr:first-child td { border-top: none; }
+/* "×N" instance-count marker next to the model name on the group header. */
+.grp-count {
+  font-size: 11px;
+  color: var(--text3);
+  font-weight: 400;
+  margin-left: 4px;
+}
 
 /* ── Per-1M-token cost cell (models table) ───────────────── */
 /* Inline "label:$value" per line — three rows stack tightly so the
@@ -3237,6 +3253,24 @@ input[list] {
   cursor: pointer;
 }
 .logs-range-bar select:hover { border-color: var(--primary); }
+/* ── Quota decision-base switch bar ─────────────────────── */
+.decision-base-bar {
+  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  padding: 10px 14px; margin-bottom: 14px;
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: var(--surface);
+}
+.decision-base-label {
+  display: inline-flex; align-items: center; gap: 8px;
+  font-size: 13px; color: var(--text2); cursor: pointer; white-space: nowrap;
+}
+.decision-base-label input { accent-color: var(--primary); }
+.decision-base-mode {
+  font-size: 12px; color: var(--text3); white-space: nowrap;
+  padding: 2px 8px; border-radius: 999px;
+  background: var(--surface3);
+}
+.decision-base-tip { font-size: 12px; color: var(--text3); line-height: 1.5; }
 
 /* ── Analytics Board (natural-day business volume) ─────── */
 .section-subtitle {

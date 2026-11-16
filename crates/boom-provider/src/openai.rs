@@ -106,6 +106,7 @@ fn assemble_sse_response(text: &str) -> Result<ChatCompletionResponse, String> {
                 completion_tokens: stream_usage.completion_tokens.unwrap_or(0).max(0) as u32,
                 total_tokens: stream_usage.total_tokens.unwrap_or(0).max(0) as u32,
                 prompt_tokens_details: stream_usage.prompt_tokens_details,
+                completion_tokens_details: stream_usage.completion_tokens_details,
                 cache_creation_input_tokens: None,
                 cache_read_input_tokens: None,
             });

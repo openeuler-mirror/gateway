@@ -22,9 +22,7 @@
     <div id="page-login" class="page active">
       <div class="login-shell">
         <div class="login-hero">
-          <div class="hero-frame">
-            <img src="/dashboard/assets/login.png" alt="BooMGateway" draggable="false" decoding="async">
-          </div>
+          <img src="/dashboard/assets/login.png" alt="BooMGateway" draggable="false" decoding="async">
         </div>
         <div class="login-card">
         <div class="login-brand">
@@ -43,12 +41,12 @@
         </div>
         <form id="login-form">
           <p class="login-hint" id="login-hint" data-i18n="login.subtitle">Enter your API Key to sign in</p>
-          <div class="form-group hidden" id="user-id-group">
+          <div class="form-group ghost" id="user-id-group">
             <label for="user_id" data-i18n="login.username">Username</label>
-            <input type="text" id="user_id" placeholder="admin" value="">
+            <input type="text" id="user_id" autocomplete="username" placeholder="admin" value="">
           </div>
           <div class="form-group">
-            <input type="password" id="api_key" data-i18n-ph="login.api_key_placeholder" placeholder="API Key (sk-...)" required>
+            <input type="password" id="api_key" autocomplete="current-password" data-i18n-ph="login.api_key_placeholder" placeholder="API Key (sk-...)" required>
           </div>
           <button type="submit" id="login-btn" data-i18n="login.submit">Login</button>
           <p id="login-error" class="error-msg hidden"></p>
@@ -304,6 +302,14 @@
                   <span class="an-hint" id="an-models-hint"></span>
                 </div>
                 <div id="an-table-wrap"><p class="loading" data-i18n="common.loading">Loading...</p></div>
+              </div>
+
+              <div class="card an-panel">
+                <div class="an-card-head">
+                  <h3 data-i18n="analytics.instances.title">By Instance</h3>
+                  <span class="an-hint" id="an-instances-hint"></span>
+                </div>
+                <div id="an-instances-wrap"><p class="loading" data-i18n="common.loading">Loading...</p></div>
               </div>
             </div>
 
@@ -701,6 +707,7 @@
               <h2 data-i18n="quota.title">Quota Management</h2>
               <button class="btn-small" id="btn-create-team" onclick="showCreateTeamModal()" data-i18n="quota.create_team">Create Team</button>
             </div>
+            <div id="quota-decision-base-wrap"></div>
             <div id="quota-overview-wrap"><p class="loading" data-i18n="common.loading">Loading...</p></div>
           </section>
 
@@ -714,6 +721,7 @@
                 <button class="btn-small" id="btn-reset-logs-filters" data-i18n="logs.reset_filters">Reset Filters</button>
               </div>
             </div>
+            <p class="muted" data-i18n="logs.runtime_override_hint">Prompt Log / Debug toggles are runtime overrides on this instance only — not persisted, not broadcast; restart reverts to the YAML value.</p>
             <div id="logs-table-wrap">
               <table id="logs-table">
                 <thead>

@@ -4,8 +4,6 @@
 
 use super::decision::{select_fallback, FallbackDecision, RollbackRoute};
 
-use boom_core::context_error::RollbackStats;
-
 /// Everything the retry orchestration needs from the calling context.
 /// Replaces a direct `&AppState` dependency so this crate stands alone —
 /// boom-main constructs it from its state, tests construct it from fakes.

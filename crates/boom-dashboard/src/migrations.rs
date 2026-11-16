@@ -161,6 +161,12 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
     // (no-op if already present). New tables created by cumulative_ddl() above
     // already include them.
     run_ddl_on_conn(&mut conn, boom_limiter::migrations::state_alter_ddl()).await?;
+    // Widen the legacy cache_key PK to (cache_key, window_start) — required
+    // by the multi-instance delta protocol (per-generation rows). Guarded
+    // no-op when already composite; errors propagate.
+    run_ddl_on_conn(&mut conn, boom_limiter::migrations::state_pk_alter_ddl()).await?;
+    // Delta-push watermark table (idempotent incremental sync).
+    run_ddl_on_conn(&mut conn, boom_limiter::migrations::quota_delta_ddl()).await?;
     // GaussDB distributed: mark as REPLICATION so the table is copied to
     // every datanode. Without this, single-table queries still get routed
     // to a datanode where the table doesn't exist ("relation does not exist
