@@ -5690,24 +5690,49 @@
   //   fully configured + multiple tiers → "active"; single tier → "no
   //   fallback target". Pure display layer — data stays one row per
   //   deployment, row rendering unchanged.
-  function rollbackPoolBadge(rows) {
-    // Pool participates only when EVERY deployment row opted in (the pool
-    // toggle writes the whole group; rows could still differ if written
-    // via YAML/seed). Off pools show no badge — the toggle says it.
-    if (!rows.every((m) => m.rollback_enabled)) return "";
-    const configured = rows.filter((m) => m.max_context_tokens != null);
-    if (configured.length !== rows.length) {
-      const missing = rows.length - configured.length;
-      return '<span class="badge badge-blocked" title="' + esc(t("tip.badge.rb_mixed", { n: missing })) + '">' + esc(t("models.rollback.mixed", { n: missing })) + '</span>';
+  // Rollback pool STATE LINE (static — no toggle). The max_context_tokens
+  // declaration is the sole participation signal. Four states:
+  //   active · N tiers A→B     ≥2 distinct declared tiers
+  //   rescue · 1 tier           1 declared tier + undeclared instances
+  //                             (their failures are rescued; they are
+  //                             never fallback targets)
+  //   no larger tier            all declared, single tier
+  //   unconfigured              no instance declared
+  function fmtTier(v) {
+    if (v >= 1000000 && v % 1000000 === 0) return (v / 1000000) + "M";
+    if (v >= 1000) return Math.round(v / 1000) + "K";
+    return String(v);
+  }
+  function rollbackPoolState(rows) {
+    const declared = rows.filter((m) => m.max_context_tokens != null);
+    if (declared.length === 0) {
+      return '<span class="rb-state rb-state-dim">' + esc(t("models.rollback.state_unconfigured")) + '</span>';
     }
-    const distinct = new Set(configured.map((m) => m.max_context_tokens));
-    if (distinct.size > 1) return '<span class="badge badge-active">' + esc(t("models.rollback.active")) + '</span>';
-    return '<span class="badge badge-plan" title="' + esc(t("tip.badge.rb_no_target")) + '">' + esc(t("models.rollback.no_target")) + '</span>';
+    const tiers = [...new Set(declared.map((m) => m.max_context_tokens))].sort((a, b) => a - b);
+    const undeclared = rows.length - declared.length;
+    const suffix = undeclared > 0
+      ? ' <span class="rb-state-note">' + esc(t("models.rollback.mixed_note", { n: undeclared })) + '</span>'
+      : '';
+    if (tiers.length >= 2) {
+      return '<span class="rb-state rb-state-on">'
+        + esc(t("models.rollback.state_active", { n: tiers.length, tiers: tiers.map(fmtTier).join("→") }))
+        + suffix + '</span>';
+    }
+    if (undeclared > 0) {
+      return '<span class="rb-state rb-state-on">'
+        + esc(t("models.rollback.state_rescue", { tier: fmtTier(tiers[0]) }))
+        + suffix + '</span>';
+    }
+    return '<span class="rb-state rb-state-dim">'
+      + esc(t("models.rollback.state_single", { tier: fmtTier(tiers[0]) })) + '</span>';
   }
 
   function renderModelsTable(models, aliasesMap) {
+    // In-flight-table style (Stats page): block = model (rowspan identity
+    // cell), row = instance, zebra alternates by GROUP. The model cell
+    // carries the rollback state line — static, no toggle: the
+    // max_context_tokens declaration is the sole participation signal.
     const wrap = document.getElementById("models-table-wrap");
-    syncRollbackMaster(models);
     if (models.length === 0) { wrap.innerHTML = "<p>" + t("models.empty") + "</p>"; return; }
     aliasesMap = aliasesMap || {};
     const order = [];
@@ -5717,34 +5742,23 @@
       byName[m.model_name].push(m);
     });
 
-    wrap.innerHTML = `<table class="models-table">
-      <thead><tr><th>${t("models.col.deploy_id")}</th><th>${t("models.col.aliases")}</th><th>${t("models.col.cost")}</th><th>${t("models.col.base_url")}</th><th class="num">${t("models.col.ratio")}</th><th class="num">${t("models.col.rpm")}</th><th class="num">${t("models.col.timeout")}</th><th>${t("models.col.enabled")}</th><th>${t("models.col.source")}</th><th>${t("models.col.actions")}</th></tr></thead>
+    wrap.innerHTML = `<table class="data-table models-table">
+      <thead><tr><th>${t("models.col.model")}</th><th>${t("models.col.deploy_id")}</th><th>${t("models.col.aliases")}</th><th>${t("models.col.cost")}</th><th>${t("models.col.base_url")}</th><th class="num">${t("models.col.ratio")}</th><th class="num">${t("models.col.rpm")}</th><th class="num">${t("models.col.timeout")}</th><th>${t("models.col.enabled")}</th><th>${t("models.col.source")}</th><th>${t("models.col.actions")}</th></tr></thead>
       <tbody>
-      ${order.map((name) => {
+      ${order.map((name, groupIdx) => {
         const rows = byName[name];
-        const poolOn = rows.every((m) => m.rollback_enabled);
-
-        // Pool header: switch + name + count + badge (full-width row)
-        const badge = rollbackPoolBadge(rows);
+        const zebra = groupIdx % 2 === 1 ? " dep-alt" : "";
         const vendor = vendorOf(name);
-        const headerRow = `<tr class="pool-header">
-          <td colspan="10">
-            <div class="pool-header-inner">
-              <img class="vendor-logo pool-vendor-logo" src="/dashboard/assets/vendor/${vendor}" alt="${vendor}">
-              <div class="pool-id-block">
-                <span class="pool-name">${esc(name)}</span>
-                <span class="pool-count">${rows.length} ${esc(t("models.pool.instances"))}</span>
-              </div>
-              <div class="pool-actions">
-              ${badge}
-              <label class="rb-switch" title="${esc(t("tip.pool.rollback"))}">
-                <input type="checkbox" ${poolOn ? "checked" : ""} onchange="window._togglePoolRollback('${esc(name)}', this.checked)">
-                <span class="rb-slider"></span>
-              </label>
-              </div>
-            </div>
-          </td>
-        </tr>`;
+        const state = rollbackPoolState(rows);
+        const warnCount = rows.filter((m) => !m.enabled && m.auto_disabled).length;
+        const modelCell = `<td rowspan="${rows.length + warnCount}" class="model-block${zebra}">
+          <img class="vendor-logo model-vendor-logo" src="/dashboard/assets/vendor/${vendor}" alt="${vendor}">
+          <div class="model-id-block">
+            <span class="model-name">${esc(name)}</span>
+            <span class="model-count">${rows.length} ${esc(t("models.pool.instances"))}</span>
+            ${state}
+          </div>
+        </td>`;
 
         const depRows = rows.map((m, rowIdx) => {
           const isAutoDisabled = !m.enabled && m.auto_disabled;
@@ -5755,7 +5769,7 @@
               ? '<span class="badge badge-blocked">' + t("common.no") + '</span><br><span style="color:var(--danger);font-size:0.8em">' + t("status.auto_disabled") + '</span>'
               : '<span class="badge badge-blocked">' + t("common.no") + '</span>';
           const warningRow = isAutoDisabled
-            ? `<tr class="model-row-warning"><td colspan="10">${t("models.fault_disabled")}</td></tr>`
+            ? `<tr class="model-row-warning${zebra}"><td colspan="11">${t("models.fault_disabled")}</td></tr>`
             : '';
           const c = m.cost_per_million || {};
           const fmtCost = (v) => (v == null || v === "0" || v === "") ? "-" : "¥" + v;
@@ -5775,8 +5789,8 @@
               + esc(t("models.aliases.view_detail", { n: aliases.length })) + '</button>';
           }
           const visBadge = visibilityBadgeFor(m);
-        const zebra = rowIdx % 2 === 1 ? " dep-alt" : "";
-        return `<tr class="pool-dep${zebra} ${rowClass}">
+          return `<tr class="pool-dep${zebra} ${rowClass}">
+          ${rowIdx === 0 ? modelCell : ""}
           <td><div class="dep-id-block"><span class="dep-id">${esc(m.deployment_id || "-")}</span><span class="dep-vis">${visBadge}</span></div></td>
           <td>${aliasCell}</td>
           <td>${costCell}</td>
@@ -5793,27 +5807,12 @@
         </tr>${warningRow}`;
         }).join("");
 
-        return headerRow + depRows;
+        return depRows;
       }).join("")}
       </tbody>
     </table>`;
   }
 
-  // Toolbar master toggle (#rb-master) mirrors the aggregate pool state:
-  // checked = every deployment opted in, indeterminate = mixed, unchecked =
-  // all off. Clicking it flips the whole fleet (confirm → _setAllRollback).
-  function syncRollbackMaster(models) {
-    const el = document.getElementById("rb-master");
-    if (!el) return;
-    const label = el.closest(".rb-master-toggle");
-    if (label) label.title = t("tip.master.rollback"); // refresh per render (language-safe)
-    el.disabled = !models.length;
-    if (!models.length) { el.checked = false; el.indeterminate = false; return; }
-    const all = models.every((m) => m.rollback_enabled);
-    const any = models.some((m) => m.rollback_enabled);
-    el.checked = all;
-    el.indeterminate = any && !all;
-  }
 
   async function showNewModelModal(prefill) {
     // Cost templates drive the pricing dropdown — load them lazily so the
@@ -6048,9 +6047,6 @@
           max_inflight_queue_len: document.getElementById("m-model-maxinflight").value ? Number(document.getElementById("m-model-maxinflight").value) : null,
           max_context_len: document.getElementById("m-model-maxctx").value ? Number(document.getElementById("m-model-maxctx").value) : null,
           max_context_tokens: document.getElementById("m-model-max-context-tokens").value ? Math.round(Number(document.getElementById("m-model-max-context-tokens").value) * 1000) : null,
-          // Not editable in the modal (pool-toggle surface) — echo the
-          // current value so update_db doesn't reset participation.
-          rollback_enabled: !!(p && p.rollback_enabled),
           enabled: document.getElementById("m-model-enabled").checked,
           serve_not_match: document.getElementById("m-model-serve-not-match").checked,
           client_type_header: document.getElementById("m-model-client-type").checked,
@@ -6107,49 +6103,6 @@
     loadModels();
   };
 
-  // ── Admin: Rollback participation (pool checkbox + master toggle) ──
-  // Both hit POST /admin/models/rollback; boom-main writes rollback_enabled
-  // on the affected deployment rows and reloads routing, then we re-render.
-  // (The API also accepts deployment_id for row-level writes — the UI uses
-  // pool granularity; the pool checkbox is the all-rows aggregate.)
-  window._togglePoolRollback = async (name, enabled) => {
-    try {
-      const data = await api("/admin/models/rollback", {
-        method: "POST", skipConfirm: true,
-        body: JSON.stringify({ model_name: name, enabled }),
-      });
-      if (data && data.error) { alert(t("common.error_prefix", { message: data.error })); return; }
-      loadModels();
-    } catch (err) {
-      alert(t("common.error_prefix", { message: err.message }));
-      loadModels(); // revert the checkbox to the server-side truth
-    }
-  };
-
-  // Master toggle change: browser flips indeterminate→checked (enable all)
-  // or checked→unchecked (disable all). Cancel re-renders from server truth.
-  window._masterRollback = async (el) => {
-    const target = el.checked;
-    if (!confirm(t(target ? "models.rollback.all_confirm" : "models.rollback.none_confirm"))) {
-      loadModels();
-      return;
-    }
-    await window._setAllRollback(target);
-  };
-
-  window._setAllRollback = async (enabled) => {
-    try {
-      const data = await api("/admin/models/rollback", {
-        method: "POST", skipConfirm: true,
-        body: JSON.stringify({ enabled }),
-      });
-      if (data && data.error) { alert(t("common.error_prefix", { message: data.error })); return; }
-      showToast(t("models.rollback.set_all_toast", { n: (data && data.models) || 0, state: t(enabled ? "models.rollback.on" : "models.rollback.off_word") }));
-      loadModels();
-    } catch (err) {
-      alert(t("common.error_prefix", { message: err.message }));
-    }
-  };
 
   // ── Admin: Aliases ────────────────────────────────────
   // Alias management lives inside the model edit modal (see setupAliasCard);

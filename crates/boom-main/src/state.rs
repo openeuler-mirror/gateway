@@ -1745,7 +1745,6 @@ fn build_deployments_from_config(
             deployment_id,
             entry.client_type_header,
             p.max_context_tokens,
-            entry.rollback_enabled,
         ) {
             Ok(provider) => {
                 // Also register as wildcard catch-all if flagged.
@@ -2276,15 +2275,6 @@ pub(crate) async fn build_config_snapshot_value(pool: &PgPool) -> Result<serde_j
                 "model_name": r.model_name,
                 "litellm_params": litellm_params,
             });
-
-            // rollback participation (ModelEntry top-level field): emit only
-            // when set, keeping opted-out rows clean in the YAML snapshot.
-            if r.rollback_enabled {
-                entry.as_object_mut().unwrap().insert(
-                    "rollback_enabled".into(),
-                    serde_json::Value::Bool(true),
-                );
-            }
 
             // ── flow_control: emit as a dedicated node. Include only when
             // at least one limit is set so we don't litter YAML with empty

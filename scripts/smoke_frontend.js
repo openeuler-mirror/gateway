@@ -39,58 +39,56 @@ function loadBlock(startMarker, endMarker, returns) {
   )(t, esc, tip, renderDeployCell, visibilityBadgeFor, vendorOf, document);
 }
 
-const pool = loadBlock('  function rollbackPoolBadge', '  async function showNewModelModal',
-  'renderModelsTable, rollbackPoolBadge');
+const pool = loadBlock('  function fmtTier(', '  async function showNewModelModal',
+  'renderModelsTable, rollbackPoolState, fmtTier');
 
 
-// ── fixtures ──────────────────────────────────────────────────────
+// ── fixtures（API 行不再含 rollback_enabled——声明是唯一参与信号）──
 const models = [
-  { id: '1', model_name: 'glm-5.3', litellm_model: 'openai/glm-5.3', enabled: true, rollback_enabled: true, max_context_tokens: 204800, quota_count_ratio: 1, timeout: 1200, source: 'db' },
-  { id: '2', model_name: 'glm-5.3', litellm_model: 'openai/glm-5.3', enabled: true, rollback_enabled: true, max_context_tokens: 204800, quota_count_ratio: 1, timeout: 1200, source: 'db' },
-  { id: '3', model_name: 'glm-5.3', litellm_model: 'openai/glm-5.3', enabled: false, auto_disabled: true, rollback_enabled: true, max_context_tokens: 1048576, quota_count_ratio: 1, timeout: 1200, source: 'db' },
-  { id: '4', model_name: 'qwen3', litellm_model: 'openai/qwen3', enabled: true, quota_count_ratio: 1, timeout: 1200, source: 'db' }, // 未开启 → 无徽标
+  { id: '1', model_name: 'glm-5.3', litellm_model: 'openai/glm-5.3', enabled: true, max_context_tokens: 204800, quota_count_ratio: 1, timeout: 1200, source: 'db' },
+  { id: '2', model_name: 'glm-5.3', litellm_model: 'openai/glm-5.3', enabled: true, max_context_tokens: 204800, quota_count_ratio: 1, timeout: 1200, source: 'db' },
+  { id: '3', model_name: 'glm-5.3', litellm_model: 'openai/glm-5.3', enabled: false, auto_disabled: true, max_context_tokens: 1048576, quota_count_ratio: 1, timeout: 1200, source: 'db' },
+  { id: '4', model_name: 'qwen3', litellm_model: 'openai/qwen3', enabled: true, quota_count_ratio: 1, timeout: 1200, source: 'db' }, // 全未声明
 ];
 
-// ── 1. 池头行 + 缩进行结构（无独立 rollback 列）────────────────
+// ── 1. rowspan 分组表(在途请求风格)+ 静态状态行 ────────────────
 pool.renderModelsTable(models, {});
 const html = el.innerHTML;
-// 无独立 rollback 列
-if (html.includes('col-rollback')) fail('dedicated rollback column removed');
-if (html.includes('cell-rollback')) fail('per-row rollback cells removed');
-// 池头行：每池一个，含开关+名称+计数+徽标
-const headers = html.match(/class="pool-header"/g) || [];
-if (headers.length !== 2) fail(`2 pools → 2 header rows, got ${headers.length}`);
-if (!html.includes('pool-header-inner')) fail('header has inner layout div');
-if (!html.includes('rb-switch')) fail('iOS switch present');
-if (!html.includes('rb-slider')) fail('slider present');
-if (!html.includes('pool-name')) fail('pool name span present');
-if (!html.includes('pool-count')) fail('instance count present');
-// 勾选状态在池头行的 checkbox
-if (!html.includes("window._togglePoolRollback('glm-5.3'")) fail('glm toggle wired');
-if (!html.includes('checked')) fail('on pool has checked switch');
-// 激活徽标在池头行
-if (!html.includes('models.rollback.active')) fail('active badge in header');
-// 部署行缩进
-if (!html.includes('pool-dep')) fail('indented deployment rows');
-// 黑框分隔已删（池头行就是分隔）
-if (html.includes('pool-start')) fail('old border separator removed');
+// 开关全删:无 rb-switch/checked/任何 toggle 接线
+if (html.includes('rb-switch')) fail('pool toggle must be removed');
+if (html.includes('checkbox')) fail('no checkbox in the models table');
+if (html.includes('_togglePoolRollback')) fail('toggle handler must be removed');
+if (html.includes('pool-header')) fail('pool header rows replaced by rowspan blocks');
+// 模型块:2 池 → 2 个 model-block;glm rowspan=3+1告警行=4,qwen rowspan=1
+const blocks = html.match(/class="model-block[^"]*"/g) || [];
+if (blocks.length !== 2) fail(`2 pools → 2 model-block cells, got ${blocks.length}`);
+if (!html.includes('rowspan="4"')) fail('glm block spans 3 dep rows + 1 warning row');
+if (!html.includes('rowspan="1"')) fail('qwen block spans its single row');
+// 状态行:glm 2 层(205K→1049K)激活;qwen 未配置
+if (!html.includes('models.rollback.state_active')) fail('2 declared tiers → active state');
+if (!html.includes('models.rollback.state_unconfigured')) fail('no declarations → unconfigured');
+// 斑马按块:qwen(第二块)行带 dep-alt,glm 行不带
+const altRows = html.match(/class="pool-dep dep-alt/g) || [];
+if (altRows.length !== 1) fail(`zebra by GROUP: only qwen rows carry dep-alt, got ${altRows.length}`);
+// 告警行跟随块色且 colspan=11
+if (!html.includes('colspan="11"')) fail('warning row colspan follows 11 columns');
+// fmtTier 紧凑格式
+if (pool.fmtTier(200000) !== '200K') fail('fmtTier K');
+if (pool.fmtTier(1000000) !== '1M') fail('fmtTier M');
+if (pool.fmtTier(500) !== '500') fail('fmtTier raw');
 
-// 开关关的池无徽标
-pool.renderModelsTable([models[3]], {});  // qwen3 off
-if (el.innerHTML.includes('models.rollback.no_target')) fail('off pool → no badge');
-// 开关开的池有徽标
-pool.renderModelsTable([models[0], models[1], models[2]], {});
-if (!el.innerHTML.includes('models.rollback.active')) fail('on pool → badge');
+// 状态四态
+const state = (rows) => { pool.renderModelsTable(rows, {}); return el.innerHTML; };
+if (!state([{ id: 'a', model_name: 'x', enabled: true, max_context_tokens: 200000, timeout: 1 }, { id: 'b', model_name: 'x', enabled: true, timeout: 1 }])
+  .includes('models.rollback.state_rescue')) fail('1 declared tier + undeclared → rescue state');
+if (!state([{ id: 'a', model_name: 'x', enabled: true, max_context_tokens: 200000, timeout: 1 }, { id: 'b', model_name: 'x', enabled: true, max_context_tokens: 200000, timeout: 1 }])
+  .includes('models.rollback.state_single')) fail('all declared single tier → no-larger-tier state');
+const rescueHtml = state([{ id: 'a', model_name: 'x', enabled: true, max_context_tokens: 200000, timeout: 1 }, { id: 'b', model_name: 'x', enabled: true, timeout: 1 }]);
+if (!rescueHtml.includes('models.rollback.mixed_note')) fail('undeclared count note rendered');
 
-// 主开关三态：混合（glm 开、qwen3 关）→ indeterminate
-pool.renderModelsTable(models, {});
-if (el.indeterminate !== true || el.checked !== false) fail('mixed state → indeterminate');
-// 全开 → checked
-pool.renderModelsTable([models[0], models[1], models[2]], {});
-if (el.checked !== true || el.indeterminate !== false) fail('all on → checked');
-// 空表 → disabled
+// 空表不崩
 pool.renderModelsTable([], {});
-if (el.disabled !== true) fail('empty table → master disabled');
+if (!el.innerHTML.includes('models.empty')) fail('empty state renders');
 
 // 价格列头不再右对齐
 if (html.includes('<th class="num">models.col.cost</th>')) fail('cost header must not carry .num');
@@ -161,7 +159,7 @@ if (rbHtml.includes('no per-model data')) fail('placeholder shown despite per-mo
 // 两条不变量均成立（fixture 满足 identify_total = miss+inert+no_target+selected 等）
 if (!rbHtml.includes('✓')) fail('invariant checkmarks missing');
 
-console.log('SMOKE OK: pool header rows with switches, indented dep rows, no rollback column');
+console.log('SMOKE OK: rowspan grouped table (in-flight style), static rollback state line, toggle fully removed');
 console.log('SMOKE OK: rollback tree — codes under all 6 error headers + retry-success fixed-error sub-rows, alias-free keys');
 
 // ── 4. KVC DFX 表:Detail 列 + 错误详情链接(与主日志页同款) ─────
