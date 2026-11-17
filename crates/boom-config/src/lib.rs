@@ -44,6 +44,9 @@ pub struct Config {
     /// Limiter delta-sync cadence (multi-instance incremental protocol).
     #[serde(default)]
     pub quota_sync: QuotaSyncSettings,
+    /// Instance telemetry snapshot cadence (dashboard cross-instance view).
+    #[serde(default)]
+    pub instance_telemetry: InstanceTelemetrySettings,
     #[serde(default)]
     pub plan_settings: PlanSettings,
     /// Reusable billing templates — referenced by `model_info.cost_template`.
@@ -1053,6 +1056,36 @@ impl QuotaSyncSettings {
     /// turned into a hot-loop or silently disabled by a typo.
     pub fn effective_interval_secs(&self) -> u64 {
         self.interval_secs.clamp(30, 600)
+    }
+}
+
+/// Cadence of the instance telemetry snapshot write
+/// (`boom_instance_state.snapshot`, per-instance in-flight counters for the
+/// dashboard's cross-instance view). Process-level parameter:
+/// reload-effective, not broadcast. Clamped to 1–30s; default 3s.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct InstanceTelemetrySettings {
+    #[serde(default = "default_instance_telemetry_interval_secs")]
+    pub interval_secs: u64,
+}
+
+fn default_instance_telemetry_interval_secs() -> u64 {
+    3
+}
+
+impl Default for InstanceTelemetrySettings {
+    fn default() -> Self {
+        Self {
+            interval_secs: default_instance_telemetry_interval_secs(),
+        }
+    }
+}
+
+impl InstanceTelemetrySettings {
+    /// Clamped, never rejected: the write must not become a hot-loop nor
+    /// silently stop on a typo.
+    pub fn effective_interval_secs(&self) -> u64 {
+        self.interval_secs.clamp(1, 30)
     }
 }
 

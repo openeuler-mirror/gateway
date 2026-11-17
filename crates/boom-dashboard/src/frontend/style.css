@@ -1875,6 +1875,77 @@ input[list] {
   margin-left: 4px;
 }
 
+/* ── Cross-instance peer snapshot rows (stats page) ──────── */
+/* Peer rows sit under this instance's live row for the same deployment.
+   Muted, smaller, slightly dimmed — clearly secondary to the live row. */
+#inflight-table-wrap tbody tr.peer-row td {
+  opacity: 0.72;
+  font-size: 12px;
+}
+/* Instance badge: colored dot + id — one stable color per instance id
+   (hash-picked in app.js), so the same instance is trackable across rows.
+   Without --ib it marks the local instance. */
+.inst-badge {
+  display: inline-block;
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--ib, var(--primary));
+  white-space: nowrap;
+}
+.inst-badge::before {
+  content: "●";
+  margin-right: 3px;
+  font-size: 8px;
+  vertical-align: 1px;
+}
+/* Legend above the table: local (live) vs peers (snapshot). */
+#inflight-table-wrap .inflight-legend {
+  margin: 0 0 6px;
+  font-size: 12px;
+  color: var(--text3);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+#inflight-table-wrap .legend-sep { margin: 0 4px; opacity: 0.4; }
+#inflight-table-wrap .legend-sep::before { content: "|"; }
+/* ▸/▾ expand toggle in front of the deployment id — sized as a real button
+   so it is visible and comfortably clickable, not a bare tiny glyph. */
+.peer-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  margin-right: 7px;
+  border: 1px solid var(--border2);
+  border-radius: 6px;
+  background: var(--surface2);
+  color: var(--text2);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  user-select: none;
+  vertical-align: middle;
+  transition: color .15s, border-color .15s, background .15s;
+}
+.peer-toggle:hover {
+  color: var(--primary);
+  border-color: var(--primary);
+  background: var(--surface3);
+}
+/* Σ cluster-sum cells (collapsed state): bolded + Σ-accented so they read
+   as multi-instance totals, never as the configured per-instance cap. */
+.sum-cell { font-weight: 600; color: var(--text); }
+.sum-cell .sum-sigma { color: var(--primary); margin-right: 2px; }
+.remote-only-label { color: var(--text3); font-size: 11px; }
+/* Hovering a peer badge: highlight that instance's rows, dim the other
+   peer rows so the highlighted ones stand out against the live rows. */
+#inflight-table-wrap tbody tr.hl td { background: var(--surface3) !important; opacity: 1 !important; }
+#inflight-table-wrap tbody.hovering tr:not(.hl):not(.self-row):not(.grp-start) td { opacity: 0.35; }
+
 /* ── Per-1M-token cost cell (models table) ───────────────── */
 /* Inline "label:$value" per line — three rows stack tightly so the
    column stays narrow even when EN headers ("Cost / 1M tokens") squeeze it. */
@@ -3009,6 +3080,47 @@ input[list] {
   letter-spacing: .2px;
   /* Fixed-width digits — the 1.5s poll refresh never makes the value jump. */
   font-variant-numeric: tabular-nums;
+}
+
+/* Multi-instance legend shared by all five pressure charts. Hidden until
+   a peer is live; chips mirror line styles (self solid, peers dashed). */
+.stress-legend {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 14px;
+  padding: 8px 14px;
+  margin-top: 8px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 12px;
+  color: var(--text2);
+}
+.stress-legend__note {
+  color: var(--text3);
+  margin-right: 2px;
+}
+.stress-legend__chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+.stress-legend__swatch {
+  display: inline-block;
+  width: 18px;
+  height: 0;
+  border-top: 2px dashed #888;
+}
+.stress-legend__swatch--self {
+  border-top-style: solid;
+  border-top-color: var(--primary);
+}
+/* Peer with no fresh points (sampler writes every 10s) — instance down,
+   line kept for its remaining 24h history. */
+.stress-legend__chip--stale {
+  opacity: .45;
 }
 .stress-info-bar {
   position: relative;

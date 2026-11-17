@@ -69,10 +69,12 @@ fn validate_prefix_and_tag(req: &CreateKeyRequest) -> Option<Response> {
         if !p.is_empty() && !is_valid_prefix(p) {
             return Some((
                 axum::http::StatusCode::BAD_REQUEST,
-                format!(
-                    "Invalid key_prefix '{}': must be 1-50 ASCII alphanumeric chars [a-zA-Z0-9]",
-                    p
-                ),
+                Json(json!({
+                    "error": format!(
+                        "Invalid key_prefix '{}': must be 1-50 ASCII alphanumeric chars [a-zA-Z0-9]",
+                        p
+                    )
+                })),
             )
                 .into_response());
         }
@@ -81,7 +83,7 @@ fn validate_prefix_and_tag(req: &CreateKeyRequest) -> Option<Response> {
         if tag.chars().count() > MAX_TAG_LEN {
             return Some((
                 axum::http::StatusCode::BAD_REQUEST,
-                format!("Invalid tag: length must be <= {} chars", MAX_TAG_LEN),
+                Json(json!({ "error": format!("Invalid tag: length must be <= {} chars", MAX_TAG_LEN) })),
             )
                 .into_response());
         }
@@ -992,7 +994,7 @@ pub async fn create_key(
         req.max_parallel_requests,
         req.budget_duration.as_deref(),
     ) {
-        return (StatusCode::BAD_REQUEST, msg).into_response();
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response();
     }
 
     // 0b. Reject a budget that a governing plan would silently disable.
@@ -1002,7 +1004,7 @@ pub async fn create_key(
         &req.plan_name,
         req.team_id.as_deref(),
     ) {
-        return (StatusCode::BAD_REQUEST, msg).into_response();
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response();
     }
 
     // 1. Generate raw key + token hash + optional prefix metadata.
@@ -1033,7 +1035,7 @@ pub async fn create_key(
         if exists {
             return (
                 axum::http::StatusCode::CONFLICT,
-                format!("key_alias '{}' already exists", alias),
+                Json(json!({ "error": format!("key_alias '{}' already exists", alias) })),
             )
                 .into_response();
         }
@@ -1080,7 +1082,7 @@ pub async fn create_key(
         tracing::error!("Dashboard create_key insert failed: {}", e);
         return (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            "Internal error",
+            Json(json!({ "error": "Internal error" })),
         )
             .into_response();
     }
@@ -4301,7 +4303,45 @@ pub async fn get_inflight_stats(
         })
     });
 
-    Json(json!({ "deployments": result })).into_response()
+    // Peer instances: live rows other than ours, each carrying its last
+    // telemetry snapshot (counters only). Best-effort — on any failure the
+    // page degrades to the local-only view it has always had.
+    let mut peers = serde_json::Map::new();
+    if let Some(pool) = &state.db_pool {
+        match boom_state::registry::live_instances(
+            pool,
+            std::time::Duration::from_secs(boom_state::INSTANCE_TTL_SECS),
+        )
+        .await
+        {
+            Ok(instances) => {
+                for inst in instances {
+                    if inst.instance_id == *state.instance_id {
+                        continue; // Self renders from live memory.
+                    }
+                    // NULL (fresh takeover, pre-telemetry binary) or an
+                    // unparseable snapshot → the peer contributes no rows.
+                    if let Some(t) = inst
+                        .snapshot
+                        .as_deref()
+                        .and_then(|s| serde_json::from_str::<boom_core::InstanceTelemetry>(s).ok())
+                    {
+                        peers.insert(inst.instance_id, json!(t));
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "peer telemetry unavailable; showing local view only");
+            }
+        }
+    }
+
+    Json(json!({
+        "deployments": result,
+        "peers": peers,
+        "self_instance_id": &*state.instance_id,
+    }))
+    .into_response()
 }
 
 /// Aggregate dispatched key entries by key_alias, returning per-key request counts.
@@ -4813,7 +4853,13 @@ pub async fn get_request_rate_stats(
     if parsed.use_memory {
         let window = parsed.resolved.to_window();
         let all = state.request_rate.snapshot_all();
-        let expected_ts: Vec<String> = window.expected_buckets().into_iter()
+        let buckets = window.expected_buckets();
+        // Minute epoch of each expected bucket — the tracker's buckets are
+        // wall-clock minute-aligned tumbling counters, so peer snapshots can
+        // be summed by minute. Only meaningful for the 1h window (60 × 1min).
+        let expected_min: Vec<i64> = buckets.iter().map(|t| t.timestamp() / 60).collect();
+        let first_min = expected_min.first().copied().unwrap_or(0);
+        let expected_ts: Vec<String> = buckets.into_iter()
             .map(|t| t.to_rfc3339()).collect();
 
         // Reshape per-deployment snapshots into per-model groups. Each model
@@ -4846,6 +4892,70 @@ pub async fn get_request_rate_stats(
             }
             by_model.entry(model).or_default().insert(dep_id, v);
         }
+
+        // Peer snapshots: minute-aligned buckets sum exactly by wall-clock
+        // minute, so every dashboard renders the cluster total without
+        // per-instance splits. Same display-only semantics as the in-flight
+        // peers (≤3s stale); on any failure the chart stays local-only.
+        if window.bucket_secs == 60 {
+            if let Some(pool) = &state.db_pool {
+                if let Ok(instances) = boom_state::registry::live_instances(
+                    pool,
+                    std::time::Duration::from_secs(boom_state::INSTANCE_TTL_SECS),
+                )
+                .await
+                {
+                    for inst in instances {
+                        if inst.instance_id == *state.instance_id {
+                            continue; // Self renders from live memory.
+                        }
+                        let Some(t) = inst
+                            .snapshot
+                            .as_deref()
+                            .and_then(|s| serde_json::from_str::<boom_core::InstanceTelemetry>(s).ok())
+                        else {
+                            continue;
+                        };
+                        if t.rate_1h.base_min == 0 {
+                            continue; // Writer predates the rate histogram.
+                        }
+                        for (dep_id, series) in &t.rate_1h.series {
+                            let n = series.counts.len();
+                            for (i, &c) in series.counts.iter().enumerate() {
+                                if c == 0 {
+                                    continue;
+                                }
+                                let min = t.rate_1h.base_min.saturating_sub((n - 1 - i) as u64) as i64;
+                                // The 1h window is [now-60min, now) while the
+                                // tracker's newest bucket is the current wall
+                                // minute — the local pass zips tracker bucket
+                                // k onto slot k, so wall-minute data renders
+                                // one slot early. Mirror that exactly: a peer
+                                // minute maps to (min - 1)'s slot, or local
+                                // and peer views disagree by one bucket.
+                                let pos = min - first_min - 1;
+                                if pos < 0 || pos as usize >= expected_min.len() {
+                                    continue;
+                                }
+                                let entry = by_model
+                                    .entry(series.model.clone())
+                                    .or_default()
+                                    .entry(dep_id.clone())
+                                    .or_insert_with(|| vec![0u64; expected_min.len()]);
+                                entry[pos as usize] += c;
+                                total_counts[pos as usize] += c;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Peer traffic aged out of the window can leave all-zero series —
+        // drop them like the local pass does.
+        by_model.retain(|_, deps| {
+            deps.retain(|_, v| !v.iter().all(|&c| c == 0));
+            !deps.is_empty()
+        });
 
         let mut charts: Vec<serde_json::Value> = Vec::new();
 
@@ -6765,35 +6875,76 @@ pub async fn quota_reset_team_windows(
 
 // ── System Pressure ────────────────────────────────────────────────────
 //
-// Reads from boom-stressmon's ring buffer (1Hz × 60min). The chart on the
-// admin stats page polls this every 1.5s — see `loadStressPanel` in app.js.
+// With a DB the canonical view is `boom_stress_sample`: one 10s MAX point
+// per instance per wall-aligned bucket, 24h retention. Every dashboard —
+// including this instance's own series — reads the same rows, so any page
+// shows the same cluster picture (stress metrics are physical quantities,
+// never summed: one line per instance). The client caches the full window
+// and polls with `since` for incremental points only.
+//
+// Without a DB the page degrades to this instance's in-process ring
+// (same 10s points, 24h, single series).
 
 #[derive(Debug, Deserialize)]
-pub struct StressRangeQuery {
-    /// `5m` / `15m` / `30m` / `60m` (default 5m). Bounded to the ring
-    /// buffer's 60-min capacity by the impl.
-    #[serde(default = "default_stress_range")]
-    pub range: String,
+pub struct StressHistoryQuery {
+    /// Only return points with `ts > since` (unix secs). `0` (default) is
+    /// the initial full-window load.
+    #[serde(default)]
+    pub since: i64,
 }
 
-fn default_stress_range() -> String {
-    "5m".to_string()
-}
-
-pub async fn get_stress_timeseries(
+pub async fn get_stress_history(
     _session: AdminSession,
     Extension(state): Extension<Arc<DashboardState>>,
-    Query(q): Query<StressRangeQuery>,
+    Query(q): Query<StressHistoryQuery>,
 ) -> Response {
-    let window_secs: i64 = match q.range.as_str() {
-        "5m" => 300,
-        "15m" => 900,
-        "30m" => 1800,
-        "60m" => 3600,
-        _ => 300,
-    };
-    let snap = state.stressmon.timeseries(window_secs).await;
-    Json(snap).into_response()
+    // Self-process meta regardless of mode (uptime card + worker count).
+    let meta = state.stressmon.timeseries(0).await;
+
+    if state.db_pool.is_some() {
+        let rows = state.stressmon.history(q.since).await;
+        // Rows are ts-ordered; group per instance preserving that order.
+        let mut order: Vec<String> = Vec::new();
+        let mut grouped: std::collections::HashMap<String, Vec<serde_json::Value>> =
+            std::collections::HashMap::new();
+        for r in rows {
+            let entry = grouped.entry(r.instance_id.clone()).or_insert_with(|| {
+                order.push(r.instance_id.clone());
+                Vec::new()
+            });
+            entry.push(serde_json::json!({
+                "ts": r.ts,
+                "cpu_pct": r.cpu_pct,
+                "rss_bytes": r.rss_bytes,
+                "worker_queue_depth": r.worker_queue_depth,
+                "blocking_tasks_queued": r.blocking_tasks_queued,
+                "inflight": r.inflight,
+            }));
+        }
+        let instances: Vec<serde_json::Value> = order
+            .into_iter()
+            .map(|id| serde_json::json!({ "instance_id": id, "samples": grouped[&id] }))
+            .collect();
+        return Json(serde_json::json!({
+            "num_workers": meta.num_workers,
+            "uptime_secs": meta.uptime_secs,
+            "self_instance_id": &*state.instance_id,
+            "instances": instances,
+        }))
+        .into_response();
+    }
+
+    // No-DB fallback: local ring only, self is the whole cluster.
+    Json(serde_json::json!({
+        "num_workers": meta.num_workers,
+        "uptime_secs": meta.uptime_secs,
+        "self_instance_id": &*state.instance_id,
+        "instances": [{
+            "instance_id": &*state.instance_id,
+            "samples": meta.samples,
+        }],
+    }))
+    .into_response()
 }
 
 // ═══════════════════════════════════════════════════════════

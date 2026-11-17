@@ -64,6 +64,7 @@ boom-dashboard → boom-core, boom-limiter, boom-routing, boom-audit（禁止依
 | boom-gatekeeper | 客户端拦截（client blocklist 规则匹配 + enabled 开关，DB 权威） | 不做密钥校验、不做路由 |
 | boom-audit | 请求日志读写（boom_request_log 表） | 不做路由决策 |
 | boom-trace | 请求级 trace 链路 + 延迟分布（in-memory 直方图、慢请求 ring buffer、OTLP traces 导出） | 不写 DB 表（持久化归 boom-audit）、不记 prompt 内容（归 boom-promptlog）、不做路由决策 |
+| boom-stressmon | 系统压力打点：1Hz 采样聚合为 10s 峰值点，24h ring + `boom_stress_sample` 持久化（多实例各写各行，看板读全集群） | 采样编排归 boom-main（保持叶子 crate，不依赖 boom-routing） |
 | boom-dashboard | Web UI + REST API + JWT 认证 | 不直接操作 Provider/Config |
 | boom-state | 跨实例机制原语：心跳注册表（实例活性）、revision changelog（配置变更广播） | 无业务语义；不持有热路径请求状态 |
 | boom-main | 路由处理、状态组装、热加载、后台任务 | 不在 handler 里写业务逻辑 |
@@ -77,6 +78,7 @@ boom-dashboard → boom-core, boom-limiter, boom-routing, boom-audit（禁止依
 - boom-limiter: `boom_rate_limit_state`（复合主键 cache_key+window_start，窗口代次共存）, `boom_rate_limit_cumulative`, `boom_quota_delta`（增量水位）, `boom_key_plan_assignment`, `boom_rate_limit_plan`, `boom_team_plan_assignment`
 - boom-gatekeeper: `boom_client_block_rule`, `boom_client_blocklist_state`
 - boom-state: `boom_instance_state`（心跳）, `boom_config_revision`（category 计数器）
+- boom-stressmon: `boom_stress_sample`（每实例 10s 峰值点 × 24h；主键 instance_id+ts_secs 墙钟对齐，写入 gaussdb_upsert 幂等）
 - boom-dashboard: `boom_config`
 - boom-main: `boom_config_meta`（seed 幂等标记 — 唯一例外：表本身属于启动编排层，由 from_config/reload 的 seed_if_empty 读写）
 - boom-auth: 读取 `LiteLLM_VerificationToken`, `LiteLLM_TeamTable`（litellm 兼容，只读）

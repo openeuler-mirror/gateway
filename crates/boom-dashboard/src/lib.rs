@@ -222,10 +222,11 @@ pub fn build_router<S: Clone + Send + Sync + 'static>(state: DashboardState) -> 
             "/dashboard/api/admin/stats/instances",
             get(handlers_admin::get_instance_stats),
         )
-        // Admin — System Pressure timeseries (1Hz ring buffer, last N minutes).
+        // Admin — System Pressure history (10s points × 24h, all instances
+        // from boom_stress_sample; `since` param for incremental polls).
         .route(
-            "/dashboard/api/admin/stress/timeseries",
-            get(handlers_admin::get_stress_timeseries),
+            "/dashboard/api/admin/stress/history",
+            get(handlers_admin::get_stress_history),
         )
         // Admin — Deployment 24h Summary (on-demand, off auto-refresh).
         .route(

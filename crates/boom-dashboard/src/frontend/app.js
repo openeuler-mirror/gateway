@@ -2176,14 +2176,20 @@
   let inflightTimer = null;
 
   // ── System Pressure ───────────────────────────────────
-  // 1.5s poll + canvas redraw. Stops when leaving admin-stress section.
-  // Window is fixed at 60 min (the ring buffer's full capacity) so each
-  // 1Hz sample lands in its own second on the X axis.
+  // 5s poll + canvas redraw. Stops when leaving admin-stress section.
+  // Data is per-instance 10s MAX points with 24h retention (DB-backed;
+  // every dashboard reads the same rows). The client caches the full
+  // window and polls incrementally: only points newer than the cursor
+  // cross the wire after the initial load.
   let stressTimer = null;
-  let stressLastSampleTs = 0;
   // Last uptime pulled by renderStress — kept so a language switch can
-  // re-format immediately instead of waiting for the next 1.5s poll.
+  // re-format immediately instead of waiting for the next 5s poll.
   let stressUptimeSecs = 0;
+  // instance_id -> samples[{ts, cpu_pct, …}]; newest ts seen = `since`
+  // cursor for the next incremental poll.
+  let stressSeries = {};
+  let stressSince = 0;
+
   document.addEventListener("languagechange", () => {
     const el = document.getElementById("stress-uptime-value");
     if (el) el.textContent = formatUptime(stressUptimeSecs);
@@ -2193,7 +2199,7 @@
     stopStressPoll();
     // Immediate fetch so the chart appears without waiting the first tick.
     loadStress();
-    stressTimer = setInterval(loadStress, 1500);
+    stressTimer = setInterval(loadStress, 5000);
   }
 
   function stopStressPoll() {
@@ -2205,11 +2211,11 @@
 
   async function loadStress() {
     try {
-      const res = await api("/admin/stress/timeseries?range=60m");
+      const res = await api("/admin/stress/history?since=" + stressSince);
       renderStress(res);
     } catch (e) {
       // Silently skip — dashboard is read-only, errors shouldn't spam the
-      // console every 1.5s. Network errors usually mean logout.
+      // console every 5s. Network errors usually mean logout.
     }
   }
 
@@ -2363,24 +2369,53 @@
     `; }).join("");
   }
 
+  // Fold the response into the per-instance cache. Server rows are
+  // ts-ascending per instance; resent boundary points replace, newer ones
+  // append. Points past the 24h window are trimmed client-side so the
+  // cache mirrors the DB's retention and stays bounded.
+  function mergeStressSeries(instances) {
+    const cutoff = Math.floor(Date.now() / 1000) - 24 * 3600;
+    for (const inst of instances || []) {
+      let arr = stressSeries[inst.instance_id] || (stressSeries[inst.instance_id] = []);
+      for (const s of inst.samples || []) {
+        if (s.ts > stressSince) stressSince = s.ts;
+        const last = arr[arr.length - 1];
+        if (!last || s.ts > last.ts) arr.push(s);
+        else if (s.ts === last.ts) arr[arr.length - 1] = s;
+      }
+      while (arr.length && arr[0].ts <= cutoff) arr.shift();
+      if (!arr.length) delete stressSeries[inst.instance_id];
+    }
+  }
+
   function renderStress(snap) {
-    const samples = snap.samples || [];
-    const numWorkers = snap.num_workers || 1;
-    const latest = samples.length > 0 ? samples[samples.length - 1] : null;
-    if (latest) stressLastSampleTs = latest.ts;
+    mergeStressSeries(snap.instances);
+
+    const selfId = snap.self_instance_id || "";
+    const samples = stressSeries[selfId] || [];
 
     stressUptimeSecs = snap.uptime_secs || 0;
     const uptimeEl = document.getElementById("stress-uptime-value");
     if (uptimeEl) uptimeEl.textContent = formatUptime(stressUptimeSecs);
 
+    // Every instance (self included) reads from the same DB rows, so all
+    // dashboards show the same picture. Self renders as the solid primary
+    // main line; peers are dashed overlays in their badge color (same
+    // peerColor as the stats page, an instance is one color everywhere).
+    const overlayFor = (key) =>
+      Object.keys(stressSeries)
+        .filter((id) => id !== selfId)
+        .map((id) => ({
+          color: peerColor(id),
+          points: stressSeries[id].map((s) => ({ ts: s.ts, v: s[key] })),
+        }))
+        .filter((o) => o.points.length > 0);
+    renderStressLegend(selfId);
+
     // CPU = process-level (utime+stime), not normalized. May go far past
     // num_workers × 100 because tokio's blocking pool runs threads outside
     // the worker pool (prompt-log gzip, DB work, file I/O). Y axis auto-
-    // scales; the info-bar "CPU > 80% count" still tracks how often the
-    // worker pool itself hit 80% saturation (num_workers × 80 in absolute
-    // terms), but no line is drawn — process CPU spends most of its time
-    // outside that range under load, so the band just visually polluted
-    // the chart without communicating anything actionable.
+    // scales.
     drawMetricCanvas({
       canvasId: "stress-cpu-canvas",
       valueId: "stress-cpu-value",
@@ -2389,9 +2424,10 @@
       yMax: "auto",
       yMinFloor: 100,
       color: cssVar("--primary") || "#0e7490",
-      emptyHint: "Collecting… (first sample takes 1s)",
+      emptyHint: "Collecting… (first point closes ~10s)",
       formatValue: (v) => v.toFixed(1) + "%",
       formatY: (v) => v.toFixed(0) + "%",
+      overlays: overlayFor("cpu_pct"),
     });
 
     // RSS: bytes → MiB / GiB.
@@ -2406,6 +2442,7 @@
       emptyHint: "—",
       formatValue: formatBytes,
       formatY: (v) => formatBytes(v, true),
+      overlays: overlayFor("rss_bytes"),
     });
 
     // Worker queue depth.
@@ -2419,6 +2456,7 @@
       emptyHint: "—",
       formatValue: (v) => String(v),
       formatY: (v) => String(Math.round(v)),
+      overlays: overlayFor("worker_queue_depth"),
     });
 
     // Blocking pool queue.
@@ -2432,6 +2470,7 @@
       emptyHint: "—",
       formatValue: (v) => String(v),
       formatY: (v) => String(Math.round(v)),
+      overlays: overlayFor("blocking_tasks_queued"),
     });
 
     // Inflight requests — soft fill underneath the line.
@@ -2446,7 +2485,38 @@
       emptyHint: "—",
       formatValue: (v) => String(v),
       formatY: (v) => String(Math.round(v)),
+      overlays: overlayFor("inflight"),
     });
+  }
+
+  // One shared legend for all five charts — they always show the same
+  // instance set. Hidden when self is alone. A peer whose newest point is
+  // >30s old (sampler writes every 10s) is dimmed: instance down, line
+  // kept for its remaining history.
+  function renderStressLegend(selfId) {
+    const el = document.getElementById("stress-legend");
+    if (!el) return;
+    const ids = Object.keys(stressSeries);
+    if (ids.length < 2) {
+      el.hidden = true;
+      el.innerHTML = "";
+      return;
+    }
+    el.hidden = false;
+    const now = Math.floor(Date.now() / 1000);
+    const chip = (id, isSelf) => {
+      const newest = stressSeries[id][stressSeries[id].length - 1].ts;
+      const stale = !isSelf && now - newest > 30;
+      const swatchStyle = isSelf ? "" : ` style="border-color:${peerColor(id)}"`;
+      const swatchClass = isSelf ? " stress-legend__swatch--self" : "";
+      const chipClass = stale ? " stress-legend__chip--stale" : "";
+      const label = isSelf ? t("stress.legend.self") : id;
+      return `<span class="stress-legend__chip${chipClass}" title="${esc(id)}"><span class="stress-legend__swatch${swatchClass}"${swatchStyle}></span>${esc(label)}</span>`;
+    };
+    const peers = ids.filter((id) => id !== selfId).sort();
+    el.innerHTML =
+      `<span class="stress-legend__note">${esc(t("stress.legend.note"))}</span>` +
+      [chip(selfId, true)].concat(peers.map((id) => chip(id, false))).join("");
   }
 
   // Process uptime → "0天 1小时 30分钟 15秒" (zh) / "0d 1h 30m 15s" (en).
@@ -2556,6 +2626,10 @@
     if (!canvas) return;
     const valueEl = document.getElementById(opts.valueId);
     const samples = opts.samples;
+    // Overlay series (peer-instance lines): each is {color, points:[{ts,v}]}.
+    // Drawn dashed so a peer is distinguishable from the solid self line
+    // even when its palette color lands near the primary color.
+    const overlays = opts.overlays || [];
 
     // Match canvas backing resolution to the CSS pixel box × devicePixelRatio.
     // Without this, the 1200×220 backing gets stretched by the browser when
@@ -2573,7 +2647,7 @@
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
     if (valueEl) valueEl.textContent = opts.emptyHint || "—";
-    if (samples.length === 0) {
+    if (samples.length === 0 && overlays.length === 0) {
       ctx.clearRect(0, 0, cssW, cssH);
       ctx.fillStyle = cssVar("--text3") || "#888";
       ctx.font = "12px sans-serif";
@@ -2583,10 +2657,13 @@
     }
 
     const latest = samples[samples.length - 1];
-    if (valueEl) valueEl.textContent = opts.formatValue(opts.accessor(latest));
+    if (latest && valueEl) {
+      valueEl.textContent = opts.formatValue(opts.accessor(latest));
+    }
 
     const values = samples.map(opts.accessor);
-    const peak = Math.max(0.0001, ...values);
+    const overlayPeaks = overlays.flatMap((o) => o.points.map((p) => p.v));
+    const peak = Math.max(0.0001, ...values, ...overlayPeaks);
 
     let yMax, tickStep;
     if (typeof opts.yMax === "number") {
@@ -2619,8 +2696,14 @@
     // exist — points stay equidistant on screen even though wall-clock
     // spacing is uneven, which makes recent data look artificially sparse
     // next to dense early-history data. Using ts preserves the true rhythm.
-    const tMin = samples[0].ts;
-    const tMax = samples[samples.length - 1].ts;
+    // Range spans self + overlays so a peer with longer history than the
+    // local buffer still fits the plot instead of drawing off-canvas.
+    const overlayTss = overlays.flatMap((o) => o.points.map((p) => p.ts));
+    const tMin = Math.min(samples[0] ? samples[0].ts : Infinity, ...overlayTss);
+    const tMax = Math.max(
+      samples.length ? samples[samples.length - 1].ts : -Infinity,
+      ...overlayTss,
+    );
     const tRange = Math.max(1, tMax - tMin);
     const xForTs = (t) => padLeft + (plotW * (t - tMin)) / tRange;
     const xFor = (i) => xForTs(samples[i].ts);
@@ -2719,7 +2802,27 @@
     });
     ctx.strokeStyle = opts.color;
     ctx.lineWidth = 1.6;
+    ctx.setLineDash([]);
     ctx.stroke();
+
+    // Peer overlays: coarser resolution (1/min MAX vs 1Hz), dashed so the
+    // self line stays the visual anchor. yFor clamps to [0, yMax] so a
+    // peer spike above the local peak can't draw outside the plot.
+    overlays.forEach((o) => {
+      if (!o.points || o.points.length === 0) return;
+      ctx.beginPath();
+      o.points.forEach((p, i) => {
+        const x = xForTs(p.ts);
+        const y = yFor(p.v);
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
+      ctx.strokeStyle = o.color;
+      ctx.lineWidth = 1.4;
+      ctx.setLineDash([5, 3]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    });
   }
 
   // 24h per-deployment aggregates — populated on page load and Refresh button
@@ -2749,17 +2852,59 @@
   async function loadInflight() {
     try {
       const [data, vis] = await Promise.all([api("/admin/stats/inflight"), getModelVisibility()]);
+      lastInflightData = data;
+      lastInflightVis = vis;
       renderInflightTable(data, vis);
     } catch (err) {
       console.error("loadInflight error:", err);
     }
   }
 
+  // Deterministic muted hue per instance id — peer badges stay visually
+  // trackable across rows without any extra state.
+  function peerColor(id) {
+    var palette = ["#d97706", "#0f766e", "#7c3aed", "#b91c1c", "#1d4ed8", "#be185d", "#4d7c0f", "#9333ea"];
+    var h = 0;
+    for (var i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) >>> 0;
+    return palette[h % palette.length];
+  }
+
+  // Peer expansion is collapsed by default (this instance's row then shows
+  // the cluster Σ sums). Module-level so it survives both the 3s auto-poll
+  // re-renders and standalone toggle re-renders.
+  let inflightExpanded = {};
+  // deployment ids that currently have peer rows + last fetched payload,
+  // consumed by the toggle-all button and ▸/▾ delegation for instant
+  // re-render (no refetch).
+  let inflightPeerDeps = [];
+  let lastInflightData = null;
+  let lastInflightVis = null;
+
   function renderInflightTable(data, visMap) {
     const wrap = document.getElementById("inflight-table-wrap");
     var deployments = data.deployments || [];
+    var peers = data.peers || {};
+    var selfId = data.self_instance_id || "";
+    var peerIds = Object.keys(peers).sort();
+    var localDeps = {};
+    deployments.forEach(function (d) { localDeps[d.deployment_id] = true; });
 
-    if (!deployments.length) {
+    // Deployments known only to peer instances (not configured here) render
+    // as a trailing "-" model group.
+    var remoteOnlyIds = [];
+    var remoteSeen = {};
+    peerIds.forEach(function (pid) {
+      var fl = (peers[pid] && peers[pid].inflight) || {};
+      Object.keys(fl).forEach(function (depId) {
+        if (!localDeps[depId] && !remoteSeen[depId]) {
+          remoteSeen[depId] = true;
+          remoteOnlyIds.push(depId);
+        }
+      });
+    });
+    remoteOnlyIds.sort();
+
+    if (!deployments.length && !remoteOnlyIds.length) {
       var emptyMsg = t("stats.inflight.no_inflight");
       if (deployment24hSummary && deployment24hSummary.__error) {
         emptyMsg += ' <span style="color:#c00">' + t("stats.inflight.24h_load_failed", { error: esc(String(deployment24hSummary.__error)) }) + "</span>";
@@ -2773,85 +2918,237 @@
       errorBanner = '<p style="color:#c00;margin:0 0 6px">' + t("stats.inflight.24h_load_failed", { error: esc(String(deployment24hSummary.__error)) }) + "</p>";
     }
 
+    // Peer snapshots carry counters only (no per-user detail, by design).
+    function peerStat(pid, depId) {
+      var p = peers[pid];
+      return p && p.inflight && p.inflight[depId];
+    }
+    function peerIdsFor(depId) {
+      return peerIds.filter(function (pid) { return peerStat(pid, depId); });
+    }
+    function peerBadgeHtml(pid) {
+      return '<span class="inst-badge" data-inst="' + esc(pid) + '" style="--ib:' + peerColor(pid) + '">' + esc(pid) + "</span>";
+    }
+    function fmtInflightDisplay(s) {
+      return {
+        reqs: s.in_reqs_max > 0 ? s.in_reqs + " / " + s.in_reqs_max : String(s.in_reqs),
+        ctx: s.in_context_max > 0
+          ? s.in_context.toLocaleString() + " / " + s.in_context_max.toLocaleString()
+          : s.in_context.toLocaleString(),
+      };
+    }
+    // Σ cluster-sum cell: deliberately unlike the configured-capacity
+    // "num / max" form so a sum can't be misread as "the cap isn't applied".
+    // Denominator = per-instance cap × instance count.
+    function fmtSumCell(v, max, nInst, title) {
+      var maxSum = max > 0 ? max * nInst : 0;
+      return '<span class="sum-cell" title="' + title + '"><span class="sum-sigma">Σ</span>' +
+        v.toLocaleString() + (maxSum > 0 ? " / " + maxSum.toLocaleString() : "") + "</span>";
+    }
+    // All instances (self + peers) summed for one deployment.
+    function clusterSums(d, pids) {
+      var fc = d.fc_queue, reqs = d.in_reqs, ctx = d.in_context, peerReqs = 0;
+      pids.forEach(function (pid) {
+        var s = peerStat(pid, d.deployment_id);
+        fc += s.fc_queue; reqs += s.in_reqs; ctx += s.in_context; peerReqs += s.in_reqs;
+      });
+      return { fc: fc, reqs: reqs, ctx: ctx, selfReqs: d.in_reqs, peerReqs: peerReqs };
+    }
+    // Peer row: badge-only leading cell (deployment id is already on the
+    // self row above); the 24h columns are cluster-global aggregates and
+    // cannot be split per instance.
+    function peerRowHtml(pid, depId, grp, modelTd) {
+      var s = peerStat(pid, depId);
+      var disp = fmtInflightDisplay(s);
+      return (
+        '<tr class="' + grp + ' peer-row" data-inst="' + esc(pid) + '">' +
+        modelTd +
+        '<td class="inst-id">' + peerBadgeHtml(pid) + "</td>" +
+        "<td class=\"num\">" + s.fc_queue + "</td>" +
+        "<td class=\"num\">" + disp.reqs + "</td>" +
+        "<td class=\"num\">" + disp.ctx + "</td>" +
+        "<td class=\"num\">-</td>" +
+        "<td class=\"num\">-</td>" +
+        "<td class=\"num\">-</td>" +
+        "<td class=\"num\">-</td>" +
+        "<td class=\"num\">-</td>" +
+        "</tr>"
+      );
+    }
+
+    var legend = "";
+    if (peerIds.length) {
+      legend =
+        '<div class="inflight-legend">' +
+        '<span class="inst-badge">' + esc(selfId) + "</span> " +
+        t("stats.inflight.legend.self_live") +
+        '<span class="legend-sep"></span>' +
+        peerIds.map(peerBadgeHtml).join(" ") + " " +
+        t("stats.inflight.legend.peer_snapshot") +
+        "</div>";
+    }
+
     // Rows arrive model-sorted from the backend (alphabetical model, then
     // deployment_id), so same-model instances are consecutive. Grouped-table
     // layout (AWS/GCP-console style): the model identity cell uses rowspan
-    // to span all of that model's instance rows, and each instance id gets
-    // its own column — block = model, row = instance. Zebra alternates by
-    // GROUP (the merged cell can't follow per-row striping): one model
-    // block shares one shade, adjacent blocks alternate.
+    // to span all of that model's rows, and each deployment id gets its own
+    // column — block = model, row = deployment. Zebra alternates by GROUP
+    // (the merged cell can't follow per-row striping): one model block
+    // shares one shade, adjacent blocks alternate.
+    //
+    // rowspan counts every row of the group — peer rows only while that
+    // deployment is expanded. The ×N marker stays local-deployments-only —
+    // peers don't add backend instances, they are other views of the same
+    // deployments.
+    var localModelCounts = {};
+    var groupCounts = {};
+    inflightPeerDeps = [];
+    deployments.forEach(function (d) {
+      localModelCounts[d.model] = (localModelCounts[d.model] || 0) + 1;
+      if (peerIdsFor(d.deployment_id).length) inflightPeerDeps.push(d.deployment_id);
+      groupCounts[d.model] = (groupCounts[d.model] || 0) + 1 +
+        (inflightExpanded[d.deployment_id] ? peerIdsFor(d.deployment_id).length : 0);
+    });
+
+    var rows = [];
     var prevModel = null;
     var groupIndex = -1;
-    var groupCounts = {};
     deployments.forEach(function (d) {
-      groupCounts[d.model] = (groupCounts[d.model] || 0) + 1;
+      var disp = fmtInflightDisplay(d);
+
+      // FC QUEUE tooltip — show queued key aliases (VIP first).
+      var fcQueueHtml = String(d.fc_queue);
+      if (d.fc_queue > 0 && d.queued_keys && d.queued_keys.length > 0) {
+        var items = d.queued_keys.map(function (k) {
+          var vipTag = k.is_vip ? "★ " : "";
+          return vipTag + esc(k.key_alias || "?");
+        });
+        fcQueueHtml = '<span class="cell-tip" data-tip="' + items.join("&#10;").replace(/"/g, "&quot;") + '">' + d.fc_queue + '</span>';
+      }
+
+      // IN-MODEL REQS tooltip — show per-key request counts.
+      var reqsHtml = disp.reqs;
+      if (d.in_reqs > 0 && d.key_stats && d.key_stats.length > 0) {
+        var reqItems = d.key_stats.map(function (k) {
+          var vipTag = k.is_vip ? "★ " : "";
+          return vipTag + esc(k.key_alias || "?") + ": " + k.request_count;
+        });
+        reqsHtml = '<span class="cell-tip" data-tip="' + reqItems.join("&#10;").replace(/"/g, "&quot;") + '">' + disp.reqs + '</span>';
+      }
+
+      var isGroupFirst = d.model !== prevModel;
+      prevModel = d.model;
+      if (isGroupFirst) groupIndex += 1;
+      var grp = groupIndex % 2 === 0 ? "grp-a" : "grp-b";
+      var modelTd = isGroupFirst
+        ? '<td class="grp-model" rowspan="' + groupCounts[d.model] + '">' +
+          renderDeployCell(d.model, null, localModelCounts[d.model]) +
+          (visMap ? visibilityBadgeFor(visMap[d.model]) : "") +
+          "</td>"
+        : "";
+
+      // ▸/▾ toggle in front of the deployment id (only when peers exist).
+      var pids = peerIdsFor(d.deployment_id);
+      var isOpen = !!inflightExpanded[d.deployment_id] && pids.length > 0;
+      var toggle = pids.length
+        ? '<span class="peer-toggle" data-dep="' + esc(d.deployment_id) + '" title="' +
+          (isOpen ? t("stats.inflight.toggle_collapse")
+                  : t("stats.inflight.toggle_expand", { n: pids.length })) +
+          '">' + (isOpen ? "▾" : "▸") + "</span>"
+        : "";
+
+      // Collapsed: numeric cells show cluster sums (Σ form; denominator =
+      // per-instance cap × instance count; hover shows the self/peer
+      // breakdown). Expanded: this instance's own value / cap, with peer
+      // detail rows below.
+      var fcCell = fcQueueHtml, reqsCell = reqsHtml, ctxCell = disp.ctx;
+      if (pids.length && !isOpen) {
+        var sums = clusterSums(d, pids);
+        var n = pids.length + 1;
+        fcCell = fmtSumCell(sums.fc, 0, 0, t("stats.inflight.sum_total", { n: n }));
+        reqsCell = fmtSumCell(sums.reqs, d.in_reqs_max, n,
+          t("stats.inflight.sum_breakdown", { n: n, self: sums.selfReqs, peers: sums.peerReqs }));
+        ctxCell = fmtSumCell(sums.ctx, d.in_context_max, n, t("stats.inflight.sum_ctx", { n: n }));
+      }
+
+      // 24h aggregates — read from cache populated on page load / Refresh button.
+      var s = d.deployment_id ? deployment24hSummary[d.deployment_id] : null;
+      function fmtInt(v) { return (v == null) ? "-" : Math.round(v).toLocaleString(); }
+      function fmtToken(v) { return (v == null) ? "-" : Math.round(v).toLocaleString(); }
+      function fmtTtft(v) { return (v == null) ? "-" : Math.round(v) + "ms"; }
+
+      rows.push(
+        "<tr class=\"" + grp + (isGroupFirst ? " grp-start" : "") + " self-row\">" +
+        modelTd +
+        "<td class=\"inst-id\">" + toggle + esc(d.deployment_id) + "</td>" +
+        "<td class=\"num\">" + fcCell + "</td>" +
+        "<td class=\"num\">" + reqsCell + "</td>" +
+        "<td class=\"num\">" + ctxCell + "</td>" +
+        "<td class=\"num\">" + fmtInt(s ? s.total_requests : null) + "</td>" +
+        "<td class=\"num\">" + fmtToken(s ? s.avg_input_tokens : null) + "</td>" +
+        "<td class=\"num\">" + fmtToken(s ? s.avg_output_tokens : null) + "</td>" +
+        "<td class=\"num\">" + fmtTtft(s ? s.avg_ttft_ms : null) + "</td>" +
+        "<td class=\"num\">" + fmtPrefixHit(s ? s.avg_prefix_hit_rate : null) + "</td>" +
+        "</tr>"
+      );
+      if (isOpen) {
+        pids.forEach(function (pid) {
+          rows.push(peerRowHtml(pid, d.deployment_id, grp, ""));
+        });
+      }
     });
+
+    // Trailing "-" group: deployments this instance doesn't know, seen only
+    // through peer snapshots. Header row carries the deployment id; there is
+    // no self row, so peer badge rows always render below it.
+    if (remoteOnlyIds.length) {
+      groupIndex += 1;
+      var grpR = groupIndex % 2 === 0 ? "grp-a" : "grp-b";
+      var remoteFirst = true;
+      remoteOnlyIds.forEach(function (depId) {
+        var pidsR = peerIdsFor(depId);
+        rows.push(
+          '<tr class="' + grpR + (remoteFirst ? " grp-start" : "") + ' self-row">' +
+          '<td class="grp-model" rowspan="' + (pidsR.length + 1) + '">' +
+          renderDeployCell("-", null, 0) +
+          "</td>" +
+          '<td class="inst-id">' + esc(depId) +
+          ' <span class="remote-only-label">' + t("stats.inflight.remote_only") + "</span></td>" +
+          "<td class=\"num\">-</td>" +
+          "<td class=\"num\">-</td>" +
+          "<td class=\"num\">-</td>" +
+          "<td class=\"num\">-</td>" +
+          "<td class=\"num\">-</td>" +
+          "<td class=\"num\">-</td>" +
+          "<td class=\"num\">-</td>" +
+          "<td class=\"num\">-</td>" +
+          "</tr>"
+        );
+        remoteFirst = false;
+        pidsR.forEach(function (pid) {
+          rows.push(peerRowHtml(pid, depId, grpR, ""));
+        });
+      });
+    }
 
     wrap.innerHTML =
       errorBanner +
+      legend +
       '<table class="data-table"><thead><tr>' +
-      "<th>" + t("stats.inflight.col.model") + "</th><th>" + t("stats.inflight.col.instance") + "</th><th class=\"num\">" + t("stats.inflight.col.fc_queue") + "</th><th class=\"num\">" + t("stats.inflight.col.in_reqs") + "</th><th class=\"num\">" + t("stats.inflight.col.in_context") + "</th>" +
+      "<th>" + t("stats.inflight.col.model") + "</th><th>" + t("stats.inflight.col.deployment") + "</th><th class=\"num\">" + t("stats.inflight.col.fc_queue") + "</th><th class=\"num\">" + t("stats.inflight.col.in_reqs") + "</th><th class=\"num\">" + t("stats.inflight.col.in_context") + "</th>" +
       "<th class=\"num\">" + t("stats.inflight.col.24h_reqs") + "</th><th class=\"num\">" + t("stats.inflight.col.avg_in") + "</th><th class=\"num\">" + t("stats.inflight.col.avg_out") + "</th><th class=\"num\">" + t("stats.inflight.col.avg_ttft") + "</th><th class=\"num\">" + t("stats.inflight.col.avg_prefix_hit_rate") + "</th>" +
       "</tr></thead><tbody>" +
-      deployments
-        .map(function (d) {
-          var reqsDisplay = d.in_reqs_max > 0 ? d.in_reqs + " / " + d.in_reqs_max : String(d.in_reqs);
-          var ctxDisplay = d.in_context_max > 0 ? d.in_context.toLocaleString() + " / " + d.in_context_max.toLocaleString() : d.in_context.toLocaleString();
-
-          // FC QUEUE tooltip — show queued key aliases (VIP first).
-          var fcQueueHtml = String(d.fc_queue);
-          if (d.fc_queue > 0 && d.queued_keys && d.queued_keys.length > 0) {
-            var items = d.queued_keys.map(function (k) {
-              var vipTag = k.is_vip ? "★ " : "";
-              return vipTag + esc(k.key_alias || "?");
-            });
-            fcQueueHtml = '<span class="cell-tip" data-tip="' + items.join("&#10;").replace(/"/g, "&quot;") + '">' + d.fc_queue + '</span>';
-          }
-
-          // IN-MODEL REQS tooltip — show per-key request counts.
-          var reqsHtml = reqsDisplay;
-          if (d.in_reqs > 0 && d.key_stats && d.key_stats.length > 0) {
-            var reqItems = d.key_stats.map(function (k) {
-              var vipTag = k.is_vip ? "★ " : "";
-              return vipTag + esc(k.key_alias || "?") + ": " + k.request_count;
-            });
-            reqsHtml = '<span class="cell-tip" data-tip="' + reqItems.join("&#10;").replace(/"/g, "&quot;") + '">' + reqsDisplay + '</span>';
-          }
-
-          var isGroupFirst = d.model !== prevModel;
-          prevModel = d.model;
-          if (isGroupFirst) groupIndex += 1;
-          var grp = groupIndex % 2 === 0 ? "grp-a" : "grp-b";
-          var modelTd = isGroupFirst
-            ? '<td class="grp-model" rowspan="' + groupCounts[d.model] + '">' +
-              renderDeployCell(d.model, null, groupCounts[d.model]) +
-              (visMap ? visibilityBadgeFor(visMap[d.model]) : "") +
-              "</td>"
-            : "";
-
-          // 24h aggregates — read from cache populated on page load / Refresh button.
-          var s = d.deployment_id ? deployment24hSummary[d.deployment_id] : null;
-          function fmtInt(v) { return (v == null) ? "-" : Math.round(v).toLocaleString(); }
-          function fmtToken(v) { return (v == null) ? "-" : Math.round(v).toLocaleString(); }
-          function fmtTtft(v) { return (v == null) ? "-" : Math.round(v) + "ms"; }
-
-          return (
-            "<tr class=\"" + grp + (isGroupFirst ? " grp-start" : "") + "\">" +
-            modelTd +
-            "<td class=\"inst-id\">" + esc(d.deployment_id) + "</td>" +
-            "<td class=\"num\">" + fcQueueHtml + "</td>" +
-            "<td class=\"num\">" + reqsHtml + "</td>" +
-            "<td class=\"num\">" + ctxDisplay + "</td>" +
-            "<td class=\"num\">" + fmtInt(s ? s.total_requests : null) + "</td>" +
-            "<td class=\"num\">" + fmtToken(s ? s.avg_input_tokens : null) + "</td>" +
-            "<td class=\"num\">" + fmtToken(s ? s.avg_output_tokens : null) + "</td>" +
-            "<td class=\"num\">" + fmtTtft(s ? s.avg_ttft_ms : null) + "</td>" +
-            "<td class=\"num\">" + fmtPrefixHit(s ? s.avg_prefix_hit_rate : null) + "</td>" +
-            "</tr>"
-          );
-        })
-        .join("") +
+      rows.join("") +
       "</tbody></table>";
+
+    // Master expand/collapse button: hidden with no peers; label flips to
+    // "collapse all" once nothing is left collapsed.
+    var btnAll = document.getElementById("btn-toggle-inflight-peers");
+    if (btnAll) {
+      var anyCollapsed = inflightPeerDeps.some(function (dep) { return !inflightExpanded[dep]; });
+      btnAll.style.display = peerIds.length ? "" : "none";
+      btnAll.textContent = anyCollapsed ? t("stats.inflight.expand_all") : t("stats.inflight.collapse_all");
+    }
   }
 
   function startInflightPoll() {
@@ -7776,6 +8073,37 @@
       finally {
         btnRefreshInflight.disabled = false;
         btnRefreshInflight.textContent = t("action.refresh");
+      }
+    });
+    // Master expand/collapse: flips every deployment that has peer rows,
+    // then re-renders from the cached payload (no refetch).
+    const btnTogglePeers = document.getElementById("btn-toggle-inflight-peers");
+    if (btnTogglePeers) btnTogglePeers.addEventListener("click", () => {
+      if (!lastInflightData) return;
+      const anyCollapsed = inflightPeerDeps.some((dep) => !inflightExpanded[dep]);
+      inflightPeerDeps.forEach((dep) => { inflightExpanded[dep] = anyCollapsed; });
+      renderInflightTable(lastInflightData, lastInflightVis);
+    });
+    // ▸/▾ toggles re-create the table on every render — delegation at the
+    // document level is the only place a single binding survives them all.
+    document.addEventListener("click", (e) => {
+      const tg = e.target.closest ? e.target.closest(".peer-toggle") : null;
+      if (!tg || !tg.dataset.dep || !lastInflightData) return;
+      inflightExpanded[tg.dataset.dep] = !inflightExpanded[tg.dataset.dep];
+      renderInflightTable(lastInflightData, lastInflightVis);
+    });
+    // Hovering a peer badge highlights that instance's rows and dims the
+    // other peer rows (see .hovering/.hl rules in style.css).
+    document.addEventListener("mouseover", (e) => {
+      const el = e.target.closest ? e.target.closest(".inst-badge[data-inst]") : null;
+      const tbody = document.querySelector("#inflight-table-wrap tbody");
+      if (!tbody) return;
+      if (el) {
+        tbody.classList.add("hovering");
+        tbody.querySelectorAll('tr[data-inst="' + el.dataset.inst + '"]').forEach((tr) => { tr.classList.add("hl"); });
+      } else {
+        tbody.classList.remove("hovering");
+        tbody.querySelectorAll("tr.hl").forEach((tr) => { tr.classList.remove("hl"); });
       }
     });
     const btnDebug = document.getElementById("btn-debug-toggle");

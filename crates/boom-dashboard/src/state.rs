@@ -215,6 +215,9 @@ pub struct DashboardState {
     pub inflight: Arc<InFlightTracker>,
     /// Per-deployment flow controller for real-time stats.
     pub flow_controller: Arc<FlowController>,
+    /// This instance's stable id — splits the stats view into "self (live
+    /// memory)" vs "peers (snapshot from boom_instance_state)".
+    pub instance_id: Arc<str>,
     /// Channel for model write operations (handled by boom-main).
     pub admin_tx: AdminTx,
     /// Session JWT signing key — independent of `master_key` (configured
@@ -291,6 +294,7 @@ impl DashboardState {
         cost_template_store: Arc<CostTemplateStore>,
         inflight: Arc<InFlightTracker>,
         flow_controller: Arc<FlowController>,
+        instance_id: Arc<str>,
         admin_tx: AdminTx,
         master_key: Option<String>,
         session_secret: Option<String>,
@@ -327,6 +331,7 @@ impl DashboardState {
             cost_template_store,
             inflight,
             flow_controller,
+            instance_id,
             admin_tx,
             jwt_secret,
             master_key,

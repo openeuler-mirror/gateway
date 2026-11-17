@@ -11,7 +11,8 @@
 //! - [`revision`]: DB-as-changelog. Writers bump a category counter after
 //!   committing a business write; every instance polls the counters and
 //!   reconciles changed categories. Reconciles are idempotent, so a
-//!   redundant trigger is harmless.
+//!   redundant trigger is harmless, and a periodic full re-assertion
+//!   ([`FULL_RECONCILE_EVERY_POLLS`]) bounds the staleness of lost signals.
 //!
 //! Hot-path request state does NOT belong here (windows stay in-memory in
 //! boom-limiter); the quota-delta protocol lands in a later phase as
@@ -37,3 +38,9 @@ pub const HEARTBEAT_INTERVAL_SECS: u64 = 15;
 pub const INSTANCE_TTL_SECS: u64 = 60;
 /// Revision poll cadence — upper bound on config-change propagation.
 pub const REVISION_POLL_INTERVAL_SECS: u64 = 5;
+/// Every Nth poll, watchers re-run the full reconcile set regardless of the
+/// counters. The revision signal only *accelerates* convergence; this
+/// periodic re-assertion bounds the staleness of any lost signal (a bump
+/// that failed after the business write, a dispatch that failed, a deleted
+/// revision row) to one full-reconcile interval. 120 polls × 5s = 10 min.
+pub const FULL_RECONCILE_EVERY_POLLS: u64 = 120;

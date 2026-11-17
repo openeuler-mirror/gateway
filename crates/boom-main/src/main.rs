@@ -125,12 +125,14 @@ async fn async_main(
     spawn_sighup_listener(state.clone(), shutdown_tx.subscribe());
 
     // Spawn background sync task (persist rate limit state + cleanup memory).
-    spawn_sync_task(state.clone(), shutdown_tx.subscribe());
+    spawn_sync_task(state.clone(), shutdown_tx.subscribe(), shutdown_tx.subscribe());
 
-    // Cross-instance mechanisms: liveness heartbeat + config revision
-    // watcher (multi-instance propagation; single-instance no-ops into a
-    // cheap self-reconcile loop).
+    // Cross-instance mechanisms: liveness heartbeat + telemetry snapshot
+    // (in-flight counters for peer dashboards) + config revision watcher
+    // (multi-instance propagation; single-instance no-ops into a cheap
+    // self-reconcile loop).
     revision_watcher::spawn_instance_heartbeat(state.clone(), shutdown_tx.subscribe());
+    revision_watcher::spawn_instance_telemetry(state.clone(), shutdown_tx.subscribe());
     revision_watcher::spawn_revision_watcher(state.clone(), shutdown_tx.subscribe());
 
     // Spawn request summary logger (every 60s).
@@ -155,10 +157,13 @@ async fn async_main(
     alert_reconciler::spawn_alert_reconciler(state.clone(), shutdown_tx.subscribe());
 
     // Spawn the system pressure sampler (1 Hz — CPU, RSS, tokio worker queue
-    // depth, blocking pool queue, inflight). See `spawn_stressmon_sampler`.
+    // depth, blocking pool queue, inflight — folded into 10s MAX points and,
+    // with a DB, persisted to boom_stress_sample). See `spawn_stressmon_sampler`.
     spawn_stressmon_sampler(
         state.stressmon.clone(),
         state.inflight.clone(),
+        state.instance_id.clone(),
+        state.db_pool.clone(),
         shutdown_tx.subscribe(),
     );
 
@@ -300,6 +305,7 @@ fn build_router(state: AppState) -> Router {
         state.cost_template_store.clone(),
         state.inflight.clone(),
         state.flow_controller.clone(),
+        state.instance_id.clone(),
         admin_tx,
         master_key,
         dashboard_session_secret,
@@ -348,15 +354,13 @@ fn build_router(state: AppState) -> Router {
 
 /// Listen for SIGHUP and trigger hot-reload.
 ///
-/// A single-slot `Mutex` serializes concurrent SIGHUPs: rapid `kill -HUP`
-/// bursts (e.g. from a wrapper script) won't stack reloads on top of each
-/// other. `try_lock` (not `lock().await`) so the listener itself never
-/// blocks waiting for the previous reload to finish — additional SIGHUPs
-/// during an in-progress reload just get a "skipping" log line.
+/// Concurrency control lives in [`AppState::reload`] itself: every trigger
+/// source (SIGHUP, HTTP `/admin/config/reload`, the config-section editor)
+/// funnels through the same try-lock, so a reload already in progress
+/// rejects further triggers with a log line instead of stacking on top.
 fn spawn_sighup_listener(state: AppState, mut shutdown: tokio::sync::broadcast::Receiver<()>) {
     #[cfg(unix)]
     {
-        let reload_lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
         let state_clone = state.clone();
         tokio::spawn(async move {
             let mut stream = match tokio::signal::unix::signal(
@@ -372,22 +376,13 @@ fn spawn_sighup_listener(state: AppState, mut shutdown: tokio::sync::broadcast::
             loop {
                 tokio::select! {
                     _ = stream.recv() => {
-                        // try_lock: if a previous reload is still running
-                        // (bounded to 60s by AppState::reload's outer timeout),
-                        // skip this SIGHUP instead of queueing another.
-                        let guard = reload_lock.try_lock();
-                        if guard.is_err() {
-                            tracing::warn!(
-                                "SIGHUP received but a reload is already in progress — skipping"
-                            );
-                            continue;
-                        }
                         tracing::info!("Received SIGHUP — triggering hot-reload...");
+                        // Rejections ("already in progress") and real failures
+                        // are both already logged inside reload().
                         match state_clone.reload().await {
                             Ok(summary) => tracing::info!("SIGHUP reload: {}", summary),
-                            Err(e) => tracing::error!("SIGHUP reload failed: {}", e),
+                            Err(_) => {}
                         }
-                        drop(guard);
                     }
                     _ = shutdown.recv() => {
                         tracing::debug!("SIGHUP listener shutting down");
@@ -483,26 +478,52 @@ fn spawn_request_summary(
 }
 
 /// Background task: every 1s, sample system pressure (CPU, RSS, tokio
-/// worker queue depth, blocking pool queue, inflight) and push to the
-/// `StressmonCollector`.
+/// worker queue depth, blocking pool queue, inflight) and fold it into the
+/// collector's open 10s MAX bucket. Each closed bucket is persisted to
+/// `boom_stress_sample` (one row per instance per bucket, wall-clock
+/// aligned — see boom-stressmon) and the retention window is pruned
+/// hourly. Without a DB the ring buffer alone serves the local dashboard.
 ///
 /// Sampling lives here (not inside boom-stressmon) so boom-stressmon stays
 /// a leaf crate with no dep on boom-routing's `InFlightTracker`
-/// (CLAUDE.md §1 — boom-core is the only leaf dep). The collector itself
-/// is just a ring buffer.
+/// (CLAUDE.md §1 — boom-core is the only leaf dep).
 fn spawn_stressmon_sampler(
     collector: std::sync::Arc<boom_stressmon::StressmonCollector>,
     inflight: std::sync::Arc<boom_routing::InFlightTracker>,
+    instance_id: std::sync::Arc<str>,
+    pool: Option<sqlx::PgPool>,
     mut shutdown: tokio::sync::broadcast::Receiver<()>,
 ) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // 360 closed buckets ≈ 1h — the prune cadence.
+        let mut buckets_since_prune: u32 = 0;
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
                     let sample = sample_pressure_once(&inflight);
-                    collector.record_sample(sample);
+                    if let Some(point) = collector.observe(sample) {
+                        let Some(pool) = &pool else { continue };
+                        if let Err(e) =
+                            boom_stressmon::write_sample(pool, &instance_id, &point).await
+                        {
+                            tracing::warn!(error = %e, "stress sample persist failed");
+                        }
+                        buckets_since_prune += 1;
+                        if buckets_since_prune >= 360 {
+                            buckets_since_prune = 0;
+                            match boom_stressmon::prune(pool).await {
+                                Ok(n) if n > 0 => {
+                                    tracing::debug!(deleted = n, "stress samples pruned");
+                                }
+                                Ok(_) => {}
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "stress sample prune failed");
+                                }
+                            }
+                        }
+                    }
                 }
                 _ = shutdown.recv() => {
                     tracing::debug!("Stressmon sampler shutting down");
@@ -511,7 +532,7 @@ fn spawn_stressmon_sampler(
             }
         }
     });
-    tracing::info!("System pressure sampler spawned (1 Hz)");
+    tracing::info!("System pressure sampler spawned (1 Hz → 10s points)");
 }
 
 /// Take one pressure sample. CPU is process-level: sum of utime+stime
@@ -678,80 +699,104 @@ fn spawn_periodic_fc_dispatch(
 
 /// Background task: run the limiter's incremental delta sync cycle
 /// (default 60s, `quota_sync.interval_secs` 30–600s) and clean up memory.
-fn spawn_sync_task(state: AppState, mut shutdown: tokio::sync::broadcast::Receiver<()>) {
-    let db_pool = state.db_pool.clone();
-    let limiter = state.limiter.clone();
-    let plan_store = state.plan_store.clone();
-
-    tokio::spawn(async move {
-        let pool = match db_pool {
-            Some(p) => p,
-            None => return, // No DB — nothing to persist.
-        };
-
-        // Initial delay to let startup traffic settle.
-        tokio::select! {
-            _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {}
-            _ = shutdown.recv() => {
-                tracing::debug!("Sync task shutting down during initial delay");
-                return;
-            }
-        }
-
-        loop {
-            // Interval is re-read each cycle so a reload (SIGHUP / config
-            // section write) adjusts the cadence without a restart. Clamped
-            // to 30–600s by the config getter.
-            let interval_secs = {
-                let inner = state.inner.load();
-                inner.config.quota_sync.effective_interval_secs()
-            };
+/// Quota convergence + in-memory housekeeping, as two independent tasks:
+///
+/// - the delta sync needs the shared DB — without one there is nothing to
+///   push or pull (counters are per-boot in-memory);
+/// - the cleanup sweep is pure memory work and must run in EVERY mode:
+///   bundling it with the DB sync (the old shape) let no-DB deployments
+///   accumulate expired windows and idle concurrency counters forever.
+fn spawn_sync_task(
+    state: AppState,
+    mut shutdown: tokio::sync::broadcast::Receiver<()>,
+    mut cleanup_shutdown: tokio::sync::broadcast::Receiver<()>,
+) {
+    if let Some(pool) = state.db_pool.clone() {
+        let limiter = state.limiter.clone();
+        let inner = state.inner.clone();
+        tokio::spawn(async move {
+            // Initial delay to let startup traffic settle.
             tokio::select! {
-                _ = tokio::time::sleep(std::time::Duration::from_secs(interval_secs)) => {}
+                _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {}
                 _ = shutdown.recv() => {
-                    tracing::debug!("Sync task shutting down");
+                    tracing::debug!("Sync task shutting down during initial delay");
                     return;
                 }
             }
 
-            // 1. Incremental delta cycle: purge expired rows, push local
-            //    deltas (watermarked, idempotent), pull peer globals when
-            //    decisions are shared. An ambiguous outcome (timeout) is
-            //    safe: the watermark row makes the retry skip a committed
-            //    batch instead of double-applying it.
-            let cycle_result = tokio::time::timeout(
-                std::time::Duration::from_secs(30),
-                limiter.sync_delta_cycle(&pool),
-            )
-            .await;
-            match cycle_result {
-                Ok(Ok(stats)) => {
-                    if stats.window_deltas > 0
-                        || stats.cumulative_deltas > 0
-                        || stats.recovered_from_watermark
-                    {
-                        tracing::debug!(
-                            window_deltas = stats.window_deltas,
-                            cumulative_deltas = stats.cumulative_deltas,
-                            pulled_windows = stats.pulled_windows,
-                            pulled_cumulative = stats.pulled_cumulative,
-                            recovered = stats.recovered_from_watermark,
-                            "Quota delta sync cycle"
+            loop {
+                // Interval is re-read each cycle so a reload (SIGHUP / config
+                // section write) adjusts the cadence without a restart. Clamped
+                // to 30–600s by the config getter.
+                let interval_secs = {
+                    let inner = inner.load();
+                    inner.config.quota_sync.effective_interval_secs()
+                };
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(interval_secs)) => {}
+                    _ = shutdown.recv() => {
+                        tracing::debug!("Sync task shutting down");
+                        return;
+                    }
+                }
+
+                // Incremental delta cycle: purge expired rows, push local
+                // deltas (watermarked, idempotent), pull peer globals when
+                // decisions are shared. The watchdog timeout below is safe at
+                // ANY kill point: dirty keys are only snapshotted (retired
+                // after commit), so an aborted cycle leaves the batch
+                // scheduled; the watermark row makes the retry skip an
+                // already-committed batch instead of double-applying it.
+                let cycle_result = tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    limiter.sync_delta_cycle(&pool),
+                )
+                .await;
+                match cycle_result {
+                    Ok(Ok(stats)) => {
+                        if stats.window_deltas > 0
+                            || stats.cumulative_deltas > 0
+                            || stats.recovered_from_watermark
+                        {
+                            tracing::debug!(
+                                window_deltas = stats.window_deltas,
+                                cumulative_deltas = stats.cumulative_deltas,
+                                pulled_windows = stats.pulled_windows,
+                                pulled_cumulative = stats.pulled_cumulative,
+                                recovered = stats.recovered_from_watermark,
+                                "Quota delta sync cycle"
+                            );
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!("Quota delta sync failed (will retry): {}", e);
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            "Quota delta sync timed out after 30s — next cycle checks the \
+                             watermark and recovers a committed-but-unmirrored push"
                         );
                     }
                 }
-                Ok(Err(e)) => {
-                    tracing::warn!("Quota delta sync failed (will retry): {}", e);
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        "Quota delta sync timed out after 30s — next cycle checks the \
-                         watermark and recovers a committed-but-unmirrored push"
-                    );
+            }
+        });
+        tracing::info!(
+            "Background quota delta sync task spawned (default 60s, 30-600s configurable)"
+        );
+    }
+
+    // In-memory housekeeping sweep — every deployment mode.
+    let limiter = state.limiter.clone();
+    let plan_store = state.plan_store.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {}
+                _ = cleanup_shutdown.recv() => {
+                    tracing::debug!("Cleanup task shutting down");
+                    return;
                 }
             }
-
-            // 2. Cleanup stale in-memory entries.
             let expired = limiter.cleanup_expired();
             let concurrency_freed = plan_store.cleanup_concurrency();
             if expired > 0 || concurrency_freed > 0 {
@@ -763,7 +808,6 @@ fn spawn_sync_task(state: AppState, mut shutdown: tokio::sync::broadcast::Receiv
             }
         }
     });
-    tracing::info!("Background quota delta sync task spawned (default 60s, 30-600s configurable)");
 }
 
 /// Spawn the TTL prune task if kvc_aware is enabled. Delegates to
