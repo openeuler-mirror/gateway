@@ -1911,6 +1911,40 @@ input[list] {
 }
 #inflight-table-wrap .legend-sep { margin: 0 4px; opacity: 0.4; }
 #inflight-table-wrap .legend-sep::before { content: "|"; }
+/* ▸/▾ expand toggle in front of the deployment id — sized as a real button
+   so it is visible and comfortably clickable, not a bare tiny glyph. */
+.peer-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  margin-right: 7px;
+  border: 1px solid var(--border2);
+  border-radius: 6px;
+  background: var(--surface2);
+  color: var(--text2);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  user-select: none;
+  vertical-align: middle;
+  transition: color .15s, border-color .15s, background .15s;
+}
+.peer-toggle:hover {
+  color: var(--primary);
+  border-color: var(--primary);
+  background: var(--surface3);
+}
+/* Σ cluster-sum cells (collapsed state): bolded + Σ-accented so they read
+   as multi-instance totals, never as the configured per-instance cap. */
+.sum-cell { font-weight: 600; color: var(--text); }
+.sum-cell .sum-sigma { color: var(--primary); margin-right: 2px; }
+.remote-only-label { color: var(--text3); font-size: 11px; }
+/* Hovering a peer badge: highlight that instance's rows, dim the other
+   peer rows so the highlighted ones stand out against the live rows. */
+#inflight-table-wrap tbody tr.hl td { background: var(--surface3) !important; opacity: 1 !important; }
+#inflight-table-wrap tbody.hovering tr:not(.hl):not(.self-row):not(.grp-start) td { opacity: 0.35; }
 
 /* ── Per-1M-token cost cell (models table) ───────────────── */
 /* Inline "label:$value" per line — three rows stack tightly so the

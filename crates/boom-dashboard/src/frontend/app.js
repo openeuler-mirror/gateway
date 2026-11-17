@@ -2749,6 +2749,8 @@
   async function loadInflight() {
     try {
       const [data, vis] = await Promise.all([api("/admin/stats/inflight"), getModelVisibility()]);
+      lastInflightData = data;
+      lastInflightVis = vis;
       renderInflightTable(data, vis);
     } catch (err) {
       console.error("loadInflight error:", err);
@@ -2763,6 +2765,17 @@
     for (var i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) >>> 0;
     return palette[h % palette.length];
   }
+
+  // Peer expansion is collapsed by default (this instance's row then shows
+  // the cluster Σ sums). Module-level so it survives both the 3s auto-poll
+  // re-renders and standalone toggle re-renders.
+  let inflightExpanded = {};
+  // deployment ids that currently have peer rows + last fetched payload,
+  // consumed by the toggle-all button and ▸/▾ delegation for instant
+  // re-render (no refetch).
+  let inflightPeerDeps = [];
+  let lastInflightData = null;
+  let lastInflightVis = null;
 
   function renderInflightTable(data, visMap) {
     const wrap = document.getElementById("inflight-table-wrap");
@@ -2811,7 +2824,7 @@
       return peerIds.filter(function (pid) { return peerStat(pid, depId); });
     }
     function peerBadgeHtml(pid) {
-      return '<span class="inst-badge" style="--ib:' + peerColor(pid) + '">' + esc(pid) + "</span>";
+      return '<span class="inst-badge" data-inst="' + esc(pid) + '" style="--ib:' + peerColor(pid) + '">' + esc(pid) + "</span>";
     }
     function fmtInflightDisplay(s) {
       return {
@@ -2821,15 +2834,33 @@
           : s.in_context.toLocaleString(),
       };
     }
-    // Peer row: counters from the snapshot; the 24h columns are
-    // cluster-global aggregates and cannot be split per instance.
+    // Σ cluster-sum cell: deliberately unlike the configured-capacity
+    // "num / max" form so a sum can't be misread as "the cap isn't applied".
+    // Denominator = per-instance cap × instance count.
+    function fmtSumCell(v, max, nInst, title) {
+      var maxSum = max > 0 ? max * nInst : 0;
+      return '<span class="sum-cell" title="' + title + '"><span class="sum-sigma">Σ</span>' +
+        v.toLocaleString() + (maxSum > 0 ? " / " + maxSum.toLocaleString() : "") + "</span>";
+    }
+    // All instances (self + peers) summed for one deployment.
+    function clusterSums(d, pids) {
+      var fc = d.fc_queue, reqs = d.in_reqs, ctx = d.in_context, peerReqs = 0;
+      pids.forEach(function (pid) {
+        var s = peerStat(pid, d.deployment_id);
+        fc += s.fc_queue; reqs += s.in_reqs; ctx += s.in_context; peerReqs += s.in_reqs;
+      });
+      return { fc: fc, reqs: reqs, ctx: ctx, selfReqs: d.in_reqs, peerReqs: peerReqs };
+    }
+    // Peer row: badge-only leading cell (deployment id is already on the
+    // self row above); the 24h columns are cluster-global aggregates and
+    // cannot be split per instance.
     function peerRowHtml(pid, depId, grp, modelTd) {
       var s = peerStat(pid, depId);
       var disp = fmtInflightDisplay(s);
       return (
-        "<tr class=\"" + grp + " peer-row\">" +
+        '<tr class="' + grp + ' peer-row" data-inst="' + esc(pid) + '">' +
         modelTd +
-        "<td class=\"inst-id\">" + peerBadgeHtml(pid) + " " + esc(depId) + "</td>" +
+        '<td class="inst-id">' + peerBadgeHtml(pid) + "</td>" +
         "<td class=\"num\">" + s.fc_queue + "</td>" +
         "<td class=\"num\">" + disp.reqs + "</td>" +
         "<td class=\"num\">" + disp.ctx + "</td>" +
@@ -2862,14 +2893,18 @@
     // (the merged cell can't follow per-row striping): one model block
     // shares one shade, adjacent blocks alternate.
     //
-    // rowspan counts every row of the group, including peer snapshot rows;
-    // the ×N marker stays local-deployments-only — peers don't add backend
-    // instances, they are other views of the same deployments.
+    // rowspan counts every row of the group — peer rows only while that
+    // deployment is expanded. The ×N marker stays local-deployments-only —
+    // peers don't add backend instances, they are other views of the same
+    // deployments.
     var localModelCounts = {};
     var groupCounts = {};
+    inflightPeerDeps = [];
     deployments.forEach(function (d) {
       localModelCounts[d.model] = (localModelCounts[d.model] || 0) + 1;
-      groupCounts[d.model] = (groupCounts[d.model] || 0) + 1 + peerIdsFor(d.deployment_id).length;
+      if (peerIdsFor(d.deployment_id).length) inflightPeerDeps.push(d.deployment_id);
+      groupCounts[d.model] = (groupCounts[d.model] || 0) + 1 +
+        (inflightExpanded[d.deployment_id] ? peerIdsFor(d.deployment_id).length : 0);
     });
 
     var rows = [];
@@ -2909,6 +2944,30 @@
           "</td>"
         : "";
 
+      // ▸/▾ toggle in front of the deployment id (only when peers exist).
+      var pids = peerIdsFor(d.deployment_id);
+      var isOpen = !!inflightExpanded[d.deployment_id] && pids.length > 0;
+      var toggle = pids.length
+        ? '<span class="peer-toggle" data-dep="' + esc(d.deployment_id) + '" title="' +
+          (isOpen ? t("stats.inflight.toggle_collapse")
+                  : t("stats.inflight.toggle_expand", { n: pids.length })) +
+          '">' + (isOpen ? "▾" : "▸") + "</span>"
+        : "";
+
+      // Collapsed: numeric cells show cluster sums (Σ form; denominator =
+      // per-instance cap × instance count; hover shows the self/peer
+      // breakdown). Expanded: this instance's own value / cap, with peer
+      // detail rows below.
+      var fcCell = fcQueueHtml, reqsCell = reqsHtml, ctxCell = disp.ctx;
+      if (pids.length && !isOpen) {
+        var sums = clusterSums(d, pids);
+        var n = pids.length + 1;
+        fcCell = fmtSumCell(sums.fc, 0, 0, t("stats.inflight.sum_total", { n: n }));
+        reqsCell = fmtSumCell(sums.reqs, d.in_reqs_max, n,
+          t("stats.inflight.sum_breakdown", { n: n, self: sums.selfReqs, peers: sums.peerReqs }));
+        ctxCell = fmtSumCell(sums.ctx, d.in_context_max, n, t("stats.inflight.sum_ctx", { n: n }));
+      }
+
       // 24h aggregates — read from cache populated on page load / Refresh button.
       var s = d.deployment_id ? deployment24hSummary[d.deployment_id] : null;
       function fmtInt(v) { return (v == null) ? "-" : Math.round(v).toLocaleString(); }
@@ -2916,12 +2975,12 @@
       function fmtTtft(v) { return (v == null) ? "-" : Math.round(v) + "ms"; }
 
       rows.push(
-        "<tr class=\"" + grp + (isGroupFirst ? " grp-start" : "") + "\">" +
+        "<tr class=\"" + grp + (isGroupFirst ? " grp-start" : "") + " self-row\">" +
         modelTd +
-        "<td class=\"inst-id\">" + esc(d.deployment_id) + "</td>" +
-        "<td class=\"num\">" + fcQueueHtml + "</td>" +
-        "<td class=\"num\">" + reqsHtml + "</td>" +
-        "<td class=\"num\">" + disp.ctx + "</td>" +
+        "<td class=\"inst-id\">" + toggle + esc(d.deployment_id) + "</td>" +
+        "<td class=\"num\">" + fcCell + "</td>" +
+        "<td class=\"num\">" + reqsCell + "</td>" +
+        "<td class=\"num\">" + ctxCell + "</td>" +
         "<td class=\"num\">" + fmtInt(s ? s.total_requests : null) + "</td>" +
         "<td class=\"num\">" + fmtToken(s ? s.avg_input_tokens : null) + "</td>" +
         "<td class=\"num\">" + fmtToken(s ? s.avg_output_tokens : null) + "</td>" +
@@ -2929,26 +2988,42 @@
         "<td class=\"num\">" + fmtPrefixHit(s ? s.avg_prefix_hit_rate : null) + "</td>" +
         "</tr>"
       );
-      peerIdsFor(d.deployment_id).forEach(function (pid) {
-        rows.push(peerRowHtml(pid, d.deployment_id, grp, ""));
-      });
+      if (isOpen) {
+        pids.forEach(function (pid) {
+          rows.push(peerRowHtml(pid, d.deployment_id, grp, ""));
+        });
+      }
     });
 
     // Trailing "-" group: deployments this instance doesn't know, seen only
-    // through peer snapshots.
+    // through peer snapshots. Header row carries the deployment id; there is
+    // no self row, so peer badge rows always render below it.
     if (remoteOnlyIds.length) {
       groupIndex += 1;
       var grpR = groupIndex % 2 === 0 ? "grp-a" : "grp-b";
       var remoteFirst = true;
       remoteOnlyIds.forEach(function (depId) {
-        peerIdsFor(depId).forEach(function (pid, i) {
-          var modelTd = i === 0
-            ? '<td class="grp-model" rowspan="' + peerIdsFor(depId).length + '">' +
-              renderDeployCell("-", null, 0) +
-              "</td>"
-            : "";
-          rows.push(peerRowHtml(pid, depId, grpR + (remoteFirst ? " grp-start" : ""), modelTd));
-          remoteFirst = false;
+        var pidsR = peerIdsFor(depId);
+        rows.push(
+          '<tr class="' + grpR + (remoteFirst ? " grp-start" : "") + ' self-row">' +
+          '<td class="grp-model" rowspan="' + (pidsR.length + 1) + '">' +
+          renderDeployCell("-", null, 0) +
+          "</td>" +
+          '<td class="inst-id">' + esc(depId) +
+          ' <span class="remote-only-label">' + t("stats.inflight.remote_only") + "</span></td>" +
+          "<td class=\"num\">-</td>" +
+          "<td class=\"num\">-</td>" +
+          "<td class=\"num\">-</td>" +
+          "<td class=\"num\">-</td>" +
+          "<td class=\"num\">-</td>" +
+          "<td class=\"num\">-</td>" +
+          "<td class=\"num\">-</td>" +
+          "<td class=\"num\">-</td>" +
+          "</tr>"
+        );
+        remoteFirst = false;
+        pidsR.forEach(function (pid) {
+          rows.push(peerRowHtml(pid, depId, grpR, ""));
         });
       });
     }
@@ -2962,6 +3037,15 @@
       "</tr></thead><tbody>" +
       rows.join("") +
       "</tbody></table>";
+
+    // Master expand/collapse button: hidden with no peers; label flips to
+    // "collapse all" once nothing is left collapsed.
+    var btnAll = document.getElementById("btn-toggle-inflight-peers");
+    if (btnAll) {
+      var anyCollapsed = inflightPeerDeps.some(function (dep) { return !inflightExpanded[dep]; });
+      btnAll.style.display = peerIds.length ? "" : "none";
+      btnAll.textContent = anyCollapsed ? t("stats.inflight.expand_all") : t("stats.inflight.collapse_all");
+    }
   }
 
   function startInflightPoll() {
@@ -7886,6 +7970,37 @@
       finally {
         btnRefreshInflight.disabled = false;
         btnRefreshInflight.textContent = t("action.refresh");
+      }
+    });
+    // Master expand/collapse: flips every deployment that has peer rows,
+    // then re-renders from the cached payload (no refetch).
+    const btnTogglePeers = document.getElementById("btn-toggle-inflight-peers");
+    if (btnTogglePeers) btnTogglePeers.addEventListener("click", () => {
+      if (!lastInflightData) return;
+      const anyCollapsed = inflightPeerDeps.some((dep) => !inflightExpanded[dep]);
+      inflightPeerDeps.forEach((dep) => { inflightExpanded[dep] = anyCollapsed; });
+      renderInflightTable(lastInflightData, lastInflightVis);
+    });
+    // ▸/▾ toggles re-create the table on every render — delegation at the
+    // document level is the only place a single binding survives them all.
+    document.addEventListener("click", (e) => {
+      const tg = e.target.closest ? e.target.closest(".peer-toggle") : null;
+      if (!tg || !tg.dataset.dep || !lastInflightData) return;
+      inflightExpanded[tg.dataset.dep] = !inflightExpanded[tg.dataset.dep];
+      renderInflightTable(lastInflightData, lastInflightVis);
+    });
+    // Hovering a peer badge highlights that instance's rows and dims the
+    // other peer rows (see .hovering/.hl rules in style.css).
+    document.addEventListener("mouseover", (e) => {
+      const el = e.target.closest ? e.target.closest(".inst-badge[data-inst]") : null;
+      const tbody = document.querySelector("#inflight-table-wrap tbody");
+      if (!tbody) return;
+      if (el) {
+        tbody.classList.add("hovering");
+        tbody.querySelectorAll('tr[data-inst="' + el.dataset.inst + '"]').forEach((tr) => { tr.classList.add("hl"); });
+      } else {
+        tbody.classList.remove("hovering");
+        tbody.querySelectorAll("tr.hl").forEach((tr) => { tr.classList.remove("hl"); });
       }
     });
     const btnDebug = document.getElementById("btn-debug-toggle");
