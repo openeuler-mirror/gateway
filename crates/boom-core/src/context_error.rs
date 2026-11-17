@@ -289,6 +289,26 @@ mod tests {
     }
 
     #[test]
+    fn error_code_map_caps_distinct_shapes() {
+        use std::sync::atomic::Ordering;
+        let pm = PerModelRollback::default();
+        // 灌满 64 个不同形态
+        for i in 0..PerModelRollback::MAX_DISTINCT_CODES {
+            pm.record_error_code("retry_error", &format!("shape-{i}"));
+        }
+        // 第 65 个新形态 → 丢弃
+        pm.record_error_code("retry_error", "shape-new");
+        assert_eq!(pm.error_codes.len(), PerModelRollback::MAX_DISTINCT_CODES);
+        assert!(!pm.error_codes.contains_key("retry_error:shape-new"));
+        // 既有键继续计数
+        pm.record_error_code("retry_error", "shape-0");
+        assert_eq!(
+            pm.error_codes.get("retry_error:shape-0").unwrap().load(Ordering::Relaxed),
+            2
+        );
+    }
+
+    #[test]
     fn wrapper_body_with_string_code_is_found() {
         let body = r#"boom: {"error":{"code":"InputTokenExceeded","message":"x"}}"#;
         assert_eq!(extract_error_code(body).as_deref(), Some("InputTokenExceeded"));
@@ -439,6 +459,27 @@ pub struct RollbackStats {
     affinity_direct: std::sync::atomic::AtomicU64,
     /// Per-model breakdown (debug pane tree view).
     models: dashmap::DashMap<String, PerModelRollback>,
+    /// 维测:窗口化收敛率 24 个 1h 槽(direct/retry 各一,槽存 epoch-hour
+    /// 防回绕混代)。
+    conv_direct: [std::sync::atomic::AtomicU64; 24],
+    conv_retry: [std::sync::atomic::AtomicU64; 24],
+    conv_hour: [std::sync::atomic::AtomicI64; 24],
+}
+
+/// ═══ 维测:窗口化收敛率/// ═══ 维测:窗口化收敛率(1h × 24 槽,墙钟对齐)═══
+/// The lifetime-cumulative convergence rate is dragged down forever by the
+/// early retries of a cold trie. The windowed view answers "is it improving
+/// NOW". Slots are tumbling wall-clock hours (now/3600), same alignment idea
+/// as the quota windows; the slot stores its epoch-hour so wraparound
+/// resets stale slots instead of mixing generations.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct ConvWindow {
+    /// Epoch hour this slot belongs to (0 = never written).
+    pub hour: i64,
+    /// Affinity direct hits in this hour (convergence numerator).
+    pub direct: u64,
+    /// Rollback retry successes in this hour (denominator complement).
+    pub retry: u64,
 }
 
 /// Serializable point-in-time snapshot. Field names are the dashboard API
@@ -455,6 +496,8 @@ pub struct RollbackStatsSnapshot {
     pub guard_error: u64,
     pub no_fallback_return: u64,
     pub affinity_direct: u64,
+    /// 维测:窗口化收敛率(24 个 1h 槽,仅含已写槽).
+    pub convergence_windows: Vec<ConvWindow>,
     /// Per-model tree breakdown (keyed by model_name).
     pub models: std::collections::BTreeMap<String, PerModelRollbackSnapshot>,
 }
@@ -475,6 +518,9 @@ pub struct PerModelRollback {
     /// Error-type breakdown for identify_miss (e.g., "timeout" → 5).
         /// Unified error-code breakdown: key = "{event}:{code}".
     pub error_codes: dashmap::DashMap<String, std::sync::atomic::AtomicU64>,
+    /// Deployment-dimension tallies per event (from / from→to). Bounded by
+    /// MAX_DISTINCT_DEPLOYS.
+    pub deploys: dashmap::DashMap<String, std::sync::atomic::AtomicU64>,
     /// Cumulative retry duration (ms) — divide by retry_success for avg.
     pub retry_ms_sum: std::sync::atomic::AtomicU64,
 }
@@ -493,6 +539,10 @@ pub struct PerModelRollbackSnapshot {
     pub affinity_direct: u64,
     /// Error-type breakdown for identify_miss.
     pub error_codes: std::collections::BTreeMap<String, u64>,
+    /// Deployment tallies per event: key "{event}:{from}" (no retry) or
+    /// "{event}:{from}→{to}" (retry edge). Rendered as mono sub-rows next
+    /// to the error-code sub-rows in the tree.
+    pub deploys: std::collections::BTreeMap<String, u64>,
     /// Upstream error codes for retry-error events.
     /// Average retry duration in ms (None when no retries yet).
     pub avg_retry_ms: Option<u64>,
@@ -503,13 +553,16 @@ impl PerModelRollback {
         field.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Event names are the SNAPSHOT FIELD NAMES — the single vocabulary
+    /// shared by per-model counters, error_codes and deploys keys, the
+    /// frontend eventKeys and the snapshot struct. No short-name alias
+    /// layer anywhere.
     pub fn record(&self, event: &str) {
         match event {
-            "miss" => Self::bump(&self.identify_miss),
-            "inert" => Self::bump(&self.pool_inert),
+            "identify_miss" => Self::bump(&self.identify_miss),
+            "pool_inert" => Self::bump(&self.pool_inert),
             "no_target" => Self::bump(&self.no_target),
-            "selected" => Self::bump(&self.fallback_selected),
-            "success" => Self::bump(&self.retry_success),
+            "fallback_selected" => Self::bump(&self.fallback_selected),
             "retry_error" => Self::bump(&self.retry_error),
             "guard_error" => Self::bump(&self.guard_error),
             "no_fallback_return" => Self::bump(&self.no_fallback_return),
@@ -518,10 +571,54 @@ impl PerModelRollback {
         }
     }
 
+    /// Distinct-code cap per model. The code key comes from the upstream
+    /// message SNIPPET when no structured error.code exists — a chatty
+    /// upstream that prefixes messages with timestamps/request-ids would
+    /// mint a new key per request and grow the map without bound
+    /// (~250B/entry; 10K req/day ≈ 2.5MB/day). Real error shapes are a
+    /// handful; 64 is generous. Beyond the cap new keys are dropped (the
+    /// totals keep counting — only the per-code breakdown saturates).
+    const MAX_DISTINCT_CODES: usize = 64;
+
+    /// Deploy-dimension cap per model: keys are deployment ids (deployment
+    /// churn — delete/re-add mints new uuids — grows the map slowly). Real
+    /// pools have a handful of instances; 64 is generous.
+    const MAX_DISTINCT_DEPLOYS: usize = 64;
+
+    /// Record one deployment-dimension tally under an event + ITS code —
+    /// the JOINT distribution, so the tree can nest edges under the exact
+    /// error code they occurred with (multi-code nodes stay truthful).
+    /// Key: "{event}:{code}|{edge}" (edge = "from" or "from→to"; code may
+    /// be empty for codeless decisions like fallback_selected). Same
+    /// full-name prefix scheme as error_codes.
+    fn record_deploy(&self, event: &str, code: &str, from: Option<&str>, to: Option<&str>) {
+        let edge = match (from, to) {
+            (Some(f), Some(t2)) => format!("{}→{}", f, t2),
+            (Some(f), None) => f.to_string(),
+            _ => return, // no deployment identity — nothing useful to tally
+        };
+        let key = format!("{}:{}|{}", event, code, edge);
+        if self.deploys.len() >= Self::MAX_DISTINCT_DEPLOYS
+            && !self.deploys.contains_key(&key)
+        {
+            return;
+        }
+        self.deploys
+            .entry(key)
+            .or_default()
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Record an error code for any event type. Key = "{event}:{code}".
     pub fn record_error_code(&self, event: &str, code: &str) {
+        let key = format!("{}:{}", event, code);
+        if self.error_codes.len() >= Self::MAX_DISTINCT_CODES
+            && !self.error_codes.contains_key(&key)
+        {
+            return; // cap reached and this is a NEW shape — drop it
+        }
         self.error_codes
-            .entry(format!("{}:{}", event, code))
+            .entry(key)
             .or_default()
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
@@ -547,6 +644,11 @@ impl PerModelRollback {
             affinity_direct: self.affinity_direct.load(Relaxed),
             error_codes: self
                 .error_codes
+                .iter()
+                .map(|e| (e.key().clone(), e.value().load(std::sync::atomic::Ordering::Relaxed)))
+                .collect(),
+            deploys: self
+                .deploys
                 .iter()
                 .map(|e| (e.key().clone(), e.value().load(std::sync::atomic::Ordering::Relaxed)))
                 .collect(),
@@ -598,6 +700,21 @@ impl RollbackStats {
             .record_error_code(event, code);
     }
 
+    /// Deployment-dimension tally for a specific model and event.
+    fn record_model_deploys(
+        &self,
+        model: &str,
+        event: &str,
+        code: &str,
+        from: Option<&str>,
+        to: Option<&str>,
+    ) {
+        self.models
+            .entry(model.to_string())
+            .or_default()
+            .record_deploy(event, code, from, to);
+    }
+
 /// Snapshot of per-model counters, sorted by model name.
     pub fn model_snapshots(&self) -> std::collections::BTreeMap<String, PerModelRollbackSnapshot> {
         self.models
@@ -623,37 +740,63 @@ impl RollbackStats {
     // ②: fallback_selected = retry_success + retry_error + guard_error).
 
     /// Decision: context error NOT identified as such — no retry possible.
-    pub fn record_miss_identified(&self, model: &str, error: &GatewayError) {
+    /// Returns the derived code so call sites can reuse it (维测 ring).
+    pub fn record_miss_identified(
+        &self,
+        model: &str,
+        error: &GatewayError,
+        from: Option<&str>,
+    ) -> String {
         Self::rb_bump(&self.identify_total);
         Self::rb_bump(&self.identify_miss);
-        self.record_model(model, "miss");
-        self.record_model_error_code(model, "identify_miss", &error_code_of(error));
+        self.record_model(model, "identify_miss");
+        let code = error_code_of(error);
+        self.record_model_error_code(model, "identify_miss", &code);
+        self.record_model_deploys(model, "identify_miss", &code, from, None);
+        code
     }
 
     /// Decision: context error identified but the pool cannot roll back
     /// (mixed config / single tier — the handler's else branch, and the
     /// defensive PoolInert arm in attempt.rs).
-    pub fn record_pool_inert_identified(&self, model: &str, error: &GatewayError) {
+    pub fn record_pool_inert_identified(
+        &self,
+        model: &str,
+        error: &GatewayError,
+        from: Option<&str>,
+    ) -> String {
         Self::rb_bump(&self.identify_total);
         Self::rb_bump(&self.pool_inert);
-        self.record_model(model, "inert");
-        self.record_model_error_code(model, "pool_inert", &error_code_of(error));
+        self.record_model(model, "pool_inert");
+        let code = error_code_of(error);
+        self.record_model_error_code(model, "pool_inert", &code);
+        self.record_model_deploys(model, "pool_inert", &code, from, None);
+        code
     }
 
     /// Decision: identified + capable pool, but no satisfying tier.
-    pub fn record_no_target_identified(&self, model: &str, error: &GatewayError) {
+    pub fn record_no_target_identified(
+        &self,
+        model: &str,
+        error: &GatewayError,
+        from: Option<&str>,
+    ) -> String {
         Self::rb_bump(&self.identify_total);
         Self::rb_bump(&self.no_target);
         self.record_model(model, "no_target");
-        self.record_model_error_code(model, "no_target", &error_code_of(error));
+        let code = error_code_of(error);
+        self.record_model_error_code(model, "no_target", &code);
+        self.record_model_deploys(model, "no_target", &code, from, None);
+        code
     }
 
     /// Decision: a fallback target was selected (retry follows). No code —
     /// the retry outcome records exactly one (invariant ②).
-    pub fn record_selected(&self, model: &str) {
+    pub fn record_selected(&self, model: &str, from: Option<&str>, to: Option<&str>) {
         Self::rb_bump(&self.identify_total);
         Self::rb_bump(&self.fallback_selected);
-        self.record_model(model, "selected");
+        self.record_model(model, "fallback_selected");
+        self.record_model_deploys(model, "fallback_selected", "", from, to);
     }
 
     /// Retry succeeded. `fixed_error` is the ORIGINAL context error the
@@ -664,35 +807,67 @@ impl RollbackStats {
         model: &str,
         fixed_error: &GatewayError,
         ms: u64,
-    ) {
+        from: Option<&str>,
+        to: Option<&str>,
+    ) -> String {
         Self::rb_bump(&self.retry_success);
         self.record_model_success_ms(model, ms);
-        self.record_model_error_code(model, "retry_success", &error_code_of(fixed_error));
+        self.conv_bump(false);
+        let code = error_code_of(fixed_error);
+        self.record_model_error_code(model, "retry_success", &code);
+        self.record_model_deploys(model, "retry_success", &code, from, to);
+        code
     }
 
     /// Retry call itself failed (guard swap succeeded — a call was made).
-    pub fn record_retry_error(&self, model: &str, error: &GatewayError) {
+    pub fn record_retry_error(
+        &self,
+        model: &str,
+        error: &GatewayError,
+        from: Option<&str>,
+        to: Option<&str>,
+    ) -> String {
         Self::rb_bump(&self.retry_error);
         self.record_model(model, "retry_error");
-        self.record_model_error_code(model, "retry_error", &error_code_of(error));
+        let code = error_code_of(error);
+        self.record_model_error_code(model, "retry_error", &code);
+        self.record_model_deploys(model, "retry_error", &code, from, to);
+        code
     }
 
     /// Guard swap failed — terminal (no retry call was made).
-    pub fn record_guard_error(&self, model: &str, error: &GatewayError) {
+    pub fn record_guard_error(
+        &self,
+        model: &str,
+        error: &GatewayError,
+        from: Option<&str>,
+        to: Option<&str>,
+    ) -> String {
         Self::rb_bump(&self.guard_error);
         self.record_model(model, "guard_error");
-        self.record_model_error_code(model, "guard_error", &error_code_of(error));
+        let code = error_code_of(error);
+        self.record_model_error_code(model, "guard_error", &code);
+        self.record_model_deploys(model, "guard_error", &code, from, to);
+        code
     }
 
     /// Final passthrough: the client got the identified context error back
     /// (after the 502→400 conversion). Outside both invariants; per-model
     /// part only when the model is known.
-    pub fn record_no_fallback_return(&self, model: Option<&str>, error: &GatewayError) {
+    pub fn record_no_fallback_return(
+        &self,
+        model: Option<&str>,
+        error: &GatewayError,
+        from: Option<&str>,
+    ) -> String {
         Self::rb_bump(&self.no_fallback_return);
+        let code = error_code_of(error);
         if let Some(m) = model {
             self.record_model(m, "no_fallback_return");
-            self.record_model_error_code(m, "no_fallback_return", &error_code_of(error));
+            self.record_model_error_code(m, "no_fallback_return", &code);
+            self.record_model_deploys(m, "no_fallback_return", &code, from, None);
         }
+        code
     }
 
     /// First-try affinity direct hit on a capable pool (convergence-rate
@@ -700,7 +875,51 @@ impl RollbackStats {
     pub fn record_affinity_direct(&self, model: &str) {
         Self::rb_bump(&self.affinity_direct);
         self.record_model(model, "affinity_direct");
+        self.conv_bump(true);
     }
+
+    // ═══ 维测:事件 ring / 迁移矩阵 / 窗口化收敛率 ═══
+
+
+    /// Tumbling-hour slot bump: the slot stores its epoch-hour; a stale
+    /// slot (wraparound or first write) resets the direct/retry PAIR so
+    /// both counters always belong to the same generation. `direct` picks
+    /// the counter (true = affinity direct hit, false = retry success).
+    fn conv_bump(&self, direct: bool) {
+        const R: std::sync::atomic::Ordering = std::sync::atomic::Ordering::Relaxed;
+        let hour = chrono::Utc::now().timestamp() / 3600;
+        let idx = (hour % 24) as usize;
+        if self.conv_hour[idx].load(R) != hour {
+            self.conv_hour[idx].store(hour, R);
+            self.conv_direct[idx].store(0, R);
+            self.conv_retry[idx].store(0, R);
+        }
+        if direct {
+            self.conv_direct[idx].fetch_add(1, R);
+        } else {
+            self.conv_retry[idx].fetch_add(1, R);
+        }
+    }
+
+    /// Windowed convergence snapshot: slots that were written this
+    /// generation only (hour != 0), ascending by hour.
+    fn conv_windows(&self) -> Vec<ConvWindow> {
+        const R: std::sync::atomic::Ordering = std::sync::atomic::Ordering::Relaxed;
+        let mut out = Vec::new();
+        for idx in 0..24 {
+            let hour = self.conv_hour[idx].load(R);
+            if hour != 0 {
+                out.push(ConvWindow {
+                    hour,
+                    direct: self.conv_direct[idx].load(R),
+                    retry: self.conv_retry[idx].load(R),
+                });
+            }
+        }
+        out.sort_by_key(|w| w.hour);
+        out
+    }
+
 
     pub fn snapshot(&self) -> RollbackStatsSnapshot {
         use std::sync::atomic::Ordering::Relaxed;
@@ -715,6 +934,7 @@ impl RollbackStats {
             guard_error: self.guard_error.load(Relaxed),
             no_fallback_return: self.no_fallback_return.load(Relaxed),
             affinity_direct: self.affinity_direct.load(Relaxed),
+            convergence_windows: self.conv_windows(),
             models: self.model_snapshots(),
         }
     }

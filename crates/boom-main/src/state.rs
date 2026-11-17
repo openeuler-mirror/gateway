@@ -103,6 +103,9 @@ pub struct AppState {
     /// Rollback observability counters (debug page). Top-level Arc:
     /// survives reloads; the rollback module's functions are stateless.
     pub rollback_stats: Arc<boom_rollback::RollbackStats>,
+    /// Current rollback patterns — injected into DashboardState (self-test).
+    /// Refreshed on reload.
+    pub rollback_patterns: Arc<std::sync::RwLock<Vec<String>>>,
     /// Per-deployment request rate tracker (survives reloads).
     pub request_rate: Arc<RequestRateTracker>,
     /// Agent (client-type) statistics tracker (survives reloads).
@@ -317,6 +320,9 @@ impl AppState {
         // recreated on every reload — per-policy counters would reset).
         let kvc_stats = Arc::new(KvcSchedulerStats::new());
         let rollback_stats = Arc::new(boom_rollback::RollbackStats::new());
+        let rollback_patterns = Arc::new(std::sync::RwLock::new(
+            config.router_settings.rollback.context.patterns.clone(),
+        ));
         let request_rate = Arc::new(RequestRateTracker::new());
         let agent_stats = Arc::new(AgentStatsTracker::new());
 
@@ -581,6 +587,7 @@ impl AppState {
             rebalance_move_tracker,
             kvc_stats,
             rollback_stats,
+            rollback_patterns,
             request_rate,
             agent_stats,
             kv_index,
@@ -623,7 +630,28 @@ impl AppState {
 
         let started = std::time::Instant::now();
         let inner = AssertUnwindSafe(self.reload_inner()).catch_unwind();
-        match tokio::time::timeout(std::time::Duration::from_secs(60), inner).await {
+        let result = tokio::time::timeout(std::time::Duration::from_secs(60), inner).await;
+        // Rollback identification patterns are YAML-home config — refresh the
+        // DashboardState mirror so the self-test endpoint always runs against
+        // the CURRENT patterns (dashboard must not depend on boom-config).
+        if let Ok(Ok(_)) = &result {
+            let pats = self
+                .inner
+                .load()
+                .config
+                .router_settings
+                .rollback
+                .context
+                .patterns
+                .clone();
+            if let Ok(mut guard) = self.rollback_patterns.write() {
+                if *guard != pats {
+                    tracing::info!("rollback patterns refreshed on reload ({} entries)", pats.len());
+                    *guard = pats;
+                }
+            }
+        }
+        match result {
             // Outer Ok = timeout didn't fire.
             // Middle Ok = no panic (catch_unwind recovered).
             // Inner Ok = reload_inner returned success.
@@ -1762,7 +1790,6 @@ fn build_deployments_from_config(
             deployment_id,
             entry.client_type_header,
             p.max_context_tokens,
-            entry.rollback_enabled,
         ) {
             Ok(provider) => {
                 // Also register as wildcard catch-all if flagged.
@@ -2293,15 +2320,6 @@ pub(crate) async fn build_config_snapshot_value(pool: &PgPool) -> Result<serde_j
                 "model_name": r.model_name,
                 "litellm_params": litellm_params,
             });
-
-            // rollback participation (ModelEntry top-level field): emit only
-            // when set, keeping opted-out rows clean in the YAML snapshot.
-            if r.rollback_enabled {
-                entry.as_object_mut().unwrap().insert(
-                    "rollback_enabled".into(),
-                    serde_json::Value::Bool(true),
-                );
-            }
 
             // ── flow_control: emit as a dedicated node. Include only when
             // at least one limit is set so we don't litter YAML with empty

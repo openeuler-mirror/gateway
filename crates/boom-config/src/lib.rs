@@ -400,12 +400,6 @@ pub struct ModelEntry {
     /// otherwise. Default: false.
     #[serde(default)]
     pub client_type_header: bool,
-    /// Whether this deployment participates in context rollback. Pool-level
-    /// semantics: a model group participates when EVERY deployment row has
-    /// this flag set (the Models page pool toggle writes the whole group).
-    /// Default: false.
-    #[serde(default)]
-    pub rollback_enabled: bool,
     /// Unified access-control state. See [`ModelVisibility`].
     ///
     /// Backward compatibility: entries written before this field existed that
@@ -693,7 +687,7 @@ pub struct RollbackSettings {
     /// Framework container kept generic: future strategies extend as
     /// sibling sub-sections.
     ///
-    /// Participation lives in the DB (`boom_model_deployment.rollback_enabled`,
+    /// Participation lives in the DB (`boom_model_deployment.max_context_tokens`,
     /// toggled per pool / globally from the Models page) — NOT here. This
     /// section only carries strategy parameters (identification patterns).
     #[serde(default)]
@@ -1617,13 +1611,6 @@ mod tests {
             vec!["code:SomeCode".to_string(), "prompt is too long".to_string()]
         );
 
-        // ModelEntry.rollback_enabled: omitted → false; explicit → round-trip.
-        let cfg: Config = serde_yaml::from_str(
-            "server:\n  port: 4000\nmodel_list:\n  - model_name: a\n    litellm_params:\n      model: openai/x\n  - model_name: b\n    litellm_params:\n      model: openai/y\n    rollback_enabled: true\n",
-        )
-        .unwrap();
-        assert!(!cfg.model_list[0].rollback_enabled);
-        assert!(cfg.model_list[1].rollback_enabled);
     }
 
     #[test]

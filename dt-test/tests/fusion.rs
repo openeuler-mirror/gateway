@@ -118,6 +118,7 @@ fn response(model: &str, content: &str, tool_calls: Option<Vec<ToolCall>>) -> Ch
             cache_creation_input_tokens: Some(5),
             cache_read_input_tokens: Some(7),
             prompt_tokens_details: Some(PromptTokensDetails { cached_tokens: Some(4) }),
+        completion_tokens_details: None,
         }),
         system_fingerprint: None,
         raw_response: None,
@@ -284,6 +285,9 @@ impl ModelInvoker for StubInvoker {
                         completion_tokens: Some(4),
                         total_tokens: Some(14),
                         prompt_tokens_details: Some(PromptTokensDetails { cached_tokens: Some(2) }),
+                        completion_tokens_details: None,
+                        cache_creation_input_tokens: None,
+                        cache_read_input_tokens: None,
                     }),
                     raw_data: None,
                 };
@@ -1068,6 +1072,9 @@ async fn execute_stream_negative_usage_clamped_to_zero() {
                     completion_tokens: Some(3),
                     total_tokens: None,            // 缺失 → prompt+completion 自算
                     prompt_tokens_details: None,
+                    completion_tokens_details: None,
+                    cache_creation_input_tokens: None,
+                    cache_read_input_tokens: None,
                 }),
                 raw_data: None,
             };
@@ -1131,6 +1138,9 @@ async fn execute_stream_overflow_usage_capped_at_i32_max() {
                     completion_tokens: Some(1),
                     total_tokens: Some(2),
                     prompt_tokens_details: None,
+                    completion_tokens_details: None,
+                    cache_creation_input_tokens: None,
+                    cache_read_input_tokens: None,
                 }),
                 raw_data: None,
             };
@@ -1189,6 +1199,9 @@ async fn execute_stream_no_cache_details_stays_none() {
                     completion_tokens: Some(1),
                     total_tokens: Some(2),
                     prompt_tokens_details: None,
+                    completion_tokens_details: None,
+                    cache_creation_input_tokens: None,
+                    cache_read_input_tokens: None,
                 }),
                 raw_data: None,
             };

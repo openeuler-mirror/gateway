@@ -125,7 +125,6 @@ pub fn create_provider(
     deployment_id: Option<String>,
     client_type_header: bool,
     max_context_tokens: Option<u64>,
-    rollback_enabled: bool,
 ) -> Result<Arc<dyn Provider>, GatewayError> {
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(timeout.max(1)))
@@ -192,7 +191,6 @@ pub fn create_provider(
                     deployment_id,
                     client_type_header,
                     max_context_tokens,
-                    rollback_enabled,
                 )
                 .with_custom_headers(attached),
             ))
@@ -368,7 +366,6 @@ mod tests {
                 None,
                 false,
                 None,
-                false,
             )
             .unwrap()
         };
@@ -413,7 +410,6 @@ mod tests {
             None,
             false,
             None,
-            false,
         )
         .unwrap();
         let attached = provider.custom_headers();
@@ -439,7 +435,6 @@ mod tests {
             None,
             false,
             None,
-            false,
         )
         .unwrap();
         assert!(

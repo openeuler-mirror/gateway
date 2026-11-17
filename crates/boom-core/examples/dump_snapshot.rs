@@ -16,7 +16,7 @@ fn main() {
         status: 400,
         message: r#"{"error":{"code":"WeirdModelError","message":"odd"}}"#.into(),
     };
-    stats.record_miss_identified(m, &e_miss);
+    stats.record_miss_identified(m, &e_miss, Some("d-small"));
 
     // req2: identified but pool not capable → inert (routes.rs else branch;
     // bumps identify_total + pool_inert + per-model + code internally)
@@ -24,22 +24,22 @@ fn main() {
         status: 400,
         message: r#"{"error":{"code":"InputTokenExceeded","message":"too long"}}"#.into(),
     };
-    stats.record_pool_inert_identified(m, &e_ctx);
+    stats.record_pool_inert_identified(m, &e_ctx, Some("d-small"));
 
     // req3: capable but no satisfying tier → no_target
-    stats.record_no_target_identified(m, &e_ctx);
+    stats.record_no_target_identified(m, &e_ctx, Some("d-small"));
 
     // req4: rollback attempted and succeeded (fixed the e_ctx error)
-    stats.record_selected(m);
-    stats.record_retry_success_fixed(m, &e_ctx, 42);
+    stats.record_selected(m, Some("d-small"), Some("d-big"));
+    stats.record_retry_success_fixed(m, &e_ctx, 42, Some("d-small"), Some("d-big"));
 
     // req5: rollback attempted, retry call itself failed
     let e_retry = GatewayError::UpstreamError {
         status: 500,
         message: "internal".into(),
     };
-    stats.record_selected(m);
-    stats.record_retry_error(m, &e_retry);
+    stats.record_selected(m, Some("d-small"), Some("d-bad"));
+    stats.record_retry_error(m, &e_retry, Some("d-small"), Some("d-bad"));
 
     // req6: rollback attempted, guard swap failed (terminal — no retry
     // call, no retry_error double-count, invariant ②)
@@ -48,14 +48,15 @@ fn main() {
         waiters: 3,
         message: "queue full".into(),
     };
-    stats.record_selected(m);
-    stats.record_guard_error(m, &e_guard);
+    stats.record_selected(m, Some("d-small"), Some("d-queue"));
+    stats.record_guard_error(m, &e_guard, Some("d-small"), Some("d-queue"));
 
     // req7: 502→400 passthrough (finalize.rs; outside both invariants)
-    stats.record_no_fallback_return(Some(m), &e_ctx);
+    stats.record_no_fallback_return(Some(m), &e_ctx, Some("d-small"));
 
     // first-try direct hit (success metric, outside both invariants)
     stats.record_affinity_direct(m);
+
 
     println!(
         "{}",

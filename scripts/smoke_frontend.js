@@ -34,63 +34,55 @@ function loadBlock(startMarker, endMarker, returns) {
   const end = src.indexOf(endMarker);
   if (start < 0 || end < 0 || end <= start) fail(`block not found: ${startMarker}`);
   const block = src.slice(start, end);
-  return new Function('t', 'esc', 'tip', 'renderDeployCell', 'visibilityBadgeFor', 'vendorOf', 'document',
+  return new Function('t', 'esc', 'tip', 'renderDeployCell', 'visibilityBadgeFor', 'vendorOf', 'document', 'window',
     block + `\nreturn { ${returns} };`
-  )(t, esc, tip, renderDeployCell, visibilityBadgeFor, vendorOf, document);
+  )(t, esc, tip, renderDeployCell, visibilityBadgeFor, vendorOf, document, globalThis);
 }
 
-const pool = loadBlock('  function rollbackPoolBadge', '  async function showNewModelModal',
-  'renderModelsTable, rollbackPoolBadge');
+const pool = loadBlock('  function renderModelsTable', '  async function showNewModelModal',
+  'renderModelsTable');
 
 
-// ── fixtures ──────────────────────────────────────────────────────
+// ── fixtures（API 行不再含 rollback_enabled——声明是唯一参与信号）──
 const models = [
-  { id: '1', model_name: 'glm-5.3', litellm_model: 'openai/glm-5.3', enabled: true, rollback_enabled: true, max_context_tokens: 204800, quota_count_ratio: 1, timeout: 1200, source: 'db' },
-  { id: '2', model_name: 'glm-5.3', litellm_model: 'openai/glm-5.3', enabled: true, rollback_enabled: true, max_context_tokens: 204800, quota_count_ratio: 1, timeout: 1200, source: 'db' },
-  { id: '3', model_name: 'glm-5.3', litellm_model: 'openai/glm-5.3', enabled: false, auto_disabled: true, rollback_enabled: true, max_context_tokens: 1048576, quota_count_ratio: 1, timeout: 1200, source: 'db' },
-  { id: '4', model_name: 'qwen3', litellm_model: 'openai/qwen3', enabled: true, quota_count_ratio: 1, timeout: 1200, source: 'db' }, // 未开启 → 无徽标
+  { id: '1', model_name: 'glm-5.3', litellm_model: 'openai/glm-5.3', enabled: true, max_context_tokens: 204800, quota_count_ratio: 1, timeout: 1200, source: 'db' },
+  { id: '2', model_name: 'glm-5.3', litellm_model: 'openai/glm-5.3', enabled: true, max_context_tokens: 204800, quota_count_ratio: 1, timeout: 1200, source: 'db' },
+  { id: '3', model_name: 'glm-5.3', litellm_model: 'openai/glm-5.3', enabled: false, auto_disabled: true, max_context_tokens: 1048576, quota_count_ratio: 1, timeout: 1200, source: 'db' },
+  { id: '4', model_name: 'qwen3', litellm_model: 'openai/qwen3', enabled: true, quota_count_ratio: 1, timeout: 1200, source: 'db' }, // 全未声明
 ];
 
-// ── 1. 池头行 + 缩进行结构（无独立 rollback 列）────────────────
+// ── 1. rowspan 分组表(在途请求风格)+ 静态状态行 ────────────────
 pool.renderModelsTable(models, {});
 const html = el.innerHTML;
-// 无独立 rollback 列
-if (html.includes('col-rollback')) fail('dedicated rollback column removed');
-if (html.includes('cell-rollback')) fail('per-row rollback cells removed');
-// 池头行：每池一个，含开关+名称+计数+徽标
-const headers = html.match(/class="pool-header"/g) || [];
-if (headers.length !== 2) fail(`2 pools → 2 header rows, got ${headers.length}`);
-if (!html.includes('pool-header-inner')) fail('header has inner layout div');
-if (!html.includes('rb-switch')) fail('iOS switch present');
-if (!html.includes('rb-slider')) fail('slider present');
-if (!html.includes('pool-name')) fail('pool name span present');
-if (!html.includes('pool-count')) fail('instance count present');
-// 勾选状态在池头行的 checkbox
-if (!html.includes("window._togglePoolRollback('glm-5.3'")) fail('glm toggle wired');
-if (!html.includes('checked')) fail('on pool has checked switch');
-// 激活徽标在池头行
-if (!html.includes('models.rollback.active')) fail('active badge in header');
-// 部署行缩进
-if (!html.includes('pool-dep')) fail('indented deployment rows');
-// 黑框分隔已删（池头行就是分隔）
-if (html.includes('pool-start')) fail('old border separator removed');
+// 开关全删:无 rb-switch/checked/任何 toggle 接线
+if (html.includes('rb-switch')) fail('pool toggle must be removed');
+if (html.includes('checkbox')) fail('no checkbox in the models table');
+if (html.includes('_togglePoolRollback')) fail('toggle handler must be removed');
+if (html.includes('pool-header')) fail('pool header rows replaced by rowspan blocks');
+// 模型块:2 池 → 2 个 model-block;glm rowspan=3+1告警行=4,qwen rowspan=1
+const blocks = html.match(/class="model-block[^"]*"/g) || [];
+if (blocks.length !== 2) fail(`2 pools → 2 model-block cells, got ${blocks.length}`);
+if (!html.includes('rowspan="4"')) fail('glm block spans 3 dep rows + 1 warning row');
+if (!html.includes('rowspan="1"')) fail('qwen block spans its single row');
+// 状态行已移至 Debug → Rollback(模型页不再渲染任何回退状态键)
+if (html.includes('state_active') || html.includes('state_unconfigured')
+  || html.includes('rollbackPoolState') || html.includes('rb-state')) {
+  fail('rollback state line must live in the Debug pane, not the models table');
+}
+// 模型格内容存在(名称+计数),无状态行
+if (!html.includes('model-name')) fail('model name span present');
+if (!html.includes('model-count')) fail('instance count present');
+// 斑马按块:qwen(第二块)行带 dep-alt,glm 行不带
+const bRows = html.match(/class="pool-dep grp-b/g) || [];
+if (bRows.length !== 1) fail(`zebra by GROUP: only qwen rows carry grp-b, got ${bRows.length}`);
+const aRows = html.match(/class="pool-dep grp-a/g) || [];
+if (aRows.length !== 3) fail(`first group rows carry grp-a, got ${aRows.length}`);
+// 告警行跟随块色且 colspan=11
+if (!html.includes('colspan="11"')) fail('warning row colspan follows 11 columns');
 
-// 开关关的池无徽标
-pool.renderModelsTable([models[3]], {});  // qwen3 off
-if (el.innerHTML.includes('models.rollback.no_target')) fail('off pool → no badge');
-// 开关开的池有徽标
-pool.renderModelsTable([models[0], models[1], models[2]], {});
-if (!el.innerHTML.includes('models.rollback.active')) fail('on pool → badge');
-
-// 主开关三态：混合（glm 开、qwen3 关）→ indeterminate
-pool.renderModelsTable(models, {});
-if (el.indeterminate !== true || el.checked !== false) fail('mixed state → indeterminate');
-// 全开 → checked
-pool.renderModelsTable([models[0], models[1], models[2]], {});
-if (el.checked !== true || el.indeterminate !== false) fail('all on → checked');
-// 空表 → disabled
+// 空表不崩
 pool.renderModelsTable([], {});
-if (el.disabled !== true) fail('empty table → master disabled');
+if (!el.innerHTML.includes('models.empty')) fail('empty state renders');
 
 // 价格列头不再右对齐
 if (html.includes('<th class="num">models.col.cost</th>')) fail('cost header must not carry .num');
@@ -105,39 +97,86 @@ if (src.includes('renderCardRollback')) fail('renderCardRollback should be remov
 const rb = loadBlock('  function renderRollbackStats(data) {', '  // ── KVC Hit Calibration',
   'renderRollbackStats');
 const rbSnapshot = {
-  identify_total: 6, identify_miss: 1, pool_inert: 1, no_target: 1, fallback_selected: 3,
-  retry_success: 1, retry_error: 1, guard_error: 1, no_fallback_return: 1, affinity_direct: 1,
-  models: {
-    'glm-5.3': {
-      identify_miss: 1, pool_inert: 1, no_target: 1, fallback_selected: 3, retry_success: 1,
-      retry_error: 1, guard_error: 1, no_fallback_return: 1, affinity_direct: 1,
-      error_codes: {
-        'guard_error:flow_control_timeout': 1,
-        'identify_miss:WeirdModelError': 1,
-        'no_fallback_return:InputTokenExceeded': 1,
-        'no_target:InputTokenExceeded': 1,
-        'pool_inert:InputTokenExceeded': 1,
-        'retry_error:internal HTTP(500)': 1,
-        'retry_success:InputTokenExceeded': 1,
+  "identify_total": 6,
+  "identify_miss": 1,
+  "pool_inert": 1,
+  "no_target": 1,
+  "fallback_selected": 3,
+  "retry_success": 1,
+  "retry_error": 1,
+  "guard_error": 1,
+  "no_fallback_return": 1,
+  "affinity_direct": 1,
+  "convergence_windows": [
+    {
+      "hour": 498564,
+      "direct": 1,
+      "retry": 1
+    }
+  ],
+  "models": {
+    "glm-5.3": {
+      "identify_miss": 1,
+      "pool_inert": 1,
+      "no_target": 1,
+      "fallback_selected": 3,
+      "retry_success": 1,
+      "retry_error": 1,
+      "guard_error": 1,
+      "no_fallback_return": 1,
+      "affinity_direct": 1,
+      "error_codes": {
+        "guard_error:flow_control_timeout": 1,
+        "identify_miss:WeirdModelError": 1,
+        "no_fallback_return:InputTokenExceeded": 1,
+        "no_target:InputTokenExceeded": 1,
+        "pool_inert:InputTokenExceeded": 1,
+        "retry_error:internal HTTP(500)": 1,
+        "retry_success:InputTokenExceeded": 1
       },
-      avg_retry_ms: 42,
-    },
+      "deploys": {
+        "fallback_selected:|d-small→d-bad": 1,
+        "fallback_selected:|d-small→d-big": 1,
+        "fallback_selected:|d-small→d-queue": 1,
+        "guard_error:flow_control_timeout|d-small→d-queue": 1,
+        "identify_miss:WeirdModelError|d-small": 1,
+        "no_fallback_return:InputTokenExceeded|d-small": 1,
+        "no_target:InputTokenExceeded|d-small": 1,
+        "pool_inert:InputTokenExceeded|d-small": 1,
+        "retry_error:internal HTTP(500)|d-small→d-bad": 1,
+        "retry_success:InputTokenExceeded|d-small→d-big": 1
+      },
+      "avg_retry_ms": 42
+    }
   },
+  "pools": [
+    { "model": "glm-5.3", "state": "active", "deployments": [
+      { "deployment_id": "d-200k-a", "max_context_tokens": 204800, "enabled": true },
+      { "deployment_id": "d-200k-b", "max_context_tokens": 204800, "enabled": true },
+      { "deployment_id": "d-1m", "max_context_tokens": 1048576, "enabled": true }
+    ] },
+    { "model": "qwen3.8", "state": "rescue", "deployments": [
+      { "deployment_id": "d-200k", "max_context_tokens": 200000, "enabled": true },
+      { "deployment_id": "d-undecl", "max_context_tokens": null, "enabled": false }
+    ] }
+  ]
 };
 rb.renderRollbackStats(rbSnapshot);
 const rbHtml = el.innerHTML;
-// 9 个 treeNode 按渲染顺序切分
-const nodes = rbHtml.split('<div class="rb-tree-node">').slice(1);
-if (nodes.length !== 9) fail(`9 tree nodes expected, got ${nodes.length}`);
+// 9 个统计 treeNode 按渲染顺序切分;池状态节(rb-tree 同款结构)在
+// 其后渲染,不在计数内。
+const statsHtml = rbHtml.split('debug.rollback.pools_title')[0];
+const nodes = statsHtml.split('<div class="rb-tree-node">').slice(1);
+if (nodes.length !== 9) fail(`9 stats tree nodes expected, got ${nodes.length}`);
 // (标题, 该节点的错误码子行期望; null = 成功指标，不应有子行)
-// (标题, 该节点的错误码子行期望; null = 无码指标[已选目标/亲和直达])
-// 键名=快照字段名,与后端 error_codes 前缀构造性一致,无别名层。
-// 重试成功节点展示"修复了什么错误"(原始上下文错误的码)+ 个数。
+// (标题, 该节点的子行期望; null = 无子行[仅亲和直达])
+// 键名=快照字段名,与后端 error_codes/deploys 前缀构造性一致,无别名层。
+// 重试节点的子行 = 错误码 + from→to 边;无重试节点的子行 = 错误码 + 失败部署。
 const rbExpect = [
   ['debug.rollback.miss',        'WeirdModelError'],
   ['debug.rollback.inert',       'InputTokenExceeded'],
   ['debug.rollback.no_target',   'InputTokenExceeded'],
-  ['debug.rollback.selected',    null],
+  ['debug.rollback.selected',    'd-small→d-big'],
   ['debug.rollback.success',     'InputTokenExceeded'],
   ['debug.rollback.retry_error', 'internal HTTP(500)'],
   ['debug.rollback.guard_error', 'flow_control_timeout'],
@@ -161,8 +200,51 @@ if (rbHtml.includes('no per-model data')) fail('placeholder shown despite per-mo
 // 两条不变量均成立（fixture 满足 identify_total = miss+inert+no_target+selected 等）
 if (!rbHtml.includes('✓')) fail('invariant checkmarks missing');
 
-console.log('SMOKE OK: pool header rows with switches, indented dep rows, no rollback column');
-console.log('SMOKE OK: rollback tree — codes under all 6 error headers + retry-success fixed-error sub-rows, alias-free keys');
+console.log('SMOKE OK: rowspan grouped table (in-flight style), state line moved to Debug pane, toggle fully removed');
+// 事件表/迁移矩阵已撤销(信息并入各标题的部署子行)——断言其绝迹
+if (rbHtml.includes('events_title') || rbHtml.includes('matrix_title')) fail('events/matrix sections must be gone');
+if (src.includes('_rbEvData') || src.includes('_rbEventsApply')) fail('events handlers must be gone');
+
+// 维测渲染:窗口收敛率 / 池状态 / 自检表单
+if (!rbHtml.includes('debug.rollback.conv_windows')) fail('convergence windows section missing');
+if (!rbHtml.includes('debug.rollback.selftest_title')) fail('self-test form missing');
+if (!src.includes('window._rbSelfTest')) fail('self-test handler missing');
+
+// 部署维度子行(事件表撤销后信息的去向):
+// 无重试节记失败部署(mono d-xxx);重试节记 from→to 边
+const nodeWith = (label) => nodes.find((n) => n.includes(label)) || '';
+if (!nodeWith('debug.rollback.miss').includes('>d-small<')) fail('miss node: failed-deployment sub-row missing');
+if (!nodeWith('debug.rollback.inert').includes('>d-small<')) fail('inert node: failed-deployment sub-row missing');
+if (!nodeWith('debug.rollback.success').includes('d-small→d-big')) fail('success node: from→to edge sub-row missing');
+if (!nodeWith('debug.rollback.retry_error').includes('d-small→d-bad')) fail('retry_error node: from→to edge sub-row missing');
+if (!nodeWith('debug.rollback.guard_error').includes('d-small→d-queue')) fail('guard_error node: from→to edge sub-row missing');
+if (!nodeWith('debug.rollback.no_fallback').includes('>d-small<')) fail('no_fallback node: failed-deployment sub-row missing');
+// 嵌套层级:有码节的边带 rb-tree-edge(归属该错误码,深一层);
+// 已选目标(无码决策)的边留在码层级(无 rb-tree-edge)
+if (!/rb-tree-edge[^>]*>.*d-small→d-big/.test(nodeWith('debug.rollback.success'))) fail('success edge must nest under its code (rb-tree-edge)');
+if (nodeWith('debug.rollback.selected').includes('rb-tree-edge')) fail('selected edges sit at code level (no rb-tree-edge)');
+console.log('SMOKE OK: rollback tree — code sub-rows + deploy sub-rows (from / from→to) under all headers, alias-free keys');
+// 池状态节(可折叠树):池头带 总/已配置/未配置 计数,子行按部署;
+// 数值为紧凑格式(200K/1M),未配置显示 —,停用带标记
+if (!rbHtml.includes('debug.rollback.pools_title')) fail('pool states section missing');
+if (!rbHtml.includes('debug.rollback.state_active')) fail('active state rendered');
+if (!rbHtml.includes('debug.rollback.state_rescue')) fail('rescue state rendered');
+if (!rbHtml.includes('debug.rollback.pool_counts')) fail('pool counts line missing');
+// 池头计数行存在(桩返回 key 原文;真实插值文案由 e2e 用真 i18n 验证)
+if (!rbHtml.includes('debug.rollback.pool_counts')) fail('pool counts line rendered');
+// 200K 紧凑值 + 原始行
+if (!rbHtml.includes('205K') && !rbHtml.includes('200K')) fail('compact 200K value rendered');
+if (!rbHtml.includes('1M') && !rbHtml.includes('1049K')) fail('compact 1M value rendered');
+if (!rbHtml.includes('d-undecl')) fail('per-deployment rows rendered');
+if (!rbHtml.includes('rb-field-name')) fail('field-name label missing on instance rows');
+if (!rbHtml.includes('max_context_tokens</span> 200K') && !rbHtml.includes('max_context_tokens</span> 205K')) fail('field name prefixes the value');
+if (!rbHtml.includes('—')) fail('unconfigured dash rendered');
+if (!rbHtml.includes('debug.rollback.disabled')) fail('disabled marker rendered');
+// 可折叠结构:池状态节内 rb-tree-node(树已在其它节存在,校验本节 head 含 onclick)
+const poolsSeg = rbHtml.split('debug.rollback.pools_title')[1] || '';
+if (!poolsSeg.includes('rb-tree-head')) fail('collapsible pool head missing');
+if (!poolsSeg.includes("toggle('rb-open')") && !poolsSeg.includes('toggle(\'rb-open\')')) fail('collapse toggle wired');
+console.log('SMOKE OK: diagnostics — pool states (collapsible), hourly convergence, deploy sub-rows, self-test form');
 
 // ── 4. KVC DFX 表:Detail 列 + 错误详情链接(与主日志页同款) ─────
 // 提取块引用闭包变量 debugEnabled / promptLogEnabled → 以参数注入。
@@ -179,19 +261,23 @@ function loadKvcBlock(debugEnabled, promptLogEnabled) {
 // 表头:16 列,Detail 在末尾;筛选行 16 格,10 个输入框不变
 const kvcShell = loadKvcBlock(false, false).kvcDfxShellHtml();
 if (!kvcShell.includes('<th>Detail</th>')) fail('KVC DFX header lacks Detail column');
+if (!kvcShell.includes('<th>Instance</th>')) fail('KVC DFX header lacks Instance column');
+if (!kvcShell.includes('data-col="instance_id"')) fail('instance filter input missing');
 const shellCells = (kvcShell.match(/<td[>\s]/g) || []).length;
-if (shellCells !== 16) fail(`filter row must have 16 cells, got ${shellCells}`);
-if ((kvcShell.match(/col-filter/g) || []).length !== 9) fail('filter input count changed');
+if (shellCells !== 17) fail(`filter row must have 17 cells, got ${shellCells}`);
+if ((kvcShell.match(/col-filter/g) || []).length !== 10) fail('filter input count changed');
 // debug 开 + prompt log 开:错误类型可点 → _showDebugError;Detail 有 View 按钮
 const kvcOn = loadKvcBlock(true, true);
 const errRow = kvcOn.renderKvcDfxRow({
   request_id: 'rid-1', key_hash: 'kh', team_alias: 'team-a', model: 'm1:d1', api_path: '/v1/chat/completions',
+  instance_id: '127.0.0.1:8080',
   status_code: 502, error_type: 'upstream_error', error_message: 'boom', is_stream: true,
   input_tokens: 10, output_tokens: 2, cached_tokens: 4, kv_hit_blocks: 1, kv_input_blocks: 2,
   trie_blocks: 3, trie_max_blocks: 100, request_tokens: 100, duration_ms: 5, ttft_ms: 1, policy: 'rr+rollback',
 });
 if (!errRow.includes("window._showDebugError('rid-1')")) fail('error cell must link _showDebugError when debug on');
 if (!errRow.includes("window._viewPromptLog('rid-1'")) fail('detail cell must offer prompt-log view');
+if (!errRow.includes('127.0.0.1:8080')) fail('instance_id cell rendered');
 if (!errRow.includes('action.view')) fail('detail cell button label');
 // 两个开关都关:无链接、Detail 为 "-"
 const errRowOff = loadKvcBlock(false, false).renderKvcDfxRow({
@@ -216,7 +302,7 @@ if (!okRow.includes("window._viewPromptLog('rid-3'")) fail('success row detail c
 // 列数:每行 16 个 <td>
 for (const row of [errRow, errRowOff, okRow]) {
   const tds = (row.match(/<td/g) || []).length;
-  if (tds !== 16) fail(`row must render 16 cells, got ${tds}`);
+  if (tds !== 17) fail(`row must render 17 cells, got ${tds}`);
 }
 
 console.log('SMOKE OK: KVC DFX detail column + debug-error link mirror the logs page');
