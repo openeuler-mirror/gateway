@@ -112,12 +112,133 @@ async fn swap_fc_guard(
 }
 
 
-/// Streaming retry: identify → gate → second select → guard swap → ONE
-/// re-call of the ORIGINAL request on the fallback provider. The caller
-/// passes the request it saved (clone) and the provider identities of the
-/// failed attempt; on `Retried` the caller rebinds provider/deployment_id/
-/// fc_guard to the returned values and treats `result` as the call outcome.
+/// Retry core: identify → gate → second select → guard swap → ONE re-call
+/// of the ORIGINAL request on the fallback provider, invoked via `call`.
+/// The caller passes the request it saved (clone) and the provider
+/// identities of the failed attempt; on `Retried` the caller rebinds
+/// provider/deployment_id/fc_guard to the returned values and treats
+/// `result` as the call outcome.
 /// Flat: one decision, one guard swap, one provider call. No loops.
+///
+/// The ONLY per-flavor difference is the provider invocation (stream vs
+/// non-stream), passed as a boxed-future closure (async closures are not
+/// stable). All decision recording and retry bookkeeping lives here ONCE
+/// — the two flavors used to duplicate ~110 lines that drifted apart once
+/// (an invariant-comment divergence silently broke a patch).
+#[allow(clippy::too_many_arguments)]
+async fn attempt<T, F>(
+    ctx: &RollbackCtx<'_>,
+    first_error: &GatewayError,
+    req: ChatCompletionRequest,
+    call_ctx: Option<ProviderCallContext>,
+    failed_provider: Arc<dyn Provider>,
+    failed_deployment_id: Option<String>,
+    fc_guard: Option<boom_flowcontrol::FlowControlGuard>,
+    is_vip: bool,
+    key_alias: Option<String>,
+    route: &RollbackRoute<'_>,
+    call: F,
+) -> RollbackOutcome<T>
+where
+    F: FnOnce(
+            Arc<dyn Provider>,
+            ChatCompletionRequest,
+            Option<ProviderCallContext>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<T, GatewayError>> + Send>,
+        >,
+{
+    let patterns = ctx.patterns.to_vec();
+    let decision = select_fallback(first_error, &patterns, route, &ctx.router, &failed_provider);
+    // Composite event methods: each bumps its counters + per-model entry +
+    // error code + deploy dimension, all derived INTERNALLY from the error
+    // (error_code_of) — no caller-side extraction, no hand-crafted codes,
+    // one request → one identical code string in every tree section.
+    match &decision {
+        FallbackDecision::Target(target) => {
+            ctx.stats.record_selected(
+                route.model,
+                failed_deployment_id.as_deref(),
+                target.deployment_id(),
+            );
+        }
+        FallbackDecision::MissIdentify => {
+            ctx.stats
+                .record_miss_identified(route.model, first_error, failed_deployment_id.as_deref());
+        }
+        FallbackDecision::PoolInert => {
+            ctx.stats
+                .record_pool_inert_identified(route.model, first_error, failed_deployment_id.as_deref());
+        }
+        FallbackDecision::NoTarget => {
+            ctx.stats
+                .record_no_target_identified(route.model, first_error, failed_deployment_id.as_deref());
+        }
+    }
+    let Some(target) = decision.target()
+    else {
+        return RollbackOutcome::NoRetry;
+    };
+    let new_id = target.deployment_id().map(str::to_string);
+    let (new_guard, guard_err) = swap_fc_guard(
+        ctx,
+        fc_guard,
+        new_id.as_deref().unwrap_or(""),
+        route.input_chars,
+        is_vip,
+        key_alias.clone(),
+        route.key_hash,
+        route.model,
+    )
+    .await;
+    if let Some(ref ge) = guard_err.as_ref().err() {
+        ctx.stats
+            .record_guard_error(route.model, ge, failed_deployment_id.as_deref(), new_id.as_deref());
+    }
+    let retry_start = std::time::Instant::now();
+    let guard_failed = guard_err.is_err();
+    let result = match guard_err {
+        Err(e) => Err(e),
+        Ok(()) => call(target.clone(), req, call_ctx).await,
+    };
+    match &result {
+        Ok(_) => {
+            let ms = retry_start.elapsed().as_millis() as u64;
+            // `first_error` = the ORIGINAL context error the retry FIXED —
+            // its code feeds the retry-success tree's sub-rows ("成功修复
+            // 了什么错误、各多少次").
+            ctx.stats.record_retry_success_fixed(
+                route.model,
+                first_error,
+                ms,
+                failed_deployment_id.as_deref(),
+                new_id.as_deref(),
+            );
+        }
+        // Guard-swap failure is already counted as guard_error (terminal:
+        // no retry call was made) — bumping retry_error here too would
+        // double-count and break invariant ② selected = success +
+        // retry_error + guard_error.
+        Err(ref e) if !guard_failed => {
+            ctx.stats.record_retry_error(
+                route.model,
+                e,
+                failed_deployment_id.as_deref(),
+                new_id.as_deref(),
+            );
+        }
+        Err(_) => {}
+    }
+    RollbackOutcome::Retried {
+        result,
+        provider: target,
+        deployment_id: new_id,
+        fc_guard: new_guard,
+        from_deployment_id: failed_deployment_id,
+    }
+}
+
+/// Streaming retry — same contract as [`attempt`].
 pub async fn attempt_stream(
     ctx: &RollbackCtx<'_>,
     first_error: &GatewayError,
@@ -130,103 +251,30 @@ pub async fn attempt_stream(
     key_alias: Option<String>,
     route: &RollbackRoute<'_>,
 ) -> RollbackOutcome<ChatStream> {
-    let patterns = ctx.patterns.to_vec();
-    let decision = select_fallback(first_error, &patterns, route, &ctx.router, &failed_provider);
-    // Composite event methods: each bumps its counters + per-model entry +
-    // error code derived INTERNALLY from the error (error_code_of) — no
-    // caller-side extraction, no hand-crafted codes, one request → one
-    // identical code string in every tree section.
-    match &decision {
-        // Composite methods record counters + per-model + code + DEPLOY
-        // dimension (from / from→to) in one call — the tree sub-rows come
-        // from the same recording, no separate event log.
-        FallbackDecision::Target(target) => {
-            ctx.stats.record_selected(
-                route.model,
-                failed_deployment_id.as_deref(),
-                target.deployment_id(),
-            );
-        }
-        FallbackDecision::MissIdentify => {
-            ctx.stats
-                .record_miss_identified(route.model, first_error, failed_deployment_id.as_deref());
-        }
-        FallbackDecision::PoolInert => {
-            ctx.stats
-                .record_pool_inert_identified(route.model, first_error, failed_deployment_id.as_deref());
-        }
-        FallbackDecision::NoTarget => {
-            ctx.stats
-                .record_no_target_identified(route.model, first_error, failed_deployment_id.as_deref());
-        }
-    }
-    let Some(target) = decision.target()
-    else {
-        return RollbackOutcome::NoRetry;
-    };
-    let new_id = target.deployment_id().map(str::to_string);
-    let (new_guard, guard_err) = swap_fc_guard(
+    attempt(
         ctx,
+        first_error,
+        req,
+        call_ctx,
+        failed_provider,
+        failed_deployment_id,
         fc_guard,
-        new_id.as_deref().unwrap_or(""),
-        route.input_chars,
         is_vip,
-        key_alias.clone(),
-        route.key_hash,
-        route.model,
-    )
-    .await;
-    if let Some(ref ge) = guard_err.as_ref().err() {
-        ctx.stats
-            .record_guard_error(route.model, ge, failed_deployment_id.as_deref(), new_id.as_deref());
-    }
-    let retry_start = std::time::Instant::now();
-    let guard_failed = guard_err.is_err();
-    let result = match guard_err {
-        Err(e) => Err(e),
-        Ok(()) => match call_ctx {
-            Some(ctx) => target.chat_stream_with_context(req, ctx).await,
-            None => target.chat_stream(req).await,
+        key_alias,
+        route,
+        |p, r, cc| {
+            Box::pin(async move {
+                match cc {
+                    Some(c) => p.chat_stream_with_context(r, c).await,
+                    None => p.chat_stream(r).await,
+                }
+            })
         },
-    };
-    match &result {
-        Ok(_) => {
-            let ms = retry_start.elapsed().as_millis() as u64;
-            // `first_error` = the ORIGINAL context error the retry FIXED —
-            // its code feeds the retry-success tree's sub-rows ("成功修复
-            // 了什么错误、各多少次").
-            ctx.stats.record_retry_success_fixed(
-                route.model,
-                first_error,
-                ms,
-                failed_deployment_id.as_deref(),
-                new_id.as_deref(),
-            );
-        }
-        // Guard-swap failure is already counted as guard_error (terminal:
-        // no retry call was made) — bumping retry_error here too would
-        // double-count and break invariant ② selected = success +
-        // retry_error + guard_error.
-        Err(ref e) if !guard_failed => {
-            ctx.stats.record_retry_error(
-                route.model,
-                e,
-                failed_deployment_id.as_deref(),
-                new_id.as_deref(),
-            );
-        }
-        Err(_) => {}
-    }
-    RollbackOutcome::Retried {
-        result,
-        provider: target,
-        deployment_id: new_id,
-        fc_guard: new_guard,
-        from_deployment_id: failed_deployment_id,
-    }
+    )
+    .await
 }
 
-/// Non-streaming retry — same contract as [`attempt_stream`].
+/// Non-streaming retry — same contract as [`attempt`].
 pub async fn attempt_call(
     ctx: &RollbackCtx<'_>,
     first_error: &GatewayError,
@@ -239,99 +287,25 @@ pub async fn attempt_call(
     key_alias: Option<String>,
     route: &RollbackRoute<'_>,
 ) -> RollbackOutcome<ChatCompletionResponse> {
-    let patterns = ctx.patterns.to_vec();
-    let decision = select_fallback(first_error, &patterns, route, &ctx.router, &failed_provider);
-    // Composite event methods: each bumps its counters + per-model entry +
-    // error code derived INTERNALLY from the error (error_code_of) — no
-    // caller-side extraction, no hand-crafted codes, one request → one
-    // identical code string in every tree section.
-    match &decision {
-        // Composite methods record counters + per-model + code + DEPLOY
-        // dimension (from / from→to) in one call — the tree sub-rows come
-        // from the same recording, no separate event log.
-        FallbackDecision::Target(target) => {
-            ctx.stats.record_selected(
-                route.model,
-                failed_deployment_id.as_deref(),
-                target.deployment_id(),
-            );
-        }
-        FallbackDecision::MissIdentify => {
-            ctx.stats
-                .record_miss_identified(route.model, first_error, failed_deployment_id.as_deref());
-        }
-        FallbackDecision::PoolInert => {
-            ctx.stats
-                .record_pool_inert_identified(route.model, first_error, failed_deployment_id.as_deref());
-        }
-        FallbackDecision::NoTarget => {
-            ctx.stats
-                .record_no_target_identified(route.model, first_error, failed_deployment_id.as_deref());
-        }
-    }
-    let Some(target) = decision.target()
-    else {
-        return RollbackOutcome::NoRetry;
-    };
-    let new_id = target.deployment_id().map(str::to_string);
-    let (new_guard, guard_err) = swap_fc_guard(
+    attempt(
         ctx,
+        first_error,
+        req,
+        call_ctx,
+        failed_provider,
+        failed_deployment_id,
         fc_guard,
-        new_id.as_deref().unwrap_or(""),
-        route.input_chars,
         is_vip,
-        key_alias.clone(),
-        route.key_hash,
-        route.model,
-    )
-    .await;
-    if let Some(ref ge) = guard_err.as_ref().err() {
-        ctx.stats
-            .record_guard_error(route.model, ge, failed_deployment_id.as_deref(), new_id.as_deref());
-    }
-    let retry_start = std::time::Instant::now();
-    let guard_failed = guard_err.is_err();
-    let result = match guard_err {
-        Err(e) => Err(e),
-        Ok(()) => match call_ctx {
-            Some(ctx) => target.chat_with_context(req, ctx).await,
-            None => target.chat(req).await,
+        key_alias,
+        route,
+        |p, r, cc| {
+            Box::pin(async move {
+                match cc {
+                    Some(c) => p.chat_with_context(r, c).await,
+                    None => p.chat(r).await,
+                }
+            })
         },
-    };
-    match &result {
-        Ok(_) => {
-            let ms = retry_start.elapsed().as_millis() as u64;
-            // `first_error` = the ORIGINAL context error the retry FIXED —
-            // its code feeds the retry-success tree's sub-rows ("成功修复
-            // 了什么错误、各多少次").
-            ctx.stats.record_retry_success_fixed(
-                route.model,
-                first_error,
-                ms,
-                failed_deployment_id.as_deref(),
-                new_id.as_deref(),
-            );
-        }
-        // Guard-swap failure is already counted as guard_error (terminal:
-        // no retry call was made) — bumping retry_error here too would
-        // double-count and break invariant ② selected = success +
-        // retry_error + guard_error.
-        Err(ref e) if !guard_failed => {
-            ctx.stats.record_retry_error(
-                route.model,
-                e,
-                failed_deployment_id.as_deref(),
-                new_id.as_deref(),
-            );
-        }
-        Err(_) => {}
-    }
-    RollbackOutcome::Retried {
-        result,
-        provider: target,
-        deployment_id: new_id,
-        fc_guard: new_guard,
-        from_deployment_id: failed_deployment_id,
-    }
+    )
+    .await
 }
-

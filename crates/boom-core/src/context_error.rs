@@ -553,13 +553,16 @@ impl PerModelRollback {
         field.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Event names are the SNAPSHOT FIELD NAMES — the single vocabulary
+    /// shared by per-model counters, error_codes and deploys keys, the
+    /// frontend eventKeys and the snapshot struct. No short-name alias
+    /// layer anywhere.
     pub fn record(&self, event: &str) {
         match event {
-            "miss" => Self::bump(&self.identify_miss),
-            "inert" => Self::bump(&self.pool_inert),
+            "identify_miss" => Self::bump(&self.identify_miss),
+            "pool_inert" => Self::bump(&self.pool_inert),
             "no_target" => Self::bump(&self.no_target),
-            "selected" => Self::bump(&self.fallback_selected),
-            "success" => Self::bump(&self.retry_success),
+            "fallback_selected" => Self::bump(&self.fallback_selected),
             "retry_error" => Self::bump(&self.retry_error),
             "guard_error" => Self::bump(&self.guard_error),
             "no_fallback_return" => Self::bump(&self.no_fallback_return),
@@ -746,7 +749,7 @@ impl RollbackStats {
     ) -> String {
         Self::rb_bump(&self.identify_total);
         Self::rb_bump(&self.identify_miss);
-        self.record_model(model, "miss");
+        self.record_model(model, "identify_miss");
         let code = error_code_of(error);
         self.record_model_error_code(model, "identify_miss", &code);
         self.record_model_deploys(model, "identify_miss", &code, from, None);
@@ -764,7 +767,7 @@ impl RollbackStats {
     ) -> String {
         Self::rb_bump(&self.identify_total);
         Self::rb_bump(&self.pool_inert);
-        self.record_model(model, "inert");
+        self.record_model(model, "pool_inert");
         let code = error_code_of(error);
         self.record_model_error_code(model, "pool_inert", &code);
         self.record_model_deploys(model, "pool_inert", &code, from, None);
@@ -792,7 +795,7 @@ impl RollbackStats {
     pub fn record_selected(&self, model: &str, from: Option<&str>, to: Option<&str>) {
         Self::rb_bump(&self.identify_total);
         Self::rb_bump(&self.fallback_selected);
-        self.record_model(model, "selected");
+        self.record_model(model, "fallback_selected");
         self.record_model_deploys(model, "fallback_selected", "", from, to);
     }
 
