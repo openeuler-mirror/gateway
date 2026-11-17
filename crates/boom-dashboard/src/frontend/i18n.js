@@ -194,6 +194,9 @@
       "stress.info.help.blocking_pool": "spawn_blocking tasks run here (prompt-log gzip, DB migrations, file I/O). The pool grows on demand up to 512 threads; queued tasks waiting for a free thread show up as blocking_tasks_queued. These threads are NOT counted under workers, which is why the CPU chart can show 1300% on a 16-core box even with 8 workers configured.",
       "stress.info.help.sample_rate": "How often tokio runtime metrics and /proc/self/stat are read: 1 Hz. Points shown on the charts are 10s max aggregates of those samples.",
 
+      "stats.hero.eyebrow": "BoomGateway Console",
+      "stats.hero.title": "Gateway Stats",
+      "stats.hero.sub": "Live in-flight requests, per-model request rate and cross-instance totals",
       "stats.inflight.title": "In-Flight Requests",
       "stats.inflight.col.model": "Model",
       "stats.inflight.col.deployment": "Deployment",
@@ -1459,6 +1462,9 @@
       "stress.info.help.blocking_pool": "spawn_blocking 任务在此执行(prompt-log gzip、DB 迁移、文件 I/O)。线程池按需增长,上限 512;排队等空闲线程的任务数即 blocking_tasks_queued。这些线程不归 worker 数管 —— 这就是为什么 8 worker 配置下,CPU 图仍然可能显示 1300%(16 核机器)。",
       "stress.info.help.sample_rate": "读取 tokio 运行时指标和 /proc/self/stat 的频率:1 Hz(每秒一次)。图上的点是这些采样按 10 秒取峰值后的聚合。",
 
+      "stats.hero.eyebrow": "BoomGateway 控制台",
+      "stats.hero.title": "统计总览",
+      "stats.hero.sub": "实时在途请求、按模型请求速率与跨实例汇总",
       "stats.inflight.title": "在途请求",
       "stats.inflight.col.model": "模型",
       "stats.inflight.col.deployment": "部署",

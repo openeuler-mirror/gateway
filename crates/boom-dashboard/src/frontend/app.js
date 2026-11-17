@@ -7,7 +7,7 @@
   let usageRefreshTimer = null;
 
   // ── Theme ─────────────────────────────────────────────
-  function getTheme() { return document.documentElement.dataset.theme || "light"; }
+  function getTheme() { return document.documentElement.dataset.theme || "dark"; }
   function setTheme(t) {
     document.documentElement.dataset.theme = t;
     localStorage.setItem("boom-theme", t);
@@ -2423,7 +2423,7 @@
       accessor: (s) => s.cpu_pct,
       yMax: "auto",
       yMinFloor: 100,
-      color: cssVar("--primary") || "#0e7490",
+      color: cssVar("--primary") || "#9376ff",
       emptyHint: "Collecting… (first point closes ~10s)",
       formatValue: (v) => v.toFixed(1) + "%",
       formatY: (v) => v.toFixed(0) + "%",
@@ -2438,7 +2438,7 @@
       accessor: (s) => s.rss_bytes,
       yMax: "auto",
       yMinFloor: 100 * 1024 * 1024,
-      color: cssVar("--primary") || "#0e7490",
+      color: cssVar("--primary") || "#9376ff",
       emptyHint: "—",
       formatValue: formatBytes,
       formatY: (v) => formatBytes(v, true),
@@ -2452,7 +2452,7 @@
       samples,
       accessor: (s) => s.worker_queue_depth,
       yMax: "auto",
-      color: cssVar("--primary") || "#0e7490",
+      color: cssVar("--primary") || "#9376ff",
       emptyHint: "—",
       formatValue: (v) => String(v),
       formatY: (v) => String(Math.round(v)),
@@ -2466,7 +2466,7 @@
       samples,
       accessor: (s) => s.blocking_tasks_queued,
       yMax: "auto",
-      color: cssVar("--primary") || "#0e7490",
+      color: cssVar("--primary") || "#9376ff",
       emptyHint: "—",
       formatValue: (v) => String(v),
       formatY: (v) => String(Math.round(v)),
@@ -2480,8 +2480,8 @@
       samples,
       accessor: (s) => s.inflight,
       yMax: "auto",
-      color: cssVar("--primary") || "#0e7490",
-      fill: cssVar("--primary-glow") || "rgba(14,116,144,.16)",
+      color: cssVar("--primary") || "#9376ff",
+      fill: cssVar("--primary-glow") || "rgba(147,118,255,.20)",
       emptyHint: "—",
       formatValue: (v) => String(v),
       formatY: (v) => String(Math.round(v)),
@@ -2593,7 +2593,7 @@
   let _cssVarCache = null;
   let _cssVarTheme = null;
   function cssVar(name) {
-    const theme = document.documentElement.dataset.theme || "light";
+    const theme = document.documentElement.dataset.theme || "dark";
     if (_cssVarCache && _cssVarTheme === theme) return _cssVarCache[name] || "";
     _cssVarTheme = theme;
     const styles = getComputedStyle(document.documentElement);
@@ -2608,6 +2608,16 @@
     };
     return _cssVarCache[name] || "";
   }
+  // Re-alpha an rgba() string for canvas gradient stops (used by the area
+  // fill fade). Non-rgba input passes through untouched.
+  function fadeRgba(str, alpha) {
+    const m = /^rgba?\(([^)]+)\)$/.exec(String(str).trim());
+    if (!m) return str;
+    const parts = m[1].split(",").map((x) => x.trim());
+    if (parts.length < 3) return str;
+    return "rgba(" + parts[0] + "," + parts[1] + "," + parts[2] + "," + alpha + ")";
+  }
+
   // Invalidate cache on theme toggle and immediately redraw current charts.
   document.addEventListener("themechange", () => {
     _cssVarCache = null;
@@ -2776,7 +2786,8 @@
       );
     }
 
-    // Soft fill under the line (optional).
+    // Soft fill under the line (optional) — vertical fade, strongest at the
+    // line's ceiling and transparent at the baseline.
     if (opts.fill) {
       ctx.beginPath();
       values.forEach((v, i) => {
@@ -2788,7 +2799,10 @@
       ctx.lineTo(xFor(values.length - 1), padTop + plotH);
       ctx.lineTo(xFor(0), padTop + plotH);
       ctx.closePath();
-      ctx.fillStyle = opts.fill;
+      const grad = ctx.createLinearGradient(0, padTop, 0, padTop + plotH);
+      grad.addColorStop(0, opts.fill);
+      grad.addColorStop(1, fadeRgba(opts.fill, 0));
+      ctx.fillStyle = grad;
       ctx.fill();
     }
 
@@ -4442,7 +4456,7 @@
     const yTicks = [0, yMax / 2, yMax].map((v) => {
       const yp = sy(v);
       return '<line x1="' + padL + '" y1="' + yp + '" x2="' + (padL + plotW) + '" y2="' + yp + '" stroke="var(--border, #eee)" stroke-dasharray="2 2"/>' +
-             '<text x="' + (padL - 6) + '" y="' + (yp + 3) + '" text-anchor="end" font-size="10" fill="var(--text-muted, #6b7280)">' + v.toFixed(1) + '</text>';
+             '<text x="' + (padL - 6) + '" y="' + (yp + 3) + '" text-anchor="end" font-size="10" fill="var(--text3)">' + v.toFixed(1) + '</text>';
     }).join("");
     const xTickMax = Math.ceil(xMax);
     const xTicksArr = [];
@@ -4451,20 +4465,20 @@
       const xp = sx(xv);
       const label = (Math.pow(10, k)).toLocaleString();
       xTicksArr.push('<line x1="' + xp + '" y1="' + (padT + plotH) + '" x2="' + xp + '" y2="' + (padT + plotH + 4) + '" stroke="var(--border, #ccc)"/>' +
-                     '<text x="' + xp + '" y="' + (padT + plotH + 16) + '" text-anchor="middle" font-size="10" fill="var(--text-muted, #6b7280)">' + label + '</text>');
+                     '<text x="' + xp + '" y="' + (padT + plotH + 16) + '" text-anchor="middle" font-size="10" fill="var(--text3)">' + label + '</text>');
     }
     const xTicks = xTicksArr.join("");
     const axisX =
       '<line x1="' + padL + '" y1="' + (padT + plotH) + '" x2="' + (padL + plotW) + '" y2="' + (padT + plotH) + '" stroke="var(--border, #ccc)"/>' +
       xTicks +
-      '<text x="' + (padL + plotW / 2) + '" y="' + (H - 8) + '" text-anchor="middle" font-size="11" fill="var(--text-muted, #6b7280)">' + esc(t("debug.anomalies.scatter.x_label")) + '</text>';
+      '<text x="' + (padL + plotW / 2) + '" y="' + (H - 8) + '" text-anchor="middle" font-size="11" fill="var(--text3)">' + esc(t("debug.anomalies.scatter.x_label")) + '</text>';
     const axisY =
       '<line x1="' + padL + '" y1="' + padT + '" x2="' + padL + '" y2="' + (padT + plotH) + '" stroke="var(--border, #ccc)"/>' +
       yTicks +
-      '<text x="14" y="' + (padT + plotH / 2) + '" text-anchor="middle" font-size="11" fill="var(--text-muted, #6b7280)" transform="rotate(-90 14 ' + (padT + plotH / 2) + ')">' + esc(t("debug.anomalies.scatter.y_label")) + '</text>';
+      '<text x="14" y="' + (padT + plotH / 2) + '" text-anchor="middle" font-size="11" fill="var(--text3)" transform="rotate(-90 14 ' + (padT + plotH / 2) + ')">' + esc(t("debug.anomalies.scatter.y_label")) + '</text>';
 
     // Points — color by metric_count
-    const colorFor = (mc) => mc >= 4 ? "#c0392b" : mc >= 2 ? "#b8860b" : "#3b82f6";
+    const colorFor = (mc) => mc >= 4 ? "var(--danger)" : mc >= 2 ? "var(--warn)" : "var(--info)";
     const points = pts.map((p) => {
       const cx = sx(p.x).toFixed(2);
       const cy = sy(p.y).toFixed(2);
@@ -4472,7 +4486,7 @@
       const tip = esc(p.alias + " | req=" + p.req_count.toLocaleString() + " | sev=" + p.severity.toFixed(2) + " | " + p.metric_count + " metrics");
       const label = '<title>' + tip + '</title>';
       const labelText = p.alias.length > 14 ? p.alias.slice(0, 13) + "…" : p.alias;
-      const labelSvg = '<text x="' + (parseFloat(cx) + 8) + '" y="' + (parseFloat(cy) + 4) + '" font-size="10" fill="var(--text-muted, #6b7280)">' + esc(labelText) + '</text>';
+      const labelSvg = '<text x="' + (parseFloat(cx) + 8) + '" y="' + (parseFloat(cy) + 4) + '" font-size="10" fill="var(--text3)">' + esc(labelText) + '</text>';
       return '<circle cx="' + cx + '" cy="' + cy + '" r="5" fill="' + color + '" fill-opacity="0.7" stroke="' + color + '">' + label + '</circle>' + labelSvg;
     }).join("");
 
@@ -4485,9 +4499,9 @@
         points +
       '</svg>' +
       '<div class="anomaly-scatter-legend">' +
-        '<span><svg width="10" height="10"><circle cx="5" cy="5" r="4" fill="#3b82f6"/></svg> 1 metric</span>' +
-        '<span><svg width="10" height="10"><circle cx="5" cy="5" r="4" fill="#b8860b"/></svg> 2-3 metrics</span>' +
-        '<span><svg width="10" height="10"><circle cx="5" cy="5" r="4" fill="#c0392b"/></svg> 4+ metrics</span>' +
+        '<span><svg width="10" height="10"><circle cx="5" cy="5" r="4" fill="var(--info)"/></svg> 1 metric</span>' +
+        '<span><svg width="10" height="10"><circle cx="5" cy="5" r="4" fill="var(--warn)"/></svg> 2-3 metrics</span>' +
+        '<span><svg width="10" height="10"><circle cx="5" cy="5" r="4" fill="var(--danger)"/></svg> 4+ metrics</span>' +
         '<span class="anomaly-scatter-quadrant">' + esc(t("debug.anomalies.explainer.scatter")) + '</span>' +
       '</div>' +
     '</div>';
@@ -4531,20 +4545,20 @@
         '</div>' +
         '<div class="agent-summary-card">' +
           '<div class="agent-summary-label">' + t("stats.agent.summary.anthropic") + '</div>' +
-          '<div class="agent-summary-value" style="color:#10b981">' + summary.anthropic.toLocaleString() + '</div>' +
+          '<div class="agent-summary-value" style="color:var(--success)">' + summary.anthropic.toLocaleString() + '</div>' +
         '</div>' +
         '<div class="agent-summary-card">' +
           '<div class="agent-summary-label">' + t("stats.agent.summary.share") + '</div>' +
-          '<div class="agent-summary-value" style="color:#10b981">' + ratioPct + '%</div>' +
+          '<div class="agent-summary-value" style="color:var(--success)">' + ratioPct + '%</div>' +
         '</div>' +
         '<div class="agent-summary-card">' +
           '<div class="agent-summary-label">' + t("stats.agent.summary.input_anthropic") + '</div>' +
-          '<div class="agent-summary-value" style="color:#10b981">' + summary.input_tokens_anthropic.toLocaleString() +
+          '<div class="agent-summary-value" style="color:var(--success)">' + summary.input_tokens_anthropic.toLocaleString() +
             ' <span style="font-size:0.7em;color:#6b7280">/ ' + summary.input_tokens_total.toLocaleString() + ' (' + inputRatioPct + '%)</span></div>' +
         '</div>' +
         '<div class="agent-summary-card">' +
           '<div class="agent-summary-label">' + t("stats.agent.summary.output_anthropic") + '</div>' +
-          '<div class="agent-summary-value" style="color:#10b981">' + summary.output_tokens_anthropic.toLocaleString() +
+          '<div class="agent-summary-value" style="color:var(--success)">' + summary.output_tokens_anthropic.toLocaleString() +
             ' <span style="font-size:0.7em;color:#6b7280">/ ' + summary.output_tokens_total.toLocaleString() + ' (' + outputRatioPct + '%)</span></div>' +
         '</div>' +
       '</div>';
@@ -8859,8 +8873,8 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
             <div class="form-group"><label>${t("form.key.max_budget")} ${tip(t("tip.key.max_budget_edit"))}</label><input id="m-edit-budget" type="number" step="0.01" min="0" value="${key.max_budget != null ? key.max_budget : ""}"></div>
             <div class="form-group"><label>${t("form.key.budget_duration")} ${tip(t("tip.key.budget_duration"))}</label><input id="m-edit-budget-duration" value="${esc(key.budget_duration || "")}" placeholder="1d / 7d / 30d"></div>
             <div class="form-group field-full"><label>${t("form.key.expires")} ${tip(t("tip.key.expires"))}</label><input id="m-edit-expires" value="${esc(key.expires || "")}" placeholder="2026-12-31 23:59:59" style="font-family:var(--mono);font-size:12px"></div>
-            <div class="form-group field-full"><label>${t("form.key.vip")} ${tip(t("tip.key.vip"))}</label><div style="display:flex;align-items:center;gap:8px;padding-top:4px"><input type="checkbox" id="m-edit-vip" ${isVip ? "checked" : ""}><span style="font-weight:600;color:#b45309;white-space:nowrap">${t("form.key.vip_label")}</span></div></div>
-            <div class="form-group field-full"><label>${t("form.key.prompt_log")} ${tip(t("tip.key.prompt_log"))}</label><div style="display:flex;align-items:center;gap:8px;padding-top:4px"><input type="checkbox" id="m-edit-no-prompt-log" ${isPromptLogExcluded ? "checked" : ""}><span style="font-weight:600;color:#dc2626;white-space:nowrap">${t("form.key.prompt_log_label")}</span></div></div>
+            <div class="form-group field-full"><label>${t("form.key.vip")} ${tip(t("tip.key.vip"))}</label><div style="display:flex;align-items:center;gap:8px;padding-top:4px"><input type="checkbox" id="m-edit-vip" ${isVip ? "checked" : ""}><span style="font-weight:600;color:var(--warn);white-space:nowrap">${t("form.key.vip_label")}</span></div></div>
+            <div class="form-group field-full"><label>${t("form.key.prompt_log")} ${tip(t("tip.key.prompt_log"))}</label><div style="display:flex;align-items:center;gap:8px;padding-top:4px"><input type="checkbox" id="m-edit-no-prompt-log" ${isPromptLogExcluded ? "checked" : ""}><span style="font-weight:600;color:var(--danger);white-space:nowrap">${t("form.key.prompt_log_label")}</span></div></div>
           </div>
         </div>
       </div>

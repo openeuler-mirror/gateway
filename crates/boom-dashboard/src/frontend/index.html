@@ -9,7 +9,7 @@
     (function(){
       var s=localStorage.getItem('boom-theme');
       if(s)document.documentElement.dataset.theme=s;
-      else if(matchMedia('(prefers-color-scheme:dark)').matches)document.documentElement.dataset.theme='dark';
+      else if(matchMedia('(prefers-color-scheme:light)').matches)document.documentElement.dataset.theme='light';
     })();
   </script>
   <script src="/dashboard/i18n.js" defer></script>
@@ -224,7 +224,31 @@
         </aside>
         <main class="main-content">
           <!-- Stats Section -->
-          <section id="admin-stats" class="section">            <div class="section-header">
+          <section id="admin-stats" class="section">
+            <div class="hero-banner">
+              <div class="hero-banner__grid"></div>
+              <svg class="hero-banner__circuit" viewBox="0 0 660 116" preserveAspectRatio="xMidYMid slice" aria-hidden="true">
+                <g fill="none" stroke-width="1">
+                  <path class="hb-trace" d="M0 78h96l26-26h84l30 30h120l24-24h88l22 22h150"/>
+                  <path class="hb-trace hb-dim" d="M40 108h140l20-20h180l18 18h262"/>
+                  <path class="hb-trace hb-dim" d="M0 34h150l24 24h210l28-28h100"/>
+                </g>
+                <g class="hb-nodes">
+                  <circle class="hb-node" cx="122" cy="52" r="3"/>
+                  <circle class="hb-node" cx="326" cy="82" r="3"/>
+                  <circle class="hb-node" cx="462" cy="58" r="3"/>
+                  <circle class="hb-node" cx="572" cy="80" r="3"/>
+                  <circle class="hb-node hb-node--pulse" cx="384" cy="30" r="3.5"/>
+                </g>
+              </svg>
+              <div class="hero-banner__slab" aria-hidden="true"></div>
+              <div class="hero-banner__content">
+                <div class="hero-banner__eyebrow"><i></i><span data-i18n="stats.hero.eyebrow">BoomGateway Console</span></div>
+                <h2 data-i18n="stats.hero.title">Gateway Stats</h2>
+                <p data-i18n="stats.hero.sub">Live in-flight requests, per-model request rate and cross-instance totals</p>
+              </div>
+            </div>
+            <div class="section-header">
               <h2 data-i18n="stats.inflight.title">In-Flight Requests</h2>
               <div style="display:flex;gap:8px">
                 <button class="btn-small" id="btn-toggle-inflight-peers" style="display:none">Expand all</button>
