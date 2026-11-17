@@ -6873,35 +6873,76 @@ pub async fn quota_reset_team_windows(
 
 // ── System Pressure ────────────────────────────────────────────────────
 //
-// Reads from boom-stressmon's ring buffer (1Hz × 60min). The chart on the
-// admin stats page polls this every 1.5s — see `loadStressPanel` in app.js.
+// With a DB the canonical view is `boom_stress_sample`: one 10s MAX point
+// per instance per wall-aligned bucket, 24h retention. Every dashboard —
+// including this instance's own series — reads the same rows, so any page
+// shows the same cluster picture (stress metrics are physical quantities,
+// never summed: one line per instance). The client caches the full window
+// and polls with `since` for incremental points only.
+//
+// Without a DB the page degrades to this instance's in-process ring
+// (same 10s points, 24h, single series).
 
 #[derive(Debug, Deserialize)]
-pub struct StressRangeQuery {
-    /// `5m` / `15m` / `30m` / `60m` (default 5m). Bounded to the ring
-    /// buffer's 60-min capacity by the impl.
-    #[serde(default = "default_stress_range")]
-    pub range: String,
+pub struct StressHistoryQuery {
+    /// Only return points with `ts > since` (unix secs). `0` (default) is
+    /// the initial full-window load.
+    #[serde(default)]
+    pub since: i64,
 }
 
-fn default_stress_range() -> String {
-    "5m".to_string()
-}
-
-pub async fn get_stress_timeseries(
+pub async fn get_stress_history(
     _session: AdminSession,
     Extension(state): Extension<Arc<DashboardState>>,
-    Query(q): Query<StressRangeQuery>,
+    Query(q): Query<StressHistoryQuery>,
 ) -> Response {
-    let window_secs: i64 = match q.range.as_str() {
-        "5m" => 300,
-        "15m" => 900,
-        "30m" => 1800,
-        "60m" => 3600,
-        _ => 300,
-    };
-    let snap = state.stressmon.timeseries(window_secs).await;
-    Json(snap).into_response()
+    // Self-process meta regardless of mode (uptime card + worker count).
+    let meta = state.stressmon.timeseries(0).await;
+
+    if state.db_pool.is_some() {
+        let rows = state.stressmon.history(q.since).await;
+        // Rows are ts-ordered; group per instance preserving that order.
+        let mut order: Vec<String> = Vec::new();
+        let mut grouped: std::collections::HashMap<String, Vec<serde_json::Value>> =
+            std::collections::HashMap::new();
+        for r in rows {
+            let entry = grouped.entry(r.instance_id.clone()).or_insert_with(|| {
+                order.push(r.instance_id.clone());
+                Vec::new()
+            });
+            entry.push(serde_json::json!({
+                "ts": r.ts,
+                "cpu_pct": r.cpu_pct,
+                "rss_bytes": r.rss_bytes,
+                "worker_queue_depth": r.worker_queue_depth,
+                "blocking_tasks_queued": r.blocking_tasks_queued,
+                "inflight": r.inflight,
+            }));
+        }
+        let instances: Vec<serde_json::Value> = order
+            .into_iter()
+            .map(|id| serde_json::json!({ "instance_id": id, "samples": grouped[&id] }))
+            .collect();
+        return Json(serde_json::json!({
+            "num_workers": meta.num_workers,
+            "uptime_secs": meta.uptime_secs,
+            "self_instance_id": &*state.instance_id,
+            "instances": instances,
+        }))
+        .into_response();
+    }
+
+    // No-DB fallback: local ring only, self is the whole cluster.
+    Json(serde_json::json!({
+        "num_workers": meta.num_workers,
+        "uptime_secs": meta.uptime_secs,
+        "self_instance_id": &*state.instance_id,
+        "instances": [{
+            "instance_id": &*state.instance_id,
+            "samples": meta.samples,
+        }],
+    }))
+    .into_response()
 }
 
 // ═══════════════════════════════════════════════════════════

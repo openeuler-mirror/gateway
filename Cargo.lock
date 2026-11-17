@@ -688,6 +688,7 @@ dependencies = [
  "boom-core",
  "chrono",
  "serde",
+ "sqlx",
  "tokio",
  "tracing",
 ]

@@ -157,10 +157,13 @@ async fn async_main(
     alert_reconciler::spawn_alert_reconciler(state.clone(), shutdown_tx.subscribe());
 
     // Spawn the system pressure sampler (1 Hz — CPU, RSS, tokio worker queue
-    // depth, blocking pool queue, inflight). See `spawn_stressmon_sampler`.
+    // depth, blocking pool queue, inflight — folded into 10s MAX points and,
+    // with a DB, persisted to boom_stress_sample). See `spawn_stressmon_sampler`.
     spawn_stressmon_sampler(
         state.stressmon.clone(),
         state.inflight.clone(),
+        state.instance_id.clone(),
+        state.db_pool.clone(),
         shutdown_tx.subscribe(),
     );
 
@@ -475,26 +478,52 @@ fn spawn_request_summary(
 }
 
 /// Background task: every 1s, sample system pressure (CPU, RSS, tokio
-/// worker queue depth, blocking pool queue, inflight) and push to the
-/// `StressmonCollector`.
+/// worker queue depth, blocking pool queue, inflight) and fold it into the
+/// collector's open 10s MAX bucket. Each closed bucket is persisted to
+/// `boom_stress_sample` (one row per instance per bucket, wall-clock
+/// aligned — see boom-stressmon) and the retention window is pruned
+/// hourly. Without a DB the ring buffer alone serves the local dashboard.
 ///
 /// Sampling lives here (not inside boom-stressmon) so boom-stressmon stays
 /// a leaf crate with no dep on boom-routing's `InFlightTracker`
-/// (CLAUDE.md §1 — boom-core is the only leaf dep). The collector itself
-/// is just a ring buffer.
+/// (CLAUDE.md §1 — boom-core is the only leaf dep).
 fn spawn_stressmon_sampler(
     collector: std::sync::Arc<boom_stressmon::StressmonCollector>,
     inflight: std::sync::Arc<boom_routing::InFlightTracker>,
+    instance_id: std::sync::Arc<str>,
+    pool: Option<sqlx::PgPool>,
     mut shutdown: tokio::sync::broadcast::Receiver<()>,
 ) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // 360 closed buckets ≈ 1h — the prune cadence.
+        let mut buckets_since_prune: u32 = 0;
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
                     let sample = sample_pressure_once(&inflight);
-                    collector.record_sample(sample);
+                    if let Some(point) = collector.observe(sample) {
+                        let Some(pool) = &pool else { continue };
+                        if let Err(e) =
+                            boom_stressmon::write_sample(pool, &instance_id, &point).await
+                        {
+                            tracing::warn!(error = %e, "stress sample persist failed");
+                        }
+                        buckets_since_prune += 1;
+                        if buckets_since_prune >= 360 {
+                            buckets_since_prune = 0;
+                            match boom_stressmon::prune(pool).await {
+                                Ok(n) if n > 0 => {
+                                    tracing::debug!(deleted = n, "stress samples pruned");
+                                }
+                                Ok(_) => {}
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "stress sample prune failed");
+                                }
+                            }
+                        }
+                    }
                 }
                 _ = shutdown.recv() => {
                     tracing::debug!("Stressmon sampler shutting down");
@@ -503,7 +532,7 @@ fn spawn_stressmon_sampler(
             }
         }
     });
-    tracing::info!("System pressure sampler spawned (1 Hz)");
+    tracing::info!("System pressure sampler spawned (1 Hz → 10s points)");
 }
 
 /// Take one pressure sample. CPU is process-level: sum of utime+stime

@@ -377,6 +377,10 @@ impl AppState {
             // dashboard migrations: the revision watcher and heartbeat
             // depend on them existing.
             boom_state::migrations::run(pool).await?;
+            // System-pressure point store (boom-stressmon owns
+            // boom_stress_sample). Fatal too: the sampler would otherwise
+            // warn on every 10s persist for the process's whole lifetime.
+            boom_stressmon::migrations::run(pool).await?;
 
             // Register the stable instance id BEFORE any heartbeat or
             // traffic: a duplicate id (copy-paste YAML, loopback + same
@@ -555,7 +559,8 @@ impl AppState {
             .metrics()
             .num_workers()
             .max(1);
-        let stressmon = boom_stressmon::StressmonCollector::new(num_workers, started_at);
+        let stressmon =
+            boom_stressmon::StressmonCollector::new(num_workers, started_at, db_pool.clone());
 
         let response_store =
             Arc::new(boom_responses::ResponseStore::new(db_pool.clone()));

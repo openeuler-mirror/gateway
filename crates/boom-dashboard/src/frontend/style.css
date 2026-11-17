@@ -3081,6 +3081,47 @@ input[list] {
   /* Fixed-width digits — the 1.5s poll refresh never makes the value jump. */
   font-variant-numeric: tabular-nums;
 }
+
+/* Multi-instance legend shared by all five pressure charts. Hidden until
+   a peer is live; chips mirror line styles (self solid, peers dashed). */
+.stress-legend {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 14px;
+  padding: 8px 14px;
+  margin-top: 8px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 12px;
+  color: var(--text2);
+}
+.stress-legend__note {
+  color: var(--text3);
+  margin-right: 2px;
+}
+.stress-legend__chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+.stress-legend__swatch {
+  display: inline-block;
+  width: 18px;
+  height: 0;
+  border-top: 2px dashed #888;
+}
+.stress-legend__swatch--self {
+  border-top-style: solid;
+  border-top-color: var(--primary);
+}
+/* Peer with no fresh points (sampler writes every 10s) — instance down,
+   line kept for its remaining 24h history. */
+.stress-legend__chip--stale {
+  opacity: .45;
+}
 .stress-info-bar {
   position: relative;
   display: flex;

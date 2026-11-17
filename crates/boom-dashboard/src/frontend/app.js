@@ -2176,14 +2176,20 @@
   let inflightTimer = null;
 
   // ── System Pressure ───────────────────────────────────
-  // 1.5s poll + canvas redraw. Stops when leaving admin-stress section.
-  // Window is fixed at 60 min (the ring buffer's full capacity) so each
-  // 1Hz sample lands in its own second on the X axis.
+  // 5s poll + canvas redraw. Stops when leaving admin-stress section.
+  // Data is per-instance 10s MAX points with 24h retention (DB-backed;
+  // every dashboard reads the same rows). The client caches the full
+  // window and polls incrementally: only points newer than the cursor
+  // cross the wire after the initial load.
   let stressTimer = null;
-  let stressLastSampleTs = 0;
   // Last uptime pulled by renderStress — kept so a language switch can
-  // re-format immediately instead of waiting for the next 1.5s poll.
+  // re-format immediately instead of waiting for the next 5s poll.
   let stressUptimeSecs = 0;
+  // instance_id -> samples[{ts, cpu_pct, …}]; newest ts seen = `since`
+  // cursor for the next incremental poll.
+  let stressSeries = {};
+  let stressSince = 0;
+
   document.addEventListener("languagechange", () => {
     const el = document.getElementById("stress-uptime-value");
     if (el) el.textContent = formatUptime(stressUptimeSecs);
@@ -2193,7 +2199,7 @@
     stopStressPoll();
     // Immediate fetch so the chart appears without waiting the first tick.
     loadStress();
-    stressTimer = setInterval(loadStress, 1500);
+    stressTimer = setInterval(loadStress, 5000);
   }
 
   function stopStressPoll() {
@@ -2205,11 +2211,11 @@
 
   async function loadStress() {
     try {
-      const res = await api("/admin/stress/timeseries?range=60m");
+      const res = await api("/admin/stress/history?since=" + stressSince);
       renderStress(res);
     } catch (e) {
       // Silently skip — dashboard is read-only, errors shouldn't spam the
-      // console every 1.5s. Network errors usually mean logout.
+      // console every 5s. Network errors usually mean logout.
     }
   }
 
@@ -2363,24 +2369,53 @@
     `; }).join("");
   }
 
+  // Fold the response into the per-instance cache. Server rows are
+  // ts-ascending per instance; resent boundary points replace, newer ones
+  // append. Points past the 24h window are trimmed client-side so the
+  // cache mirrors the DB's retention and stays bounded.
+  function mergeStressSeries(instances) {
+    const cutoff = Math.floor(Date.now() / 1000) - 24 * 3600;
+    for (const inst of instances || []) {
+      let arr = stressSeries[inst.instance_id] || (stressSeries[inst.instance_id] = []);
+      for (const s of inst.samples || []) {
+        if (s.ts > stressSince) stressSince = s.ts;
+        const last = arr[arr.length - 1];
+        if (!last || s.ts > last.ts) arr.push(s);
+        else if (s.ts === last.ts) arr[arr.length - 1] = s;
+      }
+      while (arr.length && arr[0].ts <= cutoff) arr.shift();
+      if (!arr.length) delete stressSeries[inst.instance_id];
+    }
+  }
+
   function renderStress(snap) {
-    const samples = snap.samples || [];
-    const numWorkers = snap.num_workers || 1;
-    const latest = samples.length > 0 ? samples[samples.length - 1] : null;
-    if (latest) stressLastSampleTs = latest.ts;
+    mergeStressSeries(snap.instances);
+
+    const selfId = snap.self_instance_id || "";
+    const samples = stressSeries[selfId] || [];
 
     stressUptimeSecs = snap.uptime_secs || 0;
     const uptimeEl = document.getElementById("stress-uptime-value");
     if (uptimeEl) uptimeEl.textContent = formatUptime(stressUptimeSecs);
 
+    // Every instance (self included) reads from the same DB rows, so all
+    // dashboards show the same picture. Self renders as the solid primary
+    // main line; peers are dashed overlays in their badge color (same
+    // peerColor as the stats page, an instance is one color everywhere).
+    const overlayFor = (key) =>
+      Object.keys(stressSeries)
+        .filter((id) => id !== selfId)
+        .map((id) => ({
+          color: peerColor(id),
+          points: stressSeries[id].map((s) => ({ ts: s.ts, v: s[key] })),
+        }))
+        .filter((o) => o.points.length > 0);
+    renderStressLegend(selfId);
+
     // CPU = process-level (utime+stime), not normalized. May go far past
     // num_workers × 100 because tokio's blocking pool runs threads outside
     // the worker pool (prompt-log gzip, DB work, file I/O). Y axis auto-
-    // scales; the info-bar "CPU > 80% count" still tracks how often the
-    // worker pool itself hit 80% saturation (num_workers × 80 in absolute
-    // terms), but no line is drawn — process CPU spends most of its time
-    // outside that range under load, so the band just visually polluted
-    // the chart without communicating anything actionable.
+    // scales.
     drawMetricCanvas({
       canvasId: "stress-cpu-canvas",
       valueId: "stress-cpu-value",
@@ -2389,9 +2424,10 @@
       yMax: "auto",
       yMinFloor: 100,
       color: cssVar("--primary") || "#0e7490",
-      emptyHint: "Collecting… (first sample takes 1s)",
+      emptyHint: "Collecting… (first point closes ~10s)",
       formatValue: (v) => v.toFixed(1) + "%",
       formatY: (v) => v.toFixed(0) + "%",
+      overlays: overlayFor("cpu_pct"),
     });
 
     // RSS: bytes → MiB / GiB.
@@ -2406,6 +2442,7 @@
       emptyHint: "—",
       formatValue: formatBytes,
       formatY: (v) => formatBytes(v, true),
+      overlays: overlayFor("rss_bytes"),
     });
 
     // Worker queue depth.
@@ -2419,6 +2456,7 @@
       emptyHint: "—",
       formatValue: (v) => String(v),
       formatY: (v) => String(Math.round(v)),
+      overlays: overlayFor("worker_queue_depth"),
     });
 
     // Blocking pool queue.
@@ -2432,6 +2470,7 @@
       emptyHint: "—",
       formatValue: (v) => String(v),
       formatY: (v) => String(Math.round(v)),
+      overlays: overlayFor("blocking_tasks_queued"),
     });
 
     // Inflight requests — soft fill underneath the line.
@@ -2446,7 +2485,38 @@
       emptyHint: "—",
       formatValue: (v) => String(v),
       formatY: (v) => String(Math.round(v)),
+      overlays: overlayFor("inflight"),
     });
+  }
+
+  // One shared legend for all five charts — they always show the same
+  // instance set. Hidden when self is alone. A peer whose newest point is
+  // >30s old (sampler writes every 10s) is dimmed: instance down, line
+  // kept for its remaining history.
+  function renderStressLegend(selfId) {
+    const el = document.getElementById("stress-legend");
+    if (!el) return;
+    const ids = Object.keys(stressSeries);
+    if (ids.length < 2) {
+      el.hidden = true;
+      el.innerHTML = "";
+      return;
+    }
+    el.hidden = false;
+    const now = Math.floor(Date.now() / 1000);
+    const chip = (id, isSelf) => {
+      const newest = stressSeries[id][stressSeries[id].length - 1].ts;
+      const stale = !isSelf && now - newest > 30;
+      const swatchStyle = isSelf ? "" : ` style="border-color:${peerColor(id)}"`;
+      const swatchClass = isSelf ? " stress-legend__swatch--self" : "";
+      const chipClass = stale ? " stress-legend__chip--stale" : "";
+      const label = isSelf ? t("stress.legend.self") : id;
+      return `<span class="stress-legend__chip${chipClass}" title="${esc(id)}"><span class="stress-legend__swatch${swatchClass}"${swatchStyle}></span>${esc(label)}</span>`;
+    };
+    const peers = ids.filter((id) => id !== selfId).sort();
+    el.innerHTML =
+      `<span class="stress-legend__note">${esc(t("stress.legend.note"))}</span>` +
+      [chip(selfId, true)].concat(peers.map((id) => chip(id, false))).join("");
   }
 
   // Process uptime → "0天 1小时 30分钟 15秒" (zh) / "0d 1h 30m 15s" (en).
@@ -2556,6 +2626,10 @@
     if (!canvas) return;
     const valueEl = document.getElementById(opts.valueId);
     const samples = opts.samples;
+    // Overlay series (peer-instance lines): each is {color, points:[{ts,v}]}.
+    // Drawn dashed so a peer is distinguishable from the solid self line
+    // even when its palette color lands near the primary color.
+    const overlays = opts.overlays || [];
 
     // Match canvas backing resolution to the CSS pixel box × devicePixelRatio.
     // Without this, the 1200×220 backing gets stretched by the browser when
@@ -2573,7 +2647,7 @@
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
     if (valueEl) valueEl.textContent = opts.emptyHint || "—";
-    if (samples.length === 0) {
+    if (samples.length === 0 && overlays.length === 0) {
       ctx.clearRect(0, 0, cssW, cssH);
       ctx.fillStyle = cssVar("--text3") || "#888";
       ctx.font = "12px sans-serif";
@@ -2583,10 +2657,13 @@
     }
 
     const latest = samples[samples.length - 1];
-    if (valueEl) valueEl.textContent = opts.formatValue(opts.accessor(latest));
+    if (latest && valueEl) {
+      valueEl.textContent = opts.formatValue(opts.accessor(latest));
+    }
 
     const values = samples.map(opts.accessor);
-    const peak = Math.max(0.0001, ...values);
+    const overlayPeaks = overlays.flatMap((o) => o.points.map((p) => p.v));
+    const peak = Math.max(0.0001, ...values, ...overlayPeaks);
 
     let yMax, tickStep;
     if (typeof opts.yMax === "number") {
@@ -2619,8 +2696,14 @@
     // exist — points stay equidistant on screen even though wall-clock
     // spacing is uneven, which makes recent data look artificially sparse
     // next to dense early-history data. Using ts preserves the true rhythm.
-    const tMin = samples[0].ts;
-    const tMax = samples[samples.length - 1].ts;
+    // Range spans self + overlays so a peer with longer history than the
+    // local buffer still fits the plot instead of drawing off-canvas.
+    const overlayTss = overlays.flatMap((o) => o.points.map((p) => p.ts));
+    const tMin = Math.min(samples[0] ? samples[0].ts : Infinity, ...overlayTss);
+    const tMax = Math.max(
+      samples.length ? samples[samples.length - 1].ts : -Infinity,
+      ...overlayTss,
+    );
     const tRange = Math.max(1, tMax - tMin);
     const xForTs = (t) => padLeft + (plotW * (t - tMin)) / tRange;
     const xFor = (i) => xForTs(samples[i].ts);
@@ -2719,7 +2802,27 @@
     });
     ctx.strokeStyle = opts.color;
     ctx.lineWidth = 1.6;
+    ctx.setLineDash([]);
     ctx.stroke();
+
+    // Peer overlays: coarser resolution (1/min MAX vs 1Hz), dashed so the
+    // self line stays the visual anchor. yFor clamps to [0, yMax] so a
+    // peer spike above the local peak can't draw outside the plot.
+    overlays.forEach((o) => {
+      if (!o.points || o.points.length === 0) return;
+      ctx.beginPath();
+      o.points.forEach((p, i) => {
+        const x = xForTs(p.ts);
+        const y = yFor(p.v);
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
+      ctx.strokeStyle = o.color;
+      ctx.lineWidth = 1.4;
+      ctx.setLineDash([5, 3]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    });
   }
 
   // 24h per-deployment aggregates — populated on page load and Refresh button

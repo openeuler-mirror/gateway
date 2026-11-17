@@ -24,7 +24,7 @@ pub use instance_telemetry::{InstanceTelemetry, InflightStat, RateSeries, RateTe
 pub use otlp_config::OtlpConfig;
 pub use types::is_hard_blocked_header;
 pub use provider::{Authenticator, DeploymentQueueInfo, KeyAliasLookup, Provider};
-pub use stressmon::{StressmonApi, StressmonSample, StressmonSnapshot};
+pub use stressmon::{StressHistorySample, StressmonApi, StressmonSample, StressmonSnapshot};
 pub use trace::{
     ExporterStatusSnapshot, ProbeResult, RequestSpan, SpanStatus, TraceApi, TraceSnapshot,
 };
