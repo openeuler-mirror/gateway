@@ -181,6 +181,7 @@
       document.getElementById("sidebar-version-admin").textContent = v;
       if (data.instance_id) {
         document.getElementById("sidebar-instance-admin").textContent = data.instance_id;
+        window.__BOOM_INSTANCE_ID = data.instance_id;
       }
     } catch {
       // Network/probe failure — leave the placeholder; not worth surfacing.
@@ -3187,7 +3188,8 @@
           const v = Number(stats[eventKey] || 0);
           const avg = stats.avg_retry_ms;
           const errorCodes = stats.error_codes || {};
-          return { m, v, avg, errorCodes };
+          const deploys = stats.deploys || {};
+          return { m, v, avg, errorCodes, deploys };
         })
         .filter(e => e.v > 0)
         .sort((a, b) => b.v - a.v);
@@ -3213,20 +3215,50 @@
           // Backend stores as "{event}:{code}" in one map; frontend
           // filters by "{eventKey}:" prefix and strips it for display.
           {
-            // Backend error_codes keys are the SNAPSHOT FIELD NAMES
-            // ("identify_miss:InputTokenExceeded", "retry_success:…" …) —
-            // exactly this tree's eventKey, so the prefix match is by
-            // construction (no alias layer; the composite recording methods
-            // on RollbackStats are the only producers).
+            // Backend keys are the SNAPSHOT FIELD NAMES — exactly this
+            // tree's eventKey, so the prefix match is by construction.
+            // error_codes: "{event}:{code}"; deploys (JOINT): "{event}:
+            // {code}|{from}→{to}" — edges nest UNDER their error code
+            // (truthful attribution in multi-code nodes). Codeless edges
+            // (fallback_selected decision) sit at the code level.
             const prefix = eventKey + ':';
+            const parseDeploys = () => Object.entries(e.deploys || {})
+              .filter(([k, v]) => k.startsWith(prefix) && v > 0)
+              .map(([k, v]) => {
+                const rest = k.slice(prefix.length);
+                const bar = rest.indexOf('|');
+                return bar < 0 ? [rest, '', v] : [rest.slice(0, bar), rest.slice(bar + 1), v];
+              });
+            const edgeRows = parseDeploys();
             const codes = Object.entries(e.errorCodes)
               .filter(([k, v]) => k.startsWith(prefix) && v > 0)
               .map(([k, v]) => [k.slice(prefix.length), v])
               .sort((a, b) => b[1] - a[1]);
+            const renderedCodes = new Set(codes.map(([c]) => c));
             for (const [code, cv] of codes) {
               html += '<div class="rb-tree-child rb-tree-sub">' +
                 '<span class="rb-tree-model">' + esc(code) + '</span>' +
                 '<span class="rb-tree-val">' + cv + '</span>' +
+              '</div>';
+              // 归属于此错误码的部署边:嵌套一层(mono)
+              const nested = edgeRows
+                .filter(([c]) => c === code)
+                .sort((a, b) => b[2] - a[2]);
+              for (const [, edge, dv] of nested) {
+                html += '<div class="rb-tree-child rb-tree-sub rb-tree-edge">' +
+                  '<span class="rb-tree-model mono">' + esc(edge) + '</span>' +
+                  '<span class="rb-tree-val">' + dv + '</span>' +
+                '</div>';
+              }
+            }
+            // 无码边(selected 决策)与孤儿边(码被封顶丢弃):码层级展示
+            const topEdges = edgeRows
+              .filter(([c]) => !renderedCodes.has(c))
+              .sort((a, b) => b[2] - a[2]);
+            for (const [, edge, dv] of topEdges) {
+              html += '<div class="rb-tree-child rb-tree-sub">' +
+                '<span class="rb-tree-model mono rb-tree-deploy">' + esc(edge) + '</span>' +
+                '<span class="rb-tree-val">' + dv + '</span>' +
               '</div>';
             }
           }
@@ -3275,8 +3307,108 @@
         direct: direct.toLocaleString(), success: success.toLocaleString(),
       }) + '</p>';
     }
+
+    // ── 池状态(可折叠树,rb-tree 同款交互):池头 = 模型+状态+
+    // 总数/已配置/未配置(为后续 rollback 策略预留同构计数位——
+    // 届时每策略一组计数);展开 = 每个部署的原始声明配置。
+    // 数值用紧凑格式(200K/1M);状态判定仅计启用行,原始行展示全部。
+    const pools = data.pools || [];
+    if (pools.length) {
+      const stateKey = { active: "debug.rollback.state_active", rescue: "debug.rollback.state_rescue", single: "debug.rollback.state_single", unconfigured: "debug.rollback.state_unconfigured" };
+      const fmtCtx = (v) => v == null ? null
+        : (v >= 1000000 && v % 1000000 === 0) ? (v / 1000000) + "M"
+        : v >= 1000 ? Math.round(v / 1000) + "K"
+        : String(v);
+      html += '<div class="rb-tree-section">' + t("debug.rollback.pools_title") + '</div>';
+      html += '<div class="rb-tree">';
+      for (const p of pools) {
+        const deps = p.deployments || [];
+        const configured = deps.filter((d) => d.max_context_tokens != null).length;
+        const label = stateKey[p.state] ? t(stateKey[p.state]) : p.state;
+        const cls = (p.state === "active" || p.state === "rescue") ? "rb-state-on" : "rb-state-dim";
+        html += '<div class="rb-tree-node">' +
+          '<div class="rb-tree-head" onclick="this.parentElement.classList.toggle(\'rb-open\')">' +
+            '<span class="rb-tree-arrow">' + (deps.length ? '▸' : '·') + '</span>' +
+            '<span class="rb-tree-label">' + esc(p.model) +
+              ' <span class="rb-state ' + cls + '">' + esc(label) + '</span></span>' +
+            '<span class="rb-tree-count">' + esc(t("debug.rollback.pool_counts", {
+              total: deps.length, configured, unconfigured: deps.length - configured,
+            })) + '</span>' +
+          '</div><div class="rb-tree-children">';
+        for (const d of deps) {
+          const val = fmtCtx(d.max_context_tokens);
+          // 字段名:值 —— 维测形态,后续策略新增字段按同构行追加
+          html += '<div class="rb-tree-child">' +
+            '<span class="rb-tree-model mono">' + esc(d.deployment_id || "-") +
+              (d.enabled === false ? ' <span class="badge badge-blocked">' + esc(t("debug.rollback.disabled")) + '</span>' : '') + '</span>' +
+            '<span class="rb-tree-val">' + (val != null
+              ? '<span class="rb-field-name">max_context_tokens</span> ' + esc(val)
+              : '<span class="muted">—</span>') + '</span>' +
+          '</div>';
+        }
+        html += '</div></div>';
+      }
+      html += '</div>';
+    }
+
+    // ── 维测①:窗口化收敛率(1h 槽,墙钟对齐)── 生命周期累计值会被
+    // 冷 trie 期的重试长期压低;窗口化回答"现在是否在改善"。
+    const wins = (data.convergence_windows || []).slice(-24);
+    if (wins.length) {
+      html += '<div class="rb-tree-section">' + t("debug.rollback.conv_windows") + '</div>';
+      html += '<table class="data-table rb-mini-table"><thead><tr>' +
+        '<th>' + t("debug.rollback.conv_hour") + '</th><th class="num">' + t("debug.rollback.conv_direct") + '</th>' +
+        '<th class="num">' + t("debug.rollback.conv_retry") + '</th><th class="num">' + t("debug.rollback.convergence") + '</th></tr></thead><tbody>';
+      for (const w of wins) {
+        const total = w.direct + w.retry;
+        const pct = total > 0 ? Math.round(w.direct * 100 / total) : null;
+        const hourLabel = new Date(w.hour * 3600 * 1000).toISOString().slice(11, 13) + ":00";
+        html += '<tr><td class="mono">' + hourLabel + '</td><td class="num">' + w.direct + '</td><td class="num">' + w.retry + '</td>' +
+          '<td class="num">' + (pct === null ? "—" : pct + '%') + '</td></tr>';
+      }
+      html += '</tbody></table>';
+    }
+
+    // ── 维测④:识别自检——新报错形态离线验证,零副作用。
+    html += '<div class="rb-tree-section">' + t("debug.rollback.selftest_title") + '</div>';
+    html += '<div class="rb-selftest"><p class="kcs-breakdown">' + t("debug.rollback.selftest_hint") + '</p>' +
+      '<textarea id="rb-st-body" rows="3" style="width:100%;font-family:var(--mono);font-size:12px" placeholder="' + t("debug.rollback.selftest_placeholder") + '"></textarea>' +
+      '<div style="display:flex;gap:8px;margin-top:6px;align-items:center">' +
+      '<input id="rb-st-status" type="number" value="400" min="100" max="599" style="width:80px" class="search-input">' +
+      '<button class="btn-small btn-primary" onclick="window._rbSelfTest()">' + t("debug.rollback.selftest_run") + '</button>' +
+      '<span id="rb-st-result" style="font-size:12px"></span></div></div>';
+
     wrap.innerHTML = html;
+    // 多实例观测(本次复现的错位教训):回退统计是每实例进程内存态,
+    // 面板必须标明"这是哪个实例的计数"。
+    const sub = document.getElementById("rollback-instance-badge");
+    if (sub) sub.textContent = window.__BOOM_INSTANCE_ID ? " @ " + window.__BOOM_INSTANCE_ID : "";
   }
+
+  // 维测④的后端调用:POST /admin/stats/rollback/self-test(零副作用)。
+  window._rbSelfTest = async () => {
+    const body = document.getElementById("rb-st-body");
+    const statusEl = document.getElementById("rb-st-status");
+    const out = document.getElementById("rb-st-result");
+    if (!body || !out) return;
+    try {
+      const d = await api("/admin/stats/rollback/self-test", {
+        method: "POST", skipConfirm: true,
+        body: JSON.stringify({ status: Number(statusEl.value) || 400, body: body.value }),
+      });
+      if (d.matched) {
+        out.innerHTML = '<span style="color:var(--primary)">✓ ' + esc(t("debug.rollback.selftest_matched", {
+          req: d.requested_tokens == null ? "?" : d.requested_tokens,
+          max: d.max_tokens == null ? "?" : d.max_tokens,
+        })) + '</span>';
+      } else {
+        out.innerHTML = '<span style="color:var(--danger)">✗ ' + esc(t("debug.rollback.selftest_unmatched")) + '</span>';
+      }
+      out.title = t("debug.rollback.selftest_code_title", { code: d.code || "-" });
+    } catch (err) {
+      out.textContent = err.message;
+    }
+  };
 
   // ── KVC Hit Calibration (predicted trie hit vs actual cached_tokens) ──
   // Loads every block on the KVC AWARE pane. Called on pane entry and
@@ -5690,24 +5822,17 @@
   //   fully configured + multiple tiers → "active"; single tier → "no
   //   fallback target". Pure display layer — data stays one row per
   //   deployment, row rendering unchanged.
-  function rollbackPoolBadge(rows) {
-    // Pool participates only when EVERY deployment row opted in (the pool
-    // toggle writes the whole group; rows could still differ if written
-    // via YAML/seed). Off pools show no badge — the toggle says it.
-    if (!rows.every((m) => m.rollback_enabled)) return "";
-    const configured = rows.filter((m) => m.max_context_tokens != null);
-    if (configured.length !== rows.length) {
-      const missing = rows.length - configured.length;
-      return '<span class="badge badge-blocked" title="' + esc(t("tip.badge.rb_mixed", { n: missing })) + '">' + esc(t("models.rollback.mixed", { n: missing })) + '</span>';
-    }
-    const distinct = new Set(configured.map((m) => m.max_context_tokens));
-    if (distinct.size > 1) return '<span class="badge badge-active">' + esc(t("models.rollback.active")) + '</span>';
-    return '<span class="badge badge-plan" title="' + esc(t("tip.badge.rb_no_target")) + '">' + esc(t("models.rollback.no_target")) + '</span>';
-  }
+  // NOTE: the per-pool rollback state line LIVES IN THE DEBUG → ROLLBACK
+  // pane now ("池状态" section, computed server-side by the stats
+  // endpoint from the deployment rows) — the Models page shows only the
+  // model identity. See renderRollbackStats.
 
   function renderModelsTable(models, aliasesMap) {
+    // In-flight-table style (Stats page): block = model (rowspan identity
+    // cell), row = instance, zebra alternates by GROUP. The model cell
+    // carries the rollback state line — static, no toggle: the
+    // max_context_tokens declaration is the sole participation signal.
     const wrap = document.getElementById("models-table-wrap");
-    syncRollbackMaster(models);
     if (models.length === 0) { wrap.innerHTML = "<p>" + t("models.empty") + "</p>"; return; }
     aliasesMap = aliasesMap || {};
     const order = [];
@@ -5717,34 +5842,21 @@
       byName[m.model_name].push(m);
     });
 
-    wrap.innerHTML = `<table class="models-table">
-      <thead><tr><th>${t("models.col.deploy_id")}</th><th>${t("models.col.aliases")}</th><th>${t("models.col.cost")}</th><th>${t("models.col.base_url")}</th><th class="num">${t("models.col.ratio")}</th><th class="num">${t("models.col.rpm")}</th><th class="num">${t("models.col.timeout")}</th><th>${t("models.col.enabled")}</th><th>${t("models.col.source")}</th><th>${t("models.col.actions")}</th></tr></thead>
+    wrap.innerHTML = `<table class="data-table models-table">
+      <thead><tr><th>${t("models.col.model")}</th><th>${t("models.col.deploy_id")}</th><th>${t("models.col.aliases")}</th><th>${t("models.col.cost")}</th><th>${t("models.col.base_url")}</th><th class="num">${t("models.col.ratio")}</th><th class="num">${t("models.col.rpm")}</th><th class="num">${t("models.col.timeout")}</th><th>${t("models.col.enabled")}</th><th>${t("models.col.source")}</th><th>${t("models.col.actions")}</th></tr></thead>
       <tbody>
-      ${order.map((name) => {
+      ${order.map((name, groupIdx) => {
         const rows = byName[name];
-        const poolOn = rows.every((m) => m.rollback_enabled);
-
-        // Pool header: switch + name + count + badge (full-width row)
-        const badge = rollbackPoolBadge(rows);
+        const zebra = groupIdx % 2 === 1 ? " grp-b" : " grp-a";
         const vendor = vendorOf(name);
-        const headerRow = `<tr class="pool-header">
-          <td colspan="10">
-            <div class="pool-header-inner">
-              <img class="vendor-logo pool-vendor-logo" src="/dashboard/assets/vendor/${vendor}" alt="${vendor}">
-              <div class="pool-id-block">
-                <span class="pool-name">${esc(name)}</span>
-                <span class="pool-count">${rows.length} ${esc(t("models.pool.instances"))}</span>
-              </div>
-              <div class="pool-actions">
-              ${badge}
-              <label class="rb-switch" title="${esc(t("tip.pool.rollback"))}">
-                <input type="checkbox" ${poolOn ? "checked" : ""} onchange="window._togglePoolRollback('${esc(name)}', this.checked)">
-                <span class="rb-slider"></span>
-              </label>
-              </div>
-            </div>
-          </td>
-        </tr>`;
+        const warnCount = rows.filter((m) => !m.enabled && m.auto_disabled).length;
+        const modelCell = `<td rowspan="${rows.length + warnCount}" class="model-block${zebra}">
+          <img class="vendor-logo model-vendor-logo" src="/dashboard/assets/vendor/${vendor}" alt="${vendor}">
+          <div class="model-id-block">
+            <span class="model-name">${esc(name)}</span>
+            <span class="model-count">${rows.length} ${esc(t("models.pool.instances"))}</span>
+          </div>
+        </td>`;
 
         const depRows = rows.map((m, rowIdx) => {
           const isAutoDisabled = !m.enabled && m.auto_disabled;
@@ -5755,7 +5867,7 @@
               ? '<span class="badge badge-blocked">' + t("common.no") + '</span><br><span style="color:var(--danger);font-size:0.8em">' + t("status.auto_disabled") + '</span>'
               : '<span class="badge badge-blocked">' + t("common.no") + '</span>';
           const warningRow = isAutoDisabled
-            ? `<tr class="model-row-warning"><td colspan="10">${t("models.fault_disabled")}</td></tr>`
+            ? `<tr class="model-row-warning${zebra}"><td colspan="11">${t("models.fault_disabled")}</td></tr>`
             : '';
           const c = m.cost_per_million || {};
           const fmtCost = (v) => (v == null || v === "0" || v === "") ? "-" : "¥" + v;
@@ -5775,8 +5887,8 @@
               + esc(t("models.aliases.view_detail", { n: aliases.length })) + '</button>';
           }
           const visBadge = visibilityBadgeFor(m);
-        const zebra = rowIdx % 2 === 1 ? " dep-alt" : "";
-        return `<tr class="pool-dep${zebra} ${rowClass}">
+          return `<tr class="pool-dep${zebra} ${rowClass}">
+          ${rowIdx === 0 ? modelCell : ""}
           <td><div class="dep-id-block"><span class="dep-id">${esc(m.deployment_id || "-")}</span><span class="dep-vis">${visBadge}</span></div></td>
           <td>${aliasCell}</td>
           <td>${costCell}</td>
@@ -5793,27 +5905,12 @@
         </tr>${warningRow}`;
         }).join("");
 
-        return headerRow + depRows;
+        return depRows;
       }).join("")}
       </tbody>
     </table>`;
   }
 
-  // Toolbar master toggle (#rb-master) mirrors the aggregate pool state:
-  // checked = every deployment opted in, indeterminate = mixed, unchecked =
-  // all off. Clicking it flips the whole fleet (confirm → _setAllRollback).
-  function syncRollbackMaster(models) {
-    const el = document.getElementById("rb-master");
-    if (!el) return;
-    const label = el.closest(".rb-master-toggle");
-    if (label) label.title = t("tip.master.rollback"); // refresh per render (language-safe)
-    el.disabled = !models.length;
-    if (!models.length) { el.checked = false; el.indeterminate = false; return; }
-    const all = models.every((m) => m.rollback_enabled);
-    const any = models.some((m) => m.rollback_enabled);
-    el.checked = all;
-    el.indeterminate = any && !all;
-  }
 
   async function showNewModelModal(prefill) {
     // Cost templates drive the pricing dropdown — load them lazily so the
@@ -6048,9 +6145,6 @@
           max_inflight_queue_len: document.getElementById("m-model-maxinflight").value ? Number(document.getElementById("m-model-maxinflight").value) : null,
           max_context_len: document.getElementById("m-model-maxctx").value ? Number(document.getElementById("m-model-maxctx").value) : null,
           max_context_tokens: document.getElementById("m-model-max-context-tokens").value ? Math.round(Number(document.getElementById("m-model-max-context-tokens").value) * 1000) : null,
-          // Not editable in the modal (pool-toggle surface) — echo the
-          // current value so update_db doesn't reset participation.
-          rollback_enabled: !!(p && p.rollback_enabled),
           enabled: document.getElementById("m-model-enabled").checked,
           serve_not_match: document.getElementById("m-model-serve-not-match").checked,
           client_type_header: document.getElementById("m-model-client-type").checked,
@@ -6107,49 +6201,6 @@
     loadModels();
   };
 
-  // ── Admin: Rollback participation (pool checkbox + master toggle) ──
-  // Both hit POST /admin/models/rollback; boom-main writes rollback_enabled
-  // on the affected deployment rows and reloads routing, then we re-render.
-  // (The API also accepts deployment_id for row-level writes — the UI uses
-  // pool granularity; the pool checkbox is the all-rows aggregate.)
-  window._togglePoolRollback = async (name, enabled) => {
-    try {
-      const data = await api("/admin/models/rollback", {
-        method: "POST", skipConfirm: true,
-        body: JSON.stringify({ model_name: name, enabled }),
-      });
-      if (data && data.error) { alert(t("common.error_prefix", { message: data.error })); return; }
-      loadModels();
-    } catch (err) {
-      alert(t("common.error_prefix", { message: err.message }));
-      loadModels(); // revert the checkbox to the server-side truth
-    }
-  };
-
-  // Master toggle change: browser flips indeterminate→checked (enable all)
-  // or checked→unchecked (disable all). Cancel re-renders from server truth.
-  window._masterRollback = async (el) => {
-    const target = el.checked;
-    if (!confirm(t(target ? "models.rollback.all_confirm" : "models.rollback.none_confirm"))) {
-      loadModels();
-      return;
-    }
-    await window._setAllRollback(target);
-  };
-
-  window._setAllRollback = async (enabled) => {
-    try {
-      const data = await api("/admin/models/rollback", {
-        method: "POST", skipConfirm: true,
-        body: JSON.stringify({ enabled }),
-      });
-      if (data && data.error) { alert(t("common.error_prefix", { message: data.error })); return; }
-      showToast(t("models.rollback.set_all_toast", { n: (data && data.models) || 0, state: t(enabled ? "models.rollback.on" : "models.rollback.off_word") }));
-      loadModels();
-    } catch (err) {
-      alert(t("common.error_prefix", { message: err.message }));
-    }
-  };
 
   // ── Admin: Aliases ────────────────────────────────────
   // Alias management lives inside the model edit modal (see setupAliasCard);
@@ -9456,7 +9507,7 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
       '<tr>' +
         '<th>Time</th><th>IP</th><th>Team</th><th>Key</th><th>Model</th><th>Path</th>' +
         '<th>Status</th><th>Stream</th><th>IN/OUT</th><th>Prefix Hit</th>' +
-        '<th>Policy</th><th>Req Bytes</th><th>Duration</th><th>TTFT</th><th>Error</th><th>Detail</th>' +
+        '<th>Policy</th><th>Instance</th><th>Req Bytes</th><th>Duration</th><th>TTFT</th><th>Error</th><th>Detail</th>' +
       '</tr>' +
       '<tr class="filter-row">' +
         '<td></td>' +
@@ -9469,6 +9520,7 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
         '<td><input class="col-filter" data-col="stream" placeholder="filter"></td>' +
         '<td></td><td></td>' +
         '<td><input class="col-filter" data-col="policy" placeholder="filter"></td>' +
+        '<td><input class="col-filter" data-col="instance_id" placeholder="filter"></td>' +
         '<td></td><td></td><td></td>' +
         '<td><input class="col-filter" data-col="error" placeholder="filter"></td>' +
         '<td></td>' +
@@ -9524,6 +9576,7 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
       '<td class="mono">' + inOut + '</td>' +
       '<td class="mono kvc-prefix">' + prefixCell + '</td>' +
       '<td class="mono">' + esc(l.policy || "-") + '</td>' +
+      '<td class="mono">' + esc(l.instance_id || "-") + '</td>' +
       '<td class="mono">' + (l.request_tokens != null ? formatNumber(l.request_tokens) : "-") + '</td>' +
       '<td>' + (l.duration_ms != null ? l.duration_ms + "ms" : "-") + '</td>' +
       '<td>' + (l.ttft_ms != null ? l.ttft_ms + "ms" : "-") + '</td>' +
@@ -9580,10 +9633,10 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
       var rows = data.logs || [];
       tbody.innerHTML = rows.length
         ? rows.map(renderKvcDfxRow).join("")
-        : '<tr><td colspan="16" class="muted">No logs.</td></tr>';
+        : '<tr><td colspan="17" class="muted">No logs.</td></tr>';
       renderKvcPagination(data);
     } catch (e) {
-      tbody.innerHTML = '<tr><td colspan="16" class="muted">Failed to load: ' + esc(String(e)) + '</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="17" class="muted">Failed to load: ' + esc(String(e)) + '</td></tr>';
     }
   }
 

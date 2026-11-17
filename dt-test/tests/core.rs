@@ -814,6 +814,7 @@ fn provider_billing_accumulates_usage_nested() {
         prompt_tokens_details: Some(boom_core::types::PromptTokensDetails {
             cached_tokens: Some(40),
         }),
+    completion_tokens_details: None,
     });
     b.add_actual_usage(&Usage {
         prompt_tokens: 10,
@@ -824,6 +825,7 @@ fn provider_billing_accumulates_usage_nested() {
         prompt_tokens_details: Some(boom_core::types::PromptTokensDetails {
             cached_tokens: Some(60),
         }),
+        completion_tokens_details: None,
     });
 
     let u = b.actual_usage().expect("set");
@@ -846,6 +848,7 @@ fn provider_billing_usage_none_details() {
         cache_creation_input_tokens: None,
         cache_read_input_tokens: None,
         prompt_tokens_details: None,
+        completion_tokens_details: None,
     });
     let u = b.actual_usage().expect("set");
     assert_eq!(u.prompt_tokens, 0);

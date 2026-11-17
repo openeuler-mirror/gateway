@@ -451,6 +451,7 @@ fn resp_with(content: MessageContent, reasoning: Option<String>, tool_calls: Opt
             cache_creation_input_tokens: Some(3),
             cache_read_input_tokens: Some(7),
             prompt_tokens_details: None,
+        completion_tokens_details: None,
         }),
         system_fingerprint: None,
         raw_response: None,

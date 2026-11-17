@@ -109,7 +109,10 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
     // run_ddl_on_conn + `?` discipline as visibility: DeploymentRow SELECTs
     // reference the column, so a failed add must fail startup loudly.
     run_ddl_on_conn(&mut conn, boom_routing::migrations::migration_add_max_context_tokens()).await?;
-    run_ddl_on_conn(&mut conn, boom_routing::migrations::migration_add_rollback_enabled()).await?;
+    // Intent-carrying drop of rollback_enabled (pool toggle removal):
+    // clears declarations in pools that had rollback disabled, then drops
+    // the column. No-op on fresh DBs.
+    boom_routing::migrations::migration_drop_rollback_enabled(&mut conn).await?;
     // Backfill deployment_id for legacy rows written before insert-path
     // auto-generation (NULL/''): gives them a stable persisted identity for
     // flow-control slots and kv affinity. Idempotent — fires at most once

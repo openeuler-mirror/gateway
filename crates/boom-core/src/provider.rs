@@ -263,13 +263,6 @@ pub trait Provider: Send + Sync + 'static {
         None
     }
 
-    /// Per-deployment rollback participation (pool semantics: the model
-    /// group participates when every candidate returns true). Default
-    /// false.
-    fn rollback_enabled(&self) -> bool {
-        false
-    }
-
     /// Whether to attach the `X-BooM-Client-Type` header to outgoing
     /// requests routed to this deployment. Driven by the per-deployment
     /// `client_type_header: bool` config flag; default false.

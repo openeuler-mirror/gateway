@@ -19,7 +19,6 @@ CREATE TABLE IF NOT EXISTS boom_model_deployment (
     temperature       DOUBLE PRECISION,
     max_tokens        INTEGER,
     max_context_tokens BIGINT,
-    rollback_enabled  BOOLEAN NOT NULL DEFAULT false,
     enabled           BOOLEAN NOT NULL DEFAULT true,
     auto_disabled     BOOLEAN NOT NULL DEFAULT false,
     source            TEXT    NOT NULL DEFAULT 'yaml',
@@ -60,14 +59,67 @@ ALTER TABLE boom_model_deployment ADD COLUMN IF NOT EXISTS max_context_tokens BI
 "#
 }
 
-/// Migration: add `rollback_enabled` — per-deployment participation in
-/// context rollback (pool semantics: a model group participates when every
-/// row is set; the Models page pool toggle / global select-all writes the
-/// whole group). NOT NULL DEFAULT false keeps legacy rows opted out.
-pub fn migration_add_rollback_enabled() -> &'static str {
-    r#"
-ALTER TABLE boom_model_deployment ADD COLUMN IF NOT EXISTS rollback_enabled BOOLEAN NOT NULL DEFAULT false;
-"#
+/// Intent-carrying removal of `rollback_enabled` (the Models-page pool
+/// toggle). Participation is now the `max_context_tokens` DECLARATION alone,
+/// so the old toggle's expressed intent must not be lost: any pool that had
+/// a disabled instance was inert as a whole under the all-or-nothing gate —
+/// clear every declaration in such pools so their behavior is UNCHANGED
+/// (still no rollback) after the column is dropped. Cleared values are
+/// logged as a recovery trail; operators opt back in by re-declaring in the
+/// dashboard. No-op on fresh DBs (the column no longer exists there).
+pub async fn migration_drop_rollback_enabled(
+    conn: &mut sqlx::PgConnection,
+) -> Result<(), sqlx::Error> {
+    let exists: Option<(i32,)> = sqlx::query_as(
+        "SELECT 1 FROM information_schema.columns \
+         WHERE table_name = 'boom_model_deployment' AND column_name = 'rollback_enabled' LIMIT 1",
+    )
+    .fetch_optional(&mut *conn)
+    .await?;
+    if exists.is_none() {
+        return Ok(());
+    }
+
+    // Recovery trail BEFORE clearing (this is the only record of the values).
+    let affected: Vec<(String, Option<String>, Option<i64>)> = sqlx::query_as(
+        "SELECT model_name, deployment_id, max_context_tokens \
+         FROM boom_model_deployment d \
+         WHERE d.max_context_tokens IS NOT NULL \
+           AND EXISTS (SELECT 1 FROM boom_model_deployment x \
+                      WHERE x.model_name = d.model_name AND x.rollback_enabled = false) \
+         ORDER BY model_name, created_at",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    if !affected.is_empty() {
+        tracing::warn!(
+            count = affected.len(),
+            "rollback migration: clearing max_context_tokens on {} declaration(s) in pools that had rollback disabled (toggle OFF was the operator's expressed intent). Recovery trail follows; re-declare in the dashboard to opt back in.",
+            affected.len()
+        );
+        for (model, deploy, tokens) in &affected {
+            tracing::warn!(
+                model = %model,
+                deployment_id = %deploy.as_deref().unwrap_or("-"),
+                max_context_tokens = tokens.unwrap_or(0),
+                "cleared declaration (rollback was disabled for this pool)"
+            );
+        }
+        sqlx::query(
+            "UPDATE boom_model_deployment d \
+             SET max_context_tokens = NULL, updated_at = NOW() \
+             WHERE d.max_context_tokens IS NOT NULL \
+               AND EXISTS (SELECT 1 FROM boom_model_deployment x \
+                           WHERE x.model_name = d.model_name AND x.rollback_enabled = false)",
+        )
+        .execute(&mut *conn)
+        .await?;
+    }
+
+    sqlx::query("ALTER TABLE boom_model_deployment DROP COLUMN IF EXISTS rollback_enabled")
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
 }
 
 /// Migration: add the unified `visibility` column ('normal' | 'public' |

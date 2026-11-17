@@ -43,7 +43,6 @@ mod tests {
     struct FakeProvider {
         dep: &'static str,
         max_ctx: Option<u64>,
-        rb: bool,
     }
 
     #[async_trait]
@@ -72,20 +71,21 @@ mod tests {
         fn max_context_tokens(&self) -> Option<u64> {
             self.max_ctx
         }
-        fn rollback_enabled(&self) -> bool {
-            self.rb
-        }
     }
 
     fn pool() -> Vec<Arc<dyn Provider>> {
-        // 2×200K + 1×500K + 2×1M, all rollback-enabled.
+        // 2×200K + 1×500K + 2×1M, all declared (declaration = participation).
         vec![
-            Arc::new(FakeProvider { dep: "d200a", max_ctx: Some(200_000), rb: true }),
-            Arc::new(FakeProvider { dep: "d200b", max_ctx: Some(200_000), rb: true }),
-            Arc::new(FakeProvider { dep: "d500", max_ctx: Some(500_000), rb: true }),
-            Arc::new(FakeProvider { dep: "d1ma", max_ctx: Some(1_000_000), rb: true }),
-            Arc::new(FakeProvider { dep: "d1mb", max_ctx: Some(1_000_000), rb: true }),
+            Arc::new(FakeProvider { dep: "d200a", max_ctx: Some(200_000) }),
+            Arc::new(FakeProvider { dep: "d200b", max_ctx: Some(200_000) }),
+            Arc::new(FakeProvider { dep: "d500", max_ctx: Some(500_000) }),
+            Arc::new(FakeProvider { dep: "d1ma", max_ctx: Some(1_000_000) }),
+            Arc::new(FakeProvider { dep: "d1mb", max_ctx: Some(1_000_000) }),
         ]
+    }
+
+    fn undeclared(dep: &'static str) -> Arc<dyn Provider> {
+        Arc::new(FakeProvider { dep, max_ctx: None })
     }
 
     fn patterns() -> Vec<String> {
@@ -180,14 +180,17 @@ mod tests {
     #[test]
     fn select_fallback_gates_on_pool_state() {
         let r = router();
-        // ① 池里有实例未配 max_context → mixed → NoRetry
+        // ① 混配池(有未声明实例):声明子集照常回退——失败在声明层 d200a
+        //    → 目标 500K,不再全灭(旧行为:PoolInert)
         let mut mixed = pool();
-        mixed.push(Arc::new(FakeProvider { dep: "dx", max_ctx: None, rb: true }));
-        assert!(select_fallback(&ctx_error(Some(250_000)), &patterns(), &route(&mixed), &r, &mixed[0]).target().is_none());
-        // ② 有实例未开 rollback → NoRetry
-        let mut off = pool();
-        off.push(Arc::new(FakeProvider { dep: "dy", max_ctx: Some(300_000), rb: false }));
-        assert!(select_fallback(&ctx_error(Some(250_000)), &patterns(), &route(&off), &r, &off[0]).target().is_none());
+        mixed.push(undeclared("dx"));
+        let target = select_fallback(&ctx_error(Some(250_000)), &patterns(), &route(&mixed), &r, &mixed[0])
+            .target()
+            .expect("declared subset still rolls back");
+        assert_eq!(max_of(&target), 500_000);
+        // ② 未声明子集为空 → PoolInert(全未声明池)
+        let all_undeclared = vec![undeclared("u1"), undeclared("u2")];
+        assert!(select_fallback(&ctx_error(Some(250_000)), &patterns(), &route(&all_undeclared), &r, &all_undeclared[0]).target().is_none());
         // ③ 非上下文错误 → NoRetry
         let cands = pool();
         let not_ctx = GatewayError::UpstreamError { status: 400, message: r#"{"error":{"code":"BadModel"}}"#.into() };
@@ -197,6 +200,53 @@ mod tests {
         assert!(select_fallback(&e401, &patterns(), &route(&cands), &r, &cands[0]).target().is_none());
         // ⑤ 空模式表 → NoRetry
         assert!(select_fallback(&ctx_error(Some(250_000)), &[], &route(&cands), &r, &cands[0]).target().is_none());
+    }
+
+    /// 救助方案:未声明实例上撞墙的请求仍被声明子集救——
+    /// 全部已声明层可选,取满足解析 size 的最小层,否则最大层。
+    #[test]
+    fn select_fallback_rescues_undeclared_origin() {
+        let r = router();
+        let mut cands = pool();
+        cands.push(undeclared("dx"));
+        let failed = cands.last().unwrap().clone();
+        // requested 250K → 全层可选 {200K,500K,1M} → 最小满足 = 500K
+        let target = select_fallback(&ctx_error(Some(250_000)), &patterns(), &route(&cands), &r, &failed)
+            .target()
+            .expect("undeclared-origin failures are rescued");
+        assert_eq!(max_of(&target), 500_000);
+        // requested 超全部已声明层 → 最大层(1M,既有语义:解析值可能是过估)
+        let target2 = select_fallback(&ctx_error(Some(2_000_000)), &patterns(), &route(&cands), &r, &failed)
+            .target()
+            .expect("rescue falls to largest declared tier");
+        assert_eq!(max_of(&target2), 1_000_000);
+        // 解析失败 → 最大层
+        let target3 = select_fallback(&ctx_error(None), &patterns(), &route(&cands), &r, &failed)
+            .target()
+            .expect("unparsed rescue → largest");
+        assert_eq!(max_of(&target3), 1_000_000);
+    }
+
+    /// 救助的单层特例:池里只有 1 个声明实例 + 未声明实例——capable 为真
+    /// (未声明实例的失败可被救),失败在声明层则 NoTarget。
+    #[test]
+    fn rescue_with_single_declared_tier() {
+        let r = router();
+        let cands = vec![
+            Arc::new(FakeProvider { dep: "d200a", max_ctx: Some(200_000) }),
+            undeclared("dx"),
+        ];
+        // 失败在未声明实例 → 救到唯一的声明层(即使解析 size 超过它,
+        // 按既有语义试最大层;装不下会以 retry_error 落账)
+        let failed = cands[1].clone();
+        let target = select_fallback(&ctx_error(Some(250_000)), &patterns(), &route(&cands), &r, &failed)
+            .target()
+            .expect("single declared tier still rescues undeclared-origin");
+        assert_eq!(max_of(&target), 200_000);
+        // 失败在声明实例 → 无更大层 → NoTarget
+        assert!(select_fallback(&ctx_error(Some(250_000)), &patterns(), &route(&cands), &r, &cands[0])
+            .target()
+            .is_none());
     }
 
     #[test]
@@ -222,14 +272,19 @@ mod tests {
     #[test]
     fn capable_mirrors_gates() {
         assert!(capable(&patterns(), &pool()));
-        // 混配
+        // 混配(声明子集 ≥2 层 + 未声明)→ 可回退(声明层间可退)
         let mut mixed = pool();
-        mixed.push(Arc::new(FakeProvider { dep: "dx", max_ctx: None, rb: true }));
-        assert!(!capable(&patterns(), &mixed));
-        // 单层
+        mixed.push(undeclared("dx"));
+        assert!(capable(&patterns(), &mixed));
+        // 单层声明 + 未声明实例 → 可回退(未声明源失败可被救)
+        let single_plus = vec![pool()[0].clone(), undeclared("dx")];
+        assert!(capable(&patterns(), &single_plus));
+        // 单层声明、无未声明 → 不可
         let single = vec![pool()[0].clone(), pool()[1].clone()];
         assert!(!capable(&patterns(), &single));
-        // 空 patterns / 单候选
+        // 全未声明 → 不可
+        assert!(!capable(&patterns(), &[undeclared("u1"), undeclared("u2")]));
+        // 空 patterns / 声明子集空
         assert!(!capable(&[], &pool()));
         assert!(!capable(&patterns(), &pool()[..1]));
     }
@@ -237,7 +292,7 @@ mod tests {
     #[test]
     fn finalize_error_converts_and_preserves() {
         let e = ctx_error(Some(250_000));
-        let converted = finalize_error(e, &patterns(), None, None);
+        let converted = finalize_error(e, &patterns(), None, None, None);
         match converted {
             GatewayError::ContextLengthExceeded(ref msg) => {
                 assert!(msg.contains("InputTokenExceeded"));
@@ -247,10 +302,10 @@ mod tests {
         assert_eq!(converted.status_code(), 400);
         // 特性关闭（空 patterns）：原样保留 502 语义
         let e2 = ctx_error(Some(250_000));
-        let kept = finalize_error(e2, &[], None, None);
+        let kept = finalize_error(e2, &[], None, None, None);
         assert_eq!(kept.status_code(), 502);
         // 非上下文错误：原样
         let e3 = GatewayError::UpstreamError { status: 400, message: "other".into() };
-        assert_eq!(finalize_error(e3, &patterns(), None, None).status_code(), 502);
+        assert_eq!(finalize_error(e3, &patterns(), None, None, None).status_code(), 502);
     }
 }

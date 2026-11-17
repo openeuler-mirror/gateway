@@ -781,6 +781,59 @@ impl<S: futures::Stream + Unpin> futures::Stream for LoggedStream<S> {
 // Chat Completions
 // ============================================================
 
+/// Post-success rollback bookkeeping (design §6) — ONE copy shared by all
+/// 3 handlers × stream/non-stream paths. When a fallback served the
+/// request: audit "+rollback" label, key-binding correction (on_outcome →
+/// the deployment that actually served), trace marker. Otherwise, on a
+/// capable pool with a trie prefix hit: the convergence counter (memory-
+/// follow numerator). `schedule_policy` is the handler's mutable label —
+/// taken and re-stamped in place.
+#[allow(clippy::too_many_arguments)]
+fn rb_success_bookkeeping(
+    state: &AppState,
+    identity: &AuthIdentity,
+    resolved_model: &str,
+    deployment_id: Option<&str>,
+    schedule_policy: &mut Option<String>,
+    rollback_from: &Option<String>,
+    rb_capable: bool,
+    kv_hit_blocks: Option<i64>,
+    trace_guard: Option<&boom_trace::TraceGuard>,
+) {
+    if let Some(ref rb_from) = rollback_from {
+        *schedule_policy = schedule_policy.take().map(|p| format!("{}+rollback", p));
+        state
+            .router
+            .notify_outcome(Some(&identity.key_hash), resolved_model, deployment_id, true);
+        if let Some(g) = trace_guard {
+            g.set_attribute(
+                "boom-gateway.rollback",
+                boom_core::trace::SpanAttributeValue::String(format!(
+                    "{:?} -> {:?}",
+                    rb_from, deployment_id
+                )),
+            );
+        }
+    } else if rb_capable && kv_hit_blocks.map(|b| b > 0).unwrap_or(false) {
+        state.rollback_stats.record_affinity_direct(resolved_model);
+    }
+}
+
+/// Non-capable-pool passthrough recording (6 handler sites share this):
+/// an identified context error on a pool that can't roll back → inert tally.
+#[inline]
+fn rb_record_inert_passthrough(
+    stats: &boom_core::context_error::RollbackStats,
+    model: &str,
+    e: &boom_core::GatewayError,
+    from: Option<&str>,
+    patterns: &[String],
+) {
+    if e.context_error_match(patterns).matched {
+        stats.record_pool_inert_identified(model, e, from);
+    }
+}
+
 pub async fn chat_completions(
     State(state): State<AppState>,
     auth: RequiredAuth,
@@ -1142,7 +1195,7 @@ async fn chat_completions_inner(
     macro_rules! rb_fail { ($err:expr, $stream:expr) => {{
         // Finalize FIRST so the audit row records the client-visible status
         // (400 passthrough for context errors), not the masked 502.
-        let rb_final = boom_rollback::finalize_error($err, rb_patterns, Some(&state.rollback_stats), Some(&resolved_model));
+        let rb_final = boom_rollback::finalize_error($err, rb_patterns, Some(&state.rollback_stats), Some(&resolved_model), deployment_id.as_deref());
         let partial_usage = provider_billing.actual_usage();
         settle_partial_provider_accounting(&mut plan_charge, &provider_billing);
         log_error_with_usage(&state, &identity, &model, api_path, $stream, start, &rb_final, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()), user_tags.clone(), partial_usage.as_ref(), None, schedule_policy.clone());
@@ -1167,6 +1220,25 @@ async fn chat_completions_inner(
         crate::health_monitor::record_request_failure(&state, &deployment_id, &rb_final);
         return Err(GatewayErrorReply(rb_final, $stream));
     }} }
+    // Retried/NoRetry 重绑定(流/非流两路共用):回退成功 → 身份重绑到
+    // 实际服务的部署;任何失败走 rb_fail!(宏卫生:定义于 handler 内,
+    // 引用的都是此时已声明的局部)。
+    macro_rules! rb_rebind { ($outcome:expr, $orig:expr, $stream:expr) => {{
+        match ($outcome) {
+            boom_rollback::RollbackOutcome::NoRetry => rb_fail!($orig, $stream),
+            boom_rollback::RollbackOutcome::Retried { result, provider: p2, deployment_id: d2, fc_guard: g2, from_deployment_id } => {
+                provider = p2;
+                deployment_id = d2;
+                fc_guard = g2;
+                rollback_from = from_deployment_id;
+                match result {
+                    Ok(s) => s,
+                    Err(e2) => rb_fail!(e2, $stream),
+                }
+            }
+        }
+    }} }
+
 
     if is_stream {
         if let Some(g) = trace_guard.as_ref() { g.note_upstream_start(); }
@@ -1177,23 +1249,10 @@ async fn chat_completions_inner(
             // pools, never on inert pools).
             match provider.chat_stream_with_context(req.clone(), provider_context.clone()).await {
                 Ok(s) => s,
-                Err(e) => match boom_rollback::attempt_stream(
-                    &rb_ctx, &e, req, Some(provider_context),
-                    provider.clone(), deployment_id.clone(), fc_guard.take(),
-                    is_vip, identity.key_alias.clone(), &rb_route,
-                ).await {
-                    boom_rollback::RollbackOutcome::NoRetry => rb_fail!(e, true),
-                    boom_rollback::RollbackOutcome::Retried { result, provider: p2, deployment_id: d2, fc_guard: g2, from_deployment_id } => {
-                        provider = p2;
-                        deployment_id = d2;
-                        fc_guard = g2;
-                        rollback_from = from_deployment_id;
-                        match result {
-                            Ok(s) => s,
-                            Err(e2) => rb_fail!(e2, true),
-                        }
-                    }
-                },
+                Err(e) => rb_rebind!(
+                    boom_rollback::attempt_stream(&rb_ctx, &e, req, Some(provider_context), provider.clone(), deployment_id.clone(), fc_guard.take(), is_vip, identity.key_alias.clone(), &rb_route,).await,
+                    e, true
+                )
             }
         } else {
             match provider.chat_stream_with_context(req, provider_context).await {
@@ -1206,9 +1265,7 @@ async fn chat_completions_inner(
           // wrapper-shaped bodies ("Context length exceeded: {json}")
           // while the other paths recorded "HTTP_400" — one request,
           // two different codes across tree sections.
-          if e.context_error_match(rb_patterns).matched {
-            state.rollback_stats.record_pool_inert_identified(&resolved_model, &e);
-          }
+          rb_record_inert_passthrough(&state.rollback_stats, &resolved_model, &e, deployment_id.as_deref(), rb_patterns);
         }
         rb_fail!(e, true) }
             }
@@ -1219,24 +1276,8 @@ async fn chat_completions_inner(
         // Trie learning: admission success is the "it fits" proof — record
         // only on the Ok path (Err prefixes must never learn, design §7).
         state.kvc_orchestrator.record_success(&resolved_model, provider.kv_worker_id(), &prefix_bytes);
-        // ── Rollback bookkeeping (design §6): audit label, key-binding
-        // correction (on_outcome → the deployment that actually served),
-        // trace marker. Runs only when a fallback served this request. ──
-        if let Some(ref rb_from) = rollback_from {
-            schedule_policy = schedule_policy.take().map(|p| format!("{}+rollback", p));
-            state.router.notify_outcome(Some(&identity.key_hash), &resolved_model, deployment_id.as_deref(), true);
-            if let Some(g) = trace_guard.as_ref() {
-                g.set_attribute(
-                    "boom-gateway.rollback",
-                    boom_core::trace::SpanAttributeValue::String(format!("{:?} -> {:?}", rb_from, deployment_id)),
-                );
-            }
-        } else if rb_capable && kv_hit_blocks.map(|b| b > 0).unwrap_or(false) {
-            // Converged: affinity direct hit on a capable pool, no rollback
-            // needed — the memory-follow is working (debug pane convergence
-            // rate numerator).
-            state.rollback_stats.record_affinity_direct(&resolved_model);
-        }
+        // ── Rollback bookkeeping (design §6) — shared single copy. ──
+        rb_success_bookkeeping(&state, &identity, &resolved_model, deployment_id.as_deref(), &mut schedule_policy, &rollback_from, rb_capable, kv_hit_blocks, trace_guard.as_ref());
         let usage = UsageTracker::default();
         let sse_stream = sse_stream_from_chat_stream(stream, usage.clone());
         let inflight_guard = if let Some(ref did) = deployment_id {
@@ -1400,23 +1441,10 @@ async fn chat_completions_inner(
         let response = if rb_capable {
             match provider.chat_with_context(req.clone(), provider_context.clone()).await {
                 Ok(r) => r,
-                Err(e) => match boom_rollback::attempt_call(
-                    &rb_ctx, &e, req, Some(provider_context),
-                    provider.clone(), deployment_id.clone(), fc_guard.take(),
-                    is_vip, identity.key_alias.clone(), &rb_route,
-                ).await {
-                    boom_rollback::RollbackOutcome::NoRetry => rb_fail!(e, false),
-                    boom_rollback::RollbackOutcome::Retried { result, provider: p2, deployment_id: d2, fc_guard: g2, from_deployment_id } => {
-                        provider = p2;
-                        deployment_id = d2;
-                        fc_guard = g2;
-                        rollback_from = from_deployment_id;
-                        match result {
-                            Ok(r) => r,
-                            Err(e2) => rb_fail!(e2, false),
-                        }
-                    }
-                },
+                Err(e) => rb_rebind!(
+                    boom_rollback::attempt_call(&rb_ctx, &e, req, Some(provider_context), provider.clone(), deployment_id.clone(), fc_guard.take(), is_vip, identity.key_alias.clone(), &rb_route,).await,
+                    e, false
+                )
             }
         } else {
             match provider.chat_with_context(req, provider_context).await {
@@ -1429,9 +1457,7 @@ async fn chat_completions_inner(
           // wrapper-shaped bodies ("Context length exceeded: {json}")
           // while the other paths recorded "HTTP_400" — one request,
           // two different codes across tree sections.
-          if e.context_error_match(rb_patterns).matched {
-            state.rollback_stats.record_pool_inert_identified(&resolved_model, &e);
-          }
+          rb_record_inert_passthrough(&state.rollback_stats, &resolved_model, &e, deployment_id.as_deref(), rb_patterns);
         }
         rb_fail!(e, false) }
             }
@@ -1446,24 +1472,8 @@ async fn chat_completions_inner(
         // Trie learning: admission success is the "it fits" proof — record
         // only on the Ok path (Err prefixes must never learn, design §7).
         state.kvc_orchestrator.record_success(&resolved_model, provider.kv_worker_id(), &prefix_bytes);
-        // ── Rollback bookkeeping (design §6): audit label, key-binding
-        // correction (on_outcome → the deployment that actually served),
-        // trace marker. Runs only when a fallback served this request. ──
-        if let Some(ref rb_from) = rollback_from {
-            schedule_policy = schedule_policy.take().map(|p| format!("{}+rollback", p));
-            state.router.notify_outcome(Some(&identity.key_hash), &resolved_model, deployment_id.as_deref(), true);
-            if let Some(g) = trace_guard.as_ref() {
-                g.set_attribute(
-                    "boom-gateway.rollback",
-                    boom_core::trace::SpanAttributeValue::String(format!("{:?} -> {:?}", rb_from, deployment_id)),
-                );
-            }
-        } else if rb_capable && kv_hit_blocks.map(|b| b > 0).unwrap_or(false) {
-            // Converged: affinity direct hit on a capable pool, no rollback
-            // needed — the memory-follow is working (debug pane convergence
-            // rate numerator).
-            state.rollback_stats.record_affinity_direct(&resolved_model);
-        }
+        // ── Rollback bookkeeping (design §6) — shared single copy. ──
+        rb_success_bookkeeping(&state, &identity, &resolved_model, deployment_id.as_deref(), &mut schedule_policy, &rollback_from, rb_capable, kv_hit_blocks, trace_guard.as_ref());
 
         let duration_ms = start.elapsed().as_millis() as i32;
         // None = upstream did not report usage → log NULL, settle 0 tokens.
@@ -3824,7 +3834,7 @@ pub async fn messages(
     };
     macro_rules! rb_fail { ($err:expr, $stream:expr) => {{
         // Finalize FIRST so the audit row records the client-visible status.
-        let rb_final = boom_rollback::finalize_error($err, rb_patterns, Some(&state.rollback_stats), Some(&resolved_model));
+        let rb_final = boom_rollback::finalize_error($err, rb_patterns, Some(&state.rollback_stats), Some(&resolved_model), deployment_id.as_deref());
         crate::request_log::log_error_with_policy(&state, &identity, &model, "/v1/messages", $stream, start, &rb_final, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()), user_tags.clone(), schedule_policy.clone());
         write_prompt_log_error(
             &state,
@@ -3848,29 +3858,35 @@ pub async fn messages(
         // plan_charge drops here without commit — no quota consumed.
         return Err(AnthropicErrorReply(rb_final, $stream));
     }} }
+    // Retried/NoRetry 重绑定(流/非流两路共用):回退成功 → 身份重绑到
+    // 实际服务的部署;任何失败走 rb_fail!(宏卫生:定义于 handler 内,
+    // 引用的都是此时已声明的局部)。
+    macro_rules! rb_rebind { ($outcome:expr, $orig:expr, $stream:expr) => {{
+        match ($outcome) {
+            boom_rollback::RollbackOutcome::NoRetry => rb_fail!($orig, $stream),
+            boom_rollback::RollbackOutcome::Retried { result, provider: p2, deployment_id: d2, fc_guard: g2, from_deployment_id } => {
+                provider = p2;
+                deployment_id = d2;
+                fc_guard = g2;
+                rollback_from = from_deployment_id;
+                match result {
+                    Ok(s) => s,
+                    Err(e2) => rb_fail!(e2, $stream),
+                }
+            }
+        }
+    }} }
+
 
     if is_stream {
         if let Some(g) = trace_guard.as_ref() { g.note_upstream_start(); }
         let stream = if rb_capable {
             match provider.chat_stream(openai_req.clone()).await {
                 Ok(s) => s,
-                Err(e) => match boom_rollback::attempt_stream(
-                    &rb_ctx, &e, openai_req, None,
-                    provider.clone(), deployment_id.clone(), fc_guard.take(),
-                    is_vip, identity.key_alias.clone(), &rb_route,
-                ).await {
-                    boom_rollback::RollbackOutcome::NoRetry => rb_fail!(e, true),
-                    boom_rollback::RollbackOutcome::Retried { result, provider: p2, deployment_id: d2, fc_guard: g2, from_deployment_id } => {
-                        provider = p2;
-                        deployment_id = d2;
-                        fc_guard = g2;
-                        rollback_from = from_deployment_id;
-                        match result {
-                            Ok(s) => s,
-                            Err(e2) => rb_fail!(e2, true),
-                        }
-                    }
-                },
+                Err(e) => rb_rebind!(
+                    boom_rollback::attempt_stream(&rb_ctx, &e, openai_req, None, provider.clone(), deployment_id.clone(), fc_guard.take(), is_vip, identity.key_alias.clone(), &rb_route,).await,
+                    e, true
+                )
             }
         } else {
             match provider.chat_stream(openai_req).await {
@@ -3883,9 +3899,7 @@ pub async fn messages(
           // wrapper-shaped bodies ("Context length exceeded: {json}")
           // while the other paths recorded "HTTP_400" — one request,
           // two different codes across tree sections.
-          if e.context_error_match(rb_patterns).matched {
-            state.rollback_stats.record_pool_inert_identified(&resolved_model, &e);
-          }
+          rb_record_inert_passthrough(&state.rollback_stats, &resolved_model, &e, deployment_id.as_deref(), rb_patterns);
         }
         rb_fail!(e, true) }
             }
@@ -3896,24 +3910,8 @@ pub async fn messages(
         // Trie learning: admission success is the "it fits" proof — record
         // only on the Ok path (Err prefixes must never learn, design §7).
         state.kvc_orchestrator.record_success(&resolved_model, provider.kv_worker_id(), &prefix_bytes);
-        // ── Rollback bookkeeping (design §6): audit label, key-binding
-        // correction (on_outcome → the deployment that actually served),
-        // trace marker. Runs only when a fallback served this request. ──
-        if let Some(ref rb_from) = rollback_from {
-            schedule_policy = schedule_policy.take().map(|p| format!("{}+rollback", p));
-            state.router.notify_outcome(Some(&identity.key_hash), &resolved_model, deployment_id.as_deref(), true);
-            if let Some(g) = trace_guard.as_ref() {
-                g.set_attribute(
-                    "boom-gateway.rollback",
-                    boom_core::trace::SpanAttributeValue::String(format!("{:?} -> {:?}", rb_from, deployment_id)),
-                );
-            }
-        } else if rb_capable && kv_hit_blocks.map(|b| b > 0).unwrap_or(false) {
-            // Converged: affinity direct hit on a capable pool, no rollback
-            // needed — the memory-follow is working (debug pane convergence
-            // rate numerator).
-            state.rollback_stats.record_affinity_direct(&resolved_model);
-        }
+        // ── Rollback bookkeeping (design §6) — shared single copy. ──
+        rb_success_bookkeeping(&state, &identity, &resolved_model, deployment_id.as_deref(), &mut schedule_policy, &rollback_from, rb_capable, kv_hit_blocks, trace_guard.as_ref());
         let usage = UsageTracker::default();
         let sse_stream = sse_stream_from_anthropic_chat_stream(stream, model.clone(), usage.clone());
         let inflight_guard = if let Some(ref did) = deployment_id {
@@ -4054,23 +4052,10 @@ pub async fn messages(
         let response = if rb_capable {
             match provider.chat(openai_req.clone()).await {
                 Ok(r) => r,
-                Err(e) => match boom_rollback::attempt_call(
-                    &rb_ctx, &e, openai_req, None,
-                    provider.clone(), deployment_id.clone(), fc_guard.take(),
-                    is_vip, identity.key_alias.clone(), &rb_route,
-                ).await {
-                    boom_rollback::RollbackOutcome::NoRetry => rb_fail!(e, false),
-                    boom_rollback::RollbackOutcome::Retried { result, provider: p2, deployment_id: d2, fc_guard: g2, from_deployment_id } => {
-                        provider = p2;
-                        deployment_id = d2;
-                        fc_guard = g2;
-                        rollback_from = from_deployment_id;
-                        match result {
-                            Ok(r) => r,
-                            Err(e2) => rb_fail!(e2, false),
-                        }
-                    }
-                },
+                Err(e) => rb_rebind!(
+                    boom_rollback::attempt_call(&rb_ctx, &e, openai_req, None, provider.clone(), deployment_id.clone(), fc_guard.take(), is_vip, identity.key_alias.clone(), &rb_route,).await,
+                    e, false
+                )
             }
         } else {
             match provider.chat(openai_req).await {
@@ -4083,9 +4068,7 @@ pub async fn messages(
           // wrapper-shaped bodies ("Context length exceeded: {json}")
           // while the other paths recorded "HTTP_400" — one request,
           // two different codes across tree sections.
-          if e.context_error_match(rb_patterns).matched {
-            state.rollback_stats.record_pool_inert_identified(&resolved_model, &e);
-          }
+          rb_record_inert_passthrough(&state.rollback_stats, &resolved_model, &e, deployment_id.as_deref(), rb_patterns);
         }
         rb_fail!(e, false) }
             }
@@ -4099,24 +4082,8 @@ pub async fn messages(
         // Trie learning: admission success is the "it fits" proof — record
         // only on the Ok path (Err prefixes must never learn, design §7).
         state.kvc_orchestrator.record_success(&resolved_model, provider.kv_worker_id(), &prefix_bytes);
-        // ── Rollback bookkeeping (design §6): audit label, key-binding
-        // correction (on_outcome → the deployment that actually served),
-        // trace marker. Runs only when a fallback served this request. ──
-        if let Some(ref rb_from) = rollback_from {
-            schedule_policy = schedule_policy.take().map(|p| format!("{}+rollback", p));
-            state.router.notify_outcome(Some(&identity.key_hash), &resolved_model, deployment_id.as_deref(), true);
-            if let Some(g) = trace_guard.as_ref() {
-                g.set_attribute(
-                    "boom-gateway.rollback",
-                    boom_core::trace::SpanAttributeValue::String(format!("{:?} -> {:?}", rb_from, deployment_id)),
-                );
-            }
-        } else if rb_capable && kv_hit_blocks.map(|b| b > 0).unwrap_or(false) {
-            // Converged: affinity direct hit on a capable pool, no rollback
-            // needed — the memory-follow is working (debug pane convergence
-            // rate numerator).
-            state.rollback_stats.record_affinity_direct(&resolved_model);
-        }
+        // ── Rollback bookkeeping (design §6) — shared single copy. ──
+        rb_success_bookkeeping(&state, &identity, &resolved_model, deployment_id.as_deref(), &mut schedule_policy, &rollback_from, rb_capable, kv_hit_blocks, trace_guard.as_ref());
 
         let duration_ms = start.elapsed().as_millis() as i32;
         // None = upstream did not report usage → log NULL, settle 0 tokens.
@@ -4910,7 +4877,7 @@ pub async fn responses(
     // the macro can expand on both the first-error and retry-error paths.
     macro_rules! rb_fail { ($err:expr, $stream:expr) => {{
         // Finalize FIRST so the audit row records the client-visible status.
-        let rb_final = boom_rollback::finalize_error($err, rb_patterns, Some(&state.rollback_stats), Some(&resolved_model));
+        let rb_final = boom_rollback::finalize_error($err, rb_patterns, Some(&state.rollback_stats), Some(&resolved_model), deployment_id.as_deref());
         crate::request_log::log_error_with_policy(&state, &identity, &model, "/v1/responses", $stream, start, &rb_final, Some(request_id.clone()), deployment_id.clone(), debug_req_body.clone(), Some(client_ip.clone()), user_tags.clone(), schedule_policy.clone());
         write_prompt_log_error(
             &state,
@@ -4956,29 +4923,35 @@ pub async fn responses(
             return Err(ResponsesErrorReply(rb_final));
         }
     }} }
+    // Retried/NoRetry 重绑定(流/非流两路共用):回退成功 → 身份重绑到
+    // 实际服务的部署;任何失败走 rb_fail!(宏卫生:定义于 handler 内,
+    // 引用的都是此时已声明的局部)。
+    macro_rules! rb_rebind { ($outcome:expr, $orig:expr, $stream:expr) => {{
+        match ($outcome) {
+            boom_rollback::RollbackOutcome::NoRetry => rb_fail!($orig, $stream),
+            boom_rollback::RollbackOutcome::Retried { result, provider: p2, deployment_id: d2, fc_guard: g2, from_deployment_id } => {
+                provider = p2;
+                deployment_id = d2;
+                fc_guard = g2;
+                rollback_from = from_deployment_id;
+                match result {
+                    Ok(s) => s,
+                    Err(e2) => rb_fail!(e2, $stream),
+                }
+            }
+        }
+    }} }
+
 
     if is_stream {
         if let Some(g) = trace_guard.as_ref() { g.note_upstream_start(); }
         let stream = if rb_capable {
             match provider.chat_stream(openai_req.clone()).await {
                 Ok(s) => s,
-                Err(e) => match boom_rollback::attempt_stream(
-                    &rb_ctx, &e, openai_req, None,
-                    provider.clone(), deployment_id.clone(), fc_guard.take(),
-                    is_vip, identity.key_alias.clone(), &rb_route,
-                ).await {
-                    boom_rollback::RollbackOutcome::NoRetry => rb_fail!(e, true),
-                    boom_rollback::RollbackOutcome::Retried { result, provider: p2, deployment_id: d2, fc_guard: g2, from_deployment_id } => {
-                        provider = p2;
-                        deployment_id = d2;
-                        fc_guard = g2;
-                        rollback_from = from_deployment_id;
-                        match result {
-                            Ok(s) => s,
-                            Err(e2) => rb_fail!(e2, true),
-                        }
-                    }
-                },
+                Err(e) => rb_rebind!(
+                    boom_rollback::attempt_stream(&rb_ctx, &e, openai_req, None, provider.clone(), deployment_id.clone(), fc_guard.take(), is_vip, identity.key_alias.clone(), &rb_route,).await,
+                    e, true
+                )
             }
         } else {
             match provider.chat_stream(openai_req).await {
@@ -4991,9 +4964,7 @@ pub async fn responses(
           // wrapper-shaped bodies ("Context length exceeded: {json}")
           // while the other paths recorded "HTTP_400" — one request,
           // two different codes across tree sections.
-          if e.context_error_match(rb_patterns).matched {
-            state.rollback_stats.record_pool_inert_identified(&resolved_model, &e);
-          }
+          rb_record_inert_passthrough(&state.rollback_stats, &resolved_model, &e, deployment_id.as_deref(), rb_patterns);
         }
         rb_fail!(e, true) }
             }
@@ -5003,24 +4974,8 @@ pub async fn responses(
         // Trie learning: admission success is the "it fits" proof — record
         // only on the Ok path (Err prefixes must never learn, design §7).
         state.kvc_orchestrator.record_success(&resolved_model, provider.kv_worker_id(), &prefix_bytes);
-        // ── Rollback bookkeeping (design §6): audit label, key-binding
-        // correction (on_outcome → the deployment that actually served),
-        // trace marker. Runs only when a fallback served this request. ──
-        if let Some(ref rb_from) = rollback_from {
-            schedule_policy = schedule_policy.take().map(|p| format!("{}+rollback", p));
-            state.router.notify_outcome(Some(&identity.key_hash), &resolved_model, deployment_id.as_deref(), true);
-            if let Some(g) = trace_guard.as_ref() {
-                g.set_attribute(
-                    "boom-gateway.rollback",
-                    boom_core::trace::SpanAttributeValue::String(format!("{:?} -> {:?}", rb_from, deployment_id)),
-                );
-            }
-        } else if rb_capable && kv_hit_blocks.map(|b| b > 0).unwrap_or(false) {
-            // Converged: affinity direct hit on a capable pool, no rollback
-            // needed — the memory-follow is working (debug pane convergence
-            // rate numerator).
-            state.rollback_stats.record_affinity_direct(&resolved_model);
-        }
+        // ── Rollback bookkeeping (design §6) — shared single copy. ──
+        rb_success_bookkeeping(&state, &identity, &resolved_model, deployment_id.as_deref(), &mut schedule_policy, &rollback_from, rb_capable, kv_hit_blocks, trace_guard.as_ref());
         let usage = UsageTracker::default();
         let sse_stream = sse_stream_from_responses_chat_stream(
             stream, model.clone(), response_id.clone(), created_at, usage.clone(),
@@ -5176,23 +5131,10 @@ pub async fn responses(
         let response = if rb_capable {
             match provider.chat(openai_req.clone()).await {
                 Ok(r) => r,
-                Err(e) => match boom_rollback::attempt_call(
-                    &rb_ctx, &e, openai_req, None,
-                    provider.clone(), deployment_id.clone(), fc_guard.take(),
-                    is_vip, identity.key_alias.clone(), &rb_route,
-                ).await {
-                    boom_rollback::RollbackOutcome::NoRetry => rb_fail!(e, false),
-                    boom_rollback::RollbackOutcome::Retried { result, provider: p2, deployment_id: d2, fc_guard: g2, from_deployment_id } => {
-                        provider = p2;
-                        deployment_id = d2;
-                        fc_guard = g2;
-                        rollback_from = from_deployment_id;
-                        match result {
-                            Ok(r) => r,
-                            Err(e2) => rb_fail!(e2, false),
-                        }
-                    }
-                },
+                Err(e) => rb_rebind!(
+                    boom_rollback::attempt_call(&rb_ctx, &e, openai_req, None, provider.clone(), deployment_id.clone(), fc_guard.take(), is_vip, identity.key_alias.clone(), &rb_route,).await,
+                    e, false
+                )
             }
         } else {
             match provider.chat(openai_req).await {
@@ -5205,9 +5147,7 @@ pub async fn responses(
           // wrapper-shaped bodies ("Context length exceeded: {json}")
           // while the other paths recorded "HTTP_400" — one request,
           // two different codes across tree sections.
-          if e.context_error_match(rb_patterns).matched {
-            state.rollback_stats.record_pool_inert_identified(&resolved_model, &e);
-          }
+          rb_record_inert_passthrough(&state.rollback_stats, &resolved_model, &e, deployment_id.as_deref(), rb_patterns);
         }
         rb_fail!(e, false) }
             }
@@ -5219,24 +5159,8 @@ pub async fn responses(
         // Trie learning: admission success is the "it fits" proof — record
         // only on the Ok path (Err prefixes must never learn, design §7).
         state.kvc_orchestrator.record_success(&resolved_model, provider.kv_worker_id(), &prefix_bytes);
-        // ── Rollback bookkeeping (design §6): audit label, key-binding
-        // correction (on_outcome → the deployment that actually served),
-        // trace marker. Runs only when a fallback served this request. ──
-        if let Some(ref rb_from) = rollback_from {
-            schedule_policy = schedule_policy.take().map(|p| format!("{}+rollback", p));
-            state.router.notify_outcome(Some(&identity.key_hash), &resolved_model, deployment_id.as_deref(), true);
-            if let Some(g) = trace_guard.as_ref() {
-                g.set_attribute(
-                    "boom-gateway.rollback",
-                    boom_core::trace::SpanAttributeValue::String(format!("{:?} -> {:?}", rb_from, deployment_id)),
-                );
-            }
-        } else if rb_capable && kv_hit_blocks.map(|b| b > 0).unwrap_or(false) {
-            // Converged: affinity direct hit on a capable pool, no rollback
-            // needed — the memory-follow is working (debug pane convergence
-            // rate numerator).
-            state.rollback_stats.record_affinity_direct(&resolved_model);
-        }
+        // ── Rollback bookkeeping (design §6) — shared single copy. ──
+        rb_success_bookkeeping(&state, &identity, &resolved_model, deployment_id.as_deref(), &mut schedule_policy, &rollback_from, rb_capable, kv_hit_blocks, trace_guard.as_ref());
 
         let duration_ms = start.elapsed().as_millis() as i32;
         let usage = response.usage.as_ref();

@@ -186,6 +186,9 @@ fn text_chunk(model: &str, content: &str, with_usage: bool) -> ChatStreamChunk {
                 completion_tokens: Some(1),
                 total_tokens: Some(3),
                 prompt_tokens_details: None,
+                completion_tokens_details: None,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
             })
         } else {
             None
@@ -217,6 +220,9 @@ fn rich_chunk(model: &str, content: &str, usage: Option<(i32, i32, Option<i32>, 
             completion_tokens: Some(c),
             total_tokens: t,
             prompt_tokens_details: cached.map(|n| PromptTokensDetails { cached_tokens: Some(n) }),
+            completion_tokens_details: None,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
         }),
         raw_data: None,
     }

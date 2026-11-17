@@ -59,30 +59,34 @@ pub fn select_fallback(
         return FallbackDecision::MissIdentify;
     }
 
-    // ── L2 gates: pool participation (all-or-nothing on both fields). ──
+    // ── L2: participation set = DECLARED instances only ──
+    // `max_context_tokens` is the sole participation signal (the pool
+    // toggle was removed). Undeclared instances are never TARGETS; but a
+    // context error that fired on an UNDECLARED instance is still rescued
+    // — the request fell to it via normal routing and the declared subset
+    // may fit it (the "救" scheme). Semantics:
+    //   failed instance declared (tier T) → strictly larger tiers eligible
+    //   failed instance undeclared            → ALL declared tiers eligible
+    //   declared subset empty                 → PoolInert (defensive;
+    //                                          the capable() precheck
+    //                                          normally routes these to
+    //                                          the handler's else branch)
     let failed_max = failed_provider.max_context_tokens();
     let mut tiers = std::collections::BTreeSet::new();
     for c in route.candidates {
-        if !c.rollback_enabled() {
-            return FallbackDecision::PoolInert;
-        }
-        match c.max_context_tokens() {
-            Some(v) => {
-                tiers.insert(v);
-            }
-            None => return FallbackDecision::PoolInert,
+        if let Some(v) = c.max_context_tokens() {
+            tiers.insert(v);
         }
     }
-    if tiers.len() < 2 {
-        return FallbackDecision::PoolInert; // single tier: nowhere to fall back to
+    if tiers.is_empty() {
+        return FallbackDecision::PoolInert;
     }
 
-    // ── Target tier: strictly larger than the failed tier; smallest tier
-    // satisfying the parsed request size, else the largest. ──
     let larger: Vec<u64> = match failed_max {
         Some(fm) => tiers.iter().copied().filter(|&v| v > fm).collect(),
-        // Failed provider not in the pool anymore (disabled mid-flight?):
-        // treat every tier as eligible.
+        // Undeclared-origin rescue (first-class, not the old defensive
+        // branch): pick the smallest declared tier satisfying the parsed
+        // request size, else the largest.
         None => tiers.iter().copied().collect(),
     };
     if larger.is_empty() {
@@ -97,7 +101,10 @@ pub fn select_fallback(
         None => *larger.last().unwrap(), // unparsed → largest (design §5)
     };
 
-    // ── Tier candidates, excluding the failed deployment itself. ──
+    // ── Tier candidates: declared instances of the target tier only
+    // (undeclared are never targets), excluding the failed deployment
+    // itself. For an undeclared-origin rescue the failed instance is not
+    // in any declared tier, so the ptr_eq guard is a no-op. ──
     let tier_candidates: Vec<Arc<dyn Provider>> = route
         .candidates
         .iter()
@@ -129,21 +136,27 @@ pub fn select_fallback(
 /// Everything is re-checked by [`select_fallback`] after the actual error
 /// arrives — this is purely the clone-cost gate.
 pub fn capable(patterns: &[String], candidates: &[Arc<dyn Provider>]) -> bool {
-    if patterns.is_empty() || candidates.len() < 2 {
+    if patterns.is_empty() {
         return false;
     }
+    // Declaration is the sole participation signal (pool toggle removed).
+    // A pool can roll back SOMETHING when either:
+    //   - a declared instance can fall up (≥2 distinct declared tiers), or
+    //   - an undeclared instance exists whose failures can be rescued by
+    //     the declared subset (even a single declared tier suffices).
+    // All-undeclared pools and all-declared-single-tier pools can't.
     let mut tiers = std::collections::BTreeSet::new();
+    let mut undeclared = false;
     for c in candidates {
-        if !c.rollback_enabled() {
-            return false;
-        }
         match c.max_context_tokens() {
             Some(v) => {
                 tiers.insert(v);
             }
-            None => return false, // mixed pool → inert (all-or-nothing gate)
+            None => {
+                undeclared = true;
+            }
         }
     }
-    tiers.len() >= 2
+    !tiers.is_empty() && (tiers.len() >= 2 || undeclared)
 }
 

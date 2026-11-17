@@ -2488,11 +2488,6 @@ pub struct CreateDeploymentRequest {
     /// not participating). Distinct from max_context_len (flow-control chars).
     #[serde(default)]
     pub max_context_tokens: Option<i64>,
-    /// Per-deployment rollback participation (pool semantics: group
-    /// participates when every row is set). None = false (create) / the
-    /// frontend echoes the current value on update.
-    #[serde(default)]
-    pub rollback_enabled: Option<bool>,
     /// Attach `X-BooM-Client-Type` header to outgoing requests (default false).
     #[serde(default)]
     pub client_type_header: bool,
@@ -2579,7 +2574,6 @@ pub async fn list_models(
                 "max_inflight_queue_len": r.max_inflight_queue_len,
                 "max_context_len": r.max_context_len,
                 "max_context_tokens": r.max_context_tokens,
-                "rollback_enabled": r.rollback_enabled,
                 "client_type_header": r.client_type_header.unwrap_or(false),
                 "serve_not_match": r.serve_not_match,
                 "allowed_teams": r.allowed_teams,
@@ -2613,63 +2607,6 @@ pub async fn list_models(
 
     Json(json!({"models": models})).into_response()
 }
-
-/// Body for `POST /admin/models/rollback`. Exactly one granularity:
-/// `deployment_id` (one row), `model_name` (one pool), or neither (ALL
-/// pools — the toolbar master toggle).
-#[derive(Debug, serde::Deserialize)]
-pub struct SetRollbackRequest {
-    /// Single deployment row (per-row checkbox in the models table).
-    pub deployment_id: Option<String>,
-    /// Whole model group.
-    pub model_name: Option<String>,
-    pub enabled: bool,
-}
-
-/// POST /dashboard/api/admin/models/rollback — set rollback participation
-/// at one of three granularities: a single deployment row (deployment_id),
-/// one pool (model_name), or every pool (neither). Boom-main writes
-/// `rollback_enabled` on the affected rows and reloads routing.
-pub async fn set_model_rollback(
-    _session: AdminSession,
-    Extension(state): Extension<std::sync::Arc<DashboardState>>,
-    Json(req): Json<SetRollbackRequest>,
-) -> Response {
-    if req.deployment_id.is_some() && req.model_name.is_some() {
-        return Json(json!({"error": "specify either deployment_id or model_name, not both"})).into_response();
-    }
-    let deployment_id = match req.deployment_id.as_deref() {
-        None => None,
-        Some(raw) => match raw.parse::<uuid::Uuid>() {
-            Ok(id) => Some(id),
-            Err(_) => return Json(json!({"error": format!("invalid deployment_id '{}'", raw)})).into_response(),
-        },
-    };
-    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    let cmd = crate::state::AdminCommand::SetModelRollback {
-        deployment_id,
-        model_name: req.model_name,
-        enabled: req.enabled,
-        reply: reply_tx,
-    };
-    if state.admin_tx.send(cmd).await.is_err() {
-        return (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            "Admin command handler unavailable",
-        )
-            .into_response();
-    }
-    match reply_rx.await {
-        Ok(Ok(value)) => Json(value).into_response(),
-        Ok(Err(msg)) => Json(json!({"error": msg})).into_response(),
-        Err(_) => (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            "Admin command handler dropped reply",
-        )
-            .into_response(),
-    }
-}
-
 pub async fn create_model(
     _session: AdminSession,
     Extension(state): Extension<std::sync::Arc<DashboardState>>,
@@ -3273,6 +3210,9 @@ pub struct ListLogsQuery {
     pub error: Option<String>,
     pub team_alias: Option<String>,
     pub policy: Option<String>,
+    /// Multi-instance ops: restrict rows to one gateway instance (stable
+    /// instance id, e.g. "127.0.0.1:8080"). ILIKE for prefix matching.
+    pub instance_id: Option<String>,
     pub client_ip: Option<String>,
     /// Time window: "3d" (default) / "7d" / "30d" / "all". Bounds the scan to
     /// the created_at index range so the ILIKE filters only apply within the
@@ -3334,6 +3274,9 @@ struct LogRow {
     trie_max_blocks: Option<i64>,
     request_tokens: Option<i64>,
     queue_wait_ms: Option<i32>,
+    // Multi-instance attribution: the stable instance id that served the
+    // request (NULL on rows written by older binaries).
+    instance_id: Option<String>,
     // Per-user attribution slots — values of the configured user_tag_headers,
     // one column per header in list order.
     user_tag1: Option<String>,
@@ -3382,6 +3325,7 @@ pub async fn list_logs(
     let team_alias_param = slot!(query.team_alias);
     let client_ip_param   = slot!(query.client_ip);
     let policy_param     = slot!(query.policy);
+    let instance_param   = slot!(query.instance_id);
 
     if let Some(i) = range_param {
         where_clauses.push(format!("rl.created_at >= ${i}"));
@@ -3429,6 +3373,9 @@ pub async fn list_logs(
         // so both the raw name and display labels match via ILIKE.
         where_clauses.push(format!("rl.schedule_policy ILIKE ${}", policy_param.unwrap()));
     }
+    if query.instance_id.is_some() {
+        where_clauses.push(format!("rl.instance_id ILIKE ${}", instance_param.unwrap()));
+    }
     if query.client_ip.is_some() {
         where_clauses.push(format!("rl.client_ip ILIKE ${}", client_ip_param.unwrap()));
     }
@@ -3451,7 +3398,7 @@ pub async fn list_logs(
                   rl.deployment_id, rl.client_ip, rl.cached_tokens,
                   rl.schedule_policy, rl.kv_hit_blocks, rl.kv_input_blocks,
                   rl.trie_blocks, rl.trie_max_blocks, rl.request_tokens,
-                  rl.queue_wait_ms, rl.user_tag1, rl.user_tag2, rl.user_tag3
+                  rl.queue_wait_ms, rl.instance_id, rl.user_tag1, rl.user_tag2, rl.user_tag3
            FROM boom_request_log rl
            LEFT JOIN boom_team_table bt ON rl.team_id = bt.team_id
            {where_sql}
@@ -3471,6 +3418,7 @@ pub async fn list_logs(
     let team_alias_pattern = query.team_alias.as_ref().map(|v| format!("%{}%", escape_like(v)));
     let client_ip_pattern  = query.client_ip.as_ref().map(|v| format!("%{}%", escape_like(v)));
     let policy_pattern     = query.policy.as_ref().map(|v| format!("%{}%", escape_like(v)));
+    let instance_pattern   = query.instance_id.as_ref().map(|v| format!("%{}%", escape_like(v)));
 
     // Bind parameters (order must match slot allocation above).
     if let Some(from) = range_from {
@@ -3508,6 +3456,9 @@ pub async fn list_logs(
         q = q.bind(p.clone());
     }
     if let Some(ref p) = policy_pattern {
+        q = q.bind(p.clone());
+    }
+    if let Some(ref p) = instance_pattern {
         q = q.bind(p.clone());
     }
 
@@ -3563,6 +3514,9 @@ pub async fn list_logs(
         cq = cq.bind(p.clone());
     }
     if let Some(ref p) = policy_pattern {
+        cq = cq.bind(p.clone());
+    }
+    if let Some(ref p) = instance_pattern {
         cq = cq.bind(p.clone());
     }
     cq = cq.bind(LOGS_COUNT_CAP);
@@ -3637,6 +3591,7 @@ pub async fn list_logs(
                 // DFX: scheduling observability. Raw schedule_policy value —
                 // WYSIWYG: what you see is what you can filter on (ILIKE).
                 "policy": r.schedule_policy.clone().unwrap_or_default(),
+                "instance_id": r.instance_id,
                 "kv_hit_blocks": r.kv_hit_blocks,
                 "kv_input_blocks": r.kv_input_blocks,
                 "trie_blocks": r.trie_blocks,
@@ -4480,6 +4435,42 @@ pub async fn get_rebalance_moves(
 // Rollback Stats (global counters, process lifetime)
 // ═══════════════════════════════════════════════════════════
 
+/// 维测:识别自检——把上游报错 body 对着当前生效 patterns 跑一遍识别
+/// 与码提取,离线验证新报错形态是否会被命中,零副作用(不写任何计数)。
+#[derive(serde::Deserialize)]
+pub struct RollbackSelfTestRequest {
+    /// Upstream HTTP status (default 400 — the L1 status gate).
+    pub status: Option<u16>,
+    /// Raw upstream error body.
+    pub body: String,
+}
+
+pub async fn rollback_self_test(
+    _session: AdminSession,
+    Extension(state): Extension<std::sync::Arc<DashboardState>>,
+    axum::Json(req): axum::Json<RollbackSelfTestRequest>,
+) -> Response {
+    let status = req.status.unwrap_or(400);
+    let patterns = state
+        .rollback_patterns
+        .read()
+        .map(|g| g.clone())
+        .unwrap_or_default();
+    let m = boom_core::context_error::identify(status, &req.body, &patterns);
+    let e = boom_core::GatewayError::UpstreamError { status, message: req.body.clone() };
+    let code = boom_core::context_error::error_code_of(&e);
+    Json(json!({
+        "matched": m.matched,
+        "requested_tokens": m.requested_tokens,
+        "max_tokens": m.max_tokens,
+        "code": code,
+        "pattern_count": patterns.len(),
+    }))
+    .into_response()
+}
+
+
+
 pub async fn get_rollback_stats(
     _session: AdminSession,
     Extension(state): Extension<Arc<DashboardState>>,
@@ -4487,7 +4478,82 @@ pub async fn get_rollback_stats(
     // Snapshot field names are the API contract. Invariants:
     //   identify_total == identify_miss + pool_inert + no_target + fallback_selected
     //   fallback_selected == retry_success + retry_error + guard_error
-    Json(json!(state.rollback_stats.snapshot())).into_response()
+    //
+    // `pools` carries the per-model rollback POOL STATE (moved here from
+    // the Models page): declaration is the sole participation signal, so
+    // the state is derived from the deployment rows — enabled rows only
+    // (a disabled instance is not routable, it is neither a tier nor a
+    // rescue target). Computed server-side; absent rows → empty list.
+    let mut v = serde_json::to_value(state.rollback_stats.snapshot())
+        .unwrap_or_else(|_| serde_json::json!({}));
+    let pools: Vec<serde_json::Value> = match &state.db_pool {
+        Some(db_pool) => match boom_routing::DeploymentStore::list_all_db(db_pool).await {
+            Ok(rows) => {
+                // Group by model (rows arrive model-sorted), enabled only.
+                use std::collections::BTreeMap;
+                let mut by_model: BTreeMap<String, Vec<&boom_routing::DeploymentRow>> =
+                    BTreeMap::new();
+                for r in &rows {
+                    if r.enabled.unwrap_or(true) {
+                        by_model.entry(r.model_name.clone()).or_default().push(r);
+                    }
+                }
+                by_model
+                    .into_iter()
+                    .map(|(model, rs)| {
+                        // State verdict from ROUTABLE rows only (a disabled
+                        // instance is neither a tier nor a rescue target);
+                        // the deployment list is RAW — every row shown with
+                        // its original declaration value.
+                        let enabled_rows: Vec<&boom_routing::DeploymentRow> =
+                            rs.iter().copied().filter(|r| r.enabled.unwrap_or(true)).collect();
+                        let tiers: Vec<i64> = {
+                            let mut v: Vec<i64> = enabled_rows
+                                .iter()
+                                .filter_map(|r| r.max_context_tokens)
+                                .collect();
+                            v.sort_unstable();
+                            v.dedup();
+                            v
+                        };
+                        let undeclared = enabled_rows.len() - declared_len(&enabled_rows);
+                        let state = if tiers.is_empty() {
+                            "unconfigured"
+                        } else if tiers.len() >= 2 {
+                            "active"
+                        } else if undeclared > 0 {
+                            "rescue"
+                        } else {
+                            "single"
+                        };
+                        let deployments: Vec<serde_json::Value> = rs
+                            .iter()
+                            .map(|r| {
+                                json!({
+                                    "deployment_id": r.deployment_id.clone().unwrap_or_else(|| r.id.to_string()),
+                                    "max_context_tokens": r.max_context_tokens,
+                                    "enabled": r.enabled.unwrap_or(true),
+                                })
+                            })
+                            .collect();
+                        json!({
+                            "model": model,
+                            "state": state,
+                            "deployments": deployments,
+                        })
+                    })
+                    .collect()
+            }
+            Err(_) => Vec::new(),
+        },
+        None => Vec::new(),
+    };
+    v["pools"] = json!(pools);
+    Json(v).into_response()
+}
+
+fn declared_len<'a>(rows: &[&'a boom_routing::DeploymentRow]) -> usize {
+    rows.iter().filter(|r| r.max_context_tokens.is_some()).count()
 }
 
 // ═══════════════════════════════════════════════════════════
