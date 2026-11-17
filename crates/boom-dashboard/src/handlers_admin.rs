@@ -69,10 +69,12 @@ fn validate_prefix_and_tag(req: &CreateKeyRequest) -> Option<Response> {
         if !p.is_empty() && !is_valid_prefix(p) {
             return Some((
                 axum::http::StatusCode::BAD_REQUEST,
-                format!(
-                    "Invalid key_prefix '{}': must be 1-50 ASCII alphanumeric chars [a-zA-Z0-9]",
-                    p
-                ),
+                Json(json!({
+                    "error": format!(
+                        "Invalid key_prefix '{}': must be 1-50 ASCII alphanumeric chars [a-zA-Z0-9]",
+                        p
+                    )
+                })),
             )
                 .into_response());
         }
@@ -81,7 +83,7 @@ fn validate_prefix_and_tag(req: &CreateKeyRequest) -> Option<Response> {
         if tag.chars().count() > MAX_TAG_LEN {
             return Some((
                 axum::http::StatusCode::BAD_REQUEST,
-                format!("Invalid tag: length must be <= {} chars", MAX_TAG_LEN),
+                Json(json!({ "error": format!("Invalid tag: length must be <= {} chars", MAX_TAG_LEN) })),
             )
                 .into_response());
         }
@@ -992,7 +994,7 @@ pub async fn create_key(
         req.max_parallel_requests,
         req.budget_duration.as_deref(),
     ) {
-        return (StatusCode::BAD_REQUEST, msg).into_response();
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response();
     }
 
     // 0b. Reject a budget that a governing plan would silently disable.
@@ -1002,7 +1004,7 @@ pub async fn create_key(
         &req.plan_name,
         req.team_id.as_deref(),
     ) {
-        return (StatusCode::BAD_REQUEST, msg).into_response();
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response();
     }
 
     // 1. Generate raw key + token hash + optional prefix metadata.
@@ -1033,7 +1035,7 @@ pub async fn create_key(
         if exists {
             return (
                 axum::http::StatusCode::CONFLICT,
-                format!("key_alias '{}' already exists", alias),
+                Json(json!({ "error": format!("key_alias '{}' already exists", alias) })),
             )
                 .into_response();
         }
@@ -1080,7 +1082,7 @@ pub async fn create_key(
         tracing::error!("Dashboard create_key insert failed: {}", e);
         return (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            "Internal error",
+            Json(json!({ "error": "Internal error" })),
         )
             .into_response();
     }
