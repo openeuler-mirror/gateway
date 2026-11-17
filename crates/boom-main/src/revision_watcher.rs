@@ -3,6 +3,10 @@
 //! - [`spawn_instance_heartbeat`]: upsert this process's liveness row every
 //!   [`boom_state::HEARTBEAT_INTERVAL_SECS`]. DB-side NOW() only — instance
 //!   clocks are never trusted for liveness.
+//! - [`spawn_instance_telemetry`]: publish this instance's in-flight
+//!   telemetry snapshot into the same row every
+//!   `instance_telemetry.interval_secs` (default 3s), so any instance's
+//!   dashboard can render peer state.
 //! - [`spawn_revision_watcher`]: poll `boom_config_revision` every
 //!   [`boom_state::REVISION_POLL_INTERVAL_SECS`] and react to changed
 //!   categories by reconciling the matching store from the DB. The local
@@ -39,7 +43,7 @@ pub fn spawn_instance_heartbeat(state: AppState, mut shutdown: Receiver<()>) {
     tokio::spawn(async move {
         let mut identity_lost = false;
         loop {
-            match heartbeat(&pool, &info).await {
+            match heartbeat(&pool, &info, None).await {
                 Ok(boom_state::registry::Heartbeat::Own) => {}
                 Ok(boom_state::registry::Heartbeat::ReRegistered) => {
                     tracing::warn!("instance heartbeat row had vanished — re-registered");
@@ -84,6 +88,168 @@ pub fn spawn_instance_heartbeat(state: AppState, mut shutdown: Receiver<()>) {
             }
         }
     });
+}
+
+/// Publish this instance's telemetry snapshot (counters only — no per-user
+/// detail) into `boom_instance_state.snapshot` every
+/// `instance_telemetry.interval_secs` (default 3s, reload-effective). The
+/// snapshot piggybacks the pid-guarded heartbeat UPDATE: liveness stays at
+/// least as fresh as the telemetry cadence, and identity fencing is the
+/// heartbeat's concern (it seals shared-state writes on takeover —
+/// telemetry is display-only and the pid guard already no-ops our writes).
+///
+/// Snapshot semantics: overwrite in place, no history — this is a
+/// dashboard view of "now", not an audit source.
+pub fn spawn_instance_telemetry(state: AppState, mut shutdown: Receiver<()>) {
+    let Some(pool) = state.db_pool.clone() else {
+        return; // No DB — no cluster to share telemetry with.
+    };
+    let info = {
+        let server = &state.inner.load().config.server;
+        InstanceInfo::current(&state.instance_id, &server.host, server.port)
+    };
+
+    tokio::spawn(async move {
+        let mut identity_lost = false;
+        loop {
+            let telemetry = build_instance_telemetry(
+                state.flow_controller.get_stats(),
+                state.inflight.get_deployment_stats(),
+            );
+            match serde_json::to_string(&telemetry) {
+                Ok(json) => match heartbeat(&pool, &info, Some(&json)).await {
+                    Ok(boom_state::registry::Heartbeat::Own)
+                    | Ok(boom_state::registry::Heartbeat::ReRegistered) => {}
+                    Ok(boom_state::registry::Heartbeat::TakenOver { holder_pid }) => {
+                        // The heartbeat task already fences shared-state
+                        // writes; telemetry needs no more than a sticky log
+                        // (pid-guarded writes are no-ops for us now).
+                        if !identity_lost {
+                            tracing::error!(
+                                instance_id = %info.instance_id,
+                                holder_pid,
+                                "instance telemetry refusing to publish — row held by \
+                                 another process (duplicate instance id)"
+                            );
+                        } else {
+                            tracing::debug!(
+                                instance_id = %info.instance_id,
+                                holder_pid,
+                                "instance telemetry still withheld (row held elsewhere)"
+                            );
+                        }
+                        identity_lost = true;
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "instance telemetry write failed (will retry)");
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(error = %e, "instance telemetry serialization failed");
+                }
+            }
+            let interval = state
+                .inner
+                .load()
+                .config
+                .instance_telemetry
+                .effective_interval_secs();
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(interval)) => {}
+                _ = shutdown.recv() => {
+                    tracing::debug!("instance telemetry task shutting down");
+                    return;
+                }
+            }
+        }
+    });
+}
+
+/// Merge the two in-flight views into the cross-instance wire snapshot.
+/// FlowControl stats are authoritative (they carry queue depth and caps);
+/// deployments without an FC slot fall back to the raw tracker (caps
+/// unknown → 0). Deployments absent from both have no activity — omitted,
+/// readers default missing keys to zero.
+fn build_instance_telemetry(
+    fc_stats: Vec<boom_flowcontrol::FlowControlStat>,
+    tracker_stats: Vec<boom_routing::DeploymentInFlightStat>,
+) -> boom_core::InstanceTelemetry {
+    let inflight = fc_stats
+        .into_iter()
+        .map(|s| {
+            (
+                s.deployment_id,
+                boom_core::InflightStat {
+                    fc_queue: s.waiters + s.vip_waiters,
+                    in_reqs: s.current_inflight as u64,
+                    in_context: s.current_context,
+                    in_reqs_max: s.max_inflight,
+                    in_context_max: s.max_context,
+                },
+            )
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    let inflight = tracker_stats
+        .into_iter()
+        .fold(inflight, |mut acc, d| {
+            acc.entry(d.deployment_id).or_insert_with(|| {
+                boom_core::InflightStat {
+                    in_reqs: d.inflight_requests,
+                    in_context: d.inflight_input_chars,
+                    ..Default::default()
+                }
+            });
+            acc
+        });
+    boom_core::InstanceTelemetry { inflight }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn telemetry_merges_fc_and_tracker_views() {
+        let fc = vec![boom_flowcontrol::FlowControlStat {
+            deployment_id: "dep-fc".into(),
+            current_inflight: 3,
+            current_context: 3000,
+            waiters: 1,
+            vip_waiters: 2,
+            max_inflight: 10,
+            max_context: 100_000,
+        }];
+        let tracker = vec![
+            // FC-covered deployment: tracker must NOT override FC values.
+            boom_routing::DeploymentInFlightStat {
+                model: "m".into(),
+                deployment_id: "dep-fc".into(),
+                inflight_requests: 999,
+                inflight_input_chars: 999,
+            },
+            // Tracker-only deployment: no FC slot → caps 0.
+            boom_routing::DeploymentInFlightStat {
+                model: "m2".into(),
+                deployment_id: "dep-raw".into(),
+                inflight_requests: 2,
+                inflight_input_chars: 500,
+            },
+        ];
+
+        let t = build_instance_telemetry(fc, tracker);
+
+        let fc = &t.inflight["dep-fc"];
+        assert_eq!(fc.fc_queue, 3); // waiters + vip_waiters
+        assert_eq!(fc.in_reqs, 3); // FC wins over tracker's 999
+        assert_eq!(fc.in_reqs_max, 10);
+        assert_eq!(fc.in_context_max, 100_000);
+        let raw = &t.inflight["dep-raw"];
+        assert_eq!(raw.in_reqs, 2);
+        assert_eq!(raw.in_context, 500);
+        assert_eq!(raw.fc_queue, 0);
+        assert_eq!(raw.in_reqs_max, 0);
+        assert_eq!(t.inflight.len(), 2);
+    }
 }
 
 /// Poll the revision counters and reconcile changed categories. The

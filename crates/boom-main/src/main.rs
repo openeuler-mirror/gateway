@@ -127,10 +127,12 @@ async fn async_main(
     // Spawn background sync task (persist rate limit state + cleanup memory).
     spawn_sync_task(state.clone(), shutdown_tx.subscribe(), shutdown_tx.subscribe());
 
-    // Cross-instance mechanisms: liveness heartbeat + config revision
-    // watcher (multi-instance propagation; single-instance no-ops into a
-    // cheap self-reconcile loop).
+    // Cross-instance mechanisms: liveness heartbeat + telemetry snapshot
+    // (in-flight counters for peer dashboards) + config revision watcher
+    // (multi-instance propagation; single-instance no-ops into a cheap
+    // self-reconcile loop).
     revision_watcher::spawn_instance_heartbeat(state.clone(), shutdown_tx.subscribe());
+    revision_watcher::spawn_instance_telemetry(state.clone(), shutdown_tx.subscribe());
     revision_watcher::spawn_revision_watcher(state.clone(), shutdown_tx.subscribe());
 
     // Spawn request summary logger (every 60s).
@@ -300,6 +302,7 @@ fn build_router(state: AppState) -> Router {
         state.cost_template_store.clone(),
         state.inflight.clone(),
         state.flow_controller.clone(),
+        state.instance_id.clone(),
         admin_tx,
         master_key,
         dashboard_session_secret,

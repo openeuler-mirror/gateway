@@ -4346,7 +4346,45 @@ pub async fn get_inflight_stats(
         })
     });
 
-    Json(json!({ "deployments": result })).into_response()
+    // Peer instances: live rows other than ours, each carrying its last
+    // telemetry snapshot (counters only). Best-effort — on any failure the
+    // page degrades to the local-only view it has always had.
+    let mut peers = serde_json::Map::new();
+    if let Some(pool) = &state.db_pool {
+        match boom_state::registry::live_instances(
+            pool,
+            std::time::Duration::from_secs(boom_state::INSTANCE_TTL_SECS),
+        )
+        .await
+        {
+            Ok(instances) => {
+                for inst in instances {
+                    if inst.instance_id == *state.instance_id {
+                        continue; // Self renders from live memory.
+                    }
+                    // NULL (fresh takeover, pre-telemetry binary) or an
+                    // unparseable snapshot → the peer contributes no rows.
+                    if let Some(t) = inst
+                        .snapshot
+                        .as_deref()
+                        .and_then(|s| serde_json::from_str::<boom_core::InstanceTelemetry>(s).ok())
+                    {
+                        peers.insert(inst.instance_id, json!(t));
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "peer telemetry unavailable; showing local view only");
+            }
+        }
+    }
+
+    Json(json!({
+        "deployments": result,
+        "peers": peers,
+        "self_instance_id": &*state.instance_id,
+    }))
+    .into_response()
 }
 
 /// Aggregate dispatched key entries by key_alias, returning per-key request counts.

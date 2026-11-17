@@ -1875,6 +1875,43 @@ input[list] {
   margin-left: 4px;
 }
 
+/* ── Cross-instance peer snapshot rows (stats page) ──────── */
+/* Peer rows sit under this instance's live row for the same deployment.
+   Muted, smaller, slightly dimmed — clearly secondary to the live row. */
+#inflight-table-wrap tbody tr.peer-row td {
+  opacity: 0.72;
+  font-size: 12px;
+}
+/* Instance badge: colored dot + id — one stable color per instance id
+   (hash-picked in app.js), so the same instance is trackable across rows.
+   Without --ib it marks the local instance. */
+.inst-badge {
+  display: inline-block;
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--ib, var(--primary));
+  white-space: nowrap;
+}
+.inst-badge::before {
+  content: "●";
+  margin-right: 3px;
+  font-size: 8px;
+  vertical-align: 1px;
+}
+/* Legend above the table: local (live) vs peers (snapshot). */
+#inflight-table-wrap .inflight-legend {
+  margin: 0 0 6px;
+  font-size: 12px;
+  color: var(--text3);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+#inflight-table-wrap .legend-sep { margin: 0 4px; opacity: 0.4; }
+#inflight-table-wrap .legend-sep::before { content: "|"; }
+
 /* ── Per-1M-token cost cell (models table) ───────────────── */
 /* Inline "label:$value" per line — three rows stack tightly so the
    column stays narrow even when EN headers ("Cost / 1M tokens") squeeze it. */

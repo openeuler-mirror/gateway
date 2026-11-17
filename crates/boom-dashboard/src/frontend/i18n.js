@@ -194,7 +194,7 @@
 
       "stats.inflight.title": "In-Flight Requests",
       "stats.inflight.col.model": "Model",
-      "stats.inflight.col.instance": "Instance",
+      "stats.inflight.col.deployment": "Deployment",
       "stats.inflight.col.fc_queue": "FC queue",
       "stats.inflight.col.in_reqs": "In-model reqs",
       "stats.inflight.col.in_context": "In-model context",
@@ -206,6 +206,8 @@
       "stats.inflight.no_inflight": "No in-flight requests.",
       "stats.inflight.24h_load_failed": "24h summary load failed: {error}",
       "stats.inflight.grp_instances": "{n} backend instances of this model",
+      "stats.inflight.legend.self_live": "this instance · live",
+      "stats.inflight.legend.peer_snapshot": "peer instances · snapshot (up to 3s stale)",
 
       "stats.rate.title": "Request Rate (per model)",
       "stats.rate.no_data": "No data.",
@@ -1443,7 +1445,7 @@
 
       "stats.inflight.title": "在途请求",
       "stats.inflight.col.model": "模型",
-      "stats.inflight.col.instance": "实例",
+      "stats.inflight.col.deployment": "部署",
       "stats.inflight.col.fc_queue": "流控队列",
       "stats.inflight.col.in_reqs": "模型在途",
       "stats.inflight.col.in_context": "上下文长度",
@@ -1455,6 +1457,8 @@
       "stats.inflight.no_inflight": "暂无在途请求。",
       "stats.inflight.24h_load_failed": "24小时汇总加载失败：{error}",
       "stats.inflight.grp_instances": "该模型共 {n} 个后端实例",
+      "stats.inflight.legend.self_live": "本实例 · 实时",
+      "stats.inflight.legend.peer_snapshot": "其他实例 · 快照（最多滞后 3s）",
 
       "stats.rate.title": "请求速率（按模型）",
       "stats.rate.no_data": "暂无数据。",

@@ -254,10 +254,13 @@ pub async fn register(pool: &PgPool, info: &InstanceInfo) -> Result<Registration
         });
     }
 
-    // Take over: rewrite the row with this boot's incarnation.
+    // Take over: rewrite the row with this boot's incarnation. The previous
+    // incarnation's telemetry snapshot must not survive the boundary — the
+    // new one repopulates it within one telemetry tick.
     sqlx::query(
         r#"UPDATE boom_instance_state
            SET hostname = $2, pid = $3, version = $4, advertise_addr = $5,
+               snapshot = NULL,
                started_at = NOW(), heartbeat_at = NOW()
            WHERE instance_id = $1"#,
     )
@@ -403,24 +406,45 @@ pub enum Heartbeat {
     TakenOver { holder_pid: i64 },
 }
 
-/// Advance the heartbeat. The UPDATE is pid-guarded: a 0-row result means
-/// the row was taken over (another pid) or deleted, and the follow-up
-/// SELECT distinguishes the two. All timestamps are DB-side NOW() — clock
-/// drift cannot kill a live instance or resurrect a dead one. No
-/// error-code classification: every branch is decided by row counts, so
-/// this is GaussDB-safe.
-pub async fn heartbeat(pool: &PgPool, info: &InstanceInfo) -> Result<Heartbeat, sqlx::Error> {
-    let updated = sqlx::query(
-        r#"UPDATE boom_instance_state
-           SET heartbeat_at = NOW(), advertise_addr = $2
-           WHERE instance_id = $1 AND pid = $3"#,
-    )
-    .bind(&info.instance_id)
-    .bind(&info.advertise_addr)
-    .bind(info.pid as i64)
-    .execute(pool)
-    .await?
-    .rows_affected();
+/// Advance the heartbeat, optionally refreshing the telemetry `snapshot`
+/// blob in the same pid-guarded UPDATE. Two callers, one outcome path: the
+/// 15s heartbeat task passes `None`, the 3s telemetry task passes `Some` —
+/// which also refreshes `heartbeat_at`, making liveness at least as fresh
+/// as the telemetry cadence. A 0-row result means the row was taken over
+/// (another pid) or deleted, and the follow-up SELECT distinguishes the
+/// two. All timestamps are DB-side NOW() — clock drift cannot kill a live
+/// instance or resurrect a dead one. No error-code classification: every
+/// branch is decided by row counts, so this is GaussDB-safe.
+pub async fn heartbeat(
+    pool: &PgPool,
+    info: &InstanceInfo,
+    snapshot: Option<&str>,
+) -> Result<Heartbeat, sqlx::Error> {
+    let updated = match snapshot {
+        None => sqlx::query(
+            r#"UPDATE boom_instance_state
+               SET heartbeat_at = NOW(), advertise_addr = $2
+               WHERE instance_id = $1 AND pid = $3"#,
+        )
+        .bind(&info.instance_id)
+        .bind(&info.advertise_addr)
+        .bind(info.pid as i64)
+        .execute(pool)
+        .await?
+        .rows_affected(),
+        Some(s) => sqlx::query(
+            r#"UPDATE boom_instance_state
+               SET heartbeat_at = NOW(), advertise_addr = $2, snapshot = $3
+               WHERE instance_id = $1 AND pid = $4"#,
+        )
+        .bind(&info.instance_id)
+        .bind(&info.advertise_addr)
+        .bind(s)
+        .bind(info.pid as i64)
+        .execute(pool)
+        .await?
+        .rows_affected(),
+    };
     if updated > 0 {
         return Ok(Heartbeat::Own);
     }

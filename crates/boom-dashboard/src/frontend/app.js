@@ -2754,11 +2754,40 @@
     }
   }
 
+  // Deterministic muted hue per instance id — peer badges stay visually
+  // trackable across rows without any extra state.
+  function peerColor(id) {
+    var palette = ["#d97706", "#0f766e", "#7c3aed", "#b91c1c", "#1d4ed8", "#be185d", "#4d7c0f", "#9333ea"];
+    var h = 0;
+    for (var i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) >>> 0;
+    return palette[h % palette.length];
+  }
+
   function renderInflightTable(data, visMap) {
     const wrap = document.getElementById("inflight-table-wrap");
     var deployments = data.deployments || [];
+    var peers = data.peers || {};
+    var selfId = data.self_instance_id || "";
+    var peerIds = Object.keys(peers).sort();
+    var localDeps = {};
+    deployments.forEach(function (d) { localDeps[d.deployment_id] = true; });
 
-    if (!deployments.length) {
+    // Deployments known only to peer instances (not configured here) render
+    // as a trailing "-" model group.
+    var remoteOnlyIds = [];
+    var remoteSeen = {};
+    peerIds.forEach(function (pid) {
+      var fl = (peers[pid] && peers[pid].inflight) || {};
+      Object.keys(fl).forEach(function (depId) {
+        if (!localDeps[depId] && !remoteSeen[depId]) {
+          remoteSeen[depId] = true;
+          remoteOnlyIds.push(depId);
+        }
+      });
+    });
+    remoteOnlyIds.sort();
+
+    if (!deployments.length && !remoteOnlyIds.length) {
       var emptyMsg = t("stats.inflight.no_inflight");
       if (deployment24hSummary && deployment24hSummary.__error) {
         emptyMsg += ' <span style="color:#c00">' + t("stats.inflight.24h_load_failed", { error: esc(String(deployment24hSummary.__error)) }) + "</span>";
@@ -2772,84 +2801,165 @@
       errorBanner = '<p style="color:#c00;margin:0 0 6px">' + t("stats.inflight.24h_load_failed", { error: esc(String(deployment24hSummary.__error)) }) + "</p>";
     }
 
+    // Peer snapshots carry counters only (no per-user detail, by design).
+    function peerStat(pid, depId) {
+      var p = peers[pid];
+      return p && p.inflight && p.inflight[depId];
+    }
+    function peerIdsFor(depId) {
+      return peerIds.filter(function (pid) { return peerStat(pid, depId); });
+    }
+    function peerBadgeHtml(pid) {
+      return '<span class="inst-badge" style="--ib:' + peerColor(pid) + '">' + esc(pid) + "</span>";
+    }
+    function fmtInflightDisplay(s) {
+      return {
+        reqs: s.in_reqs_max > 0 ? s.in_reqs + " / " + s.in_reqs_max : String(s.in_reqs),
+        ctx: s.in_context_max > 0
+          ? s.in_context.toLocaleString() + " / " + s.in_context_max.toLocaleString()
+          : s.in_context.toLocaleString(),
+      };
+    }
+    // Peer row: counters from the snapshot; the 24h columns are
+    // cluster-global aggregates and cannot be split per instance.
+    function peerRowHtml(pid, depId, grp, modelTd) {
+      var s = peerStat(pid, depId);
+      var disp = fmtInflightDisplay(s);
+      return (
+        "<tr class=\"" + grp + " peer-row\">" +
+        modelTd +
+        "<td class=\"inst-id\">" + peerBadgeHtml(pid) + " " + esc(depId) + "</td>" +
+        "<td class=\"num\">" + s.fc_queue + "</td>" +
+        "<td class=\"num\">" + disp.reqs + "</td>" +
+        "<td class=\"num\">" + disp.ctx + "</td>" +
+        "<td class=\"num\">-</td>" +
+        "<td class=\"num\">-</td>" +
+        "<td class=\"num\">-</td>" +
+        "<td class=\"num\">-</td>" +
+        "<td class=\"num\">-</td>" +
+        "</tr>"
+      );
+    }
+
+    var legend = "";
+    if (peerIds.length) {
+      legend =
+        '<div class="inflight-legend">' +
+        '<span class="inst-badge">' + esc(selfId) + "</span> " +
+        t("stats.inflight.legend.self_live") +
+        '<span class="legend-sep"></span>' +
+        peerIds.map(peerBadgeHtml).join(" ") + " " +
+        t("stats.inflight.legend.peer_snapshot") +
+        "</div>";
+    }
+
     // Rows arrive model-sorted from the backend (alphabetical model, then
     // deployment_id), so same-model instances are consecutive. Grouped-table
     // layout (AWS/GCP-console style): the model identity cell uses rowspan
-    // to span all of that model's instance rows, and each instance id gets
-    // its own column — block = model, row = instance. Zebra alternates by
-    // GROUP (the merged cell can't follow per-row striping): one model
-    // block shares one shade, adjacent blocks alternate.
-    var prevModel = null;
-    var groupIndex = -1;
+    // to span all of that model's rows, and each deployment id gets its own
+    // column — block = model, row = deployment. Zebra alternates by GROUP
+    // (the merged cell can't follow per-row striping): one model block
+    // shares one shade, adjacent blocks alternate.
+    //
+    // rowspan counts every row of the group, including peer snapshot rows;
+    // the ×N marker stays local-deployments-only — peers don't add backend
+    // instances, they are other views of the same deployments.
+    var localModelCounts = {};
     var groupCounts = {};
     deployments.forEach(function (d) {
-      groupCounts[d.model] = (groupCounts[d.model] || 0) + 1;
+      localModelCounts[d.model] = (localModelCounts[d.model] || 0) + 1;
+      groupCounts[d.model] = (groupCounts[d.model] || 0) + 1 + peerIdsFor(d.deployment_id).length;
     });
+
+    var rows = [];
+    var prevModel = null;
+    var groupIndex = -1;
+    deployments.forEach(function (d) {
+      var disp = fmtInflightDisplay(d);
+
+      // FC QUEUE tooltip — show queued key aliases (VIP first).
+      var fcQueueHtml = String(d.fc_queue);
+      if (d.fc_queue > 0 && d.queued_keys && d.queued_keys.length > 0) {
+        var items = d.queued_keys.map(function (k) {
+          var vipTag = k.is_vip ? "★ " : "";
+          return vipTag + esc(k.key_alias || "?");
+        });
+        fcQueueHtml = '<span class="cell-tip" data-tip="' + items.join("&#10;").replace(/"/g, "&quot;") + '">' + d.fc_queue + '</span>';
+      }
+
+      // IN-MODEL REQS tooltip — show per-key request counts.
+      var reqsHtml = disp.reqs;
+      if (d.in_reqs > 0 && d.key_stats && d.key_stats.length > 0) {
+        var reqItems = d.key_stats.map(function (k) {
+          var vipTag = k.is_vip ? "★ " : "";
+          return vipTag + esc(k.key_alias || "?") + ": " + k.request_count;
+        });
+        reqsHtml = '<span class="cell-tip" data-tip="' + reqItems.join("&#10;").replace(/"/g, "&quot;") + '">' + disp.reqs + '</span>';
+      }
+
+      var isGroupFirst = d.model !== prevModel;
+      prevModel = d.model;
+      if (isGroupFirst) groupIndex += 1;
+      var grp = groupIndex % 2 === 0 ? "grp-a" : "grp-b";
+      var modelTd = isGroupFirst
+        ? '<td class="grp-model" rowspan="' + groupCounts[d.model] + '">' +
+          renderDeployCell(d.model, null, localModelCounts[d.model]) +
+          (visMap ? visibilityBadgeFor(visMap[d.model]) : "") +
+          "</td>"
+        : "";
+
+      // 24h aggregates — read from cache populated on page load / Refresh button.
+      var s = d.deployment_id ? deployment24hSummary[d.deployment_id] : null;
+      function fmtInt(v) { return (v == null) ? "-" : Math.round(v).toLocaleString(); }
+      function fmtToken(v) { return (v == null) ? "-" : Math.round(v).toLocaleString(); }
+      function fmtTtft(v) { return (v == null) ? "-" : Math.round(v) + "ms"; }
+
+      rows.push(
+        "<tr class=\"" + grp + (isGroupFirst ? " grp-start" : "") + "\">" +
+        modelTd +
+        "<td class=\"inst-id\">" + esc(d.deployment_id) + "</td>" +
+        "<td class=\"num\">" + fcQueueHtml + "</td>" +
+        "<td class=\"num\">" + reqsHtml + "</td>" +
+        "<td class=\"num\">" + disp.ctx + "</td>" +
+        "<td class=\"num\">" + fmtInt(s ? s.total_requests : null) + "</td>" +
+        "<td class=\"num\">" + fmtToken(s ? s.avg_input_tokens : null) + "</td>" +
+        "<td class=\"num\">" + fmtToken(s ? s.avg_output_tokens : null) + "</td>" +
+        "<td class=\"num\">" + fmtTtft(s ? s.avg_ttft_ms : null) + "</td>" +
+        "<td class=\"num\">" + fmtPrefixHit(s ? s.avg_prefix_hit_rate : null) + "</td>" +
+        "</tr>"
+      );
+      peerIdsFor(d.deployment_id).forEach(function (pid) {
+        rows.push(peerRowHtml(pid, d.deployment_id, grp, ""));
+      });
+    });
+
+    // Trailing "-" group: deployments this instance doesn't know, seen only
+    // through peer snapshots.
+    if (remoteOnlyIds.length) {
+      groupIndex += 1;
+      var grpR = groupIndex % 2 === 0 ? "grp-a" : "grp-b";
+      var remoteFirst = true;
+      remoteOnlyIds.forEach(function (depId) {
+        peerIdsFor(depId).forEach(function (pid, i) {
+          var modelTd = i === 0
+            ? '<td class="grp-model" rowspan="' + peerIdsFor(depId).length + '">' +
+              renderDeployCell("-", null, 0) +
+              "</td>"
+            : "";
+          rows.push(peerRowHtml(pid, depId, grpR + (remoteFirst ? " grp-start" : ""), modelTd));
+          remoteFirst = false;
+        });
+      });
+    }
 
     wrap.innerHTML =
       errorBanner +
+      legend +
       '<table class="data-table"><thead><tr>' +
-      "<th>" + t("stats.inflight.col.model") + "</th><th>" + t("stats.inflight.col.instance") + "</th><th class=\"num\">" + t("stats.inflight.col.fc_queue") + "</th><th class=\"num\">" + t("stats.inflight.col.in_reqs") + "</th><th class=\"num\">" + t("stats.inflight.col.in_context") + "</th>" +
+      "<th>" + t("stats.inflight.col.model") + "</th><th>" + t("stats.inflight.col.deployment") + "</th><th class=\"num\">" + t("stats.inflight.col.fc_queue") + "</th><th class=\"num\">" + t("stats.inflight.col.in_reqs") + "</th><th class=\"num\">" + t("stats.inflight.col.in_context") + "</th>" +
       "<th class=\"num\">" + t("stats.inflight.col.24h_reqs") + "</th><th class=\"num\">" + t("stats.inflight.col.avg_in") + "</th><th class=\"num\">" + t("stats.inflight.col.avg_out") + "</th><th class=\"num\">" + t("stats.inflight.col.avg_ttft") + "</th><th class=\"num\">" + t("stats.inflight.col.avg_prefix_hit_rate") + "</th>" +
       "</tr></thead><tbody>" +
-      deployments
-        .map(function (d) {
-          var reqsDisplay = d.in_reqs_max > 0 ? d.in_reqs + " / " + d.in_reqs_max : String(d.in_reqs);
-          var ctxDisplay = d.in_context_max > 0 ? d.in_context.toLocaleString() + " / " + d.in_context_max.toLocaleString() : d.in_context.toLocaleString();
-
-          // FC QUEUE tooltip — show queued key aliases (VIP first).
-          var fcQueueHtml = String(d.fc_queue);
-          if (d.fc_queue > 0 && d.queued_keys && d.queued_keys.length > 0) {
-            var items = d.queued_keys.map(function (k) {
-              var vipTag = k.is_vip ? "★ " : "";
-              return vipTag + esc(k.key_alias || "?");
-            });
-            fcQueueHtml = '<span class="cell-tip" data-tip="' + items.join("&#10;").replace(/"/g, "&quot;") + '">' + d.fc_queue + '</span>';
-          }
-
-          // IN-MODEL REQS tooltip — show per-key request counts.
-          var reqsHtml = reqsDisplay;
-          if (d.in_reqs > 0 && d.key_stats && d.key_stats.length > 0) {
-            var reqItems = d.key_stats.map(function (k) {
-              var vipTag = k.is_vip ? "★ " : "";
-              return vipTag + esc(k.key_alias || "?") + ": " + k.request_count;
-            });
-            reqsHtml = '<span class="cell-tip" data-tip="' + reqItems.join("&#10;").replace(/"/g, "&quot;") + '">' + reqsDisplay + '</span>';
-          }
-
-          var isGroupFirst = d.model !== prevModel;
-          prevModel = d.model;
-          if (isGroupFirst) groupIndex += 1;
-          var grp = groupIndex % 2 === 0 ? "grp-a" : "grp-b";
-          var modelTd = isGroupFirst
-            ? '<td class="grp-model" rowspan="' + groupCounts[d.model] + '">' +
-              renderDeployCell(d.model, null, groupCounts[d.model]) +
-              (visMap ? visibilityBadgeFor(visMap[d.model]) : "") +
-              "</td>"
-            : "";
-
-          // 24h aggregates — read from cache populated on page load / Refresh button.
-          var s = d.deployment_id ? deployment24hSummary[d.deployment_id] : null;
-          function fmtInt(v) { return (v == null) ? "-" : Math.round(v).toLocaleString(); }
-          function fmtToken(v) { return (v == null) ? "-" : Math.round(v).toLocaleString(); }
-          function fmtTtft(v) { return (v == null) ? "-" : Math.round(v) + "ms"; }
-
-          return (
-            "<tr class=\"" + grp + (isGroupFirst ? " grp-start" : "") + "\">" +
-            modelTd +
-            "<td class=\"inst-id\">" + esc(d.deployment_id) + "</td>" +
-            "<td class=\"num\">" + fcQueueHtml + "</td>" +
-            "<td class=\"num\">" + reqsHtml + "</td>" +
-            "<td class=\"num\">" + ctxDisplay + "</td>" +
-            "<td class=\"num\">" + fmtInt(s ? s.total_requests : null) + "</td>" +
-            "<td class=\"num\">" + fmtToken(s ? s.avg_input_tokens : null) + "</td>" +
-            "<td class=\"num\">" + fmtToken(s ? s.avg_output_tokens : null) + "</td>" +
-            "<td class=\"num\">" + fmtTtft(s ? s.avg_ttft_ms : null) + "</td>" +
-            "<td class=\"num\">" + fmtPrefixHit(s ? s.avg_prefix_hit_rate : null) + "</td>" +
-            "</tr>"
-          );
-        })
-        .join("") +
+      rows.join("") +
       "</tbody></table>";
   }
 
