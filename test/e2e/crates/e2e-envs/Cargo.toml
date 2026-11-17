@@ -1,0 +1,15 @@
+[package]
+name = "e2e-envs"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+rand = { workspace = true }
+libc = { workspace = true }
+reqwest = { workspace = true }
+e2e-tools = { workspace = true }

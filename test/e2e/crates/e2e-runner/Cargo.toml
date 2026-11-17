@@ -1,0 +1,20 @@
+[package]
+name = "e2e-runner"
+edition.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "e2e-runner"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+e2e-tools = { workspace = true }
+e2e-envs = { workspace = true }
+e2e-impl = { workspace = true }
+futures = { workspace = true }
+libc = { workspace = true }
