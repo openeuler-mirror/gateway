@@ -3210,6 +3210,9 @@ pub struct ListLogsQuery {
     pub error: Option<String>,
     pub team_alias: Option<String>,
     pub policy: Option<String>,
+    /// Multi-instance ops: restrict rows to one gateway instance (stable
+    /// instance id, e.g. "127.0.0.1:8080"). ILIKE for prefix matching.
+    pub instance_id: Option<String>,
     pub client_ip: Option<String>,
     /// Time window: "3d" (default) / "7d" / "30d" / "all". Bounds the scan to
     /// the created_at index range so the ILIKE filters only apply within the
@@ -3271,6 +3274,9 @@ struct LogRow {
     trie_max_blocks: Option<i64>,
     request_tokens: Option<i64>,
     queue_wait_ms: Option<i32>,
+    // Multi-instance attribution: the stable instance id that served the
+    // request (NULL on rows written by older binaries).
+    instance_id: Option<String>,
     // Per-user attribution slots — values of the configured user_tag_headers,
     // one column per header in list order.
     user_tag1: Option<String>,
@@ -3319,6 +3325,7 @@ pub async fn list_logs(
     let team_alias_param = slot!(query.team_alias);
     let client_ip_param   = slot!(query.client_ip);
     let policy_param     = slot!(query.policy);
+    let instance_param   = slot!(query.instance_id);
 
     if let Some(i) = range_param {
         where_clauses.push(format!("rl.created_at >= ${i}"));
@@ -3366,6 +3373,9 @@ pub async fn list_logs(
         // so both the raw name and display labels match via ILIKE.
         where_clauses.push(format!("rl.schedule_policy ILIKE ${}", policy_param.unwrap()));
     }
+    if query.instance_id.is_some() {
+        where_clauses.push(format!("rl.instance_id ILIKE ${}", instance_param.unwrap()));
+    }
     if query.client_ip.is_some() {
         where_clauses.push(format!("rl.client_ip ILIKE ${}", client_ip_param.unwrap()));
     }
@@ -3388,7 +3398,7 @@ pub async fn list_logs(
                   rl.deployment_id, rl.client_ip, rl.cached_tokens,
                   rl.schedule_policy, rl.kv_hit_blocks, rl.kv_input_blocks,
                   rl.trie_blocks, rl.trie_max_blocks, rl.request_tokens,
-                  rl.queue_wait_ms, rl.user_tag1, rl.user_tag2, rl.user_tag3
+                  rl.queue_wait_ms, rl.instance_id, rl.user_tag1, rl.user_tag2, rl.user_tag3
            FROM boom_request_log rl
            LEFT JOIN boom_team_table bt ON rl.team_id = bt.team_id
            {where_sql}
@@ -3408,6 +3418,7 @@ pub async fn list_logs(
     let team_alias_pattern = query.team_alias.as_ref().map(|v| format!("%{}%", escape_like(v)));
     let client_ip_pattern  = query.client_ip.as_ref().map(|v| format!("%{}%", escape_like(v)));
     let policy_pattern     = query.policy.as_ref().map(|v| format!("%{}%", escape_like(v)));
+    let instance_pattern   = query.instance_id.as_ref().map(|v| format!("%{}%", escape_like(v)));
 
     // Bind parameters (order must match slot allocation above).
     if let Some(from) = range_from {
@@ -3445,6 +3456,9 @@ pub async fn list_logs(
         q = q.bind(p.clone());
     }
     if let Some(ref p) = policy_pattern {
+        q = q.bind(p.clone());
+    }
+    if let Some(ref p) = instance_pattern {
         q = q.bind(p.clone());
     }
 
@@ -3500,6 +3514,9 @@ pub async fn list_logs(
         cq = cq.bind(p.clone());
     }
     if let Some(ref p) = policy_pattern {
+        cq = cq.bind(p.clone());
+    }
+    if let Some(ref p) = instance_pattern {
         cq = cq.bind(p.clone());
     }
     cq = cq.bind(LOGS_COUNT_CAP);
@@ -3574,6 +3591,7 @@ pub async fn list_logs(
                 // DFX: scheduling observability. Raw schedule_policy value —
                 // WYSIWYG: what you see is what you can filter on (ILIKE).
                 "policy": r.schedule_policy.clone().unwrap_or_default(),
+                "instance_id": r.instance_id,
                 "kv_hit_blocks": r.kv_hit_blocks,
                 "kv_input_blocks": r.kv_input_blocks,
                 "trie_blocks": r.trie_blocks,

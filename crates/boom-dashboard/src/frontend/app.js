@@ -181,6 +181,7 @@
       document.getElementById("sidebar-version-admin").textContent = v;
       if (data.instance_id) {
         document.getElementById("sidebar-instance-admin").textContent = data.instance_id;
+        window.__BOOM_INSTANCE_ID = data.instance_id;
       }
     } catch {
       // Network/probe failure — leave the placeholder; not worth surfacing.
@@ -3378,6 +3379,10 @@
       '<span id="rb-st-result" style="font-size:12px"></span></div></div>';
 
     wrap.innerHTML = html;
+    // 多实例观测(本次复现的错位教训):回退统计是每实例进程内存态,
+    // 面板必须标明"这是哪个实例的计数"。
+    const sub = document.getElementById("rollback-instance-badge");
+    if (sub) sub.textContent = window.__BOOM_INSTANCE_ID ? " @ " + window.__BOOM_INSTANCE_ID : "";
   }
 
   // 维测④的后端调用:POST /admin/stats/rollback/self-test(零副作用)。
@@ -9502,7 +9507,7 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
       '<tr>' +
         '<th>Time</th><th>IP</th><th>Team</th><th>Key</th><th>Model</th><th>Path</th>' +
         '<th>Status</th><th>Stream</th><th>IN/OUT</th><th>Prefix Hit</th>' +
-        '<th>Policy</th><th>Req Bytes</th><th>Duration</th><th>TTFT</th><th>Error</th><th>Detail</th>' +
+        '<th>Policy</th><th>Instance</th><th>Req Bytes</th><th>Duration</th><th>TTFT</th><th>Error</th><th>Detail</th>' +
       '</tr>' +
       '<tr class="filter-row">' +
         '<td></td>' +
@@ -9515,6 +9520,7 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
         '<td><input class="col-filter" data-col="stream" placeholder="filter"></td>' +
         '<td></td><td></td>' +
         '<td><input class="col-filter" data-col="policy" placeholder="filter"></td>' +
+        '<td><input class="col-filter" data-col="instance_id" placeholder="filter"></td>' +
         '<td></td><td></td><td></td>' +
         '<td><input class="col-filter" data-col="error" placeholder="filter"></td>' +
         '<td></td>' +
@@ -9570,6 +9576,7 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
       '<td class="mono">' + inOut + '</td>' +
       '<td class="mono kvc-prefix">' + prefixCell + '</td>' +
       '<td class="mono">' + esc(l.policy || "-") + '</td>' +
+      '<td class="mono">' + esc(l.instance_id || "-") + '</td>' +
       '<td class="mono">' + (l.request_tokens != null ? formatNumber(l.request_tokens) : "-") + '</td>' +
       '<td>' + (l.duration_ms != null ? l.duration_ms + "ms" : "-") + '</td>' +
       '<td>' + (l.ttft_ms != null ? l.ttft_ms + "ms" : "-") + '</td>' +
@@ -9626,10 +9633,10 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
       var rows = data.logs || [];
       tbody.innerHTML = rows.length
         ? rows.map(renderKvcDfxRow).join("")
-        : '<tr><td colspan="16" class="muted">No logs.</td></tr>';
+        : '<tr><td colspan="17" class="muted">No logs.</td></tr>';
       renderKvcPagination(data);
     } catch (e) {
-      tbody.innerHTML = '<tr><td colspan="16" class="muted">Failed to load: ' + esc(String(e)) + '</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="17" class="muted">Failed to load: ' + esc(String(e)) + '</td></tr>';
     }
   }
 

@@ -261,19 +261,23 @@ function loadKvcBlock(debugEnabled, promptLogEnabled) {
 // 表头:16 列,Detail 在末尾;筛选行 16 格,10 个输入框不变
 const kvcShell = loadKvcBlock(false, false).kvcDfxShellHtml();
 if (!kvcShell.includes('<th>Detail</th>')) fail('KVC DFX header lacks Detail column');
+if (!kvcShell.includes('<th>Instance</th>')) fail('KVC DFX header lacks Instance column');
+if (!kvcShell.includes('data-col="instance_id"')) fail('instance filter input missing');
 const shellCells = (kvcShell.match(/<td[>\s]/g) || []).length;
-if (shellCells !== 16) fail(`filter row must have 16 cells, got ${shellCells}`);
-if ((kvcShell.match(/col-filter/g) || []).length !== 9) fail('filter input count changed');
+if (shellCells !== 17) fail(`filter row must have 17 cells, got ${shellCells}`);
+if ((kvcShell.match(/col-filter/g) || []).length !== 10) fail('filter input count changed');
 // debug 开 + prompt log 开:错误类型可点 → _showDebugError;Detail 有 View 按钮
 const kvcOn = loadKvcBlock(true, true);
 const errRow = kvcOn.renderKvcDfxRow({
   request_id: 'rid-1', key_hash: 'kh', team_alias: 'team-a', model: 'm1:d1', api_path: '/v1/chat/completions',
+  instance_id: '127.0.0.1:8080',
   status_code: 502, error_type: 'upstream_error', error_message: 'boom', is_stream: true,
   input_tokens: 10, output_tokens: 2, cached_tokens: 4, kv_hit_blocks: 1, kv_input_blocks: 2,
   trie_blocks: 3, trie_max_blocks: 100, request_tokens: 100, duration_ms: 5, ttft_ms: 1, policy: 'rr+rollback',
 });
 if (!errRow.includes("window._showDebugError('rid-1')")) fail('error cell must link _showDebugError when debug on');
 if (!errRow.includes("window._viewPromptLog('rid-1'")) fail('detail cell must offer prompt-log view');
+if (!errRow.includes('127.0.0.1:8080')) fail('instance_id cell rendered');
 if (!errRow.includes('action.view')) fail('detail cell button label');
 // 两个开关都关:无链接、Detail 为 "-"
 const errRowOff = loadKvcBlock(false, false).renderKvcDfxRow({
@@ -298,7 +302,7 @@ if (!okRow.includes("window._viewPromptLog('rid-3'")) fail('success row detail c
 // 列数:每行 16 个 <td>
 for (const row of [errRow, errRowOff, okRow]) {
   const tds = (row.match(/<td/g) || []).length;
-  if (tds !== 16) fail(`row must render 16 cells, got ${tds}`);
+  if (tds !== 17) fail(`row must render 17 cells, got ${tds}`);
 }
 
 console.log('SMOKE OK: KVC DFX detail column + debug-error link mirror the logs page');
