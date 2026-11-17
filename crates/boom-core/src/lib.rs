@@ -20,7 +20,7 @@ pub use debug_store::{DebugErrorEntry, DebugErrorStore};
 pub use error::GatewayError;
 pub use key_format::is_valid_prefix;
 pub use kv_event::KvIndexBackend;
-pub use instance_telemetry::{InstanceTelemetry, InflightStat};
+pub use instance_telemetry::{InstanceTelemetry, InflightStat, RateSeries, RateTelemetry};
 pub use otlp_config::OtlpConfig;
 pub use types::is_hard_blocked_header;
 pub use provider::{Authenticator, DeploymentQueueInfo, KeyAliasLookup, Provider};

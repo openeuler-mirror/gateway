@@ -19,6 +19,8 @@ use serde::{Deserialize, Serialize};
 pub struct InstanceTelemetry {
     #[serde(default)]
     pub inflight: HashMap<String, InflightStat>,
+    #[serde(default)]
+    pub rate_1h: RateTelemetry,
 }
 
 /// Counters only — no per-user detail (queued key lists, dispatched key
@@ -40,6 +42,31 @@ pub struct InflightStat {
     pub in_context_max: u64,
 }
 
+/// Request-rate histogram feeding the stats page's 1h "Request Rate"
+/// chart. Buckets are wall-clock minute-aligned tumbling counters, so
+/// instances sum exactly by minute — any dashboard shows the cluster
+/// total without per-instance splits. `_total` is NOT carried: readers
+/// recompute the grand total from the per-deployment series.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RateTelemetry {
+    /// Minute-epoch (epoch_secs / 60) of the NEWEST bucket (`counts[len-1]`).
+    #[serde(default)]
+    pub base_min: u64,
+    /// key = deployment_id; all-zero series omitted.
+    #[serde(default)]
+    pub series: HashMap<String, RateSeries>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RateSeries {
+    /// Model name recorded at request time (chart attribution).
+    #[serde(default)]
+    pub model: String,
+    /// Counts oldest-first: `counts[i]` is the minute `base_min - (len-1) + i`.
+    #[serde(default)]
+    pub counts: Vec<u64>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -54,6 +81,7 @@ mod tests {
                 in_reqs_max: 10,
                 in_context_max: 100000,
             })]),
+            ..Default::default()
         };
         let json = serde_json::to_string(&t).unwrap();
         let back: InstanceTelemetry = serde_json::from_str(&json).unwrap();
@@ -66,16 +94,43 @@ mod tests {
         // Old/foreign writer shapes must not break the reader.
         let t: InstanceTelemetry = serde_json::from_str("{}").unwrap();
         assert!(t.inflight.is_empty());
+        assert_eq!(t.rate_1h.base_min, 0);
+        assert!(t.rate_1h.series.is_empty());
 
         let t: InstanceTelemetry =
             serde_json::from_str(r#"{"inflight":{"dep-1":{"in_reqs":3}}}"#).unwrap();
         assert_eq!(t.inflight["dep-1"].in_reqs, 3);
         assert_eq!(t.inflight["dep-1"].fc_queue, 0);
         assert_eq!(t.inflight["dep-1"].in_context_max, 0);
+        assert!(t.rate_1h.series.is_empty());
+
+        // Old writer's snapshot (pre-rate_1h) keeps parsing with defaults.
+        let t: InstanceTelemetry =
+            serde_json::from_str(r#"{"inflight":{},"rate_1h":{"base_min":0}}"#).unwrap();
+        assert!(t.rate_1h.series.is_empty());
 
         // Unknown fields from a NEWER writer are ignored by an older reader.
         let t: InstanceTelemetry =
             serde_json::from_str(r#"{"inflight":{},"future_state":{"a":1}}"#).unwrap();
         assert!(t.inflight.is_empty());
+    }
+
+    #[test]
+    fn rate_1h_round_trip() {
+        let t = InstanceTelemetry {
+            rate_1h: RateTelemetry {
+                base_min: 29_000_000,
+                series: HashMap::from([("dep-1".into(), RateSeries {
+                    model: "GLM-5.3".into(),
+                    counts: vec![0, 2, 4],
+                })]),
+            },
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&t).unwrap();
+        let back: InstanceTelemetry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.rate_1h.base_min, 29_000_000);
+        assert_eq!(back.rate_1h.series["dep-1"].counts, vec![0, 2, 4]);
+        assert_eq!(back.rate_1h.series["dep-1"].model, "GLM-5.3");
     }
 }

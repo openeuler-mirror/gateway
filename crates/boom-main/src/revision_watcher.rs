@@ -112,9 +112,20 @@ pub fn spawn_instance_telemetry(state: AppState, mut shutdown: Receiver<()>) {
     tokio::spawn(async move {
         let mut identity_lost = false;
         loop {
+            // base_min captured before snapshot_all(): buckets are
+            // wall-clock minute-aligned, counts[i] maps to minute
+            // base_min - 59 + i. A minute-boundary straddle mid-call
+            // shifts one bucket for one 3s cycle — display-only, self-heals.
+            let rate_base_min = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                / 60;
             let telemetry = build_instance_telemetry(
                 state.flow_controller.get_stats(),
                 state.inflight.get_deployment_stats(),
+                state.request_rate.snapshot_all(),
+                rate_base_min,
             );
             match serde_json::to_string(&telemetry) {
                 Ok(json) => match heartbeat(&pool, &info, Some(&json)).await {
@@ -173,6 +184,8 @@ pub fn spawn_instance_telemetry(state: AppState, mut shutdown: Receiver<()>) {
 fn build_instance_telemetry(
     fc_stats: Vec<boom_flowcontrol::FlowControlStat>,
     tracker_stats: Vec<boom_routing::DeploymentInFlightStat>,
+    rate_stats: Vec<(String, String, Vec<(String, u64)>)>,
+    rate_base_min: u64,
 ) -> boom_core::InstanceTelemetry {
     let inflight = fc_stats
         .into_iter()
@@ -201,7 +214,28 @@ fn build_instance_telemetry(
             });
             acc
         });
-    boom_core::InstanceTelemetry { inflight }
+    // `_total` is skipped (readers recompute the grand total); all-zero
+    // series (traffic aged out of the window) stay out of the blob.
+    let series = rate_stats
+        .into_iter()
+        .filter(|(dep_id, _, _)| dep_id != "_total")
+        .filter_map(|(dep_id, model, data)| {
+            let counts: Vec<u64> = data.into_iter().map(|(_, c)| c).collect();
+            (!counts.iter().all(|&c| c == 0)).then(|| {
+                (
+                    dep_id,
+                    boom_core::RateSeries { model, counts },
+                )
+            })
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    boom_core::InstanceTelemetry {
+        inflight,
+        rate_1h: boom_core::RateTelemetry {
+            base_min: rate_base_min,
+            series,
+        },
+    }
 }
 
 #[cfg(test)]
@@ -235,8 +269,26 @@ mod tests {
                 inflight_input_chars: 500,
             },
         ];
+        let rate = vec![
+            (
+                "_total".into(),
+                "_total".into(),
+                vec![("now".into(), 7)],
+            ),
+            (
+                "dep-fc".into(),
+                "m".into(),
+                vec![("-59m".into(), 0), ("-1m".into(), 3), ("now".into(), 4)],
+            ),
+            // All-zero series (traffic aged out) stays out of the snapshot.
+            (
+                "dep-old".into(),
+                "m2".into(),
+                vec![("now".into(), 0)],
+            ),
+        ];
 
-        let t = build_instance_telemetry(fc, tracker);
+        let t = build_instance_telemetry(fc, tracker, rate, 29_000_059);
 
         let fc = &t.inflight["dep-fc"];
         assert_eq!(fc.fc_queue, 3); // waiters + vip_waiters
@@ -249,6 +301,12 @@ mod tests {
         assert_eq!(raw.fc_queue, 0);
         assert_eq!(raw.in_reqs_max, 0);
         assert_eq!(t.inflight.len(), 2);
+
+        assert_eq!(t.rate_1h.base_min, 29_000_059);
+        assert_eq!(t.rate_1h.series.len(), 1); // _total + all-zero dropped
+        let s = &t.rate_1h.series["dep-fc"];
+        assert_eq!(s.model, "m");
+        assert_eq!(s.counts, vec![0, 3, 4]);
     }
 }
 

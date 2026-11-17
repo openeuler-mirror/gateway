@@ -4851,7 +4851,13 @@ pub async fn get_request_rate_stats(
     if parsed.use_memory {
         let window = parsed.resolved.to_window();
         let all = state.request_rate.snapshot_all();
-        let expected_ts: Vec<String> = window.expected_buckets().into_iter()
+        let buckets = window.expected_buckets();
+        // Minute epoch of each expected bucket — the tracker's buckets are
+        // wall-clock minute-aligned tumbling counters, so peer snapshots can
+        // be summed by minute. Only meaningful for the 1h window (60 × 1min).
+        let expected_min: Vec<i64> = buckets.iter().map(|t| t.timestamp() / 60).collect();
+        let first_min = expected_min.first().copied().unwrap_or(0);
+        let expected_ts: Vec<String> = buckets.into_iter()
             .map(|t| t.to_rfc3339()).collect();
 
         // Reshape per-deployment snapshots into per-model groups. Each model
@@ -4884,6 +4890,70 @@ pub async fn get_request_rate_stats(
             }
             by_model.entry(model).or_default().insert(dep_id, v);
         }
+
+        // Peer snapshots: minute-aligned buckets sum exactly by wall-clock
+        // minute, so every dashboard renders the cluster total without
+        // per-instance splits. Same display-only semantics as the in-flight
+        // peers (≤3s stale); on any failure the chart stays local-only.
+        if window.bucket_secs == 60 {
+            if let Some(pool) = &state.db_pool {
+                if let Ok(instances) = boom_state::registry::live_instances(
+                    pool,
+                    std::time::Duration::from_secs(boom_state::INSTANCE_TTL_SECS),
+                )
+                .await
+                {
+                    for inst in instances {
+                        if inst.instance_id == *state.instance_id {
+                            continue; // Self renders from live memory.
+                        }
+                        let Some(t) = inst
+                            .snapshot
+                            .as_deref()
+                            .and_then(|s| serde_json::from_str::<boom_core::InstanceTelemetry>(s).ok())
+                        else {
+                            continue;
+                        };
+                        if t.rate_1h.base_min == 0 {
+                            continue; // Writer predates the rate histogram.
+                        }
+                        for (dep_id, series) in &t.rate_1h.series {
+                            let n = series.counts.len();
+                            for (i, &c) in series.counts.iter().enumerate() {
+                                if c == 0 {
+                                    continue;
+                                }
+                                let min = t.rate_1h.base_min.saturating_sub((n - 1 - i) as u64) as i64;
+                                // The 1h window is [now-60min, now) while the
+                                // tracker's newest bucket is the current wall
+                                // minute — the local pass zips tracker bucket
+                                // k onto slot k, so wall-minute data renders
+                                // one slot early. Mirror that exactly: a peer
+                                // minute maps to (min - 1)'s slot, or local
+                                // and peer views disagree by one bucket.
+                                let pos = min - first_min - 1;
+                                if pos < 0 || pos as usize >= expected_min.len() {
+                                    continue;
+                                }
+                                let entry = by_model
+                                    .entry(series.model.clone())
+                                    .or_default()
+                                    .entry(dep_id.clone())
+                                    .or_insert_with(|| vec![0u64; expected_min.len()]);
+                                entry[pos as usize] += c;
+                                total_counts[pos as usize] += c;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Peer traffic aged out of the window can leave all-zero series —
+        // drop them like the local pass does.
+        by_model.retain(|_, deps| {
+            deps.retain(|_, v| !v.iter().all(|&c| c == 0));
+            !deps.is_empty()
+        });
 
         let mut charts: Vec<serde_json::Value> = Vec::new();
 
