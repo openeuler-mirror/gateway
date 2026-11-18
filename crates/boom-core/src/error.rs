@@ -78,10 +78,18 @@ pub enum GatewayError {
     #[error("Upstream error ({status}): {message}")]
     UpstreamError { status: u16, message: String },
 
-    /// Context-length rejection passthrough (rollback L1 identified, no
-    /// fallback available or the fallback also rejected). Carries the
-    /// upstream 400 semantics + the original message so agents don't treat
-    /// it as a retryable 5xx (the UpstreamError→502 masking defect).
+    /// Context-length rejection. Two producers by design:
+    /// 1. Passthrough of the upstream 400 (rollback L1 identified, no
+    ///    fallback available or the fallback also rejected) — carries the
+    ///    original message so agents don't treat it as a retryable 5xx
+    ///    (the UpstreamError→502 masking defect).
+    /// 2. Ingress rejection by boom-main's `buffer_request_body` when the
+    ///    body exceeds `MAX_REQUEST_BODY_BYTES` (10 MiB ≈ 2.4M-token
+    ///    context): a body that large could not fit the served models'
+    ///    context anyway, so the client gets the SAME code/type as the backend's
+    ///    own context-length rejection — agents route it into their
+    ///    existing context-length handling instead of a generic-retry
+    ///    loop. Gateway logs keep the two origins distinguishable.
     #[error("Context length exceeded: {0}")]
     ContextLengthExceeded(String),
 
@@ -102,6 +110,16 @@ pub enum GatewayError {
         waiters: usize,
         message: String,
     },
+
+    /// Ingress failure: the body stream could not be read (connection
+    /// aborted mid-body, malformed framing). The request is rejected
+    /// with the cause — the gateway never caches empty bytes and lets a
+    /// downstream extractor fabricate a JSON syntax error from a body
+    /// the client never sent. No size-cap variant exists by design: the
+    /// ingress applies no app-level body limit (litellm-parity posture;
+    /// size governance belongs to the deployment boundary).
+    #[error("Failed to read request body: {0}")]
+    RequestBodyReadFailed(String),
 
     #[error("Internal error: {0}")]
     InternalError(String),
@@ -128,6 +146,7 @@ impl GatewayError {
             Self::ResponseNotFound(_) => 404,
             Self::UnsupportedMode(_) => 400,
             Self::FlowControlQueueTimeout { .. } => 503,
+            Self::RequestBodyReadFailed(_) => 400,
             Self::InternalError(_) => 500,
         }
     }
@@ -175,6 +194,10 @@ impl GatewayError {
                 | Self::UpstreamError { .. }
                 | Self::ProviderError(_)
                 | Self::UpstreamTimeout
+                // Ingress body-read failures come in bursts (broken
+                // connections, aborted uploads) — one log line per
+                // (key, model, 60s) is plenty.
+                | Self::RequestBodyReadFailed(_)
         )
     }
 
@@ -209,6 +232,7 @@ impl GatewayError {
             Self::ProviderError(_) => "provider_error",
             Self::UpstreamParseError { .. } => "upstream_parse_error",
             Self::FlowControlQueueTimeout { .. } => "flow_control_timeout",
+            Self::RequestBodyReadFailed(_) => "request_body_read_error",
             Self::ConfigError(_) | Self::InternalError(_) => "internal_error",
         }
     }
@@ -318,6 +342,16 @@ mod tests {
             // upstream of the DB write.
             assert!(e.should_log_to_db());
         }
+    }
+
+    #[test]
+    fn ingress_body_read_failed_mappings() {
+        // Read failure → honest 400 naming the cause, deduped (bursts of
+        // broken connections).
+        let read_failed = GatewayError::RequestBodyReadFailed("connection reset".into());
+        assert_eq!(read_failed.status_code(), 400);
+        assert_eq!(read_failed.error_type(), "request_body_read_error");
+        assert!(read_failed.should_dedup_log());
     }
 }
 
