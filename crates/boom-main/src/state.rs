@@ -255,6 +255,16 @@ impl AppState {
             ),
             None => format!("{}:{}", config.server.host, config.server.port).into(),
         };
+        // Length cap: the id is stamped into every request-log row and shown
+        // as a chip across the dashboard; an unbounded id would distort the
+        // UI and bloat hot-path writes. The default host:port form fits well
+        // under 32; bind to a long IPv6 literal? set a short explicit id.
+        if instance_id.len() > 32 {
+            anyhow::bail!(
+                "server.instance_id is {} bytes — max 32",
+                instance_id.len()
+            );
+        }
         tracing::info!(instance_id = %instance_id, "instance identity resolved");
 
         // Audit log writer: dedicated 8-conn pool + single batch-INSERT task.

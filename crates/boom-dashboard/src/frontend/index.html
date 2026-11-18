@@ -63,10 +63,16 @@
       <div class="layout">
         <aside class="sidebar">
           <div class="sidebar-top">
+            <svg class="sidebar-mark" viewBox="0 0 48 48" width="22" height="22" aria-hidden="true">
+              <g transform="translate(24,24)">
+                <rect x="-7" y="-7" width="14" height="14" fill="var(--primary)" transform="rotate(45)" rx="1.5"/>
+                <circle cx="-18" cy="0" r="3" fill="var(--primary)" opacity=".35"/>
+                <circle cx="18" cy="0" r="3" fill="var(--primary)" opacity=".35"/>
+                <circle cx="0" cy="-18" r="3" fill="var(--primary)" opacity=".35"/>
+                <circle cx="0" cy="18" r="3" fill="var(--primary)" opacity=".35"/>
+              </g>
+            </svg>
             <h2 id="user-sidebar-title">Dashboard</h2>
-            <button class="lang-toggle" id="lang-toggle-user" data-i18n-title="action.toggle_lang" title="Switch language">
-              <span class="lang-current">EN</span>
-            </button>
           </div>
           <nav>
             <a href="#/dashboard" class="nav-link active" data-section="user-overview">
@@ -84,10 +90,9 @@
           </nav>
           <div class="sidebar-footer">
             <span class="sidebar-version" id="sidebar-version-user">v—</span>
-            <button class="btn-secondary" id="logout-btn" data-i18n="action.logout">Logout</button>
-            <button class="theme-toggle" id="theme-toggle-user" data-i18n-title="action.toggle_theme" title="Toggle theme">
-              <svg class="icon-sun" viewBox="0 0 20 20" fill="currentColor"><circle cx="10" cy="10" r="4"/><path d="M10 0v3M10 17v3M0 10h3M17 10h3M2.93 2.93l2.12 2.12M14.95 14.95l2.12 2.12M2.93 17.07l2.12-2.12M14.95 5.05l2.12-2.12" stroke="currentColor" stroke-width="1.5" fill="none"/></svg>
-              <svg class="icon-moon" viewBox="0 0 20 20" fill="currentColor" style="display:none"><path d="M17.293 13.293A8 8 0 016.707 2.707a8.001 8.001 0 1010.586 10.586z"/></svg>
+            <button class="btn-secondary" id="logout-btn" data-i18n-title="action.logout" title="Logout">
+              <svg class="logout-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 2H3.5A1.5 1.5 0 002 3.5v9A1.5 1.5 0 003.5 14H6M10.5 11L14 8l-3.5-3M14 8H6"/></svg>
+              <span data-i18n="action.logout">Logout</span>
             </button>
           </div>
         </aside>
@@ -151,10 +156,16 @@
       <div class="layout">
         <aside class="sidebar">
           <div class="sidebar-top">
+            <svg class="sidebar-mark" viewBox="0 0 48 48" width="22" height="22" aria-hidden="true">
+              <g transform="translate(24,24)">
+                <rect x="-7" y="-7" width="14" height="14" fill="var(--primary)" transform="rotate(45)" rx="1.5"/>
+                <circle cx="-18" cy="0" r="3" fill="var(--primary)" opacity=".35"/>
+                <circle cx="18" cy="0" r="3" fill="var(--primary)" opacity=".35"/>
+                <circle cx="0" cy="-18" r="3" fill="var(--primary)" opacity=".35"/>
+                <circle cx="0" cy="18" r="3" fill="var(--primary)" opacity=".35"/>
+              </g>
+            </svg>
             <h2 data-i18n="admin.sidebar_title">Admin Panel</h2>
-            <button class="lang-toggle" id="lang-toggle-admin" data-i18n-title="action.toggle_lang" title="Switch language">
-              <span class="lang-current">EN</span>
-            </button>
           </div>
           <nav>
             <a href="#/admin/stats" class="nav-link" data-section="admin-stats">
@@ -214,11 +225,9 @@
           </nav>
           <div class="sidebar-footer">
             <span class="sidebar-version" id="sidebar-version-admin">v—</span>
-            <span class="sidebar-instance" id="sidebar-instance-admin"></span>
-            <button class="btn-secondary" id="logout-btn-admin" data-i18n="action.logout">Logout</button>
-            <button class="theme-toggle" id="theme-toggle-admin" data-i18n-title="action.toggle_theme" title="Toggle theme">
-              <svg class="icon-sun" viewBox="0 0 20 20" fill="currentColor"><circle cx="10" cy="10" r="4"/><path d="M10 0v3M10 17v3M0 10h3M17 10h3M2.93 2.93l2.12 2.12M14.95 14.95l2.12 2.12M2.93 17.07l2.12-2.12M14.95 5.05l2.12-2.12" stroke="currentColor" stroke-width="1.5" fill="none"/></svg>
-              <svg class="icon-moon" viewBox="0 0 20 20" fill="currentColor" style="display:none"><path d="M17.293 13.293A8 8 0 016.707 2.707a8.001 8.001 0 1010.586 10.586z"/></svg>
+            <button class="btn-secondary" id="logout-btn-admin" data-i18n-title="action.logout" title="Logout">
+              <svg class="logout-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 2H3.5A1.5 1.5 0 002 3.5v9A1.5 1.5 0 003.5 14H6M10.5 11L14 8l-3.5-3M14 8H6"/></svg>
+              <span data-i18n="action.logout">Logout</span>
             </button>
           </div>
         </aside>
@@ -248,6 +257,7 @@
                 <p data-i18n="stats.hero.sub">Live in-flight requests, per-model request rate and cross-instance totals</p>
               </div>
             </div>
+            <div class="stats-metrics" id="stats-summary-wrap"></div>
             <div class="section-header">
               <h2 data-i18n="stats.inflight.title">In-Flight Requests</h2>
               <div style="display:flex;gap:8px">
@@ -514,7 +524,7 @@
             <div class="debug-pane" data-pane="rollback">
               <div class="section-header" style="margin-top:1.5rem">
                 <h2 data-i18n="debug.rollback.title">Rollback Stats (global)</h2>
-                <span style="font-size:.85em;color:var(--text3)" data-i18n="debug.rollback.subtitle">Process lifetime cumulative</span><span id="rollback-instance-badge" style="font-size:.85em;color:var(--text3);font-family:var(--mono)"></span>
+                <span style="font-size:.85em;color:var(--text3)" data-i18n="debug.rollback.subtitle">Process lifetime cumulative</span>
               </div>
               <div id="rollback-stats-wrap"><p class="loading" data-i18n="common.loading">Loading...</p></div>
             </div>
@@ -568,6 +578,19 @@
                 <button class="btn-small btn-primary" id="btn-new-model" data-i18n="models.add">+ Add Model</button>
               </div>
             </div>
+            <div class="filter-row" id="models-filter-row">
+              <input type="text" id="models-filter-search" class="search-input" data-i18n-ph="models.filter.search_ph" placeholder="Search model or deployment ID...">
+              <select id="models-filter-vendor" class="search-input" data-i18n-title="models.filter.vendor" title="Vendor">
+                <option value="all" data-i18n="models.filter.vendor_all">All vendors</option>
+              </select>
+              <select id="models-filter-visibility" class="search-input" data-i18n-title="models.filter.access" title="Access type">
+                <option value="all" data-i18n="models.filter.access_all">All types</option>
+                <option value="public" data-i18n="models.badge_public">Public</option>
+                <option value="private" data-i18n="models.badge_private">Private</option>
+                <option value="normal" data-i18n="models.filter.access_normal">Standard</option>
+              </select>
+              <span class="filter-count" id="models-filter-count"></span>
+            </div>
             <div id="models-table-wrap"><p class="loading" data-i18n="common.loading">Loading...</p></div>
           </section>
 
@@ -598,6 +621,7 @@
                 <button class="btn-small btn-primary" id="btn-new-plan" data-i18n="plans.add">+ New Plan</button>
               </div>
             </div>
+            <div class="plans-summary" id="plans-summary-wrap"></div>
             <div id="plans-table-wrap"><p class="loading" data-i18n="common.loading">Loading...</p></div>
           </section>
 
@@ -606,6 +630,7 @@
             <div class="section-header">
               <h2 data-i18n="keys.title">API Keys</h2>
             </div>
+            <div class="plans-summary" id="keys-summary-wrap"></div>
             <div class="keys-toolbar">
               <div class="toolbar-group">
                 <input type="text" id="keys-search" data-i18n-ph="keys.search_placeholder" placeholder="Search alias, name, user, token..." class="search-input">
@@ -646,7 +671,7 @@
             </div>
             <div class="stress-uptime">
               <span class="stress-uptime__label" data-i18n="stress.uptime">Uptime</span>
-              <span class="stress-uptime__value" id="stress-uptime-value">—</span>
+              <span class="stress-uptime__items" id="stress-uptime-items"></span>
             </div>
             <div class="stress-info-bar" id="stress-info-bar">
               <span class="stress-info-item"><b data-i18n="stress.info.worker_queue">Worker local queue</b> <span data-i18n="stress.info.worker_queue_value">256 (tokio default)</span></span>
@@ -654,9 +679,9 @@
               <span class="stress-info-item"><b data-i18n="stress.info.sample_rate">Sample rate</b> 1 Hz → 10s/点</span>
               <span class="stress-info-help" tabindex="0" data-i18n-title="stress.info.help_title" title="?">?</span>
               <div class="stress-info-tooltip" id="stress-info-tooltip" hidden></div>
+              <div class="stress-legend" id="stress-legend" hidden></div>
             </div>
             <p class="modal-hint" data-i18n="stress.hint">In-memory 1Hz ring buffer (last 60 min). CPU is process-level and may exceed worker count × 100.</p>
-            <div class="stress-legend" id="stress-legend" hidden></div>
             <div class="stress-grid">
               <div class="stress-card">
                 <div class="stress-card__head">
@@ -703,29 +728,30 @@
               <h2 data-i18n="status.title">Status</h2>
               <span id="status-health-banner" class="status-banner status-banner--green" data-i18n="status.healthy">All systems healthy</span>
             </div>
-            <p class="modal-hint" data-i18n="status.hint">Alerts fire when the health monitor auto-disables an enabled deployment, or when the OTLP traces exporter is configured but offline. Manual disables do not alert.</p>
-
             <div class="status-panel">
               <div class="status-panel__head">
-                <span class="status-panel__title" data-i18n="status.active_title">Active Alerts</span>
+                <span class="status-panel__title" data-i18n="status.panel_title">Alerts</span>
+              </div>
+              <div class="status-subhead">
+                <span data-i18n="status.active_title">Active Alerts</span>
                 <span class="status-panel__count status-panel__count--green" id="status-active-count">0</span>
               </div>
               <div id="status-active-wrap"><p class="loading" data-i18n="common.loading">Loading...</p></div>
-            </div>
-
-            <div class="status-panel">
-              <div class="status-panel__head">
-                <span class="status-panel__title" data-i18n="status.history_title">Alert History</span>
+              <div class="status-subhead status-subhead--history">
+                <span data-i18n="status.history_title">Alert History</span>
                 <span class="status-panel__count" id="status-history-count">0</span>
               </div>
               <div id="status-history-wrap"><p class="loading" data-i18n="common.loading">Loading...</p></div>
             </div>
+
+            <p class="modal-hint" data-i18n="status.hint">Alerts fire when the health monitor auto-disables an enabled deployment, or when the OTLP traces exporter is configured but offline. Manual disables do not alert.</p>
           </section>
           <section id="admin-quota" class="section">
             <div class="section-header">
               <h2 data-i18n="quota.title">Quota Management</h2>
               <button class="btn-small" id="btn-create-team" onclick="showCreateTeamModal()" data-i18n="quota.create_team">Create Team</button>
             </div>
+            <div class="plans-summary" id="teams-summary-wrap"></div>
             <div id="quota-decision-base-wrap"></div>
             <div id="quota-overview-wrap"><p class="loading" data-i18n="common.loading">Loading...</p></div>
           </section>
@@ -737,6 +763,7 @@
               <div>
                 <button class="btn-small" id="btn-prompt-log-toggle" data-i18n="logs.prompt_log.off">Prompt Log: OFF</button>
                 <button class="btn-small" id="btn-debug-toggle" data-i18n="logs.debug.off">Debug: OFF</button>
+                <button class="btn-small" id="btn-apply-logs-filters" data-i18n="logs.apply_filters">Apply Filters</button>
                 <button class="btn-small" id="btn-reset-logs-filters" data-i18n="logs.reset_filters">Reset Filters</button>
               </div>
             </div>
@@ -745,11 +772,10 @@
               <table id="logs-table">
                 <thead>
                   <tr class="filter-row">
-                    <td></td>
                     <td><input class="col-filter" data-col="client_ip" data-i18n-ph="logs.filter_placeholder" placeholder="filter"></td>
                     <td><input class="col-filter" data-col="team_alias" data-i18n-ph="logs.filter_placeholder" placeholder="filter"></td>
                     <td><input class="col-filter" data-col="key_alias" data-i18n-ph="logs.filter_placeholder" placeholder="filter"></td>
-                    <td></td>
+                    <td><input class="col-filter" data-col="instance_id" data-i18n-ph="logs.filter_placeholder" placeholder="filter"></td>
                     <td><input class="col-filter" data-col="model" data-i18n-ph="logs.filter_placeholder" placeholder="filter"></td>
                     <td><input class="col-filter" data-col="api_path" data-i18n-ph="logs.filter_placeholder" placeholder="filter"></td>
                     <td><input class="col-filter" data-col="status_code" data-i18n-ph="logs.filter_placeholder" placeholder="filter"></td>
@@ -763,11 +789,10 @@
                     <td></td>
                   </tr>
                   <tr>
-                    <th data-i18n="logs.col.time">Time</th>
-                    <th data-i18n="logs.col.ip">IP</th>
+                    <th data-i18n="logs.col.time_ip">Time · IP</th>
                     <th data-i18n="logs.col.team">Team</th>
                     <th data-i18n="logs.col.key_alias">Key Alias</th>
-                    <th data-i18n="logs.col.user_tag">User Tag</th>
+                    <th data-i18n="logs.col.instance">Instance</th>
                     <th data-i18n="logs.col.model">Model</th>
                     <th data-i18n="logs.col.path">Path</th>
                     <th data-i18n="logs.col.status">Status</th>
@@ -800,6 +825,30 @@
           </section>
         </main>
       </div>
+    </div>
+
+    <!-- Fixed control bar — sidebar collapse / language / theme. Sibling of
+         the .page divs so `#page-login.active ~ .topbar` hides it pre-login. -->
+    <div class="topbar" id="topbar">
+      <button class="topbar-btn" id="topbar-collapse" type="button" data-i18n-title="action.toggle_sidebar" title="Toggle sidebar">
+        <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="3.5" width="15" height="13" rx="2"/><path d="M7.5 3.5v13"/></svg>
+      </button>
+      <div class="topbar-seg" role="group" aria-label="Language / 语言">
+        <button class="topbar-seg-btn topbar-lang-btn" type="button" data-lang="zh">中</button>
+        <button class="topbar-seg-btn topbar-lang-btn" type="button" data-lang="en">EN</button>
+      </div>
+      <div class="topbar-seg" role="group" aria-label="Theme / 外观">
+        <button class="topbar-seg-btn topbar-theme-btn" type="button" data-theme="dark" data-i18n-title="action.theme_dark" title="Dark">
+          <svg viewBox="0 0 20 20" fill="currentColor"><path d="M17.293 13.293A8 8 0 016.707 2.707a8.001 8.001 0 1010.586 10.586z"/></svg>
+        </button>
+        <button class="topbar-seg-btn topbar-theme-btn" type="button" data-theme="light" data-i18n-title="action.theme_light" title="Light">
+          <svg viewBox="0 0 20 20" fill="currentColor"><circle cx="10" cy="10" r="4"/><path d="M10 0v3M10 17v3M0 10h3M17 10h3M2.93 2.93l2.12 2.12M14.95 14.95l2.12 2.12M2.93 17.07l2.12-2.12M14.95 5.05l2.12-2.12" stroke="currentColor" stroke-width="1.5" fill="none"/></svg>
+        </button>
+      </div>
+      <!-- Instance identity roster: every "which instance am I / who else is
+           alive" display converges here. Self = filled chip, peers = outline
+           chips; wraps to multiple rows when the cluster is wide. -->
+      <div class="topbar-instances" id="topbar-instances"></div>
     </div>
 
     <!-- Modal Overlay -->
