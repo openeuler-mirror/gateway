@@ -4,8 +4,11 @@ use crate::routes::{GatewayErrorReply, extract_client_ip, extract_user_tags};
 use crate::state::AppState;
 use axum::body::Bytes;
 use axum::extract::{FromRequest, FromRequestParts, Request};
+use axum::response::IntoResponse;
 use boom_core::types::AuthIdentity;
 use boom_core::GatewayError;
+use http_body_util::LengthLimitError;
+use std::error::Error as _;
 use std::time::Instant;
 use uuid::Uuid;
 
@@ -219,12 +222,19 @@ impl FromRequestParts<AppState> for RequiredAuth {
     }
 }
 
-/// Body size limit applied by [`buffer_request_body`] middleware when
-/// buffering the request body for the pre_auth hook. axum's
-/// `DefaultBodyLimit` defaults to 2 MB; we use the same cap so behavior
-/// matches the pre-existing limit on `Json<T>`. If a larger body is sent,
-/// `axum::body::to_bytes` surfaces as a 413 to the client.
-pub const BODY_BUF_LIMIT: usize = 2 * 1024 * 1024;
+/// Ingress body cap for the LLM routes. 10 MiB ≈ 2.4M tokens of
+/// conversation (measured ~4.4 bytes/token for a mixed code/Chinese
+/// agent workload, GLM tokenizer + chat template) — ~2.4× the 1M-context
+/// models' full-history replay, absorbing image/base64 attachment
+/// overhead and leaving room for larger future context windows. This is
+/// an abuse ceiling, NOT a session cliff: a legitimate 1M-token session
+/// (~4.5 MB) passes and its natural end is still adjudicated by the
+/// model itself. A body above the cap could not fit the served models'
+/// context anyway, so the rejection reuses the backend's own error
+/// semantics (`ContextLengthExceeded` — 400, `context_length_exceeded`):
+/// agent clients route it into their existing context-length handling
+/// (compaction/give-up) instead of a generic-retry loop.
+pub const MAX_REQUEST_BODY_BYTES: usize = 10 * 1024 * 1024;
 
 /// Middleware that buffers the request body once into
 /// `Request::extensions()` as [`CachedBodyBytes`] so that
@@ -233,31 +243,104 @@ pub const BODY_BUF_LIMIT: usize = 2 * 1024 * 1024;
 /// `CachedJson<T>` (a `FromRequest`) can re-deserialize the body without
 /// a second buffer pass.
 ///
-/// The body is replaced with an empty `Body::default()` after buffering
-/// — downstream extractors that try `Bytes::from_request` would now get
-/// empty bytes, which is why LLM handler entry points use `CachedJson<T>`
-/// (which reads from extensions) instead of `Json<T>` (which reads from
-/// the body stream). Non-LLM handlers (e.g. `admin_upsert_plan`) using
-/// `Json<T>` must NOT have this middleware applied — they would get an
-/// empty body.
+/// Size policy: bodies above [`MAX_REQUEST_BODY_BYTES`] are rejected at
+/// ingress — BEFORE auth, without buffering when Content-Length declares
+/// the oversize — reusing `GatewayError::ContextLengthExceeded` so the
+/// client sees exactly the error the upstream model would have
+/// produced. History: the original 2 MiB cap (axum `DefaultBodyLimit`
+/// parity, inherited, never sized for LLM traffic) was the root cause of
+/// the 2026-11 stepwise incident — it swallowed oversize bodies via
+/// `to_bytes(..).unwrap_or_default()` and answered a fabricated
+/// "Failed to parse the request body as JSON: EOF while parsing a value
+/// at line 1 column 0" 400, killing every agent session whose
+/// full-history replay crossed ~470K tokens; a 10 MiB ceiling sized from
+/// measured bytes/token keeps it above the 1M-token workload.
+///
+/// Error contract: a body that fails to READ is never cached as empty
+/// bytes either — the middleware rejects the request with the real
+/// cause (`RequestBodyReadFailed`, 400) and logs a warn with
+/// path/client-IP/limit. CachedJson only ever sees a body that was
+/// actually read to the end.
+///
+/// The body is replaced with an empty `Body::default()` after
+/// buffering — downstream extractors that try `Bytes::from_request`
+/// would now get empty bytes, which is why LLM handler entry points
+/// use `CachedJson<T>` (which reads from extensions) instead of
+/// `Json<T>` (which reads from the body stream). Non-LLM handlers
+/// (e.g. `admin_upsert_plan`) using `Json<T>` must NOT have this
+/// middleware applied — they would get an empty body.
 ///
 /// Apply only to routes whose handlers use `RequiredAuth` AND want the
 /// pre_auth hook to see the `model` field — currently the LLM endpoints
-/// (`/v1/chat/completions`, `/v1/messages`, `/v1/completions` and their
-/// un-prefixed aliases). Admin / GET / DELETE routes do not need this
-/// middleware.
+/// (`/v1/chat/completions`, `/v1/messages`, `/v1/completions`,
+/// `/v1/responses` and their un-prefixed aliases). Admin / GET /
+/// DELETE routes do not need this middleware.
 pub async fn buffer_request_body(
     req: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    // Buffer the body now. On failure we let the request through with
-    // empty cached bytes — `CachedJson<T>` will then surface the real
-    // error (413 / BadRequest) on the slow path. The hook just doesn't
-    // see a model on a broken-body request.
     let (mut parts, body) = req.into_parts();
-    let body_bytes = axum::body::to_bytes(body, BODY_BUF_LIMIT)
-        .await
-        .unwrap_or_default();
+    let path = parts.uri.path().to_string();
+    let client_ip = extract_client_ip(&parts.headers, None);
+
+    // Fast reject on the declared Content-Length — before buffering,
+    // before auth. Requests without one (chunked) fall through to the
+    // capped buffered read below.
+    let declared_len: Option<u64> = parts
+        .headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok());
+    if let Some(cl) = declared_len {
+        if cl > MAX_REQUEST_BODY_BYTES as u64 {
+            tracing::warn!(
+                path = %path,
+                client_ip = ?client_ip,
+                declared_len = cl,
+                limit = MAX_REQUEST_BODY_BYTES,
+                "request body over ingress cap (Content-Length precheck) — rejecting as context_length_exceeded"
+            );
+            return GatewayErrorReply(
+                GatewayError::ContextLengthExceeded(format!(
+                    "request body of {cl} bytes (Content-Length) exceeds the gateway request limit \
+                     of {MAX_REQUEST_BODY_BYTES} bytes; trim the conversation history and retry"
+                )),
+                false,
+            )
+            .into_response();
+        }
+    }
+
+    // Buffer the body once, capped. On failure the request is rejected
+    // with the real cause — never continued with empty cached bytes (see
+    // the error contract). The pre_auth hook and CachedJson only ever
+    // see a body that was actually read to the end.
+    let body_bytes = match axum::body::to_bytes(body, MAX_REQUEST_BODY_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            let over_limit = err
+                .source()
+                .map(|s| s.is::<LengthLimitError>())
+                .unwrap_or(false);
+            tracing::warn!(
+                path = %path,
+                client_ip = ?client_ip,
+                limit = MAX_REQUEST_BODY_BYTES,
+                over_limit,
+                error = ?err,
+                "request body read failed at ingress — rejecting"
+            );
+            let error = if over_limit {
+                GatewayError::ContextLengthExceeded(format!(
+                    "request body exceeds the gateway request limit of {MAX_REQUEST_BODY_BYTES} bytes; \
+                     trim the conversation history and retry"
+                ))
+            } else {
+                GatewayError::RequestBodyReadFailed(err.to_string())
+            };
+            return GatewayErrorReply(error, false).into_response();
+        }
+    };
 
     // Park the bytes for RequiredAuth (FromRequestParts probe) +
     // CachedJson<T> (FromRequest). `parts.extensions` IS the new
@@ -512,5 +595,197 @@ mod tests {
             extract_from_header("api-key", "demo-token"),
             Some("demo-token".to_string())
         );
+    }
+}
+
+/// Ingress behavior of [`buffer_request_body`]: bodies up to
+/// [`MAX_REQUEST_BODY_BYTES`] (10 MiB) pass; larger bodies are rejected
+/// with the BACKEND-PARITY error — `GatewayError::ContextLengthExceeded`
+/// (400, `context_length_exceeded`), the same code a client gets when the
+/// upstream model rejects an over-context request — so agent harnesses
+/// handle ingress caps via their existing context-length path. Read
+/// failures keep their honest 400 + warn. Never a fabricated
+/// "unparseable JSON" 400 from cached-empty bytes (the 2026-11 stepwise
+/// RCA).
+#[cfg(test)]
+mod body_limit_tests {
+    use super::{CachedJson, MAX_REQUEST_BODY_BYTES, RequiredAuth, buffer_request_body};
+    use crate::state::AppState;
+    use axum::body::{Body, Bytes};
+    use axum::http::{Request, StatusCode};
+    use axum::routing::post;
+    use axum::Router;
+    use tower::ServiceExt;
+
+    async fn state_from_yaml(yaml: &str) -> AppState {
+        let config: boom_config::Config = serde_yaml::from_str(yaml).expect("parse config yaml");
+        AppState::from_config(config, None)
+            .await
+            .expect("build AppState")
+    }
+
+    /// Production-shaped pipeline: middleware → RequiredAuth → CachedJson.
+    fn llm_app(state: &AppState) -> Router {
+        Router::new()
+            .route(
+                "/v1/chat/completions",
+                post(
+                    |_auth: RequiredAuth,
+                     CachedJson(_body): CachedJson<serde_json::Value>|
+                     async { "handler-reached" },
+                ),
+            )
+            .with_state(state.clone())
+            .layer(axum::middleware::from_fn(buffer_request_body))
+    }
+
+    /// Valid JSON body of exactly `total` bytes ("x"-padded user content).
+    fn json_body(total: usize) -> Vec<u8> {
+        let prefix = r#"{"model":"m","messages":[{"role":"user","content":""#;
+        let suffix = r#""}]}"#;
+        let pad = total - prefix.len() - suffix.len();
+        let s = format!("{}{}{}", prefix, "x".repeat(pad), suffix);
+        assert_eq!(s.len(), total);
+        s.into_bytes()
+    }
+
+    async fn body_text(res: axum::response::Response) -> String {
+        let bytes = axum::body::to_bytes(res.into_body(), 1024 * 1024)
+            .await
+            .expect("read response body");
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    fn post_json(body: impl Into<Body>) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer sk-test-m")
+            .body(body.into())
+            .unwrap()
+    }
+
+    /// THE regression test for the 2026-11 stepwise RCA: a multi-MiB
+    /// full-history-replay body must flow through to auth and parsing —
+    /// the old 2 MiB cap used to swallow it and answer a fabricated
+    /// "EOF while parsing a value at line 1 column 0" 400. The 10 MiB
+    /// ceiling sits ~2.4× above the 1M-token workload (~4.5 MB measured).
+    #[tokio::test]
+    async fn multi_mib_body_reaches_handler_up_to_cap() {
+        let state = state_from_yaml("general_settings:\n  master_key: sk-test-m\n").await;
+        let app = llm_app(&state);
+        for size in [3 * 1024 * 1024, MAX_REQUEST_BODY_BYTES] {
+            let res = app
+                .clone()
+                .oneshot(post_json(json_body(size)))
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "body of {size} bytes");
+            assert_eq!(body_text(res).await, "handler-reached");
+        }
+    }
+
+    /// Over-cap bodies get the BACKEND-PARITY error: 400 with
+    /// `type: context_length_exceeded` — identical to what the upstream
+    /// model returns for an over-context request — NOT a 413 (agent
+    /// harnesses don't route 413 into their context-length handling)
+    /// and NOT a fabricated JSON parse error.
+    #[tokio::test]
+    async fn over_cap_body_gets_backend_style_context_error() {
+        let state = state_from_yaml("general_settings:\n  master_key: sk-test-m\n").await;
+        let app = llm_app(&state);
+        // No content-length (tower bypasses framing) → capped buffered read.
+        let res = app
+            .clone()
+            .oneshot(post_json(json_body(MAX_REQUEST_BODY_BYTES + 1)))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let text = body_text(res).await;
+        assert!(text.contains("context_length_exceeded"), "got: {text}");
+        assert!(
+            text.contains("exceeds the gateway request limit of 10485760 bytes"),
+            "message names the cap, got: {text}"
+        );
+        assert!(!text.contains("EOF while parsing"), "got: {text}");
+    }
+
+    /// Declared oversize Content-Length is rejected without buffering and
+    /// BEFORE auth (no Authorization header; an authenticated path would
+    /// have answered 401) — and with the same backend-parity error.
+    #[tokio::test]
+    async fn content_length_precheck_rejects_before_auth_with_backend_error() {
+        let state = state_from_yaml("general_settings:\n  master_key: sk-test-m\n").await;
+        let app = llm_app(&state);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header("content-length", (MAX_REQUEST_BODY_BYTES + 1).to_string())
+            .body(Body::from(json_body(MAX_REQUEST_BODY_BYTES + 1)))
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let text = body_text(res).await;
+        assert!(text.contains("context_length_exceeded"), "got: {text}");
+        assert!(
+            text.contains("Content-Length") && text.contains("10485760"),
+            "precheck message names declared size and cap, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn body_read_failure_rejected_with_honest_400() {
+        // A body stream that errors mid-read must surface as a 400 naming
+        // the read failure — never as cached-empty bytes that
+        // CachedJson would misreport as unparseable JSON.
+        let state = state_from_yaml("general_settings:\n  master_key: sk-test-m\n").await;
+        let app = llm_app(&state);
+        let err_stream = futures::stream::once(async {
+            Err::<Bytes, _>(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "client vanished mid-body",
+            ))
+        });
+        let res = app
+            .oneshot(post_json(Body::from_stream(err_stream)))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let text = body_text(res).await;
+        assert!(
+            text.contains("Failed to read request body"),
+            "got: {text}"
+        );
+        assert!(
+            !text.contains("EOF while parsing"),
+            "must not fabricate a JSON parse error: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn small_garbage_json_keeps_parse_400_and_auth_first() {
+        // Control: the middleware itself must not reject small bodies —
+        // auth and CachedJson still own those. Garbage JSON gets the real
+        // serde syntax message; missing auth gets 401 first.
+        let state = state_from_yaml("general_settings:\n  master_key: sk-test-m\n").await;
+        let app = llm_app(&state);
+        let res = app.clone().oneshot(post_json("garbage!!!")).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let text = body_text(res).await;
+        assert!(
+            text.contains("expected value"),
+            "serde's syntax message, got: {text}"
+        );
+
+        let no_auth = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let res = app.oneshot(no_auth).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
     }
 }
