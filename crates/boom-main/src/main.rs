@@ -236,7 +236,17 @@ fn build_router(state: AppState) -> Router {
         .route("/chat/completions", post(routes::chat_completions))
         .route("/completions", post(routes::completions))
         .route("/responses", post(routes::responses))
-        .layer(axum::middleware::from_fn(extractor::buffer_request_body));
+        // Body parking for the pre_auth hook + ingress size cap
+        // (MAX_REQUEST_BODY_BYTES; oversize is rejected with the
+        // backend-parity ContextLengthExceeded — see the middleware doc).
+        .layer(axum::middleware::from_fn(extractor::buffer_request_body))
+        // Slow-path parity for CachedJson's fallback (`Bytes::from_request`
+        // is capped by axum's DefaultBodyLimit — default 2 MB). Dead path on
+        // these routes (the middleware always parks bytes) but keeps the two
+        // mechanisms consistent.
+        .layer(axum::extract::DefaultBodyLimit::max(
+            extractor::MAX_REQUEST_BODY_BYTES,
+        ));
 
     let api_routes = Router::new()
         .route("/v1/models", get(routes::list_models))
