@@ -760,9 +760,9 @@ pub async fn list_keys(
             // limited, we still report it from the largest plan window —
             // every counter records all three dimensions, so this yields the
             // actual usage inside the plan's window instead of a misleading 0.
-            let (usage_count, usage_tokens, usage_cost_micros, usage_reset_secs) =
+            let (usage_count, usage_tokens, usage_cost_micros, usage_reset_secs, window_limited) =
                 match state.plan_store.resolve_effective_key_plan(&r.token) {
-                    None => (None, None, None, 0u64),
+                    None => (None, None, None, 0u64, false),
                     Some(plan) => {
                         let windows = state.limiter.peek_plan_window_usage(&r.token);
                         let (_, effective, _) = plan.effective_limits();
@@ -805,7 +805,28 @@ pub async fn list_keys(
                         let (c, c_reset) = pick(dim_secs[0], 0);
                         let (t, t_reset) = pick(dim_secs[1], 1);
                         let (m, m_reset) = pick(dim_secs[2], 2);
-                        (c, t, m, c_reset.max(t_reset).max(m_reset))
+                        // Window-limited right now: any effective window whose
+                        // live usage has reached its cap in any dimension.
+                        let million = rust_decimal::Decimal::from(1_000_000u64);
+                        let mut window_limited = false;
+                        for w in &effective {
+                            let usage = match windows.iter().find(|u| u.window_secs == w.window_secs) {
+                                Some(u) => u,
+                                None => continue,
+                            };
+                            if let Some(c) = w.counts {
+                                if usage.counts >= c { window_limited = true; break; }
+                            }
+                            if let Some(tk) = w.tokens {
+                                if usage.tokens >= tk { window_limited = true; break; }
+                            }
+                            if let Some(cost) = w.costs {
+                                if rust_decimal::Decimal::from(usage.costs_micros) >= cost * million {
+                                    window_limited = true; break;
+                                }
+                            }
+                        }
+                        (c, t, m, c_reset.max(t_reset).max(m_reset), window_limited)
                     }
                 };
             let usage_cost = usage_cost_micros.map(|micros| {
@@ -846,6 +867,27 @@ pub async fn list_keys(
                 })
                 .unwrap_or_else(|| (total_cost.to_string(), "lifetime".to_string()));
 
+            // Budget-limited right now: period spend (scope-aligned above)
+            // has reached max_budget. Keys without a budget are never
+            // budget-limited.
+            let budget_limited = r
+                .max_budget
+                .filter(|max| *max > 0.0)
+                .and_then(rust_decimal::Decimal::from_f64_retain)
+                .map(|max_dec| {
+                    budget_period_spend
+                        .parse::<rust_decimal::Decimal>()
+                        .map(|sp| sp >= max_dec)
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
+            let limited_by = match (window_limited, budget_limited) {
+                (false, false) => serde_json::Value::Null,
+                (true, false) => json!("window"),
+                (false, true) => json!("budget"),
+                (true, true) => json!("both"),
+            };
+
             json!({
                 "token_prefix": token_prefix,
                 "token_hash": r.token,
@@ -876,6 +918,7 @@ pub async fn list_keys(
                 "usage_cost": usage_cost.map(|d| d.to_string()),
                 "plan_name": plan_name,
                 "plan_assignment_kind": plan_assignment_kind,
+                "limited_by": limited_by,
             })
         })
         .collect();
@@ -885,6 +928,76 @@ pub async fn list_keys(
         let ca = a.get("usage_count").and_then(|v| v.as_u64()).unwrap_or(0);
         let cb = b.get("usage_count").and_then(|v| v.as_u64()).unwrap_or(0);
         cb.cmp(&ca)
+    });
+
+    // Page-level summary cards. Computed BEFORE the VIP/plan retain filters:
+    // the cards answer "how is the whole key fleet doing", not "how many
+    // rows does the current filter match". Normal = neither blocked nor
+    // expired (the two states can overlap on one key, so it is counted
+    // directly rather than derived from total - blocked - expired).
+    let now = chrono::Utc::now().naive_utc();
+    let mut s_active = 0i64;
+    let mut s_blocked = 0i64;
+    let mut s_expired = 0i64;
+    let mut s_vip = 0i64;
+    let mut s_limited_window = 0i64;
+    let mut s_limited_budget = 0i64;
+    let mut spend_sum = rust_decimal::Decimal::ZERO;
+    for k in &keys {
+        let blocked = k.get("blocked").and_then(|v| v.as_bool()).unwrap_or(false);
+        // The per-key json stringifies the DB's NaiveDateTime with
+        // to_string() → "YYYY-MM-DD HH:MM:SS" (naive, UTC-stored).
+        let expired = k
+            .get("expires")
+            .and_then(|v| v.as_str())
+            .and_then(|s| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").ok())
+            .map(|d| d < now)
+            .unwrap_or(false);
+        if blocked {
+            s_blocked += 1;
+        }
+        if expired {
+            s_expired += 1;
+        }
+        if !blocked && !expired {
+            s_active += 1;
+        }
+        if k.get("metadata")
+            .and_then(|m| m.get("vip"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            s_vip += 1;
+        }
+        match k.get("limited_by").and_then(|v| v.as_str()) {
+            Some("window") | Some("both") => s_limited_window += 1,
+            _ => {}
+        }
+        match k.get("limited_by").and_then(|v| v.as_str()) {
+            Some("budget") | Some("both") => s_limited_budget += 1,
+            _ => {}
+        }
+        if let Some(c) = k
+            .get("total_cost")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<rust_decimal::Decimal>().ok())
+        {
+            spend_sum += c;
+        }
+    }
+    let summary = json!({
+        "total": keys.len() as i64,
+        "active": s_active,
+        "blocked": s_blocked,
+        "expired": s_expired,
+        "vip": s_vip,
+        // Union — a key limited by both window and budget counts once.
+        "limited_now": keys.iter()
+            .filter(|k| k.get("limited_by").and_then(|v| v.as_str()).is_some())
+            .count() as i64,
+        "limited_by_window": s_limited_window,
+        "limited_by_budget": s_limited_budget,
+        "spend_sum": spend_sum.to_string(),
     });
 
     // Filter VIP-only if requested.
@@ -932,6 +1045,7 @@ pub async fn list_keys(
         "page": page,
         "per_page": per_page,
         "total": filtered_total,
+        "summary": summary,
     }))
     .into_response()
 }
@@ -4344,6 +4458,41 @@ pub async fn get_inflight_stats(
     .into_response()
 }
 
+/// Instance roster for the topbar identity strip: self (the instance serving
+/// this page) plus live peers from the heartbeat registry. Identity display
+/// only — per-row/per-chart instance data stays in its own endpoints.
+pub async fn list_instances(
+    _session: AdminSession,
+    Extension(state): Extension<std::sync::Arc<DashboardState>>,
+) -> Response {
+    let mut peers: Vec<String> = Vec::new();
+    if let Some(pool) = &state.db_pool {
+        match boom_state::registry::live_instances(
+            pool,
+            std::time::Duration::from_secs(boom_state::INSTANCE_TTL_SECS),
+        )
+        .await
+        {
+            Ok(instances) => {
+                for inst in instances {
+                    if inst.instance_id != *state.instance_id {
+                        peers.push(inst.instance_id.to_string());
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "instance registry unavailable; topbar shows self only");
+            }
+        }
+    }
+    peers.sort();
+    Json(json!({
+        "self": &*state.instance_id,
+        "peers": peers,
+    }))
+    .into_response()
+}
+
 /// Aggregate dispatched key entries by key_alias, returning per-key request counts.
 fn aggregate_dispatched_keys(keys: Option<&Vec<boom_flowcontrol::DispatchedKeyEntry>>) -> Vec<serde_json::Value> {
     let entries = match keys {
@@ -6901,6 +7050,32 @@ pub async fn get_stress_history(
     // Self-process meta regardless of mode (uptime card + worker count).
     let meta = state.stressmon.timeseries(0).await;
 
+    // Per-instance uptime for the uptime strip. Self comes from process
+    // meta (exact); peers are derived from the registry's started_at,
+    // computed DB-clock-side (NOW() - started_at) — started_at is
+    // rewritten on every takeover, so it tracks the current incarnation.
+    // Same liveness cutoff as boom_state::live_instances (heartbeat TTL).
+    let mut uptimes = serde_json::Map::new();
+    if let Some(pool) = &state.db_pool {
+        if let Ok(rows) = sqlx::query_as::<_, (String, i64)>(
+            r#"SELECT instance_id, EXTRACT(EPOCH FROM (NOW() - started_at))::bigint
+               FROM boom_instance_state
+               WHERE heartbeat_at >= NOW() - ($1 * interval '1 second')"#,
+        )
+        .bind(boom_state::INSTANCE_TTL_SECS as i64)
+        .fetch_all(pool)
+        .await
+        {
+            for (id, secs) in rows {
+                uptimes.insert(id, serde_json::json!(secs.max(0)));
+            }
+        }
+    }
+    uptimes.insert(
+        state.instance_id.to_string(),
+        serde_json::json!(meta.uptime_secs),
+    );
+
     if state.db_pool.is_some() {
         let rows = state.stressmon.history(q.since).await;
         // Rows are ts-ordered; group per instance preserving that order.
@@ -6929,6 +7104,7 @@ pub async fn get_stress_history(
             "num_workers": meta.num_workers,
             "uptime_secs": meta.uptime_secs,
             "self_instance_id": &*state.instance_id,
+            "uptimes": uptimes,
             "instances": instances,
         }))
         .into_response();
@@ -6939,6 +7115,7 @@ pub async fn get_stress_history(
         "num_workers": meta.num_workers,
         "uptime_secs": meta.uptime_secs,
         "self_instance_id": &*state.instance_id,
+        "uptimes": uptimes,
         "instances": [{
             "instance_id": &*state.instance_id,
             "samples": meta.samples,

@@ -4,129 +4,139 @@
 /* ── Reset ─────────────────────────────────────────────── */
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
-/* ── Light Theme (default) ─────────────────────────────── */
+/* ── Theme tokens ─────────────────────────────────────────
+   Finora reskin. Dark is the default identity (deep neutral #101014 with a
+   violet accent); light is a full override on the same variable contract.
+   Every component below consumes only these names — reskin = edit here. */
 :root {
+  color-scheme: dark;
   --font: "DM Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   --heading: "Space Grotesk", "DM Sans", sans-serif;
   --mono: "Fira Code", "JetBrains Mono", "Menlo", "Consolas", monospace;
   --radius: 10px;
-  --radius-sm: 6px;
+  --radius-sm: 7px;
   --radius-xs: 4px;
   --transition: .15s ease;
 
-  /* Surfaces */
-  --bg:        #f5f7fa;
-  --surface:   #ffffff;
-  --surface2:  #f1f3f7;
-  --surface3:  #e8ebf0;
-  --border:    #e2e5eb;
-  --border2:   #cdd2da;
+  /* Surfaces — violet-tinted graphite ramp */
+  --bg:        #101014;
+  --surface:   #19191e;
+  --surface2:  #202027;
+  --surface3:  #282832;
+  --border:    #2b2b34;
+  --border2:   #3a3a45;
 
-  /* Text */
-  --text:      #111318;
-  --text2:     #4a5068;
-  --text3:     #8891a5;
-  --text-inv:  #ffffff;
+  /* Text — text3 must hold ~4.5:1 on surface2: it feeds 12px chips
+     (log timestamps, chart legends) where dimmer values fail contrast. */
+  --text:      #f3f3f7;
+  --text2:     #a0a0b2;
+  --text3:     #8a8a9e;
+  --text-inv:  #101014;
 
-  /* Brand — signal cyan, from the instrument-panel world. #0e7490 keeps
-     4.5:1 contrast both as white-text button fill and as text on white. */
-  --primary:     #0e7490;
-  --primary-h:   #155e75;
-  --primary-bg:  rgba(14,116,144,.08);
-  --primary-glow:rgba(14,116,144,.16);
+  /* Brand — Finora violet. Solid fill for primary actions keeps white ink
+     at 4.5:1; the lighter hover step reads on dark without a glow. */
+  --primary:     #9376ff;
+  --primary-h:   #a58aff;
+  --primary-bg:  rgba(147,118,255,.10);
+  --primary-glow:rgba(147,118,255,.20);
   --accent-ink:  #ffffff;
-  /* Primary button fill differs per theme: light = accent fill, dark =
-     off-white fill with dark ink (accent recedes to selection + figures). */
-  --btn-primary-bg:   var(--primary);
-  --btn-primary-bg-h: var(--primary-h);
+  --btn-primary-bg:   #7d5af0;
+  --btn-primary-bg-h: #9376ff;
   --btn-primary-text: var(--accent-ink);
 
+  /* Soft violet wash — icon chips, hover fills, banner tints */
+  --soft:      #2b2345;
+  --soft-text: #b5a7dc;
+
   /* Semantic */
-  --success:     #10b981;
-  --success-bg:  rgba(16,185,129,.07);
-  --danger:      #ef4444;
-  --danger-bg:   rgba(239,68,68,.07);
-  --warn:        #f59e0b;
-  --warn-bg:     rgba(245,158,11,.07);
-  --info:        #3b82f6;
-  --info-bg:     rgba(59,130,246,.07);
+  --success:     #43cda0;
+  --success-bg:  rgba(67,205,160,.10);
+  --danger:      #f1808f;
+  --danger-bg:   rgba(241,128,143,.10);
+  --warn:        #e6a23c;
+  --warn-bg:     rgba(230,162,60,.10);
+  --info:        #6f9dff;
+  --info-bg:     rgba(111,157,255,.10);
 
-  /* Shadows */
-  --shadow-sm: 0 1px 2px rgba(0,0,0,.04);
-  --shadow:    0 1px 3px rgba(0,0,0,.05), 0 1px 2px rgba(0,0,0,.03);
-  --shadow-md: 0 4px 14px rgba(0,0,0,.06), 0 1px 3px rgba(0,0,0,.03);
-  --shadow-lg: 0 12px 40px rgba(0,0,0,.08), 0 4px 12px rgba(0,0,0,.04);
+  /* Shadows — one large diffuse layer, the Finora signature */
+  --shadow-sm: 0 2px 8px rgba(0,0,0,.16);
+  --shadow:    0 4px 18px rgba(0,0,0,.14);
+  --shadow-md: 0 10px 40px rgba(0,0,0,.16);
+  --shadow-lg: 0 18px 60px rgba(0,0,0,.34);
 
-  /* Sidebar — graphite in both themes; a long-stare surface, so no hue.
-     Accent appears only as the active indicator bar and stays a brighter
-     cyan shade than the content accent (dark surface needs the lighter step). */
-  --sidebar-bg:         #131519;
-  --sidebar-hover:      rgba(255,255,255,.06);
-  --sidebar-active:     rgba(255,255,255,.10);
-  --sidebar-text:       #9aa1ad;
-  --sidebar-text-active:#f4f6f8;
-  --sidebar-border:     rgba(255,255,255,.08);
-  --sidebar-accent:     #22d3ee;
+  /* Sidebar — a step darker than content surface; violet marks the active
+     item, everything else stays neutral. */
+  --sidebar-bg:         #141418;
+  --sidebar-hover:      rgba(255,255,255,.05);
+  --sidebar-active:     rgba(147,118,255,.16);
+  --sidebar-text:       #9695a6;
+  --sidebar-text-active:#f3f3f7;
+  --sidebar-border:     var(--border);
+  --sidebar-accent:     #9376ff;
 
   /* Scrollbar */
   --scrollbar-track: transparent;
   --scrollbar-thumb: var(--border);
   --scrollbar-hover: var(--border2);
 
-  --selection-bg: rgba(14,116,144,.20);
+  --selection-bg: rgba(147,118,255,.30);
 }
 
-/* ── Dark Theme ────────────────────────────────────────── */
-[data-theme="dark"] {
-  /* Surfaces — neutral graphite ramp, no hue. Depth from surface steps and
-     hairlines, not shadows. */
-  --bg:        #0f1115;
-  --surface:   #15181d;
-  --surface2:  #1b1f25;
-  --surface3:  #232830;
-  --border:    #272c34;
-  --border2:   #363d47;
+/* ── Light Theme ────────────────────────────────────────── */
+[data-theme="light"] {
+  color-scheme: light;
+  /* Surfaces */
+  --bg:        #f7f8fc;
+  --surface:   #ffffff;
+  --surface2:  #f4f5fa;
+  --surface3:  #e8e9f1;
+  --border:    #e8e9f1;
+  --border2:   #d6d7e4;
 
-  --text:      #e6e9ed;
-  --text2:     #a3aab5;
-  --text3:     #69707c;
-  --text-inv:  #0f1115;
+  --text:      #252438;
+  --text2:     #62637a;
+  /* text3 feeds 12px chips on surface2 (log timestamps) — must stay ≥4.5:1 there */
+  --text3:     #66677a;
+  --text-inv:  #ffffff;
 
-  --primary:     #22d3ee;
-  --primary-h:   #67e8f9;
-  --primary-bg:  rgba(34,211,238,.10);
-  --primary-glow:rgba(34,211,238,.20);
-  --accent-ink:  #0f1115;
-  --btn-primary-bg:   #e6e9ed;
-  --btn-primary-bg-h: #ffffff;
-  --btn-primary-text: #0f1115;
+  --primary:     #7654eb;
+  --primary-h:   #6543de;
+  --primary-bg:  rgba(118,84,235,.08);
+  --primary-glow:rgba(118,84,235,.14);
+  --accent-ink:  #ffffff;
+  --btn-primary-bg:   #7654eb;
+  --btn-primary-bg-h: #8a6bf2;
+  --btn-primary-text: var(--accent-ink);
 
-  --success:     #34d399;
-  --success-bg:  rgba(52,211,153,.1);
-  --danger:      #f87171;
-  --danger-bg:   rgba(248,113,113,.1);
-  --warn:        #fbbf24;
-  --warn-bg:     rgba(251,191,36,.1);
-  --info:        #60a5fa;
-  --info-bg:     rgba(96,165,250,.1);
+  --soft:      #eee9ff;
+  --soft-text: #7b69a4;
 
-  --shadow-sm: 0 1px 2px rgba(0,0,0,.3);
-  --shadow:    0 1px 3px rgba(0,0,0,.4), 0 1px 2px rgba(0,0,0,.3);
-  --shadow-md: 0 4px 14px rgba(0,0,0,.4), 0 1px 3px rgba(0,0,0,.3);
-  --shadow-lg: 0 12px 40px rgba(0,0,0,.5), 0 4px 12px rgba(0,0,0,.4);
+  --success:     #168966;
+  --success-bg:  rgba(22,137,102,.08);
+  --danger:      #cf5064;
+  --danger-bg:   rgba(207,80,100,.08);
+  --warn:        #b97f24;
+  --warn-bg:     rgba(185,127,36,.08);
+  --info:        #3b6fe0;
+  --info-bg:     rgba(59,111,224,.08);
 
-  --sidebar-bg:         #0b0d11;
-  --sidebar-hover:      rgba(255,255,255,.05);
-  --sidebar-active:     rgba(255,255,255,.08);
-  --sidebar-text:       #7d8592;
-  --sidebar-text-active:#eef1f4;
-  --sidebar-border:     rgba(255,255,255,.07);
-  --sidebar-accent:     #22d3ee;
+  --shadow-sm: 0 1px 2px rgba(0,0,0,.04);
+  --shadow:    0 1px 3px rgba(0,0,0,.05), 0 1px 2px rgba(0,0,0,.03);
+  --shadow-md: 0 10px 40px rgba(0,0,0,.07), 0 4px 12px rgba(0,0,0,.03);
+  --shadow-lg: 0 18px 60px rgba(0,0,0,.12), 0 6px 18px rgba(0,0,0,.05);
+
+  --sidebar-bg:         #ffffff;
+  --sidebar-hover:      rgba(0,0,0,.04);
+  --sidebar-active:     rgba(118,84,235,.10);
+  --sidebar-text:       #78798f;
+  --sidebar-text-active:#252438;
+  --sidebar-border:     var(--border);
+  --sidebar-accent:     #7654eb;
 
   --scrollbar-thumb: var(--border);
   --scrollbar-hover: var(--border2);
 
-  --selection-bg: rgba(34,211,238,.24);
+  --selection-bg: rgba(118,84,235,.16);
 }
 
 /* ── Base ──────────────────────────────────────────────── */
@@ -176,6 +186,7 @@ input, select, textarea { font-family: var(--font); font-size: 14px; }
   max-width: calc(58vw - 80px);
   height: auto;
   user-select: none;
+  filter: hue-rotate(70deg) saturate(1.04);
 }
 /* Username slot: the layout box is always reserved so the password field,
    login button and mode toggle stay pinned; toggling only fades the field. */
@@ -226,10 +237,6 @@ input, select, textarea { font-family: var(--font); font-size: 14px; }
   padding: 10px 12px;
   font-size: 13px;
   margin: 0 0 12px;
-}
-[data-theme="dark"] .login-card .error-msg {
-  background: rgba(239,68,68,.16); border-color: rgba(239,68,68,.28);
-  color: #fca5a5;
 }
 .login-card #login-btn {
   width: 100%; height: 40px; padding: 0 16px;
@@ -325,11 +332,11 @@ p.error { color: var(--danger); font-style: italic; margin: 0; }
 .sidebar nav { flex: 1; padding: 8px 0; }
 .nav-link {
   display: flex; align-items: center; gap: 10px;
-  padding: 8px 20px; color: var(--sidebar-text);
+  padding: 8px 12px; margin: 1px 8px;
+  border-radius: var(--radius-sm);
+  color: var(--sidebar-text);
   font-size: 13px; font-weight: 500;
   transition: background var(--transition), color var(--transition);
-  border-left: 3px solid transparent;
-  margin: 1px 0;
 }
 .nav-link:hover {
   color: var(--sidebar-text-active);
@@ -338,17 +345,20 @@ p.error { color: var(--danger); font-style: italic; margin: 0; }
 .nav-link.active {
   color: var(--sidebar-text-active);
   background: var(--sidebar-active);
-  border-left-color: var(--sidebar-accent);
   font-weight: 500;
 }
 .nav-link svg { width: 16px; height: 16px; flex-shrink: 0; opacity: .75; }
-.nav-link.active svg { opacity: 1; }
+.nav-link.active svg { opacity: 1; color: var(--sidebar-accent); }
 .sidebar-footer {
   padding: 12px 16px; border-top: 1px solid var(--sidebar-border);
   display: flex; gap: 8px; align-items: center;
   flex-wrap: wrap;
 }
-.sidebar-footer .btn-secondary { flex: 1; }
+.sidebar-footer .btn-secondary {
+  flex: 1;
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+}
+.sidebar-footer .btn-secondary .logout-icon { display: none; width: 14px; height: 14px; flex-shrink: 0; }
 .sidebar-version {
   flex-basis: 100%;
   font-size: 11px;
@@ -356,59 +366,110 @@ p.error { color: var(--danger); font-style: italic; margin: 0; }
   font-variant-numeric: tabular-nums;
   margin-bottom: 2px;
 }
-.sidebar-instance {
-  flex-basis: 100%;
-  font-size: 10px;
-  color: var(--sidebar-text);
-  opacity: .6;
-  font-variant-numeric: tabular-nums;
-  word-break: break-all;
-  margin-bottom: 2px;
-}
 
-/* ── Theme Toggle ───────────────────────────────────────── */
-.theme-toggle {
-  width: 32px; height: 32px; border-radius: var(--radius-sm);
-  background: transparent; border: 1px solid var(--sidebar-border);
-  color: var(--sidebar-text); display: flex; align-items: center; justify-content: center;
-  transition: background var(--transition), color var(--transition); flex-shrink: 0;
+/* ── Fixed Control Bar (top row: controls left, instances right) ──
+ * Full-width menu bar across the content area (reference layout: header
+ * spans the app column above main). Controls sit at the LEFT; content
+ * scrolls under the glass. Left edge tracks the sidebar width, so the
+ * collapse animation stays in sync. Hidden on the login page via the
+ * `#page-login.active ~ .topbar` sibling selector.
+ * Height is content-driven (min 48px): the instance roster on the right
+ * wraps to extra rows on wide clusters. JS mirrors the measured height
+ * into --topbar-h so the fixed-bar offsets below follow. */
+.topbar {
+  position: fixed; top: 0; left: 240px; right: 0; min-height: 48px; z-index: 90;
+  display: flex; align-items: center; gap: 10px;
+  padding: 6px 16px;
+  background: color-mix(in srgb, var(--bg) 76%, transparent);
+  border-bottom: 1px solid var(--border);
+  -webkit-backdrop-filter: blur(14px) saturate(140%);
+  backdrop-filter: blur(14px) saturate(140%);
+  transition: left .2s ease;
 }
-.theme-toggle:hover {
-  background: var(--sidebar-hover);
-  color: var(--sidebar-text-active);
+body.nav-collapsed .topbar { left: 68px; }
+#page-login.active ~ .topbar { display: none; }
+/* Instance identity roster (self + live peers) — the ONE place instance
+ * ids appear as identity. margin-left:auto pins it to the right edge. */
+.topbar-instances {
+  margin-left: auto;
+  display: flex; flex-wrap: wrap; justify-content: flex-end;
+  align-items: center; gap: 6px;
 }
-.theme-toggle svg { width: 18px; height: 18px; }
+/* Self vs peers, made explicit: self is a SOLID fill with knockout text
+ * (glyphs render in the canvas color, as if cut out of the block); peers
+ * keep the outline look — colored border + colored glyphs, NO background. */
+.topbar-instances .inst-chip-self {
+  background: var(--ib, var(--primary));
+  color: var(--bg);
+  border-color: var(--ib, var(--primary));
+  font-weight: 600;
+}
+.topbar-instances .inst-chip-peer {
+  background: transparent;
+  opacity: .92;
+}
+.topbar-seg {
+  display: flex; align-items: center; gap: 2px;
+  padding: 2px;
+  border-radius: 999px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+}
+.topbar-btn, .topbar-seg-btn {
+  min-width: 30px; height: 28px; padding: 0 8px;
+  display: flex; align-items: center; justify-content: center;
+  border: none; background: transparent; border-radius: 999px;
+  color: var(--text3); font-size: 12px; font-weight: 500; line-height: 1;
+  font-family: var(--font-ui, inherit);
+  cursor: pointer;
+  transition: background var(--transition), color var(--transition);
+}
+.topbar-btn:hover, .topbar-seg-btn:hover { color: var(--text); }
+.topbar-seg-btn.active {
+  background: var(--primary-bg);
+  color: var(--primary);
+}
+.topbar-btn svg, .topbar-seg-btn svg { width: 15px; height: 15px; }
 
-/* ── Sidebar Top (title + lang toggle) ───────────────────── */
+/* ── Sidebar Top (brand mark + title) ───────────────────── */
 .sidebar-top {
-  display: flex; align-items: center; justify-content: space-between;
-  gap: 8px; padding: 16px 20px 14px;
+  display: flex; align-items: center; justify-content: flex-start;
+  gap: 10px; padding: 16px 20px 14px;
   border-bottom: 1px solid var(--sidebar-border);
 }
 .sidebar-top h2 {
   padding: 0; margin: 0; font-size: 13px; letter-spacing: 0;
   color: var(--sidebar-text-active); font-weight: 500;
 }
+.sidebar-mark { display: none; flex-shrink: 0; }
 
-/* ── Language Toggle ─────────────────────────────────────── */
-.lang-toggle {
-  width: 36px; height: 36px; border-radius: var(--radius-sm);
-  background: var(--sidebar-hover); border: 1px solid var(--sidebar-border);
-  color: var(--sidebar-text);
-  display: flex; align-items: center; justify-content: center;
-  font-size: 0.85rem; font-weight: 600; line-height: 1;
-  transition: all var(--transition); flex-shrink: 0; cursor: pointer;
-  font-family: var(--font-ui, inherit);
+/* ── Sidebar Collapse (body.nav-collapsed) ──────────────── */
+.sidebar { transition: width .2s ease; }
+body.nav-collapsed .sidebar { width: 68px; }
+body.nav-collapsed .sidebar-top {
+  justify-content: center; padding: 16px 8px 14px;
 }
-.lang-toggle:hover {
-  background: var(--sidebar-hover); color: var(--sidebar-text-active);
-  border-color: rgba(255,255,255,.18);
+body.nav-collapsed .sidebar-top h2 { display: none; }
+body.nav-collapsed .sidebar-mark { display: block; }
+body.nav-collapsed .nav-link {
+  justify-content: center; padding: 9px 0; margin: 1px 6px;
 }
-.lang-toggle .lang-current { display: inline-block; }
+body.nav-collapsed .nav-link span { display: none; }
+body.nav-collapsed .sidebar-version { display: none; }
+body.nav-collapsed .sidebar-footer {
+  flex-direction: column; align-items: center;
+  padding: 10px 8px; flex-wrap: nowrap;
+}
+body.nav-collapsed .sidebar-footer .btn-secondary {
+  width: 34px; height: 34px; padding: 0; flex: 0 0 auto;
+}
+body.nav-collapsed .sidebar-footer .btn-secondary span { display: none; }
+body.nav-collapsed .sidebar-footer .btn-secondary .logout-icon { display: block; }
 
 /* ── Main Content ───────────────────────────────────────── */
 .main-content {
-  flex: 1; padding: 32px; overflow-y: auto; background: var(--bg);
+  flex: 1; padding: 32px; padding-top: calc(var(--topbar-h, 48px) + 32px);
+  overflow-y: auto; background: var(--bg);
   animation: fadeIn .2s ease;
 }
 @keyframes fadeIn {
@@ -431,10 +492,163 @@ p.error { color: var(--danger); font-style: italic; margin: 0; }
   font-weight: 400;
 }
 
+/* ── Hero Banner (stats page) — Finora decorative language: violet wash,
+      fine grid, circuit traces, one floating glass slab. Purely presentational;
+      the section header below keeps every functional control. ── */
+.hero-banner {
+  position: relative;
+  display: flex; flex-direction: column; justify-content: center;
+  min-height: 128px;
+  margin-bottom: 22px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background:
+    radial-gradient(120% 180% at 0% 0%, rgba(147,118,255,.16), transparent 55%),
+    radial-gradient(90% 140% at 100% 100%, rgba(126,232,248,.05), transparent 60%),
+    var(--surface);
+  overflow: hidden;
+}
+.hero-banner__grid {
+  position: absolute; inset: 0; z-index: 0;
+  background-image:
+    linear-gradient(rgba(151,129,221,.05) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(151,129,221,.05) 1px, transparent 1px);
+  background-size: 24px 24px;
+  -webkit-mask-image: linear-gradient(90deg, transparent 30%, #000 100%);
+  mask-image: linear-gradient(90deg, transparent 30%, #000 100%);
+}
+.hero-banner__circuit {
+  position: absolute; right: 24px; top: 6px;
+  height: 116px; width: min(660px, 62%);
+  z-index: 1; pointer-events: none;
+}
+.hero-banner__circuit .hb-trace { stroke: #aa8ef2; stroke-opacity: .55; }
+.hero-banner__circuit .hb-dim { stroke-opacity: .3; }
+.hero-banner__circuit .hb-node { fill: #c5aeff; animation: hb-breathe 6s ease-in-out infinite; }
+.hero-banner__circuit .hb-node--pulse { animation-duration: 3.6s; }
+.hero-banner__slab {
+  position: absolute; right: 15%; top: 12px;
+  width: 132px; height: 76px;
+  border: 1px solid rgba(210,193,255,.45);
+  border-radius: 12px;
+  background: linear-gradient(135deg, rgba(246,239,255,.14), rgba(185,155,253,.12) 45%, rgba(126,232,248,.07));
+  box-shadow: inset 0 2px 0 rgba(255,255,255,.22), 3px 8px 16px rgba(13,16,60,.12);
+  -webkit-backdrop-filter: blur(3px); backdrop-filter: blur(3px);
+  transform: rotate(-9deg);
+  animation: hb-slab-float 6s ease-in-out infinite alternate;
+  overflow: hidden;
+  z-index: 1; pointer-events: none;
+}
+.hero-banner__slab::before {
+  content: ''; position: absolute; inset: 7px;
+  border: 1px solid rgba(200,194,255,.16); border-radius: 8px;
+}
+.hero-banner__slab::after {
+  content: ''; position: absolute;
+  width: 44px; height: 130px; top: -28px; left: -60px;
+  background: linear-gradient(90deg, transparent, rgba(255,255,255,.16), transparent);
+  transform: rotate(30deg);
+  animation: hb-slab-shine 7s ease-in-out infinite;
+}
+.hero-banner__content {
+  position: relative; z-index: 2;
+  padding: 20px 26px;
+  max-width: 62%;
+}
+.hero-banner__eyebrow {
+  display: flex; align-items: center; gap: 7px;
+  font-size: 10px; letter-spacing: 1.2px; text-transform: uppercase;
+  color: var(--soft-text);
+  margin-bottom: 6px;
+}
+.hero-banner__eyebrow i {
+  width: 4px; height: 4px; border-radius: 50%;
+  background: var(--primary);
+  box-shadow: 0 0 9px rgba(147,118,255,.55);
+}
+.hero-banner__content h2 {
+  font-size: 20px; font-weight: 500; letter-spacing: .3px;
+  color: var(--text); margin: 0 0 4px; line-height: 1.3;
+}
+.hero-banner__content p {
+  margin: 0; font-size: 12px; line-height: 1.5; color: var(--text2);
+}
+[data-theme="light"] .hero-banner__circuit .hb-trace { stroke: #8d75c5; }
+[data-theme="light"] .hero-banner__circuit .hb-node { fill: #8d75c5; }
+[data-theme="light"] .hero-banner__slab {
+  border-color: rgba(255,255,255,.9);
+  background: linear-gradient(135deg, rgba(255,255,255,.55), rgba(199,181,249,.3) 55%, rgba(144,215,237,.24));
+  box-shadow: inset 0 2px 0 rgba(255,255,255,.85), 5px 9px 15px rgba(117,96,175,.14);
+}
+[data-theme="light"] .hero-banner__grid { opacity: .75; }
+[data-theme="light"] .hero-banner__eyebrow { color: #7b69a4; }
+@keyframes hb-breathe {
+  0%, 100% { opacity: .45; }
+  50% { opacity: 1; }
+}
+@keyframes hb-slab-float {
+  from { transform: rotate(-9deg) translateY(0); }
+  to   { transform: rotate(-9deg) translateY(-6px); }
+}
+@keyframes hb-slab-shine {
+  0%, 55% { left: -60px; }
+  85%, 100% { left: 140px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .hero-banner__slab, .hero-banner__slab::after,
+  .hero-banner__circuit .hb-node { animation: none; }
+}
+@media (max-width: 1100px) {
+  .hero-banner__circuit { opacity: .25; }
+  .hero-banner__slab { display: none; }
+  .hero-banner__content { max-width: 90%; }
+}
+
+/* ── Stats Summary Strip (real-time totals) ────────────────
+ * Six glass metric cards right under the hero banner: window-scoped
+ * totals from the request-rate data + 24h weighted token/ttft/cache
+ * averages from the per-deployment summary. */
+.stats-metrics {
+  display: grid; grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 12px; margin-bottom: 22px;
+}
+.sm-card {
+  position: relative; overflow: hidden;
+  background:
+    radial-gradient(120% 160% at 100% 0%, var(--primary-bg), transparent 55%),
+    var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 14px 15px 13px;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.04), var(--shadow-sm);
+  transition: border-color var(--transition);
+}
+.sm-card:hover { border-color: var(--border2); }
+.sm-card-top {
+  display: flex; justify-content: space-between; align-items: center;
+  color: var(--text2); font-size: 11px; line-height: 1.2;
+}
+.sm-ic {
+  display: grid; place-items: center;
+  width: 22px; height: 22px; border-radius: 6px;
+  background: var(--primary-bg); color: var(--primary);
+  flex-shrink: 0;
+}
+.sm-ic svg { width: 13px; height: 13px; }
+.sm-value {
+  font-size: 22px; font-weight: 500; letter-spacing: -.5px;
+  margin: 10px 0 4px; color: var(--text); line-height: 1.15;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.sm-foot { font-size: 10px; color: var(--text3); line-height: 1.3; }
+@media (max-width: 1280px) { .stats-metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+@media (max-width: 680px)  { .stats-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+
 .debug-banner {
   background: var(--surface);
   border: 1px solid var(--border);
-  border-left: 3px solid var(--accent, #f0a020);
+  border-left: 3px solid var(--warn);
   padding: 10px 14px;
   margin-bottom: 22px;
   font-size: 13px;
@@ -505,12 +719,12 @@ p.error { color: var(--danger); font-style: italic; margin: 0; }
 /* OTel-semantic body renderer (boom-gateway.llm_request / llm_response) */
 .trace-body-summary { display: flex; flex-direction: column; gap: 6px; }
 .trace-body-row { display: flex; gap: 8px; align-items: center; font-size: .9em; }
-.trace-body-row .tb-label { color: var(--text-muted); min-width: 60px; }
+.trace-body-row .tb-label { color: var(--text3); min-width: 60px; }
 .trace-body-params code,
-.trace-body-usage { font-size: .85em; color: var(--text-muted); }
+.trace-body-usage { font-size: .85em; color: var(--text3); }
 .trace-body-params { display: inline-block; }
 .trace-body-messages th,
-.trace-body-choices th { text-align: left; padding: 4px 8px; font-size: .8em; color: var(--text-muted); }
+.trace-body-choices th { text-align: left; padding: 4px 8px; font-size: .8em; color: var(--text3); }
 .trace-body-messages td,
 .trace-body-choices td { padding: 4px 8px; }
 @media (max-width: 768px) {
@@ -536,7 +750,7 @@ p.error { color: var(--danger); font-style: italic; margin: 0; }
 .anomaly-explainer-body p {
   margin: 0.4rem 0;
   line-height: 1.5;
-  color: var(--text-muted, #6b7280);
+  color: var(--text3);
 }
 .anomaly-explainer-body p:first-child { margin-top: 0; }
 .anomaly-explainer-body p:last-child { margin-bottom: 0; }
@@ -620,13 +834,13 @@ p.error { color: var(--danger); font-style: italic; margin: 0; }
   background: var(--surface);
 }
 .anomaly-table .metric-chip.high {
-  color: var(--danger, #c0392b);
-  border-color: var(--danger, #c0392b);
+  color: var(--danger);
+  border-color: var(--danger);
   background: rgba(192, 57, 43, .08);
 }
 .anomaly-table .metric-chip.low {
-  color: var(--warning, #b8860b);
-  border-color: var(--warning, #b8860b);
+  color: var(--warn);
+  border-color: var(--warn);
   background: rgba(184, 134, 11, .08);
 }
 .anomaly-table .metric-sev {
@@ -648,7 +862,7 @@ p.error { color: var(--danger); font-style: italic; margin: 0; }
   display: block;
   font-size: 11px;
   font-family: ui-monospace, SFMono-Regular, monospace;
-  color: var(--text-muted, #6b7280);
+  color: var(--text3);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -683,7 +897,7 @@ p.error { color: var(--danger); font-style: italic; margin: 0; }
   gap: 12px;
   margin-top: 0.5rem;
   font-size: 11px;
-  color: var(--text-muted, #6b7280);
+  color: var(--text3);
   align-items: center;
 }
 .anomaly-scatter-legend span {
@@ -701,10 +915,10 @@ p.error { color: var(--danger); font-style: italic; margin: 0; }
 .card {
   background: var(--surface); border: 1px solid var(--border);
   border-radius: var(--radius); padding: 24px; margin-bottom: 16px;
-  box-shadow: var(--shadow-sm);
+  box-shadow: var(--shadow);
   transition: border-color var(--transition), box-shadow var(--transition);
 }
-.card:hover { border-color: var(--border2); box-shadow: var(--shadow); }
+.card:hover { border-color: var(--border2); box-shadow: var(--shadow-md); }
 .card h3 {
   font-size: 13px; color: var(--text2); margin-bottom: 16px;
   letter-spacing: 0; font-weight: 500;
@@ -1057,14 +1271,14 @@ div[id$="-table-wrap"]:not(.bare) > table > thead:first-child > tr:first-child >
 
 /* ── Modal ──────────────────────────────────────────────── */
 .modal-overlay {
-  position: fixed; inset: 0; background: rgba(0,0,0,.3);
+  position: fixed; inset: 0; background: rgba(0,0,0,.55);
   display: flex; align-items: center; justify-content: center; z-index: 100;
   backdrop-filter: blur(6px);
 }
-[data-theme="dark"] .modal-overlay { background: rgba(0,0,0,.55); }
+[data-theme="light"] .modal-overlay { background: rgba(0,0,0,.3); }
 .modal {
   background: var(--surface); border: 1px solid var(--border);
-  border-radius: 16px; padding: 28px;
+  border-radius: var(--radius); padding: 28px;
   width: 500px; max-width: 90vw; max-height: 80vh; overflow-y: auto;
   box-shadow: var(--shadow-lg);
   animation: modalIn .25s cubic-bezier(.16,1,.3,1);
@@ -1187,7 +1401,7 @@ div[id$="-table-wrap"]:not(.bare) > table > thead:first-child > tr:first-child >
   transition: background 200ms ease;
 }
 .otlp-ping-row[data-state="ok"] .otlp-ping-dot {
-  background: var(--success, #10b981);
+  background: var(--success);
 }
 .otlp-ping-row[data-state="fail"] .otlp-ping-dot {
   background: var(--danger, #ef4444);
@@ -1237,7 +1451,7 @@ div[id$="-table-wrap"]:not(.bare) > table > thead:first-child > tr:first-child >
   margin-bottom: 6px;
 }
 .blockrule-cond-row input.brc-field,
-.blockrule-cond-row input.brc-value { font-family: var(--mono-font, monospace); font-size: 12px; width: 100%; }
+.blockrule-cond-row input.brc-value { font-family: var(--mono); font-size: 12px; width: 100%; }
 .blockrule-cond-row select.brc-op { width: 100%; }
 .blockrule-cond-row .brc-del { white-space: nowrap; }
 #br-conds { display: flex; flex-direction: column; margin-bottom: 8px; }
@@ -1640,6 +1854,67 @@ div[id$="-table-wrap"]:not(.bare) > table > thead:first-child > tr:first-child >
 .search-input::placeholder { color: var(--text3); }
 .search-input:focus { border-color: var(--primary); box-shadow: 0 0 0 3px var(--primary-bg); }
 
+/* ── Models page filter row (reference .filter-row pattern) ──
+ * Scoped to #models-filter-row: the logs and KVC DFX tables also have a
+ * <tr class="filter-row"> inside <thead>, and a bare .filter-row flex rule
+ * would break their table-cell layout. */
+#models-filter-row {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  margin-bottom: 16px;
+}
+#models-filter-row .search-input { width: 300px; }
+#models-filter-row select.search-input { width: 150px; }
+.filter-count { font-size: 12px; color: var(--text3); margin-left: auto; }
+@media (max-width: 768px) {
+  #models-filter-row .search-input, #models-filter-row select.search-input { width: 100%; }
+  .filter-count { margin-left: 0; }
+}
+
+/* ── Plans summary strip (reference .plan-summary pattern) ──
+ * Count + Σ of the numeric cap columns. Accent-tinted icon sits top-right
+ * like the reference's blue/violet/orange cards. */
+.plans-summary {
+  display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px; margin-bottom: 22px;
+}
+.ps-card {
+  position: relative;
+  display: flex; flex-direction: column; gap: 6px;
+  min-height: 116px;
+  background:
+    radial-gradient(120% 160% at 100% 0%, var(--ps-accent-bg, transparent), transparent 55%),
+    var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 16px;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.04), var(--shadow-sm);
+  transition: border-color var(--transition);
+}
+.ps-card:hover { border-color: var(--border2); }
+.ps-card-main { display: flex; flex-direction: column; gap: 8px; padding-right: 52px; min-width: 0; }
+.ps-card-main span { font-size: 12px; color: var(--text2); }
+.ps-card-main strong {
+  font-size: 26px; font-weight: 550; line-height: 1.15; letter-spacing: -.6px;
+  font-variant-numeric: tabular-nums; overflow-wrap: anywhere; color: var(--text);
+}
+.ps-card small { font-size: 10px; color: var(--text3); line-height: 1.4; }
+.ps-card-icon {
+  position: absolute; right: 16px; top: 16px;
+  width: 38px; height: 38px; display: grid; place-items: center;
+  border-radius: 12px;
+}
+.ps-card-icon svg { width: 19px; height: 19px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+.ps-card-blue   { --ps-accent-bg: rgba(91,119,245,.10); }
+.ps-card-blue   .ps-card-icon { color: #8ca2ff; background: rgba(91,119,245,.16); }
+.ps-card-violet { --ps-accent-bg: rgba(152,109,239,.10); }
+.ps-card-violet .ps-card-icon { color: #b99aff; background: rgba(152,109,239,.16); }
+.ps-card-orange { --ps-accent-bg: rgba(236,145,63,.09); }
+.ps-card-orange .ps-card-icon { color: #f2ab6c; background: rgba(236,145,63,.13); }
+[data-theme="light"] .ps-card-blue   .ps-card-icon { color: #4d6ae9; background: #e8ecff; }
+[data-theme="light"] .ps-card-violet .ps-card-icon { color: #8960dc; background: #f0eaff; }
+[data-theme="light"] .ps-card-orange .ps-card-icon { color: #dc8537; background: #fff2e7; }
+@media (max-width: 960px) { .plans-summary { grid-template-columns: 1fr; } }
+
 /* ── Key display ────────────────────────────────────────── */
 .key-display {
   background: var(--surface2); color: var(--success); padding: 14px;
@@ -1678,29 +1953,25 @@ td.kvc-prefix .kvc-sub { font-size: 11px; color: var(--text3); }
 /* Visibility text badges: yellow "Private" / blue "Public". Sit inline next
    to model names in the models table, stats inflight table, and
    request-rate chart cards. Private keeps the team count as tooltip. */
-.private-model-badge { margin-left: 6px; padding: 1px 7px; font-size: 10px; vertical-align: middle; white-space: nowrap; background: var(--warn-bg); color: var(--warn); }
-.public-model-badge { margin-left: 6px; padding: 1px 7px; font-size: 10px; vertical-align: middle; white-space: nowrap; background: var(--info-bg); color: var(--info); }
+.private-model-badge { margin-left: 12px; padding: 1px 6px; font-size: 10px; vertical-align: middle; white-space: nowrap; background: var(--warn-bg); color: var(--warn); border-radius: 3px; }
+.public-model-badge { margin-left: 12px; padding: 1px 6px; font-size: 10px; vertical-align: middle; white-space: nowrap; background: var(--info-bg); color: var(--info); border-radius: 3px; }
 /* Inline warning note on config cards (e.g. metrics switch on but the trace
    master switch is off — /metrics stays dark until it is enabled). */
 .cfg-warn-note { margin: 4px 0 0; padding: 6px 10px; border-radius: 8px; font-size: 12px; background: var(--warn-bg); color: var(--warn); }
-.rb-chart-card__label .private-model-badge { margin-left: 4px; padding: 0 6px; }
-.rb-chart-card__label .public-model-badge { margin-left: 4px; padding: 0 6px; }
 .badge-plan-default {
-  background: var(--surface3); color: var(--text-muted);
+  background: var(--surface3); color: var(--text3);
   font-weight: 500; margin-left: 6px; padding: 2px 7px; font-size: 10px;
 }
 .badge-plan-no-plan {
   background: var(--danger-bg); color: var(--danger);
   font-weight: 600;
 }
-.badge-prefix { background: var(--surface3); color: var(--text-muted); margin-left: 6px; font-family: var(--mono-font, monospace); }
-.badge-tag { background: rgba(59,130,246,.12); color: #2563eb; margin-left: 6px; font-weight: 500; max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block; vertical-align: middle; }
-[data-theme="dark"] .badge-tag { color: #93c5fd; }
+.badge-prefix { background: var(--surface3); color: var(--text3); margin-left: 6px; font-family: var(--mono); }
+.badge-tag { background: var(--info-bg); color: var(--info); margin-left: 6px; font-weight: 500; max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block; vertical-align: middle; }
 .badge-vip {
   background: var(--primary-bg); color: var(--primary);
   font-weight: 500; border: 1px solid transparent;
 }
-[data-theme="dark"] .badge-vip { color: var(--primary); }
 
 /* ── Token stats ────────────────────────────────────────── */
 .token-stats { display: flex; gap: 14px; }
@@ -1725,11 +1996,12 @@ td.kvc-prefix .kvc-sub { font-size: 11px; color: var(--text3); }
   .sidebar { width: 56px; }
   .sidebar h2, .sidebar .nav-link span, .sidebar-footer { display: none; }
   .sidebar-top { padding: 12px 8px; justify-content: center; }
-  .lang-toggle { display: none; }
+  .sidebar-mark { display: block; }
   .nav-link { justify-content: center; padding: 12px; }
   .nav-link svg { margin: 0; }
-  .theme-toggle { display: none; }
-  .main-content { padding: 16px; }
+  #topbar-collapse { display: none; }
+  .topbar { left: 56px; }
+  .main-content { padding: 16px; padding-top: calc(var(--topbar-h, 48px) + 16px); }
   table { font-size: 11px; }
   th, td { padding: 8px 10px; }
 }
@@ -1790,19 +2062,16 @@ input[list] {
   color: var(--text);
 }
 
-/* ── Log cell: timestamp ────────────────────────────────── */
-.log-ts {
+/* ── Log cell: merged time+IP (stacked to halve lead-column width) ── */
+.log-timeip { line-height: 1.45; }
+.log-timeip span { display: block; white-space: nowrap; }
+.log-timeip-ts {
   font-family: var(--mono); font-size: 12px;
-  color: var(--text3); letter-spacing: .3px;
-  background: var(--surface2); padding: 2px 7px;
-  border-radius: var(--radius-xs); white-space: nowrap;
+  color: var(--text2); letter-spacing: .3px;
 }
-
-/* ── Log cell: IP address ───────────────────────────────── */
-.log-ip {
-  font-family: var(--mono); font-size: 12px;
-  color: var(--text2); letter-spacing: .5px;
-  padding: 2px 0;
+.log-timeip-ip {
+  font-family: var(--mono); font-size: 11px;
+  color: var(--text3); letter-spacing: .5px;
 }
 
 /* ── Log cell: model tag ────────────────────────────────── */
@@ -1827,8 +2096,8 @@ input[list] {
   display: flex; align-items: center; gap: 10px;
 }
 .vendor-logo {
-  width: 22px; height: 22px;
-  border-radius: 5px;
+  width: 26px; height: 26px;
+  border-radius: 6px;
   flex-shrink: 0;
   object-fit: contain;
   background: var(--surface3);   /* shows through if the SVG fails to load */
@@ -1885,20 +2154,33 @@ input[list] {
 /* Instance badge: colored dot + id — one stable color per instance id
    (hash-picked in app.js), so the same instance is trackable across rows.
    Without --ib it marks the local instance. */
-.inst-badge {
+/* Instance id chip — one rounded-rect box per instance, border tinted with
+ * the instance's deterministic theme color (peerColor). Used everywhere an
+ * instance id appears: inflight table, stress legend, analytics, logs,
+ * admin sidebar. */
+.inst-chip {
+  /* inline-block (not inline-flex): text-overflow: ellipsis is a block-
+   * container feature — flex containers ignore it, and a long instance id
+   * must never stretch the surrounding table/legend/sidebar. */
   display: inline-block;
+  max-width: 160px;
+  overflow: hidden; text-overflow: ellipsis;
   font-family: var(--mono);
   font-size: 11px;
-  line-height: 1.4;
+  line-height: 1.5;
   color: var(--ib, var(--primary));
+  border: 1px solid var(--ib, var(--primary));
+  background: color-mix(in srgb, var(--ib, var(--primary)) 8%, transparent);
+  border-radius: 6px;
+  padding: 0 7px;
   white-space: nowrap;
+  vertical-align: middle;
+  /* Dark canvas (default theme) starves the deepest palette colors (worst
+   * case #1d4ed8 ≈ 2.8:1). Brighten the whole chip uniformly — hue is
+   * preserved, so an instance keeps its color identity in both themes. */
+  filter: brightness(1.35);
 }
-.inst-badge::before {
-  content: "●";
-  margin-right: 3px;
-  font-size: 8px;
-  vertical-align: 1px;
-}
+[data-theme="light"] .inst-chip { filter: none; }
 /* Legend above the table: local (live) vs peers (snapshot). */
 #inflight-table-wrap .inflight-legend {
   margin: 0 0 6px;
@@ -2036,20 +2318,39 @@ input[list] {
 /* ── Stats bar chart (Request Rate / high-throughput feel) ─ */
 /*
  * Visual feel: thin rounded bars, not chunky ones. Each column is wide,
- * but the bar itself only takes ~14px centered inside it — looks more
+ * but the bar itself only takes ~18px centered inside it — looks more
  * refined and lets dense time axes breathe.
  */
 .rebalance-chart { display: flex; align-items: stretch; height: 160px; gap: 0; }
 .rb-y-axis {
   display: flex; flex-direction: column; justify-content: space-between;
-  padding: 0 8px 18px 0; font-size: 11px; color: var(--text3);
+  padding: 0 8px 18px 0; font-size: 10px; color: var(--text3);
   text-align: right; min-width: 32px;
+  font-variant-numeric: tabular-nums;
 }
 .rb-bars {
   display: flex; align-items: flex-end; flex: 1; gap: 2px;
   padding-bottom: 18px; border-bottom: 1px solid var(--border);
   border-radius: 0 0 2px 2px;
   min-width: 0;
+  position: relative;
+}
+/* Dashed horizontal gridlines at the 50% / 100% marks of the plot area
+   (the 100% line doubles as the bar baseline). Drawn as 6px-repeating
+   background tiles on an inset pseudo-element so they sit UNDER the bars
+   and never block hover titles. */
+.rb-bars::before {
+  content: '';
+  position: absolute; left: 0; right: 0; bottom: 18px;
+  height: calc(100% - 18px);
+  pointer-events: none;
+  background-image:
+    linear-gradient(to right, var(--border) 0 3px, transparent 3px 6px),
+    linear-gradient(to right, var(--border) 0 3px, transparent 3px 6px);
+  background-size: 6px 1px, 6px 1px;
+  background-repeat: repeat-x, repeat-x;
+  background-position: 0 50%, 0 100%;
+  opacity: .85;
 }
 .rb-bar-col {
   /* `flex: 1 1 0` + `min-width: 0` = columns share container width equally
@@ -2066,27 +2367,34 @@ input[list] {
   min-width: 0;
   display: flex; flex-direction: column;
   align-items: center; height: 100%; justify-content: flex-end;
+  position: relative; z-index: 1;
 }
 .rb-bar-value { font-size: 10px; color: var(--text3); margin-bottom: 3px; line-height: 1; font-weight: 500; }
 .rb-bar-value-zero { visibility: hidden; }
+.rb-bar-value-peak { color: var(--text); font-weight: 600; }
 .rb-bar {
-  /* Width as % of column → bar thickens/thins with column. 45% leaves a wide
-     gutter so bars stay slender and refined even at wide windows. min/max
-     caps: 2px hairline on very narrow windows, 14px ceiling on very wide
-     (was 22px — felt chunky and lost the high-throughput feel).
+  /* Width as % of column → bar thickens/thins with column. 55% with an
+     18px ceiling keeps bars present but not chunky on wide windows;
+     2px hairline floor for very narrow ones.
 
      min-height raised to 3px so tiny-value bars still render as a clean
      flat-bottom sliver (border-radius < height would otherwise round the
      bottom corners and make the bar look like it's floating above the
      baseline — which is the "bars don't bottom-align" visual issue). */
-  width: 45%;
+  width: 55%;
   min-width: 2px;
-  max-width: 14px;
+  max-width: 18px;
   min-height: 3px;
   border-radius: 3px 3px 0 0;
   transition: height .3s ease;
   position: relative;
+  background: var(--primary);
 }
+/* Peak-dim pattern (reference style): the busiest bucket reads at full
+   intensity, the rest settle back — stacked bars opt out (segment colors
+   already carry the encoding). */
+.rb-bar:not(.rb-bar-stacked) { opacity: .48; }
+.rb-bar.rb-bar-peak { opacity: 1; }
 .rb-bar-label {
   font-size: 10px; color: var(--text3); margin-top: 3px;
   /* Constrain to column width so long labels (MM-DD HH:MM) truncate with
@@ -2117,25 +2425,47 @@ input[list] {
   border-top: 1px solid rgba(255,255,255,.35);
 }
 
-/* Per-chart wrapper so the legend can absolutely position to top-right. */
+/* Per-chart wrapper. Cards live in the #request-rate-wrap grid: the "all
+   models" card spans the full row, per-model cards pair up 2-up. */
+#request-rate-wrap {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+#request-rate-wrap > p { grid-column: 1 / -1; }
 .rb-chart-card {
   position: relative;
-  margin-bottom: 0.8rem;
+  margin-bottom: 0;
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
-  padding: 14px 16px 10px;
+  padding: 14px 16px 12px;
+  min-width: 0;
+}
+.rb-chart-card--single { grid-column: 1 / -1; }
+.rb-chart-card__head {
+  display: flex; justify-content: space-between; align-items: baseline;
+  gap: 12px; margin-bottom: 10px; flex-wrap: wrap;
 }
 .rb-chart-card__label {
   font-size: 12px;
   font-weight: 600;
-  margin-bottom: 6px;
   color: var(--text2);
-  padding-right: 200px;   /* keep title clear of the floating legend */
   min-height: 16px;
+  display: flex; align-items: center; flex-wrap: wrap; gap: 2px;
+  min-width: 0;
 }
-.rb-chart-card--single { margin-bottom: 1rem; }
-.rb-chart-card:last-child { margin-bottom: 0; }
+.rb-chart-card__meta {
+  font-size: 11px; color: var(--text3);
+  display: flex; align-items: baseline; gap: 6px;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.rb-chart-card__meta b { color: var(--text); font-weight: 600; font-size: 13px; }
+.rb-meta-sep::before { content: '·'; opacity: .6; margin-left: 2px; }
+@media (max-width: 1100px) {
+  #request-rate-wrap { grid-template-columns: 1fr; }
+}
 
 /* Outer panel: wraps "Request Rate" title + range controls + all chart cards. */
 .request-rate-panel {
@@ -2159,13 +2489,12 @@ input[list] {
   font-size: 13px;
 }
 
-/* Legend floats at the chart card's top-right corner. */
+/* Legend sits below the chart, left-aligned (the head row now owns the
+   top-right corner). */
 .rb-legend {
-  position: absolute;
-  top: 14px; right: 16px;
   display: flex; flex-wrap: wrap; gap: 6px 12px;
-  justify-content: flex-end;
-  max-width: 60%;
+  justify-content: flex-start;
+  margin-top: 8px;
   font-size: 11px; color: var(--text3);
   line-height: 1.4;
 }
@@ -2257,7 +2586,7 @@ input[list] {
   background: var(--surface2);
   border: 1px solid var(--border);
 }
-.calib-diag { box-shadow: inset 0 0 0 1.5px #10b981; }
+.calib-diag { box-shadow: inset 0 0 0 1.5px var(--success); }
 .calib-axis-note {
   display: flex; justify-content: space-between;
   max-width: 640px; margin-top: 6px;
@@ -2293,7 +2622,7 @@ input[list] {
 }
 .calib-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; }
 .calib-swatch-pred   { background: #94a3b8; }
-.calib-swatch-actual { background: #10b981; }
+.calib-swatch-actual { background: var(--success); }
 .calib-caveat {
   font-size: 12px; color: var(--text3); line-height: 1.6;
   margin: 16px 0 0; padding: 10px 12px;
@@ -2358,7 +2687,7 @@ input[list] {
   display: inline-block; width: 10px; height: 10px;
   border-radius: 2px;
 }
-.agent-legend-anthropic { background: #10b981; }
+.agent-legend-anthropic { background: var(--success); }
 .agent-legend-other { background: #94a3b8; }
 
 /* ── Skeleton Loading ───────────────────────────────────── */
@@ -2376,7 +2705,7 @@ input[list] {
 
 /* ── Toast ──────────────────────────────────────────────── */
 .toast-container {
-  position: fixed; top: 20px; right: 20px; z-index: 300;
+  position: fixed; top: calc(var(--topbar-h, 48px) + 12px); right: 20px; z-index: 300;
   display: flex; flex-direction: column; gap: 8px;
 }
 .toast {
@@ -3073,6 +3402,25 @@ input[list] {
   color: var(--text3);
   white-space: nowrap;
 }
+/* One entry per live instance (self labeled + peer id chips); wraps when
+   the cluster is wide. */
+.stress-uptime__items {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 18px;
+}
+.stress-uptime__item {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 8px;
+  white-space: nowrap;
+}
+.stress-uptime__self {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--primary);
+}
 .stress-uptime__value {
   font-size: 18px;
   font-weight: 500;
@@ -3083,17 +3431,21 @@ input[list] {
 }
 
 /* Multi-instance legend shared by all five pressure charts. Hidden until
-   a peer is live; chips mirror line styles (self solid, peers dashed). */
+   a peer is live; chips mirror line styles (self solid, peers dashed).
+   Lives INSIDE the info bar card as its second row — width:100% forces a
+   wrapped row, the top divider separates it from the info items. The
+   [hidden] override is required: the display:flex above would win over
+   the UA stylesheet's hidden handling and leave an empty box. */
+.stress-legend[hidden] { display: none; }
 .stress-legend {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: 6px 14px;
-  padding: 8px 14px;
-  margin-top: 8px;
-  background: var(--surface2);
-  border: 1px solid var(--border);
-  border-radius: 8px;
+  width: 100%;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
   font-size: 12px;
   color: var(--text2);
 }
@@ -3240,9 +3592,9 @@ input[list] {
   margin-left: auto; flex-shrink: 0;
   transition: background .3s ease;
 }
-.alert-dot.green { background: #10b981; }
+.alert-dot.green { background: var(--success); }
 .alert-dot.red {
-  background: #ef4444;
+  background: var(--danger);
   animation: alert-pulse 1.6s ease-in-out infinite;
 }
 @keyframes alert-pulse {
@@ -3288,6 +3640,16 @@ input[list] {
 }
 .status-panel__count--red    { background: var(--danger-bg);  color: var(--danger); }
 .status-panel__count--green  { background: var(--success-bg); color: var(--success); }
+/* Section labels inside the merged alerts panel (active / history). */
+.status-subhead {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 13px; font-weight: 500; color: var(--text2);
+  margin: 0 0 10px;
+}
+.status-subhead--history {
+  margin-top: 16px; padding-top: 16px;
+  border-top: 1px solid var(--border);
+}
 
 /* One alert episode = one row card */
 .alert-card {
@@ -3473,23 +3835,25 @@ input[list] {
 }
 .an-hy span {
   position: absolute; right: 10px; transform: translateY(50%);
-  font-size: 11px; color: var(--text3); font-family: var(--mono);
+  font-size: 11px; font-family: var(--mono);
   font-variant-numeric: tabular-nums;
 }
 /* Axis labels are tiny 11px figures — the generic dark --text3 is too
    dim for them (≈2.6:1); lift to a legible-but-still-muted tone. */
-[data-theme="dark"] .an-hy span,
-[data-theme="dark"] .an-hx span { color: #8b94a8; }
+.an-hy span,
+.an-hx span { color: #8b94a8; }
+[data-theme="light"] .an-hy span,
+[data-theme="light"] .an-hx span { color: var(--text3); }
 .an-svgwrap {
   position: relative; flex: 1; height: 160px;
   border-bottom: 1px solid var(--border2);
 }
 .an-svg { display: block; width: 100%; height: 100%; overflow: visible; }
 .an-grid {
-  stroke: var(--border); stroke-width: 1; stroke-dasharray: 4 4;
+  stroke: var(--border2); stroke-width: 1; stroke-dasharray: 4 4;
 }
-[data-theme="dark"] .an-grid { stroke: var(--border2); }
-.an-grad-a { stop-color: var(--primary); stop-opacity: .18; }
+[data-theme="light"] .an-grid { stroke: var(--border); }
+.an-grad-a { stop-color: var(--primary); stop-opacity: .28; }
 .an-grad-b { stop-color: var(--primary); stop-opacity: 0; }
 .an-line {
   fill: none; stroke: var(--primary); stroke-width: 2;
@@ -3505,7 +3869,7 @@ input[list] {
 .an-hx { position: relative; height: 16px; margin-left: 44px; margin-top: 6px; }
 .an-hx span {
   position: absolute; transform: translateX(-50%);
-  font-size: 10.5px; color: var(--text3); font-family: var(--mono);
+  font-size: 10.5px; font-family: var(--mono);
 }
 
 /* Hover tooltip — absolutely positioned inside the chart card, follows the
@@ -3692,7 +4056,7 @@ input[list] {
   width: 1%;
   white-space: nowrap;
 }
-.model-vendor-logo { width: 22px; height: 22px; vertical-align: middle; }
+.model-vendor-logo { width: 26px; height: 26px; vertical-align: middle; }
 .model-id-block {
   display: inline-flex; flex-direction: column; gap: 1px;
   line-height: 1.3; vertical-align: middle; margin-left: 6px;
@@ -3740,13 +4104,4 @@ input[list] {
   display: inline-block; vertical-align: middle;
 }
 
-/* Data row: stacked(deploy_id / visibility) */
-.dep-id-block {
-  display: flex; flex-direction: column; gap: 0;
-  line-height: 1.3;
-}
-.dep-vis {
-  font-size: 10px; color: var(--text3);
-}
-.dep-vis .badge { font-size: 9px; padding: 1px 5px; }
 

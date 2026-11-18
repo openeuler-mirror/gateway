@@ -7,21 +7,17 @@
   let usageRefreshTimer = null;
 
   // ── Theme ─────────────────────────────────────────────
-  function getTheme() { return document.documentElement.dataset.theme || "light"; }
+  function getTheme() { return document.documentElement.dataset.theme || "dark"; }
   function setTheme(t) {
     document.documentElement.dataset.theme = t;
     localStorage.setItem("boom-theme", t);
     updateThemeIcons();
     document.dispatchEvent(new CustomEvent("themechange"));
   }
-  function toggleTheme() { setTheme(getTheme() === "dark" ? "light" : "dark"); }
   function updateThemeIcons() {
-    var dark = getTheme() === "dark";
-    document.querySelectorAll(".theme-toggle").forEach(function(btn) {
-      var sun = btn.querySelector(".icon-sun");
-      var moon = btn.querySelector(".icon-moon");
-      if (sun) sun.style.display = dark ? "none" : "block";
-      if (moon) moon.style.display = dark ? "block" : "none";
+    var theme = getTheme();
+    document.querySelectorAll(".topbar-theme-btn").forEach(function(btn) {
+      btn.classList.toggle("active", btn.dataset.theme === theme);
     });
   }
   function isDark() { return getTheme() === "dark"; }
@@ -141,8 +137,7 @@
     setupLogin();
     setupLogout();
     setupAdminButtons();
-    setupThemeToggle();
-    setupLangToggle();
+    setupTopbar();
     updateLangToggle();
     updateThemeIcons();
     setupViewportTooltip();
@@ -150,6 +145,9 @@
     initSidebarVersion();
     window.addEventListener("hashchange", () => { onRoute(); onUserRoute(); });
     document.addEventListener("languagechange", () => {
+      // Topbar seg is a view of lang state — sync it for programmatic
+      // switches, not just topbar clicks (which sync in their own handler).
+      updateLangToggle();
       // Re-render visible dynamic content so t() picks up the new language.
       onRoute();
       onUserRoute();
@@ -165,11 +163,11 @@
     checkSession();
   });
 
-  // Fetch /health once on load and inject the version into both sidebars
-  // and the instance id into the admin sidebar — behind an LB each page
-  // load can land on a different instance, and the admin sidebar's
-  // per-instance stats pages need the "which instance am I on" context.
-  // /health is unauthenticated (liveness endpoint), so this works pre-login.
+  // Fetch /health once on load and inject the version into both sidebars;
+  // remember the instance id for the topbar roster (self fallback before the
+  // first authenticated poll lands) — behind an LB each page load can land
+  // on a different instance. /health is unauthenticated (liveness endpoint),
+  // so this works pre-login.
   async function initSidebarVersion() {
     try {
       const res = await fetch("/health");
@@ -180,7 +178,6 @@
       document.getElementById("sidebar-version-user").textContent = v;
       document.getElementById("sidebar-version-admin").textContent = v;
       if (data.instance_id) {
-        document.getElementById("sidebar-instance-admin").textContent = data.instance_id;
         window.__BOOM_INSTANCE_ID = data.instance_id;
       }
     } catch {
@@ -188,27 +185,86 @@
     }
   }
 
-  // ── Language toggle ───────────────────────────────────
-  function setupLangToggle() {
-    document.querySelectorAll(".lang-toggle").forEach(function (btn) {
-      btn.addEventListener("click", toggleLang);
+  // ── Topbar (sidebar collapse / language / theme) ──────
+  function setupTopbar() {
+    if (localStorage.getItem("boom-nav-collapsed") === "1") {
+      document.body.classList.add("nav-collapsed");
+    }
+    var collapseBtn = document.getElementById("topbar-collapse");
+    if (collapseBtn) {
+      collapseBtn.addEventListener("click", function () {
+        var collapsed = document.body.classList.toggle("nav-collapsed");
+        localStorage.setItem("boom-nav-collapsed", collapsed ? "1" : "0");
+      });
+    }
+    document.querySelectorAll(".topbar-lang-btn").forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        window.__i18n.setLang(btn.dataset.lang);
+        updateLangToggle();
+      });
     });
-  }
-
-  function toggleLang() {
-    const next = (window.__i18n.currentLang() === "en") ? "zh" : "en";
-    window.__i18n.setLang(next);
-    updateLangToggle();
+    document.querySelectorAll(".topbar-theme-btn").forEach(function (btn) {
+      btn.addEventListener("click", function () { setTheme(btn.dataset.theme); });
+    });
   }
 
   function updateLangToggle() {
-    // Show the *other* language's code on the button (the one you'll switch to).
-    const current = window.__i18n.currentLang();
-    const label = current === "en" ? "中" : "EN";
-    document.querySelectorAll(".lang-toggle .lang-current").forEach(function (el) {
-      el.textContent = label;
+    var current = window.__i18n.currentLang();
+    document.querySelectorAll(".topbar-lang-btn").forEach(function (btn) {
+      btn.classList.toggle("active", btn.dataset.lang === current);
     });
     document.documentElement.setAttribute("lang", current === "en" ? "en" : "zh-CN");
+  }
+
+  // ── Topbar instance roster ────────────────────────────
+  // The one place instance-ID *identity* is shown: which instance serves
+  // this dashboard (filled chip) and which peers are alive (outline chips,
+  // data-inst keeps the inflight-row hover linkage). Row-level data chips
+  // (logs/analytics instance columns, stress legend, inflight table badges)
+  // are per-row attribution, not identity — they stay in their sections.
+  // Height follows content: a wide cluster wraps to multiple rows, and
+  // --topbar-h re-pins the fixed-bar offsets (main-content padding, toast
+  // container).
+  var topbarInstancesTimer = null;
+  function syncTopbarHeight() {
+    var bar = document.getElementById("topbar");
+    if (!bar) return;
+    var h = Math.max(48, Math.round(bar.getBoundingClientRect().height));
+    document.documentElement.style.setProperty("--topbar-h", h + "px");
+  }
+  async function loadTopbarInstances() {
+    var el = document.getElementById("topbar-instances");
+    if (!el) return;
+    try {
+      var data = await api("/admin/instances");
+      var self = data.self || window.__BOOM_INSTANCE_ID || "";
+      var html = "";
+      if (self) {
+        html += '<span class="inst-chip inst-chip-self" style="--ib:' + peerColor(self) + '" data-inst="' + esc(self) +
+          '" title="' + esc(t("topbar.self_instance")) + " · " + esc(self) + '">' + esc(self) + "</span>";
+      }
+      (data.peers || []).forEach(function (pid) {
+        html += '<span class="inst-chip inst-chip-peer" style="--ib:' + peerColor(pid) + '" data-inst="' + esc(pid) +
+          '" title="' + esc(pid) + '">' + esc(pid) + "</span>";
+      });
+      el.innerHTML = html;
+      syncTopbarHeight();
+    } catch {
+      // Transient failure — keep the last roster; it's contextual chrome.
+    }
+  }
+  function startTopbarInstancesPoll() {
+    if (topbarInstancesTimer) return;
+    loadTopbarInstances();
+    topbarInstancesTimer = setInterval(loadTopbarInstances, 15000);
+    window.addEventListener("resize", syncTopbarHeight);
+  }
+  function stopTopbarInstancesPoll() {
+    if (topbarInstancesTimer) clearInterval(topbarInstancesTimer);
+    topbarInstancesTimer = null;
+    var el = document.getElementById("topbar-instances");
+    if (el) el.innerHTML = "";
+    syncTopbarHeight();
   }
 
   // ── Viewport-aware tooltip for .cell-tip and .field-tip ──────
@@ -250,12 +306,6 @@
     document.addEventListener("mouseout", function(e) {
       var el = e.target.closest(".cell-tip, .field-tip");
       if (el) tip.classList.remove("show");
-    });
-  }
-
-  function setupThemeToggle() {
-    document.querySelectorAll(".theme-toggle").forEach(function(btn) {
-      btn.addEventListener("click", toggleTheme);
     });
   }
 
@@ -310,6 +360,7 @@
   function showLogin() {
     currentUser = null;
     clearUsageRefresh();
+    stopTopbarInstancesPoll();
     document.querySelectorAll(".page").forEach((p) => p.classList.remove("active"));
     document.getElementById("page-login").classList.add("active");
   }
@@ -320,6 +371,7 @@
       document.getElementById("page-admin").classList.add("active");
       onRoute();
       startNavDotPoll();
+      startTopbarInstancesPoll();
     } else {
       applyUserSidebarTitle();
       document.getElementById("page-dashboard").classList.add("active");
@@ -1093,8 +1145,11 @@
       const errRate = r.requests > 0 ? (r.errors / r.requests * 100) : 0;
       const errRateCls = r.errors === 0 ? "an-errrate-zero" : errRate >= 5 ? "an-errrate-high" : errRate >= 1 ? "an-errrate-low" : "";
       const dur = r.avg_duration_ms == null ? "—" : Math.round(r.avg_duration_ms).toLocaleString() + " ms";
+      const idCell = r.instance_id === "unknown"
+        ? esc(nameOf(r))
+        : instanceChip(r.instance_id, ' title="' + esc(nameOf(r)) + '"');
       return "<tr>" +
-        '<td class="an-model" title="' + esc(nameOf(r)) + '">' + esc(nameOf(r)) + "</td>" +
+        '<td class="an-model">' + idCell + "</td>" +
         '<td class="num" title="' + fmtFullNum(r.requests) + '">' + fmtFullNum(r.requests) + "</td>" +
         '<td><div class="an-share"><div class="an-share-bar"><i style="width:' + barW + '%"></i></div><span>' + share.toFixed(1) + "%</span></div></td>" +
         '<td class="num" title="' + fmtFullNum(r.input_tokens) + " / " + fmtFullNum(r.output_tokens) + '">' +
@@ -2182,17 +2237,18 @@
   // window and polls incrementally: only points newer than the cursor
   // cross the wire after the initial load.
   let stressTimer = null;
-  // Last uptime pulled by renderStress — kept so a language switch can
-  // re-format immediately instead of waiting for the next 5s poll.
-  let stressUptimeSecs = 0;
+  // Last uptime map pulled by renderStress — kept so a language switch can
+  // re-render (chips + duration formatting are language-dependent)
+  // immediately instead of waiting for the next 5s poll.
+  let stressUptimeMap = {};
+  let stressSelfId = "";
   // instance_id -> samples[{ts, cpu_pct, …}]; newest ts seen = `since`
   // cursor for the next incremental poll.
   let stressSeries = {};
   let stressSince = 0;
 
   document.addEventListener("languagechange", () => {
-    const el = document.getElementById("stress-uptime-value");
-    if (el) el.textContent = formatUptime(stressUptimeSecs);
+    renderStressUptime(stressSelfId, stressUptimeMap);
   });
 
   function startStressPoll() {
@@ -2394,9 +2450,7 @@
     const selfId = snap.self_instance_id || "";
     const samples = stressSeries[selfId] || [];
 
-    stressUptimeSecs = snap.uptime_secs || 0;
-    const uptimeEl = document.getElementById("stress-uptime-value");
-    if (uptimeEl) uptimeEl.textContent = formatUptime(stressUptimeSecs);
+    renderStressUptime(snap.self_instance_id, snap.uptimes);
 
     // Every instance (self included) reads from the same DB rows, so all
     // dashboards show the same picture. Self renders as the solid primary
@@ -2423,7 +2477,7 @@
       accessor: (s) => s.cpu_pct,
       yMax: "auto",
       yMinFloor: 100,
-      color: cssVar("--primary") || "#0e7490",
+      color: cssVar("--primary") || "#9376ff",
       emptyHint: "Collecting… (first point closes ~10s)",
       formatValue: (v) => v.toFixed(1) + "%",
       formatY: (v) => v.toFixed(0) + "%",
@@ -2438,7 +2492,7 @@
       accessor: (s) => s.rss_bytes,
       yMax: "auto",
       yMinFloor: 100 * 1024 * 1024,
-      color: cssVar("--primary") || "#0e7490",
+      color: cssVar("--primary") || "#9376ff",
       emptyHint: "—",
       formatValue: formatBytes,
       formatY: (v) => formatBytes(v, true),
@@ -2452,7 +2506,7 @@
       samples,
       accessor: (s) => s.worker_queue_depth,
       yMax: "auto",
-      color: cssVar("--primary") || "#0e7490",
+      color: cssVar("--primary") || "#9376ff",
       emptyHint: "—",
       formatValue: (v) => String(v),
       formatY: (v) => String(Math.round(v)),
@@ -2466,7 +2520,7 @@
       samples,
       accessor: (s) => s.blocking_tasks_queued,
       yMax: "auto",
-      color: cssVar("--primary") || "#0e7490",
+      color: cssVar("--primary") || "#9376ff",
       emptyHint: "—",
       formatValue: (v) => String(v),
       formatY: (v) => String(Math.round(v)),
@@ -2480,8 +2534,8 @@
       samples,
       accessor: (s) => s.inflight,
       yMax: "auto",
-      color: cssVar("--primary") || "#0e7490",
-      fill: cssVar("--primary-glow") || "rgba(14,116,144,.16)",
+      color: cssVar("--primary") || "#9376ff",
+      fill: cssVar("--primary-glow") || "rgba(147,118,255,.20)",
       emptyHint: "—",
       formatValue: (v) => String(v),
       formatY: (v) => String(Math.round(v)),
@@ -2510,13 +2564,44 @@
       const swatchStyle = isSelf ? "" : ` style="border-color:${peerColor(id)}"`;
       const swatchClass = isSelf ? " stress-legend__swatch--self" : "";
       const chipClass = stale ? " stress-legend__chip--stale" : "";
-      const label = isSelf ? t("stress.legend.self") : id;
-      return `<span class="stress-legend__chip${chipClass}" title="${esc(id)}"><span class="stress-legend__swatch${swatchClass}"${swatchStyle}></span>${esc(label)}</span>`;
+      const label = isSelf ? t("stress.legend.self") : instanceChip(id);
+      return `<span class="stress-legend__chip${chipClass}" title="${esc(id)}"><span class="stress-legend__swatch${swatchClass}"${swatchStyle}></span>${label}</span>`;
     };
     const peers = ids.filter((id) => id !== selfId).sort();
     el.innerHTML =
       `<span class="stress-legend__note">${esc(t("stress.legend.note"))}</span>` +
       [chip(selfId, true)].concat(peers.map((id) => chip(id, false))).join("");
+  }
+
+  // Uptime strip: one entry per live instance — self labeled, peers as
+  // id chips (per-instance data, same convention as the legend below).
+  // Only live instances appear (registry heartbeat); a dead instance's
+  // curves stay in the charts for their 24h but its uptime is gone with
+  // the process.
+  function renderStressUptime(selfId, uptimes) {
+    stressSelfId = selfId || "";
+    stressUptimeMap = uptimes || {};
+    const box = document.getElementById("stress-uptime-items");
+    if (!box) return;
+    const ids = Object.keys(stressUptimeMap).sort((a, b) =>
+      a === stressSelfId ? -1 : b === stressSelfId ? 1 : a.localeCompare(b));
+    if (!ids.length) {
+      box.innerHTML = '<span class="stress-uptime__value">—</span>';
+      return;
+    }
+    box.innerHTML = ids
+      .map((id) => {
+        const label = id === stressSelfId
+          ? '<span class="stress-uptime__self">' + esc(t("topbar.self_instance")) + "</span>"
+          : instanceChip(id);
+        return (
+          '<span class="stress-uptime__item">' +
+          label +
+          '<span class="stress-uptime__value">' + esc(formatUptime(Number(stressUptimeMap[id]) || 0)) + "</span>" +
+          "</span>"
+        );
+      })
+      .join("");
   }
 
   // Process uptime → "0天 1小时 30分钟 15秒" (zh) / "0d 1h 30m 15s" (en).
@@ -2593,7 +2678,7 @@
   let _cssVarCache = null;
   let _cssVarTheme = null;
   function cssVar(name) {
-    const theme = document.documentElement.dataset.theme || "light";
+    const theme = document.documentElement.dataset.theme || "dark";
     if (_cssVarCache && _cssVarTheme === theme) return _cssVarCache[name] || "";
     _cssVarTheme = theme;
     const styles = getComputedStyle(document.documentElement);
@@ -2608,6 +2693,16 @@
     };
     return _cssVarCache[name] || "";
   }
+  // Re-alpha an rgba() string for canvas gradient stops (used by the area
+  // fill fade). Non-rgba input passes through untouched.
+  function fadeRgba(str, alpha) {
+    const m = /^rgba?\(([^)]+)\)$/.exec(String(str).trim());
+    if (!m) return str;
+    const parts = m[1].split(",").map((x) => x.trim());
+    if (parts.length < 3) return str;
+    return "rgba(" + parts[0] + "," + parts[1] + "," + parts[2] + "," + alpha + ")";
+  }
+
   // Invalidate cache on theme toggle and immediately redraw current charts.
   document.addEventListener("themechange", () => {
     _cssVarCache = null;
@@ -2776,7 +2871,8 @@
       );
     }
 
-    // Soft fill under the line (optional).
+    // Soft fill under the line (optional) — vertical fade, strongest at the
+    // line's ceiling and transparent at the baseline.
     if (opts.fill) {
       ctx.beginPath();
       values.forEach((v, i) => {
@@ -2788,7 +2884,10 @@
       ctx.lineTo(xFor(values.length - 1), padTop + plotH);
       ctx.lineTo(xFor(0), padTop + plotH);
       ctx.closePath();
-      ctx.fillStyle = opts.fill;
+      const grad = ctx.createLinearGradient(0, padTop, 0, padTop + plotH);
+      grad.addColorStop(0, opts.fill);
+      grad.addColorStop(1, fadeRgba(opts.fill, 0));
+      ctx.fillStyle = grad;
       ctx.fill();
     }
 
@@ -2840,6 +2939,7 @@
         const map = {};
         (data.deployments || []).forEach((d) => { map[d.deployment_id] = d; });
         deployment24hSummary = map;
+        renderStatsSummary();
       }
       loadInflight();
     } catch (err) {
@@ -2855,6 +2955,7 @@
       lastInflightData = data;
       lastInflightVis = vis;
       renderInflightTable(data, vis);
+      renderStatsSummary();
     } catch (err) {
       console.error("loadInflight error:", err);
     }
@@ -2867,6 +2968,18 @@
     var h = 0;
     for (var i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) >>> 0;
     return palette[h % palette.length];
+  }
+
+  // Instance id → rounded-rect chip, border tinted with the instance's
+  // deterministic theme color (same peerColor everywhere: stats, stress,
+  // analytics, logs, sidebar — one instance, one color).
+  function instanceChip(id, extra) {
+    if (!id) return "";
+    // Long ids ellipsize at the CSS level; the native title keeps the full
+    // id hoverable unless the caller already provides a richer tooltip.
+    var attrs = extra || "";
+    if (attrs.indexOf("title=") === -1) attrs += ' title="' + esc(id) + '"';
+    return '<span class="inst-chip" style="--ib:' + peerColor(id) + '"' + attrs + '>' + esc(id) + "</span>";
   }
 
   // Peer expansion is collapsed by default (this instance's row then shows
@@ -2927,7 +3040,7 @@
       return peerIds.filter(function (pid) { return peerStat(pid, depId); });
     }
     function peerBadgeHtml(pid) {
-      return '<span class="inst-badge" data-inst="' + esc(pid) + '" style="--ib:' + peerColor(pid) + '">' + esc(pid) + "</span>";
+      return instanceChip(pid, ' data-inst="' + esc(pid) + '"');
     }
     function fmtInflightDisplay(s) {
       return {
@@ -2978,13 +3091,13 @@
 
     var legend = "";
     if (peerIds.length) {
+      // Identity chips live in the topbar now — the legend only explains the
+      // data semantics: which rows are live vs snapshot.
       legend =
         '<div class="inflight-legend">' +
-        '<span class="inst-badge">' + esc(selfId) + "</span> " +
         t("stats.inflight.legend.self_live") +
         '<span class="legend-sep"></span>' +
-        peerIds.map(peerBadgeHtml).join(" ") + " " +
-        t("stats.inflight.legend.peer_snapshot") +
+        t("stats.inflight.legend.peer_snapshot", { count: peerIds.length }) +
         "</div>";
     }
 
@@ -3042,8 +3155,8 @@
       var grp = groupIndex % 2 === 0 ? "grp-a" : "grp-b";
       var modelTd = isGroupFirst
         ? '<td class="grp-model" rowspan="' + groupCounts[d.model] + '">' +
-          renderDeployCell(d.model, null, localModelCounts[d.model]) +
-          (visMap ? visibilityBadgeFor(visMap[d.model]) : "") +
+          renderDeployCell(d.model, null, localModelCounts[d.model],
+            visMap ? visibilityBadgeFor(visMap[d.model]) : "") +
           "</td>"
         : "";
 
@@ -3168,9 +3281,21 @@
     }
   }
 
-  // Throughput chart color — the accent, flat. Height already encodes value.
-  function throughputBarColor() {
-    return "var(--primary)";
+  // 2 decimals normally; near-zero traffic ("0.00" with real requests in the
+  // window) is meaningless, so fall back to 3 decimals there.
+  function fmtRps(v) {
+    var s = v.toFixed(2);
+    if (s === "0.00" && v > 0) s = v.toFixed(3);
+    return s;
+  }
+
+  // Chart-card head meta: "Σ requests · avg RPS" for the selected window.
+  function rbCardMeta(totalReq, windowSecs) {
+    var avg = windowSecs ? t("stats.rate.avg_rps", { v: fmtRps(totalReq / windowSecs) }) : "";
+    return '<div class="rb-chart-card__meta">'
+      + '<b>' + formatNumber(totalReq) + '</b> ' + esc(t("stats.rate.window_reqs"))
+      + (avg ? '<span class="rb-meta-sep"></span>' + esc(avg) : '')
+      + '</div>';
   }
 
   // ── Range controls (Agent Statistics + Request Rate) ─────
@@ -3292,11 +3417,102 @@
     }
   }
 
+  // ── Stats summary strip (real-time totals above the fold) ──
+  // Two data sources, both already fetched for this page:
+  //   - lastInflightData (3s poll) → cluster-wide 在途/上下文/流控 totals
+  //   - deployment24hSummary cache → 24h request total + weighted hit rate
+  // Pure client-side aggregation; whichever loader lands last re-renders.
+  function inflightClusterTotals() {
+    var out = { reqs: 0, ctx: 0, fc: 0, has: false };
+    if (!lastInflightData) return out;
+    out.has = true;
+    (lastInflightData.deployments || []).forEach(function (d) {
+      out.reqs += d.in_reqs || 0; out.ctx += d.in_context || 0; out.fc += d.fc_queue || 0;
+    });
+    var peers = lastInflightData.peers || {};
+    Object.keys(peers).forEach(function (pid) {
+      var fl = (peers[pid] && peers[pid].inflight) || {};
+      Object.keys(fl).forEach(function (depId) {
+        var s = fl[depId]; if (!s) return;
+        out.reqs += s.in_reqs || 0; out.ctx += s.in_context || 0; out.fc += s.fc_queue || 0;
+      });
+    });
+    return out;
+  }
+
+  function weighted24h(key) {
+    var num = 0, den = 0;
+    Object.keys(deployment24hSummary).forEach(function (id) {
+      var s = deployment24hSummary[id];
+      if (!s || !s.total_requests || s[key] == null) return;
+      num += s.total_requests * s[key];
+      den += s.total_requests;
+    });
+    return den > 0 ? num / den : null;
+  }
+
+  function renderStatsSummary() {
+    var wrap = document.getElementById("stats-summary-wrap");
+    if (!wrap) return;
+    var infl = inflightClusterTotals();
+    var total24 = 0;
+    Object.keys(deployment24hSummary).forEach(function (id) {
+      var s = deployment24hSummary[id];
+      if (s && s.total_requests) total24 += s.total_requests;
+    });
+    var hit = weighted24h("avg_prefix_hit_rate");
+    var fmtInt = function (v, has) { return has ? Math.round(v).toLocaleString() : "—"; };
+    var cards = [
+      {
+        key: "inflight", value: fmtInt(infl.reqs, infl.has),
+        icon: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M1.5 8h3l2-4 3 8 2-4h3"/></svg>',
+      },
+      {
+        key: "inctx", value: fmtInt(infl.ctx, infl.has),
+        icon: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="8" cy="4" rx="5.5" ry="2.2"/><path d="M2.5 4v8c0 1.2 2.5 2.2 5.5 2.2s5.5-1 5.5-2.2V4"/><path d="M2.5 8c0 1.2 2.5 2.2 5.5 2.2s5.5-1 5.5-2.2"/></svg>',
+      },
+      {
+        key: "fc", value: fmtInt(infl.fc, infl.has),
+        icon: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 2h10M3 14h10M5 2c0 4 6 4 6 6s-6 2-6 6"/></svg>',
+      },
+      {
+        key: "req24", value: Object.keys(deployment24hSummary).some(function (id) { return deployment24hSummary[id] && deployment24hSummary[id].total_requests != null; })
+          ? total24.toLocaleString() : "—",
+        icon: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M2 14V9M6 14V4M10 14V7M14 14V2"/></svg>',
+      },
+      {
+        key: "hit24", value: hit == null ? "—" : hit.toFixed(1) + "%",
+        icon: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2.5v4h-4"/><path d="M13 6.5a5.5 5.5 0 10.5 3"/></svg>',
+      },
+    ];
+    wrap.innerHTML = cards.map(function (c) {
+      return '<div class="sm-card">'
+        + '<div class="sm-card-top"><span>' + esc(t("stats.summary." + c.key)) + '</span>'
+        + '<i class="sm-ic">' + c.icon + '</i></div>'
+        + '<div class="sm-value">' + c.value + '</div>'
+        + '<div class="sm-foot">' + esc(t("stats.summary." + c.key + "_foot")) + '</div>'
+        + '</div>';
+    }).join("");
+  }
+
   function renderRequestRateCharts(charts, window, visMap) {
     const wrap = document.getElementById("request-rate-wrap");
     if (!wrap) return;
     setRangeWindowNote("rate", window && window.from, window && window.to);
+    renderStatsSummary();
     if (!charts.length) { wrap.innerHTML = "<p>" + t("common.no_records") + "</p>"; return; }
+
+    // Window duration for RPS math — prefer explicit from/to; fall back to
+    // bucket length × bucket count (custom windows may end mid-bucket).
+    var windowSecs = null;
+    if (window && window.from && window.to) {
+      var wa = new Date(window.from).getTime(), wb = new Date(window.to).getTime();
+      if (!isNaN(wa) && !isNaN(wb) && wb > wa) windowSecs = (wb - wa) / 1000;
+    }
+    if (!windowSecs && window && window.bucket_secs && charts.length) {
+      var ev0 = (charts[0].events || []).length;
+      if (ev0) windowSecs = window.bucket_secs * ev0;
+    }
 
     var html = "";
     charts.forEach(function (chart) {
@@ -3311,23 +3527,27 @@
 
       if (isTotal) {
         // No segments — render a single-color bar chart.
-        var maxCount = Math.max(1, ...events.map(function (e) { return e.count || 0; }));
+        var counts = events.map(function (e) { return e.count || 0; });
+        var maxCount = Math.max(1, ...counts);
+        var peak = Math.max(0, ...counts);
+        var totalReq = counts.reduce(function (s, v) { return s + v; }, 0);
         var bars = events.map(function (e, idx) {
-          var count = e.count || 0;
+          var count = counts[idx];
           var pct = (count / maxCount) * 100;
           var showLabel = shouldShowLabel(events, idx);
           var lbl = formatBucketLabel(e.ts, window ? window.bucket_secs : 0);
           var title = lbl + ": " + t("stats.rebalance.req_count", { n: count });
           return '<div class="rb-bar-col" title="' + esc(title) + '">' +
-            '<div class="rb-bar-value' + (count === 0 ? " rb-bar-value-zero" : "") + '">' + count + '</div>' +
-            '<div class="rb-bar" style="height:' + Math.max(pct, 1) + '%;background:' + throughputBarColor(pct) + '"></div>' +
+            '<div class="rb-bar-value' + (count === 0 ? " rb-bar-value-zero" : "") + (count === peak && peak > 0 ? " rb-bar-value-peak" : "") + '">' + count + '</div>' +
+            '<div class="rb-bar' + (count === peak && peak > 0 ? " rb-bar-peak" : "") + '" style="height:' + Math.max(pct, 1) + '%"></div>' +
             '<div class="rb-bar-label' + (showLabel ? "" : " rb-label-hidden") + '">' + esc(lbl) + '</div>' +
             '</div>';
         }).join("");
         html += '<div class="rb-chart-card rb-chart-card--single">' +
-          '<div class="rb-chart-card__label">' + label + '</div>' +
+          '<div class="rb-chart-card__head"><div class="rb-chart-card__label">' + label + '</div>' +
+          rbCardMeta(totalReq, windowSecs) + '</div>' +
           '<div class="rebalance-chart">' +
-          '<div class="rb-y-axis"><span>' + maxCount + '</span><span>0</span></div>' +
+          '<div class="rb-y-axis"><span>' + maxCount + '</span><span>' + Math.round(maxCount / 2) + '</span><span>0</span></div>' +
           '<div class="rb-bars">' + bars + '</div>' +
           '</div></div>';
       } else {
@@ -3379,9 +3599,10 @@
         }).join("");
 
         html += '<div class="rb-chart-card rb-chart-card--stacked">' +
-          '<div class="rb-chart-card__label">' + label + '</div>' +
+          '<div class="rb-chart-card__head"><div class="rb-chart-card__label">' + label + '</div>' +
+          rbCardMeta(bucketTotals.reduce(function (s, v) { return s + v; }, 0), windowSecs) + '</div>' +
           '<div class="rebalance-chart">' +
-          '<div class="rb-y-axis"><span>' + maxTotal + '</span><span>0</span></div>' +
+          '<div class="rb-y-axis"><span>' + maxTotal + '</span><span>' + Math.round(maxTotal / 2) + '</span><span>0</span></div>' +
           '<div class="rb-bars">' + bars + '</div>' +
           '</div>' +
           '<div class="rb-legend">' +
@@ -3676,10 +3897,6 @@
       '<span id="rb-st-result" style="font-size:12px"></span></div></div>';
 
     wrap.innerHTML = html;
-    // 多实例观测(本次复现的错位教训):回退统计是每实例进程内存态,
-    // 面板必须标明"这是哪个实例的计数"。
-    const sub = document.getElementById("rollback-instance-badge");
-    if (sub) sub.textContent = window.__BOOM_INSTANCE_ID ? " @ " + window.__BOOM_INSTANCE_ID : "";
   }
 
   // 维测④的后端调用:POST /admin/stats/rollback/self-test(零副作用)。
@@ -4442,7 +4659,7 @@
     const yTicks = [0, yMax / 2, yMax].map((v) => {
       const yp = sy(v);
       return '<line x1="' + padL + '" y1="' + yp + '" x2="' + (padL + plotW) + '" y2="' + yp + '" stroke="var(--border, #eee)" stroke-dasharray="2 2"/>' +
-             '<text x="' + (padL - 6) + '" y="' + (yp + 3) + '" text-anchor="end" font-size="10" fill="var(--text-muted, #6b7280)">' + v.toFixed(1) + '</text>';
+             '<text x="' + (padL - 6) + '" y="' + (yp + 3) + '" text-anchor="end" font-size="10" fill="var(--text3)">' + v.toFixed(1) + '</text>';
     }).join("");
     const xTickMax = Math.ceil(xMax);
     const xTicksArr = [];
@@ -4451,20 +4668,20 @@
       const xp = sx(xv);
       const label = (Math.pow(10, k)).toLocaleString();
       xTicksArr.push('<line x1="' + xp + '" y1="' + (padT + plotH) + '" x2="' + xp + '" y2="' + (padT + plotH + 4) + '" stroke="var(--border, #ccc)"/>' +
-                     '<text x="' + xp + '" y="' + (padT + plotH + 16) + '" text-anchor="middle" font-size="10" fill="var(--text-muted, #6b7280)">' + label + '</text>');
+                     '<text x="' + xp + '" y="' + (padT + plotH + 16) + '" text-anchor="middle" font-size="10" fill="var(--text3)">' + label + '</text>');
     }
     const xTicks = xTicksArr.join("");
     const axisX =
       '<line x1="' + padL + '" y1="' + (padT + plotH) + '" x2="' + (padL + plotW) + '" y2="' + (padT + plotH) + '" stroke="var(--border, #ccc)"/>' +
       xTicks +
-      '<text x="' + (padL + plotW / 2) + '" y="' + (H - 8) + '" text-anchor="middle" font-size="11" fill="var(--text-muted, #6b7280)">' + esc(t("debug.anomalies.scatter.x_label")) + '</text>';
+      '<text x="' + (padL + plotW / 2) + '" y="' + (H - 8) + '" text-anchor="middle" font-size="11" fill="var(--text3)">' + esc(t("debug.anomalies.scatter.x_label")) + '</text>';
     const axisY =
       '<line x1="' + padL + '" y1="' + padT + '" x2="' + padL + '" y2="' + (padT + plotH) + '" stroke="var(--border, #ccc)"/>' +
       yTicks +
-      '<text x="14" y="' + (padT + plotH / 2) + '" text-anchor="middle" font-size="11" fill="var(--text-muted, #6b7280)" transform="rotate(-90 14 ' + (padT + plotH / 2) + ')">' + esc(t("debug.anomalies.scatter.y_label")) + '</text>';
+      '<text x="14" y="' + (padT + plotH / 2) + '" text-anchor="middle" font-size="11" fill="var(--text3)" transform="rotate(-90 14 ' + (padT + plotH / 2) + ')">' + esc(t("debug.anomalies.scatter.y_label")) + '</text>';
 
     // Points — color by metric_count
-    const colorFor = (mc) => mc >= 4 ? "#c0392b" : mc >= 2 ? "#b8860b" : "#3b82f6";
+    const colorFor = (mc) => mc >= 4 ? "var(--danger)" : mc >= 2 ? "var(--warn)" : "var(--info)";
     const points = pts.map((p) => {
       const cx = sx(p.x).toFixed(2);
       const cy = sy(p.y).toFixed(2);
@@ -4472,7 +4689,7 @@
       const tip = esc(p.alias + " | req=" + p.req_count.toLocaleString() + " | sev=" + p.severity.toFixed(2) + " | " + p.metric_count + " metrics");
       const label = '<title>' + tip + '</title>';
       const labelText = p.alias.length > 14 ? p.alias.slice(0, 13) + "…" : p.alias;
-      const labelSvg = '<text x="' + (parseFloat(cx) + 8) + '" y="' + (parseFloat(cy) + 4) + '" font-size="10" fill="var(--text-muted, #6b7280)">' + esc(labelText) + '</text>';
+      const labelSvg = '<text x="' + (parseFloat(cx) + 8) + '" y="' + (parseFloat(cy) + 4) + '" font-size="10" fill="var(--text3)">' + esc(labelText) + '</text>';
       return '<circle cx="' + cx + '" cy="' + cy + '" r="5" fill="' + color + '" fill-opacity="0.7" stroke="' + color + '">' + label + '</circle>' + labelSvg;
     }).join("");
 
@@ -4485,9 +4702,9 @@
         points +
       '</svg>' +
       '<div class="anomaly-scatter-legend">' +
-        '<span><svg width="10" height="10"><circle cx="5" cy="5" r="4" fill="#3b82f6"/></svg> 1 metric</span>' +
-        '<span><svg width="10" height="10"><circle cx="5" cy="5" r="4" fill="#b8860b"/></svg> 2-3 metrics</span>' +
-        '<span><svg width="10" height="10"><circle cx="5" cy="5" r="4" fill="#c0392b"/></svg> 4+ metrics</span>' +
+        '<span><svg width="10" height="10"><circle cx="5" cy="5" r="4" fill="var(--info)"/></svg> 1 metric</span>' +
+        '<span><svg width="10" height="10"><circle cx="5" cy="5" r="4" fill="var(--warn)"/></svg> 2-3 metrics</span>' +
+        '<span><svg width="10" height="10"><circle cx="5" cy="5" r="4" fill="var(--danger)"/></svg> 4+ metrics</span>' +
         '<span class="anomaly-scatter-quadrant">' + esc(t("debug.anomalies.explainer.scatter")) + '</span>' +
       '</div>' +
     '</div>';
@@ -4531,20 +4748,20 @@
         '</div>' +
         '<div class="agent-summary-card">' +
           '<div class="agent-summary-label">' + t("stats.agent.summary.anthropic") + '</div>' +
-          '<div class="agent-summary-value" style="color:#10b981">' + summary.anthropic.toLocaleString() + '</div>' +
+          '<div class="agent-summary-value" style="color:var(--success)">' + summary.anthropic.toLocaleString() + '</div>' +
         '</div>' +
         '<div class="agent-summary-card">' +
           '<div class="agent-summary-label">' + t("stats.agent.summary.share") + '</div>' +
-          '<div class="agent-summary-value" style="color:#10b981">' + ratioPct + '%</div>' +
+          '<div class="agent-summary-value" style="color:var(--success)">' + ratioPct + '%</div>' +
         '</div>' +
         '<div class="agent-summary-card">' +
           '<div class="agent-summary-label">' + t("stats.agent.summary.input_anthropic") + '</div>' +
-          '<div class="agent-summary-value" style="color:#10b981">' + summary.input_tokens_anthropic.toLocaleString() +
+          '<div class="agent-summary-value" style="color:var(--success)">' + summary.input_tokens_anthropic.toLocaleString() +
             ' <span style="font-size:0.7em;color:#6b7280">/ ' + summary.input_tokens_total.toLocaleString() + ' (' + inputRatioPct + '%)</span></div>' +
         '</div>' +
         '<div class="agent-summary-card">' +
           '<div class="agent-summary-label">' + t("stats.agent.summary.output_anthropic") + '</div>' +
-          '<div class="agent-summary-value" style="color:#10b981">' + summary.output_tokens_anthropic.toLocaleString() +
+          '<div class="agent-summary-value" style="color:var(--success)">' + summary.output_tokens_anthropic.toLocaleString() +
             ' <span style="font-size:0.7em;color:#6b7280">/ ' + summary.output_tokens_total.toLocaleString() + ' (' + outputRatioPct + '%)</span></div>' +
         '</div>' +
       '</div>';
@@ -5577,8 +5794,51 @@
   async function loadPlans() {
     try {
       const data = await api("/admin/plans");
-      renderPlansTable(data.plans || []);
+      const plans = data.plans || [];
+      renderPlansSummary(plans);
+      renderPlansTable(plans);
     } catch {}
+  }
+
+  // Totals strip above the plans table — same shape as the reference's
+  // plan summary: count + Σ of the numeric cap columns.
+  function renderPlansSummary(plans) {
+    const wrap = document.getElementById("plans-summary-wrap");
+    if (!wrap) return;
+    const teamN = plans.filter((p) => p.type === "team").length;
+    let tokens = 0, cost = 0;
+    plans.forEach((p) => {
+      if (p.total_token_limit != null && Number(p.total_token_limit) > 0) tokens += Number(p.total_token_limit);
+      if (p.total_cost_limit != null && Number(p.total_cost_limit) > 0) cost += Number(p.total_cost_limit);
+    });
+    const fmtCompact = (v) =>
+      v >= 1e9 ? (v / 1e9).toFixed(1) + "B" : v >= 1e6 ? (v / 1e6).toFixed(1) + "M" : v >= 1e3 ? (v / 1e3).toFixed(1) + "K" : String(v);
+    const cards = [
+      {
+        key: "count", value: String(plans.length),
+        foot: t("plans.summary.count_foot", { key: plans.length - teamN, team: teamN }),
+        icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 3 7.5v9L12 21l9-4.5v-9L12 3Z"/><path d="M3 7.5l9 4.5 9-4.5"/><path d="M12 12v9"/></svg>',
+      },
+      {
+        key: "tokens", value: fmtCompact(tokens), title: tokens.toLocaleString(),
+        foot: t("plans.summary.tokens_foot"),
+        icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></svg>',
+      },
+      {
+        key: "cost", value: "¥" + (cost >= 1e4 ? fmtCompact(cost) : cost.toLocaleString()),
+        title: "¥" + cost.toLocaleString(),
+        foot: t("plans.summary.cost_foot"),
+        icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M20 12a8 8 0 1 1-16 0 8 8 0 0 1 16 0Z"/><path d="M8.5 6.5 12 12l3.5-5.5"/><path d="M8.5 12h7M8.5 15h7M12 12v6"/></svg>',
+      },
+    ];
+    wrap.innerHTML = cards.map((c, i) =>
+      '<section class="ps-card ps-card-' + ["blue", "violet", "orange"][i] + '">' +
+        '<div class="ps-card-main"><span>' + esc(t("plans.summary." + c.key)) + '</span>' +
+        '<strong title="' + esc(c.title || c.value) + '">' + esc(c.value) + "</strong></div>" +
+        '<div class="ps-card-icon" aria-hidden="true">' + c.icon + "</div>" +
+        "<small>" + esc(c.foot) + "</small>" +
+      "</section>"
+    ).join("");
   }
 
   function renderPlansTable(plans) {
@@ -5947,9 +6207,12 @@
       if (myToken !== keysLoadToken) return;
       const data = await api(url);
       if (myToken !== keysLoadToken) return;
+      // Summary is fleet-wide (backend computes it before search/VIP/plan
+      // filters) — it must not flicker when the user narrows the table.
       // Publish the edit metadata and rows only for the latest load.
       window._promptLogExcludedKeys = excludedKeys;
       keysDataCache = data.keys || [];
+      renderKeysSummary(data.summary);
       renderKeysTable(keysDataCache);
       renderKeysPagination(data);
     } catch (err) {
@@ -5958,6 +6221,44 @@
       if (wrap) wrap.innerHTML = `<p class="error-msg">${t("common.failed_to_load", { what: t("keys.title"), message: esc(err.message) })}</p>`;
       console.error("loadKeys error:", err);
     }
+  }
+
+  // Totals strip above the keys table — same ps-card shape as the plans
+  // summary. Data comes from the backend `summary` object (fleet-wide, not
+  // filtered-view totals).
+  function renderKeysSummary(s) {
+    const wrap = document.getElementById("keys-summary-wrap");
+    if (!wrap) return;
+    if (!s) { wrap.innerHTML = ""; return; }
+    const fmtCompact = (v) =>
+      v >= 1e9 ? (v / 1e9).toFixed(1) + "B" : v >= 1e6 ? (v / 1e6).toFixed(1) + "M" : v >= 1e3 ? (v / 1e3).toFixed(1) + "K" : String(v);
+    const spend = Number(s.spend_sum || 0);
+    const cards = [
+      {
+        key: "total", value: String(s.total ?? 0), title: String(s.total ?? 0),
+        foot: t("keys.summary.total_foot", { active: s.active ?? 0, blocked: s.blocked ?? 0, expired: s.expired ?? 0, vip: s.vip ?? 0 }),
+        icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M14 7a4 4 0 1 1-5.7 5.7L3.5 17.5v3h3l.8-.8v-2h2v-2h2l1-1A4 4 0 0 1 14 7Z"/></svg>',
+      },
+      {
+        key: "spend", value: "¥" + (spend >= 1e4 ? fmtCompact(spend) : spend.toLocaleString(undefined, { maximumFractionDigits: 2 })),
+        title: "¥" + spend.toLocaleString(undefined, { maximumFractionDigits: 2 }),
+        foot: t("keys.summary.spend_foot"),
+        icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M20 12a8 8 0 1 1-16 0 8 8 0 0 1 16 0Z"/><path d="M8.5 6.5 12 12l3.5-5.5"/><path d="M8.5 12h7M8.5 15h7M12 12v6"/></svg>',
+      },
+      {
+        key: "limited", value: String(s.limited_now ?? 0), title: String(s.limited_now ?? 0),
+        foot: t("keys.summary.limited_foot", { window: s.limited_by_window ?? 0, budget: s.limited_by_budget ?? 0 }),
+        icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/><path d="M12 9v4M12 17h.01"/></svg>',
+      },
+    ];
+    wrap.innerHTML = cards.map((c, i) =>
+      '<section class="ps-card ps-card-' + ["blue", "violet", "orange"][i] + '">' +
+        '<div class="ps-card-main"><span>' + esc(t("keys.summary." + c.key)) + '</span>' +
+        '<strong title="' + esc(c.title || c.value) + '">' + esc(c.value) + "</strong></div>" +
+        '<div class="ps-card-icon" aria-hidden="true">' + c.icon + "</div>" +
+        "<small>" + esc(c.foot) + "</small>" +
+      "</section>"
+    ).join("");
   }
 
   // Render the plan cell for a key row. Three kinds:
@@ -6091,6 +6392,12 @@
   };
 
   // ── Admin: Models ─────────────────────────────────────
+  // Filter state survives reloads (60s auto-refresh re-renders from cache).
+  let modelFilterState = { query: "", vendor: "all", visibility: "all" };
+  let lastModelsRows = null;
+  let lastAliasesMap = null;
+  let modelsFilterBound = false;
+
   async function loadModels() {
     try {
       const [modelsResp, aliasesResp] = await Promise.all([
@@ -6104,11 +6411,70 @@
         if (!a.target_model) return;
         (aliasesMap[a.target_model] = aliasesMap[a.target_model] || []).push(a.alias_name);
       });
-      renderModelsTable(modelsResp.models || [], aliasesMap);
+      lastModelsRows = modelsResp.models || [];
+      lastAliasesMap = aliasesMap;
+      renderModelsTable(lastModelsRows, aliasesMap);
     } catch (err) {
       const wrap = document.getElementById("models-table-wrap");
       if (wrap) wrap.innerHTML = `<p class="error-msg">${t("common.failed_to_load", { what: t("models.title"), message: esc(err.message) })}</p>`;
     }
+  }
+
+  // Filter-row events — bound once. Typing refilters from the cached rows
+  // (no refetch), preserving caret position since the input itself is never
+  // re-created.
+  function setupModelsFilter() {
+    if (modelsFilterBound) return;
+    const search = document.getElementById("models-filter-search");
+    const vendor = document.getElementById("models-filter-vendor");
+    const vis = document.getElementById("models-filter-visibility");
+    if (!search || !vendor || !vis) return;
+    modelsFilterBound = true;
+    search.addEventListener("input", () => {
+      modelFilterState.query = search.value;
+      renderModelsTable(lastModelsRows || [], lastAliasesMap);
+    });
+    vendor.addEventListener("change", () => {
+      modelFilterState.vendor = vendor.value;
+      renderModelsTable(lastModelsRows || [], lastAliasesMap);
+    });
+    vis.addEventListener("change", () => {
+      modelFilterState.visibility = vis.value;
+      renderModelsTable(lastModelsRows || [], lastAliasesMap);
+    });
+  }
+
+  // Vendor <option> list rebuilt per load (models can change); the current
+  // selection is kept when its vendor still exists.
+  function refreshModelsVendorOptions(models) {
+    const sel = document.getElementById("models-filter-vendor");
+    if (!sel) return;
+    const vendors = [];
+    models.forEach((m) => {
+      const v = vendorOf(m.model_name);
+      if (vendors.indexOf(v) === -1) vendors.push(v);
+    });
+    vendors.sort();
+    if (modelFilterState.vendor !== "all" && vendors.indexOf(modelFilterState.vendor) === -1) {
+      modelFilterState.vendor = "all";
+    }
+    sel.innerHTML = '<option value="all">' + esc(t("models.filter.vendor_all")) + "</option>" +
+      vendors.map((v) => '<option value="' + esc(v) + '"' + (modelFilterState.vendor === v ? " selected" : "") + ">" + esc(v) + "</option>").join("");
+    sel.value = modelFilterState.vendor;
+  }
+
+  function applyModelFilters(models) {
+    const f = modelFilterState;
+    const q = (f.query || "").trim().toLowerCase();
+    return models.filter((m) => {
+      if (f.vendor !== "all" && vendorOf(m.model_name) !== f.vendor) return false;
+      if (f.visibility !== "all" && (m.visibility || "normal") !== f.visibility) return false;
+      if (q) {
+        const hay = ((m.model_name || "") + " " + (m.deployment_id || "")).toLowerCase();
+        if (hay.indexOf(q) === -1) return false;
+      }
+      return true;
+    });
   }
 
   // ── Models page: resource pool view ──────────────────────────────
@@ -6130,7 +6496,18 @@
     // carries the rollback state line — static, no toggle: the
     // max_context_tokens declaration is the sole participation signal.
     const wrap = document.getElementById("models-table-wrap");
-    if (models.length === 0) { wrap.innerHTML = "<p>" + t("models.empty") + "</p>"; return; }
+    setupModelsFilter();
+    refreshModelsVendorOptions(models);
+    const total = models.length;
+    models = applyModelFilters(models);
+    const countEl = document.getElementById("models-filter-count");
+    if (countEl) countEl.textContent = t("models.filter.count", { shown: models.length, total: total });
+    if (models.length === 0) {
+      wrap.innerHTML = total === 0
+        ? "<p>" + t("models.empty") + "</p>"
+        : '<p class="loading">' + esc(t("models.filter.empty")) + "</p>";
+      return;
+    }
     aliasesMap = aliasesMap || {};
     const order = [];
     const byName = {};
@@ -6150,7 +6527,7 @@
         const modelCell = `<td rowspan="${rows.length + warnCount}" class="model-block${zebra}">
           <img class="vendor-logo model-vendor-logo" src="/dashboard/assets/vendor/${vendor}" alt="${vendor}">
           <div class="model-id-block">
-            <span class="model-name">${esc(name)}</span>
+            <span class="model-name">${esc(name)}${visibilityBadgeFor(rows[0])}</span>
             <span class="model-count">${rows.length} ${esc(t("models.pool.instances"))}</span>
           </div>
         </td>`;
@@ -6183,10 +6560,9 @@
             aliasCell = '<button class="btn-small" onclick="window._showModelAliases(\'' + esc(m.model_name) + '\')">'
               + esc(t("models.aliases.view_detail", { n: aliases.length })) + '</button>';
           }
-          const visBadge = visibilityBadgeFor(m);
           return `<tr class="pool-dep${zebra} ${rowClass}">
           ${rowIdx === 0 ? modelCell : ""}
-          <td><div class="dep-id-block"><span class="dep-id">${esc(m.deployment_id || "-")}</span><span class="dep-vis">${visBadge}</span></div></td>
+          <td><span class="dep-id">${esc(m.deployment_id || "-")}</span></td>
           <td>${aliasCell}</td>
           <td>${costCell}</td>
           <td class="mono cell-url" title="${esc(m.api_base || "")}">${esc(m.api_base || "-")}</td>
@@ -8095,7 +8471,7 @@
     // Hovering a peer badge highlights that instance's rows and dims the
     // other peer rows (see .hovering/.hl rules in style.css).
     document.addEventListener("mouseover", (e) => {
-      const el = e.target.closest ? e.target.closest(".inst-badge[data-inst]") : null;
+      const el = e.target.closest ? e.target.closest(".inst-chip[data-inst]") : null;
       const tbody = document.querySelector("#inflight-table-wrap tbody");
       if (!tbody) return;
       if (el) {
@@ -8859,8 +9235,8 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
             <div class="form-group"><label>${t("form.key.max_budget")} ${tip(t("tip.key.max_budget_edit"))}</label><input id="m-edit-budget" type="number" step="0.01" min="0" value="${key.max_budget != null ? key.max_budget : ""}"></div>
             <div class="form-group"><label>${t("form.key.budget_duration")} ${tip(t("tip.key.budget_duration"))}</label><input id="m-edit-budget-duration" value="${esc(key.budget_duration || "")}" placeholder="1d / 7d / 30d"></div>
             <div class="form-group field-full"><label>${t("form.key.expires")} ${tip(t("tip.key.expires"))}</label><input id="m-edit-expires" value="${esc(key.expires || "")}" placeholder="2026-12-31 23:59:59" style="font-family:var(--mono);font-size:12px"></div>
-            <div class="form-group field-full"><label>${t("form.key.vip")} ${tip(t("tip.key.vip"))}</label><div style="display:flex;align-items:center;gap:8px;padding-top:4px"><input type="checkbox" id="m-edit-vip" ${isVip ? "checked" : ""}><span style="font-weight:600;color:#b45309;white-space:nowrap">${t("form.key.vip_label")}</span></div></div>
-            <div class="form-group field-full"><label>${t("form.key.prompt_log")} ${tip(t("tip.key.prompt_log"))}</label><div style="display:flex;align-items:center;gap:8px;padding-top:4px"><input type="checkbox" id="m-edit-no-prompt-log" ${isPromptLogExcluded ? "checked" : ""}><span style="font-weight:600;color:#dc2626;white-space:nowrap">${t("form.key.prompt_log_label")}</span></div></div>
+            <div class="form-group field-full"><label>${t("form.key.vip")} ${tip(t("tip.key.vip"))}</label><div style="display:flex;align-items:center;gap:8px;padding-top:4px"><input type="checkbox" id="m-edit-vip" ${isVip ? "checked" : ""}><span style="font-weight:600;color:var(--warn);white-space:nowrap">${t("form.key.vip_label")}</span></div></div>
+            <div class="form-group field-full"><label>${t("form.key.prompt_log")} ${tip(t("tip.key.prompt_log"))}</label><div style="display:flex;align-items:center;gap:8px;padding-top:4px"><input type="checkbox" id="m-edit-no-prompt-log" ${isPromptLogExcluded ? "checked" : ""}><span style="font-weight:600;color:var(--danger);white-space:nowrap">${t("form.key.prompt_log_label")}</span></div></div>
           </div>
         </div>
       </div>
@@ -9160,6 +9536,7 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
     const wrap = document.getElementById("quota-overview-wrap");
     const teams = data.teams || [];
     const noTeam = data.no_team || {};
+    renderTeamsSummary(teams, noTeam);
 
     const teamCard = (t1) => {
       const tokens = Number(t1.total_input_tokens || 0) + Number(t1.total_output_tokens || 0);
@@ -9223,6 +9600,56 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
 
   async function renderQuotaTeamDetail(teamId) {
     await _renderQuotaKeysView({ teamId, titleSuffix: t("quota.teams_header") });
+  }
+
+  // Totals strip above the quota overview — ps-card shape, same as plans and
+  // keys. Lifetime口径, fleet-wide: the value sums include the no-team
+  // rollup (most keys are unassigned; a "总量" card that silently skips
+  // them would read 0 on a busy fleet). The feet then break out the
+  // unassigned share.
+  function renderTeamsSummary(teams, noTeam) {
+    const wrap = document.getElementById("teams-summary-wrap");
+    if (!wrap) return;
+    const fmtCompact = (v) =>
+      v >= 1e9 ? (v / 1e9).toFixed(1) + "B" : v >= 1e6 ? (v / 1e6).toFixed(1) + "M" : v >= 1e3 ? (v / 1e3).toFixed(1) + "K" : String(v);
+    let keyCount = 0, inTok = 0, outTok = 0, cost = 0;
+    teams.forEach((tm) => {
+      keyCount += Number(tm.key_count || 0);
+      inTok += Number(tm.total_input_tokens || 0);
+      outTok += Number(tm.total_output_tokens || 0);
+      cost += Number(tm.total_cost || 0);
+    });
+    const unassignedKeys = Number(noTeam.key_count || 0);
+    const unassignedCost = Number(noTeam.total_cost || 0);
+    inTok += Number(noTeam.total_input_tokens || 0);
+    outTok += Number(noTeam.total_output_tokens || 0);
+    cost += unassignedCost;
+    const cards = [
+      {
+        key: "count", value: String(teams.length), title: String(teams.length),
+        foot: t("teams.summary.count_foot", { keys: keyCount, unassigned: unassignedKeys }),
+        icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>',
+      },
+      {
+        key: "spend", value: "¥" + (cost >= 1e4 ? fmtCompact(cost) : cost.toLocaleString(undefined, { maximumFractionDigits: 2 })),
+        title: "¥" + cost.toLocaleString(undefined, { maximumFractionDigits: 2 }),
+        foot: t("teams.summary.spend_foot", { cost: unassignedCost.toLocaleString(undefined, { maximumFractionDigits: 2 }) }),
+        icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M20 12a8 8 0 1 1-16 0 8 8 0 0 1 16 0Z"/><path d="M8.5 6.5 12 12l3.5-5.5"/><path d="M8.5 12h7M8.5 15h7M12 12v6"/></svg>',
+      },
+      {
+        key: "tokens", value: fmtCompact(inTok + outTok), title: (inTok + outTok).toLocaleString(),
+        foot: t("teams.summary.tokens_foot", { input: fmtCompact(inTok), output: fmtCompact(outTok) }),
+        icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></svg>',
+      },
+    ];
+    wrap.innerHTML = cards.map((c, i) =>
+      '<section class="ps-card ps-card-' + ["blue", "violet", "orange"][i] + '">' +
+        '<div class="ps-card-main"><span>' + esc(t("teams.summary." + c.key)) + '</span>' +
+        '<strong title="' + esc(c.title || c.value) + '">' + esc(c.value) + "</strong></div>" +
+        '<div class="ps-card-icon" aria-hidden="true">' + c.icon + "</div>" +
+        "<small>" + esc(c.foot) + "</small>" +
+      "</section>"
+    ).join("");
   }
 
   async function renderQuotaUnassigned() {
@@ -9626,7 +10053,6 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
   // ── Admin: Logs ──────────────────────────────────────
   let logsPage = 1;
   let logsFilters = {};
-  let logsFiltersTimer = null;
   let logsFiltersSetup = false;
   // Time window for the logs query: "3d" (default) / "7d" / "30d" / "all".
   // Keeps the backend ILIKE filters bounded to an indexed created_at range
@@ -9638,11 +10064,9 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
   // bumps the token; when the awaited fetch returns, if its captured token
   // no longer equals the live one, the response is discarded — so a slow
   // earlier request can't overwrite a newer one's render. Without this,
-  // typing fast in a column filter (e.g. "张" then "张三") could see the
-  // broader "张" result land *after* the narrower "张三" one and clobber
-  // the table back to a wider set — or vice versa, with the narrower result
-  // landing first then the wider one arriving late. Same for hashchange
-  // re-entering admin-logs mid-typing.
+  // a slow "page 1" response could land after a pagination click and clobber
+  // the table, or a hashchange re-entering admin-logs could race an in-flight
+  // Apply.
   let logsLoadToken = 0;
 
   function setupLogsFilters() {
@@ -9651,17 +10075,28 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
     const table = document.getElementById("logs-table");
     if (!table) return;
     // Event delegation on the static table — filter inputs are in <thead>.
+    // Typing only updates state; the query fires on Apply / Enter, not on
+    // every keystroke (each keystroke is a full server round-trip).
     table.addEventListener("input", (e) => {
       if (!e.target.classList.contains("col-filter")) return;
-      clearTimeout(logsFiltersTimer);
-      logsFiltersTimer = setTimeout(() => {
-        const col = e.target.dataset.col;
-        const val = e.target.value.trim();
-        if (val) { logsFilters[col] = val; } else { delete logsFilters[col]; }
+      const col = e.target.dataset.col;
+      const val = e.target.value.trim();
+      if (val) { logsFilters[col] = val; } else { delete logsFilters[col]; }
+    });
+    table.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && e.target.classList.contains("col-filter")) {
+        e.preventDefault();
         logsPage = 1;
         loadLogs();
-      }, 400);
+      }
     });
+    const applyBtn = document.getElementById("btn-apply-logs-filters");
+    if (applyBtn) {
+      applyBtn.addEventListener("click", () => {
+        logsPage = 1;
+        loadLogs();
+      });
+    }
     const rangeSelect = document.getElementById("logs-range");
     if (rangeSelect) {
       rangeSelect.value = logsRange;
@@ -9734,7 +10169,7 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
     const tbody = document.getElementById("logs-tbody");
     if (!tbody) return;
     if (logs.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="16" class="no-results">' + t("common.no_matching", { what: t("logs.title").toLowerCase() }) + '</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="15" class="no-results">' + t("common.no_matching", { what: t("logs.title").toLowerCase() }) + '</td></tr>';
       return;
     }
     tbody.innerHTML = logs.map((l) => {
@@ -9750,10 +10185,14 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
         const detailCell = promptLogEnabled && l.request_id
           ? '<button class="btn-small" onclick="window._viewPromptLog(\'' + esc(l.request_id) + '\',\'' + esc(l.key_hash) + '\',\'' + esc(l.team_alias || "") + '\')">' + t("action.view") + '</button>'
           : "-";
-        // Timestamp: muted mono badge
-        var tsCell = '<span class="log-ts">' + formatTimestamp(l.created_at) + '</span>';
-        // IP: special mono style
-        var ipCell = '<span class="log-ip">' + esc(l.client_ip || "-") + '</span>';
+        // Time + IP merged into one stacked cell — halves the lead-column
+        // width without dropping information: the full year lives in the
+        // title tooltip, the IP stays on its own (filterable) line.
+        var timeIpCell =
+          '<div class="log-timeip" title="' + esc(formatTimestamp(l.created_at) + (l.client_ip ? " · " + l.client_ip : "")) + '">' +
+            '<span class="log-timeip-ts">' + esc(compactTs(l.created_at)) + '</span>' +
+            '<span class="log-timeip-ip">' + esc(l.client_ip || "-") + '</span>' +
+          '</div>';
         // Model: split into model_name + deployment_id
         var modelVal = esc(l.model || "-");
         var modelCell;
@@ -9775,15 +10214,13 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
           ? formatNumber(l.input_tokens) + " / " + formatNumber(l.output_tokens)
           : "- / -";
         var kvCell = '<span class="mono">' + esc(pct) + "</span>";
-        // User tag: up to 3 attribution slots, non-empty ones joined " / ".
-        var tagParts = [l.user_tag1, l.user_tag2, l.user_tag3].filter(Boolean);
-        var tagCell = tagParts.length ? esc(tagParts.join(" / ")) : "-";
+        // Instance: the serving gateway instance, chipped in its theme color.
+        var instCell = l.instance_id ? instanceChip(l.instance_id) : "-";
         return `<tr>
-        <td>${tsCell}</td>
-        <td>${ipCell}</td>
+        <td>${timeIpCell}</td>
         <td>${esc(l.team_alias || l.team_id || "-")}</td>
         <td>${esc(l.key_alias || l.key_name || "-")}</td>
-        <td class="mono" title="${esc(tagParts.join("\n"))}">${tagCell}</td>
+        <td>${instCell}</td>
         <td>${modelCell}</td>
         <td class="mono">${esc(l.api_path)}</td>
         <td>${l.status_code >= 400 ? '<span style="color:var(--danger)">' + l.status_code + '</span>' : l.status_code}</td>
@@ -9904,7 +10341,7 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
       '<td class="mono">' + inOut + '</td>' +
       '<td class="mono kvc-prefix">' + prefixCell + '</td>' +
       '<td class="mono">' + esc(l.policy || "-") + '</td>' +
-      '<td class="mono">' + esc(l.instance_id || "-") + '</td>' +
+      '<td class="mono">' + (l.instance_id ? instanceChip(l.instance_id) : "-") + '</td>' +
       '<td class="mono">' + (l.request_tokens != null ? formatNumber(l.request_tokens) : "-") + '</td>' +
       '<td>' + (l.duration_ms != null ? l.duration_ms + "ms" : "-") + '</td>' +
       '<td>' + (l.ttft_ms != null ? l.ttft_ms + "ms" : "-") + '</td>' +
@@ -10257,7 +10694,7 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
   // Replaces the old "model:deployment_id" flat concatenation.
   // instanceCount (optional): when a model group has >1 backend instances,
   // append a "×N" marker so the group size is visible on the header row.
-  function renderDeployCell(model, deploymentId, instanceCount) {
+  function renderDeployCell(model, deploymentId, instanceCount, badgeHtml) {
     const v = vendorOf(model);
     const countTag = instanceCount > 1
       ? '<span class="grp-count" data-tip="' + t("stats.inflight.grp_instances", { n: instanceCount }) + '">×' + instanceCount + '</span>'
@@ -10266,7 +10703,7 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
       '<div class="deploy-cell">' +
         '<img class="vendor-logo" src="/dashboard/assets/vendor/' + v + '" alt="' + v + '">' +
         '<div class="deploy-text">' +
-          '<div class="deploy-model">' + esc(model) + countTag + '</div>' +
+          '<div class="deploy-model">' + esc(model) + countTag + (badgeHtml || '') + '</div>' +
           (deploymentId ? '<div class="deploy-id">' + esc(deploymentId) + '</div>' : '') +
         '</div>' +
       '</div>';
@@ -10369,6 +10806,18 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
     const pad = (n) => String(n).padStart(2, "0");
     return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ` +
            `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  }
+
+  // Logs-table compact stamp: "MM-DD HH:mm:ss". The year is folded into the
+  // cell's title tooltip and reappears in the text only for cross-year rows
+  // (range=all can reach back into the previous year).
+  function compactTs(iso) {
+    if (!iso) return "-";
+    const d = new Date(iso);
+    const pad = (n) => String(n).padStart(2, "0");
+    const rest = pad(d.getMonth() + 1) + "-" + pad(d.getDate()) + " " +
+      `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+    return d.getFullYear() === new Date().getFullYear() ? rest : d.getFullYear() + "-" + rest;
   }
 
   // Format a prefix hit-rate percentage. Truncate to 1 decimal (no rounding)

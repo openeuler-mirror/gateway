@@ -78,6 +78,11 @@ pub fn build_router<S: Clone + Send + Sync + 'static>(state: DashboardState) -> 
             "/dashboard/api/admin/keys",
             get(handlers_admin::list_keys).post(handlers_admin::create_key),
         )
+        // Admin — Instance roster (topbar identity strip).
+        .route(
+            "/dashboard/api/admin/instances",
+            get(handlers_admin::list_instances),
+        )
         .route(
             "/dashboard/api/admin/keys/batch",
             post(handlers_admin::batch_create_keys),
