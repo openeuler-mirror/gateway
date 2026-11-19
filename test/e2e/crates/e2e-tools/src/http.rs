@@ -33,6 +33,8 @@ impl HttpTestClient {
             base: base_url.trim_end_matches('/').to_string(),
             key: key.to_string(),
             client: reqwest::Client::builder()
+                // 目标全是 runner 本机 spawn 的子进程，环境代理变量会劫持 127.0.0.1 请求
+                .no_proxy()
                 .timeout(std::time::Duration::from_secs(60))
                 .build()
                 .expect("reqwest client"),
