@@ -9,5 +9,5 @@ pub use analytics::{
     TtlCache,
 };
 pub use daily_stats::{DailySnapshot, DailyStatsTracker, StatsRange};
-pub use reader::{list_logs, logs_page_to_json, ListLogsQuery, LogRow, LogsPage};
+pub use reader::{has_next, list_logs, list_logs_for_key, LogRow, LogsPage, LogsQuery, LOGS_COUNT_CAP};
 pub use user_tag_store::UserTagStore;

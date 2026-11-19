@@ -3336,12 +3336,6 @@ pub struct ListLogsQuery {
     pub range: Option<String>,
 }
 
-/// Upper bound for the bounded exact count behind the logs page total. The
-/// count subquery stops at this many matches, so cost is O(cap); totals at or
-/// above the cap are reported as `total_capped` and rendered "1000+ pages".
-/// Shared by the admin and user logs pages.
-pub(crate) const LOGS_COUNT_CAP: i64 = 50_000;
-
 /// Resolve the range param to a lower bound on created_at.
 /// Unknown values fall back to the 3d default.
 fn logs_range_from(range: &str) -> Option<chrono::DateTime<chrono::Utc>> {
@@ -3354,51 +3348,7 @@ fn logs_range_from(range: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     }
 }
 
-/// Escape LIKE/ILIKE metacharacters in user input so a literal "%" or "_"
-/// in a filter value can't widen the match to unrelated rows.
-fn escape_like(v: &str) -> String {
-    v.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
-}
 
-#[derive(Debug, sqlx::FromRow)]
-struct LogRow {
-    request_id: Option<String>,
-    key_hash: String,
-    key_name: Option<String>,
-    key_alias: Option<String>,
-    team_id: Option<String>,
-    team_alias: Option<String>,
-    model: String,
-    api_path: String,
-    is_stream: bool,
-    status_code: i16,
-    error_type: Option<String>,
-    error_message: Option<String>,
-    input_tokens: Option<i32>,
-    output_tokens: Option<i32>,
-    duration_ms: Option<i32>,
-    ttft_ms: Option<i32>,
-    created_at: Option<chrono::DateTime<chrono::Utc>>,
-    deployment_id: Option<String>,
-    client_ip: Option<String>,
-    cached_tokens: Option<i64>,
-    // DFX scheduling observability — columns on boom_request_log.
-    schedule_policy: Option<String>,
-    kv_hit_blocks: Option<i64>,
-    kv_input_blocks: Option<i64>,
-    trie_blocks: Option<i64>,
-    trie_max_blocks: Option<i64>,
-    request_tokens: Option<i64>,
-    queue_wait_ms: Option<i32>,
-    // Multi-instance attribution: the stable instance id that served the
-    // request (NULL on rows written by older binaries).
-    instance_id: Option<String>,
-    // Per-user attribution slots — values of the configured user_tag_headers,
-    // one column per header in list order.
-    user_tag1: Option<String>,
-    user_tag2: Option<String>,
-    user_tag3: Option<String>,
-}
 
 pub async fn list_logs(
     _session: AdminSession,
@@ -3412,244 +3362,31 @@ pub async fn list_logs(
         }
     };
 
-    let (page, per_page) = normalize_pagination(query.page, query.per_page);
-    let offset = (page - 1) * per_page;
-
-    // Build WHERE clause dynamically.
-    let mut where_clauses = Vec::new();
-    let mut param_idx = 1u32;
-
-    // Helper: register a param slot, return its index.
-    macro_rules! slot {
-        ($field:expr) => {
-            if $field.is_some() { let i = param_idx; param_idx += 1; Some(i) } else { None }
-        };
-    }
-
     let range = query.range.as_deref().unwrap_or("3d");
     let range_from = logs_range_from(range);
-    let range_param = if range_from.is_some() { let i = param_idx; param_idx += 1; Some(i) } else { None };
-    let key_hash_param   = slot!(query.key_hash);
-    let model_param      = slot!(query.model);
-    let status_param     = if query.status.as_deref() == Some("error") { let i = param_idx; param_idx += 1; Some(i) } else { None };
-    let request_id_param = slot!(query.request_id);
-    let key_alias_param  = slot!(query.key_alias);
-    let api_path_param   = slot!(query.api_path);
-    let status_code_param= slot!(query.status_code);
-    // stream is handled as a static WHERE clause (no param slot needed).
-    let error_param      = slot!(query.error);
-    let team_alias_param = slot!(query.team_alias);
-    let client_ip_param   = slot!(query.client_ip);
-    let policy_param     = slot!(query.policy);
-    let instance_param   = slot!(query.instance_id);
 
-    if let Some(i) = range_param {
-        where_clauses.push(format!("rl.created_at >= ${i}"));
-    }
-    if query.key_hash.is_some() {
-        where_clauses.push(format!("rl.key_hash = ${}", key_hash_param.unwrap()));
-    }
-    if query.model.is_some() {
-        where_clauses.push(format!("rl.model ILIKE ${}", model_param.unwrap()));
-    }
-    if query.status.as_deref() == Some("error") {
-        where_clauses.push(format!("rl.status_code != ${}", status_param.unwrap()));
-    }
-    if query.request_id.is_some() {
-        where_clauses.push(format!("rl.request_id ILIKE ${}", request_id_param.unwrap()));
-    }
-    if query.key_alias.is_some() {
-        where_clauses.push(format!("(rl.key_alias ILIKE ${0} OR rl.key_name ILIKE ${0})", key_alias_param.unwrap()));
-    }
-    if query.api_path.is_some() {
-        where_clauses.push(format!("rl.api_path ILIKE ${}", api_path_param.unwrap()));
-    }
-    if query.status_code.is_some() {
-        where_clauses.push(format!("rl.status_code = ${}", status_code_param.unwrap()));
-    }
-    if query.stream.is_some() {
-        let s = query.stream.as_deref().unwrap().to_lowercase();
-        if s == "yes" || s == "true" || s == "1" {
-            where_clauses.push("rl.is_stream = true".to_string());
-        } else if s == "no" || s == "false" || s == "0" {
-            where_clauses.push("rl.is_stream = false".to_string());
-        }
-    }
-    if query.error.is_some() {
-        // Match the error *type* (client_blocked, upstream_error, …), not the
-        // free-form error_message — a message like "upstream ... client ..."
-        // would otherwise surface unrelated error kinds for a "client" query.
-        where_clauses.push(format!("rl.error_type ILIKE ${}", error_param.unwrap()));
-    }
-    if query.team_alias.is_some() {
-        where_clauses.push(format!("bt.team_alias ILIKE ${}", team_alias_param.unwrap()));
-    }
-    if query.policy.is_some() {
-        // Filter against the RAW schedule_policy column (e.g. "kvc_aware+rollback")
-        // so both the raw name and display labels match via ILIKE.
-        where_clauses.push(format!("rl.schedule_policy ILIKE ${}", policy_param.unwrap()));
-    }
-    if query.instance_id.is_some() {
-        where_clauses.push(format!("rl.instance_id ILIKE ${}", instance_param.unwrap()));
-    }
-    if query.client_ip.is_some() {
-        where_clauses.push(format!("rl.client_ip ILIKE ${}", client_ip_param.unwrap()));
-    }
-    let where_sql = if where_clauses.is_empty() {
-        String::new()
-    } else {
-        format!("WHERE {}", where_clauses.join(" AND "))
+    // §3 DDL/SQL 所有权:boom_request_log 的全部 SQL 在 boom-audit。
+    // Dashboard 只做 HTTP 解析 + 响应组装。
+    let audit_query = boom_audit::LogsQuery {
+        page: query.page,
+        per_page: query.per_page,
+        range_from,
+        key_hash: query.key_hash,
+        model: query.model,
+        status: query.status,
+        request_id: query.request_id,
+        key_alias: query.key_alias,
+        api_path: query.api_path,
+        status_code: query.status_code,
+        stream: query.stream,
+        error: query.error,
+        team_alias: query.team_alias,
+        policy: query.policy,
+        instance_id: query.instance_id,
+        client_ip: query.client_ip,
     };
-
-    let limit_idx = param_idx;
-    param_idx += 1;
-    let offset_idx = param_idx;
-
-    let sql = format!(
-        r#"SELECT rl.request_id, rl.key_hash, rl.key_name, rl.key_alias, rl.team_id,
-                  bt.team_alias,
-                  rl.model, rl.api_path,
-                  rl.is_stream, rl.status_code, rl.error_type, rl.error_message,
-                  rl.input_tokens, rl.output_tokens, rl.duration_ms, rl.ttft_ms, rl.created_at,
-                  rl.deployment_id, rl.client_ip, rl.cached_tokens,
-                  rl.schedule_policy, rl.kv_hit_blocks, rl.kv_input_blocks,
-                  rl.trie_blocks, rl.trie_max_blocks, rl.request_tokens,
-                  rl.queue_wait_ms, rl.instance_id, rl.user_tag1, rl.user_tag2, rl.user_tag3
-           FROM boom_request_log rl
-           LEFT JOIN boom_team_table bt ON rl.team_id = bt.team_id
-           {where_sql}
-           ORDER BY rl.created_at DESC
-           LIMIT ${limit_idx} OFFSET ${offset_idx}"#,
-    );
-
-    let mut q = sqlx::query_as::<_, LogRow>(&sql);
-
-    // Pre-build LIKE patterns so they outlive the bind chain. User input is
-    // escaped so literal %/_ match themselves instead of every row.
-    let model_pattern      = query.model.as_ref().map(|v| format!("%{}%", escape_like(v)));
-    let request_id_pattern = query.request_id.as_ref().map(|v| format!("%{}%", escape_like(v)));
-    let key_alias_pattern  = query.key_alias.as_ref().map(|v| format!("%{}%", escape_like(v)));
-    let api_path_pattern   = query.api_path.as_ref().map(|v| format!("%{}%", escape_like(v)));
-    let error_pattern      = query.error.as_ref().map(|v| format!("%{}%", escape_like(v)));
-    let team_alias_pattern = query.team_alias.as_ref().map(|v| format!("%{}%", escape_like(v)));
-    let client_ip_pattern  = query.client_ip.as_ref().map(|v| format!("%{}%", escape_like(v)));
-    let policy_pattern     = query.policy.as_ref().map(|v| format!("%{}%", escape_like(v)));
-    let instance_pattern   = query.instance_id.as_ref().map(|v| format!("%{}%", escape_like(v)));
-
-    // Bind parameters (order must match slot allocation above).
-    if let Some(from) = range_from {
-        q = q.bind(from);
-    }
-    if let Some(ref v) = query.key_hash {
-        q = q.bind(v.clone());
-    }
-    if let Some(ref p) = model_pattern {
-        q = q.bind(p.clone());
-    }
-    if query.status.as_deref() == Some("error") {
-        q = q.bind(200i16);
-    }
-    if let Some(ref p) = request_id_pattern {
-        q = q.bind(p.clone());
-    }
-    if let Some(ref p) = key_alias_pattern {
-        q = q.bind(p.clone());
-    }
-    if let Some(ref p) = api_path_pattern {
-        q = q.bind(p.clone());
-    }
-    if let Some(v) = query.status_code {
-        q = q.bind(v);
-    }
-    // stream is handled as a static WHERE clause (no bind needed).
-    if let Some(ref p) = error_pattern {
-        q = q.bind(p.clone());
-    }
-    if let Some(ref p) = team_alias_pattern {
-        q = q.bind(p.clone());
-    }
-    if let Some(ref p) = client_ip_pattern {
-        q = q.bind(p.clone());
-    }
-    if let Some(ref p) = policy_pattern {
-        q = q.bind(p.clone());
-    }
-    if let Some(ref p) = instance_pattern {
-        q = q.bind(p.clone());
-    }
-
-    // Fetch per_page + 1 to detect if there is a next page.
-    q = q.bind(per_page + 1).bind(offset);
-
-    // Bounded exact count for pagination display: same WHERE/JOIN as the data
-    // query, but the inner SELECT stops at LOGS_COUNT_CAP matches, so cost is
-    // O(cap) — an index walk at most — instead of O(all matching rows) like a
-    // bare COUNT(*) (that full count is what the LIMIT+1 design avoided).
-    // When the true total exceeds the cap the response reports total_capped
-    // so the UI can render "1000+ pages".
-    let count_sql = format!(
-        r#"SELECT COUNT(*) FROM (
-               SELECT 1 FROM boom_request_log rl
-               LEFT JOIN boom_team_table bt ON rl.team_id = bt.team_id
-               {where_sql}
-               LIMIT ${limit_idx}
-           ) t"#,
-    );
-    let mut cq = sqlx::query_scalar::<_, i64>(&count_sql);
-    if let Some(from) = range_from {
-        cq = cq.bind(from);
-    }
-    if let Some(ref v) = query.key_hash {
-        cq = cq.bind(v.clone());
-    }
-    if let Some(ref p) = model_pattern {
-        cq = cq.bind(p.clone());
-    }
-    if query.status.as_deref() == Some("error") {
-        cq = cq.bind(200i16);
-    }
-    if let Some(ref p) = request_id_pattern {
-        cq = cq.bind(p.clone());
-    }
-    if let Some(ref p) = key_alias_pattern {
-        cq = cq.bind(p.clone());
-    }
-    if let Some(ref p) = api_path_pattern {
-        cq = cq.bind(p.clone());
-    }
-    if let Some(v) = query.status_code {
-        cq = cq.bind(v);
-    }
-    if let Some(ref p) = error_pattern {
-        cq = cq.bind(p.clone());
-    }
-    if let Some(ref p) = team_alias_pattern {
-        cq = cq.bind(p.clone());
-    }
-    if let Some(ref p) = client_ip_pattern {
-        cq = cq.bind(p.clone());
-    }
-    if let Some(ref p) = policy_pattern {
-        cq = cq.bind(p.clone());
-    }
-    if let Some(ref p) = instance_pattern {
-        cq = cq.bind(p.clone());
-    }
-    cq = cq.bind(LOGS_COUNT_CAP);
-
-    // Run both queries inside a transaction with a 10s statement_timeout so a
-    // pathological "all time" + ILIKE scan is cancelled server-side by PG
-    // instead of hogging DB resources until it finishes.
-    let (rows, total): (Vec<LogRow>, i64) = match async {
-        let mut tx = begin_with_timeout(db_pool).await?;
-        let rows = q.fetch_all(&mut *tx).await?;
-        let total = cq.fetch_one(&mut *tx).await?;
-        tx.commit().await?;
-        Ok::<_, sqlx::Error>((rows, total))
-    }
-    .await
-    {
-        Ok(r) => r,
+    let page_result = match boom_audit::list_logs(db_pool, audit_query).await {
+        Ok(p) => p,
         Err(e) => {
             let msg = e.to_string();
             tracing::error!("Dashboard list_logs query failed: {}", msg);
@@ -3667,15 +3404,13 @@ pub async fn list_logs(
                 .into_response();
         }
     };
-
-    // total = min(real_matches, LOGS_COUNT_CAP), so total >= offset+per_page+1
-    // implies the real match count does too — a count-based next-page signal
-    // that also covers pages beyond the per_page+1 probe.
-    let has_next = rows.len() > per_page as usize || total >= offset + per_page + 1;
-    let logs: Vec<Value> = rows
+    let has_next = boom_audit::has_next(&page_result);
+    let per_page = page_result.per_page;
+    let total = page_result.total;
+    let logs: Vec<Value> = page_result
+        .logs
         .into_iter()
         .take(per_page as usize)
-        .into_iter()
         .map(|r| {
             let display_model = match &r.deployment_id {
                 Some(did) if !did.is_empty() => format!("{}:{}", r.model, did),
@@ -3696,16 +3431,11 @@ pub async fn list_logs(
                 "error_message": r.error_message,
                 "input_tokens": r.input_tokens,
                 "output_tokens": r.output_tokens,
-                // vLLM-reported real KV-cache hit (prompt_tokens_details.cached_tokens).
-                // Frontend "Prefix Hit Rate" = cached_tokens / input_tokens
-                // (prefix only), computed client-side.
                 "cached_tokens": r.cached_tokens,
                 "duration_ms": r.duration_ms,
                 "ttft_ms": r.ttft_ms,
                 "created_at": r.created_at.map(|d| d.to_rfc3339()),
                 "client_ip": r.client_ip,
-                // DFX: scheduling observability. Raw schedule_policy value —
-                // WYSIWYG: what you see is what you can filter on (ILIKE).
                 "policy": r.schedule_policy.clone().unwrap_or_default(),
                 "instance_id": r.instance_id,
                 "kv_hit_blocks": r.kv_hit_blocks,
@@ -3723,11 +3453,11 @@ pub async fn list_logs(
 
     Json(json!({
         "logs": logs,
-        "page": page,
+        "page": page_result.page,
         "per_page": per_page,
         "has_next": has_next,
         "total": total,
-        "total_capped": total >= LOGS_COUNT_CAP,
+        "total_capped": page_result.total_capped,
     }))
     .into_response()
 }
