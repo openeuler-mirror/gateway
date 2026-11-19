@@ -201,7 +201,7 @@ fn budget_period_partition(
 /// at boot-restore, by our own pushes, and by pulls) plus the local unpushed
 /// increment (`counts`/`tokens`/`costs_micros`, zeroed on every successful
 /// push). Admission checks and dashboard reads use the sum — the 判定口径 is
-/// 全局基数 + 本地增量. `decision_shared=false` (the default) freezes the
+/// 全局基数 + 本地增量. `decision_shared=false` freezes the
 /// base at boot + own pushes, i.e. instances enforce independently while
 /// billing data still converges in the DB via pushes.
 pub struct SlidingWindowLimiter {
@@ -230,7 +230,8 @@ pub struct SlidingWindowLimiter {
     /// continues after the last committed row at boot.
     push_seq: std::sync::atomic::AtomicI64,
     /// When true, the sync cycle also pulls peer deltas into the global
-    /// bases (shared enforcement). Default false → per-instance decisions.
+    /// bases (shared enforcement). Default true → cluster-wide quota
+    /// semantics; false opts into per-instance decisions.
     decision_shared: std::sync::atomic::AtomicBool,
     /// Set when the heartbeat detects our instance registration was taken
     /// over by another process. The id no longer belongs to this process;
@@ -311,7 +312,7 @@ impl SlidingWindowLimiter {
             budget_periods: Arc::new(DashMap::new()),
             instance_id: RwLock::new(None),
             push_seq: std::sync::atomic::AtomicI64::new(0),
-            decision_shared: std::sync::atomic::AtomicBool::new(false),
+            decision_shared: std::sync::atomic::AtomicBool::new(true),
             sealed: std::sync::atomic::AtomicBool::new(false),
         }
     }
