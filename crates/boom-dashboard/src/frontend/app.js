@@ -3869,24 +3869,6 @@
       html += '</div>';
     }
 
-    // ── 维测①:窗口化收敛率(1h 槽,墙钟对齐)── 生命周期累计值会被
-    // 冷 trie 期的重试长期压低;窗口化回答"现在是否在改善"。
-    const wins = (data.convergence_windows || []).slice(-24);
-    if (wins.length) {
-      html += '<div class="rb-tree-section">' + t("debug.rollback.conv_windows") + '</div>';
-      html += '<table class="data-table rb-mini-table"><thead><tr>' +
-        '<th>' + t("debug.rollback.conv_hour") + '</th><th class="num">' + t("debug.rollback.conv_direct") + '</th>' +
-        '<th class="num">' + t("debug.rollback.conv_retry") + '</th><th class="num">' + t("debug.rollback.convergence") + '</th></tr></thead><tbody>';
-      for (const w of wins) {
-        const total = w.direct + w.retry;
-        const pct = total > 0 ? Math.round(w.direct * 100 / total) : null;
-        const hourLabel = new Date(w.hour * 3600 * 1000).toISOString().slice(11, 13) + ":00";
-        html += '<tr><td class="mono">' + hourLabel + '</td><td class="num">' + w.direct + '</td><td class="num">' + w.retry + '</td>' +
-          '<td class="num">' + (pct === null ? "—" : pct + '%') + '</td></tr>';
-      }
-      html += '</tbody></table>';
-    }
-
     // ── 维测④:识别自检——新报错形态离线验证,零副作用。
     html += '<div class="rb-tree-section">' + t("debug.rollback.selftest_title") + '</div>';
     html += '<div class="rb-selftest"><p class="kcs-breakdown">' + t("debug.rollback.selftest_hint") + '</p>' +
