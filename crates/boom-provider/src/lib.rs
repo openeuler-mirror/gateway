@@ -126,6 +126,24 @@ pub fn create_provider(
     client_type_header: bool,
     max_context_tokens: Option<u64>,
 ) -> Result<Arc<dyn Provider>, GatewayError> {
+    create_provider_with_request_defaults(model, api_key, api_base, timeout, extra,
+        custom_headers, deployment_id, client_type_header, max_context_tokens, &serde_json::Map::new())
+}
+
+/// Build a deployment with defaults applied only to OpenAI-compatible bodies.
+pub fn create_provider_with_request_defaults(
+    model: &str,
+    api_key: Option<String>,
+    api_base: Option<String>,
+    timeout: u64,
+    extra: &HashMap<String, String>,
+    custom_headers: &HashMap<String, String>,
+    deployment_id: Option<String>,
+    client_type_header: bool,
+    max_context_tokens: Option<u64>,
+    request_defaults: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Arc<dyn Provider>, GatewayError> {
+    validate_request_defaults(model, request_defaults).map_err(GatewayError::ConfigError)?;
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(timeout.max(1)))
         .build()
@@ -192,7 +210,8 @@ pub fn create_provider(
                     client_type_header,
                     max_context_tokens,
                 )
-                .with_custom_headers(attached),
+                .with_custom_headers(attached)
+                .with_request_defaults(request_defaults.clone()),
             ))
         }
         "anthropic" => {
@@ -249,6 +268,19 @@ pub fn create_provider(
             provider_type
         ))),
     }
+}
+
+/// Validate before saving, so unsupported defaults never replace a live provider.
+pub fn validate_request_defaults(
+    model: &str,
+    defaults: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
+    boom_core::request_defaults::validate(defaults)?;
+    let (provider, _) = parse_model_provider(model);
+    if !defaults.is_empty() && matches!(provider, "anthropic" | "azure" | "gemini" | "bedrock") {
+        return Err("request_defaults currently supports OpenAI-compatible deployments only".to_string());
+    }
+    Ok(())
 }
 
 /// Parse `provider/model-id` format. Returns (provider, actual_model).

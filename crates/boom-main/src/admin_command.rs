@@ -299,6 +299,7 @@ async fn handle_create_model(
     req: boom_dashboard::handlers_admin::CreateDeploymentRequest,
 ) -> Result<Value, String> {
     ensure_not_workflow_model(state, &req.model_name)?;
+    boom_provider::validate_request_defaults(&req.litellm_model, &req.request_defaults)?;
     let db_pool = state.db_pool.as_ref().ok_or("Database not available")?;
     let headers_json = serde_json::to_value(&req.headers).unwrap_or(json!({}));
     let visibility = parse_model_visibility(&req.visibility)?;
@@ -317,6 +318,7 @@ async fn handle_create_model(
         tpm: req.tpm,
         timeout: req.timeout,
         headers: headers_json,
+        request_defaults: Value::Object(req.request_defaults.clone()),
         temperature: req.temperature,
         max_tokens: req.max_tokens,
         enabled: req.enabled,
@@ -356,6 +358,7 @@ async fn handle_update_model(
     req: boom_dashboard::handlers_admin::CreateDeploymentRequest,
 ) -> Result<Value, String> {
     ensure_not_workflow_model(state, &req.model_name)?;
+    boom_provider::validate_request_defaults(&req.litellm_model, &req.request_defaults)?;
     let db_pool = state.db_pool.as_ref().ok_or("Database not available")?;
     let headers_json = serde_json::to_value(&req.headers).unwrap_or(json!({}));
     let visibility = parse_model_visibility(&req.visibility)?;
@@ -374,6 +377,7 @@ async fn handle_update_model(
         tpm: req.tpm,
         timeout: req.timeout,
         headers: headers_json,
+        request_defaults: Value::Object(req.request_defaults.clone()),
         temperature: req.temperature,
         max_tokens: req.max_tokens,
         enabled: req.enabled,

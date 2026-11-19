@@ -6576,6 +6576,7 @@
     }
     const p = prefill || {};
     const headers = p.headers || {};
+    const requestDefaults = p.request_defaults || {};
     const modelInfo = p.model_info || {};
     // Unified visibility. Legacy rows without the field infer private from
     // a non-null allowed_teams array.
@@ -6658,6 +6659,7 @@
             <div class="form-group"><label>${t("form.model.timeout")} ${tip(t("tip.model.timeout"))}</label><input id="m-model-timeout" type="number" value="${p.timeout || 1200}"></div>
             <div class="form-group"><label>${t("form.model.temp")} ${tip(t("tip.model.temp"))}</label><input id="m-model-temp" type="number" step="0.1" value="${p.temperature || ""}"></div>
             <div class="form-group"><label>${t("form.model.maxtok")} ${tip(t("tip.model.maxtok"))}</label><input id="m-model-maxtok" type="number" value="${p.max_tokens || ""}"></div>
+            <div class="form-group field-full"><label for="m-model-request-defaults">${t("form.model.request_defaults")} ${tip(t("tip.model.request_defaults"))}</label><textarea id="m-model-request-defaults" rows="5" style="font-family:var(--mono);font-size:12px" placeholder='{"reasoning_effort":"medium"}'>${esc(Object.keys(requestDefaults).length ? JSON.stringify(requestDefaults, null, 2) : "")}</textarea><p class="modal-hint">${t("hint.model.request_defaults")}</p></div>
           </div>
         </div>
         <div class="form-card">
@@ -6777,6 +6779,15 @@
           catch (e) { throw new Error(t("config.error.invalid_json", { msg: e.message })); }
         }
         // Build model_info only when cost_template is selected.
+        const defaultsText = document.getElementById("m-model-request-defaults").value.trim();
+        let requestDefaults = {};
+        if (defaultsText) {
+          try { requestDefaults = JSON.parse(defaultsText); }
+          catch (e) { throw new Error(t("config.error.invalid_json", { msg: e.message })); }
+          if (!requestDefaults || Array.isArray(requestDefaults) || typeof requestDefaults !== "object") {
+            throw new Error(t("error.model.request_defaults_object"));
+          }
+        }
         const costTemplate = document.getElementById("m-model-cost-template").value;
         const modelInfo = {};
         if (costTemplate) modelInfo.cost_template = costTemplate;
@@ -6811,6 +6822,7 @@
             ? Array.from(document.querySelectorAll("#m-model-allowed-teams .team-pick.selected")).map((el) => el.dataset.value)
             : null,
           headers,
+          request_defaults: requestDefaults,
         };
         if (Object.keys(modelInfo).length > 0) body.model_info = modelInfo;
 
