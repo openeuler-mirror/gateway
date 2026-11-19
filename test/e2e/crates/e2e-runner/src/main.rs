@@ -24,7 +24,7 @@ enum Cmd {
         suite: Option<String>,
         #[arg(long = "case")]
         case: Vec<String>,
-        /// 环境异常时保留 runs/ 目录便于取证（默认也保留，clean 才删）
+        /// 跑完保留环境进程现场（PG/网关/mock 不回收），供失败后 psql 取证；之后用 clean 清
         #[arg(long, default_value_t = false)]
         keep_env: bool,
     },
@@ -251,11 +251,11 @@ struct CaseOutcome {
 const SMOKE: &[&str] = &["MI-001", "MI-002", "MI-004", "MI-005"];
 
 async fn run(cmd: RunArgs) -> anyhow::Result<()> {
-    if !gateway_bin().exists() || !mock_bin().exists() {
-        println!("[..] 编译产物缺失，先构建…");
-        build_gateway()?;
-        build_mock()?;
-    }
+    // 总是走一次构建：cargo 增量编译对无变化源码秒级跳过；杜绝旧二进制
+    // 与当前源码行为漂移（探活条件/用例断言对不上，且难以排查）
+    println!("[..] 构建网关与 mock（增量）…");
+    build_gateway()?;
+    build_mock()?;
 
     // 选择用例：--case 显式；否则 --suite（smoke 过滤注册表交集；nightly 全部已实现）
     let wanted: Vec<String> = if !cmd.case.is_empty() {
@@ -332,7 +332,18 @@ async fn run(cmd: RunArgs) -> anyhow::Result<()> {
             }
             outcomes.push(outcome);
         }
-        env.teardown();
+        if cmd.keep_env {
+            println!(
+                "--keep-env：环境保留（取证后 clean 回收）\n  DSN: {}\n  日志: {}\n  配置: {}",
+                env.dsn,
+                env.root.join("logs").display(),
+                env.root.join("configs").display()
+            );
+            // drop 会杀子进程（kill_on_drop）+ 停 PG（PostgresInstance::Drop）——现场必须泄漏
+            std::mem::forget(env);
+        } else {
+            env.teardown();
+        }
         }
     }
 
@@ -343,6 +354,7 @@ async fn run(cmd: RunArgs) -> anyhow::Result<()> {
 struct RunArgs {
     suite: Option<String>,
     case: Vec<String>,
+    keep_env: bool,
 }
 
 async fn start_group_env(
@@ -479,8 +491,8 @@ async fn main() -> anyhow::Result<()> {
         Cmd::BindCheck => bind_check(),
         Cmd::Clean => clean(),
         Cmd::Report { run_id } => report(run_id),
-        Cmd::Run { suite, case, keep_env: _ } => {
-            run(RunArgs { suite, case }).await
+        Cmd::Run { suite, case, keep_env } => {
+            run(RunArgs { suite, case, keep_env }).await
         }
     }
 }

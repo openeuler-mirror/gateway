@@ -175,6 +175,10 @@ fn mi_002<'a>(env: &'a TestEnv) -> BoxFuture<'a, anyhow::Result<Vec<String>>> {
                 let model = model.clone();
                 Box::pin(async move {
                     let out = warm.chat(&model, "MI-002 warmup").await?;
+                    println!(
+                        "[mi002] warmup 传播探测: status={} body={:?}",
+                        out.status, out.body_snippet
+                    );
                     Ok(if out.status == 429 { Some(()) } else { None })
                 })
             },
