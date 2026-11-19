@@ -251,11 +251,23 @@ struct CaseOutcome {
 const SMOKE: &[&str] = &["MI-001", "MI-002", "MI-004", "MI-005"];
 
 async fn run(cmd: RunArgs) -> anyhow::Result<()> {
-    // 总是走一次构建：cargo 增量编译对无变化源码秒级跳过；杜绝旧二进制
-    // 与当前源码行为漂移（探活条件/用例断言对不上，且难以排查）
-    println!("[..] 构建网关与 mock（增量）…");
-    build_gateway()?;
-    build_mock()?;
+    // 有 cargo 则总是增量构建（秒级跳过无变化，杜绝旧二进制与源码行为漂移）；
+    // 无 cargo 但二进制齐全时跳过构建继续（现场二进制直接跑的部署形态）
+    if which_cargo() {
+        println!("[..] 构建网关与 mock（增量）…");
+        build_gateway()?;
+        build_mock()?;
+    } else if gateway_bin().exists() && mock_bin().exists() {
+        println!("[warn] cargo 不可用，跳过构建，使用现有二进制：");
+        println!("  网关: {}", gateway_bin().display());
+        println!("  mock: {}", mock_bin().display());
+    } else {
+        anyhow::bail!(
+            "cargo 不可用且二进制缺失: {} / {}",
+            gateway_bin().display(),
+            mock_bin().display()
+        );
+    }
 
     // 选择用例：--case 显式；否则 --suite（smoke 过滤注册表交集；nightly 全部已实现）
     let wanted: Vec<String> = if !cmd.case.is_empty() {
