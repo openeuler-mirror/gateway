@@ -300,3 +300,10 @@ fn set_mode_700(p: &Path) -> anyhow::Result<()> {
     std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700))?;
     Ok(())
 }
+
+impl Drop for PostgresInstance {
+    // postmaster 由 pg_ctl 守护化拉起，runner 死它不死；start_env 提前返回路径（探活/fixture 失败）的兜底
+    fn drop(&mut self) {
+        self.stop_immediate();
+    }
+}

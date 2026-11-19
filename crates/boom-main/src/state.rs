@@ -468,14 +468,14 @@ impl AppState {
             );
 
             // Quota decision base: shared (global) vs local (per-instance)
-            // enforcement view. DB-authoritative, seeded local on first
-            // boot — the conservative default keeps multi-instance rate
-            // enforcement independent until an operator opts in. Counter
-            // deltas push incrementally in BOTH modes.
+            // enforcement view. DB-authoritative, seeded shared on first
+            // boot — cluster-wide quota semantics out of the box; counter
+            // deltas push incrementally in BOTH modes, and shared mode's
+            // failure direction is fail-open (looser, never spurious 429s).
             let decision_shared = boom_dashboard::config_kv::adopt_bool(
                 pool,
                 boom_dashboard::config_kv::DECISION_BASE_SHARED,
-                false,
+                true,
             )
             .await?;
             limiter.set_decision_shared(decision_shared);
@@ -915,7 +915,7 @@ impl AppState {
             let decision_shared = boom_dashboard::config_kv::adopt_bool(
                 pool,
                 boom_dashboard::config_kv::DECISION_BASE_SHARED,
-                false,
+                true,
             )
             .await?;
             self.limiter.set_decision_shared(decision_shared);

@@ -210,7 +210,7 @@ CRUD handler（model/alias/plan/quota/blocklist/workflow/cost template 等）的
 - 窗口代次墙钟对齐（tumbling）：`window_start = now - now % window_secs`，所有实例把同一墙钟区间映射到同一代次，复合主键行（cache_key, window_start）成为该区间的集群级计数器。过期代次在收集时跳过（速率类数据不上推），每周期 purge。
 - 单事务推送：`UPDATE value=value+δ`（0 行 → INSERT）→ 写水位行（`boom_quota_delta`，instance_id+seq）→ shared 模式同事务读回全局值 → commit → 内存镜像更新（事务中落地的请求增量不丢）。模糊失败（超时）后重试凭水位行识别已提交批次，只重放镜像效果不重复入库。
 - cumulative 符号数学：管理员负数调整自纠。预算锚点（bpstart/bpbase）走快照类全值覆写（天然幂等）。
-- **`decision_base_shared`**（`boom_config` KV，默认 false=本地）：只门控**拉取**步骤；上推两种模式都执行。单实例两模式行为一致。切换走 CATEGORY_QUOTA 广播，Quota 页有开关。
+- **`decision_base_shared`**（`boom_config` KV，默认 true=共享，首启 seed）：只门控**拉取**步骤；上推两种模式都执行。单实例两模式行为一致。切换走 CATEGORY_QUOTA 广播，Quota 页有开关。
 - `quota_sync.interval_secs`（YAML 进程级）：默认 60s，钳制 30–600s，reload 生效。
 - 并发限制为实例本地（后续调度层课题）。assignment 写路径全 DB-first（`*_db` 方法 + 广播），无内存→DB 回写。
 

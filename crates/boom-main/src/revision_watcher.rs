@@ -450,7 +450,7 @@ async fn dispatch(category: &str, state: &AppState, pool: &PgPool) -> anyhow::Re
                 boom_dashboard::config_kv::DECISION_BASE_SHARED,
             )
             .await?
-            .unwrap_or(false);
+            .unwrap_or(true);
             state.limiter.set_decision_shared(shared);
             tracing::info!(shared, "quota decision base switched (revision bump)");
         }

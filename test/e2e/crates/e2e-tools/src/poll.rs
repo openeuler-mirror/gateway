@@ -15,7 +15,7 @@ where
         match probe().await {
             Ok(Some(v)) => return Ok(v),
             Ok(None) => {}
-            Err(e) => last_err = Some(e.to_string()),
+            Err(e) => last_err = Some(format!("{e:#}")),
         }
         if tokio::time::Instant::now() >= deadline {
             anyhow::bail!(

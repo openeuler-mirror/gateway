@@ -36,7 +36,7 @@
 | 症状 | 先查什么 | 常见原因与处置 |
 |---|---|---|
 | doctor 失败 | 报错信息 | 包未装；rust 缺失；`initdb` 因 locale 报错（临时实例统一 `--no-locale`） |
-| 实例探活超时 | `tail runs/<run_id>/logs/gw-<x>.log` | 迁移未完成（等首次 boot 慢）；DB 未起；端口冲突（重跑即可，runner 随机端口） |
+| 实例探活超时 | 报错自带逐次探活日志 + 网关日志尾部；`tail runs/<run_id>/logs/gw-<x>.log` | 迁移未完成（等首次 boot 慢，慢容器可 `E2E_PROBE_TIMEOUT_SECS=180` 放宽窗口，默认 60）；DB 未起；端口冲突（重跑即可，runner 随机端口） |
 | 用例 poll 超时挂起 | 实例日志有无 sync cycle 痕迹；手查水位行：`psql $DSN -c 'SELECT * FROM boom_quota_delta ORDER BY seq DESC LIMIT 5'`（DSN 在 `runs/<run_id>/env`） | 网关 config 的 interval ≠30s；postmaster 被上次 SIGSTOP 卡住（`clean` 后重跑） |
 | 用例失败 | 先读报告 divergence → 单用例复跑 ×3 | 稳定失败 = 按证据链定位（水位行 → 表值 → 两实例日志时间线）；偶发 = flaky，按窗口边界竞态排查（请求是否恰在代次切换点发出） |
 | 广播类用例超时 | B 实例日志有无 revision watcher 痕迹 | DB 不可达期间 watcher 静默失败（MI-012 正在验证此 bug）；恢复后应 ≤5s 追平 |

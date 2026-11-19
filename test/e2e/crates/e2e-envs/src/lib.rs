@@ -175,7 +175,14 @@ pub async fn start_env(root: &std::path::Path, params: &EnvParams) -> anyhow::Re
         if params.boot_mode == BootMode::Sequential {
             probe_health(&handle.base_url, &handle.instance_id, &handle.name)
                 .await
-                .map_err(|e| anyhow::anyhow!("网关 {} 探活失败: {e}", handle.name))?;
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "网关 {} 探活失败: {e}\n--- {} 日志尾部 ---\n{}",
+                        handle.name,
+                        handle.name,
+                        handle.child.tail_log(30).join("\n")
+                    )
+                })?;
             gateways.push(handle);
         } else {
             gateways.push(handle);
@@ -183,7 +190,14 @@ pub async fn start_env(root: &std::path::Path, params: &EnvParams) -> anyhow::Re
                 for gw in &gateways {
                     probe_health(&gw.base_url, &gw.instance_id, &gw.name)
                         .await
-                        .map_err(|e| anyhow::anyhow!("网关 {} 探活失败: {e}", gw.name))?;
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "网关 {} 探活失败: {e}\n--- {} 日志尾部 ---\n{}",
+                                gw.name,
+                                gw.name,
+                                gw.child.tail_log(30).join("\n")
+                            )
+                        })?;
                 }
             }
         }
@@ -212,20 +226,44 @@ pub async fn start_env(root: &std::path::Path, params: &EnvParams) -> anyhow::Re
 
 async fn probe_health(base_url: &str, instance_id: &str, name: &str) -> anyhow::Result<()> {
     let client = health_client();
-    let timeout = std::time::Duration::from_secs(60);
+    // 慢容器 boot 可放宽探活窗口；默认 60s
+    let timeout = std::time::Duration::from_secs(
+        std::env::var("E2E_PROBE_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(60),
+    );
     let step = std::time::Duration::from_millis(500);
+    let t0 = std::time::Instant::now();
     e2e_tools::poll::poll_until(timeout, step, || {
         let url = format!("{base_url}/health");
         let client = client.clone();
         let instance_id = instance_id.to_string();
+        let name = name.to_string();
+        let t0 = t0;
         Box::pin(async move {
-            let resp = client.get(&url).send().await?;
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            if status == 200 && body.contains(&instance_id) {
-                Ok(Some(()))
-            } else {
-                Ok(None)
+            let t = t0.elapsed().as_secs_f64();
+            match client.get(&url).send().await {
+                Ok(resp) => {
+                    let status = resp.status().as_u16();
+                    let body = resp.text().await.unwrap_or_default();
+                    if status == 200 && body.contains(&instance_id) {
+                        println!("[probe] {name} t={t:.1}s GET {url} -> healthy");
+                        Ok(Some(()))
+                    } else {
+                        let snippet: String = body.chars().take(120).collect();
+                        println!(
+                            "[probe] {name} t={t:.1}s GET {url} -> status={status} instance_id_missing={} body={snippet:?}",
+                            !body.contains(&instance_id)
+                        );
+                        Ok(None)
+                    }
+                }
+                Err(e) => {
+                    let e = anyhow::Error::new(e);
+                    println!("[probe] {name} t={t:.1}s GET {url} -> send failed: {e:#}");
+                    Err(e)
+                }
             }
         })
     })
@@ -235,6 +273,8 @@ async fn probe_health(base_url: &str, instance_id: &str, name: &str) -> anyhow::
 
 fn health_client() -> reqwest::Client {
     reqwest::Client::builder()
+        // 目标全是 runner 本机 spawn 的子进程，环境代理变量会劫持 127.0.0.1 探活
+        .no_proxy()
         .timeout(std::time::Duration::from_secs(5))
         .build()
         .expect("reqwest client")
