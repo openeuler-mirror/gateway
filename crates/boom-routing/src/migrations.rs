@@ -32,6 +32,11 @@ CREATE INDEX IF NOT EXISTS idx_boom_deployment_model ON boom_model_deployment(mo
 "#
 }
 
+/// Deployment request defaults; empty objects preserve existing behavior.
+pub fn migration_add_request_defaults() -> &'static str {
+    "ALTER TABLE boom_model_deployment ADD COLUMN IF NOT EXISTS request_defaults JSONB NOT NULL DEFAULT '{}';"
+}
+
 /// Migration: add auto_disabled column to existing tables.
 pub fn migration_add_auto_disabled() -> &'static str {
     r#"

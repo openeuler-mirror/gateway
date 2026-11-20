@@ -1795,7 +1795,7 @@ fn build_deployments_from_config(
             continue;
         }
 
-        match boom_provider::create_provider(
+        match boom_provider::create_provider_with_request_defaults(
             &p.model,
             p.api_key.clone(),
             p.api_base.clone(),
@@ -1805,6 +1805,7 @@ fn build_deployments_from_config(
             deployment_id,
             entry.client_type_header,
             p.max_context_tokens,
+            &p.request_defaults,
         ) {
             Ok(provider) => {
                 // Also register as wildcard catch-all if flagged.
@@ -2317,6 +2318,9 @@ pub(crate) async fn build_config_snapshot_value(pool: &PgPool) -> Result<serde_j
                     "max_context_tokens".into(),
                     serde_json::Value::Number(m.into()),
                 );
+            }
+            if r.request_defaults.as_object().is_some_and(|o| !o.is_empty()) {
+                litellm_params.insert("request_defaults".into(), r.request_defaults.clone());
             }
             // NOTE: max_inflight_queue_len / max_context_len are deliberately
             // NOT placed under litellm_params — ProviderParams doesn't have

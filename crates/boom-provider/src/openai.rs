@@ -177,6 +177,7 @@ pub struct OpenAIProvider {
     client_type_header: bool,
     custom_headers: Vec<(String, String)>,
     max_context_tokens: Option<u64>,
+    request_defaults: serde_json::Map<String, serde_json::Value>,
 }
 
 impl OpenAIProvider {
@@ -223,11 +224,17 @@ impl OpenAIProvider {
             client_type_header,
             custom_headers: Vec::new(),
             max_context_tokens,
+            request_defaults: serde_json::Map::new(),
         }
     }
 
     pub fn with_custom_headers(mut self, headers: Vec<(String, String)>) -> Self {
         self.custom_headers = headers;
+        self
+    }
+
+    pub fn with_request_defaults(mut self, defaults: serde_json::Map<String, serde_json::Value>) -> Self {
+        self.request_defaults = defaults;
         self
     }
 
@@ -271,6 +278,7 @@ impl OpenAIProvider {
         // fields (service_tier, store, reasoning_effort, ...) reach OpenAI-
         // compatible upstreams as-is.
         let mut body = serde_json::to_value(&req).unwrap_or_default();
+        boom_core::request_defaults::apply(&mut body, &self.request_defaults);
 
         // Inject vllm_xargs for KV cache full reporting when requested by gateway.
         if kv_cache_report_full {

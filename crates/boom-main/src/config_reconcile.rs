@@ -739,6 +739,7 @@ pub(crate) fn deployment_inputs_from_config(config: &Config) -> Vec<DeploymentIn
             tpm: p.tpm.map(|v| v as i64),
             timeout: p.timeout as i64,
             headers: serde_json::to_value(&p.headers).unwrap_or(serde_json::json!({})),
+            request_defaults: serde_json::Value::Object(p.request_defaults.clone()),
             temperature: p.temperature,
             max_tokens: p.max_tokens.map(|v| v as i32),
             deployment_id: entry.model_info.as_ref().and_then(|mi| mi.id.clone()),
@@ -915,7 +916,8 @@ pub(crate) fn build_provider_from_row(
         }
     });
 
-    match boom_provider::create_provider(
+    let request_defaults = row.request_defaults.as_object()?;
+    match boom_provider::create_provider_with_request_defaults(
         &row.litellm_model,
         api_key,
         row.api_base.clone(),
@@ -925,6 +927,7 @@ pub(crate) fn build_provider_from_row(
         row.deployment_id.clone(),
         row.client_type_header.unwrap_or(false),
         row.max_context_tokens.map(|v| v as u64),
+        request_defaults,
     ) {
         Ok(provider) => Some(provider),
         Err(e) => {

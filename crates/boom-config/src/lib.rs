@@ -452,6 +452,9 @@ pub struct ProviderParams {
     /// Custom headers to send with every request.
     #[serde(default)]
     pub headers: HashMap<String, String>,
+    /// Fill missing OpenAI-compatible request fields for this deployment.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub request_defaults: serde_json::Map<String, serde_json::Value>,
     /// Temperature override.
     pub temperature: Option<f64>,
     /// Max tokens override.
@@ -1160,6 +1163,10 @@ impl Config {
         // Compose per-section validation. Each settings struct owns its own
         // semantic checks; Config::validate just orchestrates them so new
         // sections plug in without growing this method.
+        for entry in &self.model_list {
+            boom_core::request_defaults::validate(&entry.litellm_params.request_defaults)
+                .map_err(GatewayError::ConfigError)?;
+        }
         self.router_settings.kvc_aware.validate()?;
         if self
             .router_settings
@@ -1679,6 +1686,7 @@ mod tests {
             tpm: None,
             timeout: 120,
             headers: HashMap::new(),
+            request_defaults: serde_json::Map::new(),
             temperature: None,
             max_tokens: None,
             max_context_tokens: None,
@@ -1702,6 +1710,7 @@ mod tests {
             tpm: None,
             timeout: 120,
             headers: HashMap::new(),
+            request_defaults: serde_json::Map::new(),
             temperature: None,
             max_tokens: None,
             max_context_tokens: None,

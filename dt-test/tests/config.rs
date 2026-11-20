@@ -23,6 +23,7 @@ fn provider_params(model: &str) -> ProviderParams {
         tpm: None,
         timeout: 1200,
         headers: HashMap::new(),
+        request_defaults: serde_json::Map::new(),
         temperature: None,
         max_tokens: None,
         max_context_tokens: None,
