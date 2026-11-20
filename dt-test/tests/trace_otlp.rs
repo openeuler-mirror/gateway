@@ -39,7 +39,7 @@ const TP_ZERO_PARENT: &str = "00-0af76598164860bd9a43d7c1a31725ab-00000000000000
 /// 带自定义 header / 小批量参数的配置。
 fn config(endpoint: &str) -> OtlpConfig {
     let mut headers = std::collections::HashMap::new();
-    headers.insert("X-Otlp-Key".to_string(), "dt-secret".to_string());
+    headers.insert("X-Otlp-Key".to_string(), "__YOUR_API_KEY__".to_string());
     OtlpConfig {
         endpoint: endpoint.to_string(),
         enabled: true,
@@ -402,7 +402,7 @@ fn convert_span_maps_ids_status_and_attributes() {
     span.set_deployment_id("dep-7".into());
     span.trace_state = "vendor=1".to_string();
     span.set_ttft_ms(250);
-    span.set_provider_type("volcengine".to_string());
+    span.set_provider_type("demo_provider".to_string());
     span.set_attribute("k.str", SpanAttributeValue::String("v".into()));
     span.set_attribute("k.int", SpanAttributeValue::Int(7));
     span.set_attribute("k.bool", SpanAttributeValue::Bool(true));
@@ -443,8 +443,14 @@ fn convert_span_maps_ids_status_and_attributes() {
     assert!(matches!(attr(&rs, "boom-gateway.is_stream"), Some(OtlpAnyValue::BoolValue(true))));
     assert!(matches!(attr(&rs, "gen_ai.request.stream"), Some(OtlpAnyValue::BoolValue(true))));
     assert!(matches!(attr(&rs, "gen_ai.response.time_to_first_chunk"), Some(OtlpAnyValue::DoubleValue(v)) if (*v - 0.25).abs() < f64::EPSILON));
-    assert!(matches!(attr(&rs, "gen_ai.provider.name"), Some(OtlpAnyValue::StringValue(v)) if v == "volcengine"));
-    assert!(matches!(attr(&rs, "gen_ai.input.messages"), Some(OtlpAnyValue::ArrayValue(_))));
+    assert!(matches!(attr(&rs, "gen_ai.provider.name"), Some(OtlpAnyValue::StringValue(v)) if v == "demo_provider"));
+    match attr(&rs, "gen_ai.input.messages") {
+        Some(OtlpAnyValue::StringValue(v)) => {
+            let messages: serde_json::Value = serde_json::from_str(v).expect("messages must be JSON text");
+            assert_eq!(messages[0]["role"], "user", "messages json: {v}");
+        }
+        other => panic!("gen_ai.input.messages wrong: {other:?}"),
+    }
     assert!(matches!(attr(&rs, "boom-gateway.deployment_id"),
         Some(OtlpAnyValue::StringValue(v)) if v == "dep-7"));
     assert!(matches!(attr(&rs, "boom-gateway.trace_state"),

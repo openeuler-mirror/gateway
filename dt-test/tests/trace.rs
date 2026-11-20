@@ -17,7 +17,7 @@ use boom_trace::{
 fn w3c() -> W3cContext {
     let mut ctx = parse_traceparent("00-0af76598164860bd9a43d7c1a31725ab-00f067aa0ba902b7-01")
         .expect("well-formed traceparent");
-    ctx.trace_state = "opencode_user_id=alice,vendor=acme".to_string();
+    ctx.trace_state = "opencode_user_id=demo_user,vendor=acme".to_string();
     ctx
 }
 
@@ -88,7 +88,7 @@ fn build_child_round_trips() {
 #[test]
 fn tracestate_value_lookup() {
     let ctx = w3c();
-    assert_eq!(ctx.tracestate_value("opencode_user_id"), Some("alice".to_string()));
+    assert_eq!(ctx.tracestate_value("opencode_user_id"), Some("demo_user".to_string()));
     assert_eq!(ctx.tracestate_value("vendor"), Some("acme".to_string()));
     assert_eq!(ctx.tracestate_value("missing"), None);
 

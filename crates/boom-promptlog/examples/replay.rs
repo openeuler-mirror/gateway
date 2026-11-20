@@ -4,8 +4,8 @@
 //! `boom_promptlog::otlp`, so "what was stored locally = what gets pushed".
 //!
 //! Usage:
-//!   cargo run --example replay -- --dir /data/prompt_logs --otlp-endpoint http://collector:4318
-//!   cargo run --example replay -- --dir /data/prompt_logs/_no_team/kh --otlp-endpoint http://collector:4318
+//!   cargo run --example replay -- --dir /path/to/project --otlp-endpoint http://example.internal:4318
+//!   cargo run --example replay -- --dir /path/to/project/_no_team/kh --otlp-endpoint http://example.internal:4318
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -26,7 +26,7 @@ struct Args {
     #[arg(long)]
     dir: PathBuf,
 
-    /// OTLP/HTTP base URL, e.g. `http://otel-collector:4318`. The exporter
+    /// OTLP/HTTP base URL, e.g. `http://example.internal:4318`. The exporter
     /// appends `/v1/logs` itself.
     #[arg(long)]
     otlp_endpoint: String,

@@ -44,11 +44,9 @@ const STATUS_OFFLINE: u8 = 1;
 const STATUS_CODE_UNSET: i32 = 0;
 const STATUS_CODE_OK: i32 = 1;
 const STATUS_CODE_ERROR: i32 = 2;
-const STRUCTURED_JSON_KEYS: &[&str] = &[
-    "gen_ai.input.messages",
-    "gen_ai.output.messages",
-    "gen_ai.response.finish_reasons",
-];
+// GenAI messages intentionally use the generic Json arm below: downstream
+// OTLP consumers parse their JSON text from StringValue, not nested AnyValues.
+const STRUCTURED_JSON_KEYS: &[&str] = &["gen_ai.response.finish_reasons"];
 
 /// OTLP traces exporter. State machine identical to promptlog's
 /// `OtelExporter` (Online → push → tick → flush; Offline → skip + probe).
@@ -856,11 +854,11 @@ mod tests {
         span.is_stream = true;
         span.set_deployment_id("dep-1".to_string());
         span.set_response_model("gpt-4-actual".to_string());
-        span.set_provider_type("volcengine".to_string());
+        span.set_provider_type("demo_provider".to_string());
         span.set_ttft_ms(120);
         span.set_attribute(
             "boom-gateway.user.id",
-            SpanAttributeValue::String("alice".to_string()),
+            SpanAttributeValue::String("demo_user".to_string()),
         );
         // Request params + usage are stamped by the route layer (issue #57)
         // as regular attributes — the exporter passes them through.
@@ -1142,9 +1140,9 @@ mod genai_export_tests {
     #[test]
     fn provider_is_exported_only_when_present() {
         let mut span = make_span("/v1/chat/completions", false);
-        span.set_provider_type("volcengine".to_string());
+        span.set_provider_type("demo_provider".to_string());
         let rs = convert_span_to_resource_spans(&span, &Resource::default(), 0);
-        assert!(matches!(attr(&rs, "gen_ai.provider.name"), Some(OtlpAnyValue::StringValue(provider)) if provider == "volcengine"));
+        assert!(matches!(attr(&rs, "gen_ai.provider.name"), Some(OtlpAnyValue::StringValue(provider)) if provider == "demo_provider"));
 
         let span = make_span("/v1/chat/completions", false);
         let rs = convert_span_to_resource_spans(&span, &Resource::default(), 0);
@@ -1209,14 +1207,22 @@ mod genai_export_tests {
     }
 
     #[test]
-    fn structured_genai_attributes_are_not_stringified() {
+    fn genai_messages_export_as_json_strings() {
         let mut span = make_span("/v1/chat/completions", false);
         span.set_structured_attribute("gen_ai.input.messages", serde_json::json!([{"role": "user", "parts": []}]));
         span.set_structured_attribute("gen_ai.output.messages", serde_json::json!([{"role": "assistant", "parts": []}]));
         span.set_response_finish_reasons(&["stop".to_string()]);
         let rs = convert_span_to_resource_spans(&span, &Resource::default(), 0);
-        for key in ["gen_ai.input.messages", "gen_ai.output.messages", "gen_ai.response.finish_reasons"] {
-            assert!(matches!(attr(&rs, key), Some(OtlpAnyValue::ArrayValue(_))), "{key} must be an OTLP array");
+        for (key, expected_role) in [("gen_ai.input.messages", "user"), ("gen_ai.output.messages", "assistant")] {
+            match attr(&rs, key) {
+                Some(OtlpAnyValue::StringValue(json)) => {
+                    let messages: serde_json::Value = serde_json::from_str(json)
+                        .unwrap_or_else(|error| panic!("{key} must contain JSON text: {error}"));
+                    assert_eq!(messages[0]["role"], expected_role, "{key} JSON: {json}");
+                }
+                other => panic!("{key} must be an OTLP StringValue, got {other:?}"),
+            }
         }
+        assert!(matches!(attr(&rs, "gen_ai.response.finish_reasons"), Some(OtlpAnyValue::ArrayValue(_))), "gen_ai.response.finish_reasons must stay an OTLP array");
     }
 }

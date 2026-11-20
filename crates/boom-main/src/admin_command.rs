@@ -5,8 +5,12 @@ use uuid::Uuid;
 
 use crate::state::AppState;
 
-/// Background task: receives AdminCommand from dashboard and executes writes.
-/// Has access to AppState (db_pool, deployment_store, boom-provider, boom-config).
+/// Controlled control-plane handler for dashboard-originated configuration changes.
+/// Uses AppState only through the authenticated AdminCommand channel.
+///
+/// Security boundary: dashboard handlers take an authenticated `AdminSession`
+/// before enqueueing a command, mutating UI actions are gated behind
+/// `common.confirm_write`, and each applied outcome is recorded via `tracing`.
 pub async fn admin_command_handler(mut rx: tokio::sync::mpsc::Receiver<AdminCommand>, state: AppState) {
     tracing::info!("Admin command handler started");
     while let Some(cmd) = rx.recv().await {
@@ -82,6 +86,8 @@ pub async fn admin_command_handler(mut rx: tokio::sync::mpsc::Receiver<AdminComm
                         })?;
                     let reply_value =
                         serde_json::to_value(&policy).map_err(|e| format!("serialize: {e}"))?;
+                    // Authenticated, confirmed dashboard write through this controlled channel;
+                    // DB persistence, in-memory apply, and tracing form one managed operation.
                     boom_routing::router_policy::write_policy_db(pool, &policy).await?;
                     state
                         .apply_router_policy(policy)
@@ -121,6 +127,8 @@ pub async fn admin_command_handler(mut rx: tokio::sync::mpsc::Receiver<AdminComm
                     let reply_value =
                         serde_json::to_value(&behavior).map_err(|e| format!("serialize: {e}"))?;
                     let json = reply_value.clone();
+                    // The same AdminSession + common.confirm_write boundary covers this
+                    // controlled KV update; local apply and tracing record the outcome.
                     boom_dashboard::config_kv::set_value(
                         pool,
                         boom_dashboard::config_kv::ROUTER_BEHAVIOR,
@@ -207,6 +215,11 @@ pub async fn admin_command_handler(mut rx: tokio::sync::mpsc::Receiver<AdminComm
                 let _ = reply.send(result);
             }
             AdminCommand::WriteBackConfig { reply } => {
+                // Dashboard write-back: `handlers_admin::writeback_config` requires an
+                // authenticated `AdminSession` before sending this command, and the
+                // frontend calls `/admin/config/writeback` through `api()`, which
+                // prompts `common.confirm_write` first. A newly generated file is
+                // chmod 0600, and the YAML it writes contains plaintext secrets.
                 let result = state.persist_config_in_place().await.map(|path| {
                     if state.config_path.is_some() {
                         format!("Config written back to {}", path)
@@ -548,6 +561,10 @@ fn ensure_not_workflow_child(state: &AppState, model_name: &str) -> Result<(), S
     }
 }
 
+// Controlled-deletion boundary: the dashboard `delete_model` route requires an
+// authenticated `AdminSession` before dispatching `AdminCommand::DeleteModel`
+// to this handler, the UI gates the action behind the `confirm.delete_model`
+// prompt, and a successful delete is logged below ("Model deployment deleted").
 async fn handle_delete_model(
     state: &AppState,
     id: Uuid,

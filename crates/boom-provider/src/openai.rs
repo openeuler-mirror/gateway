@@ -967,14 +967,14 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
-            .and(header("Authorization", "Bearer sk-test-key"))
+            .and(header("Authorization", "Bearer __YOUR_API_KEY__"))
             .and(header("X-Gateway-Priority", "100"))
             .respond_with(ResponseTemplate::new(200).set_body_json(fake_completion_response()))
             .expect(1)
             .mount(&server)
             .await;
 
-        let provider = provider_for(server.uri(), Some("sk-test-key".to_string()));
+        let provider = provider_for(server.uri(), Some("__YOUR_API_KEY__".to_string()));
         let req = request_with_headers(&[("X-Gateway-Priority", "100")]);
         assert!(provider.chat(req).await.is_ok());
     }
@@ -1178,9 +1178,9 @@ mod tests {
     #[tokio::test]
     async fn chat_stream_data_prefix_without_space_parses() {
         let sse = concat!(
-            "data:{\"choices\":[{\"delta\":{\"content\":\"<think>\\n\\nHere\",\"name\":\"\",\"role\":\"assistant\"},\"index\":0}],\"created\":2143545432432,\"id\":\"653624532443\",\"model\":\"Qwen3.6-35B-MLP\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":0,\"prompt_tokens\":0,\"total_tokens\":0}}\n\n",
-            "data:{\"choices\":[{\"delta\":{\"content\":\"lo\"},\"index\":0}],\"created\":2143545432432,\"id\":\"653624532443\",\"model\":\"Qwen3.6-35B-MLP\",\"object\":\"chat.completion.chunk\"}\n\n",
-            "data:{\"choices\":[],\"created\":2143545432432,\"id\":\"653624532443\",\"model\":\"Qwen3.6-35B-MLP\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":7,\"prompt_tokens\":5,\"total_tokens\":12}}\n\n",
+            "data:{\"choices\":[{\"delta\":{\"content\":\"<think>\\n\\nHere\",\"name\":\"\",\"role\":\"assistant\"},\"index\":0}],\"created\":2143545432432,\"id\":\"653624532443\",\"model\":\"demo-model\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":0,\"prompt_tokens\":0,\"total_tokens\":0}}\n\n",
+            "data:{\"choices\":[{\"delta\":{\"content\":\"lo\"},\"index\":0}],\"created\":2143545432432,\"id\":\"653624532443\",\"model\":\"demo-model\",\"object\":\"chat.completion.chunk\"}\n\n",
+            "data:{\"choices\":[],\"created\":2143545432432,\"id\":\"653624532443\",\"model\":\"demo-model\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":7,\"prompt_tokens\":5,\"total_tokens\":12}}\n\n",
             "data:[DONE]\n\n",
         );
         let server = MockServer::start().await;

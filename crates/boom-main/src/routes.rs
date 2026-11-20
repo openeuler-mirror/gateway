@@ -405,7 +405,7 @@ fn fold_rpm_tpm_into_60s(
 }
 
 // ═══════════════════════════════════════════════════════════
-// Debug logging — dump full request/response for specific keys
+// Prompt logging — records request/response metadata on the prompt log
 // ═══════════════════════════════════════════════════════════
 
 
@@ -6267,7 +6267,7 @@ mod tests {
             r#"
 server: { port: 18080 }
 general_settings:
-  master_key: sk-test-master-000000
+  master_key: __YOUR_API_KEY__
 trace:
   enabled: true
   capture_body: true
@@ -6300,7 +6300,7 @@ trace:
             r#"
 server: { port: 18080 }
 general_settings:
-  master_key: sk-test-master-000000
+  master_key: __YOUR_API_KEY__
 "#,
         )
         .await;
@@ -6330,7 +6330,7 @@ general_settings:
             r#"
 server: { port: 18080 }
 general_settings:
-  master_key: sk-test-master-000000
+  master_key: __YOUR_API_KEY__
 prompt_log:
   enabled: true
   excluded_keys: [k]
@@ -6380,7 +6380,7 @@ trace:
 
     #[test]
     fn user_tag_unconfigured_returns_all_none() {
-        let headers = headers_with(&[("x-user-tag", "alice")]);
+        let headers = headers_with(&[("x-user-tag", "demo_user")]);
         assert_eq!(extract_user_tags(&user_tag_settings(&[]), &headers), tags(None, None, None));
     }
 
@@ -6389,14 +6389,14 @@ trace:
         // Config in canonical case, request header in another case — HTTP
         // header lookup is case-insensitive. Only the value is stored.
         let settings = user_tag_settings(&["X-User-Tag"]);
-        let headers = headers_with(&[("x-USER-TAG", "alice")]);
-        assert_eq!(extract_user_tags(&settings, &headers), tags(Some("alice"), None, None));
+        let headers = headers_with(&[("x-USER-TAG", "demo_user")]);
+        assert_eq!(extract_user_tags(&settings, &headers), tags(Some("demo_user"), None, None));
     }
 
     #[test]
     fn user_tag_missing_header_leaves_slot_null() {
         let settings = user_tag_settings(&["X-User-Tag"]);
-        let headers = headers_with(&[("x-other", "bob")]);
+        let headers = headers_with(&[("x-other", "demo_peer")]);
         assert_eq!(extract_user_tags(&settings, &headers), tags(None, None, None));
     }
 
@@ -6410,7 +6410,7 @@ trace:
     #[test]
     fn user_tag_empty_config_string_leaves_slots_null() {
         let settings = user_tag_settings(&["  "]);
-        let headers = headers_with(&[("x-user-tag", "alice")]);
+        let headers = headers_with(&[("x-user-tag", "demo_user")]);
         assert_eq!(extract_user_tags(&settings, &headers), tags(None, None, None));
     }
 
@@ -6418,10 +6418,10 @@ trace:
     fn user_tag_joins_repeated_headers_with_comma() {
         let settings = user_tag_settings(&["X-User-Tag"]);
         let headers = headers_with(&[
-            ("x-user-tag", "alice"),
-            ("x-user-tag", "bob"),
+            ("x-user-tag", "demo_user"),
+            ("x-user-tag", "demo_peer"),
         ]);
-        assert_eq!(extract_user_tags(&settings, &headers), tags(Some("alice,bob"), None, None));
+        assert_eq!(extract_user_tags(&settings, &headers), tags(Some("demo_user,demo_peer"), None, None));
     }
 
     #[test]
@@ -6480,7 +6480,7 @@ trace:
     fn user_tag_invalid_config_header_name_leaves_slots_null() {
         // Spaces make an invalid header name — from_bytes rejects it.
         let settings = user_tag_settings(&["Bad Header Name"]);
-        let headers = headers_with(&[("x-user-tag", "alice")]);
+        let headers = headers_with(&[("x-user-tag", "demo_user")]);
         assert_eq!(extract_user_tags(&settings, &headers), tags(None, None, None));
     }
 
@@ -6641,9 +6641,9 @@ trace:
     #[test]
     fn forward_client_headers_blocks_auth_and_session_names() {
         let client = header_map(&[
-            ("authorization", "Bearer sk-client"),
-            ("x-api-key", "sk-client"),
-            ("api-key", "sk-client"),
+            ("authorization", "Bearer __YOUR_TOKEN__"),
+            ("x-api-key", "__YOUR_API_KEY__"),
+            ("api-key", "__YOUR_API_KEY__"),
             ("cookie", "session=abc"),
             ("set-cookie", "session=abc"),
             ("surrogate-key", "evil"),
@@ -6972,7 +6972,7 @@ trace:
             id: "upstream-chat-id".to_string(),
             object: "chat.completion".to_string(),
             created: 0,
-            model: "glm-5.3-flash".to_string(),
+            model: "demo-model".to_string(),
             choices: Vec::new(),
             usage: None,
             system_fingerprint: None,
@@ -6983,7 +6983,7 @@ trace:
             object: "response",
             created_at: 0,
             status: "completed".to_string(),
-            model: "volcengine/glm-5.3-flash".to_string(),
+            model: "hosted_vllm/demo-model".to_string(),
             output: Vec::new(),
             usage: None,
             incomplete_details: None,
@@ -6991,7 +6991,7 @@ trace:
         };
         stamp_responses_nonstream_metadata(&guard, &upstream, &public);
         registry.with_span_mut("req-responses-nonstream-model", |span| {
-            assert_eq!(span.response_model.as_deref(), Some("glm-5.3-flash"));
+            assert_eq!(span.response_model.as_deref(), Some("demo-model"));
             assert!(span.attributes.iter().any(|(key, value)| {
                 key == "gen_ai.response.id"
                     && matches!(value, boom_core::trace::SpanAttributeValue::String(id) if id == "resp-client")

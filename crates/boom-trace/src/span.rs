@@ -423,7 +423,7 @@ mod tests {
             "00-0af76598164860bd9a43d7c1a31725ab-00f067aa0ba902b7-01",
         )
         .unwrap();
-        ctx.trace_state = "opencode_user_id=alice".to_string();
+        ctx.trace_state = "opencode_user_id=demo_user".to_string();
         ctx
     }
 
@@ -648,7 +648,7 @@ mod genai_attribute_tests {
             "00-0af76598164860bd9a43d7c1a31725ab-00f067aa0ba902b7-01",
         )
         .unwrap();
-        ctx.trace_state = "opencode_user_id=alice".to_string();
+        ctx.trace_state = "opencode_user_id=demo_user".to_string();
         ctx
     }
 
@@ -686,7 +686,7 @@ mod genai_attribute_tests {
         );
         span.set_provider_type(" \t\n".to_string());
         assert!(span.provider_type.is_none());
-        span.set_provider_type("volcengine".to_string());
-        assert_eq!(span.provider_type.as_deref(), Some("volcengine"));
+        span.set_provider_type("demo_provider".to_string());
+        assert_eq!(span.provider_type.as_deref(), Some("demo_provider"));
     }
 }

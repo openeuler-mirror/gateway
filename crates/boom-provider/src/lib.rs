@@ -300,8 +300,8 @@ pub fn create_provider_with_request_defaults(
 /// instances behind the same host.
 ///
 /// Examples:
-///   (`dep-1`, `http://10.0.0.5:8000/v1`) → `dep-1`
-///   (None,    `http://10.0.0.5:8000/v1`) → `None` (no id → not a participant)
+///   (`dep-1`, `http://example.internal:8000/v1`) → `dep-1`
+///   (None,    `http://example.internal:8000/v1`) → `None` (no id → not a participant)
 ///   (`dep-1`, None)                      → `None` (gate: no api_base)
 pub fn kv_worker_id_for(deployment_id: Option<&str>, api_base: Option<&str>) -> Option<String> {
     if api_base.map(str::trim).filter(|s| !s.is_empty()).is_none() {

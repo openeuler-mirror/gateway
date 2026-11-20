@@ -273,7 +273,7 @@ mod tests {
             "00-0af76598164860bd9a43d7c1a31725ab-00f067aa0ba902b7-01",
         )
         .unwrap();
-        ctx.trace_state = "opencode_user_id=alice".to_string();
+        ctx.trace_state = "opencode_user_id=demo_user".to_string();
         ctx
     }
 
@@ -392,7 +392,7 @@ mod response_metadata_tests {
             "00-0af76598164860bd9a43d7c1a31725ab-00f067aa0ba902b7-01",
         )
         .unwrap();
-        ctx.trace_state = "opencode_user_id=alice".to_string();
+        ctx.trace_state = "opencode_user_id=demo_user".to_string();
         ctx
     }
 
