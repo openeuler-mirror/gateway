@@ -313,7 +313,7 @@ fn new_request_id() -> String {
 /// how litellm treats `rpm_limit: 0`.
 fn effective_key_limits(
     identity: &AuthIdentity,
-    cfg: &boom_config::RateLimitSettings,
+    cfg: &boom_limiter::RateLimitFallback,
 ) -> (Option<u64>, Option<u64>) {
     if !cfg.enabled {
         return (
@@ -337,7 +337,7 @@ fn effective_key_limits(
 /// windows must not constrain traffic either.
 fn effective_window_limits(
     raw: &[Vec<u64>],
-    cfg: &boom_config::RateLimitSettings,
+    cfg: &boom_limiter::RateLimitFallback,
 ) -> Vec<boom_core::types::WindowLimit> {
     if !cfg.enabled {
         return Vec::new();
@@ -959,8 +959,8 @@ async fn chat_completions_inner(
     ).await;
 
     // 2. Plan-based or default rate limiting.
-    let rate_limit_cfg = &inner.config.rate_limit;
-    let window_limits = effective_window_limits(&rate_limit_cfg.window_limits, rate_limit_cfg);
+    let rate_limit_cfg = state.plan_store.fallback();
+    let window_limits = effective_window_limits(&rate_limit_cfg.window_limits, &rate_limit_cfg);
     let weight = resolve_quota_weight(&req.model, &state);
     let resolved_model_for_quota = resolve_model_name(&req.model, &state);
 
@@ -969,7 +969,7 @@ async fn chat_completions_inner(
     // legacy rate-limit path entirely. The fallback only fills in gaps —
     // an explicit DB value always wins. When rate_limit.enabled=false the
     // defaults are skipped (key's own DB limits still apply).
-    let (effective_rpm, effective_tpm) = effective_key_limits(identity, rate_limit_cfg);
+    let (effective_rpm, effective_tpm) = effective_key_limits(identity, &rate_limit_cfg);
 
     let mut plan_charge = check_plan_limits(
         &state,
@@ -3628,12 +3628,12 @@ pub async fn messages(
     ).await;
 
     // 2. Plan-based or default rate limiting.
-    let rate_limit_cfg = &inner.config.rate_limit;
-    let window_limits = effective_window_limits(&rate_limit_cfg.window_limits, rate_limit_cfg);
+    let rate_limit_cfg = state.plan_store.fallback();
+    let window_limits = effective_window_limits(&rate_limit_cfg.window_limits, &rate_limit_cfg);
     let weight = resolve_quota_weight(&openai_req.model, &state);
     let resolved_model_for_quota = resolve_model_name(&openai_req.model, &state);
 
-    let (effective_rpm, effective_tpm) = effective_key_limits(identity, rate_limit_cfg);
+    let (effective_rpm, effective_tpm) = effective_key_limits(identity, &rate_limit_cfg);
 
     let mut plan_charge = check_plan_limits(
         &state,
@@ -4637,11 +4637,11 @@ pub async fn responses(
     ).await;
 
     // 2. Plan-based or default rate limiting.
-    let rate_limit_cfg = &inner.config.rate_limit;
-    let window_limits = effective_window_limits(&rate_limit_cfg.window_limits, rate_limit_cfg);
+    let rate_limit_cfg = state.plan_store.fallback();
+    let window_limits = effective_window_limits(&rate_limit_cfg.window_limits, &rate_limit_cfg);
     let weight = resolve_quota_weight(&openai_req.model, &state);
     let resolved_model_for_quota = resolve_model_name(&openai_req.model, &state);
-    let (effective_rpm, effective_tpm) = effective_key_limits(identity, rate_limit_cfg);
+    let (effective_rpm, effective_tpm) = effective_key_limits(identity, &rate_limit_cfg);
 
     let mut plan_charge = check_plan_limits(
         &state,

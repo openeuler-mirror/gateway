@@ -23,6 +23,21 @@ pub const TRACE_METRICS_ENABLED: &str = "trace_metrics_enabled";
 /// push incrementally for billing convergence in both modes). Default shared.
 pub const DECISION_BASE_SHARED: &str = "decision_base_shared";
 
+/// Fallback rate-limit settings for plan-less keys (`rate_limit` YAML
+/// section is seed-only). Value is a JSON object with the YAML field
+/// names (`enabled` / `default_rpm` / `default_tpm` / `window_limits`) —
+/// parsed into `boom_limiter::RateLimitFallback` by the callers. CATEGORY_PLAN
+/// broadcast: counters are cluster-shared, so thresholds must be too.
+pub const RATE_LIMIT_FALLBACK: &str = "rate_limit_fallback";
+
+/// Router behavior trio (`router_settings` YAML counterparts are
+/// seed-only): `enable_priority_header` / `strip_claude_code_attribution`
+/// / `forward_client_headers`. Cluster forwarding semantics — parsed back
+/// into boom-main's `RouterBehavior` by the callers. CATEGORY_ROUTER_BEHAVIOR
+/// broadcast: instances diverging here would treat the same client
+/// request differently depending on which instance served it.
+pub const ROUTER_BEHAVIOR: &str = "router_behavior";
+
 fn value_to_bool(v: serde_json::Value) -> Option<bool> {
     match v {
         serde_json::Value::Bool(b) => Some(b),
@@ -33,17 +48,31 @@ fn value_to_bool(v: serde_json::Value) -> Option<bool> {
 /// Read a boolean KV entry. `None` when the key is absent or the value is
 /// not a JSON bool (caller decides whether to seed or warn).
 pub async fn get_bool(pool: &PgPool, key: &str) -> Result<Option<bool>, sqlx::Error> {
-    let v: Option<serde_json::Value> =
-        sqlx::query_scalar::<_, serde_json::Value>("SELECT value FROM boom_config WHERE key = $1")
-            .bind(key)
-            .fetch_optional(pool)
-            .await?;
-    Ok(v.and_then(value_to_bool))
+    Ok(get_value(pool, key).await?.and_then(value_to_bool))
+}
+
+/// Read an arbitrary JSON KV entry. `None` when the key is absent.
+pub async fn get_value(
+    pool: &PgPool,
+    key: &str,
+) -> Result<Option<serde_json::Value>, sqlx::Error> {
+    sqlx::query_scalar::<_, serde_json::Value>("SELECT value FROM boom_config WHERE key = $1")
+        .bind(key)
+        .fetch_optional(pool)
+        .await
 }
 
 /// Write a boolean KV entry (UPDATE → INSERT race-tolerant upsert).
 pub async fn set_bool(pool: &PgPool, key: &str, value: bool) -> Result<(), sqlx::Error> {
-    let json = serde_json::Value::Bool(value);
+    set_value(pool, key, serde_json::Value::Bool(value)).await
+}
+
+/// Write an arbitrary JSON KV entry (UPDATE → INSERT race-tolerant upsert).
+pub async fn set_value(
+    pool: &PgPool,
+    key: &str,
+    json: serde_json::Value,
+) -> Result<(), sqlx::Error> {
     boom_core::gaussdb_upsert!(
         pool,
         || {
@@ -67,26 +96,39 @@ pub async fn adopt_bool(pool: &PgPool, key: &str, seed: bool) -> Result<bool, sq
     if let Some(v) = get_bool(pool, key).await? {
         return Ok(v);
     }
-    let json = serde_json::Value::Bool(seed);
+    Ok(value_to_bool(adopt_value(pool, key, serde_json::Value::Bool(seed)).await?)
+        .unwrap_or(seed))
+}
+
+/// JSON-object variant of [`adopt_bool`]: seed the row when absent, return
+/// the DB value when present. Callers parse the returned value into their
+/// typed struct; a malformed row should be treated by the caller as "use the
+/// seed" (the next `set_value` heals it).
+pub async fn adopt_value(
+    pool: &PgPool,
+    key: &str,
+    seed: serde_json::Value,
+) -> Result<serde_json::Value, sqlx::Error> {
+    if let Some(v) = get_value(pool, key).await? {
+        return Ok(v);
+    }
     let inserted = sqlx::query("INSERT INTO boom_config (key, value) VALUES ($1, $2)")
         .bind(key)
-        .bind(&json)
+        .bind(&seed)
         .execute(pool)
         .await;
     match inserted {
         Ok(_) => {
-            tracing::info!(key, seed, "Initialized boom_config KV entry from YAML default");
+            tracing::info!(key, "Initialized boom_config KV entry from YAML default");
             Ok(seed)
         }
         Err(_) => {
             // Lost the race to a concurrently-booting instance — adopt
             // whatever it wrote. A genuine non-race failure resurfaces here.
-            let v: serde_json::Value =
-                sqlx::query_scalar("SELECT value FROM boom_config WHERE key = $1")
-                    .bind(key)
-                    .fetch_one(pool)
-                    .await?;
-            Ok(value_to_bool(v).unwrap_or(seed))
+            sqlx::query_scalar("SELECT value FROM boom_config WHERE key = $1")
+                .bind(key)
+                .fetch_one(pool)
+                .await
         }
     }
 }

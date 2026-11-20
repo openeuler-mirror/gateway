@@ -7286,7 +7286,7 @@
     return `<div class="form-card" data-section="server">
       <div class="form-card-title">${t("config.section.server")}</div>
       <div class="form-card-grid">
-        ${fieldText("cfg-server-host", t("config.field.host"), s.host)}
+        ${fieldText("cfg-server-host", t("config.field.host"), s.host, {})}
         ${fieldNum("cfg-server-port", t("config.field.port"), s.port, { min: 1 })}
         ${fieldNum("cfg-server-workers", t("config.field.workers"), s.workers, { min: 1 })}
       </div>
@@ -7306,7 +7306,7 @@
         <div class="form-group field-full"><label for="cfg-gen-user-tag-hdr">${t("config.field.user_tag_headers")} ${tip(t("tip.config.user_tag_headers"))}</label><input id="cfg-gen-user-tag-hdr" value="${esc((g.user_tag_headers || []).join(", "))}" placeholder="X-User-Tag, X-Request-Id, X-Trace-Id"></div>
         ${fieldCheckbox("cfg-gen-priority-hdr", t("config.field.enable_priority_header"), router.enable_priority_header, { tip: t("tip.config.enable_priority_header") })}
         ${fieldCheckbox("cfg-gen-strip-cc", t("config.field.strip_claude_code_attribution"), router.strip_claude_code_attribution, { tip: t("tip.config.strip_claude_code_attribution") })}
-        ${fieldFullList("cfg-gen-forward-hdrs", t("config.field.forward_client_headers"), router.forward_client_headers || [])}
+        ${fieldFullList("cfg-gen-forward-hdrs", t("config.field.forward_client_headers"), router.forward_client_headers || [], {})}
       </div>
       <p class="modal-hint">${t("config.tip.master_key_readonly")}</p>
       <div class="form-card-actions">
@@ -7315,7 +7315,7 @@
     </div>`;
   }
 
-  function fieldFullList(id, label, list) {
+  function fieldFullList(id, label, list, opts = {}) {
     const v = Array.isArray(list) ? list.join(", ") : "";
     return `<div class="form-group field-full"><label for="${id}">${esc(label)}</label><input id="${id}" value="${esc(v)}" placeholder="comma-separated"></div>`;
   }
@@ -7343,8 +7343,8 @@
     return `<div class="form-card" data-section="plan_settings">
       <div class="form-card-title">${t("config.section.plan_settings")}</div>
       <div class="form-card-grid">
-        ${fieldSelect("cfg-ps-default-plan", t("config.field.default_plan"), planOptions, p.default_plan || "")}
-        ${fieldSelect("cfg-ps-default-team-plan", t("config.field.default_team_plan"), planOptions, p.default_team_plan || "")}
+        ${fieldSelect("cfg-ps-default-plan", t("config.field.default_plan"), planOptions, p.default_plan || "", {})}
+        ${fieldSelect("cfg-ps-default-team-plan", t("config.field.default_team_plan"), planOptions, p.default_team_plan || "", {})}
       </div>
       <p class="modal-hint">${t("config.tip.manage_plans_on_plans_page")}</p>
       <div class="form-card-actions">
@@ -7357,14 +7357,14 @@
     return `<div class="form-card" data-section="deployment_health_check">
       <div class="form-card-title">${t("config.section.deployment_health_check")}</div>
       <div class="form-card-grid">
-        ${fieldCheckbox("cfg-hc-auto-off", t("config.field.auto_offline_enabled"), h.auto_offline_enabled)}
-        ${fieldCheckbox("cfg-hc-auto-rec", t("config.field.auto_recovery_enabled"), h.auto_recovery_enabled)}
-        ${fieldText("cfg-hc-path", t("config.field.path"), h.path)}
+        ${fieldCheckbox("cfg-hc-auto-off", t("config.field.auto_offline_enabled"), h.auto_offline_enabled, {})}
+        ${fieldCheckbox("cfg-hc-auto-rec", t("config.field.auto_recovery_enabled"), h.auto_recovery_enabled, {})}
+        ${fieldText("cfg-hc-path", t("config.field.path"), h.path, {})}
         ${fieldNum("cfg-hc-failure-thr", t("config.field.failure_threshold"), h.failure_threshold, { min: 1 })}
         ${fieldNum("cfg-hc-recovery-thr", t("config.field.recovery_threshold"), h.recovery_threshold, { min: 1 })}
         ${fieldNum("cfg-hc-offline-int", t("config.field.offline_check_interval_secs"), h.offline_check_interval_secs, { min: 1 })}
         ${fieldNum("cfg-hc-recovery-int", t("config.field.recovery_check_interval_secs"), h.recovery_check_interval_secs, { min: 1 })}
-        ${fieldCheckbox("cfg-hc-req-fail-auto", t("config.field.request_failure_auto_offline_enabled"), h.request_failure_auto_offline_enabled)}
+        ${fieldCheckbox("cfg-hc-req-fail-auto", t("config.field.request_failure_auto_offline_enabled"), h.request_failure_auto_offline_enabled, {})}
         ${fieldNum("cfg-hc-req-fail-thr", t("config.field.request_failure_threshold"), h.request_failure_threshold, { min: 1 })}
       </div>
       <div class="form-card-actions">
@@ -7395,13 +7395,13 @@
     return `<div class="form-card" data-section="prompt_log">
       <div class="form-card-title">${t("config.section.prompt_log")}</div>
       <div class="form-card-grid">
-        ${fieldCheckbox("cfg-pl-enabled", t("config.field.enabled"), p.enabled)}
+        ${fieldCheckbox("cfg-pl-enabled", t("config.field.enabled"), p.enabled, {})}
         ${fieldText("cfg-pl-dir", t("config.field.dir"), p.dir, { full: true })}
         ${fieldNum("cfg-pl-max-mb", t("config.field.max_file_size_mb"), p.max_file_size_mb, { min: 1 })}
         ${fieldCheckbox("cfg-pl-capture", t("config.field.capture_raw_upstream"), p.capture_raw_upstream, { note: t("config.tip.capture_raw_upstream") })}
-        ${fieldFullList("cfg-pl-excluded-keys", t("config.field.excluded_keys"), p.excluded_keys || [])}
-        ${fieldFullList("cfg-pl-excluded-teams", t("config.field.excluded_teams"), p.excluded_teams || [])}
-        ${fieldFullList("cfg-pl-record-headers", t("config.field.record_headers"), p.record_headers || [])}
+        ${fieldFullList("cfg-pl-excluded-keys", t("config.field.excluded_keys"), p.excluded_keys || [], {})}
+        ${fieldFullList("cfg-pl-excluded-teams", t("config.field.excluded_teams"), p.excluded_teams || [], {})}
+        ${fieldFullList("cfg-pl-record-headers", t("config.field.record_headers"), p.record_headers || [], {})}
       </div>
 
       <div class="form-card-subtitle">${t("config.section.prompt_log_otlp")}</div>
@@ -7452,7 +7452,7 @@
 
       <div class="form-card-subtitle">${t("config.section.trace_filter")}</div>
       <div class="form-card-grid">
-        ${fieldFullList("cfg-tr-filter-keys", t("config.field.trace_tracestate_keys"), f.tracestate_keys || [])}
+        ${fieldFullList("cfg-tr-filter-keys", t("config.field.trace_tracestate_keys"), f.tracestate_keys || [], {})}
         ${fieldText("cfg-tr-filter-regex", t("config.field.trace_trace_id_regex"), f.trace_id_regex || "", { full: true, tip: t("config.tip.trace_trace_id_regex") })}
       </div>
 
@@ -7559,7 +7559,7 @@
     return `<div class="form-card" data-section="client_blocklist">
       <div class="form-card-title">${t("config.section.client_blocklist")}</div>
       <div class="form-card-grid">
-        ${fieldCheckbox("cfg-bl-enabled", t("config.field.blocklist_enabled"), enabled)}
+        ${fieldCheckbox("cfg-bl-enabled", t("config.field.blocklist_enabled"), enabled, {})}
       </div>
       <p class="modal-hint">${t("blockrules.hint")}</p>
       <div id="blockrules-table-wrap" style="margin-bottom:12px"><p class="loading">${t("common.loading")}</p></div>
@@ -7916,12 +7916,14 @@
           workers: numOr($("cfg-server-workers"), 4),
         });
       } else if (kind === "general") {
-        // user_tag_headers is DB-authoritative (boom_user_tag_config) — direct
-        // PUT to the dedicated endpoint, immediate effect, no YAML write.
-        // Comma-separated input → array (validated ≤3); empty = disabled.
-        // The three router_settings sub-paths stay on the YAML channel
-        // (process-level config) — sub-path writes avoid replacing the whole
-        // router_settings section. One confirm covers both channels.
+        // Both channels on this card are DB-authoritative and cluster-scoped:
+        // user_tag_headers (boom_user_tag_config) and the router behavior
+        // trio (boom_config KV router_behavior — priority header / Claude
+        // Code attribution strip / forwarded-header whitelist). Direct PUTs
+        // to dedicated endpoints, immediate effect + ≤5s peer propagation.
+        // The three sub-path YAML writes below are seed refresh only
+        // (fresh-DB restore material); in no-DB mode they are the live
+        // channel. One confirm covers both channels.
         const tagHeaders = $("cfg-gen-user-tag-hdr").value
           .split(",").map(s => s.trim()).filter(Boolean);
         if (tagHeaders.length > 3) {
@@ -7932,10 +7934,25 @@
           method: "PUT", skipConfirm: true,
           body: JSON.stringify({ headers: tagHeaders }),
         });
+        const behavior = {
+          enable_priority_header: $("cfg-gen-priority-hdr").checked,
+          strip_claude_code_attribution: $("cfg-gen-strip-cc").checked,
+          forward_client_headers: parseListInput($("cfg-gen-forward-hdrs")),
+        };
+        try {
+          await api("/admin/router-behavior", {
+            method: "PUT", skipConfirm: true,
+            body: JSON.stringify(behavior),
+          });
+        } catch (e) {
+          // No-DB mode: the trio is YAML-backed there and the sub-path
+          // writes below carry it. Any other failure is real and aborts.
+          if (!String(e.message || "").includes("Database not available")) throw e;
+        }
         for (const [path, value] of [
-          ["router_settings.enable_priority_header", $("cfg-gen-priority-hdr").checked],
-          ["router_settings.strip_claude_code_attribution", $("cfg-gen-strip-cc").checked],
-          ["router_settings.forward_client_headers", parseListInput($("cfg-gen-forward-hdrs"))],
+          ["router_settings.enable_priority_header", behavior.enable_priority_header],
+          ["router_settings.strip_claude_code_attribution", behavior.strip_claude_code_attribution],
+          ["router_settings.forward_client_headers", behavior.forward_client_headers],
         ]) {
           await api("/admin/config", { method: "PUT", skipConfirm: true, body: JSON.stringify({ path, value }) });
         }
@@ -7950,13 +7967,22 @@
           }],
         ]);
       } else if (kind === "rate_limit") {
+        // Fallback limits are DB-backed (boom_config KV, CATEGORY_PLAN
+        // broadcast) — counters are cluster-shared, so thresholds must be.
+        // Immediate effect + ≤5s peer propagation, no YAML write.
+        if (!confirm(t("common.confirm_write"))) throw new Error(t("common.canceled"));
         const tpmRaw = $("cfg-rl-default-tpm").value;
-        await saveConfigSection("rate_limit", {
-          enabled: $("cfg-rl-enabled").checked,
-          default_rpm: numOr($("cfg-rl-default-rpm"), 60),
-          default_tpm: tpmRaw === "" ? null : Number(tpmRaw),
-          window_limits: parseJsonInput($("cfg-rl-windows"), []),
+        await api("/admin/rate-limit-fallback", {
+          method: "PUT", skipConfirm: true,
+          body: JSON.stringify({
+            enabled: $("cfg-rl-enabled").checked,
+            default_rpm: numOr($("cfg-rl-default-rpm"), 60),
+            default_tpm: tpmRaw === "" ? null : Number(tpmRaw),
+            window_limits: parseJsonInput($("cfg-rl-windows"), []),
+          }),
         });
+        showToast(t("config.saved"));
+        await loadConfigPage();
       } else if (kind === "client_blocklist") {
         // Only the global switch is a config field here; rules are managed
         // via the dedicated CRUD endpoints. The switch itself is DB-backed
@@ -8022,8 +8048,9 @@
       } else if (kind === "trace") {
         // metrics.enabled is DB-authoritative (boom_config KV) — direct PUT
         // to the dedicated endpoint, immediate effect. The rest of the trace
-        // section is process-level YAML. One confirm covers both channels
-        // (saveConfigSection's confirm fires inside its own call below).
+        // section is process-level YAML. One confirm covers both channels —
+        // the kind-level confirm below carries the scope copy and the
+        // follow-up saveConfigSections() call skips its own.
         if (!confirm(t("common.confirm_write"))) throw new Error(t("common.canceled"));
         const metricsOn = $("cfg-tr-metrics-enabled").checked;
         try {
@@ -8063,36 +8090,66 @@
               max_queue_bytes: numOr($("cfg-tr-otlp-max-queue-bytes"), 67108864),
             },
           }],
-        ]);
+        ], { skipConfirm: true });
       } else if (kind === "router") {
-        const routerValue = {
+        // The scheduling-policy group (schedule_policy / key_affinity_* /
+        // rebalance_threshold / kvc router_ttl_secs / kvc max_blocks) is
+        // DB-authoritative (boom_router_policy single row) — direct PUT to
+        // the dedicated endpoint; boom-main rebuilds the policy (+ the KV
+        // trie on a policy flip, live-resizes the LRU on a max_blocks-only
+        // change) and bumps CATEGORY_ROUTER_POLICY. The rest of
+        // router_settings is process-level YAML. One confirm covers both
+        // channels.
+        if (!confirm(t("common.confirm_write"))) throw new Error(t("common.canceled"));
+        const dbPolicy = {
           schedule_policy: $("cfg-rs-policy").value,
           key_affinity_context_threshold: numOr($("cfg-rs-affinity-ctx"), 0),
           key_affinity_ttl_secs: numOr($("cfg-rs-affinity-ttl"), 3600),
           rebalance_threshold: numOr($("cfg-rs-affinity-rebal"), 20),
-          flow_control_queue_timeout_secs: numOr($("cfg-rs-flow-timeout"), 1200),
-          // These three editors live on the General card; their inputs are
-          // still in the DOM when this save fires (config page renders all
-          // cards at once, hidden panels included).
-          enable_priority_header: $("cfg-gen-priority-hdr").checked,
-          strip_claude_code_attribution: $("cfg-gen-strip-cc").checked,
-          forward_client_headers: parseListInput($("cfg-gen-forward-hdrs")),
-          // model_group_alias is DB-owned (alias CRUD on the Models page);
-          // the update_config_section path rejects it. Strip the key so the
-          // whole-section replace doesn't try to write it.
-          // The backend replaces the whole router_settings section, so every
-          // sub-tree must be re-submitted. kvc_aware reads the live inputs
-          // (its card shares this save button); auto_router and
-          // enable_workflow (feature-parked switch, YAML-only) have no
-          // editor and are passed through verbatim.
-          kvc_aware: {
-            max_blocks: numOr($("cfg-kvc-max-blocks"), 500000),
-            router_ttl_secs: numOr($("cfg-kvc-ttl"), 1200),
-          },
-          auto_router: cfg.router_settings.auto_router ?? null,
-          enable_workflow: cfg.router_settings.enable_workflow ?? false,
+          kvc_router_ttl_secs: numOr($("cfg-kvc-ttl"), 1200),
+          kvc_max_blocks: numOr($("cfg-kvc-max-blocks"), 500000),
         };
-        await saveConfigSection("router_settings", routerValue);
+        try {
+          await api("/admin/router-policy", {
+            method: "PUT", skipConfirm: true,
+            body: JSON.stringify(dbPolicy),
+          });
+        } catch (e) {
+          // No-DB mode: the group is YAML-backed there and the section
+          // write below carries it. Any other failure is real and aborts.
+          if (!String(e.message || "").includes("Database not available")) throw e;
+        }
+        await saveConfigSections([
+          ["router_settings", {
+            // Seed-only in DB mode; carrying the live values keeps the file
+            // from silently dropping the fields on a whole-section rewrite.
+            schedule_policy: dbPolicy.schedule_policy,
+            key_affinity_context_threshold: dbPolicy.key_affinity_context_threshold,
+            key_affinity_ttl_secs: dbPolicy.key_affinity_ttl_secs,
+            rebalance_threshold: dbPolicy.rebalance_threshold,
+            flow_control_queue_timeout_secs: numOr($("cfg-rs-flow-timeout"), 1200),
+            // These three editors live on the General card; their inputs are
+            // still in the DOM when this save fires (config page renders all
+            // cards at once, hidden panels included).
+            enable_priority_header: $("cfg-gen-priority-hdr").checked,
+            strip_claude_code_attribution: $("cfg-gen-strip-cc").checked,
+            forward_client_headers: parseListInput($("cfg-gen-forward-hdrs")),
+            // model_group_alias is DB-owned (alias CRUD on the Models page);
+            // the update_config_section path rejects it. Strip the key so the
+            // whole-section replace doesn't try to write it.
+            // The backend replaces the whole router_settings section, so every
+            // sub-tree must be re-submitted. kvc_aware reads the live inputs
+            // (its card shares this save button); auto_router and
+            // enable_workflow (feature-parked switch, YAML-only) have no
+            // editor and are passed through verbatim.
+            kvc_aware: {
+              max_blocks: dbPolicy.kvc_max_blocks,
+              router_ttl_secs: dbPolicy.kvc_router_ttl_secs,
+            },
+            auto_router: cfg.router_settings.auto_router ?? null,
+            enable_workflow: cfg.router_settings.enable_workflow ?? false,
+          }],
+        ], { skipConfirm: true });
       }
     } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
   }
@@ -8104,10 +8161,14 @@
   // Multi-section save: fires all PUTs first, then a single page reload.
   // Reloading between writes would drop the other sections' DOM inputs
   // before they are read. The batch is confirmed once up front; the PUTs
-  // then bypass api()'s per-call confirm via skipConfirm.
-  async function saveConfigSections(pairs) {
-    if (!confirm(t("common.confirm_write"))) {
-      throw new Error(t("common.canceled"));
+  // then bypass api()'s per-call confirm via skipConfirm. `opts.skipConfirm`
+  // is for kind-level flows that already confirmed (dedicated-endpoint
+  // branches like router/trace).
+  async function saveConfigSections(pairs, opts = {}) {
+    if (!opts.skipConfirm) {
+      if (!confirm(t("common.confirm_write"))) {
+        throw new Error(t("common.canceled"));
+      }
     }
     for (const [path, value] of pairs) {
       await api("/admin/config", { method: "PUT", skipConfirm: true, body: JSON.stringify({ path, value }) });

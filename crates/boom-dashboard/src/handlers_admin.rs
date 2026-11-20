@@ -604,6 +604,220 @@ pub async fn set_decision_base(
 }
 
 // ═══════════════════════════════════════════════════════════
+// Rate-limit fallback (boom_config KV)
+// ═══════════════════════════════════════════════════════════
+
+/// PUT /admin/rate-limit-fallback — replace the DB-authoritative fallback
+/// limits for plan-less keys (`boom_config` KV `rate_limit_fallback`; the
+/// YAML `rate_limit` section is seed-only). DB write first, local memory
+/// second, then a CATEGORY_PLAN bump so peer instances re-adopt on their
+/// next poll (≤5s). Window pairs are validated at this boundary (the YAML
+/// path stays lenient for back-compat; the API must not persist junk).
+#[derive(Debug, Deserialize)]
+pub struct SetRateLimitFallbackRequest {
+    pub enabled: bool,
+    pub default_rpm: u64,
+    pub default_tpm: Option<u64>,
+    #[serde(default)]
+    pub window_limits: Vec<Vec<u64>>,
+}
+
+pub async fn set_rate_limit_fallback(
+    _session: AdminSession,
+    Extension(state): Extension<std::sync::Arc<DashboardState>>,
+    Json(req): Json<SetRateLimitFallbackRequest>,
+) -> Response {
+    for pair in &req.window_limits {
+        if pair.len() != 2 || pair[0] == 0 || pair[1] == 0 {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "window_limits entries must be [count, window_seconds] pairs with both > 0"
+                })),
+            )
+                .into_response();
+        }
+    }
+    let db_pool = match &state.db_pool {
+        Some(pool) => pool,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "Database not available — fallback limits are DB-backed; \
+                              edit the rate_limit section in YAML for no-DB mode"
+                })),
+            )
+                .into_response()
+        }
+    };
+    let fallback = boom_limiter::RateLimitFallback {
+        enabled: req.enabled,
+        default_rpm: req.default_rpm,
+        default_tpm: req.default_tpm,
+        window_limits: req.window_limits,
+    };
+    let json = match serde_json::to_value(&fallback) {
+        Ok(v) => v,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "Internal error"})),
+            )
+                .into_response()
+        }
+    };
+    let reply_value = json.clone();
+    match crate::config_kv::set_value(db_pool, crate::config_kv::RATE_LIMIT_FALLBACK, json).await {
+        Ok(()) => {
+            state.plan_store.set_fallback(fallback);
+            boom_state::revision::bump_best_effort(db_pool, boom_state::CATEGORY_PLAN).await;
+            tracing::info!("Rate-limit fallback updated");
+            Json(json!({"ok": true, "rate_limit": reply_value})).into_response()
+        }
+        Err(e) => {
+            tracing::error!("set_rate_limit_fallback failed: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "Internal error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// PUT /admin/router-policy — replace the DB-authoritative scheduling
+/// policy group (`boom_router_policy` single row; the YAML
+/// `router_settings` counterparts are seed-only). The write is owned by
+/// boom-main via the AdminCommand channel: applying a new group rebuilds
+/// the scheduling policy object and — on a schedule_policy flip — the KV
+/// trie, which needs AppState machinery the dashboard must not touch
+/// (CLAUDE.md §5). No-DB mode rejects here: YAML is the authority there.
+pub async fn set_router_policy(
+    _session: AdminSession,
+    Extension(state): Extension<std::sync::Arc<DashboardState>>,
+    Json(policy): Json<boom_routing::RouterPolicy>,
+) -> Response {
+    if state.db_pool.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "Database not available — the scheduling policy group is DB-backed; \
+                          edit the router_settings section in YAML for no-DB mode"
+            })),
+        )
+            .into_response();
+    }
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    if state
+        .admin_tx
+        .send(crate::state::AdminCommand::SetRouterPolicy {
+            policy,
+            reply: reply_tx,
+        })
+        .await
+        .is_err()
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "Admin command handler unavailable"})),
+        )
+            .into_response();
+    }
+    match reply_rx.await {
+        Ok(Ok(v)) => Json(json!({"ok": true, "router_policy": v})).into_response(),
+        Ok(Err(msg)) => (StatusCode::BAD_REQUEST, Json(json!({"error": msg}))).into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "Admin command handler dropped reply"})),
+        )
+            .into_response(),
+    }
+}
+
+/// PUT /admin/router-behavior — replace the DB-authoritative router
+/// behavior trio (`boom_config` KV `router_behavior`; the YAML
+/// `router_settings` counterparts are seed-only). The write is owned by
+/// boom-main via the AdminCommand channel: applying a new trio swaps the
+/// live inner config, which needs AppState machinery the dashboard must
+/// not touch (CLAUDE.md §5). Header entries are validated at this API
+/// boundary (RFC 7230 token shape: non-empty, no whitespace, no ':') —
+/// the YAML loader stays lenient for back-compat. No-DB mode rejects
+/// here: YAML is the authority there.
+#[derive(Debug, Deserialize)]
+pub struct SetRouterBehaviorRequest {
+    pub enable_priority_header: bool,
+    pub strip_claude_code_attribution: bool,
+    #[serde(default)]
+    pub forward_client_headers: Vec<String>,
+}
+
+pub async fn set_router_behavior(
+    _session: AdminSession,
+    Extension(state): Extension<std::sync::Arc<DashboardState>>,
+    Json(req): Json<SetRouterBehaviorRequest>,
+) -> Response {
+    for h in &req.forward_client_headers {
+        if h.is_empty() || h.chars().any(|c| c.is_whitespace() || c == ':') {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "forward_client_headers entries must be non-empty header \
+                              names without whitespace or ':'"
+                })),
+            )
+                .into_response();
+        }
+    }
+    if req.forward_client_headers.len() > 64 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "forward_client_headers supports at most 64 entries"
+            })),
+        )
+            .into_response();
+    }
+    if state.db_pool.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "Database not available — the behavior switches are DB-backed; \
+                          edit the router_settings section in YAML for no-DB mode"
+            })),
+        )
+            .into_response();
+    }
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    if state
+        .admin_tx
+        .send(crate::state::AdminCommand::SetRouterBehavior {
+            enable_priority_header: req.enable_priority_header,
+            strip_claude_code_attribution: req.strip_claude_code_attribution,
+            forward_client_headers: req.forward_client_headers,
+            reply: reply_tx,
+        })
+        .await
+        .is_err()
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "Admin command handler unavailable"})),
+        )
+            .into_response();
+    }
+    match reply_rx.await {
+        Ok(Ok(v)) => Json(json!({"ok": true, "router_behavior": v})).into_response(),
+        Ok(Err(msg)) => (StatusCode::BAD_REQUEST, Json(json!({"error": msg}))).into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "Admin command handler dropped reply"})),
+        )
+            .into_response(),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
 // Key management (DB operations)
 // ═══════════════════════════════════════════════════════════
 

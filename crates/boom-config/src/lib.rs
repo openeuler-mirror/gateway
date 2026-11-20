@@ -1089,7 +1089,7 @@ impl InstanceTelemetrySettings {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 pub struct RateLimitSettings {
     /// Fallback switch for keys without explicit rate configuration.
     ///

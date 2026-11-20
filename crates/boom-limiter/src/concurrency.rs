@@ -290,6 +290,46 @@ fn parse_hm(s: &str) -> Option<u32> {
     Some(h.parse::<u32>().ok()? * 60 + m.parse::<u32>().ok()?)
 }
 
+/// Fallback rate-limit settings for keys with no plan and no DB-set
+/// rpm/tpm_limit — the unconfigured-key safety net.
+///
+/// DB-authoritative (boom_config KV `rate_limit_fallback`, CATEGORY_PLAN
+/// broadcast): rate-limit counters are cluster-shared, so per-instance
+/// thresholds would make the same key enforce differently depending on which
+/// instance serves it. The YAML `rate_limit` section is seed-only. Mirrors
+/// the YAML field names/defaults so the stored JSON round-trips the
+/// `boom-config` section shape.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RateLimitFallback {
+    #[serde(default = "fallback_default_enabled")]
+    pub enabled: bool,
+    #[serde(default = "fallback_default_rpm")]
+    pub default_rpm: u64,
+    #[serde(default)]
+    pub default_tpm: Option<u64>,
+    /// `[[count, window_seconds], ...]` — same shape as the YAML section.
+    #[serde(default)]
+    pub window_limits: Vec<Vec<u64>>,
+}
+
+fn fallback_default_enabled() -> bool {
+    true
+}
+fn fallback_default_rpm() -> u64 {
+    60
+}
+
+impl Default for RateLimitFallback {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            default_rpm: 60,
+            default_tpm: None,
+            window_limits: Vec::new(),
+        }
+    }
+}
+
 /// In-memory store for rate limit plans and key/team assignments.
 /// Survives config reloads.
 #[derive(Debug)]
@@ -305,6 +345,9 @@ pub struct PlanStore {
     team_concurrency_counters: DashMap<String, Arc<AtomicU32>>,
     default_plan_name: std::sync::Mutex<Option<String>>,
     default_team_plan_name: std::sync::Mutex<Option<String>>,
+    /// Fallback limits for plan-less keys — DB-authoritative in DB mode
+    /// (re-adopted on reload / revision bump), YAML-seeded in no-DB mode.
+    fallback: std::sync::RwLock<RateLimitFallback>,
 }
 
 impl PlanStore {
@@ -317,7 +360,20 @@ impl PlanStore {
             team_concurrency_counters: DashMap::new(),
             default_plan_name: std::sync::Mutex::new(None),
             default_team_plan_name: std::sync::Mutex::new(None),
+            fallback: std::sync::RwLock::new(RateLimitFallback::default()),
         }
+    }
+
+    /// Current fallback limits (cloned — small struct, read once per request
+    /// on the legacy rate-limit path).
+    pub fn fallback(&self) -> RateLimitFallback {
+        self.fallback.read().unwrap().clone()
+    }
+
+    /// Swap the fallback limits (boot adopt, reload adopt, revision-bump
+    /// reconcile, or the dashboard PUT's immediate-apply step).
+    pub fn set_fallback(&self, f: RateLimitFallback) {
+        *self.fallback.write().unwrap() = f;
     }
 
     /// Set the default plan name (called during config load / reload).

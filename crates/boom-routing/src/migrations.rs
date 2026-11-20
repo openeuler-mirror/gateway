@@ -215,3 +215,34 @@ CREATE TABLE IF NOT EXISTS boom_cost_template (
 );
 "#
 }
+
+/// DDL for boom_router_policy — the cluster scheduling policy group
+/// (CLAUDE.md §7 global domain, single row). Seeded from the YAML
+/// `router_settings` group on first boot; DB-authoritative afterwards.
+/// `kvc_max_blocks` (← `kvc_aware.max_blocks`) is nullable on purpose:
+/// deployments that created the table before the column existed get NULL,
+/// and `read_or_seed` backfills it from the YAML value once (one-time
+/// migration, DB authoritative thereafter).
+pub fn router_policy_ddl() -> &'static str {
+    r#"
+CREATE TABLE IF NOT EXISTS boom_router_policy (
+    id                              INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    schedule_policy                 TEXT NOT NULL DEFAULT 'round_robin',
+    key_affinity_context_threshold  BIGINT NOT NULL DEFAULT 0,
+    key_affinity_ttl_secs           BIGINT,
+    rebalance_threshold             SMALLINT NOT NULL DEFAULT 20,
+    kvc_router_ttl_secs             DOUBLE PRECISION NOT NULL DEFAULT 1200,
+    kvc_max_blocks                  BIGINT,
+    updated_at                      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+"#
+}
+
+/// Add `kvc_max_blocks` to pre-existing boom_router_policy tables (the
+/// CREATE above only helps fresh installs; IF NOT EXISTS never alters an
+/// existing table).
+pub fn router_policy_max_blocks_ddl() -> &'static str {
+    r#"
+ALTER TABLE boom_router_policy ADD COLUMN IF NOT EXISTS kvc_max_blocks BIGINT;
+"#
+}

@@ -419,6 +419,26 @@ pub fn build_router<S: Clone + Send + Sync + 'static>(state: DashboardState) -> 
             "/dashboard/api/admin/decision-base",
             get(handlers_admin::get_decision_base).put(handlers_admin::set_decision_base),
         )
+        // Admin — Rate-limit fallback for plan-less keys (DB-backed via
+        // boom_config KV; values projected into GET /admin/config).
+        .route(
+            "/dashboard/api/admin/rate-limit-fallback",
+            put(handlers_admin::set_rate_limit_fallback),
+        )
+        // Admin — Cluster scheduling policy group (DB-backed via the
+        // boom_router_policy single row; applied by boom-main through the
+        // AdminCommand channel — policy/trie rebuild lives there).
+        .route(
+            "/dashboard/api/admin/router-policy",
+            put(handlers_admin::set_router_policy),
+        )
+        // Admin — Cluster router behavior trio (boom_config KV
+        // router_behavior; boom-main writes + bumps + swaps the inner
+        // config through the AdminCommand channel).
+        .route(
+            "/dashboard/api/admin/router-behavior",
+            put(handlers_admin::set_router_behavior),
+        )
         // Admin — Hot-reload config.
         .route(
             "/dashboard/api/admin/config/reload",

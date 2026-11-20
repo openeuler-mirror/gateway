@@ -321,10 +321,24 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
     run_ddl_on_conn(&mut conn, boom_audit::migrations::user_tag_config_ddl()).await?;
     tracing::info!("Migration 15: done");
 
+    // 12. Cluster scheduling policy group (boom-routing, single row).
+    tracing::info!("Migration 16: router_policy...");
+    run_ddl_on_conn(&mut conn, boom_routing::migrations::router_policy_ddl()).await?;
+    tracing::info!("Migration 16: done");
+
+    // 13. kvc_max_blocks column for pre-existing router_policy tables.
+    tracing::info!("Migration 17: router_policy kvc_max_blocks...");
+    run_ddl_on_conn(
+        &mut conn,
+        boom_routing::migrations::router_policy_max_blocks_ddl(),
+    )
+    .await?;
+    tracing::info!("Migration 17: done");
+
     // Connection returns to pool on drop.
     drop(conn);
 
-    tracing::info!("BooMGateway persistence tables ensured (15 tables)");
+    tracing::info!("BooMGateway persistence tables ensured (17 migrations)");
     Ok(())
 }
 
