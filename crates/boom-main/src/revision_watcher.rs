@@ -420,6 +420,11 @@ async fn dispatch(category: &str, state: &AppState, pool: &PgPool) -> anyhow::Re
     match category {
         boom_state::CATEGORY_PLAN => {
             crate::config_reconcile::reconcile_plans(&deps).await?;
+            // Fallback limits ride the plan category (boom_config KV row):
+            // peer dashboard PUT → bump → re-adopt here.
+            let config = state.inner.load().config.clone();
+            crate::config_reconcile::adopt_rate_limit_fallback_db(pool, &state.plan_store, &config)
+                .await?;
         }
         boom_state::CATEGORY_ASSIGNMENT => {
             state.plan_store.reconcile_assignments_from_db(pool).await?;
@@ -467,6 +472,52 @@ async fn dispatch(category: &str, state: &AppState, pool: &PgPool) -> anyhow::Re
                 &config,
             )
             .await?;
+        }
+        boom_state::CATEGORY_ROUTER_POLICY => {
+            // Peer router-policy PUT: re-adopt the row and apply. The
+            // rebuild (policy object, trie only on a schedule_policy flip,
+            // prune task, inner config swap) lives in apply_router_policy,
+            // shared with the dashboard PUT path.
+            let old = state.inner.load().config.router_settings.clone();
+            let adopted = boom_routing::router_policy::read_or_seed(
+                pool,
+                &boom_routing::RouterPolicy::from_settings(&old),
+            )
+            .await?;
+            state.apply_router_policy(adopted).await?;
+        }
+        boom_state::CATEGORY_ROUTER_BEHAVIOR => {
+            // Peer behavior PUT: read the KV row and swap the inner config.
+            // The trio is read per-request — no policy/trie rebuild. The
+            // bump implies the row exists; a missing/malformed row keeps
+            // the current values (warned — the next PUT heals the row).
+            let value = boom_dashboard::config_kv::get_value(
+                pool,
+                boom_dashboard::config_kv::ROUTER_BEHAVIOR,
+            )
+            .await?;
+            match value {
+                Some(v) => match serde_json::from_value::<
+                    crate::config_reconcile::RouterBehavior,
+                >(v)
+                {
+                    Ok(behavior) => {
+                        state.apply_router_behavior(behavior)?;
+                        tracing::info!("router behavior trio re-adopted (revision bump)");
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "malformed router_behavior KV row — keeping current values"
+                        );
+                    }
+                },
+                None => {
+                    tracing::warn!(
+                        "router_behavior KV row vanished — keeping current values"
+                    );
+                }
+            }
         }
         boom_state::CATEGORY_TRACE => {
             let enabled = boom_dashboard::config_kv::get_bool(

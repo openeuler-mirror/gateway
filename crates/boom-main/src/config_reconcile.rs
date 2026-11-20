@@ -821,6 +821,103 @@ pub async fn adopt_user_tag_headers_db(
     Ok(())
 }
 
+/// DB-backed rate-limit fallback: read the `boom_config` KV row, seeding it
+/// from the YAML `rate_limit` section on first contact (fresh DB). After
+/// that the row is authoritative — the YAML section is seed-only. A
+/// malformed row falls back to the seed value (the next dashboard PUT
+/// heals the row).
+pub async fn adopt_rate_limit_fallback_db(
+    pool: &PgPool,
+    plan_store: &boom_limiter::PlanStore,
+    config: &Config,
+) -> Result<(), sqlx::Error> {
+    let seed = fallback_from_config(&config.rate_limit);
+    let seed_json = serde_json::to_value(&seed).unwrap_or(serde_json::json!({}));
+    let value = boom_dashboard::config_kv::adopt_value(
+        pool,
+        boom_dashboard::config_kv::RATE_LIMIT_FALLBACK,
+        seed_json,
+    )
+    .await?;
+    let adopted = serde_json::from_value::<boom_limiter::RateLimitFallback>(value)
+        .unwrap_or_else(|e| {
+            tracing::warn!(
+                error = %e,
+                "malformed rate_limit_fallback KV row — using the YAML seed value"
+            );
+            seed
+        });
+    plan_store.set_fallback(adopted);
+    Ok(())
+}
+
+/// Convert the YAML section struct (boom-config) into the limiter's runtime
+/// fallback struct. Separate crates by module rule, so a plain fn here.
+pub(crate) fn fallback_from_config(
+    cfg: &boom_config::RateLimitSettings,
+) -> boom_limiter::RateLimitFallback {
+    boom_limiter::RateLimitFallback {
+        enabled: cfg.enabled,
+        default_rpm: cfg.default_rpm,
+        default_tpm: cfg.default_tpm,
+        window_limits: cfg.window_limits.clone(),
+    }
+}
+
+/// DB-authoritative router behavior trio — the payload of the
+/// `boom_config` KV row `router_behavior` (CATEGORY_ROUTER_BEHAVIOR).
+/// Cluster forwarding semantics: per-instance divergence would give the
+/// same client request different header treatment depending on which
+/// instance served it. The `router_settings` YAML counterparts are
+/// seed-only.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct RouterBehavior {
+    pub enable_priority_header: bool,
+    pub strip_claude_code_attribution: bool,
+    pub forward_client_headers: Vec<String>,
+}
+
+impl RouterBehavior {
+    /// Extract the trio from the (already DB-adopted) effective settings —
+    /// the export/write-back path serializes this into the YAML document.
+    pub fn from_settings(rs: &boom_config::RouterSettings) -> Self {
+        Self {
+            enable_priority_header: rs.enable_priority_header,
+            strip_claude_code_attribution: rs.strip_claude_code_attribution,
+            forward_client_headers: rs.forward_client_headers.clone(),
+        }
+    }
+}
+
+/// DB-backed router behavior trio: read the `boom_config` KV row, seeding it
+/// from the YAML fields on first contact (fresh DB). After that the row is
+/// authoritative — the YAML fields are seed-only. A malformed row falls back
+/// to the seed value wholesale (the next dashboard PUT heals the row).
+pub async fn adopt_router_behavior_db(
+    pool: &PgPool,
+    config: &mut Config,
+) -> Result<(), sqlx::Error> {
+    let seed = RouterBehavior::from_settings(&config.router_settings);
+    let seed_json = serde_json::to_value(&seed).unwrap_or(serde_json::json!({}));
+    let value = boom_dashboard::config_kv::adopt_value(
+        pool,
+        boom_dashboard::config_kv::ROUTER_BEHAVIOR,
+        seed_json,
+    )
+    .await?;
+    let adopted = serde_json::from_value::<RouterBehavior>(value).unwrap_or_else(|e| {
+        tracing::warn!(
+            error = %e,
+            "malformed router_behavior KV row — using the YAML seed values"
+        );
+        seed
+    });
+    config.router_settings.enable_priority_header = adopted.enable_priority_header;
+    config.router_settings.strip_claude_code_attribution = adopted.strip_claude_code_attribution;
+    config.router_settings.forward_client_headers = adopted.forward_client_headers;
+    Ok(())
+}
+
 /// 防呆: warn when YAML still carries runtime-section content that is now
 /// inert (DB is the authority). Called on boot (when the DB already carried
 /// config) and on every reload in DB mode.
@@ -867,6 +964,49 @@ pub fn warn_inert_yaml_runtime_sections(config: &Config) {
                  or PUT /dashboard/api/admin/trace/metrics-enabled"
             );
         }
+    }
+    if config.rate_limit != boom_config::RateLimitSettings::default() {
+        tracing::warn!(
+            "rate_limit in YAML is inert (seed-only) — fallback limits are managed in the \
+             DB via the Dashboard (Config page) or \
+             PUT /dashboard/api/admin/rate-limit-fallback"
+        );
+    }
+}
+
+/// 防呆 companion for the router policy group, separate from
+/// [`warn_inert_yaml_runtime_sections`] because it must see the PRISTINE
+/// YAML values: the adopt path overlays the DB row onto
+/// `config.router_settings` before the policy build, so calling it after
+/// the adopt would warn about adopted (effective) values, not YAML
+/// residue. Call at the load sites before the adopt.
+pub fn warn_inert_router_policy_group(rs: &boom_config::RouterSettings) {
+    if boom_routing::RouterPolicy::from_settings(rs) != boom_routing::RouterPolicy::default() {
+        tracing::warn!(
+            "router_settings scheduling group (schedule_policy / key_affinity_* / \
+             rebalance_threshold / kvc_aware.router_ttl_secs / kvc_aware.max_blocks) in \
+             YAML is inert (seed-only) — the cluster policy group is managed in the DB \
+             via the Dashboard (Config page) or PUT /dashboard/api/admin/router-policy"
+        );
+    }
+}
+
+/// 防呆 companion for the router behavior trio, same pristine-timing
+/// contract as [`warn_inert_router_policy_group`]: call at the load sites
+/// BEFORE the adopt overlays the DB values onto `config.router_settings`.
+/// Warn condition = any non-default value (the trio's defaults are
+/// false / false / empty).
+pub fn warn_inert_router_behavior(rs: &boom_config::RouterSettings) {
+    if rs.enable_priority_header
+        || rs.strip_claude_code_attribution
+        || !rs.forward_client_headers.is_empty()
+    {
+        tracing::warn!(
+            "router_settings behavior trio (enable_priority_header / \
+             strip_claude_code_attribution / forward_client_headers) in YAML is inert \
+             (seed-only) — the cluster behavior switches are managed in the DB via the \
+             Dashboard (Config page) or PUT /dashboard/api/admin/router-behavior"
+        );
     }
 }
 

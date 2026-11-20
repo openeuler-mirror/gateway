@@ -28,6 +28,24 @@ pub const CATEGORY_QUOTA: &str = "quota";
 pub const CATEGORY_ROUTING: &str = "routing";
 /// user_tag header list changed (`boom_user_tag_config` single row).
 pub const CATEGORY_USER_TAG: &str = "user_tag";
+/// Cluster scheduling policy group changed (`boom_router_policy` single
+/// row: schedule_policy / key_affinity_* / rebalance_threshold /
+/// kvc router_ttl_secs / kvc max_blocks). Distinct from CATEGORY_ROUTING
+/// (model/alias/workflow/cost content): a policy flip also rebuilds the
+/// scheduling policy object and — on schedule_policy changes — the KV
+/// trie, so it gets its own reconcile arm. Non-flip changes (including
+/// max_blocks) preserve the learned trie: the capacity live-resizes via
+/// `KvIndexBackend::set_block_capacity`.
+pub const CATEGORY_ROUTER_POLICY: &str = "router_policy";
+/// Router behavior trio changed (`boom_config` KV `router_behavior`:
+/// enable_priority_header / strip_claude_code_attribution /
+/// forward_client_headers). Cluster forwarding semantics — instances
+/// diverging on these would give clients different header treatment
+/// depending on which instance served the request. Re-adopt is a plain
+/// inner-config swap (the fields are read per-request); no policy/trie
+/// rebuild involved, hence its own category distinct from
+/// CATEGORY_ROUTER_POLICY.
+pub const CATEGORY_ROUTER_BEHAVIOR: &str = "router_behavior";
 /// Trace observability switches changed (`boom_config` KV
 /// `trace_metrics_enabled`).
 pub const CATEGORY_TRACE: &str = "trace";

@@ -714,6 +714,32 @@ impl KvIndexBackend for TokenPrefixIndex {
     fn block_capacity(&self) -> usize {
         self.lru_queue.lock().cap().get()
     }
+
+    fn set_block_capacity(&self, max_blocks: usize) {
+        // Mirror `new`'s fallback for 0 (callers validate > 0, this is
+        // defense in depth).
+        let cap = NonZeroUsize::new(max_blocks).unwrap_or(NonZeroUsize::new(500_000).unwrap());
+        // Pop the excess LRU entries ourselves BEFORE resizing: `resize`
+        // silently drops overflow entries without letting us run the trie
+        // cleanup, which would leave claims the LRU no longer backs.
+        // Lock discipline mirrors the insert path (:301-313): collect under
+        // the lock, drop it, then evict — `lru_evict_block` re-acquires
+        // locks itself.
+        let mut evicted: Vec<(String, String, u64)> = Vec::new();
+        {
+            let mut lru = self.lru_queue.lock();
+            while lru.len() > cap.get() {
+                match lru.pop_lru() {
+                    Some(((m, w, h), _)) => evicted.push((m, w, h)),
+                    None => break,
+                }
+            }
+            lru.resize(cap);
+        }
+        for (m, w, h) in evicted {
+            self.lru_evict_block(&m, &w, h);
+        }
+    }
 }
 
 // ── apply_store_batch (private, hand-over-hand write) ─────────────────────
@@ -965,6 +991,45 @@ mod tests {
         }
         // Only the last 4 blocks should survive (LRU capacity)
         assert!(idx.block_count() <= 4);
+    }
+
+    #[test]
+    fn test_set_block_capacity_grow_keeps_entries() {
+        let idx = TokenPrefixIndex::new(4, 4);
+        for i in 0..4u64 {
+            let chunk: Vec<u8> = vec![i as u8, i as u8, i as u8, i as u8];
+            idx.apply_event(&store_event("m", "w0", 0, None, chunk));
+        }
+        assert_eq!(idx.block_count(), 4);
+        idx.set_block_capacity(100);
+        assert_eq!(idx.block_capacity(), 100);
+        // Growing must not evict anything.
+        assert_eq!(idx.block_count(), 4);
+    }
+
+    #[test]
+    fn test_set_block_capacity_shrink_evicts_lru_and_cleans_trie() {
+        let idx = TokenPrefixIndex::new(4, 8);
+        for i in 0..8u64 {
+            let chunk: Vec<u8> = vec![i as u8, i as u8, i as u8, i as u8];
+            idx.apply_event(&store_event("m", "w0", 0, None, chunk));
+        }
+        assert_eq!(idx.block_count(), 8);
+        idx.set_block_capacity(3);
+        assert_eq!(idx.block_capacity(), 3);
+        // Shrunk to 3: LRU eviction must also remove the trie claims, not
+        // just the LRU entries (blocks counter drops in lockstep).
+        assert!(idx.block_count() <= 3);
+        // Insert-time eviction still works at the new capacity.
+        idx.apply_event(&store_event("m", "w0", 0, None, vec![9u8; 4]));
+        assert!(idx.block_count() <= 3);
+    }
+
+    #[test]
+    fn test_set_block_capacity_zero_falls_back_to_default() {
+        let idx = TokenPrefixIndex::new(4, 4);
+        idx.set_block_capacity(0);
+        assert_eq!(idx.block_capacity(), 500_000);
     }
 
     // ── Regression: stack overflow via recursive chain Drop ──────────────

@@ -161,11 +161,23 @@ pub fn general_settings_fields() -> &'static [FieldMeta] {
         // `public_models` was removed: public access is now configured per
         // model via `visibility: public` (ModelEntry.visibility). The YAML
         // field still parses for backward compatibility but has no UI.
-        // `master_key` and `database_url` are read-only on the UI (masked);
-        // not exposed in the manifest of *editable* fields.
+        // `master_key` / `database_url` are read-only on the UI (masked) but
+        // still rendered — registered so the scope-badge projection covers
+        // them (they are the bootstrap chain: always per-instance YAML).
+        // `user_tag_headers` is the single editable general_settings field
+        // migrated to DB authority (boom_user_tag_config, CATEGORY_USER_TAG
+        // broadcast; see config_reconcile::adopt_user_tag_headers_db): the
+        // YAML value only seeds the first boot. The config page saves it via
+        // the dedicated `PUT /admin/user-tag-headers`, not the section editor.
+        FieldMeta { field: "master_key", section: "general", input_type: "password",
+                    label_key: "config.field.master_key", tip_key: "",
+                    home: ConfigHome::Yaml },
+        FieldMeta { field: "database_url", section: "general", input_type: "password",
+                    label_key: "config.field.database_url", tip_key: "",
+                    home: ConfigHome::Yaml },
         FieldMeta { field: "user_tag_headers", section: "general", input_type: "list",
                     label_key: "config.field.user_tag_headers", tip_key: "tip.config.user_tag_headers",
-                    home: ConfigHome::Yaml },
+                    home: ConfigHome::Db },
     ]
 }
 
@@ -179,30 +191,258 @@ pub fn general_settings_fields() -> &'static [FieldMeta] {
 /// via dotted sub-paths (`router_settings.<field>`).
 pub fn router_settings_fields() -> &'static [FieldMeta] {
     &[
+        // The six scheduling-policy-group fields are DB-homed (Phase 2 +
+        // max_blocks, boom_router_policy single row + CATEGORY_ROUTER_POLICY):
+        // cluster scheduling behavior; heterogeneous values across instances
+        // dilute KVC hit rates. The YAML values are first-boot seeds only.
         FieldMeta { field: "schedule_policy", section: "router", input_type: "select",
                     label_key: "config.field.schedule_policy", tip_key: "tip.config.schedule_policy",
-                    home: ConfigHome::Yaml },
+                    home: ConfigHome::Db },
         FieldMeta { field: "key_affinity_context_threshold", section: "router", input_type: "number",
                     label_key: "config.field.key_affinity_context_threshold", tip_key: "tip.config.key_affinity_context_threshold",
-                    home: ConfigHome::Yaml },
+                    home: ConfigHome::Db },
         FieldMeta { field: "key_affinity_ttl_secs", section: "router", input_type: "number",
                     label_key: "config.field.key_affinity_ttl_secs", tip_key: "tip.config.key_affinity_ttl_secs",
-                    home: ConfigHome::Yaml },
+                    home: ConfigHome::Db },
         FieldMeta { field: "rebalance_threshold", section: "router", input_type: "number",
                     label_key: "config.field.rebalance_threshold", tip_key: "tip.config.rebalance_threshold",
-                    home: ConfigHome::Yaml },
+                    home: ConfigHome::Db },
+        // The behavior trio (rendered on the General card) is
+        // DB-authoritative (boom_config KV router_behavior,
+        // CATEGORY_ROUTER_BEHAVIOR) — cluster forwarding semantics.
         FieldMeta { field: "enable_priority_header", section: "general", input_type: "bool",
                     label_key: "config.field.enable_priority_header", tip_key: "tip.config.enable_priority_header",
-                    home: ConfigHome::Yaml },
+                    home: ConfigHome::Db },
         FieldMeta { field: "flow_control_queue_timeout_secs", section: "router", input_type: "number",
                     label_key: "config.field.flow_control_queue_timeout_secs", tip_key: "tip.config.flow_control_queue_timeout_secs",
                     home: ConfigHome::Yaml },
         FieldMeta { field: "strip_claude_code_attribution", section: "general", input_type: "bool",
                     label_key: "config.field.strip_claude_code_attribution", tip_key: "tip.config.strip_claude_code_attribution",
-                    home: ConfigHome::Yaml },
+                    home: ConfigHome::Db },
         FieldMeta { field: "forward_client_headers", section: "general", input_type: "list",
                     label_key: "config.field.forward_client_headers", tip_key: "tip.config.forward_client_headers",
+                    home: ConfigHome::Db },
+        // The kvc_aware sub-tree renders inside the router card's collapsible
+        // section (not a separate page). Both fields ride the DB-homed policy
+        // group: max_blocks is the trie's LRU eviction watermark (a trie block
+        // is a hash + counter, not real memory — the old "per-instance memory
+        // budget" rationale was retired), router_ttl_secs is the upstream
+        // prefix-cache survival window (a fleet property).
+        FieldMeta { field: "kvc_aware.max_blocks", section: "kvc", input_type: "number",
+                    label_key: "config.field.max_blocks", tip_key: "",
+                    home: ConfigHome::Db },
+        FieldMeta { field: "kvc_aware.router_ttl_secs", section: "kvc", input_type: "number",
+                    label_key: "config.field.router_ttl_secs", tip_key: "",
+                    home: ConfigHome::Db },
+    ]
+}
+
+/// Manifest for the config page's *process-scoped* section cards that are
+/// rendered from dedicated structs (not the general/router cards above).
+///
+/// Registration rule mirrors §9's "no dead config" stance: only fields the
+/// config page actually renders are registered. Sections with no card
+/// (hooks, quota_sync, instance_telemetry, server.instance_id) stay
+/// unregistered until/unless a UI exists for them. Default home here is
+/// `Yaml`; DB-owned exceptions (trace.metrics.enabled, the rate_limit
+/// fallback group) carry `home: Db` — the badge projection renders whatever
+/// `home` says, so a later per-field DB migration (see
+/// archive/config-three-domains doc) flips the entry without touching the
+/// frontend.
+pub fn process_section_fields() -> &'static [FieldMeta] {
+    &[
+        // ── server card ──
+        FieldMeta { field: "server.host", section: "server", input_type: "text",
+                    label_key: "config.field.host", tip_key: "",
                     home: ConfigHome::Yaml },
+        FieldMeta { field: "server.port", section: "server", input_type: "number",
+                    label_key: "config.field.port", tip_key: "",
+                    home: ConfigHome::Yaml },
+        FieldMeta { field: "server.workers", section: "server", input_type: "number",
+                    label_key: "config.field.workers", tip_key: "",
+                    home: ConfigHome::Yaml },
+        // ── rate_limit fallback card ──
+        FieldMeta { field: "rate_limit.enabled", section: "rate_limit", input_type: "bool",
+                    label_key: "config.field.rate_limit_enabled", tip_key: "",
+                    home: ConfigHome::Db },
+        FieldMeta { field: "rate_limit.default_rpm", section: "rate_limit", input_type: "number",
+                    label_key: "config.field.default_rpm", tip_key: "",
+                    home: ConfigHome::Db },
+        FieldMeta { field: "rate_limit.default_tpm", section: "rate_limit", input_type: "number",
+                    label_key: "config.field.default_tpm", tip_key: "",
+                    home: ConfigHome::Db },
+        FieldMeta { field: "rate_limit.window_limits", section: "rate_limit", input_type: "window_limits",
+                    label_key: "config.field.window_limits", tip_key: "",
+                    home: ConfigHome::Db },
+        // ── deployment_health_check card ──
+        FieldMeta { field: "deployment_health_check.auto_offline_enabled", section: "health_check", input_type: "bool",
+                    label_key: "config.field.auto_offline_enabled", tip_key: "",
+                    home: ConfigHome::Yaml },
+        FieldMeta { field: "deployment_health_check.auto_recovery_enabled", section: "health_check", input_type: "bool",
+                    label_key: "config.field.auto_recovery_enabled", tip_key: "",
+                    home: ConfigHome::Yaml },
+        FieldMeta { field: "deployment_health_check.path", section: "health_check", input_type: "text",
+                    label_key: "config.field.path", tip_key: "",
+                    home: ConfigHome::Yaml },
+        FieldMeta { field: "deployment_health_check.failure_threshold", section: "health_check", input_type: "number",
+                    label_key: "config.field.failure_threshold", tip_key: "",
+                    home: ConfigHome::Yaml },
+        FieldMeta { field: "deployment_health_check.recovery_threshold", section: "health_check", input_type: "number",
+                    label_key: "config.field.recovery_threshold", tip_key: "",
+                    home: ConfigHome::Yaml },
+        FieldMeta { field: "deployment_health_check.offline_check_interval_secs", section: "health_check", input_type: "number",
+                    label_key: "config.field.offline_check_interval_secs", tip_key: "",
+                    home: ConfigHome::Yaml },
+        FieldMeta { field: "deployment_health_check.recovery_check_interval_secs", section: "health_check", input_type: "number",
+                    label_key: "config.field.recovery_check_interval_secs", tip_key: "",
+                    home: ConfigHome::Yaml },
+        FieldMeta { field: "deployment_health_check.request_failure_auto_offline_enabled", section: "health_check", input_type: "bool",
+                    label_key: "config.field.request_failure_auto_offline_enabled", tip_key: "",
+                    home: ConfigHome::Yaml },
+        FieldMeta { field: "deployment_health_check.request_failure_threshold", section: "health_check", input_type: "number",
+                    label_key: "config.field.request_failure_threshold", tip_key: "",
+                    home: ConfigHome::Yaml },
+        // ── responses_store card (general_settings.responses_store) ──
+        FieldMeta { field: "responses_store.enabled", section: "responses", input_type: "bool",
+                    label_key: "responses.enabled", tip_key: "tip.responses.enabled",
+                    home: ConfigHome::Yaml },
+        FieldMeta { field: "responses_store.ttl_secs", section: "responses", input_type: "number",
+                    label_key: "responses.ttl", tip_key: "tip.responses.ttl",
+                    home: ConfigHome::Yaml },
+        FieldMeta { field: "responses_store.max_history_items", section: "responses", input_type: "number",
+                    label_key: "responses.max_items", tip_key: "tip.responses.max_items",
+                    home: ConfigHome::Yaml },
+        // ── prompt_log card (transparent pass-through section) ──
+        FieldMeta { field: "prompt_log.enabled", section: "prompt_log", input_type: "bool",
+                    label_key: "config.field.enabled", tip_key: "",
+                    home: ConfigHome::Yaml },
+        FieldMeta { field: "prompt_log.dir", section: "prompt_log", input_type: "text",
+                    label_key: "config.field.dir", tip_key: "",
+                    home: ConfigHome::Yaml },
+        FieldMeta { field: "prompt_log.max_file_size_mb", section: "prompt_log", input_type: "number",
+                    label_key: "config.field.max_file_size_mb", tip_key: "",
+                    home: ConfigHome::Yaml },
+        FieldMeta { field: "prompt_log.capture_raw_upstream", section: "prompt_log", input_type: "bool",
+                    label_key: "config.field.capture_raw_upstream", tip_key: "",
+                    home: ConfigHome::Yaml },
+        FieldMeta { field: "prompt_log.excluded_keys", section: "prompt_log", input_type: "list",
+                    label_key: "config.field.excluded_keys", tip_key: "",
+                    home: ConfigHome::Yaml },
+        FieldMeta { field: "prompt_log.excluded_teams", section: "prompt_log", input_type: "list",
+                    label_key: "config.field.excluded_teams", tip_key: "",
+                    home: ConfigHome::Yaml },
+        FieldMeta { field: "prompt_log.record_headers", section: "prompt_log", input_type: "list",
+                    label_key: "config.field.record_headers", tip_key: "",
+                    home: ConfigHome::Yaml },
+        // ── prompt_log.otlp sub-card ──
+        FieldMeta { field: "prompt_log.otlp.enabled", section: "prompt_log", input_type: "bool",
+                    label_key: "config.field.otlp_enabled", tip_key: "config.tip.prompt_log_otlp",
+                    home: ConfigHome::Yaml },
+        FieldMeta { field: "prompt_log.otlp.endpoint", section: "prompt_log", input_type: "text",
+                    label_key: "config.field.otlp_endpoint", tip_key: "config.tip.otlp_endpoint",
+                    home: ConfigHome::Yaml },
+        FieldMeta { field: "prompt_log.otlp.service_name", section: "prompt_log", input_type: "text",
+                    label_key: "config.field.otlp_service_name", tip_key: "config.tip.otlp_service_name",
+                    home: ConfigHome::Yaml },
+        FieldMeta { field: "prompt_log.otlp.service_version", section: "prompt_log", input_type: "text",
+                    label_key: "config.field.otlp_service_version", tip_key: "config.tip.otlp_service_version_default",
+                    home: ConfigHome::Yaml },
+        FieldMeta { field: "prompt_log.otlp.timeout_secs", section: "prompt_log", input_type: "number",
+                    label_key: "config.field.otlp_timeout_secs", tip_key: "config.tip.otlp_timeout_secs",
+                    home: ConfigHome::Yaml },
+        FieldMeta { field: "prompt_log.otlp.batch_size", section: "prompt_log", input_type: "number",
+                    label_key: "config.field.otlp_batch_size", tip_key: "config.tip.otlp_batch_size",
+                    home: ConfigHome::Yaml },
+        FieldMeta { field: "prompt_log.otlp.flush_interval_secs", section: "prompt_log", input_type: "number",
+                    label_key: "config.field.otlp_flush_interval_secs", tip_key: "config.tip.otlp_flush_interval_secs",
+                    home: ConfigHome::Yaml },
+        FieldMeta { field: "prompt_log.otlp.max_attribute_bytes", section: "prompt_log", input_type: "number",
+                    label_key: "config.field.otlp_max_attribute_bytes", tip_key: "config.tip.otlp_max_attribute_bytes",
+                    home: ConfigHome::Yaml },
+        FieldMeta { field: "prompt_log.otlp.max_queue_size", section: "prompt_log", input_type: "number",
+                    label_key: "config.field.otlp_max_queue_size", tip_key: "config.tip.otlp_max_queue_size",
+                    home: ConfigHome::Yaml },
+        FieldMeta { field: "prompt_log.otlp.max_queue_bytes", section: "prompt_log", input_type: "number",
+                    label_key: "config.field.otlp_max_queue_bytes", tip_key: "config.tip.otlp_max_queue_bytes",
+                    home: ConfigHome::Yaml },
+        FieldMeta { field: "prompt_log.otlp.headers", section: "prompt_log", input_type: "json",
+                    label_key: "config.field.otlp_headers", tip_key: "config.tip.otlp_headers",
+                    home: ConfigHome::Yaml },
+        // ── trace card (metrics.enabled is the DB-adopted exception) ──
+        FieldMeta { field: "trace.enabled", section: "trace", input_type: "bool",
+                    label_key: "config.field.trace_enabled", tip_key: "config.tip.trace_enabled",
+                    home: ConfigHome::Yaml },
+        FieldMeta { field: "trace.capture_body", section: "trace", input_type: "bool",
+                    label_key: "config.field.trace_capture_body", tip_key: "config.tip.trace_capture_body",
+                    home: ConfigHome::Yaml },
+        FieldMeta { field: "trace.max_body_bytes", section: "trace", input_type: "number",
+                    label_key: "config.field.trace_max_body_bytes", tip_key: "config.tip.trace_max_body_bytes",
+                    home: ConfigHome::Yaml },
+        FieldMeta { field: "trace.propagate_only", section: "trace", input_type: "bool",
+                    label_key: "config.field.trace_propagate_only", tip_key: "config.tip.trace_propagate_only",
+                    home: ConfigHome::Yaml },
+        FieldMeta { field: "trace.metrics.enabled", section: "trace", input_type: "bool",
+                    label_key: "config.field.trace_metrics_enabled", tip_key: "config.tip.trace_metrics_enabled",
+                    home: ConfigHome::Db },
+        FieldMeta { field: "trace.report_filter.tracestate_keys", section: "trace", input_type: "list",
+                    label_key: "config.field.trace_tracestate_keys", tip_key: "",
+                    home: ConfigHome::Yaml },
+        FieldMeta { field: "trace.report_filter.trace_id_regex", section: "trace", input_type: "text",
+                    label_key: "config.field.trace_trace_id_regex", tip_key: "config.tip.trace_trace_id_regex",
+                    home: ConfigHome::Yaml },
+        // ── trace.otlp sub-card (same shape as prompt_log.otlp; targets
+        // /v1/traces, independent batch queue) ──
+        FieldMeta { field: "trace.otlp.enabled", section: "trace", input_type: "bool",
+                    label_key: "config.field.otlp_enabled", tip_key: "config.tip.trace_otlp",
+                    home: ConfigHome::Yaml },
+        FieldMeta { field: "trace.otlp.endpoint", section: "trace", input_type: "text",
+                    label_key: "config.field.otlp_endpoint", tip_key: "config.tip.otlp_endpoint",
+                    home: ConfigHome::Yaml },
+        FieldMeta { field: "trace.otlp.service_name", section: "trace", input_type: "text",
+                    label_key: "config.field.otlp_service_name", tip_key: "config.tip.otlp_service_name",
+                    home: ConfigHome::Yaml },
+        FieldMeta { field: "trace.otlp.service_version", section: "trace", input_type: "text",
+                    label_key: "config.field.otlp_service_version", tip_key: "config.tip.otlp_service_version_default",
+                    home: ConfigHome::Yaml },
+        FieldMeta { field: "trace.otlp.timeout_secs", section: "trace", input_type: "number",
+                    label_key: "config.field.otlp_timeout_secs", tip_key: "config.tip.otlp_timeout_secs",
+                    home: ConfigHome::Yaml },
+        FieldMeta { field: "trace.otlp.batch_size", section: "trace", input_type: "number",
+                    label_key: "config.field.otlp_batch_size", tip_key: "config.tip.otlp_batch_size",
+                    home: ConfigHome::Yaml },
+        FieldMeta { field: "trace.otlp.flush_interval_secs", section: "trace", input_type: "number",
+                    label_key: "config.field.otlp_flush_interval_secs", tip_key: "config.tip.otlp_flush_interval_secs",
+                    home: ConfigHome::Yaml },
+        FieldMeta { field: "trace.otlp.max_attribute_bytes", section: "trace", input_type: "number",
+                    label_key: "config.field.otlp_max_attribute_bytes", tip_key: "config.tip.otlp_max_attribute_bytes",
+                    home: ConfigHome::Yaml },
+        FieldMeta { field: "trace.otlp.max_queue_size", section: "trace", input_type: "number",
+                    label_key: "config.field.otlp_max_queue_size", tip_key: "config.tip.otlp_max_queue_size",
+                    home: ConfigHome::Yaml },
+        FieldMeta { field: "trace.otlp.max_queue_bytes", section: "trace", input_type: "number",
+                    label_key: "config.field.otlp_max_queue_bytes", tip_key: "config.tip.otlp_max_queue_bytes",
+                    home: ConfigHome::Yaml },
+        FieldMeta { field: "trace.otlp.headers", section: "trace", input_type: "json",
+                    label_key: "config.field.otlp_headers", tip_key: "config.tip.otlp_headers",
+                    home: ConfigHome::Yaml },
+    ]
+}
+
+/// Manifest for the plan *default pointers* on the config page's plan-defaults
+/// card (`PUT /admin/plans/default`). These are DB-owned pointers into
+/// `boom_rate_limit_plan` (partial unique index on `is_default` /
+/// `is_default_team`), deliberately excluded from `rate_limit_plan_fields()`
+/// (that manifest covers the plan-definition form; these are cluster
+/// pointers, not fields of a plan row). Registered separately so the badge
+/// projection covers the config-page card.
+pub fn plan_pointer_fields() -> &'static [FieldMeta] {
+    &[
+        FieldMeta { field: "plan_settings.default_plan", section: "plan", input_type: "select",
+                    label_key: "config.field.default_plan", tip_key: "",
+                    home: ConfigHome::Db },
+        FieldMeta { field: "plan_settings.default_team_plan", section: "plan", input_type: "select",
+                    label_key: "config.field.default_team_plan", tip_key: "",
+                    home: ConfigHome::Db },
     ]
 }
 
@@ -320,9 +560,8 @@ pub fn rate_limit_plan_fields() -> &'static [FieldMeta] {
 /// Manifest for client block rules (`boom_client_block_rule`, DB-owned).
 /// Maps the `BlockRule` struct: `conditions` is a list of
 /// `{field, op, value}` matchers (op ∈ eq/contains/regex/prefix/exists),
-/// `action` is `{message, status, code}`. The global blocklist switch lives
-/// in `boom_client_blocklist_state` and is toggled via
-/// `PUT /admin/blocklist/enabled` — not a rule field.
+/// `action` is `{message, status, code}`. The global blocklist switch is
+/// NOT a rule field — see `blocklist_switch_fields()` below.
 pub fn block_rule_fields() -> &'static [FieldMeta] {
     &[
         FieldMeta { field: "name", section: "block_rule", input_type: "text",
@@ -336,6 +575,19 @@ pub fn block_rule_fields() -> &'static [FieldMeta] {
                     home: ConfigHome::Db },
         FieldMeta { field: "action", section: "block_rule", input_type: "block_action",
                     label_key: "blockrules.form.action_title", tip_key: "",
+                    home: ConfigHome::Db },
+    ]
+}
+
+/// Manifest for the blocklist *global switch* rendered on the config page's
+/// blockrules card (`cfg-bl-enabled`). DB-owned single-row
+/// `boom_client_blocklist_state`, toggled via `PUT /admin/blocklist/enabled`
+/// (CATEGORY_BLOCKLIST broadcast). Kept separate from `block_rule_fields()`
+/// so the rule-form registry stays a pure map of one `BlockRule` row.
+pub fn blocklist_switch_fields() -> &'static [FieldMeta] {
+    &[
+        FieldMeta { field: "client_blocklist.enabled", section: "blocklist", input_type: "bool",
+                    label_key: "config.field.blocklist_enabled", tip_key: "",
                     home: ConfigHome::Db },
     ]
 }
@@ -419,11 +671,14 @@ mod tests {
             model_deployment_fields(),
             general_settings_fields(),
             router_settings_fields(),
+            process_section_fields(),
             cost_template_fields(),
             workflow_fields(),
             alias_fields(),
             rate_limit_plan_fields(),
             block_rule_fields(),
+            blocklist_switch_fields(),
+            plan_pointer_fields(),
         ];
         let mut total = 0;
         for manifest in all_manifests {
@@ -450,6 +705,13 @@ mod tests {
     /// `home: Yaml`. This is the §9 registry of the DB-authority split —
     /// registering a business field as Yaml (or vice versa) means the
     /// write-path routing for it is wrong somewhere.
+    ///
+    /// `user_tag_headers` is the documented exception: the one
+    /// general_settings field with DB authority (boom_user_tag_config,
+    /// CATEGORY_USER_TAG). It is asserted Db explicitly below instead of
+    /// riding the blanket chains. Same for the router_settings DB enclaves:
+    /// the policy group (boom_router_policy) and the behavior trio
+    /// (boom_config KV router_behavior).
     #[test]
     fn manifest_homes_match_authority_split() {
         for m in model_deployment_fields()
@@ -459,6 +721,8 @@ mod tests {
             .chain(alias_fields())
             .chain(rate_limit_plan_fields())
             .chain(block_rule_fields())
+            .chain(blocklist_switch_fields())
+            .chain(plan_pointer_fields())
         {
             assert_eq!(
                 m.home,
@@ -469,12 +733,94 @@ mod tests {
         }
         for m in general_settings_fields()
             .iter()
-            .chain(router_settings_fields())
+            .filter(|m| m.field != "user_tag_headers")
+            .chain(router_settings_fields().iter().filter(|m| {
+                !matches!(
+                    m.field,
+                    "schedule_policy"
+                        | "key_affinity_context_threshold"
+                        | "key_affinity_ttl_secs"
+                        | "rebalance_threshold"
+                        | "kvc_aware.router_ttl_secs"
+                        | "kvc_aware.max_blocks"
+                        | "enable_priority_header"
+                        | "strip_claude_code_attribution"
+                        | "forward_client_headers"
+                )
+            }))
+            .chain(process_section_fields().iter().filter(|m| {
+                m.field != "trace.metrics.enabled" && !m.field.starts_with("rate_limit.")
+            }))
         {
             assert_eq!(
                 m.home,
                 ConfigHome::Yaml,
                 "process field `{}` must be home: Yaml",
+                m.field
+            );
+        }
+        for m in router_settings_fields().iter().filter(|m| {
+            matches!(
+                m.field,
+                "schedule_policy"
+                    | "key_affinity_context_threshold"
+                    | "key_affinity_ttl_secs"
+                    | "rebalance_threshold"
+                    | "kvc_aware.router_ttl_secs"
+                    | "kvc_aware.max_blocks"
+            )
+        }) {
+            assert_eq!(
+                m.home,
+                ConfigHome::Db,
+                "`{}` is DB-authoritative (boom_router_policy single row, \
+                 CATEGORY_ROUTER_POLICY) — cluster scheduling behavior",
+                m.field
+            );
+        }
+        for m in router_settings_fields().iter().filter(|m| {
+            matches!(
+                m.field,
+                "enable_priority_header"
+                    | "strip_claude_code_attribution"
+                    | "forward_client_headers"
+            )
+        }) {
+            assert_eq!(
+                m.home,
+                ConfigHome::Db,
+                "`{}` is DB-authoritative (boom_config KV router_behavior, \
+                 CATEGORY_ROUTER_BEHAVIOR) — cluster forwarding semantics",
+                m.field
+            );
+        }
+        let user_tag = general_settings_fields()
+            .iter()
+            .find(|m| m.field == "user_tag_headers")
+            .expect("user_tag_headers must stay registered in general_settings_fields");
+        assert_eq!(
+            user_tag.home,
+            ConfigHome::Db,
+            "user_tag_headers is DB-authoritative (boom_user_tag_config, CATEGORY_USER_TAG)"
+        );
+        let trace_metrics = process_section_fields()
+            .iter()
+            .find(|m| m.field == "trace.metrics.enabled")
+            .expect("trace.metrics.enabled must stay registered in process_section_fields");
+        assert_eq!(
+            trace_metrics.home,
+            ConfigHome::Db,
+            "trace.metrics.enabled is DB-authoritative (boom_config KV, CATEGORY_TRACE)"
+        );
+        for m in process_section_fields()
+            .iter()
+            .filter(|m| m.field.starts_with("rate_limit."))
+        {
+            assert_eq!(
+                m.home,
+                ConfigHome::Db,
+                "`{}` is DB-authoritative (boom_config KV, CATEGORY_PLAN) — \
+                 cluster-shared counters require cluster-shared thresholds",
                 m.field
             );
         }

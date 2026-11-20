@@ -126,6 +126,29 @@ pub enum AdminCommand {
         value: Value,
         reply: oneshot::Sender<Result<String, String>>,
     },
+    /// Replace the DB-authoritative scheduling policy group
+    /// (`boom_router_policy` single row: schedule_policy /
+    /// key_affinity_* / rebalance_threshold / kvc router_ttl_secs).
+    /// Boom-main validates, writes the row + bumps
+    /// CATEGORY_ROUTER_POLICY, then rebuilds the scheduling policy —
+    /// and the KV trie when schedule_policy flipped. That rebuild needs
+    /// AppState machinery the dashboard must not touch (CLAUDE.md §5).
+    SetRouterPolicy {
+        policy: boom_routing::RouterPolicy,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
+    /// Replace the DB-authoritative router behavior trio (`boom_config` KV
+    /// `router_behavior`: enable_priority_header /
+    /// strip_claude_code_attribution / forward_client_headers). Boom-main
+    /// writes the KV row + bumps CATEGORY_ROUTER_BEHAVIOR, then swaps the
+    /// live inner config (the fields are read per-request). Inline fields —
+    /// no cross-crate payload type needed.
+    SetRouterBehavior {
+        enable_priority_header: bool,
+        strip_claude_code_attribution: bool,
+        forward_client_headers: Vec<String>,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
     /// Hot-swap the prompt-log config at runtime (toggle on/off, change
     /// exclusion lists, flip the otlp sub-config). Boom-main owns the
     /// `PromptLogWriter`; dashboard must not touch the writer handle directly

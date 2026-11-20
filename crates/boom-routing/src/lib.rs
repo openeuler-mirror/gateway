@@ -11,6 +11,7 @@ pub mod policy;
 pub mod rebalance;
 pub mod request_rate;
 pub mod router;
+pub mod router_policy;
 pub mod workflow_store;
 
 pub use alias_store::{AliasInput, AliasRow, AliasStore};
@@ -35,4 +36,5 @@ pub use policy::kvc_aware::{KvcAwarePolicy, KvcSchedulerStats, KvcSchedulerStats
 pub use rebalance::{RebalanceCounter, RebalanceMove, RebalanceMoveTracker};
 pub use request_rate::RequestRateTracker;
 pub use router::Router;
+pub use router_policy::RouterPolicy;
 pub use workflow_store::{WorkflowDefinitionRow, WorkflowModelRow, WorkflowStore};

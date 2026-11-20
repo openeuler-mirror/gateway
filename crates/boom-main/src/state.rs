@@ -205,7 +205,10 @@ impl AppState {
     ///     Kong dbless-style deployment choice, not a dual-authority merge.
     ///
     /// Runtime state (assignments, counters) is restored on top in both modes.
-    pub async fn from_config(config: Config, config_path: Option<String>) -> anyhow::Result<Self> {
+    pub async fn from_config(
+        mut config: Config,
+        config_path: Option<String>,
+    ) -> anyhow::Result<Self> {
         // 1. Connect to database (optional).
         let db_pool = match &config.general_settings.database_url {
             Some(url) => {
@@ -336,25 +339,15 @@ impl AppState {
         let request_rate = Arc::new(RequestRateTracker::new());
         let agent_stats = Arc::new(AgentStatsTracker::new());
 
-        // KV-cache index + tokenizer pool.
-        // Driven by schedule_policy == "kvc_aware", not a separate enabled flag.
-        // Built fresh on startup and on every reload (see reload()): any change
-        // to kvc_aware settings rebuilds an empty trie, so the old trie is dropped.
-        let kv_index_val = Self::build_kvc_subsystems(&config);
+        // KV-cache index + scheduling policy + auto router classifier are
+        // built AFTER the DB branch below: in DB mode the router policy
+        // group (schedule_policy / key_affinity_* / rebalance_threshold /
+        // kvc router_ttl_secs) is DB-authoritative and must be adopted and
+        // overlaid onto `config.router_settings` BEFORE the policy object
+        // freezes those values at construction. Nothing between here and
+        // the build reads them.
 
-        // Create scheduling policy from config (may reference inflight, rebalance_move_tracker, kv_index).
-        let policy = create_policy(&config, &inflight, &flow_controller, &rebalance_move_tracker, &kvc_stats, &kv_index_val);
-
-        // Build auto router classifier (optional, content-based model routing).
-        let auto_classifier = build_auto_router(&config);
-
-        // Router wraps stores + policy + classifier for routing decisions.
-        let router = Arc::new(Router::with_classifier(
-            deployment_store.clone(),
-            alias_store.clone(),
-            policy,
-            auto_classifier,
-        ));
+        // 5. Build stores. With a DB, the DB is the single runtime authority
 
         // 5. Build stores. With a DB, the DB is the single runtime authority
         // for business config (models, aliases, plans, block rules): seed
@@ -452,6 +445,32 @@ impl AppState {
                 &config,
             )
             .await?;
+            // Rate-limit fallback: DB-authoritative (boom_config KV,
+            // CATEGORY_PLAN) — cluster-shared counters require cluster-shared
+            // thresholds. Seeded from the YAML section on first boot only.
+            crate::config_reconcile::adopt_rate_limit_fallback_db(pool, &plan_store, &config)
+                .await?;
+            // Router policy group: DB-authoritative (boom_router_policy
+            // single row, CATEGORY_ROUTER_POLICY) — cluster scheduling
+            // behavior; heterogeneous values dilute KVC hit rates. Seeded
+            // from the YAML group on first boot only; the overlay below
+            // makes the effective values visible to the policy build, the
+            // live inner config (display/export), and the reload-time
+            // trie-rebuild gate. max_blocks stays YAML (memory budget).
+            crate::config_reconcile::warn_inert_router_policy_group(&config.router_settings);
+            let adopted_router_policy = boom_routing::router_policy::read_or_seed(
+                pool,
+                &boom_routing::RouterPolicy::from_settings(&config.router_settings),
+            )
+            .await?;
+            adopted_router_policy.apply_to(&mut config.router_settings);
+            // Router behavior trio: DB-authoritative (boom_config KV
+            // router_behavior, CATEGORY_ROUTER_BEHAVIOR) — cluster
+            // forwarding semantics. Seeded from the YAML fields on first
+            // boot only; the adopt overlays the effective values onto
+            // config.router_settings below.
+            crate::config_reconcile::warn_inert_router_behavior(&config.router_settings);
+            crate::config_reconcile::adopt_router_behavior_db(pool, &mut config).await?;
             // Metrics channel switch: DB-authoritative (boom_config KV),
             // seeded from the YAML value on first boot only.
             metrics_switch = Some(
@@ -490,10 +509,37 @@ impl AppState {
             build_aliases_from_config(&config, &alias_store, &deployment_store);
             build_block_rules_from_config(&config, &block_rule_store);
             load_plans_from_config(&plan_store, &config);
+            // No-DB mode: YAML is the fallback authority (dbless deployment
+            // form — see CLAUDE.md §7).
+            plan_store.set_fallback(crate::config_reconcile::fallback_from_config(
+                &config.rate_limit,
+            ));
             seed_flow_controller_from_config(&config, &flow_controller);
             load_workflows_from_config(&config, &workflow_store);
             load_cost_templates_from_config(&config, &cost_template_store);
         }
+
+        // KV-cache index + tokenizer pool.
+        // Driven by schedule_policy == "kvc_aware", not a separate enabled flag.
+        // Built fresh on startup and on every reload (see reload()): any change
+        // to kvc_aware settings rebuilds an empty trie, so the old trie is dropped.
+        // In DB mode `config.router_settings` now carries the adopted policy
+        // group, so the trie/policy reflect the cluster-authoritative values.
+        let kv_index_val = Self::build_kvc_subsystems(&config);
+
+        // Create scheduling policy from config (may reference inflight, rebalance_move_tracker, kv_index).
+        let policy = create_policy(&config, &inflight, &flow_controller, &rebalance_move_tracker, &kvc_stats, &kv_index_val);
+
+        // Build auto router classifier (optional, content-based model routing).
+        let auto_classifier = build_auto_router(&config);
+
+        // Router wraps stores + policy + classifier for routing decisions.
+        let router = Arc::new(Router::with_classifier(
+            deployment_store.clone(),
+            alias_store.clone(),
+            policy,
+            auto_classifier,
+        ));
 
         // 6. Build inner state (config + auth + health).
         let prompt_log_config = config.prompt_log.as_ref()
@@ -741,7 +787,7 @@ impl AppState {
         // keep the current process config and let the reconcile step pull
         // the DB business state (SIGHUP still rebuilds policy/classifier
         // and reconciles the stores, so it remains useful in this mode).
-        let new_config = match &self.config_path {
+        let mut new_config = match &self.config_path {
             Some(p) => boom_config::load_config(p)?,
             None => self.inner.load().config.clone(),
         };
@@ -788,12 +834,36 @@ impl AppState {
 
             self.plan_store.clear_plans();
             load_plans_from_config(&self.plan_store, &new_config);
+            self.plan_store.set_fallback(
+                crate::config_reconcile::fallback_from_config(&new_config.rate_limit),
+            );
             seed_flow_controller_from_config(&new_config, &self.flow_controller);
 
             self.workflow_store.clear();
             load_workflows_from_config(&new_config, &self.workflow_store);
             self.cost_template_store.clear();
             load_cost_templates_from_config(&new_config, &self.cost_template_store);
+        }
+
+        // Router policy group re-adopt: DB-authoritative (boom_router_policy
+        // single row). Runs BEFORE the kvc rebuild gate below so the gate
+        // compares effective values — the old inner config already carries
+        // the adopted group, and new_config gets the fresh adopt here;
+        // comparing YAML-vs-DB instead would wipe the learned trie on every
+        // reload when the YAML file still carries divergent seed values.
+        if let Some(ref pool) = db_pool {
+            crate::config_reconcile::warn_inert_router_policy_group(&new_config.router_settings);
+            let adopted = boom_routing::router_policy::read_or_seed(
+                pool,
+                &boom_routing::RouterPolicy::from_settings(&new_config.router_settings),
+            )
+            .await?;
+            adopted.apply_to(&mut new_config.router_settings);
+            // Behavior trio re-adopt (same DB-wins pattern; normally
+            // propagated by the revision watcher's router_behavior
+            // category).
+            crate::config_reconcile::warn_inert_router_behavior(&new_config.router_settings);
+            crate::config_reconcile::adopt_router_behavior_db(pool, &mut new_config).await?;
         }
 
         // Rebuild KV-cache subsystem (index + tokenizer pool + subscriber)
@@ -806,18 +876,21 @@ impl AppState {
         let old_router = self.inner.load().config.router_settings.clone();
         // Signature of kvc-relevant config that requires a trie rebuild.
         //   schedule_policy  → enables/disables kvc_aware entirely.
-        //   max_blocks       → LRU capacity; LruCache can't resize in-place.
+        //   max_blocks       → LRU capacity; live-resized (set_block_capacity),
+        //                      no rebuild needed.
         //   router_ttl_secs  → prune task TTL/interval, fixed at spawn time.
         // block_size is a code constant now (512B), so only the policy switch
         // itself invalidates entries. max_blocks / router_ttl_secs don't
         // affect existing hashes — the prune task is restarted below to pick
-        // up the new TTL, and the LRU capacity adapts on the next batch.
+        // up the new TTL, and the LRU capacity is live-resized to the
+        // (adopted) config value.
         let kvc_sig = |r: &boom_config::RouterSettings| r.schedule_policy.clone();
         if kvc_sig(&old_router) == kvc_sig(&new_config.router_settings) {
             tracing::info!("KV-aware subsystem unchanged — preserving learned trie (no rebuild)");
             // Restart prune task to pick up new router_ttl_secs (cheap: abort + spawn)
             self.stop_kv_prune_task();
             if new_config.router_settings.schedule_policy == "kvc_aware" {
+                self.sync_kv_capacity(&new_config.router_settings);
                 self.spawn_kv_prune_task(&new_config);
             }
         } else {
@@ -893,6 +966,14 @@ impl AppState {
             crate::config_reconcile::adopt_user_tag_headers_db(
                 pool,
                 &self.user_tag_store,
+                &new_config,
+            )
+            .await?;
+            // Rate-limit fallback re-adopt (same DB-wins pattern; normally
+            // propagated by the revision watcher's plan category).
+            crate::config_reconcile::adopt_rate_limit_fallback_db(
+                pool,
+                &self.plan_store,
                 &new_config,
             )
             .await?;
@@ -1103,6 +1184,128 @@ impl AppState {
         }
     }
 
+    /// Live-resize the KV trie's LRU capacity to the (adopted) config value
+    /// when they drift — the capacity is otherwise frozen at trie
+    /// construction. Cheap no-op when they already agree (uses the
+    /// backend's own `block_capacity` as the drift signal, so it covers
+    /// both the apply path and reload-after-adopt).
+    fn sync_kv_capacity(&self, rs: &boom_config::RouterSettings) {
+        if rs.schedule_policy != "kvc_aware" {
+            return;
+        }
+        let target = rs.kvc_aware.max_blocks;
+        if let Some(kv) = self.kv_index.load().as_ref() {
+            let current = kv.block_capacity();
+            if current != target {
+                kv.set_block_capacity(target);
+                tracing::info!(
+                    before = current,
+                    after = target,
+                    "KV trie LRU capacity live-resized (learned trie preserved)"
+                );
+            }
+        }
+    }
+
+    /// Apply a newly adopted/PUT router policy group to the live state:
+    /// rebuild the scheduling policy (its values freeze at construction),
+    /// rebuild the KV trie ONLY when schedule_policy flipped (a threshold,
+    /// TTL or max_blocks change must not wipe the learned trie — same
+    /// gating discipline as reload(); max_blocks live-resizes via
+    /// `sync_kv_capacity`), restart the prune task (it captured the
+    /// old TTL at spawn), and swap `inner.config` so GetConfig/export and
+    /// the reload-time trie gate all see the effective values. Shared by
+    /// the dashboard PUT path (after write_policy_db) and the revision
+    /// watcher's router_policy arm. Idempotent: adopting an unchanged
+    /// group is a no-op.
+    pub(crate) async fn apply_router_policy(
+        &self,
+        policy: boom_routing::RouterPolicy,
+    ) -> anyhow::Result<()> {
+        let old_settings = self.inner.load().config.router_settings.clone();
+        let mut new_config = self.inner.load().config.clone();
+        policy.apply_to(&mut new_config.router_settings);
+        if boom_routing::RouterPolicy::from_settings(&old_settings) == policy {
+            return Ok(());
+        }
+        self.stop_kv_prune_task();
+        if old_settings.schedule_policy != new_config.router_settings.schedule_policy {
+            tracing::info!(
+                before = %old_settings.schedule_policy,
+                after = %new_config.router_settings.schedule_policy,
+                "schedule_policy changed: rebuilding KV index (trie will be empty)"
+            );
+            let new_kv_index = Self::build_kvc_subsystems(&new_config);
+            self.kv_index.store(Arc::new(new_kv_index));
+        } else {
+            tracing::info!(
+                schedule_policy = %new_config.router_settings.schedule_policy,
+                "router policy group changed without a policy flip — preserving learned trie"
+            );
+            // A max_blocks-only change lands here: live-resize the LRU
+            // instead of wiping the learned trie.
+            self.sync_kv_capacity(&new_config.router_settings);
+        }
+        if new_config.router_settings.schedule_policy == "kvc_aware" {
+            self.spawn_kv_prune_task(&new_config);
+        }
+        let new_policy = create_policy(
+            &new_config,
+            &self.inflight,
+            &self.flow_controller,
+            &self.rebalance_move_tracker,
+            &self.kvc_stats,
+            &**self.kv_index.load(),
+        );
+        self.router.set_policy(new_policy);
+        self.swap_inner_config(new_config);
+        Ok(())
+    }
+
+    /// Apply a newly adopted/PUT router behavior trio to the live config.
+    /// The three fields are read per-request from `inner.config`
+    /// (routes.rs), so a plain inner swap takes effect immediately — no
+    /// policy/trie rebuild. One capture exception: FusionRuntime freezes
+    /// `enable_priority_header` at construction (register_fusion_models);
+    /// while workflow is parked (enable_workflow=false) it registers
+    /// nothing, so the stale capture is dormant and refreshes on the next
+    /// reload. Shared by the dashboard PUT path (after the KV write +
+    /// bump) and the revision watcher's router_behavior arm. Idempotent:
+    /// adopting an unchanged trio is a no-op.
+    pub(crate) fn apply_router_behavior(
+        &self,
+        behavior: crate::config_reconcile::RouterBehavior,
+    ) -> anyhow::Result<()> {
+        let old_settings = self.inner.load().config.router_settings.clone();
+        if crate::config_reconcile::RouterBehavior::from_settings(&old_settings) == behavior {
+            return Ok(());
+        }
+        let mut new_config = self.inner.load().config.clone();
+        new_config.router_settings.enable_priority_header = behavior.enable_priority_header;
+        new_config.router_settings.strip_claude_code_attribution =
+            behavior.strip_claude_code_attribution;
+        new_config.router_settings.forward_client_headers = behavior.forward_client_headers;
+        self.swap_inner_config(new_config);
+        Ok(())
+    }
+
+    /// Swap only `inner.config`, keeping the live auth/hooks Arcs and
+    /// health counters — the router-policy adopt changes config fields
+    /// but nothing the authenticator or hook registry derives from. A
+    /// full build_inner would rebuild those for nothing (and drop the
+    /// auth cache).
+    fn swap_inner_config(&self, config: Config) {
+        let old = self.inner.load();
+        let new_inner = AppStateInner {
+            config,
+            auth: old.auth.clone(),
+            key_alias_lookup: old.key_alias_lookup.clone(),
+            hooks: old.hooks.clone(),
+            health: old.health.clone(),
+        };
+        self.inner.store(Arc::new(new_inner));
+    }
+
     /// Build AppStateInner from config.
     fn build_inner(
         config: Config,
@@ -1300,6 +1503,16 @@ impl AppState {
             self.block_rule_store.is_enabled(),
             &self.user_tag_store.get(),
             self.trace.metrics_enabled(),
+            &serde_json::to_value(self.plan_store.fallback())
+                .map_err(|e| format!("serialize rate_limit fallback: {}", e))?,
+            &serde_json::to_value(boom_routing::RouterPolicy::from_settings(
+                &self.inner.load().config.router_settings,
+            ))
+            .map_err(|e| format!("serialize router policy: {}", e))?,
+            &serde_json::to_value(crate::config_reconcile::RouterBehavior::from_settings(
+                &self.inner.load().config.router_settings,
+            ))
+            .map_err(|e| format!("serialize router behavior: {}", e))?,
         )
     }
 
@@ -1335,7 +1548,7 @@ impl AppState {
         // ignores (or, pre-M4, partially consumes for workflow/cost) — reject
         // with a pointer to the right surface instead of silently doing the
         // wrong thing on the next reload.
-        const DB_OWNED_PATHS: [&str; 8] = [
+        const DB_OWNED_PATHS: [&str; 9] = [
             "model_list",
             "plan_settings",
             "client_blocklist",
@@ -1344,6 +1557,7 @@ impl AppState {
             "cost_templates",
             "general_settings.user_tag_headers",
             "trace.metrics.enabled",
+            "rate_limit",
         ];
         if DB_OWNED_PATHS.contains(&path) {
             return Err(format!(
@@ -1387,6 +1601,9 @@ fn merge_runtime_sections(
     blocklist_enabled: bool,
     user_tag_headers: &[String],
     metrics_enabled: bool,
+    rate_limit_fallback: &serde_json::Value,
+    router_policy: &serde_json::Value,
+    router_behavior: &serde_json::Value,
 ) -> Result<(), String> {
     let obj = snapshot
         .as_object()
@@ -1495,6 +1712,103 @@ fn merge_runtime_sections(
     boom_config::set_yaml_path(root, &["trace", "metrics", "enabled"], yaml_tm)
         .map_err(|e| format!("set trace.metrics.enabled: {}", e))?;
 
+    // Rate-limit fallback is DB-owned runtime state (boom_config KV). The
+    // snapshot carries the KV row when it exists; the running plan-store
+    // value covers the no-DB / missing-row transient. Written so a
+    // fresh-DB restore seeds from what the operator last set, not from a
+    // stale YAML value.
+    let rl_value = obj
+        .get("rate_limit")
+        .cloned()
+        .filter(|v| v.is_object())
+        .unwrap_or_else(|| rate_limit_fallback.clone());
+    let yaml_rl = json_to_yaml(&rl_value)?;
+    boom_config::set_yaml_path(root, &["rate_limit"], yaml_rl)
+        .map_err(|e| format!("set rate_limit: {}", e))?;
+
+    // Router policy group is DB-owned runtime state (boom_router_policy
+    // single row). The caller passes the LIVE effective group (from the
+    // inner config, which the adopt path overlaid) — written so a
+    // fresh-DB restore seeds from what the operator last set, not from
+    // stale YAML values. Only the six DB-homed sub-keys are touched;
+    // everything else in router_settings keeps its YAML values. A JSON
+    // null (e.g. key_affinity_ttl_secs=None) is written as YAML null —
+    // the loader reads that back as None.
+    if let serde_json::Value::Object(rp) = router_policy {
+        let set_rp = |root: &mut serde_yaml::Value,
+                      src: &str,
+                      path: &[&str]|
+         -> Result<(), String> {
+            if let Some(v) = rp.get(src) {
+                let yaml_val = json_to_yaml(v)?;
+                boom_config::set_yaml_path(root, path, yaml_val)
+                    .map_err(|e| format!("set {path:?}: {}", e))?;
+            }
+            Ok(())
+        };
+        set_rp(root, "schedule_policy", &["router_settings", "schedule_policy"])?;
+        set_rp(
+            root,
+            "key_affinity_context_threshold",
+            &["router_settings", "key_affinity_context_threshold"],
+        )?;
+        set_rp(
+            root,
+            "key_affinity_ttl_secs",
+            &["router_settings", "key_affinity_ttl_secs"],
+        )?;
+        set_rp(
+            root,
+            "rebalance_threshold",
+            &["router_settings", "rebalance_threshold"],
+        )?;
+        set_rp(
+            root,
+            "kvc_router_ttl_secs",
+            &["router_settings", "kvc_aware", "router_ttl_secs"],
+        )?;
+        set_rp(
+            root,
+            "kvc_max_blocks",
+            &["router_settings", "kvc_aware", "max_blocks"],
+        )?;
+    }
+
+    // Router behavior trio is DB-owned runtime state (boom_config KV
+    // router_behavior). Same live-effective-value contract as the policy
+    // group above — written so a fresh-DB restore seeds from what the
+    // operator last set, not from stale YAML values. Only the three
+    // DB-homed sub-keys are touched; everything else in router_settings
+    // keeps its YAML value.
+    if let serde_json::Value::Object(rb) = router_behavior {
+        let set_rb = |root: &mut serde_yaml::Value,
+                      src: &str,
+                      path: &[&str]|
+         -> Result<(), String> {
+            if let Some(v) = rb.get(src) {
+                let yaml_val = json_to_yaml(v)?;
+                boom_config::set_yaml_path(root, path, yaml_val)
+                    .map_err(|e| format!("set {path:?}: {}", e))?;
+            }
+            Ok(())
+        };
+        set_rb(
+            root,
+            "enable_priority_header",
+            &["router_settings", "enable_priority_header"],
+        )?;
+        set_rb(
+            root,
+            "strip_claude_code_attribution",
+            &["router_settings", "strip_claude_code_attribution"],
+        )?;
+        set_rb(
+            root,
+            "forward_client_headers",
+            &["router_settings", "forward_client_headers"],
+        )?;
+    }
+
     // Strip the legacy singular alias. The field now lives in the DB; a stale
     // `user_tag_header:` key left in the file would re-seed the OLD value on a
     // fresh-DB restore even after the operator cleared the list (the empty
@@ -1545,6 +1859,9 @@ fn compose_export_yaml(
     blocklist_enabled: bool,
     user_tag_headers: &[String],
     metrics_enabled: bool,
+    rate_limit_fallback: &serde_json::Value,
+    router_policy: &serde_json::Value,
+    router_behavior: &serde_json::Value,
 ) -> Result<String, String> {
     merge_runtime_sections(
         root,
@@ -1552,6 +1869,9 @@ fn compose_export_yaml(
         blocklist_enabled,
         user_tag_headers,
         metrics_enabled,
+        rate_limit_fallback,
+        router_policy,
+        router_behavior,
     )?;
     serde_yaml::to_string(root).map_err(|e| format!("serialize yaml: {}", e))
 }
@@ -2579,6 +2899,14 @@ pub(crate) async fn build_config_snapshot_value(pool: &PgPool) -> Result<serde_j
         )
         .await?;
 
+    // ── Rate-limit fallback (boom-dashboard boom_config KV row) ──
+    let rate_limit_fallback: Option<serde_json::Value> =
+        boom_dashboard::config_kv::get_value(
+            pool,
+            boom_dashboard::config_kv::RATE_LIMIT_FALLBACK,
+        )
+        .await?;
+
     // ── Workflows (delegated to WorkflowStore tables) ──
     let definition_rows = boom_routing::WorkflowStore::list_definitions_db(pool).await?;
     let model_binding_rows = boom_routing::WorkflowStore::list_models_db(pool).await?;
@@ -2653,6 +2981,7 @@ pub(crate) async fn build_config_snapshot_value(pool: &PgPool) -> Result<serde_j
                 "enabled": trace_metrics_enabled,
             },
         },
+        "rate_limit": rate_limit_fallback,
     }))
 }
 
@@ -2686,7 +3015,7 @@ mod merge_runtime_sections_tests {
         // otherwise parse the section with the serde default (true) and
         // silently activate rules the operator never turned on.
         let mut root = parse("model_list: []\n");
-        merge_runtime_sections(&mut root, &snapshot_with_rules(), false, &[], false)
+        merge_runtime_sections(&mut root, &snapshot_with_rules(), false, &[], false, &serde_json::json!({}), &serde_json::json!({}), &serde_json::json!({}))
             .expect("merge");
         let bl = root.get("client_blocklist").expect("section created");
         assert_eq!(bl.get("enabled"), Some(&serde_yaml::Value::Bool(false)));
@@ -2698,7 +3027,7 @@ mod merge_runtime_sections_tests {
         // Snapshot (KV row) wins over a stale YAML value…
         let mut root = parse("trace:\n  enabled: true\n  metrics:\n    enabled: true\n");
         let snapshot = serde_json::json!({"trace": {"metrics": {"enabled": false}}});
-        merge_runtime_sections(&mut root, &snapshot, false, &[], true).expect("merge");
+        merge_runtime_sections(&mut root, &snapshot, false, &[], true, &serde_json::json!({}), &serde_json::json!({}), &serde_json::json!({})).expect("merge");
         assert_eq!(
             root.get("trace").and_then(|t| t.get("metrics")).and_then(|m| m.get("enabled")),
             Some(&serde_yaml::Value::Bool(false))
@@ -2706,11 +3035,149 @@ mod merge_runtime_sections_tests {
         // …and the running registry value materializes the path when the KV
         // row is missing (fresh install transient / no-DB restore).
         let mut root = parse("model_list: []\n");
-        merge_runtime_sections(&mut root, &serde_json::json!({}), false, &[], true)
+        merge_runtime_sections(&mut root, &serde_json::json!({}), false, &[], true, &serde_json::json!({}), &serde_json::json!({}), &serde_json::json!({}))
             .expect("merge");
         assert_eq!(
             root.get("trace").and_then(|t| t.get("metrics")).and_then(|m| m.get("enabled")),
             Some(&serde_yaml::Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn rate_limit_fallback_snapshot_overrides_and_falls_back() {
+        // Snapshot (KV row) wins over a stale YAML section…
+        let mut root = parse("rate_limit:\n  enabled: true\n  default_rpm: 60\n");
+        let snapshot = serde_json::json!({
+            "rate_limit": {"enabled": false, "default_rpm": 120,
+                           "default_tpm": null, "window_limits": [[100, 18000]]}
+        });
+        merge_runtime_sections(
+            &mut root, &snapshot, false, &[], false,
+            &serde_json::json!({"enabled": true, "default_rpm": 60, "default_tpm": null, "window_limits": []}),
+            &serde_json::json!({}),
+            &serde_json::json!({}),
+        )
+        .expect("merge");
+        let rl = root.get("rate_limit").expect("section kept");
+        assert_eq!(rl.get("enabled").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(rl.get("default_rpm").and_then(|v| v.as_u64()), Some(120));
+        assert_eq!(
+            rl.get("window_limits").and_then(|v| v.as_sequence()).map(|s| s.len()),
+            Some(1)
+        );
+        // …and the running store value materializes the section when the KV
+        // row is missing (fresh install transient / no-DB mode).
+        let mut root = parse("model_list: []\n");
+        merge_runtime_sections(
+            &mut root, &serde_json::json!({}), false, &[], false,
+            &serde_json::json!({"enabled": false, "default_rpm": 30, "default_tpm": 400000, "window_limits": []}),
+            &serde_json::json!({}),
+            &serde_json::json!({}),
+        )
+        .expect("merge");
+        let rl = root.get("rate_limit").expect("section created");
+        assert_eq!(rl.get("enabled").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(rl.get("default_rpm").and_then(|v| v.as_u64()), Some(30));
+        assert_eq!(rl.get("default_tpm").and_then(|v| v.as_u64()), Some(400000));
+    }
+
+    #[test]
+    fn router_policy_group_merged_into_router_settings() {
+        // The live effective group (DB row adopted onto the inner config)
+        // overwrites the six DB-homed sub-keys in the exported document —
+        // a fresh-DB restore then seeds from the operator's last setting,
+        // not from stale YAML values. Other router_settings fields keep
+        // their YAML values untouched.
+        let mut root = parse(
+            "router_settings:\n  schedule_policy: round_robin\n  kvc_aware:\n    max_blocks: 999\n    router_ttl_secs: 111\n  flow_control_queue_timeout_secs: 60\n",
+        );
+        merge_runtime_sections(
+            &mut root,
+            &serde_json::json!({}),
+            false, &[], false,
+            &serde_json::json!({}),
+            &serde_json::json!({
+                "schedule_policy": "kvc_aware",
+                "key_affinity_context_threshold": 800,
+                "key_affinity_ttl_secs": null,
+                "rebalance_threshold": 35,
+                "kvc_router_ttl_secs": 600.0,
+                "kvc_max_blocks": 200000,
+            }),
+            &serde_json::json!({}),
+        )
+        .expect("merge");
+        let rs = root.get("router_settings").expect("section kept");
+        assert_eq!(
+            rs.get("schedule_policy").and_then(|v| v.as_str()),
+            Some("kvc_aware")
+        );
+        assert_eq!(
+            rs.get("key_affinity_context_threshold").and_then(|v| v.as_u64()),
+            Some(800)
+        );
+        assert_eq!(rs.get("key_affinity_ttl_secs"), Some(&serde_yaml::Value::Null));
+        assert_eq!(
+            rs.get("rebalance_threshold").and_then(|v| v.as_u64()),
+            Some(35)
+        );
+        assert_eq!(
+            rs.get("kvc_aware").and_then(|k| k.get("router_ttl_secs")).and_then(|v| v.as_f64()),
+            Some(600.0)
+        );
+        assert_eq!(
+            rs.get("kvc_aware").and_then(|k| k.get("max_blocks")).and_then(|v| v.as_u64()),
+            Some(200000)
+        );
+        // YAML-homed neighbors untouched.
+        assert_eq!(
+            rs.get("flow_control_queue_timeout_secs").and_then(|v| v.as_u64()),
+            Some(60)
+        );
+    }
+
+    #[test]
+    fn router_behavior_trio_merged_into_router_settings() {
+        // The live effective trio (KV row adopted onto the inner config)
+        // overwrites the three DB-homed sub-keys in the exported document.
+        // Other router_settings fields keep their YAML values untouched.
+        let mut root = parse(
+            "router_settings:\n  enable_priority_header: false\n  schedule_policy: round_robin\n  flow_control_queue_timeout_secs: 60\n",
+        );
+        merge_runtime_sections(
+            &mut root,
+            &serde_json::json!({}),
+            false, &[], false,
+            &serde_json::json!({}),
+            &serde_json::json!({}),
+            &serde_json::json!({
+                "enable_priority_header": true,
+                "strip_claude_code_attribution": true,
+                "forward_client_headers": ["x-client-id", "x-trace-id"],
+            }),
+        )
+        .expect("merge");
+        let rs = root.get("router_settings").expect("section kept");
+        assert_eq!(
+            rs.get("enable_priority_header").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            rs.get("strip_claude_code_attribution").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            rs.get("forward_client_headers").and_then(|v| v.as_sequence()).map(|s| s.len()),
+            Some(2)
+        );
+        // YAML-homed neighbors untouched.
+        assert_eq!(
+            rs.get("schedule_policy").and_then(|v| v.as_str()),
+            Some("round_robin")
+        );
+        assert_eq!(
+            rs.get("flow_control_queue_timeout_secs").and_then(|v| v.as_u64()),
+            Some(60)
         );
     }
 
@@ -2721,7 +3188,7 @@ mod merge_runtime_sections_tests {
         let mut root = parse("client_blocklist:\n  enabled: true\n");
         let mut snapshot = snapshot_with_rules();
         snapshot["client_blocklist"]["enabled"] = serde_json::Value::Bool(false);
-        merge_runtime_sections(&mut root, &snapshot, true, &[], false).expect("merge");
+        merge_runtime_sections(&mut root, &snapshot, true, &[], false, &serde_json::json!({}), &serde_json::json!({}), &serde_json::json!({})).expect("merge");
         let bl = root.get("client_blocklist").expect("section kept");
         assert_eq!(bl.get("enabled"), Some(&serde_yaml::Value::Bool(false)));
     }
@@ -2739,7 +3206,7 @@ mod merge_runtime_sections_tests {
             ],
             "client_blocklist": {"rules": []},
         });
-        let yaml = compose_export_yaml(&mut root, &snapshot, true, &[], false).expect("compose");
+        let yaml = compose_export_yaml(&mut root, &snapshot, true, &[], false, &serde_json::json!({}), &serde_json::json!({}), &serde_json::json!({})).expect("compose");
         let reparsed = parse(&yaml);
         assert!(reparsed.get("server").is_some(), "singleton section preserved");
         assert_eq!(
@@ -2774,7 +3241,7 @@ mod merge_runtime_sections_tests {
         let snapshot = serde_json::json!({
             "general_settings": {"user_tag_headers": ["x-user-id"]}
         });
-        merge_runtime_sections(&mut root, &snapshot, true, &[], false).expect("merge");
+        merge_runtime_sections(&mut root, &snapshot, true, &[], false, &serde_json::json!({}), &serde_json::json!({}), &serde_json::json!({})).expect("merge");
         let got = root
             .get("general_settings")
             .and_then(|g| g.get("user_tag_headers"))
@@ -2787,7 +3254,7 @@ mod merge_runtime_sections_tests {
         let snapshot = serde_json::json!({
             "general_settings": {"user_tag_headers": []}
         });
-        merge_runtime_sections(&mut root, &snapshot, true, &[], false).expect("merge");
+        merge_runtime_sections(&mut root, &snapshot, true, &[], false, &serde_json::json!({}), &serde_json::json!({}), &serde_json::json!({})).expect("merge");
         let gs = root
             .get("general_settings")
             .and_then(|g| g.as_mapping())
@@ -2808,7 +3275,7 @@ mod merge_runtime_sections_tests {
         let mut root = parse(
             "general_settings:\n  user_tag_header: x-old\n  user_tag_headers: [x-old]\n",
         );
-        merge_runtime_sections(&mut root, &snapshot, true, &[], false).expect("merge");
+        merge_runtime_sections(&mut root, &snapshot, true, &[], false, &serde_json::json!({}), &serde_json::json!({}), &serde_json::json!({})).expect("merge");
         let gs = root
             .get("general_settings")
             .and_then(|g| g.as_mapping())
@@ -2829,7 +3296,7 @@ mod merge_runtime_sections_tests {
         // fallback (no-DB transient).
         let mut root = parse("general_settings:\n  master_key: ${MASTER}\n");
         let snapshot = serde_json::json!({"general_settings": {}});
-        merge_runtime_sections(&mut root, &snapshot, true, &["x-user-tag".to_string()], false)
+        merge_runtime_sections(&mut root, &snapshot, true, &["x-user-tag".to_string()], false, &serde_json::json!({}), &serde_json::json!({}), &serde_json::json!({}))
             .expect("merge");
         assert_eq!(
             root.get("general_settings")

@@ -67,6 +67,90 @@ pub async fn admin_command_handler(mut rx: tokio::sync::mpsc::Receiver<AdminComm
                 let result = state.update_config_section(&path, value).await;
                 let _ = reply.send(result);
             }
+            AdminCommand::SetRouterPolicy { policy, reply } => {
+                let result = async {
+                    if let Err(e) = policy.validate() {
+                        return Err(e);
+                    }
+                    let pool = state
+                        .db_pool
+                        .as_ref()
+                        .ok_or_else(|| {
+                            "Database not available — the scheduling policy group is DB-backed; \
+                             edit the router_settings section in YAML for no-DB mode"
+                                .to_string()
+                        })?;
+                    let reply_value =
+                        serde_json::to_value(&policy).map_err(|e| format!("serialize: {e}"))?;
+                    boom_routing::router_policy::write_policy_db(pool, &policy).await?;
+                    state
+                        .apply_router_policy(policy)
+                        .await
+                        .map_err(|e| format!("apply router policy: {e}"))?;
+                    tracing::info!(
+                        schedule_policy = %reply_value.get("schedule_policy")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("-"),
+                        "router policy updated (DB write + bump + policy rebuild)"
+                    );
+                    Ok(reply_value)
+                }
+                .await;
+                let _ = reply.send(result);
+            }
+            AdminCommand::SetRouterBehavior {
+                enable_priority_header,
+                strip_claude_code_attribution,
+                forward_client_headers,
+                reply,
+            } => {
+                let result = async {
+                    let pool = state
+                        .db_pool
+                        .as_ref()
+                        .ok_or_else(|| {
+                            "Database not available — the behavior switches are DB-backed; \
+                             edit the router_settings section in YAML for no-DB mode"
+                                .to_string()
+                        })?;
+                    let behavior = crate::config_reconcile::RouterBehavior {
+                        enable_priority_header,
+                        strip_claude_code_attribution,
+                        forward_client_headers,
+                    };
+                    let reply_value =
+                        serde_json::to_value(&behavior).map_err(|e| format!("serialize: {e}"))?;
+                    let json = reply_value.clone();
+                    boom_dashboard::config_kv::set_value(
+                        pool,
+                        boom_dashboard::config_kv::ROUTER_BEHAVIOR,
+                        json,
+                    )
+                    .await
+                    .map_err(|e| format!("write KV: {e}"))?;
+                    // DB write + local apply landed — a bump failure only
+                    // delays peer propagation (next bump / periodic
+                    // reconcile heals), so best-effort, not an error.
+                    boom_state::revision::bump_best_effort(
+                        pool,
+                        boom_state::CATEGORY_ROUTER_BEHAVIOR,
+                    )
+                    .await;
+                    state
+                        .apply_router_behavior(behavior)
+                        .map_err(|e| format!("apply router behavior: {e}"))?;
+                    tracing::info!(
+                        enable_priority_header = reply_value
+                            .get("enable_priority_header")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false),
+                        "router behavior updated (DB write + bump + inner swap)"
+                    );
+                    Ok(reply_value)
+                }
+                .await;
+                let _ = reply.send(result);
+            }
             AdminCommand::GetConfig { reply } => {
                 // Serialize + drop the inner guard BEFORE the DB await —
                 // holding an ArcSwap guard across .await pins the old config
@@ -104,11 +188,14 @@ pub async fn admin_command_handler(mut rx: tokio::sync::mpsc::Receiver<AdminComm
                     "model_deployments": boom_config::manifest::model_deployment_fields(),
                     "general_settings": boom_config::manifest::general_settings_fields(),
                     "router_settings": boom_config::manifest::router_settings_fields(),
+                    "process_sections": boom_config::manifest::process_section_fields(),
                     "cost_templates": boom_config::manifest::cost_template_fields(),
                     "workflows": boom_config::manifest::workflow_fields(),
                     "aliases": boom_config::manifest::alias_fields(),
                     "rate_limit_plans": boom_config::manifest::rate_limit_plan_fields(),
                     "block_rules": boom_config::manifest::block_rule_fields(),
+                    "blocklist_switches": boom_config::manifest::blocklist_switch_fields(),
+                    "plan_pointers": boom_config::manifest::plan_pointer_fields(),
                 });
                 let _ = reply.send(Ok(schema));
             }
@@ -236,6 +323,7 @@ fn overlay_db_owned_sections(config: &mut Value, snapshot: &Value) {
         "client_blocklist",
         "workflow_settings",
         "cost_templates",
+        "rate_limit",
     ] {
         if let Some(v) = snap_obj.get(key) {
             cfg_obj.insert(key.to_string(), v.clone());

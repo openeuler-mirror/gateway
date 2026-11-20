@@ -205,6 +205,13 @@ pub trait KvIndexBackend: Send + Sync {
         0
     }
 
+    /// Live-resize the LRU capacity WITHOUT wiping the learned trie (a
+    /// rebuild is only required when the scheduling policy itself flips).
+    /// Shrinking evicts least-recently-used blocks through the same cleanup
+    /// path as insert-time eviction. Default no-op for backends without a
+    /// capacity notion.
+    fn set_block_capacity(&self, _max_blocks: usize) {}
+
     /// Live trie NODE count (roots + interior + leaves). Unlike
     /// `block_count` (claims, LRU-capped), node count is not capped by
     /// configuration: `nodes - blocks` is the shell population — the memory
