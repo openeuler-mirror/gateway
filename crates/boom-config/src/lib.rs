@@ -1164,8 +1164,14 @@ impl Config {
         // semantic checks; Config::validate just orchestrates them so new
         // sections plug in without growing this method.
         for entry in &self.model_list {
-            boom_core::request_defaults::validate(&entry.litellm_params.request_defaults)
-                .map_err(GatewayError::ConfigError)?;
+            let params = &entry.litellm_params;
+            boom_core::request_defaults::validate_for_model(&params.model, &params.request_defaults)
+                .map_err(|err| {
+                    GatewayError::ConfigError(format!(
+                        "model_list entry '{}': {err}",
+                        entry.model_name
+                    ))
+                })?;
         }
         self.router_settings.kvc_aware.validate()?;
         if self
@@ -1728,6 +1734,38 @@ mod tests {
     #[test]
     fn test_auto_detect_gemini() {
         assert_eq!(auto_detect_provider("gemini-2.0-flash"), "gemini");
+    }
+
+    #[test]
+    fn test_validate_request_defaults_provider() {
+        let mut config: Config = serde_yaml::from_str(
+            "model_list:
+              - model_name: test-deployment
+                litellm_params:
+                  model: vllm/claude-model
+                  request_defaults:
+                    temperature: 0.2",
+        )
+        .unwrap();
+        assert!(config.validate().is_ok());
+
+        for (model, provider) in [
+            ("anthropic/claude-model", "anthropic"),
+            ("azure/deployment", "azure"),
+            ("gemini/model", "gemini"),
+            ("bedrock/model", "bedrock"),
+            ("claude-model", "anthropic"),
+            ("amazon.model", "bedrock"),
+        ] {
+            config.model_list[0].litellm_params.model = model.into();
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains("test-deployment"), "{error}");
+            assert!(error.contains("request_defaults"), "{error}");
+            assert!(error.contains(&format!("provider: {provider}")), "{error}");
+        }
+
+        config.model_list[0].litellm_params.request_defaults.clear();
+        assert!(config.validate().is_ok());
     }
 
     #[test]

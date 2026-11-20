@@ -143,13 +143,20 @@ pub fn create_provider_with_request_defaults(
     max_context_tokens: Option<u64>,
     request_defaults: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<Arc<dyn Provider>, GatewayError> {
-    validate_request_defaults(model, request_defaults).map_err(GatewayError::ConfigError)?;
+    let (provider_type, actual_model) =
+        boom_core::provider::resolve_model_provider(model).unwrap_or_else(|| {
+            tracing::warn!(
+                "Cannot auto-detect provider for '{}', defaulting to openai",
+                model
+            );
+            ("openai", model)
+        });
+    boom_core::request_defaults::validate_for_provider(provider_type, request_defaults)
+        .map_err(GatewayError::ConfigError)?;
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(timeout.max(1)))
         .build()
         .map_err(|e| GatewayError::ConfigError(format!("Failed to create HTTP client: {}", e)))?;
-
-    let (provider_type, actual_model) = parse_model_provider(model);
 
     // Backward compatibility: reserved keys configured inside the headers
     // map used to reach `extra` through namespace merging and act as
@@ -205,7 +212,7 @@ pub fn create_provider_with_request_defaults(
                     client,
                     key,
                     api_base,
-                    &actual_model,
+                    actual_model,
                     deployment_id,
                     client_type_header,
                     max_context_tokens,
@@ -219,7 +226,7 @@ pub fn create_provider_with_request_defaults(
                 client,
                 api_key,
                 api_base,
-                &actual_model,
+                actual_model,
                 deployment_id,
                 client_type_header,
             )
@@ -235,7 +242,7 @@ pub fn create_provider_with_request_defaults(
                 client,
                 api_key,
                 api_base,
-                &actual_model,
+                actual_model,
                 &api_version,
                 deployment_id,
                 client_type_header,
@@ -245,7 +252,7 @@ pub fn create_provider_with_request_defaults(
         "gemini" => Ok(Arc::new(gemini::GeminiProvider::new(
             client,
             api_key,
-            &actual_model,
+            actual_model,
             deployment_id,
             client_type_header,
         )
@@ -257,7 +264,7 @@ pub fn create_provider_with_request_defaults(
                 .unwrap_or_else(|| "us-east-1".to_string());
             Ok(Arc::new(bedrock::BedrockProvider::new(
                 client,
-                &actual_model,
+                actual_model,
                 &region,
                 deployment_id,
                 client_type_header,
@@ -267,67 +274,6 @@ pub fn create_provider_with_request_defaults(
             "Unknown provider: '{}'. Supported: openai, anthropic, azure, gemini, bedrock, hosted_vllm, vllm, ollama, deepseek, groq, etc.",
             provider_type
         ))),
-    }
-}
-
-/// Validate before saving, so unsupported defaults never replace a live provider.
-pub fn validate_request_defaults(
-    model: &str,
-    defaults: &serde_json::Map<String, serde_json::Value>,
-) -> Result<(), String> {
-    boom_core::request_defaults::validate(defaults)?;
-    let (provider, _) = parse_model_provider(model);
-    if !defaults.is_empty() && matches!(provider, "anthropic" | "azure" | "gemini" | "bedrock") {
-        return Err("request_defaults currently supports OpenAI-compatible deployments only".to_string());
-    }
-    Ok(())
-}
-
-/// Parse `provider/model-id` format. Returns (provider, actual_model).
-fn parse_model_provider(model: &str) -> (&str, String) {
-    if let Some((provider, rest)) = model.split_once('/') {
-        (provider, rest.to_string())
-    } else {
-        let provider = auto_detect_provider(model);
-        (provider, model.to_string())
-    }
-}
-
-/// Auto-detect provider from model name when no explicit prefix is given.
-fn auto_detect_provider(model: &str) -> &'static str {
-    let lower = model.to_lowercase();
-    if lower.starts_with("gpt-")
-        || lower.starts_with("o1-")
-        || lower.starts_with("o3-")
-        || lower.starts_with("o4-")
-        || lower.starts_with("text-")
-        || lower.starts_with("dall-e-")
-        || lower.starts_with("chatgpt-")
-        || lower.starts_with("ft:gpt-")
-    {
-        "openai"
-    } else if lower.starts_with("claude-") {
-        "anthropic"
-    } else if lower.starts_with("gemini-") || lower.starts_with("gemma-") {
-        "gemini"
-    } else if lower.starts_with("anthropic.")
-        || lower.starts_with("amazon.")
-        || lower.starts_with("meta.")
-        || lower.starts_with("mistral.")
-    {
-        "bedrock"
-    } else if lower.starts_with("deepseek") {
-        "deepseek"
-    } else if lower.starts_with("llama") || lower.starts_with("qwen") || lower.starts_with("yi-") {
-        // Common open-weights models typically served via vLLM/Ollama.
-        // Default to OpenAI-compatible since vLLM uses OpenAI format.
-        "openai"
-    } else {
-        tracing::warn!(
-            "Cannot auto-detect provider for '{}', defaulting to openai",
-            model
-        );
-        "openai"
     }
 }
 

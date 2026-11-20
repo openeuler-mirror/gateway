@@ -1,8 +1,28 @@
 //! Deployment defaults for OpenAI-compatible request bodies.
 use serde_json::{Map, Value};
 
+/// Validate a deployment's defaults with the factory's provider selection.
+pub fn validate_for_model(model: &str, defaults: &Map<String, Value>) -> Result<(), String> {
+    if defaults.is_empty() {
+        return Ok(());
+    }
+    let (provider, _) = crate::provider::resolve_model_provider(model).unwrap_or(("openai", model));
+    validate_for_provider(provider, defaults)
+}
+
+/// Validate defaults when the provider type has already been resolved.
+pub fn validate_for_provider(provider: &str, defaults: &Map<String, Value>) -> Result<(), String> {
+    validate(defaults)?;
+    if !defaults.is_empty() && matches!(provider, "anthropic" | "azure" | "gemini" | "bedrock") {
+        return Err(format!(
+            "request_defaults currently supports OpenAI-compatible deployments only (provider: {provider})"
+        ));
+    }
+    Ok(())
+}
+
 /// Defaults cannot change routing, messages, transport mode or internal channels.
-pub fn validate(defaults: &Map<String, Value>) -> Result<(), String> {
+fn validate(defaults: &Map<String, Value>) -> Result<(), String> {
     for key in [
         "model",
         "messages",
