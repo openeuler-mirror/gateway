@@ -9,6 +9,45 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+/// Read the explicit provider prefix or detect it from a known model name.
+pub fn resolve_model_provider(model: &str) -> Option<(&str, &str)> {
+    if let Some(parts) = model.split_once('/') {
+        return Some(parts);
+    }
+
+    let lower = model.to_lowercase();
+    let provider = if lower.starts_with("gpt-")
+        || lower.starts_with("o1-")
+        || lower.starts_with("o3-")
+        || lower.starts_with("o4-")
+        || lower.starts_with("text-")
+        || lower.starts_with("dall-e-")
+        || lower.starts_with("chatgpt-")
+        || lower.starts_with("ft:gpt-")
+    {
+        "openai"
+    } else if lower.starts_with("claude-") {
+        "anthropic"
+    } else if lower.starts_with("gemini-") || lower.starts_with("gemma-") {
+        "gemini"
+    } else if lower.starts_with("anthropic.")
+        || lower.starts_with("amazon.")
+        || lower.starts_with("meta.")
+        || lower.starts_with("mistral.")
+    {
+        "bedrock"
+    } else if lower.starts_with("deepseek") {
+        "deepseek"
+    } else if lower.starts_with("llama") || lower.starts_with("qwen") || lower.starts_with("yi-") {
+        // Common open-weights models typically served via vLLM/Ollama.
+        // Default to OpenAI-compatible since vLLM uses OpenAI format.
+        "openai"
+    } else {
+        return None;
+    };
+    Some((provider, model))
+}
+
 /// Actual provider cost for one logical request.
 ///
 /// Ordinary providers leave this unset and the gateway computes cost from the

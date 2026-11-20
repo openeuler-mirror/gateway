@@ -1056,7 +1056,14 @@ pub(crate) fn build_provider_from_row(
         }
     });
 
-    let request_defaults = row.request_defaults.as_object()?;
+    let Some(request_defaults) = row.request_defaults.as_object() else {
+        tracing::error!(
+            model = %row.model_name,
+            deployment_id = ?row.deployment_id,
+            "Failed to create provider: stored request_defaults must be a JSON object"
+        );
+        return None;
+    };
     match boom_provider::create_provider_with_request_defaults(
         &row.litellm_model,
         api_key,

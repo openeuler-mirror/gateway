@@ -798,6 +798,29 @@ mod tests {
         .await;
     }
 
+    #[test]
+    fn anthropic_thinking_takes_precedence_over_deployment_defaults() {
+        let mut req = request_with_headers(&[]);
+        req.from_anthropic_protocol = true;
+        req.extra.insert(
+            "thinking".to_string(),
+            serde_json::json!({"type": "disabled"}),
+        );
+        let defaults = serde_json::json!({
+            "reasoning_effort": "high",
+            "chat_template_kwargs": {"enable_thinking": true},
+            "temperature": 0.2
+        });
+        let provider = provider_for("http://localhost".to_string(), None)
+            .with_request_defaults(defaults.as_object().unwrap().clone());
+
+        let body = provider.build_request(req);
+        assert_eq!(body["reasoning_effort"], "none");
+        assert_eq!(body["temperature"], serde_json::json!(0.2));
+        assert!(body.get("thinking").is_none());
+        assert!(body.get("chat_template_kwargs").is_none());
+    }
+
     /// An explicit client-side reasoning_effort wins over the translation;
     /// `thinking` is still stripped.
     #[tokio::test]

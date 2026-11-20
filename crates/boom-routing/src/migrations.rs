@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS boom_model_deployment (
     tpm               BIGINT,
     timeout           BIGINT  NOT NULL DEFAULT 1200,
     headers           JSONB   NOT NULL DEFAULT '{}',
+    request_defaults  JSONB   NOT NULL DEFAULT '{}',
     temperature       DOUBLE PRECISION,
     max_tokens        INTEGER,
     max_context_tokens BIGINT,
