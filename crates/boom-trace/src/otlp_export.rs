@@ -46,7 +46,18 @@ const STATUS_CODE_OK: i32 = 1;
 const STATUS_CODE_ERROR: i32 = 2;
 // GenAI messages intentionally use the generic Json arm below: downstream
 // OTLP consumers parse their JSON text from StringValue, not nested AnyValues.
+// Their documents also skip the wire cap — see WIRE_CAP_EXEMPT_JSON_KEYS.
 const STRUCTURED_JSON_KEYS: &[&str] = &["gen_ai.response.finish_reasons"];
+
+/// Json attributes under these keys serialize as full JSON text and skip the
+/// per-attribute wire cap: a byte cap can only cut a message document
+/// mid-JSON, leaving a StringValue downstream GenAI consumers cannot parse.
+const WIRE_CAP_EXEMPT_JSON_KEYS: &[&str] = &["gen_ai.input.messages", "gen_ai.output.messages"];
+
+/// Hard cap on the per-attempt span events a single span can carry. Keeps
+/// the exported payload bounded when an upstream is retried in a loop; the
+/// excess is reported in the span's `dropped_events_count`.
+const MAX_UPSTREAM_ATTEMPT_EVENTS: usize = 16;
 
 /// OTLP traces exporter. State machine identical to promptlog's
 /// `OtelExporter` (Online → push → tick → flush; Offline → skip + probe).
@@ -540,9 +551,11 @@ fn bound_attr_bytes(s: String, max_attribute_bytes: usize, dropped: &mut u32) ->
 /// fields. Request params (`gen_ai.request.temperature` / `top_p` /
 /// `top_k` / `max_tokens`) and usage (`gen_ai.usage.*`) arrive as regular
 /// attributes stamped by the route layer (issue #57) and pass through
-/// the bag loop unchanged. Three span events are emitted: the standard
-/// `exception` event on error spans, plus `ai.gateway.request.id` /
-/// `ai.gateway.request.body` (the latter only when body capture was on).
+/// the bag loop unchanged. Span events: `ai.gateway.request.id`,
+/// `ai.gateway.request.body` (latter only when body capture was on), one
+/// `ai.gateway.upstream.attempt` per recorded attempt (capped at
+/// `MAX_UPSTREAM_ATTEMPT_EVENTS`, excess in `dropped_events_count`), plus
+/// the standard `exception` event on error spans.
 ///
 /// `max_attribute_bytes` is the OTLP wire cap (OtlpConfig, 0 = unlimited):
 /// string attributes longer than the cap are truncated and the span's
@@ -623,6 +636,10 @@ pub fn convert_span_to_resource_spans(
             }
             SpanAttributeValue::Json(v) => {
                 let s = serde_json::to_string(v).unwrap_or_default();
+                if WIRE_CAP_EXEMPT_JSON_KEYS.contains(&k.as_str()) {
+                    otlp_attrs.push(otlp_kv_string(k, &s));
+                    continue;
+                }
                 let bounded = bound_attr_bytes(s, max_attribute_bytes, &mut dropped_attrs);
                 otlp_attrs.push(otlp_kv_string(k, &bounded));
                 if k == "boom-gateway.llm_request" {
@@ -654,6 +671,45 @@ pub fn convert_span_to_resource_spans(
             name: "ai.gateway.request.body".to_string(),
             attributes: vec![otlp_kv_string("ai.gateway.request.body", &body)],
             dropped_attributes_count: 0,
+        });
+    }
+    // One event per provider attempt, stamped at span start so consumers can
+    // order attempts against the request. Attempt bodies are NOT wire-cap
+    // exempt: only the gen_ai message documents are.
+    let dropped_events = span
+        .upstream_attempts
+        .len()
+        .saturating_sub(MAX_UPSTREAM_ATTEMPT_EVENTS) as u32;
+    for attempt in span.upstream_attempts.iter().take(MAX_UPSTREAM_ATTEMPT_EVENTS) {
+        let mut event_attrs: Vec<OtlpKeyValue> = Vec::with_capacity(4);
+        let mut event_dropped: u32 = 0;
+        event_attrs.push(otlp_kv_int(
+            "ai.gateway.upstream.attempt.number",
+            i64::from(attempt.attempt),
+        ));
+        event_attrs.push(otlp_kv_string(
+            "ai.gateway.upstream.attempt.provider",
+            &attempt.provider,
+        ));
+        if let Some(body) = &attempt.request_body {
+            let bounded = bound_attr_bytes(body.clone(), max_attribute_bytes, &mut event_dropped);
+            event_attrs.push(otlp_kv_string(
+                "ai.gateway.upstream.attempt.request_body",
+                &bounded,
+            ));
+        }
+        if let Some(body) = &attempt.response_body {
+            let bounded = bound_attr_bytes(body.clone(), max_attribute_bytes, &mut event_dropped);
+            event_attrs.push(otlp_kv_string(
+                "ai.gateway.upstream.attempt.response_body",
+                &bounded,
+            ));
+        }
+        events.push(OtlpEvent {
+            time_unix_nano: span.start_time_unix_nano,
+            name: "ai.gateway.upstream.attempt".to_string(),
+            attributes: event_attrs,
+            dropped_attributes_count: event_dropped,
         });
     }
     if status_code == STATUS_CODE_ERROR {
@@ -690,7 +746,7 @@ pub fn convert_span_to_resource_spans(
         attributes: otlp_attrs,
         dropped_attributes_count: dropped_attrs,
         events,
-        dropped_events_count: 0,
+        dropped_events_count: dropped_events,
         links: Vec::new(),
         dropped_links_count: 0,
         status: Some(OtlpStatus {
@@ -753,7 +809,7 @@ pub use boom_core::OtlpConfig;
 mod tests {
     use super::*;
     use crate::context::parse_traceparent;
-    use crate::span::RequestSpan;
+    use crate::span::{RequestSpan, UpstreamAttempt};
 
     fn make_span(req_id: &str) -> RequestSpan {
         let w3c = parse_traceparent(
@@ -763,7 +819,7 @@ mod tests {
         let mut span = RequestSpan::new(
             req_id.to_string(),
             &w3c,
-            "gpt-4".to_string(),
+            "demo_model".to_string(),
             "/v1/chat/completions".to_string(),
             false,
             1_000_000_000,
@@ -829,7 +885,7 @@ mod tests {
             0,
             true,
         );
-        span.set_llm_request(Arc::new(serde_json::json!({"messages": []})), 0);
+        span.set_llm_request(Arc::new(serde_json::json!({"messages": []})), 0, false);
         span.finalize_ok(1);
         let cfg = OtlpConfig::default();
         let resource = build_resource(&cfg);
@@ -853,7 +909,7 @@ mod tests {
         let mut span = make_span("r-dual");
         span.is_stream = true;
         span.set_deployment_id("dep-1".to_string());
-        span.set_response_model("gpt-4-actual".to_string());
+        span.set_response_model("demo_model_actual".to_string());
         span.set_provider_type("demo_provider".to_string());
         span.set_ttft_ms(120);
         span.set_attribute(
@@ -871,7 +927,7 @@ mod tests {
         span.set_attribute("gen_ai.usage.cache_read.input_tokens", SpanAttributeValue::Int(64));
         span.set_attribute("gen_ai.usage.cache_write.input_tokens", SpanAttributeValue::Int(32));
         span.set_attribute("gen_ai.usage.reasoning.output_tokens", SpanAttributeValue::Int(12));
-        span.set_llm_request(Arc::new(serde_json::json!({"messages": [], "max_tokens": 4096})), 0);
+        span.set_llm_request(Arc::new(serde_json::json!({"messages": [], "max_tokens": 4096})), 0, false);
         span.finalize_ok(3_000_000_000);
         let cfg = OtlpConfig::default();
         let resource = build_resource(&cfg);
@@ -1009,6 +1065,7 @@ mod tests {
         span.set_llm_request(
             Arc::new(serde_json::json!({"prompt": "x".repeat(500)})),
             0,
+            false,
         );
         let cfg = OtlpConfig::default();
         let resource = build_resource(&cfg);
@@ -1041,6 +1098,122 @@ mod tests {
         assert!(ev.len() <= 64);
     }
 
+    fn event_attr<'a>(event: &'a OtlpEvent, key: &str) -> Option<&'a OtlpAnyValue> {
+        event
+            .attributes
+            .iter()
+            .find(|attribute| attribute.key == key)
+            .and_then(|attribute| attribute.value.as_ref())
+            .and_then(|value| value.value.as_ref())
+    }
+
+    #[test]
+    fn attempt_events_emitted_one_per_upstream_attempt() {
+        let mut span = make_span("r-attempts");
+        span.record_upstream_attempts(vec![
+            UpstreamAttempt {
+                attempt: 1,
+                provider: "demo_provider".to_string(),
+                request_body: Some("req-a".to_string()),
+                response_body: Some("err-a".to_string()),
+            },
+            UpstreamAttempt {
+                attempt: 2,
+                provider: "demo_provider".to_string(),
+                request_body: Some("req-b".to_string()),
+                response_body: Some("ok-b".to_string()),
+            },
+        ]);
+        let rs = convert_span_to_resource_spans(&span, &Resource::default(), 0);
+        let otlp_span = &rs.scope_spans[0].spans[0];
+        let attempts: Vec<&OtlpEvent> = otlp_span
+            .events
+            .iter()
+            .filter(|event| event.name == "ai.gateway.upstream.attempt")
+            .collect();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(otlp_span.dropped_events_count, 0);
+        for (event, (number, request, response)) in attempts.iter().zip([
+            (1, "req-a", "err-a"),
+            (2, "req-b", "ok-b"),
+        ]) {
+            assert_eq!(event.time_unix_nano, span.start_time_unix_nano);
+            assert!(matches!(
+                event_attr(event, "ai.gateway.upstream.attempt.number"),
+                Some(OtlpAnyValue::IntValue(n)) if *n == number
+            ));
+            assert!(matches!(
+                event_attr(event, "ai.gateway.upstream.attempt.provider"),
+                Some(OtlpAnyValue::StringValue(p)) if p == "demo_provider"
+            ));
+            assert!(matches!(
+                event_attr(event, "ai.gateway.upstream.attempt.request_body"),
+                Some(OtlpAnyValue::StringValue(b)) if b == request
+            ));
+            assert!(matches!(
+                event_attr(event, "ai.gateway.upstream.attempt.response_body"),
+                Some(OtlpAnyValue::StringValue(b)) if b == response
+            ));
+            assert_eq!(event.dropped_attributes_count, 0);
+        }
+    }
+
+    #[test]
+    fn attempt_event_bodies_respect_wire_cap() {
+        let mut span = make_span("r-attempt-cap");
+        span.record_upstream_attempts(vec![UpstreamAttempt {
+            attempt: 1,
+            provider: "demo_provider".to_string(),
+            request_body: Some("x".repeat(500)),
+            response_body: None,
+        }]);
+        let rs = convert_span_to_resource_spans(&span, &Resource::default(), 64);
+        let otlp_span = &rs.scope_spans[0].spans[0];
+        let event = otlp_span
+            .events
+            .iter()
+            .find(|event| event.name == "ai.gateway.upstream.attempt")
+            .expect("attempt event present");
+        let OtlpAnyValue::StringValue(body) =
+            event_attr(event, "ai.gateway.upstream.attempt.request_body")
+                .expect("request body present")
+        else {
+            panic!("attempt request body should be string");
+        };
+        assert!(body.len() <= 64, "attempt body is {} bytes", body.len());
+        assert!(event.dropped_attributes_count >= 1);
+        assert!(event_attr(event, "ai.gateway.upstream.attempt.response_body").is_none());
+        // Attempt bodies are NOT wire-cap exempt: the span ingress cap only
+        // covers the two gen_ai message keys.
+        assert_eq!(otlp_span.dropped_attributes_count, 0);
+    }
+
+    #[test]
+    fn attempt_events_overflow_sets_dropped_events_count() {
+        let mut span = make_span("r-attempt-overflow");
+        span.record_upstream_attempts(
+            (1..=17)
+                .map(|number| UpstreamAttempt {
+                    attempt: number,
+                    provider: "demo_provider".to_string(),
+                    request_body: None,
+                    response_body: None,
+                })
+                .collect(),
+        );
+        let rs = convert_span_to_resource_spans(&span, &Resource::default(), 0);
+        let otlp_span = &rs.scope_spans[0].spans[0];
+        assert_eq!(
+            otlp_span
+                .events
+                .iter()
+                .filter(|event| event.name == "ai.gateway.upstream.attempt")
+                .count(),
+            16
+        );
+        assert_eq!(otlp_span.dropped_events_count, 1);
+    }
+
     #[test]
     fn batch_queue_byte_budget_drops_oldest() {
         let mut q = BatchQueue::default();
@@ -1052,6 +1225,7 @@ mod tests {
             s.set_llm_request(
                 Arc::new(serde_json::json!({"prompt": "y".repeat(400)})),
                 0,
+                false,
             );
             q.push(s, 10_000, 1_000, &dropped);
         }
@@ -1104,7 +1278,7 @@ mod genai_export_tests {
         RequestSpan::new(
             "r-genai".to_string(),
             &w3c,
-            "gpt-4".to_string(),
+            "demo_model".to_string(),
             api_path.to_string(),
             is_stream,
             1_000,
@@ -1224,5 +1398,35 @@ mod genai_export_tests {
             }
         }
         assert!(matches!(attr(&rs, "gen_ai.response.finish_reasons"), Some(OtlpAnyValue::ArrayValue(_))), "gen_ai.response.finish_reasons must stay an OTLP array");
+    }
+
+    #[test]
+    fn genai_messages_exempt_from_wire_cap_and_stay_valid_json() {
+        let mut span = make_span("/v1/chat/completions", false);
+        let big = serde_json::json!([{"role": "user", "parts": [
+            {"type": "text", "content": "x".repeat(5000)}]}]);
+        span.set_structured_attribute("gen_ai.input.messages", big.clone());
+        // convert_message only reads "content", so the 5000-char text must arrive there.
+        span.set_llm_request(
+            Arc::new(serde_json::json!({"messages": [
+                {"role": "user", "content": "x".repeat(5000)}]})),
+            0,
+            false,
+        );
+        let rs = convert_span_to_resource_spans(&span, &Resource::default(), 64);
+        match attr(&rs, "gen_ai.input.messages") {
+            Some(OtlpAnyValue::StringValue(json)) => {
+                let parsed: serde_json::Value = serde_json::from_str(json)
+                    .expect("messages must stay parseable JSON past the wire cap");
+                assert_eq!(parsed[0]["parts"][0]["content"].as_str().unwrap().len(), 5000);
+            }
+            other => panic!("must be StringValue, got {other:?}"),
+        }
+        // legacy raw body keeps the cap
+        let raw = match attr(&rs, "boom-gateway.llm_request") {
+            Some(OtlpAnyValue::StringValue(s)) => s.clone(),
+            other => panic!("raw body must stay capped StringValue: {other:?}"),
+        };
+        assert!(raw.len() <= 64);
     }
 }

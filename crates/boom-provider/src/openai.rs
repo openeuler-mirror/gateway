@@ -313,7 +313,7 @@ impl Provider for OpenAIProvider {
         // the same Value with the same serializer, so this is byte-identical
         // to what goes on the wire.
         if let Some(ref cap) = raw_capture {
-            cap.record_request_body(&body.to_string());
+            cap.record_request_body(self.name(), &body.to_string());
         }
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
 
@@ -411,9 +411,6 @@ impl Provider for OpenAIProvider {
         let gateway_headers = std::mem::take(&mut req.gateway_headers);
         let raw_capture = std::mem::take(&mut req.raw_capture);
         let mut body = self.build_request(req);
-        if let Some(ref cap) = raw_capture {
-            cap.record_request_body(&body.to_string());
-        }
         // Ensure stream is enabled and request usage in the final chunk.
         if let Some(obj) = body.as_object_mut() {
             obj.insert("stream".to_string(), serde_json::Value::Bool(true));
@@ -421,6 +418,9 @@ impl Provider for OpenAIProvider {
                 "stream_options".to_string(),
                 serde_json::json!({ "include_usage": true }),
             );
+        }
+        if let Some(ref cap) = raw_capture {
+            cap.record_request_body(self.name(), &body.to_string());
         }
 
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));

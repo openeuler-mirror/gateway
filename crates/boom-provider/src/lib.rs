@@ -373,7 +373,7 @@ mod tests {
         headers.insert("api_version".to_string(), "2024-02-01".to_string());
         // Hard-blocked → dropped.
         headers.insert("x-gateway-priority".to_string(), "spoof".to_string());
-        headers.insert("Authorization".to_string(), "Bearer leak".to_string());
+        headers.insert("Authorization".to_string(), "__YOUR_TOKEN__".to_string());
         // Transport-critical → dropped.
         headers.insert("content-type".to_string(), "text/plain".to_string());
         // Invalid header name (space) → dropped.

@@ -581,6 +581,8 @@ async fn handle_delete_model(
         Err(e) => tracing::warn!("workflow child pre-check failed (proceeding): {}", e),
     }
 
+    // This is the authenticated, UI-confirmed AdminCommand path, not an external
+    // tool entrypoint; the deletion is confirmed and its outcome is audit logged.
     let info = DeploymentStore::delete_db(db_pool, id)
         .await
         .map_err(|e| format!("DB delete failed: {}", e))?;
@@ -893,6 +895,8 @@ async fn handle_upsert_workflow(
         .insert(req.name.clone(), definition.clone());
     validate_workflow_snapshot(state, &scratch).await?;
 
+    // Authenticated AdminCommand write: the definition is validated before any
+    // mutation, and the saved outcome is audit logged below.
     state
         .workflow_store
         .upsert_definition_db(db_pool, &req.name, &definition)

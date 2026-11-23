@@ -13,7 +13,7 @@
 
 use crate::context::W3cContext;
 use crate::registry::TraceRegistry;
-use crate::span::RequestSpan;
+use crate::span::{RequestSpan, UpstreamAttempt};
 use boom_core::trace::SpanAttributeValue;
 use std::sync::Arc;
 
@@ -122,9 +122,35 @@ impl TraceGuard {
     /// under the retention cap; oversized bodies are truncated on the span
     /// (see `RequestSpan::set_llm_request`). `max_body_bytes` comes from
     /// `TraceConfig.max_body_bytes` (0 = unlimited).
-    pub fn set_llm_request(&self, body: Arc<serde_json::Value>, max_body_bytes: usize) {
+    pub fn set_llm_request(
+        &self,
+        body: Arc<serde_json::Value>,
+        max_body_bytes: usize,
+        capture_tool_details: bool,
+    ) {
         let _ = self.registry.with_span_mut(&self.request_id, |s: &mut RequestSpan| {
-            s.set_llm_request(body, max_body_bytes);
+            s.set_llm_request(body, max_body_bytes, capture_tool_details);
+        });
+    }
+
+    /// Refresh `gen_ai.input.messages` (+markers) and `gen_ai.tool.definitions`
+    /// from the provider-bound body without touching the client-facing
+    /// `boom-gateway.llm_request` attribute.
+    pub fn set_provider_bound_request(
+        &self,
+        body: Arc<serde_json::Value>,
+        max_body_bytes: usize,
+        capture_tool_details: bool,
+    ) {
+        let _ = self.registry.with_span_mut(&self.request_id, |s: &mut RequestSpan| {
+            s.set_provider_bound_request(body, max_body_bytes, capture_tool_details);
+        });
+    }
+
+    /// Replace the per-attempt upstream records on the active span.
+    pub fn record_upstream_attempts(&self, attempts: Vec<UpstreamAttempt>) {
+        let _ = self.registry.with_span_mut(&self.request_id, |s: &mut RequestSpan| {
+            s.record_upstream_attempts(attempts);
         });
     }
 
@@ -143,6 +169,9 @@ impl TraceGuard {
         self.error_message = Some(message);
         let _ = self.registry.with_span_mut(&self.request_id, |s: &mut RequestSpan| {
             s.set_error_type(error_type);
+            if !s.attributes.iter().any(|(key, _)| key == "gen_ai.response.finish_reasons") {
+                s.set_response_finish_reasons(&["error".to_string()]);
+            }
         });
     }
 
@@ -362,7 +391,7 @@ mod tests {
                 true,
             )
             .expect("started");
-            g.set_llm_request(body.clone(), 16 * 1024);
+            g.set_llm_request(body.clone(), 16 * 1024, false);
             // Verify attribute was set on the live span.
             let has_attr = reg
                 .with_span_mut("req-4", |s: &mut RequestSpan| {
@@ -417,6 +446,39 @@ mod response_metadata_tests {
             .with_span_mut("req-error-type", |s| s.error_type.clone())
             .expect("span exists");
         assert_eq!(error_type.as_deref(), Some("upstream_error"));
+        let has_error_reason = reg.with_span_mut("req-error-type", |s| {
+            s.attributes.iter().any(|(k, v)| {
+                k == "gen_ai.response.finish_reasons" && matches!(v, SpanAttributeValue::Json(reasons) if reasons.as_array().map_or(false, |items| items.len() == 1 && items[0] == "error"))
+            })
+        }).expect("span exists");
+        assert!(has_error_reason, "mark_error must stamp finish_reasons=[error] when absent");
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn mark_error_preserves_provider_finish_reasons() {
+        let reg = TraceRegistry::new();
+        reg.set_enabled_for_test(true);
+        let w3c = make_w3c();
+        let mut guard = TraceGuard::start(
+            reg.clone(),
+            "req-error-existing-reason".to_string(),
+            &w3c,
+            "m".to_string(),
+            "/p".to_string(),
+            false,
+            1_000,
+            true,
+        )
+        .expect("started");
+        guard.set_response_finish_reasons(&["stop".to_string()]);
+        guard.mark_error("upstream_error".to_string(), "boom".to_string());
+        let preserved = reg.with_span_mut("req-error-existing-reason", |s| {
+            s.attributes.iter().any(|(k, v)| {
+                k == "gen_ai.response.finish_reasons" && matches!(v, SpanAttributeValue::Json(reasons) if reasons.as_array().map_or(false, |items| items.len() == 1 && items[0] == "stop"))
+            })
+        }).expect("span exists");
+        assert!(preserved, "provider-reported finish reason must not be overwritten");
         drop(guard);
     }
 

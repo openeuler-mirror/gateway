@@ -58,6 +58,23 @@ fn write_prompt_log_error(
     if let Some(g) = trace_guard {
         g.mark_error(error.error_type().to_string(), error.to_string());
     }
+    // Trace: snapshot the raw upstream exchange onto the span before any drain
+    // below — and before the `!should_capture` early return, since trace body
+    // capture is independent of the prompt log channel.
+    if let Some(cap) = raw_capture {
+        let inner = state.inner.load();
+        if let Some(trace_cfg) = inner.config.trace.as_ref() {
+            if trace_cfg.enabled && trace_cfg.capture_body {
+                stamp_upstream_exchange(
+                    &state.trace,
+                    request_id,
+                    cap,
+                    trace_cfg.max_body_bytes,
+                    trace_cfg.capture_tool_details,
+                );
+            }
+        }
+    }
     if !should_capture {
         return;
     }
@@ -136,6 +153,62 @@ fn write_prompt_log_error(
 fn mark_trace_error(trace_guard: &mut Option<TraceGuard>, error: &GatewayError) {
     if let Some(g) = trace_guard.as_mut() {
         g.mark_error(error.error_type().to_string(), error.to_string());
+    }
+}
+
+/// Snapshot the provider-side raw capture into per-attempt span records:
+/// 1-based numbering, provider as recorded, request body only when non-empty,
+/// response frames joined with the SSE frame separator.
+fn map_raw_attempts(
+    cap: &boom_core::provider::SharedRawCapture,
+) -> Vec<boom_trace::UpstreamAttempt> {
+    cap.snapshot_attempts()
+        .into_iter()
+        .enumerate()
+        .map(|(idx, attempt)| boom_trace::UpstreamAttempt {
+            attempt: idx as u32 + 1,
+            provider: attempt.provider,
+            request_body: (!attempt.request_body.is_empty()).then_some(attempt.request_body),
+            response_body: (!attempt.response_frames.is_empty())
+                .then(|| attempt.response_frames.join("\n\n")),
+        })
+        .collect()
+}
+
+/// Stamp the raw upstream exchange on the active span: attempts first, then
+/// the provider-bound input from the LAST parseable request body (retries
+/// append, so the last call is the one that served the response). An
+/// unparseable body leaves provider-bound input as captured and only logs
+/// at debug level; the attempts are still recorded.
+///
+/// MUST run before the prompt log drains the capture channel via
+/// `take_request_body` / `take_response_body`, otherwise the span sees an
+/// empty exchange.
+fn stamp_upstream_exchange(
+    reg: &boom_trace::TraceRegistry,
+    request_id: &str,
+    cap: &boom_core::provider::SharedRawCapture,
+    max_body_bytes: usize,
+    capture_tool_details: bool,
+) {
+    let attempts = map_raw_attempts(cap);
+    let bound = attempts.iter().rev().find_map(|attempt| {
+        serde_json::from_str::<serde_json::Value>(attempt.request_body.as_deref()?).ok()
+    });
+    let had_body = attempts.iter().any(|attempt| attempt.request_body.is_some());
+    reg.record_span_upstream_attempts(request_id, attempts);
+    if let Some(body) = bound {
+        reg.set_span_provider_bound_request(
+            request_id,
+            Arc::new(body),
+            max_body_bytes,
+            capture_tool_details,
+        );
+    } else if had_body {
+        tracing::debug!(
+            request_id = %request_id,
+            "upstream request body is not JSON; provider-bound input left as captured"
+        );
     }
 }
 
@@ -503,6 +576,20 @@ struct StreamMetaState {
 
 type StreamMetaTracker = Arc<std::sync::Mutex<StreamMetaState>>;
 
+/// Finish reasons recorded on the span for a streamed request. An in-band
+/// failure sentinel wins; a stream that ended without any terminal marker is
+/// reported as `interrupted` instead of an empty list — a markerless end is
+/// the one state the client observes as a cut stream, not a completion.
+fn stream_finish_reasons(meta: &StreamMetaState) -> Vec<String> {
+    if meta.stream_error.is_some() {
+        return vec!["error".to_string()];
+    }
+    if meta.finish_reasons.is_empty() {
+        return vec!["interrupted".to_string()];
+    }
+    meta.finish_reasons.values().cloned().collect()
+}
+
 fn chunk_has_valid_content(chunk: &ChatStreamChunk) -> bool {
     chunk.choices.iter().any(|choice| {
         let delta = &choice.delta;
@@ -711,11 +798,7 @@ impl<S> Drop for LoggedStream<S> {
                 if let Some(first) = meta.first_content_at {
                     g.set_ttft_ms((first - self.start).as_millis() as u64);
                 }
-                let finish_reasons = if meta.stream_error.is_some() {
-                    vec!["error".to_string()]
-                } else {
-                    meta.finish_reasons.values().cloned().collect::<Vec<_>>()
-                };
+                let finish_reasons = stream_finish_reasons(&meta);
                 stamp_response_metadata(
                     g,
                     meta.response_id.as_deref().unwrap_or(""),
@@ -1132,7 +1215,7 @@ async fn chat_completions_inner(
     // off or the key excluded — the channels switch independently.
     if let (Some(g), Some(body)) = (trace_guard.as_ref(), shared_req_body.as_ref()) {
         if trace_cfg.capture_body {
-            g.set_llm_request(body.clone(), trace_cfg.max_body_bytes);
+            g.set_llm_request(body.clone(), trace_cfg.max_body_bytes, trace_cfg.capture_tool_details);
         }
     }
 
@@ -1351,7 +1434,7 @@ async fn chat_completions_inner(
     };
 
     // Capture request body for debug recording if debug mode is enabled.
-    let debug_req_body = if state.debug_store.is_enabled() {
+    let debug_req_body = if cfg!(debug_assertions) && state.debug_store.is_enabled() {
         serde_json::to_string(&req).ok()
     } else {
         None
@@ -1579,8 +1662,14 @@ async fn chat_completions_inner(
                 if trace_cfg.enabled && trace_cfg.capture_body {
                     let reg = state.trace.clone();
                     let maxb = trace_cfg.max_body_bytes;
+                    let tool_details = trace_cfg.capture_tool_details;
+                    let raw_capture = prompt_log_raw_capture.clone();
                     prompt_logged = prompt_logged.with_response_sink(Arc::new(move |resp| {
                         reg.set_span_response_body(&trace_sink_rid, Arc::clone(resp), maxb);
+                        // Snapshot before the inner Drop finalizes the span.
+                        if let Some(cap) = raw_capture.as_ref() {
+                            stamp_upstream_exchange(&reg, &trace_sink_rid, cap, maxb, tool_details);
+                        }
                     }));
                 }
                 // The enricher runs after the wrapper's Drop assembled the
@@ -1616,6 +1705,8 @@ async fn chat_completions_inner(
             // the request-side capture. No prompt log entry ships.
             let reg = state.trace.clone();
             let maxb = trace_cfg.max_body_bytes;
+            let tool_details = trace_cfg.capture_tool_details;
+            let raw_capture = prompt_log_raw_capture.clone();
             let trace_logged = PromptLogStream::new_trace_only(
                 logged,
                 trace_sink_rid.clone(),
@@ -1624,6 +1715,10 @@ async fn chat_completions_inner(
             )
             .with_response_sink(Arc::new(move |resp| {
                 reg.set_span_response_body(&trace_sink_rid, Arc::clone(resp), maxb);
+                // Snapshot before the inner Drop finalizes the span.
+                if let Some(cap) = raw_capture.as_ref() {
+                    stamp_upstream_exchange(&reg, &trace_sink_rid, cap, maxb, tool_details);
+                }
             }));
             let trace_logged = trace_logged.with_failure_sink(stream_failure_sink(stream_meta.clone()));
             let response =
@@ -1712,6 +1807,9 @@ async fn chat_completions_inner(
             state.request_rate.record(did, &inflight_model);
         }
 
+        // The span key outlives the RequestLog move below; the trace stamp
+        // (before the prompt-log drains) still targets the active span.
+        let trace_rid = request_id.clone();
         log_request(
             state.log_writer.as_deref(),
             RequestLog {
@@ -1767,6 +1865,20 @@ async fn chat_completions_inner(
             } else {
                 None
             };
+        // Trace: snapshot the raw upstream exchange before the prompt log
+        // drains the capture channel below (`take_request_body` /
+        // `take_response_body`) — the span's copy must be taken first.
+        if trace_cfg.enabled && trace_cfg.capture_body {
+            if let Some(cap) = prompt_log_raw_capture.as_ref() {
+                stamp_upstream_exchange(
+                    &state.trace,
+                    &trace_rid,
+                    cap,
+                    trace_cfg.max_body_bytes,
+                    trace_cfg.capture_tool_details,
+                );
+            }
+        }
         // Prompt log: emit Request-phase immediately, then Response-phase
         // with the assembled response body and status. (For non-streaming,
         // both phases fire nearly back-to-back; that's fine.)
@@ -2055,6 +2167,8 @@ pub async fn admin_upsert_plan(
 ) -> Result<Json<serde_json::Value>, GatewayErrorReply> {
     require_master(auth.identity())?;
     let name = plan.name.clone();
+    // Controlled master-only admin write: require_master above authenticates the
+    // request, and the plan change is audit logged below.
     state.plan_store.upsert_plan(plan);
     tracing::info!(plan = %name, "Plan upserted");
     Ok(Json(serde_json::json!({
@@ -2106,6 +2220,8 @@ pub async fn admin_assign_key(
     Json(body): Json<AssignRequest>,
 ) -> Result<Json<serde_json::Value>, GatewayErrorReply> {
     require_master(auth.identity())?;
+    // The same master-only admin boundary covers assignment; the write result
+    // is checked and the assignment is audit logged below.
     let result = if let Some(ref pool) = state.db_pool {
         state
             .plan_store
@@ -3820,7 +3936,7 @@ pub async fn messages(
     // log being enabled for this key.
     if let (Some(g), Some(body)) = (trace_guard.as_ref(), shared_req_body.as_ref()) {
         if trace_cfg.capture_body {
-            g.set_llm_request(body.clone(), trace_cfg.max_body_bytes);
+            g.set_llm_request(body.clone(), trace_cfg.max_body_bytes, trace_cfg.capture_tool_details);
         }
     }
 
@@ -4011,7 +4127,7 @@ pub async fn messages(
     }
 
     // Capture request body for debug recording if debug mode is enabled.
-    let debug_req_body = if state.debug_store.is_enabled() {
+    let debug_req_body = if cfg!(debug_assertions) && state.debug_store.is_enabled() {
         serde_json::to_string(&req).ok()
     } else {
         None
@@ -4635,6 +4751,22 @@ fn prepare_edge_request<T: serde::Serialize>(
     // per-request — per-request export filtering stays in the handler.
     let trace_cfg = state.inner.load().config.trace.clone().unwrap_or_default();
     let trace_wants_body = trace_cfg.enabled && trace_cfg.capture_body;
+    // Per-request raw capture for the trace channel: only requests that would
+    // actually export a trace create the provider-body side channel, so
+    // untraced traffic pays nothing for it.
+    let trace_should_raw = trace_wants_body
+        && headers
+            .get("traceparent")
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse_traceparent)
+            .map(|w| {
+                boom_trace::trace_filter_matches(
+                    &trace_cfg.report_filter.tracestate_keys,
+                    &trace_cfg.report_filter.trace_id_regex,
+                    &w,
+                )
+            })
+            .unwrap_or(false);
     let req_body_value: Option<Arc<serde_json::Value>> =
         if blocklist_armed || prompt_log_should || trace_wants_body {
             serde_json::to_value(req).ok().map(Arc::new)
@@ -4657,7 +4789,8 @@ fn prepare_edge_request<T: serde::Serialize>(
     )?;
 
     let capture_raw =
-        prompt_log_should && state.prompt_log_writer.config().capture_raw_upstream;
+        (prompt_log_should && state.prompt_log_writer.config().capture_raw_upstream)
+            || trace_should_raw;
     let pl_req_body = if prompt_log_should { req_body_value.clone() } else { None };
     Ok(EdgeRequestPrep {
         prompt_log_should,
@@ -4852,7 +4985,7 @@ pub async fn responses(
     // log being enabled for this key.
     if let (Some(g), Some(body)) = (trace_guard.as_ref(), shared_req_body.as_ref()) {
         if trace_cfg.capture_body {
-            g.set_llm_request(body.clone(), trace_cfg.max_body_bytes);
+            g.set_llm_request(body.clone(), trace_cfg.max_body_bytes, trace_cfg.capture_tool_details);
         }
     }
 
@@ -5030,7 +5163,7 @@ pub async fn responses(
         }
     }
 
-    let debug_req_body = if state.debug_store.is_enabled() {
+    let debug_req_body = if cfg!(debug_assertions) && state.debug_store.is_enabled() {
         serde_json::to_string(&req).ok()
     } else {
         None
@@ -5845,12 +5978,14 @@ fn sse_responses_extractor(
                     finish_reason: None,
                     usage: None,
                     error: None,
+                    ..Default::default()
                 }),
                 "response.function_call_arguments.delta" => Some(ChunkDelta {
                     content: v.get("delta").and_then(|d| d.as_str()).map(String::from),
                     finish_reason: None,
                     usage: None,
                     error: None,
+                    ..Default::default()
                 }),
                 // Mid-stream upstream failure: the failed terminal carries an
                 // error object — surface it as the failure sentinel so the
@@ -5862,7 +5997,13 @@ fn sse_responses_extractor(
                         .pointer("/response/error")
                         .cloned()
                         .filter(|e| !e.is_null());
-                    Some(ChunkDelta { content: None, finish_reason: None, usage: None, error })
+                    Some(ChunkDelta {
+                        content: None,
+                        finish_reason: None,
+                        usage: None,
+                        error,
+                        ..Default::default()
+                    })
                 }
                 // Terminal events must surface a finish_reason — otherwise
                 // PromptLogStream never marks StreamEnd::Finished and every
@@ -5879,6 +6020,7 @@ fn sse_responses_extractor(
                         finish_reason: Some("stop".to_string()),
                         usage,
                         error: None,
+                        ..Default::default()
                     })
                 }
                 "response.incomplete" => {
@@ -5900,6 +6042,7 @@ fn sse_responses_extractor(
                         finish_reason: Some(reason.unwrap_or_else(|| "length".to_string())),
                         usage,
                         error: None,
+                        ..Default::default()
                     })
                 }
                 _ => None,
@@ -5989,6 +6132,9 @@ fn stamp_streamed_response_id(
 fn sse_raw_data_extractor(
     response_id_slot: StreamedResponseIdSlot,
 ) -> impl FnMut(&Result<SseItem, Infallible>) -> Option<boom_promptlog::ChunkDelta> + Unpin {
+    // `ToolCallDelta` is reached through its defining module — this task
+    // deliberately keeps its diff to stream.rs and routes.rs.
+    use boom_promptlog::stream::ToolCallDelta;
     use boom_promptlog::ChunkDelta;
     // OpenAI SSE chunks have shape `{"choices": [{"delta": {"content": "..."}, "finish_reason": ...}], "usage": {...}}`.
     // We parse the raw SSE `data:` payload and pull out content / finish_reason / usage.
@@ -6022,6 +6168,7 @@ fn sse_raw_data_extractor(
                             .and_then(|c| c.as_str()).unwrap_or("upstream_error"),
                         "message": err.get("message").and_then(|m| m.as_str()).unwrap_or(""),
                     })),
+                    ..Default::default()
                 });
             }
             let choices = v.get("choices").and_then(|c| c.as_array());
@@ -6031,12 +6178,48 @@ fn sse_raw_data_extractor(
                 .and_then(|d| d.get("content"))
                 .and_then(|c| c.as_str())
                 .map(|s| s.to_string());
+            let reasoning = delta
+                .and_then(|d| d.get("reasoning_content").or_else(|| d.get("reasoning")))
+                .and_then(|r| r.as_str())
+                .map(|s| s.to_string());
+            let tool_calls = delta
+                .and_then(|d| d.get("tool_calls"))
+                .and_then(|c| c.as_array())
+                .map(|calls| {
+                    calls
+                        .iter()
+                        .enumerate()
+                        .map(|(position, call)| ToolCallDelta {
+                            index: call
+                                .get("index")
+                                .and_then(|i| i.as_u64())
+                                .unwrap_or(position as u64),
+                            id: call.get("id").and_then(|i| i.as_str()).map(String::from),
+                            name: call
+                                .pointer("/function/name")
+                                .and_then(|n| n.as_str())
+                                .map(String::from),
+                            arguments: call
+                                .pointer("/function/arguments")
+                                .and_then(|a| a.as_str())
+                                .map(String::from),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             let finish_reason = first_choice
                 .and_then(|c| c.get("finish_reason"))
                 .and_then(|f| f.as_str())
                 .map(|s| s.to_string());
             let usage = v.get("usage").cloned();
-            Some(ChunkDelta { content, finish_reason, usage, error: None })
+            Some(ChunkDelta {
+                content,
+                finish_reason,
+                usage,
+                error: None,
+                reasoning,
+                tool_calls,
+            })
         }
         Err(_) => None,
     }
@@ -6092,6 +6275,7 @@ fn sse_anthropic_extractor(
                             "code": err.get("type").and_then(|t| t.as_str()).unwrap_or("upstream_error"),
                             "message": err.get("message").and_then(|m| m.as_str()).unwrap_or(""),
                         })),
+                        ..Default::default()
                     })
                 }
                 "content_block_delta" => {
@@ -6125,6 +6309,7 @@ fn sse_anthropic_extractor(
                         finish_reason: None,
                         usage: None,
                         error: None,
+                        ..Default::default()
                     })
                 }
                 "message_delta" => {
@@ -6147,12 +6332,14 @@ fn sse_anthropic_extractor(
                             finish_reason: stop_reason,
                             usage,
                             error: None,
+                            ..Default::default()
                         }),
                         (_, Some(_), _) | (_, _, Some(_)) => Some(ChunkDelta {
                             content: None,
                             finish_reason: stop_reason,
                             usage,
                             error: None,
+                            ..Default::default()
                         }),
                         _ => None,
                     }
@@ -6177,6 +6364,7 @@ fn sse_anthropic_extractor(
                             finish_reason: None,
                             usage,
                             error: None,
+                            ..Default::default()
                         })
                     } else {
                         None
@@ -6201,6 +6389,7 @@ mod tests {
         PreferredUsage, UsageTracker, UsageTrackerState, UserTags,
         chunk_has_valid_content, note_stream_chunk_meta, note_stream_response_id,
         LoggedStream, StreamMetaTracker, stream_failure_sink,
+        stream_finish_reasons, StreamMetaState,
     };
     use axum::http::{HeaderMap, HeaderName, HeaderValue};
     use boom_core::types::{
@@ -6209,6 +6398,7 @@ mod tests {
     };
     use boom_core::GatewayError;
     use boom_core::TraceApi;
+    use boom_core::trace::SpanAttributeValue;
     use boom_promptlog::{LogPhase, PromptLogEntry, PromptLogStream};
     use futures::StreamExt;
     use serde_json::json;
@@ -7226,6 +7416,52 @@ trace:
         assert!(delta.usage.is_some());
     }
 
+    #[test]
+    fn stream_finish_reasons_error_sentinel_wins() {
+        let mut meta = StreamMetaState::default();
+        meta.finish_reasons.insert(0, "stop".to_string());
+        meta.stream_error = Some(("upstream_error".to_string(), "boom".to_string()));
+        assert_eq!(stream_finish_reasons(&meta), vec!["error".to_string()]);
+    }
+
+    #[test]
+    fn stream_finish_reasons_markerless_is_interrupted() {
+        let meta = StreamMetaState::default();
+        assert_eq!(stream_finish_reasons(&meta), vec!["interrupted".to_string()]);
+    }
+
+    #[test]
+    fn stream_finish_reasons_preserve_choice_order() {
+        let mut meta = StreamMetaState::default();
+        // Inserted out of order — the BTreeMap key is the choice index.
+        meta.finish_reasons.insert(1, "length".to_string());
+        meta.finish_reasons.insert(0, "stop".to_string());
+        assert_eq!(
+            stream_finish_reasons(&meta),
+            vec!["stop".to_string(), "length".to_string()]
+        );
+    }
+
+    #[test]
+    fn raw_extractor_pulls_reasoning_and_tool_call_delta() {
+        let mut extract = sse_raw_data_extractor(new_streamed_response_id_slot());
+        let item = Ok(super::SseItem {
+            event: axum::response::sse::Event::default(),
+            json_data: concat!(
+                r#"{"choices":[{"index":0,"delta":{"reasoning_content":"r","tool_calls":"#,
+                r#"[{"index":0,"id":"c1","function":{"name":"f","arguments":"{\""}}]}}]}"#
+            )
+            .to_string(),
+        });
+        let delta = extract(&item).expect("delta extracted");
+        assert_eq!(delta.reasoning.as_deref(), Some("r"));
+        let call = delta.tool_calls.first().expect("tool call extracted");
+        assert_eq!(call.index, 0);
+        assert_eq!(call.id.as_deref(), Some("c1"));
+        assert_eq!(call.name.as_deref(), Some("f"));
+        assert_eq!(call.arguments.as_deref(), Some("{\""));
+    }
+
     #[tokio::test]
     async fn stream_preserves_chunk_order_and_count() {
         let text_chunk = |content: &str| ChatStreamChunk {
@@ -7517,5 +7753,207 @@ trace:
         drop(logged);
         let metrics = registry.prometheus_text().expect("metrics enabled");
         assert!(!metrics.contains("gen_ai.client.operation.time_to_first_chunk_seconds"));
+    }
+
+    // ---- Task 9: raw capture → span attempts / provider-bound input ----
+
+    #[test]
+    fn map_raw_attempts_numbers_from_one_and_joins_frames() {
+        let cap = boom_core::provider::RawCaptureChannel::default();
+        cap.record_request_body("openai", r#"{"model":"m1"}"#);
+        cap.push_response_frame("f1".to_string());
+        cap.push_response_frame("f2".to_string());
+        cap.record_request_body("azure", r#"{"model":"m2"}"#);
+
+        let attempts = super::map_raw_attempts(&Arc::new(cap));
+
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].attempt, 1);
+        assert_eq!(attempts[1].attempt, 2);
+        assert_eq!(attempts[0].provider, "openai");
+        assert_eq!(attempts[1].provider, "azure");
+        assert_eq!(attempts[0].request_body.as_deref(), Some(r#"{"model":"m1"}"#));
+        assert_eq!(attempts[0].response_body.as_deref(), Some("f1\n\nf2"));
+        assert_eq!(attempts[1].response_body, None);
+    }
+
+    #[test]
+    fn map_raw_attempts_omits_empty_request_body() {
+        let cap = boom_core::provider::RawCaptureChannel::default();
+        cap.push_response_frame("only-frames".to_string());
+
+        let attempts = super::map_raw_attempts(&Arc::new(cap));
+
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].request_body, None, "empty body must not become Some(\"\")");
+        assert_eq!(attempts[0].response_body.as_deref(), Some("only-frames"));
+    }
+
+    fn span_attr(
+        registry: &boom_trace::TraceRegistry,
+        request_id: &str,
+        key: &str,
+    ) -> Option<serde_json::Value> {
+        registry
+            .with_span_mut(request_id, |span| {
+                span.attributes
+                    .iter()
+                    .find(|(k, _)| k == key)
+                    .map(|(_, value)| match value {
+                        SpanAttributeValue::Json(json) => (**json).clone(),
+                        other => panic!("attribute {key} is not JSON: {other:?}"),
+                    })
+            })
+            .expect("active span")
+    }
+
+    #[test]
+    fn stamp_upstream_exchange_skips_provider_bound_on_invalid_json() {
+        let rid = "req-stamp-invalid";
+        let (registry, _guard) = traced_guard(rid);
+        registry.with_span_mut(rid, |span| {
+            span.set_llm_request(
+                Arc::new(json!({
+                    "messages": [{"role": "user", "content": "client"}],
+                    "tools": [{"type": "function", "function": {"name": "weather"}}]
+                })),
+                16 * 1024,
+                true,
+            );
+        });
+        let before = registry
+            .with_span_mut(rid, |span| span.attributes.clone())
+            .expect("active span");
+
+        let cap = Arc::new(boom_core::provider::RawCaptureChannel::default());
+        cap.record_request_body("openai", "not-json");
+        cap.push_response_frame("f1".to_string());
+        super::stamp_upstream_exchange(&registry, rid, &cap, 16 * 1024, false);
+
+        let (attempts, after) = registry
+            .with_span_mut(rid, |span| {
+                (span.upstream_attempts.clone(), span.attributes.clone())
+            })
+            .expect("active span");
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].attempt, 1);
+        assert_eq!(attempts[0].provider, "openai");
+        assert_eq!(attempts[0].request_body.as_deref(), Some("not-json"));
+        assert_eq!(attempts[0].response_body.as_deref(), Some("f1"));
+        assert_eq!(
+            after, before,
+            "an unparseable body must not touch provider-bound input"
+        );
+    }
+
+    #[test]
+    fn stamp_upstream_exchange_refreshes_provider_bound_from_last_parseable_body() {
+        let rid = "req-stamp-valid";
+        let (registry, _guard) = traced_guard(rid);
+        registry.with_span_mut(rid, |span| {
+            span.set_llm_request(
+                Arc::new(json!({"messages": [{"role": "user", "content": "client"}]})),
+                16 * 1024,
+                false,
+            );
+        });
+
+        let cap = Arc::new(boom_core::provider::RawCaptureChannel::default());
+        cap.record_request_body(
+            "openai",
+            r#"{"messages":[{"role":"user","content":"attempt-one"}]}"#,
+        );
+        cap.record_request_body(
+            "azure",
+            r#"{"messages":[{"role":"user","content":"attempt-two"}]}"#,
+        );
+        cap.record_request_body("fallback", "not-json");
+        super::stamp_upstream_exchange(&registry, rid, &cap, 16 * 1024, false);
+
+        let attempts = registry
+            .with_span_mut(rid, |span| span.upstream_attempts.clone())
+            .expect("active span");
+        assert_eq!(attempts.len(), 3, "an unparseable trailing attempt is still recorded");
+        assert_eq!(
+            attempts.iter().map(|a| a.attempt).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+
+        let bound = span_attr(&registry, rid, "gen_ai.input.messages").expect("input messages");
+        assert_eq!(bound[0]["parts"][0]["content"], "attempt-two");
+        let client = span_attr(&registry, rid, "boom-gateway.llm_request").expect("client body");
+        assert_eq!(client["messages"][0]["content"], "client");
+    }
+
+    #[tokio::test]
+    async fn trace_mode_arms_raw_capture_even_with_prompt_log_off() {
+        let state = state_from_yaml(
+            r#"
+server: { port: 18080 }
+general_settings:
+  master_key: __YOUR_API_KEY__
+trace:
+  enabled: true
+  capture_body: true
+"#,
+        )
+        .await;
+        // Empty report filter ⇒ every request with a valid traceparent matches.
+        let headers = headers_with(&[(
+            "traceparent",
+            "00-0af76598164860bd9a43d7c1a31725ab-00f067aa0ba902b7-01",
+        )]);
+        let prep = super::prepare_edge_request(
+            &state,
+            &test_identity(),
+            &headers,
+            &json!({"model": "m", "messages": []}),
+            "m",
+            "/v1/chat/completions",
+            false,
+            "req-trace-raw",
+            "127.0.0.1",
+            [None, None, None],
+            std::time::Instant::now(),
+        )
+        .expect("prep ok");
+        assert!(!prep.prompt_log_should);
+        assert!(
+            prep.raw_capture.is_some(),
+            "traced requests capture the raw exchange"
+        );
+    }
+
+    #[tokio::test]
+    async fn untraced_request_without_prompt_log_captures_nothing() {
+        let state = state_from_yaml(
+            r#"
+server: { port: 18080 }
+general_settings:
+  master_key: __YOUR_API_KEY__
+trace:
+  enabled: true
+  capture_body: true
+"#,
+        )
+        .await;
+        let prep = super::prepare_edge_request(
+            &state,
+            &test_identity(),
+            &HeaderMap::new(),
+            &json!({"model": "m", "messages": []}),
+            "m",
+            "/v1/chat/completions",
+            false,
+            "req-untraced",
+            "127.0.0.1",
+            [None, None, None],
+            std::time::Instant::now(),
+        )
+        .expect("prep ok");
+        assert!(
+            prep.raw_capture.is_none(),
+            "no exported trace ⇒ no raw side channel"
+        );
     }
 }

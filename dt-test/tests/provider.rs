@@ -265,7 +265,7 @@ fn custom_headers_sanitization() {
     headers.insert("X-Request-Id".into(), "deploy-1".into());     // 保留
     headers.insert("api_version".into(), "2024-02-01".into());     // reserved → 丢
     headers.insert("x-gateway-priority".into(), "spoof".into());   // hard-blocked → 丢
-    headers.insert("Authorization".into(), "Bearer leak".into());  // hard-blocked → 丢
+    headers.insert("Authorization".into(), "Bearer __YOUR_TOKEN__".into());  // hard-blocked → 丢
     headers.insert("content-type".into(), "text/plain".into());    // transport → 丢
     headers.insert("bad name".into(), "x".into());                 // invalid name → 丢
     headers.insert("good-but-bad-val".into(), "\u{0}null".into()); // invalid value → 丢
@@ -344,7 +344,7 @@ fn openai_no_key_constructs() {
 /// DT-PRV-LIB-10：Provider trait 基础访问器（name/models/deployment_id/kv_worker_id/client_type_header/custom_headers）。
 #[test]
 fn provider_trait_accessors() {
-    let p = create_full("openai/gpt-4", Some("k".into()), "http://10.0.0.5:8000/v1".into(), &HashMap::new(), &HashMap::new());
+    let p = create_full("openai/gpt-4", Some("k".into()), "http://example.internal/v1".into(), &HashMap::new(), &HashMap::new());
     assert_eq!(p.name(), "openai");
     assert_eq!(p.models().len(), 1);
     assert_eq!(p.models()[0], "gpt-4");
@@ -383,16 +383,16 @@ fn client_type_header_flag_passed() {
 #[test]
 fn kv_worker_id_for_id_only_semantics() {
     // id 优先：有 id 时直接作为 worker 标识（与负载/流控/日志同域）。
-    assert_eq!(kv_worker_id_for(Some("dep-1"), Some("http://10.0.0.5:8000/v1")), Some("dep-1".into()));
+    assert_eq!(kv_worker_id_for(Some("dep-1"), Some("http://example.internal/v1")), Some("dep-1".into()));
     // id trim 后非空才生效，键取 trim 后的值。
-    assert_eq!(kv_worker_id_for(Some("  dep-1  "), Some("http://10.0.0.5:8000/v1")), Some("dep-1".into()));
+    assert_eq!(kv_worker_id_for(Some("  dep-1  "), Some("http://example.internal/v1")), Some("dep-1".into()));
     // 空白 id 视为未填 → 不参与（无 host 兜底）。
-    assert_eq!(kv_worker_id_for(Some("   "), Some("http://10.0.0.5:8000/v1")), None);
+    assert_eq!(kv_worker_id_for(Some("   "), Some("http://example.internal/v1")), None);
     // 参与门：无 api_base（Bedrock/Gemini 形态）即使有 id 也不参与 kvc。
     assert_eq!(kv_worker_id_for(Some("dep-1"), None), None);
     assert_eq!(kv_worker_id_for(Some("dep-1"), Some("  ")), None);
     // 无 id → 不参与（身份缺失降级为负载路由，而非错误身份合并实例）。
-    assert_eq!(kv_worker_id_for(None, Some("http://10.0.0.5:8000/v1")), None);
+    assert_eq!(kv_worker_id_for(None, Some("http://example.internal/v1")), None);
     assert_eq!(kv_worker_id_for(None, None), None);
 }
 
@@ -568,11 +568,11 @@ async fn openai_chat_upstream_error() {
 async fn openai_chat_gateway_headers_and_bearer() {
     let server = MockServer::start().await;
     Mock::given(method("POST")).and(path("/chat/completions"))
-        .and(header("Authorization", "Bearer sk-test"))
+        .and(header("Authorization", "Bearer __YOUR_API_KEY__"))
         .and(header("X-Gateway-Priority", "100"))
         .respond_with(ResponseTemplate::new(200).set_body_json(fake_completion_json()))
         .expect(1).mount(&server).await;
-    let p = create("openai/test-model", Some("sk-test".into()), server.uri());
+    let p = create("openai/test-model", Some("__YOUR_API_KEY__".into()), server.uri());
     let req = request_with_gateway_headers(&[("X-Gateway-Priority", "100")]);
     assert!(p.chat(req).await.is_ok());
 }
@@ -714,15 +714,11 @@ async fn openai_chat_stream_gateway_headers() {
 #[tokio::test]
 async fn openai_chat_raw_capture() {
     use boom_core::provider::SharedRawCapture;
-    use std::sync::Mutex;
     let server = MockServer::start().await;
     Mock::given(method("POST")).and(path("/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(fake_completion_json()))
         .expect(1).mount(&server).await;
-    let cap = Arc::new(boom_core::provider::RawCaptureChannel {
-        request_body: Mutex::new(None),
-        response_frames: Mutex::new(Vec::new()),
-    });
+    let cap = Arc::new(boom_core::provider::RawCaptureChannel::default());
     let mut req = min_request();
     req.raw_capture = Some(cap.clone() as SharedRawCapture);
     let p = create("openai/test-model", None, server.uri());
@@ -782,12 +778,12 @@ async fn anthropic_chat_success() {
 async fn anthropic_chat_headers() {
     let server = MockServer::start().await;
     Mock::given(method("POST")).and(path("/messages"))
-        .and(header("x-api-key", "sk-ant"))
+        .and(header("x-api-key", "__YOUR_API_KEY__"))
         .and(header("anthropic-version", "2023-06-01"))
         .and(header("x-gateway-priority", "100"))
         .respond_with(ResponseTemplate::new(200).set_body_json(fake_anthropic_response()))
         .expect(1).mount(&server).await;
-    let p = create("anthropic/claude-test", Some("sk-ant".into()), server.uri());
+    let p = create("anthropic/claude-test", Some("__YOUR_API_KEY__".into()), server.uri());
     let req = request_with_gateway_headers(&[("x-gateway-priority", "100")]);
     assert!(p.chat(req).await.is_ok());
 }
@@ -1657,6 +1653,9 @@ async fn openai_chat_stream_raw_capture_frames() {
     assert_eq!(n, 1, "one content chunk, [DONE] ends stream");
     let body = cap.take_request_body().expect("request body recorded");
     assert!(body.contains("\"model\":\"test-model\""), "serialized request captured: {body}");
+    let sent: serde_json::Value = serde_json::from_str(&body).expect("captured request is valid JSON");
+    assert_eq!(sent["stream"], true, "wire body must include stream=true");
+    assert_eq!(sent["stream_options"]["include_usage"], true, "wire body must include usage");
     let raw = cap.take_response_body().expect("frames recorded");
     assert!(raw.contains("data: {\"id\":\"1\""), "event frames captured with prefix: {raw}");
     assert!(raw.contains("[DONE]"), "[DONE] frame captured: {raw}");

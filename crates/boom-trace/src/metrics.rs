@@ -474,7 +474,7 @@ mod tests {
         RequestSpan::new(
             "r-metrics".to_string(),
             &make_w3c(),
-            "gpt-4".to_string(),
+            "demo_model".to_string(),
             api_path.to_string(),
             is_stream,
             1_000_000_000,
@@ -497,7 +497,7 @@ mod tests {
         recorder.record_request_done(&span);
 
         let text = recorder.render();
-        let labels = "gen_ai.operation.name=\"chat\",gen_ai.request.model=\"gpt-4\",ai.gateway.target.deployment.id=\"dep-1\"";
+        let labels = "gen_ai.operation.name=\"chat\",gen_ai.request.model=\"demo_model\",ai.gateway.target.deployment.id=\"dep-1\"";
         assert!(text.contains("# TYPE http.server.request.duration_seconds histogram\n"));
         assert!(text.contains(&format!(
             "http.server.request.duration_seconds_count{{{labels}}} 1\n"
@@ -532,7 +532,7 @@ mod tests {
             recorder.record_request_done(&span);
         }
         let text = recorder.render();
-        let labels = "gen_ai.operation.name=\"chat\",gen_ai.request.model=\"gpt-4\"";
+        let labels = "gen_ai.operation.name=\"chat\",gen_ai.request.model=\"demo_model\"";
         assert!(text.contains(&format!(
             "http.server.request.duration_seconds_bucket{{{labels},le=\"0.005\"}} 1\n"
         )));
@@ -554,7 +554,7 @@ mod tests {
         span.finalize_ok(1_005_000_000); // exactly 5ms == the le="0.005" boundary
         recorder.record_request_done(&span);
         let text = recorder.render();
-        let labels = "gen_ai.operation.name=\"chat\",gen_ai.request.model=\"gpt-4\"";
+        let labels = "gen_ai.operation.name=\"chat\",gen_ai.request.model=\"demo_model\"";
         assert!(text.contains(&format!(
             "http.server.request.duration_seconds_bucket{{{labels},le=\"0.005\"}} 1\n"
         )));
@@ -596,7 +596,7 @@ mod tests {
         span.finalize_error(2_000_000_000, "upstream 500".to_string());
         recorder.record_request_done(&span);
         let text = recorder.render();
-        let labels = "gen_ai.operation.name=\"chat\",gen_ai.request.model=\"gpt-4\"";
+        let labels = "gen_ai.operation.name=\"chat\",gen_ai.request.model=\"demo_model\"";
         assert!(text.contains(&format!(
             "http.client.active_requests{{{labels}}} 0\n"
         )));
@@ -605,12 +605,12 @@ mod tests {
     #[test]
     fn server_active_pairs_to_zero() {
         let recorder = MetricsRecorder::new();
-        recorder.add_server_active(1, "gpt-4", "/v1/chat/completions");
-        recorder.add_server_active(-1, "gpt-4", "/v1/chat/completions");
+        recorder.add_server_active(1, "demo_model", "/v1/chat/completions");
+        recorder.add_server_active(-1, "demo_model", "/v1/chat/completions");
         let text = recorder.render();
         assert!(text.contains("# TYPE http.server.active_requests gauge\n"));
         assert!(text.contains(
-            "http.server.active_requests{gen_ai.operation.name=\"chat\",gen_ai.request.model=\"gpt-4\"} 0\n"
+            "http.server.active_requests{gen_ai.operation.name=\"chat\",gen_ai.request.model=\"demo_model\"} 0\n"
         ));
     }
 
@@ -626,7 +626,7 @@ mod tests {
         let mut span = make_span("/v1/chat/completions", false);
         span.finalize_ok(2_000_000_000); // 1s
         recorder.record_request_done(&span);
-        let l = "gen_ai.operation.name=\"chat\",gen_ai.request.model=\"gpt-4\"";
+        let l = "gen_ai.operation.name=\"chat\",gen_ai.request.model=\"demo_model\"";
         let expected = format!(
             concat!(
                 "# HELP http.server.request.duration_seconds Gateway server-side request duration (ingress to response completion).\n",

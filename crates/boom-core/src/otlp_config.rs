@@ -10,7 +10,7 @@
 use serde::{Deserialize, Serialize};
 
 /// OTLP/HTTP exporter config. Used as `prompt_log.otlp` and `trace.otlp`.
-/// Endpoint is OTLP/HTTP base (e.g. `http://otel-collector:4318`); the
+/// Endpoint is OTLP/HTTP base (e.g. `http://example.internal:4318`); the
 /// exporter appends `/v1/logs` or `/v1/traces` itself.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct OtlpConfig {

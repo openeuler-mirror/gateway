@@ -22,6 +22,24 @@ use crate::context::W3cContext;
 use boom_core::trace::{RequestSpan as SpanSnapshot, SpanAttributeValue, SpanStatus};
 use std::sync::Arc;
 
+const INPUT_MESSAGES_KEY: &str = "gen_ai.input.messages";
+const OUTPUT_MESSAGES_KEY: &str = "gen_ai.output.messages";
+const TOOL_DEFINITIONS_KEY: &str = "gen_ai.tool.definitions";
+
+/// One provider call made while serving a request. Bodies are the raw
+/// serialized provider-bound request and the joined response frames; both
+/// are capped by the caller that produced them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpstreamAttempt {
+    /// 1-based attempt number.
+    pub attempt: u32,
+    pub provider: String,
+    /// Raw serialized provider-bound request body.
+    pub request_body: Option<String>,
+    /// Response frames joined with `\n\n`.
+    pub response_body: Option<String>,
+}
+
 /// One in-flight or finalized request span. The lifetime is bound to a
 /// request_id — `TraceRegistry::start_request` returns a `RequestSpan`
 /// already inserted into the active map; `finalize` removes it and (if
@@ -72,6 +90,9 @@ pub struct RequestSpan {
     /// inbound request carried a valid traceparent AND matched the report
     /// filter are exported as traces. Metrics record regardless.
     pub export_eligible: bool,
+    /// Per-attempt upstream call records (raw bodies included), consumed by
+    /// the OTLP attempt events and the raw-capture route.
+    pub upstream_attempts: Vec<UpstreamAttempt>,
 }
 
 impl RequestSpan {
@@ -116,6 +137,7 @@ impl RequestSpan {
             upstream_end_ns: None,
             response_model: None,
             export_eligible,
+            upstream_attempts: Vec::new(),
         }
     }
 
@@ -154,15 +176,81 @@ impl RequestSpan {
     /// PromptLogEntry); bigger bodies are stored as a truncated owned String
     /// so the span never pins a MB-scale allocation through the active map,
     /// recent ring and OTLP queue.
-    pub fn set_llm_request(&mut self, body: Arc<serde_json::Value>, max_body_bytes: usize) {
+    pub fn set_llm_request(
+        &mut self,
+        body: Arc<serde_json::Value>,
+        max_body_bytes: usize,
+        capture_tool_details: bool,
+    ) {
         if let Some(messages) = crate::genai::convert_input_messages(
             &self.api_path,
             body.as_ref(),
             max_body_bytes,
         ) {
-            self.set_structured_attribute("gen_ai.input.messages", messages);
+            self.set_structured_attribute(INPUT_MESSAGES_KEY, messages.messages);
+            self.stamp_truncation(
+                INPUT_MESSAGES_KEY,
+                messages.original_bytes,
+                messages.truncated,
+                messages.omitted_bytes,
+            );
+        }
+        if let Some(definitions) =
+            crate::genai::convert_tool_definitions(body.as_ref(), capture_tool_details)
+        {
+            self.set_structured_attribute(TOOL_DEFINITIONS_KEY, definitions);
         }
         self.set_body_attribute("boom-gateway.llm_request", body, max_body_bytes);
+    }
+
+    /// Re-derive `gen_ai.input.messages` (+markers) and `gen_ai.tool.definitions`
+    /// from the provider-bound body. The client-facing
+    /// `boom-gateway.llm_request` attribute is left untouched: it records what
+    /// the caller sent, not what the gateway assembled for the provider.
+    pub fn set_provider_bound_request(
+        &mut self,
+        body: Arc<serde_json::Value>,
+        max_body_bytes: usize,
+        capture_tool_details: bool,
+    ) {
+        match crate::genai::convert_input_messages(
+            &self.api_path,
+            body.as_ref(),
+            max_body_bytes,
+        ) {
+            Some(messages) => {
+                self.set_structured_attribute(INPUT_MESSAGES_KEY, messages.messages);
+                self.stamp_truncation(
+                    INPUT_MESSAGES_KEY,
+                    messages.original_bytes,
+                    messages.truncated,
+                    messages.omitted_bytes,
+                );
+            }
+            None => {
+                self.remove_attribute(INPUT_MESSAGES_KEY);
+                self.clear_truncation_markers(INPUT_MESSAGES_KEY);
+            }
+        }
+        match crate::genai::convert_tool_definitions(body.as_ref(), capture_tool_details) {
+            Some(definitions) => self.set_structured_attribute(TOOL_DEFINITIONS_KEY, definitions),
+            None => self.remove_attribute(TOOL_DEFINITIONS_KEY),
+        }
+    }
+
+    /// Replace the per-attempt records and add their payload sizes to the
+    /// OTLP queue byte estimate so the budget accounts for them.
+    pub fn record_upstream_attempts(&mut self, attempts: Vec<UpstreamAttempt>) {
+        let serialized: usize = attempts
+            .iter()
+            .map(|a| {
+                a.provider.len()
+                    + a.request_body.as_ref().map_or(0, String::len)
+                    + a.response_body.as_ref().map_or(0, String::len)
+            })
+            .sum();
+        self.body_bytes = self.body_bytes.saturating_add(serialized);
+        self.upstream_attempts = attempts;
     }
 
     /// Set the `boom-gateway.llm_response` body attribute. Same retention
@@ -174,7 +262,13 @@ impl RequestSpan {
             self.is_stream,
             max_body_bytes,
         ) {
-            self.set_structured_attribute("gen_ai.output.messages", messages);
+            self.set_structured_attribute(OUTPUT_MESSAGES_KEY, messages.messages);
+            self.stamp_truncation(
+                OUTPUT_MESSAGES_KEY,
+                messages.original_bytes,
+                messages.truncated,
+                messages.omitted_bytes,
+            );
         }
         self.set_body_attribute("boom-gateway.llm_response", body, max_body_bytes);
     }
@@ -228,6 +322,38 @@ impl RequestSpan {
                 );
             }
         }
+    }
+
+    fn stamp_truncation(
+        &mut self,
+        key: &str,
+        original_bytes: usize,
+        truncated: bool,
+        omitted_bytes: usize,
+    ) {
+        if truncated {
+            self.set_attribute(&format!("{key}.truncated"), SpanAttributeValue::Bool(true));
+            self.set_attribute(
+                &format!("{key}.original_bytes"),
+                SpanAttributeValue::Int(original_bytes as i64),
+            );
+            self.set_attribute(
+                &format!("{key}.omitted_bytes"),
+                SpanAttributeValue::Int(omitted_bytes as i64),
+            );
+        } else {
+            self.clear_truncation_markers(key);
+        }
+    }
+
+    fn clear_truncation_markers(&mut self, key: &str) {
+        for suffix in ["truncated", "original_bytes", "omitted_bytes"] {
+            self.remove_attribute(&format!("{key}.{suffix}"));
+        }
+    }
+
+    fn remove_attribute(&mut self, key: &str) {
+        self.attributes.retain(|(k, _)| k != key);
     }
 
     /// Conservative in-memory size estimate used by the OTLP queue byte
@@ -433,7 +559,7 @@ mod tests {
         let span = RequestSpan::new(
             "req-1".to_string(),
             &w3c,
-            "gpt-4".to_string(),
+            "demo_model".to_string(),
             "/v1/chat/completions".to_string(),
             false,
             1_000_000_000,
@@ -514,7 +640,7 @@ mod tests {
             true,
         );
         let req = Arc::new(serde_json::json!({"messages": []}));
-        span.set_llm_request(req.clone(), 16 * 1024);
+        span.set_llm_request(req.clone(), 16 * 1024, false);
         assert!(std::sync::Arc::strong_count(&req) >= 2);
         match &span.attributes[0].1 {
             SpanAttributeValue::Json(v) => assert_eq!(**v, serde_json::json!({"messages": []})),
@@ -537,7 +663,7 @@ mod tests {
         // Body whose serialized form exceeds the 64-byte cap.
         let big = "x".repeat(200);
         let req = Arc::new(serde_json::json!({"prompt": big}));
-        span.set_llm_request(req, 64);
+        span.set_llm_request(req, 64, false);
         let body_attr = span
             .attributes
             .iter()
@@ -583,7 +709,7 @@ mod tests {
         );
         let big = "x".repeat(10_000);
         let req = Arc::new(serde_json::json!({"prompt": big}));
-        span.set_llm_request(req, 0);
+        span.set_llm_request(req, 0, false);
         assert!(matches!(
             span.attributes[0].1,
             SpanAttributeValue::Json(_)
@@ -606,6 +732,7 @@ mod tests {
         span.set_llm_request(
             Arc::new(serde_json::json!({"messages": [{"role": "user", "content": "hello"}]})),
             16 * 1024,
+            false,
         );
         let bigger = span.estimated_bytes();
         assert!(bigger > small);
@@ -623,6 +750,7 @@ mod tests {
         span2.set_llm_request(
             Arc::new(serde_json::json!({"prompt": "x".repeat(10_000)})),
             64,
+            false,
         );
         assert!(span2.estimated_bytes() < small + 64 + 512);
     }
@@ -688,5 +816,152 @@ mod genai_attribute_tests {
         assert!(span.provider_type.is_none());
         span.set_provider_type("demo_provider".to_string());
         assert_eq!(span.provider_type.as_deref(), Some("demo_provider"));
+    }
+
+    fn make_span(api_path: &str) -> RequestSpan {
+        let w3c = make_w3c();
+        RequestSpan::new(
+            "r-genai".to_string(),
+            &w3c,
+            "m".to_string(),
+            api_path.to_string(),
+            false,
+            0,
+            true,
+        )
+    }
+
+    fn json_attr(span: &RequestSpan, key: &str) -> Option<serde_json::Value> {
+        span.attributes
+            .iter()
+            .find(|(k, _)| k == key)
+            .and_then(|(_, v)| match v {
+                SpanAttributeValue::Json(value) => Some((**value).clone()),
+                _ => None,
+            })
+    }
+
+    fn marker<'a>(span: &'a RequestSpan, key: &str) -> Option<&'a SpanAttributeValue> {
+        span.attributes
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v)
+    }
+
+    #[test]
+    fn tool_definitions_respect_details_flag() {
+        let body = Arc::new(serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {"name": "weather", "description": "d"}}]
+        }));
+        let mut without_details = make_span("/v1/chat/completions");
+        without_details.set_llm_request(body.clone(), 16 * 1024, false);
+        assert_eq!(
+            json_attr(&without_details, "gen_ai.tool.definitions"),
+            Some(serde_json::json!([{"type": "function", "name": "weather"}]))
+        );
+        let mut with_details = make_span("/v1/chat/completions");
+        with_details.set_llm_request(body, 16 * 1024, true);
+        assert_eq!(
+            json_attr(&with_details, "gen_ai.tool.definitions"),
+            Some(serde_json::json!([{"type": "function", "name": "weather", "description": "d"}]))
+        );
+    }
+
+    #[test]
+    fn trimming_stamps_marker_attributes() {
+        let body = Arc::new(serde_json::json!({
+            "messages": [{"role": "user", "content": "x".repeat(500)}]
+        }));
+        let mut span = make_span("/v1/chat/completions");
+        span.set_llm_request(body, 64, false);
+        assert!(matches!(
+            marker(&span, "gen_ai.input.messages.truncated"),
+            Some(SpanAttributeValue::Bool(true))
+        ));
+        assert!(matches!(
+            marker(&span, "gen_ai.input.messages.original_bytes"),
+            Some(SpanAttributeValue::Int(n)) if *n > 0
+        ));
+        assert!(matches!(
+            marker(&span, "gen_ai.input.messages.omitted_bytes"),
+            Some(SpanAttributeValue::Int(n)) if *n > 0
+        ));
+
+        let mut under_budget = make_span("/v1/chat/completions");
+        under_budget.set_llm_request(
+            Arc::new(serde_json::json!({"messages": [{"role": "user", "content": "hi"}]})),
+            16 * 1024,
+            false,
+        );
+        for key in [
+            "gen_ai.input.messages.truncated",
+            "gen_ai.input.messages.original_bytes",
+            "gen_ai.input.messages.omitted_bytes",
+        ] {
+            assert!(marker(&under_budget, key).is_none(), "{key} must be absent");
+        }
+    }
+
+    #[test]
+    fn provider_bound_refresh_overwrites_input_messages_only() {
+        let client_body = Arc::new(serde_json::json!({
+            "messages": [{"role": "user", "content": "client"}],
+            "tools": [{"type": "function", "function": {"name": "weather"}}]
+        }));
+        let bound_body = Arc::new(serde_json::json!({
+            "messages": [{"role": "user", "content": "bound"}]
+        }));
+        let mut span = make_span("/v1/chat/completions");
+        span.set_llm_request(client_body.clone(), 16 * 1024, true);
+        span.set_provider_bound_request(bound_body, 16 * 1024, true);
+        let messages = json_attr(&span, "gen_ai.input.messages").expect("input messages");
+        assert_eq!(messages[0]["parts"][0]["content"], "bound");
+        assert_eq!(
+            json_attr(&span, "boom-gateway.llm_request"),
+            Some((*client_body).clone())
+        );
+        assert!(
+            marker(&span, "gen_ai.tool.definitions").is_none(),
+            "stale tool definitions must be cleared"
+        );
+
+        let mut stale = make_span("/v1/chat/completions");
+        stale.set_llm_request(
+            Arc::new(serde_json::json!({"messages": [{"role": "user", "content": "x".repeat(500)}]})),
+            64,
+            false,
+        );
+        assert!(marker(&stale, "gen_ai.input.messages.truncated").is_some());
+        stale.set_provider_bound_request(
+            Arc::new(serde_json::json!({"messages": [{"role": "user", "content": "hi"}]})),
+            16 * 1024,
+            false,
+        );
+        for key in [
+            "gen_ai.input.messages.truncated",
+            "gen_ai.input.messages.original_bytes",
+            "gen_ai.input.messages.omitted_bytes",
+        ] {
+            assert!(marker(&stale, key).is_none(), "stale {key} must be cleared");
+        }
+    }
+
+    #[test]
+    fn record_upstream_attempts_grows_estimated_bytes() {
+        let mut span = make_span("/v1/chat/completions");
+        let before = span.estimated_bytes();
+        span.record_upstream_attempts(vec![UpstreamAttempt {
+            attempt: 1,
+            provider: "demo_provider".to_string(),
+            request_body: Some("{\"model\":\"demo_model\"}".to_string()),
+            response_body: Some("{\"id\":\"resp\"}".to_string()),
+        }]);
+        assert_eq!(span.upstream_attempts.len(), 1);
+        assert_eq!(span.upstream_attempts[0].attempt, 1);
+        assert_eq!(span.upstream_attempts[0].provider, "demo_provider");
+        assert!(span.estimated_bytes() > before);
+        span.record_upstream_attempts(Vec::new());
+        assert!(span.upstream_attempts.is_empty());
     }
 }
