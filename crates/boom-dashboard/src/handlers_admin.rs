@@ -287,11 +287,23 @@ pub async fn upsert_plan(
         ));
     }
 
-    // Persist to DB via PlanStore.
+    // Persist to DB via PlanStore. A write failure must not be reported as
+    // success: the plan would silently keep running on its previous limits and
+    // only "revert" on the next refresh. `upsert_plan_db` touches the in-memory
+    // store only after the DB write succeeds, so bailing out here leaves no
+    // inconsistent state behind.
     if let Some(ref pool) = state.db_pool {
-        if let Err(e) = state.plan_store.upsert_plan_db(pool, &plan).await {
-            tracing::error!("Failed to persist plan to DB: {}", e);
-        }
+        state
+            .plan_store
+            .upsert_plan_db(pool, &plan)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to persist plan to DB: {}", e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": "Failed to persist plan" })),
+                )
+            })?;
     } else {
         state.plan_store.upsert_plan(plan);
     }
