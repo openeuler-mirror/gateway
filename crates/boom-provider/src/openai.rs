@@ -178,6 +178,7 @@ pub struct OpenAIProvider {
     custom_headers: Vec<(String, String)>,
     max_context_tokens: Option<u64>,
     request_defaults: serde_json::Map<String, serde_json::Value>,
+    provider_type: Option<String>,
 }
 
 impl OpenAIProvider {
@@ -225,6 +226,7 @@ impl OpenAIProvider {
             custom_headers: Vec::new(),
             max_context_tokens,
             request_defaults: serde_json::Map::new(),
+            provider_type: None,
         }
     }
 
@@ -235,6 +237,12 @@ impl OpenAIProvider {
 
     pub fn with_request_defaults(mut self, defaults: serde_json::Map<String, serde_json::Value>) -> Self {
         self.request_defaults = defaults;
+        self
+    }
+
+    /// Preserve the provider type parsed from the deployment model string.
+    pub fn with_provider_type(mut self, provider_type: &str) -> Self {
+        self.provider_type = Some(provider_type.to_string());
         self
     }
 
@@ -594,6 +602,10 @@ impl Provider for OpenAIProvider {
 
     fn name(&self) -> &str {
         "openai"
+    }
+
+    fn provider_type(&self) -> &str {
+        self.provider_type.as_deref().unwrap_or("openai")
     }
 
     fn protocol(&self) -> ProviderProtocol {

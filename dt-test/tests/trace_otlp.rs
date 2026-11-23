@@ -401,12 +401,14 @@ fn convert_span_maps_ids_status_and_attributes() {
     );
     span.set_deployment_id("dep-7".into());
     span.trace_state = "vendor=1".to_string();
+    span.set_ttft_ms(250);
+    span.set_provider_type("volcengine".to_string());
     span.set_attribute("k.str", SpanAttributeValue::String("v".into()));
     span.set_attribute("k.int", SpanAttributeValue::Int(7));
     span.set_attribute("k.bool", SpanAttributeValue::Bool(true));
     span.set_attribute("k.dup", SpanAttributeValue::Int(1));
     span.set_attribute("k.dup", SpanAttributeValue::Int(2)); // 覆盖旧值
-    span.set_llm_request(Arc::new(serde_json::json!({"messages": [1]})), 0);
+    span.set_llm_request(Arc::new(serde_json::json!({"messages": [{"role": "user", "content": "hello"}]})), 0);
     span.finalize_ok(2_000_000_000);
 
     let rs = convert_span_to_resource_spans(&span, &empty_resource(), 0);
@@ -439,6 +441,10 @@ fn convert_span_maps_ids_status_and_attributes() {
         other => panic!("model wrong: {other:?}"),
     }
     assert!(matches!(attr(&rs, "boom-gateway.is_stream"), Some(OtlpAnyValue::BoolValue(true))));
+    assert!(matches!(attr(&rs, "gen_ai.request.stream"), Some(OtlpAnyValue::BoolValue(true))));
+    assert!(matches!(attr(&rs, "gen_ai.response.time_to_first_chunk"), Some(OtlpAnyValue::DoubleValue(v)) if (*v - 0.25).abs() < f64::EPSILON));
+    assert!(matches!(attr(&rs, "gen_ai.provider.name"), Some(OtlpAnyValue::StringValue(v)) if v == "volcengine"));
+    assert!(matches!(attr(&rs, "gen_ai.input.messages"), Some(OtlpAnyValue::ArrayValue(_))));
     assert!(matches!(attr(&rs, "boom-gateway.deployment_id"),
         Some(OtlpAnyValue::StringValue(v)) if v == "dep-7"));
     assert!(matches!(attr(&rs, "boom-gateway.trace_state"),
@@ -471,6 +477,7 @@ fn convert_span_maps_ids_status_and_attributes() {
     let st = rs_err.scope_spans[0].spans[0].status.as_ref().unwrap();
     assert_eq!(st.code, 2);
     assert_eq!(st.message, "boom");
+    assert!(matches!(attr(&rs_err, "error.type"), Some(OtlpAnyValue::StringValue(v)) if v == "_OTHER"));
 }
 
 /// DT-OTLP-11：resource 挂载 service.name / service.version（Some/None 两态）。

@@ -88,6 +88,8 @@ pub struct PromptLogStream<S, F> {
     /// land on a dead span. Sharing the Arc keeps stream paths zero-copy
     /// with the prompt log entry.
     response_sink: Option<Arc<dyn Fn(&Arc<serde_json::Value>) + Send + Sync>>,
+    /// Observes in-band upstream failures before the inner stream is dropped.
+    failure_sink: Option<Arc<dyn Fn(&serde_json::Value) + Send + Sync>>,
 }
 
 impl<S: Unpin, F: Unpin> Unpin for PromptLogStream<S, F> {}
@@ -115,6 +117,7 @@ impl<S, F> PromptLogStream<S, F> {
             delta_fn,
             entry_enricher: None,
             response_sink: None,
+            failure_sink: None,
         }
     }
 
@@ -144,6 +147,7 @@ impl<S, F> PromptLogStream<S, F> {
             delta_fn,
             entry_enricher: None,
             response_sink: None,
+            failure_sink: None,
         }
     }
 
@@ -162,6 +166,15 @@ impl<S, F> PromptLogStream<S, F> {
         sink: Arc<dyn Fn(&Arc<serde_json::Value>) + Send + Sync>,
     ) -> Self {
         self.response_sink = Some(sink);
+        self
+    }
+
+    /// Attach an observer called once for `StreamEnd::Failed`, before inner drop.
+    pub fn with_failure_sink(
+        mut self,
+        sink: Arc<dyn Fn(&serde_json::Value) + Send + Sync>,
+    ) -> Self {
+        self.failure_sink = Some(sink);
         self
     }
 }
@@ -205,6 +218,12 @@ impl<S, F> Drop for PromptLogStream<S, F> {
         let response = Arc::new(response);
         if let Some(sink) = self.response_sink.take() {
             sink(&response);
+        }
+
+        if matches!(&self.end_state, Some(StreamEnd::Failed)) {
+            if let (Some(sink), Some(error)) = (self.failure_sink.take(), self.stream_error.as_ref()) {
+                sink(error);
+            }
         }
 
         // Nested provider streams finalize their trace state on drop. Runs
@@ -674,5 +693,82 @@ mod tests {
 
         assert!(dropped.load(Ordering::SeqCst), "inner stream still drops");
         assert!(sink_ran.load(Ordering::SeqCst), "sink must run");
+    }
+
+    struct FailingDropStream {
+        dropped: Arc<AtomicBool>,
+        yielded: bool,
+    }
+
+    impl Stream for FailingDropStream {
+        type Item = FakeChunk;
+
+        fn poll_next(mut self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            if self.yielded {
+                return Poll::Ready(None);
+            }
+            self.yielded = true;
+            Poll::Ready(Some(FakeChunk {
+                content: Some("partial".to_string()),
+                finish_reason: None,
+                usage: None,
+                error: Some(serde_json::json!({"code": "upstream_error", "message": "boom"})),
+            }))
+        }
+    }
+
+    impl Drop for FailingDropStream {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn failure_sink_runs_once_for_failed_before_inner_drop() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (tx, _rx) = mpsc::channel(64);
+        let sink_dropped = dropped.clone();
+        let sink_calls = calls.clone();
+        let mut wrapper = PromptLogStream::new(
+            FailingDropStream { dropped: dropped.clone(), yielded: false },
+            counting_sender(tx),
+            make_request_entry("req-failure-sink"),
+            extractor,
+        )
+        .with_failure_sink(Arc::new(move |error| {
+            assert_eq!(error["code"], "upstream_error");
+            assert!(!sink_dropped.load(Ordering::SeqCst), "failure sink must run before inner drop");
+            sink_calls.fetch_add(1, Ordering::SeqCst);
+        }));
+        let _ = wrapper.next().await;
+        drop(wrapper);
+        assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn failure_sink_is_not_called_for_finished_stream() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (tx, _rx) = mpsc::channel(64);
+        let sink_calls = calls.clone();
+        let chunks = vec![FakeChunk {
+            content: Some("done".to_string()),
+            finish_reason: Some("stop".to_string()),
+            usage: None,
+            error: None,
+        }];
+        let mut wrapper = PromptLogStream::new(
+            stream::iter(chunks),
+            counting_sender(tx),
+            make_request_entry("req-finished-sink"),
+            extractor,
+        )
+        .with_failure_sink(Arc::new(move |_| {
+            sink_calls.fetch_add(1, Ordering::SeqCst);
+        }));
+        while wrapper.next().await.is_some() {}
+        drop(wrapper);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 }

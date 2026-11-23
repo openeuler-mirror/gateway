@@ -72,6 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         endpoint: args.otlp_endpoint.clone(),
         service_name: args.service_name.clone(),
         service_version: args.service_version.clone(),
+        environment: None,
         timeout_secs: args.timeout_secs,
         batch_size: args.batch_size,
         flush_interval_secs: args.flush_interval_secs,

@@ -266,6 +266,11 @@ pub trait Provider: Send + Sync + 'static {
     /// Provider identifier (e.g. "openai", "anthropic").
     fn name(&self) -> &str;
 
+    /// Raw deployment provider type used for `gen_ai.provider.name`.
+    fn provider_type(&self) -> &str {
+        self.name()
+    }
+
     /// Upstream API protocol implemented by this provider.
     fn protocol(&self) -> ProviderProtocol {
         ProviderProtocol::Native
@@ -430,5 +435,37 @@ mod raw_capture_tests {
         let cap = RawCaptureChannel::default();
         assert_eq!(cap.take_request_body(), None);
         assert_eq!(cap.take_response_body(), None);
+    }
+}
+
+
+#[cfg(test)]
+mod provider_type_tests {
+    use super::*;
+
+    struct FakeProvider;
+
+    #[async_trait]
+    impl Provider for FakeProvider {
+        async fn chat(&self, _request: ChatCompletionRequest) -> Result<ChatCompletionResponse, GatewayError> {
+            unimplemented!()
+        }
+
+        async fn chat_stream(&self, _request: ChatCompletionRequest) -> Result<ChatStream, GatewayError> {
+            unimplemented!()
+        }
+
+        fn name(&self) -> &str {
+            "fake"
+        }
+
+        fn models(&self) -> &[String] {
+            &[]
+        }
+    }
+
+    #[test]
+    fn provider_type_defaults_to_name() {
+        assert_eq!(FakeProvider.provider_type(), "fake");
     }
 }

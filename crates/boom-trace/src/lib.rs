@@ -87,6 +87,7 @@
 
 pub mod context;
 pub mod guard;
+pub mod genai;
 pub mod metrics;
 #[cfg(feature = "otlp")]
 pub mod otlp_export;

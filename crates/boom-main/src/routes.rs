@@ -56,7 +56,7 @@ fn write_prompt_log_error(
     // Mark the trace span as ending in error (does not short-circuit — we
     // still write prompt log entries below when should_capture is on).
     if let Some(g) = trace_guard {
-        g.mark_error(error.to_string());
+        g.mark_error(error.error_type().to_string(), error.to_string());
     }
     if !should_capture {
         return;
@@ -131,6 +131,12 @@ fn write_prompt_log_error(
     };
     response_entry.set_error(error_code, error.to_string());
     state.prompt_log_writer.send(response_entry);
+}
+
+fn mark_trace_error(trace_guard: &mut Option<TraceGuard>, error: &GatewayError) {
+    if let Some(g) = trace_guard.as_mut() {
+        g.mark_error(error.error_type().to_string(), error.to_string());
+    }
 }
 
 /// Extract client IP from request headers with TCP fallback.
@@ -258,6 +264,7 @@ async fn acquire_fc_guard<E>(
     request_id: &str,
     client_ip: Option<String>,
     user_tags: UserTags,
+    trace_guard: &mut Option<TraceGuard>,
     err_wrap: impl Fn(GatewayError, bool) -> E,
 ) -> Result<Option<boom_flowcontrol::FlowControlGuard>, E> {
     match state.flow_controller.acquire(deployment_id, context_chars, timeout, is_vip, key_alias, fc_key_hash, fc_model).await {
@@ -269,6 +276,7 @@ async fn acquire_fc_guard<E>(
                 waiters,
                 message: format!("Deployment '{}' flow control queue timeout — too many concurrent requests", deployment_id),
             };
+            mark_trace_error(trace_guard, &e);
             log_error_with_queue_wait(
                 state, identity, model, api_path, is_stream, start, &e,
                 Some(request_id.to_string()), Some(deployment_id.to_string()),
@@ -286,6 +294,7 @@ async fn acquire_fc_guard<E>(
                 scope_id: None,
                 plan_name: None,
             };
+            mark_trace_error(trace_guard, &e);
             log_error(state, identity, model, api_path, is_stream, start, &e, Some(request_id.to_string()), Some(deployment_id.to_string()), None, client_ip, user_tags);
             Err(err_wrap(e, is_stream))
         }
@@ -482,6 +491,114 @@ impl UsageTrackerState {
     }
 }
 
+
+#[derive(Default, Clone)]
+struct StreamMetaState {
+    first_content_at: Option<Instant>,
+    response_id: Option<String>,
+    response_model: Option<String>,
+    finish_reasons: std::collections::BTreeMap<u32, String>,
+    stream_error: Option<(String, String)>,
+}
+
+type StreamMetaTracker = Arc<std::sync::Mutex<StreamMetaState>>;
+
+fn chunk_has_valid_content(chunk: &ChatStreamChunk) -> bool {
+    chunk.choices.iter().any(|choice| {
+        let delta = &choice.delta;
+        delta.content.as_ref().is_some_and(|content| !content.is_empty())
+            || delta
+                .reasoning_content
+                .as_ref()
+                .is_some_and(|content| !content.is_empty())
+            || delta.tool_calls.as_ref().is_some_and(|calls| {
+                calls.iter().any(|call| {
+                    call.function.as_ref().is_some_and(|function| {
+                        function.name.as_ref().is_some_and(|name| !name.is_empty())
+                            || function
+                                .arguments
+                                .as_ref()
+                                .is_some_and(|arguments| !arguments.is_empty())
+                    })
+                })
+            })
+    })
+}
+
+fn note_stream_response_id(tracker: &StreamMetaTracker, response_id: &str) {
+    if response_id.is_empty() {
+        return;
+    }
+    if let Ok(mut state) = tracker.lock() {
+        if state.response_id.is_none() {
+            state.response_id = Some(response_id.to_string());
+        }
+    }
+}
+
+fn note_stream_chunk_meta(tracker: &StreamMetaTracker, chunk: &ChatStreamChunk) {
+    let Ok(mut state) = tracker.lock() else {
+        return;
+    };
+    if state.first_content_at.is_none() && chunk_has_valid_content(chunk) {
+        state.first_content_at = Some(Instant::now());
+    }
+    if state.response_id.is_none() && !chunk.id.is_empty() {
+        state.response_id = Some(chunk.id.clone());
+    }
+    if state.response_model.is_none() && !chunk.model.is_empty() {
+        state.response_model = Some(chunk.model.clone());
+    }
+    for choice in &chunk.choices {
+        if let Some(reason) = choice.finish_reason.as_ref().filter(|reason| !reason.is_empty()) {
+            state
+                .finish_reasons
+                .entry(choice.index)
+                .or_insert_with(|| reason.clone());
+        }
+    }
+}
+
+fn note_stream_error(tracker: &StreamMetaTracker, error_type: &str, message: String) {
+    if let Ok(mut state) = tracker.lock() {
+        if state.stream_error.is_none() {
+            state.stream_error = Some((error_type.to_string(), message));
+        }
+    }
+}
+
+/// Stable, low-cardinality `error.type` for an in-stream upstream failure.
+///
+/// The failure sentinel is assembled from provider-controlled `code`/`type`
+/// fields, so forwarding them verbatim would let arbitrary upstream values
+/// become the span attribute / metric label. R6 requires a bounded
+/// vocabulary, so mirror `boom_promptlog::entry::error_code::from_stream_sentinel`:
+/// only the known `timeout` class survives; every other provider failure
+/// merges into `upstream_error`, the same value `GatewayError::error_type()`
+/// reports for typed failures.
+fn stable_stream_error_type(error: &serde_json::Value) -> &'static str {
+    let code = error
+        .get("code")
+        .or_else(|| error.get("type"))
+        .and_then(serde_json::Value::as_str);
+    match code {
+        Some("timeout") => "timeout",
+        _ => "upstream_error",
+    }
+}
+
+fn stream_failure_sink(
+    tracker: StreamMetaTracker,
+) -> Arc<dyn Fn(&serde_json::Value) + Send + Sync> {
+    Arc::new(move |error| {
+        let message = error
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| error.to_string());
+        note_stream_error(&tracker, stable_stream_error_type(error), message);
+    })
+}
 /// Wrapper stream that writes the request log when dropped (i.e. when the
 /// stream has been fully consumed or the connection is torn down).
 /// This captures the *real* duration for streaming requests instead of
@@ -511,6 +628,7 @@ struct LoggedStream<S> {
     /// Moved into the stream wrapper on the streaming path so the span's
     /// end_time is the actual stream-end time (not handler-return time).
     trace_guard: Option<boom_trace::TraceGuard>,
+    stream_meta: Option<StreamMetaTracker>,
 }
 
 impl<S> LoggedStream<S> {
@@ -535,6 +653,7 @@ impl<S> LoggedStream<S> {
             plan_charge: None,
             provider_billing: None,
             trace_guard: None,
+            stream_meta: None,
         }
     }
 
@@ -559,6 +678,11 @@ impl<S> LoggedStream<S> {
         self.trace_guard = Some(guard);
         self
     }
+
+    fn with_stream_meta(mut self, tracker: StreamMetaTracker) -> Self {
+        self.stream_meta = Some(tracker);
+        self
+    }
 }
 
 impl<S> Drop for LoggedStream<S> {
@@ -578,10 +702,29 @@ impl<S> Drop for LoggedStream<S> {
         // attributes before the trace guard's own Drop (fields drop after
         // this method) finalizes the span — this is where TTFT / chunk
         // stats / upstream end / final usage become known.
-        if let Some(g) = self.trace_guard.as_ref() {
+        let stream_meta = self.stream_meta.as_ref().and_then(|tracker| {
+            tracker.lock().ok().map(|state| state.clone())
+        });
+        if let Some(g) = self.trace_guard.as_mut() {
             g.set_duration_ms(self.start.elapsed().as_millis() as u64);
-            if let Some(first) = self.first_token_at {
-                g.set_ttft_ms((first - self.start).as_millis() as u64);
+            if let Some(meta) = stream_meta {
+                if let Some(first) = meta.first_content_at {
+                    g.set_ttft_ms((first - self.start).as_millis() as u64);
+                }
+                let finish_reasons = if meta.stream_error.is_some() {
+                    vec!["error".to_string()]
+                } else {
+                    meta.finish_reasons.values().cloned().collect::<Vec<_>>()
+                };
+                stamp_response_metadata(
+                    g,
+                    meta.response_id.as_deref().unwrap_or(""),
+                    meta.response_model.as_deref().unwrap_or(""),
+                    &finish_reasons,
+                );
+                if let Some((error_type, message)) = meta.stream_error {
+                    g.mark_error(error_type, message);
+                }
             }
             let gen_ms = match (self.first_token_at, self.last_chunk_at) {
                 (Some(f), Some(l)) => (l - f).as_millis() as u64,
@@ -721,11 +864,58 @@ fn stamp_gen_ai_usage_attrs(g: &boom_trace::TraceGuard, u: &PreferredUsage) {
         g.set_attribute("gen_ai.usage.cache_read.input_tokens", V::Int(i64::from(v)));
     }
     if let Some(v) = u.cache_creation_input_tokens {
-        g.set_attribute("gen_ai.usage.cache_creation.input_tokens", V::Int(i64::from(v)));
+        g.set_attribute("gen_ai.usage.cache_write.input_tokens", V::Int(i64::from(v)));
     }
     if let Some(v) = u.reasoning_tokens {
         g.set_attribute("gen_ai.usage.reasoning.output_tokens", V::Int(i64::from(v)));
     }
+}
+
+fn stamp_response_metadata(
+    g: &boom_trace::TraceGuard,
+    response_id: &str,
+    response_model: &str,
+    finish_reasons: &[String],
+) {
+    if !response_id.trim().is_empty() {
+        g.set_response_id(response_id);
+    }
+    if !response_model.trim().is_empty() {
+        g.set_response_model(response_model);
+    }
+    if !finish_reasons.is_empty() {
+        g.set_response_finish_reasons(finish_reasons);
+    }
+}
+
+fn stamp_responses_nonstream_metadata(
+    g: &boom_trace::TraceGuard,
+    upstream: &ChatCompletionResponse,
+    public: &boom_core::responses::ResponseObject,
+) {
+    let finish_reasons = upstream
+        .choices
+        .iter()
+        .filter_map(|choice| choice.finish_reason.clone())
+        .collect::<Vec<_>>();
+    stamp_response_metadata(g, &public.id, &upstream.model, &finish_reasons);
+}
+
+fn stamp_provider_attribution(
+    g: &boom_trace::TraceGuard,
+    provider_type: &str,
+    deployment_id: Option<&str>,
+    response_model: &str,
+) {
+    g.set_provider_type(provider_type);
+    g.set_deployment(
+        deployment_id.map(str::to_string),
+        if response_model.trim().is_empty() {
+            None
+        } else {
+            Some(response_model.to_string())
+        },
+    );
 }
 
 /// Stamp the OpenTelemetry gen_ai sampling params (issue #57) from the typed
@@ -949,6 +1139,7 @@ async fn chat_completions_inner(
     // 1. Model access check (deployment-aware, alias-aware).
     check_model_access(identity, &req.model, &state.router)
         .map_err(|e| {
+            mark_trace_error(&mut trace_guard, &e);
             log_error(&state, &identity, &model, api_path, is_stream, start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()), user_tags.clone());
             GatewayErrorReply(e, false)
         })?;
@@ -989,6 +1180,7 @@ async fn chat_completions_inner(
     )
     .await
     .map_err(|e| {
+            mark_trace_error(&mut trace_guard, &e);
         log_error(&state, &identity, &model, api_path, is_stream, start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()), user_tags.clone());
         GatewayErrorReply(e, false)
     })?;
@@ -1032,6 +1224,7 @@ async fn chat_completions_inner(
                 &resolved_model, Some(&identity.key_hash), input_chars as u64, &[],
             ).ok_or_else(|| {
                 let e = GatewayError::ModelNotFound(resolved_model.clone());
+                mark_trace_error(&mut trace_guard, &e);
                 log_error(&state, &identity, &model, api_path, is_stream, start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()), user_tags.clone());
                 GatewayErrorReply(e, false)
             })?;
@@ -1058,7 +1251,8 @@ async fn chat_completions_inner(
             identity.key_alias.clone(), Some(identity.key_hash.clone()),
             Some(inflight_model.clone()),
             api_path, &identity, &model,
-            is_stream, start, &request_id, Some(client_ip.clone()), user_tags.clone(), GatewayErrorReply,
+            is_stream, start, &request_id, Some(client_ip.clone()), user_tags.clone(),
+            &mut trace_guard, GatewayErrorReply,
         ).await?
     } else {
         None
@@ -1078,7 +1272,7 @@ async fn chat_completions_inner(
     if let Some(g) = trace_guard.as_ref() {
         use boom_core::trace::SpanAttributeValue;
         g.set_attribute("boom-gateway.request.id", SpanAttributeValue::String(request_id.clone()));
-        g.set_deployment(deployment_id.clone(), Some(inflight_model.clone()));
+        stamp_provider_attribution(g, provider.provider_type(), deployment_id.as_deref(), &inflight_model);
         g.set_routing_duration_ms(routing_ms);
         if let Some(qw) = queue_wait_ms {
             g.set_attribute("boom-gateway.time_in_queue", SpanAttributeValue::Int(qw as i64));
@@ -1278,8 +1472,12 @@ async fn chat_completions_inner(
         state.kvc_orchestrator.record_success(&resolved_model, provider.kv_worker_id(), &prefix_bytes);
         // ── Rollback bookkeeping (design §6) — shared single copy. ──
         rb_success_bookkeeping(&state, &identity, &resolved_model, deployment_id.as_deref(), &mut schedule_policy, &rollback_from, rb_capable, kv_hit_blocks, trace_guard.as_ref());
+        if let Some(g) = trace_guard.as_ref() {
+            stamp_provider_attribution(g, provider.provider_type(), deployment_id.as_deref(), provider.models().first().map_or(inflight_model.as_str(), String::as_str));
+        }
         let usage = UsageTracker::default();
-        let sse_stream = sse_stream_from_chat_stream(stream, usage.clone());
+        let stream_meta = StreamMetaTracker::default();
+        let sse_stream = sse_stream_from_chat_stream(stream, usage.clone(), stream_meta.clone());
         let inflight_guard = if let Some(ref did) = deployment_id {
             InFlightGuard::new_for_deployment(state.inflight.clone(), &inflight_model, did, input_chars as u64)
         } else {
@@ -1344,6 +1542,7 @@ async fn chat_completions_inner(
             Some(g) => logged.with_trace_guard(g),
             None => logged,
         };
+        let logged = logged.with_stream_meta(stream_meta.clone());
 
         // Wrap with prompt log stream if enabled, then wrap in Sse.
         if let Some(sender) = prompt_log_sender {
@@ -1373,6 +1572,7 @@ async fn chat_completions_inner(
                     prompt_entry,
                     sse_raw_data_extractor(response_id_slot.clone()),
                 );
+                prompt_logged = prompt_logged.with_failure_sink(stream_failure_sink(stream_meta.clone()));
                 // Trace llm_response for streams: the sink stamps the
                 // assembled response on the still-active span BEFORE the
                 // inner LoggedStream's Drop finalizes it.
@@ -1425,6 +1625,7 @@ async fn chat_completions_inner(
             .with_response_sink(Arc::new(move |resp| {
                 reg.set_span_response_body(&trace_sink_rid, Arc::clone(resp), maxb);
             }));
+            let trace_logged = trace_logged.with_failure_sink(stream_failure_sink(stream_meta.clone()));
             let response =
                 Sse::new(sse_item_to_event(trace_logged)).keep_alive(KeepAlive::default());
             return Ok(response.into_response());
@@ -1474,6 +1675,9 @@ async fn chat_completions_inner(
         state.kvc_orchestrator.record_success(&resolved_model, provider.kv_worker_id(), &prefix_bytes);
         // ── Rollback bookkeeping (design §6) — shared single copy. ──
         rb_success_bookkeeping(&state, &identity, &resolved_model, deployment_id.as_deref(), &mut schedule_policy, &rollback_from, rb_capable, kv_hit_blocks, trace_guard.as_ref());
+        if let Some(g) = trace_guard.as_ref() {
+            stamp_provider_attribution(g, provider.provider_type(), deployment_id.as_deref(), provider.models().first().map_or(inflight_model.as_str(), String::as_str));
+        }
 
         let duration_ms = start.elapsed().as_millis() as i32;
         // None = upstream did not report usage → log NULL, settle 0 tokens.
@@ -1481,6 +1685,8 @@ async fn chat_completions_inner(
         let input_tokens = usage.map(|u| u.prompt_tokens as i32);
         let output_tokens = usage.map(|u| u.completion_tokens as i32);
         if let Some(g) = trace_guard.as_ref() {
+            let finish_reasons = response.choices.iter().filter_map(|choice| choice.finish_reason.clone()).collect::<Vec<_>>();
+            stamp_response_metadata(g, &response.id, &response.model, &finish_reasons);
             stamp_gen_ai_usage_attrs(g, &PreferredUsage::from_response_usage(usage));
         }
         // Settle quota: real token counts from vLLM go to key + team cumulative
@@ -3466,6 +3672,7 @@ fn done_sse_item() -> SseItem {
 fn sse_stream_from_chat_stream(
     stream: ChatStream,
     usage: UsageTracker,
+    stream_meta: StreamMetaTracker,
 ) -> impl futures::Stream<Item = Result<SseItem, Infallible>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<SseItem>(32);
     tokio::spawn(async move {
@@ -3481,6 +3688,7 @@ fn sse_stream_from_chat_stream(
             };
             match result {
                 Ok(chunk) => {
+                    note_stream_chunk_meta(&stream_meta, &chunk);
                     if let Some(ref u) = chunk.usage {
                         if let Ok(mut g) = usage.lock() {
                             g.note_chunk_usage(u);
@@ -3493,6 +3701,7 @@ fn sse_stream_from_chat_stream(
                     }
                 }
                 Err(e) => {
+                    note_stream_error(&stream_meta, e.error_type(), e.to_string());
                     tracing::error!("SSE stream error (OpenAI): {}", e);
                     let error_data = serde_json::to_string(&openai_error_body(&e))
                         .unwrap_or_default();
@@ -3618,6 +3827,7 @@ pub async fn messages(
     // 1. Model access check (deployment-aware, alias-aware).
     check_model_access(identity, &openai_req.model, &state.router)
         .map_err(|e| {
+            mark_trace_error(&mut trace_guard, &e);
             log_error(&state, &identity, &model, "/v1/messages", is_stream, start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()), user_tags.clone());
             AnthropicErrorReply(e, is_stream)
         })?;
@@ -3653,6 +3863,7 @@ pub async fn messages(
     )
     .await
     .map_err(|e| {
+            mark_trace_error(&mut trace_guard, &e);
         log_error(&state, &identity, &model, "/v1/messages", is_stream, start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()), user_tags.clone());
         AnthropicErrorReply(e, is_stream)
     })?;
@@ -3697,6 +3908,7 @@ pub async fn messages(
                 &resolved_model, Some(&identity.key_hash), input_chars as u64, &[],
             ).ok_or_else(|| {
                 let e = GatewayError::ModelNotFound(resolved_model.clone());
+                mark_trace_error(&mut trace_guard, &e);
                 log_error(&state, &identity, &model, "/v1/messages", is_stream, start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()), user_tags.clone());
                 AnthropicErrorReply(e, is_stream)
             })?;
@@ -3723,7 +3935,8 @@ pub async fn messages(
             identity.key_alias.clone(), Some(identity.key_hash.clone()),
             Some(inflight_model.clone()),
             "/v1/messages", &identity, &model,
-            is_stream, start, &request_id, Some(client_ip.clone()), user_tags.clone(), AnthropicErrorReply,
+            is_stream, start, &request_id, Some(client_ip.clone()), user_tags.clone(),
+            &mut trace_guard, AnthropicErrorReply,
         ).await?
     } else {
         None
@@ -3739,7 +3952,7 @@ pub async fn messages(
     if let Some(g) = trace_guard.as_ref() {
         use boom_core::trace::SpanAttributeValue;
         g.set_attribute("boom-gateway.request.id", SpanAttributeValue::String(request_id.clone()));
-        g.set_deployment(deployment_id.clone(), Some(inflight_model.clone()));
+        stamp_provider_attribution(g, provider.provider_type(), deployment_id.as_deref(), &inflight_model);
         g.set_routing_duration_ms(routing_ms);
         if let Some(qw) = queue_wait_ms {
             g.set_attribute("boom-gateway.time_in_queue", SpanAttributeValue::Int(qw as i64));
@@ -3912,8 +4125,12 @@ pub async fn messages(
         state.kvc_orchestrator.record_success(&resolved_model, provider.kv_worker_id(), &prefix_bytes);
         // ── Rollback bookkeeping (design §6) — shared single copy. ──
         rb_success_bookkeeping(&state, &identity, &resolved_model, deployment_id.as_deref(), &mut schedule_policy, &rollback_from, rb_capable, kv_hit_blocks, trace_guard.as_ref());
+        if let Some(g) = trace_guard.as_ref() {
+            stamp_provider_attribution(g, provider.provider_type(), deployment_id.as_deref(), provider.models().first().map_or(inflight_model.as_str(), String::as_str));
+        }
         let usage = UsageTracker::default();
-        let sse_stream = sse_stream_from_anthropic_chat_stream(stream, model.clone(), usage.clone());
+        let stream_meta = StreamMetaTracker::default();
+        let sse_stream = sse_stream_from_anthropic_chat_stream(stream, model.clone(), usage.clone(), stream_meta.clone());
         let inflight_guard = if let Some(ref did) = deployment_id {
             InFlightGuard::new_for_deployment(state.inflight.clone(), &inflight_model, did, input_chars as u64)
         } else {
@@ -3972,6 +4189,7 @@ pub async fn messages(
             Some(g) => logged.with_trace_guard(g),
             None => logged,
         };
+        let logged = logged.with_stream_meta(stream_meta.clone());
 
         // Wrap with prompt log stream if enabled, then wrap in Sse.
         if let Some(sender) = prompt_log_sender {
@@ -3999,6 +4217,7 @@ pub async fn messages(
                     prompt_entry,
                     sse_anthropic_extractor(response_id_slot.clone()),
                 );
+                prompt_logged = prompt_logged.with_failure_sink(stream_failure_sink(stream_meta.clone()));
                 // Trace llm_response for streams — see chat path comment.
                 if trace_cfg.enabled && trace_cfg.capture_body {
                     let reg = state.trace.clone();
@@ -4036,6 +4255,7 @@ pub async fn messages(
             .with_response_sink(Arc::new(move |resp| {
                 reg.set_span_response_body(&trace_sink_rid, Arc::clone(resp), maxb);
             }));
+            let trace_logged = trace_logged.with_failure_sink(stream_failure_sink(stream_meta.clone()));
             let response =
                 Sse::new(sse_item_to_event(trace_logged)).keep_alive(KeepAlive::default());
             return Ok(response.into_response());
@@ -4084,6 +4304,9 @@ pub async fn messages(
         state.kvc_orchestrator.record_success(&resolved_model, provider.kv_worker_id(), &prefix_bytes);
         // ── Rollback bookkeeping (design §6) — shared single copy. ──
         rb_success_bookkeeping(&state, &identity, &resolved_model, deployment_id.as_deref(), &mut schedule_policy, &rollback_from, rb_capable, kv_hit_blocks, trace_guard.as_ref());
+        if let Some(g) = trace_guard.as_ref() {
+            stamp_provider_attribution(g, provider.provider_type(), deployment_id.as_deref(), provider.models().first().map_or(inflight_model.as_str(), String::as_str));
+        }
 
         let duration_ms = start.elapsed().as_millis() as i32;
         // None = upstream did not report usage → log NULL, settle 0 tokens.
@@ -4155,6 +4378,10 @@ pub async fn messages(
         );
 
         let anthropic_resp = openai_response_to_anthropic(&response);
+        if let Some(g) = trace_guard.as_ref() {
+            let finish_reasons = anthropic_resp.stop_reason.iter().cloned().collect::<Vec<_>>();
+            stamp_response_metadata(g, &anthropic_resp.id, &anthropic_resp.model, &finish_reasons);
+        }
 
         // Assembled response body — ONE Arc shared by the prompt log entry
         // and the trace span; built when either channel wants it so trace
@@ -4211,16 +4438,19 @@ fn sse_stream_from_anthropic_chat_stream(
     stream: ChatStream,
     model: String,
     usage: UsageTracker,
+    stream_meta: StreamMetaTracker,
 ) -> impl futures::Stream<Item = Result<SseItem, Infallible>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<SseItem>(64);
 
     tokio::spawn(async move {
         let mut transcoder = AnthropicStreamTranscoder::new(model);
+        note_stream_response_id(&stream_meta, transcoder.message_id());
         let mut stream = std::pin::pin!(stream);
 
         while let Some(result) = stream.next().await {
             match result {
                 Ok(chunk) => {
+                    note_stream_chunk_meta(&stream_meta, &chunk);
                     // Extract usage from the chunk (OpenAI sends usage in
                     // the final chunk; Anthropic spreads it across
                     // message_start / message_delta).
@@ -4241,6 +4471,7 @@ fn sse_stream_from_anthropic_chat_stream(
                     }
                 }
                 Err(e) => {
+                    note_stream_error(&stream_meta, e.error_type(), e.to_string());
                     tracing::error!("SSE stream error (Anthropic): {}", e);
                     let error_data = serde_json::json!({
                         "type": "error",
@@ -4627,6 +4858,7 @@ pub async fn responses(
 
     // 1. Model access check (deployment-aware, alias-aware).
     check_model_access(identity, &openai_req.model, &state.router).map_err(|e| {
+        mark_trace_error(&mut trace_guard, &e);
         log_error(&state, &identity, &model, "/v1/responses", is_stream, start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()), user_tags.clone());
         ResponsesErrorReply(e)
     })?;
@@ -4661,6 +4893,7 @@ pub async fn responses(
     )
     .await
     .map_err(|e| {
+        mark_trace_error(&mut trace_guard, &e);
         log_error(&state, &identity, &model, "/v1/responses", is_stream, start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()), user_tags.clone());
         ResponsesErrorReply(e)
     })?;
@@ -4703,6 +4936,7 @@ pub async fn responses(
                 &resolved_model, Some(&identity.key_hash), input_chars as u64, &[],
             ).ok_or_else(|| {
                 let e = GatewayError::ModelNotFound(resolved_model.clone());
+                mark_trace_error(&mut trace_guard, &e);
                 log_error(&state, &identity, &model, "/v1/responses", is_stream, start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()), user_tags.clone());
                 ResponsesErrorReply(e)
             })?;
@@ -4730,6 +4964,7 @@ pub async fn responses(
             Some(inflight_model.clone()),
             "/v1/responses", &identity, &model,
             is_stream, start, &request_id, Some(client_ip.clone()), user_tags.clone(),
+            &mut trace_guard,
             |e, _is_stream| ResponsesErrorReply(e),
         ).await?
     } else {
@@ -4742,7 +4977,7 @@ pub async fn responses(
     if let Some(g) = trace_guard.as_ref() {
         use boom_core::trace::SpanAttributeValue;
         g.set_attribute("boom-gateway.request.id", SpanAttributeValue::String(request_id.clone()));
-        g.set_deployment(deployment_id.clone(), Some(inflight_model.clone()));
+        stamp_provider_attribution(g, provider.provider_type(), deployment_id.as_deref(), &inflight_model);
         g.set_routing_duration_ms(routing_ms);
         if let Some(qw) = queue_wait_ms {
             g.set_attribute("boom-gateway.time_in_queue", SpanAttributeValue::Int(qw as i64));
@@ -4976,10 +5211,14 @@ pub async fn responses(
         state.kvc_orchestrator.record_success(&resolved_model, provider.kv_worker_id(), &prefix_bytes);
         // ── Rollback bookkeeping (design §6) — shared single copy. ──
         rb_success_bookkeeping(&state, &identity, &resolved_model, deployment_id.as_deref(), &mut schedule_policy, &rollback_from, rb_capable, kv_hit_blocks, trace_guard.as_ref());
+        if let Some(g) = trace_guard.as_ref() {
+            stamp_provider_attribution(g, provider.provider_type(), deployment_id.as_deref(), provider.models().first().map_or(inflight_model.as_str(), String::as_str));
+        }
         let usage = UsageTracker::default();
+        let stream_meta = StreamMetaTracker::default();
         let sse_stream = sse_stream_from_responses_chat_stream(
             stream, model.clone(), response_id.clone(), created_at, usage.clone(),
-            persist_ctx, state.response_store.clone(),
+            persist_ctx, state.response_store.clone(), stream_meta.clone(),
         );
         let inflight_guard = if let Some(ref did) = deployment_id {
             InFlightGuard::new_for_deployment(state.inflight.clone(), &inflight_model, did, input_chars as u64)
@@ -5035,6 +5274,7 @@ pub async fn responses(
             Some(g) => logged.with_trace_guard(g),
             None => logged,
         };
+        let logged = logged.with_stream_meta(stream_meta.clone());
 
         if let Some(sender) = prompt_log_sender {
             if let Some(req_body) = prompt_log_req_body {
@@ -5059,6 +5299,7 @@ pub async fn responses(
                     prompt_entry,
                     sse_responses_extractor(response_id_slot.clone()),
                 );
+                prompt_logged = prompt_logged.with_failure_sink(stream_failure_sink(stream_meta.clone()));
                 // Trace llm_response for streams — see chat path comment.
                 if trace_cfg.enabled && trace_cfg.capture_body {
                     let reg = state.trace.clone();
@@ -5103,6 +5344,7 @@ pub async fn responses(
             .with_response_sink(Arc::new(move |resp| {
                 reg.set_span_response_body(&trace_sink_rid, Arc::clone(resp), maxb);
             }));
+            let trace_logged = trace_logged.with_failure_sink(stream_failure_sink(stream_meta.clone()));
             let response =
                 Sse::new(sse_item_to_event(trace_logged)).keep_alive(KeepAlive::default());
             let mut resp = response.into_response();
@@ -5161,6 +5403,9 @@ pub async fn responses(
         state.kvc_orchestrator.record_success(&resolved_model, provider.kv_worker_id(), &prefix_bytes);
         // ── Rollback bookkeeping (design §6) — shared single copy. ──
         rb_success_bookkeeping(&state, &identity, &resolved_model, deployment_id.as_deref(), &mut schedule_policy, &rollback_from, rb_capable, kv_hit_blocks, trace_guard.as_ref());
+        if let Some(g) = trace_guard.as_ref() {
+            stamp_provider_attribution(g, provider.provider_type(), deployment_id.as_deref(), provider.models().first().map_or(inflight_model.as_str(), String::as_str));
+        }
 
         let duration_ms = start.elapsed().as_millis() as i32;
         let usage = response.usage.as_ref();
@@ -5224,12 +5469,14 @@ pub async fn responses(
         );
 
         // Conversion path returns our typed ResponseObject.
-        let responses_value: serde_json::Value = serde_json::to_value(
-            &openai_chat_to_responses_with_custom_tools(
-                &response, &model, &response_id, created_at, &custom_tool_names,
-            ),
-        )
-        .unwrap_or(serde_json::Value::Null);
+        let response_object = openai_chat_to_responses_with_custom_tools(
+            &response, &model, &response_id, created_at, &custom_tool_names,
+        );
+        if let Some(g) = trace_guard.as_ref() {
+            stamp_responses_nonstream_metadata(g, &response, &response_object);
+        }
+        let responses_value: serde_json::Value = serde_json::to_value(&response_object)
+            .unwrap_or(serde_json::Value::Null);
 
         // Assembled response body — ONE Arc shared by the prompt log entry
         // and the trace span; built when either channel wants it so trace
@@ -5325,11 +5572,13 @@ fn sse_stream_from_responses_chat_stream(
     usage: UsageTracker,
     persist: Option<ResponsesPersistCtx>,
     store: Arc<boom_responses::ResponseStore>,
+    stream_meta: StreamMetaTracker,
 ) -> impl futures::Stream<Item = Result<SseItem, Infallible>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<SseItem>(64);
 
     tokio::spawn(async move {
         let mut transcoder = ResponsesStreamTranscoder::new(&model, &response_id, created_at);
+        note_stream_response_id(&stream_meta, &response_id);
         let mut stream = std::pin::pin!(stream);
         // NO early return may skip the persist tail. `client_gone` marks a
         // mid-stream disconnect: close items locally (events discarded) so
@@ -5351,6 +5600,7 @@ fn sse_stream_from_responses_chat_stream(
             while let Some(result) = stream.next().await {
                 match result {
                     Ok(chunk) => {
+                        note_stream_chunk_meta(&stream_meta, &chunk);
                         if let Some(ref u) = chunk.usage {
                             if let Ok(mut g) = usage.lock() {
                                 g.note_chunk_usage(u);
@@ -5371,6 +5621,7 @@ fn sse_stream_from_responses_chat_stream(
                         }
                     }
                     Err(e) => {
+                        note_stream_error(&stream_meta, e.error_type(), e.to_string());
                         tracing::error!("SSE stream error (Responses): {}", e);
                         for ev in transcoder.fail(&e) {
                             let item = SseItem {
@@ -5945,8 +6196,11 @@ mod tests {
         extract_user_tags, forward_client_headers, insert_header_ci, is_vip_key,
         new_streamed_response_id_slot, parse_traceparent, preferred_stream_usage,
         sse_anthropic_extractor, sse_raw_data_extractor, sse_stream_from_chat_stream,
-        stamp_gen_ai_request_params, stamp_gen_ai_usage_attrs, stamp_streamed_response_id,
+        stamp_gen_ai_request_params, stamp_gen_ai_usage_attrs, stamp_provider_attribution,
+        stamp_response_metadata, stamp_responses_nonstream_metadata, stamp_streamed_response_id, mark_trace_error,
         PreferredUsage, UsageTracker, UsageTrackerState, UserTags,
+        chunk_has_valid_content, note_stream_chunk_meta, note_stream_response_id,
+        LoggedStream, StreamMetaTracker, stream_failure_sink,
     };
     use axum::http::{HeaderMap, HeaderName, HeaderValue};
     use boom_core::types::{
@@ -5954,6 +6208,7 @@ mod tests {
         StreamChoice, StreamDelta, StreamUsage, ToolCallDelta, Usage,
     };
     use boom_core::GatewayError;
+    use boom_core::TraceApi;
     use boom_promptlog::{LogPhase, PromptLogEntry, PromptLogStream};
     use futures::StreamExt;
     use serde_json::json;
@@ -6638,15 +6893,139 @@ trace:
             get("gen_ai.usage.cache_read.input_tokens"),
             Some(V::Int(64))
         );
-        assert_eq!(
-            get("gen_ai.usage.cache_creation.input_tokens"),
-            Some(V::Int(32))
-        );
+        assert_eq!(get("gen_ai.usage.cache_write.input_tokens"), Some(V::Int(32)));
+        assert_eq!(get("gen_ai.usage.cache_creation.input_tokens"), None);
         assert_eq!(
             get("gen_ai.usage.reasoning.output_tokens"),
             Some(V::Int(12))
         );
         drop(guard);
+    }
+
+    fn traced_guard_with_stream(request_id: &str, is_stream: bool) -> (Arc<boom_trace::TraceRegistry>, boom_trace::TraceGuard) {
+        let registry = boom_trace::TraceRegistry::new();
+        registry.set_enabled_for_test(true);
+        let w3c = parse_traceparent(
+            "00-0af76598164860bd9a43d7c1a31725ab-00f067aa0ba902b7-01",
+        )
+        .unwrap();
+        let guard = boom_trace::TraceGuard::start(
+            registry.clone(),
+            request_id.to_string(),
+            &w3c,
+            "requested-model".to_string(),
+            "/v1/chat/completions".to_string(),
+            is_stream,
+            0,
+            true,
+        )
+        .expect("guard");
+        (registry, guard)
+    }
+
+    fn traced_guard(request_id: &str) -> (Arc<boom_trace::TraceRegistry>, boom_trace::TraceGuard) {
+        traced_guard_with_stream(request_id, false)
+    }
+
+    fn traced_stream_guard(request_id: &str) -> (Arc<boom_trace::TraceRegistry>, boom_trace::TraceGuard) {
+        traced_guard_with_stream(request_id, true)
+    }
+
+    #[test]
+    fn response_metadata_skips_empty_values() {
+        let (registry, guard) = traced_guard("req-empty-response-meta");
+        stamp_response_metadata(&guard, "", "", &[]);
+        registry.with_span_mut("req-empty-response-meta", |span| {
+            assert_eq!(span.response_model, None);
+            assert!(!span.attributes.iter().any(|(key, _)| {
+                matches!(key.as_str(), "gen_ai.response.id" | "gen_ai.response.finish_reasons")
+            }));
+        });
+    }
+
+    #[test]
+    fn response_metadata_preserves_id_model_and_reason_array() {
+        let (registry, guard) = traced_guard("req-response-meta");
+        stamp_response_metadata(
+            &guard,
+            "resp-1",
+            "actual-model",
+            &["stop".to_string(), "length".to_string()],
+        );
+        registry.with_span_mut("req-response-meta", |span| {
+            assert_eq!(span.response_model.as_deref(), Some("actual-model"));
+            assert!(span.attributes.iter().any(|(key, value)| {
+                key == "gen_ai.response.id"
+                    && matches!(value, boom_core::trace::SpanAttributeValue::String(id) if id == "resp-1")
+            }));
+            assert!(span.attributes.iter().any(|(key, value)| {
+                key == "gen_ai.response.finish_reasons"
+                    && matches!(value, boom_core::trace::SpanAttributeValue::Json(reasons) if reasons.as_array().is_some_and(|items| items.len() == 2))
+            }));
+        });
+    }
+
+    #[test]
+    fn responses_nonstream_metadata_uses_upstream_model_and_client_id() {
+        let (registry, guard) = traced_guard("req-responses-nonstream-model");
+        let upstream = boom_core::types::ChatCompletionResponse {
+            id: "upstream-chat-id".to_string(),
+            object: "chat.completion".to_string(),
+            created: 0,
+            model: "glm-5.3-flash".to_string(),
+            choices: Vec::new(),
+            usage: None,
+            system_fingerprint: None,
+            raw_response: None,
+        };
+        let public = boom_core::responses::ResponseObject {
+            id: "resp-client".to_string(),
+            object: "response",
+            created_at: 0,
+            status: "completed".to_string(),
+            model: "volcengine/glm-5.3-flash".to_string(),
+            output: Vec::new(),
+            usage: None,
+            incomplete_details: None,
+            error: None,
+        };
+        stamp_responses_nonstream_metadata(&guard, &upstream, &public);
+        registry.with_span_mut("req-responses-nonstream-model", |span| {
+            assert_eq!(span.response_model.as_deref(), Some("glm-5.3-flash"));
+            assert!(span.attributes.iter().any(|(key, value)| {
+                key == "gen_ai.response.id"
+                    && matches!(value, boom_core::trace::SpanAttributeValue::String(id) if id == "resp-client")
+            }));
+        });
+    }
+
+    #[tokio::test]
+    async fn trace_error_uses_stable_type_and_marks_failed_span() {
+        let (registry, guard) = traced_guard("req-early-error");
+        let mut guard = Some(guard);
+        let error = GatewayError::ModelNotFound("private-model".to_string());
+        let expected_type = error.error_type().to_string();
+        mark_trace_error(&mut guard, &error);
+        let error_type = registry
+            .with_span_mut("req-early-error", |span| span.error_type.clone())
+            .expect("span alive");
+        assert_eq!(error_type, Some(expected_type));
+        assert_ne!(error_type, Some(error.to_string()));
+        drop(guard);
+        assert_eq!(registry.snapshot().await.total_spans_error, 1);
+    }
+
+    #[test]
+    fn provider_attribution_overwrites_initial_route_with_final_target() {
+        let (registry, guard) = traced_guard("req-final-provider");
+        guard.set_provider_type("openai");
+        guard.set_deployment(Some("dep-old".to_string()), Some("old-model".to_string()));
+        stamp_provider_attribution(&guard, "hosted_vllm", Some("dep-new"), "new-model");
+        registry.with_span_mut("req-final-provider", |span| {
+            assert_eq!(span.provider_type.as_deref(), Some("hosted_vllm"));
+            assert_eq!(span.deployment_id.as_deref(), Some("dep-new"));
+            assert_eq!(span.response_model.as_deref(), Some("new-model"));
+        });
     }
 
     fn terminal_chunk() -> ChatStreamChunk {
@@ -6691,7 +7070,7 @@ trace:
             raw_data: None,
         };
         let stream: ChatStream = Box::pin(futures::stream::iter(vec![Ok(chunk), Ok(terminal_chunk())]));
-        let sse = sse_stream_from_chat_stream(stream, UsageTracker::default());
+        let sse = sse_stream_from_chat_stream(stream, UsageTracker::default(), StreamMetaTracker::default());
 
         let items: Vec<_> = sse.collect::<Vec<Result<_, Infallible>>>().await
             .into_iter().map(|r| r.unwrap()).collect();
@@ -6739,7 +7118,7 @@ trace:
         chunks.push(Ok(tool_chunk("", Some("tool_calls"))));
 
         let stream: ChatStream = Box::pin(futures::stream::iter(chunks));
-        let sse = sse_stream_from_chat_stream(stream, UsageTracker::default());
+        let sse = sse_stream_from_chat_stream(stream, UsageTracker::default(), StreamMetaTracker::default());
 
         let items: Vec<_> = sse.collect::<Vec<Result<_, Infallible>>>().await
             .into_iter().map(|r| r.unwrap()).collect();
@@ -6794,7 +7173,7 @@ trace:
             Ok(text_chunk("", Some("stop"))),
         ];
         let stream: ChatStream = Box::pin(futures::stream::iter(chunks));
-        let sse = sse_stream_from_chat_stream(stream, UsageTracker::default());
+        let sse = sse_stream_from_chat_stream(stream, UsageTracker::default(), StreamMetaTracker::default());
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
         let req = PromptLogEntry::new_request(
@@ -6873,7 +7252,7 @@ trace:
             Ok(text_chunk("c")),
             Ok(terminal_chunk()),
         ]));
-        let sse = sse_stream_from_chat_stream(stream, UsageTracker::default());
+        let sse = sse_stream_from_chat_stream(stream, UsageTracker::default(), StreamMetaTracker::default());
 
         let items: Vec<_> = sse.collect::<Vec<Result<_, Infallible>>>().await
             .into_iter().map(|r| r.unwrap()).collect();
@@ -6891,7 +7270,7 @@ trace:
         let stream: ChatStream = Box::pin(futures::stream::iter(vec![
             Err(GatewayError::UpstreamError { status: 500, message: "boom".into() }),
         ]));
-        let sse = sse_stream_from_chat_stream(stream, UsageTracker::default());
+        let sse = sse_stream_from_chat_stream(stream, UsageTracker::default(), StreamMetaTracker::default());
 
         let items: Vec<_> = sse.collect::<Vec<Result<_, Infallible>>>().await
             .into_iter().map(|r| r.unwrap()).collect();
@@ -6907,4 +7286,236 @@ trace:
         assert_eq!(item.json_data, "[DONE]");
     }
 
+    fn empty_stream_delta() -> StreamDelta {
+        StreamDelta { role: None, content: None, tool_calls: None, reasoning_content: None }
+    }
+
+    fn stream_meta_chunk(delta: StreamDelta) -> ChatStreamChunk {
+        ChatStreamChunk {
+            id: "chatcmpl-meta".to_string(),
+            object: "chat.completion.chunk".to_string(),
+            created: 0,
+            model: "actual-model".to_string(),
+            choices: vec![StreamChoice { index: 0, delta, finish_reason: None }],
+            usage: None,
+            raw_data: None,
+        }
+    }
+
+    #[test]
+    fn valid_chunk_content_accepts_only_real_output() {
+        let role_only = StreamDelta { role: Some(MessageRole::Assistant), ..empty_stream_delta() };
+        assert!(!chunk_has_valid_content(&stream_meta_chunk(role_only)));
+        let empty_text = StreamDelta { content: Some(String::new()), ..empty_stream_delta() };
+        assert!(!chunk_has_valid_content(&stream_meta_chunk(empty_text)));
+        let text = StreamDelta { content: Some("hello".to_string()), ..empty_stream_delta() };
+        assert!(chunk_has_valid_content(&stream_meta_chunk(text)));
+        let reasoning = StreamDelta { reasoning_content: Some("think".to_string()), ..empty_stream_delta() };
+        assert!(chunk_has_valid_content(&stream_meta_chunk(reasoning)));
+        for function in [
+            FunctionCallDelta { name: Some("weather".to_string()), arguments: None },
+            FunctionCallDelta { name: None, arguments: Some("{}".to_string()) },
+        ] {
+            let tool = StreamDelta {
+                tool_calls: Some(vec![ToolCallDelta { index: 0, id: None, call_type: None, function: Some(function) }]),
+                ..empty_stream_delta()
+            };
+            assert!(chunk_has_valid_content(&stream_meta_chunk(tool)));
+        }
+        let id_only_tool = StreamDelta {
+            tool_calls: Some(vec![ToolCallDelta { index: 0, id: Some("call-1".to_string()), call_type: None, function: None }]),
+            ..empty_stream_delta()
+        };
+        assert!(!chunk_has_valid_content(&stream_meta_chunk(id_only_tool)));
+        let mut usage_only = stream_meta_chunk(empty_stream_delta());
+        usage_only.choices.clear();
+        usage_only.usage = Some(StreamUsage::default());
+        assert!(!chunk_has_valid_content(&usage_only));
+    }
+
+    #[test]
+    fn stream_metadata_is_first_wins_and_preserves_client_ids() {
+        let tracker = StreamMetaTracker::default();
+        note_stream_response_id(&tracker, "msg_real");
+        let mut first = stream_meta_chunk(StreamDelta {
+            content: Some("hello".to_string()),
+            ..StreamDelta { role: None, content: None, tool_calls: None, reasoning_content: None }
+        });
+        first.id = "chatcmpl-not-used".to_string();
+        first.choices[0].finish_reason = Some("stop".to_string());
+        note_stream_chunk_meta(&tracker, &first);
+        note_stream_response_id(&tracker, "msg_later");
+        let mut second = stream_meta_chunk(StreamDelta { role: None, content: None, tool_calls: None, reasoning_content: None });
+        second.model = "later-model".to_string();
+        second.choices[0].finish_reason = Some("length".to_string());
+        note_stream_chunk_meta(&tracker, &second);
+        let state = tracker.lock().unwrap();
+        assert_eq!(state.response_id.as_deref(), Some("msg_real"));
+        assert_eq!(state.response_model.as_deref(), Some("actual-model"));
+        assert_eq!(state.finish_reasons.get(&0).map(String::as_str), Some("stop"));
+        assert!(state.first_content_at.is_some());
+        drop(state);
+
+        let responses_tracker = StreamMetaTracker::default();
+        note_stream_response_id(&responses_tracker, "resp_real");
+        assert_eq!(responses_tracker.lock().unwrap().response_id.as_deref(), Some("resp_real"));
+    }
+
+    #[tokio::test]
+    async fn openai_producer_records_stable_stream_error() {
+        let tracker = StreamMetaTracker::default();
+        let stream: ChatStream = Box::pin(futures::stream::iter(vec![Err(GatewayError::UpstreamTimeout)]));
+        let sse = sse_stream_from_chat_stream(stream, UsageTracker::default(), tracker.clone());
+        let _items: Vec<_> = sse.collect::<Vec<Result<_, Infallible>>>().await;
+        let state = tracker.lock().unwrap();
+        let (error_type, message) = state.stream_error.as_ref().expect("stream error recorded");
+        assert_eq!(error_type, "timeout");
+        assert!(!message.is_empty());
+    }
+
+    fn request_log_for_stream_test() -> crate::request_log::RequestLog {
+        crate::request_log::RequestLog {
+            request_id: None,
+            key_hash: String::new(),
+            key_name: None,
+            key_alias: None,
+            team_id: None,
+            model: "requested-model".to_string(),
+            model_name: None,
+            api_path: "/v1/chat/completions".to_string(),
+            is_stream: true,
+            status_code: 200,
+            error_type: None,
+            error_message: None,
+            input_tokens: None,
+            output_tokens: None,
+            duration_ms: None,
+            ttft_ms: None,
+            deployment_id: None,
+            client_ip: None,
+            cached_tokens: None,
+            schedule_policy: None,
+            kv_hit_blocks: None,
+            kv_input_blocks: None,
+            trie_blocks: None,
+            trie_max_blocks: None,
+            request_tokens: None,
+            queue_wait_ms: None,
+            user_tags: [None, None, None],
+        }
+    }
+
+    #[tokio::test]
+    async fn logged_stream_drop_consumes_metadata_ttft_and_error() {
+        let (registry, guard) = traced_stream_guard("req-stream-drop");
+        registry.set_metrics_enabled(true);
+        let start = std::time::Instant::now();
+        let tracker = StreamMetaTracker::default();
+        {
+            let mut state = tracker.lock().unwrap();
+            state.first_content_at = Some(start + std::time::Duration::from_millis(25));
+            state.response_id = Some("chatcmpl-real".to_string());
+            state.response_model = Some("actual-model".to_string());
+            state.finish_reasons.insert(0, "stop".to_string());
+            state.stream_error = Some(("upstream_error".to_string(), "boom".to_string()));
+        }
+        let logged = LoggedStream::new(
+            futures::stream::empty::<ChatStreamChunk>(),
+            None,
+            request_log_for_stream_test(),
+            start,
+            UsageTracker::default(),
+            None,
+        )
+        .with_trace_guard(guard)
+        .with_stream_meta(tracker);
+        drop(logged);
+
+        let snapshot = registry.snapshot().await;
+        assert_eq!(snapshot.total_spans_error, 1);
+        let span = &snapshot.recent[0];
+        assert_eq!(span.status, boom_core::trace::SpanStatus::Error);
+        assert_eq!(span.error_message.as_deref(), Some("boom"));
+        assert!(span.attributes.iter().any(|(key, value)| {
+            key == "gen_ai.response.id"
+                && matches!(value, boom_core::trace::SpanAttributeValue::String(id) if id == "chatcmpl-real")
+        }));
+        assert!(span.attributes.iter().any(|(key, value)| {
+            key == "gen_ai.response.finish_reasons"
+                && matches!(value, boom_core::trace::SpanAttributeValue::Json(reasons) if reasons.as_array().is_some_and(|items| items.len() == 1 && items[0] == "error"))
+        }));
+        let metrics = registry.prometheus_text().expect("metrics enabled");
+        assert!(metrics.contains("gen_ai.client.operation.time_to_first_chunk_seconds_sum"));
+        assert!(metrics.contains("0.025"));
+        assert!(metrics.contains("error.type=\"upstream_error\""));
+    }
+
+    #[tokio::test]
+    async fn stream_failure_sink_keeps_error_type_stable_and_message_whole() {
+        // R6: the in-stream failure sentinel carries provider-controlled
+        // `code`/`type` values, so neither may leak into the bounded
+        // `error.type` vocabulary; the complete message must still reach the
+        // span.
+        let (registry, guard) = traced_stream_guard("req-stream-fail-stable-type");
+        registry.set_metrics_enabled(true);
+        let tracker = StreamMetaTracker::default();
+        let sink = stream_failure_sink(tracker.clone());
+        sink(&serde_json::json!({
+            "code": "provider_specific_code_9876",
+            "type": "provider_specific_type_9876",
+            "message": "upstream exploded at 14:02 (retryable=false)",
+        }));
+
+        let logged = LoggedStream::new(
+            futures::stream::empty::<ChatStreamChunk>(),
+            None,
+            request_log_for_stream_test(),
+            std::time::Instant::now(),
+            UsageTracker::default(),
+            None,
+        )
+        .with_trace_guard(guard)
+        .with_stream_meta(tracker);
+        drop(logged);
+
+        let snapshot = registry.snapshot().await;
+        let span = &snapshot.recent[0];
+        assert_eq!(span.status, boom_core::trace::SpanStatus::Error);
+        assert_eq!(
+            span.error_message.as_deref(),
+            Some("upstream exploded at 14:02 (retryable=false)")
+        );
+        let metrics = registry.prometheus_text().expect("metrics enabled");
+        assert!(metrics.contains("error.type=\"upstream_error\""));
+        assert!(!metrics.contains("provider_specific_code_9876"));
+        assert!(!metrics.contains("provider_specific_type_9876"));
+    }
+
+    #[tokio::test]
+    async fn role_and_usage_only_stream_has_no_ttft() {
+        let (registry, guard) = traced_stream_guard("req-no-valid-content");
+        registry.set_metrics_enabled(true);
+        let tracker = StreamMetaTracker::default();
+        let role_chunk = stream_meta_chunk(StreamDelta {
+            role: Some(MessageRole::Assistant),
+            content: None,
+            tool_calls: None,
+            reasoning_content: None,
+        });
+        note_stream_chunk_meta(&tracker, &role_chunk);
+        let mut logged = LoggedStream::new(
+            futures::stream::iter(vec![role_chunk]),
+            None,
+            request_log_for_stream_test(),
+            std::time::Instant::now(),
+            UsageTracker::default(),
+            None,
+        )
+        .with_trace_guard(guard)
+        .with_stream_meta(tracker);
+        let _ = logged.next().await;
+        drop(logged);
+        let metrics = registry.prometheus_text().expect("metrics enabled");
+        assert!(!metrics.contains("gen_ai.client.operation.time_to_first_chunk_seconds"));
+    }
 }

@@ -36,6 +36,8 @@ pub struct RequestSpan {
     pub end_time_unix_nano: u64,
     pub status: SpanStatus,
     pub error_message: Option<String>,
+    pub error_type: Option<String>,
+    pub provider_type: Option<String>,
     pub model: String,
     pub deployment_id: Option<String>,
     pub is_stream: bool,
@@ -95,6 +97,8 @@ impl RequestSpan {
             end_time_unix_nano: 0,
             status: SpanStatus::Unset,
             error_message: None,
+            error_type: None,
+            provider_type: None,
             model,
             deployment_id: None,
             is_stream,
@@ -124,6 +128,26 @@ impl RequestSpan {
         self.attributes.push((key.to_string(), value));
     }
 
+    /// Store a structured JSON attribute and account for its serialized size.
+    pub(crate) fn set_structured_attribute(&mut self, key: &str, value: serde_json::Value) {
+        let serialized_len = serde_json::to_string(&value).unwrap_or_default().len();
+        self.body_bytes = self.body_bytes.saturating_add(serialized_len);
+        self.set_attribute(key, SpanAttributeValue::Json(Arc::new(value)));
+    }
+
+    /// Record the stable, low-cardinality error category used by OTLP error.type.
+    pub fn set_error_type(&mut self, error_type: String) {
+        self.error_type = Some(error_type);
+    }
+
+    /// Record the actual deployment provider type, ignoring empty values.
+    pub fn set_provider_type(&mut self, provider_type: String) {
+        let trimmed = provider_type.trim();
+        if !trimmed.is_empty() {
+            self.provider_type = Some(trimmed.to_string());
+        }
+    }
+
     /// Set the `boom-gateway.llm_request` body attribute. `max_body_bytes`
     /// is the retention cap (TraceConfig.max_body_bytes; 0 = unlimited):
     /// bodies at or under the cap keep the shared Arc (zero-copy with
@@ -131,12 +155,27 @@ impl RequestSpan {
     /// so the span never pins a MB-scale allocation through the active map,
     /// recent ring and OTLP queue.
     pub fn set_llm_request(&mut self, body: Arc<serde_json::Value>, max_body_bytes: usize) {
+        if let Some(messages) = crate::genai::convert_input_messages(
+            &self.api_path,
+            body.as_ref(),
+            max_body_bytes,
+        ) {
+            self.set_structured_attribute("gen_ai.input.messages", messages);
+        }
         self.set_body_attribute("boom-gateway.llm_request", body, max_body_bytes);
     }
 
     /// Set the `boom-gateway.llm_response` body attribute. Same retention
     /// cap semantics as `set_llm_request`.
     pub fn set_llm_response(&mut self, body: Arc<serde_json::Value>, max_body_bytes: usize) {
+        if let Some(messages) = crate::genai::convert_output_messages(
+            &self.api_path,
+            body.as_ref(),
+            self.is_stream,
+            max_body_bytes,
+        ) {
+            self.set_structured_attribute("gen_ai.output.messages", messages);
+        }
         self.set_body_attribute("boom-gateway.llm_response", body, max_body_bytes);
     }
 
@@ -214,6 +253,14 @@ impl RequestSpan {
 
     pub fn set_response_model(&mut self, m: String) {
         self.response_model = Some(m);
+    }
+
+    pub fn set_response_finish_reasons(&mut self, reasons: &[String]) {
+        let values = reasons
+            .iter()
+            .map(|reason| serde_json::Value::String(reason.clone()))
+            .collect();
+        self.set_structured_attribute("gen_ai.response.finish_reasons", serde_json::Value::Array(values));
     }
 
     pub fn set_queue_wait_ms(&mut self, ms: u64) {
@@ -587,5 +634,59 @@ mod tests {
         assert_eq!(out, "你");
         assert_eq!(truncate_at_byte_boundary("abc".to_string(), 10), "abc");
         assert_eq!(truncate_at_byte_boundary("abc".to_string(), 0), "");
+    }
+}
+
+
+#[cfg(test)]
+mod genai_attribute_tests {
+    use super::*;
+    use crate::context::parse_traceparent;
+
+    fn make_w3c() -> W3cContext {
+        let mut ctx = parse_traceparent(
+            "00-0af76598164860bd9a43d7c1a31725ab-00f067aa0ba902b7-01",
+        )
+        .unwrap();
+        ctx.trace_state = "opencode_user_id=alice".to_string();
+        ctx
+    }
+
+    #[test]
+    fn structured_attribute_tracks_bytes_and_snapshot() {
+        let w3c = make_w3c();
+        let mut span = RequestSpan::new(
+            "r-structured".to_string(),
+            &w3c,
+            "m".to_string(),
+            "/p".to_string(),
+            false,
+            0,
+            true,
+        );
+        let before = span.estimated_bytes();
+        span.set_structured_attribute("gen_ai.response.finish_reasons", serde_json::json!(["stop"]));
+        assert!(span.estimated_bytes() > before);
+        let snapshot = span.to_snapshot();
+        let value = serde_json::to_value(snapshot).expect("snapshot serializes structured attributes");
+        assert!(value.get("attributes").is_some());
+    }
+
+    #[test]
+    fn provider_type_ignores_empty_value() {
+        let w3c = make_w3c();
+        let mut span = RequestSpan::new(
+            "r-provider".to_string(),
+            &w3c,
+            "m".to_string(),
+            "/p".to_string(),
+            false,
+            0,
+            true,
+        );
+        span.set_provider_type(" \t\n".to_string());
+        assert!(span.provider_type.is_none());
+        span.set_provider_type("volcengine".to_string());
+        assert_eq!(span.provider_type.as_deref(), Some("volcengine"));
     }
 }

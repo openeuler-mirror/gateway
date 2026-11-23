@@ -343,7 +343,7 @@ async fn guard_mark_error_routes_to_finalize_error() {
             true,
         )
         .expect("started");
-        g.mark_error("upstream 500".to_string());
+        g.mark_error("upstream_error".to_string(), "upstream 500".to_string());
     }
     let snap = reg.snapshot().await;
     assert_eq!(snap.total_spans_error, 1);
