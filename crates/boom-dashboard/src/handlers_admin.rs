@@ -2799,8 +2799,8 @@ pub struct CreateDeploymentRequest {
     pub timeout: i64,
     #[serde(default)]
     pub headers: std::collections::HashMap<String, String>,
-    #[serde(default)]
-    pub request_defaults: serde_json::Map<String, serde_json::Value>,
+    #[serde(default, deserialize_with = "deserialize_some")]
+    pub request_defaults: Option<serde_json::Map<String, serde_json::Value>>,
     pub temperature: Option<f64>,
     pub max_tokens: Option<i32>,
     #[serde(default = "default_true_val")]

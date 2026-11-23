@@ -987,13 +987,28 @@ impl DeploymentStore {
         Ok(row.get("id"))
     }
 
+    /// Read the current defaults and lock the deployment until the caller
+    /// writes its update, so an omitted field cannot overwrite a concurrent edit.
+    pub async fn request_defaults_for_update(
+        conn: &mut sqlx::PgConnection,
+        id: uuid::Uuid,
+    ) -> Result<Option<serde_json::Map<String, serde_json::Value>>, sqlx::Error> {
+        let defaults = sqlx::query_scalar::<_, sqlx::types::Json<_>>(
+            "SELECT request_defaults FROM boom_model_deployment WHERE id = $1 FOR UPDATE",
+        )
+        .bind(id)
+        .fetch_optional(conn)
+        .await?;
+        Ok(defaults.map(|defaults| defaults.0))
+    }
+
     /// Update a deployment in DB by ID. Returns the row's previous
     /// model_name (None = row not found) so callers can converge the old
     /// model group in memory when the update renamed it — otherwise the old
     /// key keeps stale providers and lingers in /v1/models until a full
     /// reload.
     pub async fn update_db(
-        pool: &sqlx::PgPool,
+        conn: &mut sqlx::PgConnection,
         id: uuid::Uuid,
         input: &DeploymentInput,
     ) -> Result<Option<String>, sqlx::Error> {
@@ -1059,13 +1074,8 @@ impl DeploymentStore {
         .bind(visibility_str(input.visibility))
         .bind(input.max_context_tokens)
         .bind(&input.request_defaults)
-        .fetch_optional(pool)
+        .fetch_optional(conn)
         .await?;
-
-        if result.is_some() {
-            boom_state::revision::bump_best_effort(pool, boom_state::revision::CATEGORY_ROUTING)
-                .await;
-        }
         Ok(result.map(|row| row.get::<Option<String>, _>("old_model_name")).flatten())
     }
 
