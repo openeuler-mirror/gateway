@@ -1,5 +1,5 @@
 use crate::state::DashboardState;
-use axum::extract::FromRequestParts;
+use axum::extract::{ConnectInfo, FromRequestParts};
 use axum::http::header::{COOKIE, SET_COOKIE};
 use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};
@@ -158,25 +158,76 @@ pub struct MeResponse {
 
 // ── IP Extraction ─────────────────────────────────────────
 
-/// Extract client IP from request headers (reverse-proxy aware).
-fn extract_client_ip(headers: &axum::http::HeaderMap) -> String {
-    // Try X-Real-IP first (set by nginx etc.)
-    if let Some(val) = headers.get("X-Real-IP").and_then(|v| v.to_str().ok()) {
-        let ip = val.trim();
-        if !ip.is_empty() {
+/// Extract the client IP used as the login rate-limit key.
+///
+/// The key must not be forgeable by the caller. Proxy headers
+/// (`X-Real-IP` / `X-Forwarded-For`) are trivially spoofable, so they are only
+/// honoured when the TCP peer is a trusted local proxy (loopback or a private
+/// network address — the shapes a reverse proxy actually arrives from). For
+/// any other peer the connection's own IP wins and the headers are ignored.
+///
+/// The TCP fallback also removes the old "every direct client shares
+/// `unknown`" behaviour, which let one caller lock out everybody.
+fn extract_client_ip(
+    headers: &axum::http::HeaderMap,
+    remote_addr: Option<std::net::SocketAddr>,
+) -> String {
+    let peer_ip = remote_addr.map(|addr| addr.ip());
+
+    // Untrusted peer: the connection address is authoritative.
+    if let Some(ip) = peer_ip {
+        if !is_trusted_proxy(ip) {
             return ip.to_string();
         }
     }
-    // Try X-Forwarded-For (first IP in the list).
+
+    // Trusted proxy (or no peer information at all): read the forwarded chain.
+    // Values must parse as real IPs — a forged header cannot be allowed to seed
+    // the login-attempt map with arbitrary strings.
+    if let Some(val) = headers.get("X-Real-IP").and_then(|v| v.to_str().ok()) {
+        let ip = val.trim();
+        if !ip.is_empty() && ip.parse::<std::net::IpAddr>().is_ok() {
+            return ip.to_string();
+        }
+    }
     if let Some(val) = headers.get("X-Forwarded-For").and_then(|v| v.to_str().ok()) {
-        if let Some(ip) = val.split(',').next() {
+        // Standard reverse proxies *append* the real address:
+        //   X-Forwarded-For: <client-supplied>, ..., <real peer>
+        // so only the last segment was written by the proxy we trust. Taking the
+        // first one hands the rate-limit key straight back to the client.
+        if let Some(ip) = val.rsplit(',').next() {
             let ip = ip.trim();
-            if !ip.is_empty() {
+            if !ip.is_empty() && ip.parse::<std::net::IpAddr>().is_ok() {
                 return ip.to_string();
             }
         }
     }
-    "unknown".to_string()
+
+    peer_ip
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Whether an address is one a local reverse proxy would arrive from:
+/// loopback, or an RFC 1918 / link-local / ULA private address.
+///
+/// An IPv4-mapped IPv6 peer (`::ffff:127.0.0.1`) is judged as the embedded IPv4
+/// address: a dual-stack listener reports a loopback proxy in that form and
+/// `Ipv6Addr::is_loopback()` is false for it. Misjudging it would push every
+/// proxied login into one shared bucket — the DoS #75 fixed.
+fn is_trusted_proxy(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+        std::net::IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return v4.is_loopback() || v4.is_private() || v4.is_link_local();
+            }
+            let head = v6.segments()[0];
+            v6.is_loopback()                  // ::1
+                || (head & 0xfe00) == 0xfc00  // fc00::/7 unique local
+                || (head & 0xffc0) == 0xfe80  // fe80::/10 link local
+        }
+    }
 }
 
 // ── Login Rate Limiting ───────────────────────────────────
@@ -242,9 +293,10 @@ fn clear_login_failures(state: &DashboardState, client_ip: &str) {
 
 pub async fn login(
     Extension(state): Extension<std::sync::Arc<DashboardState>>,
+    ConnectInfo(remote_addr): ConnectInfo<std::net::SocketAddr>,
     req: axum::http::Request<axum::body::Body>,
 ) -> Response {
-    let client_ip = extract_client_ip(req.headers());
+    let client_ip = extract_client_ip(req.headers(), Some(remote_addr));
 
     // 1. Rate-limit check.
     if let Some(remaining) = check_login_lockout(&state, &client_ip) {
@@ -478,4 +530,137 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         result |= x ^ y;
     }
     result == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_client_ip;
+    use axum::http::{HeaderMap, HeaderValue};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    fn with(name: &'static str, value: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(name, HeaderValue::from_str(value).unwrap());
+        h
+    }
+
+    fn peer(addr: [u8; 4]) -> Option<SocketAddr> {
+        Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::from(addr)), 12345))
+    }
+
+    /// A public client cannot choose its rate-limit key: the TCP peer wins and
+    /// the spoofable proxy headers are ignored.
+    #[test]
+    fn public_peer_overrides_spoofed_headers() {
+        let headers = with("x-real-ip", "203.0.113.7");
+        let ip = extract_client_ip(&headers, peer([198, 51, 100, 9]));
+        println!("public peer -> {ip}");
+        assert_eq!(ip, "198.51.100.9");
+    }
+
+    #[test]
+    fn forwarded_for_is_ignored_for_public_peers() {
+        let headers = with("x-forwarded-for", "203.0.113.7, 10.0.0.1");
+        let ip = extract_client_ip(&headers, peer([198, 51, 100, 9]));
+        assert_eq!(ip, "198.51.100.9");
+    }
+
+    /// Behind a local reverse proxy the forwarded chain is the only way to tell
+    /// clients apart, so it is honoured.
+    #[test]
+    fn trusted_proxy_headers_are_honoured() {
+        let headers = with("x-real-ip", "203.0.113.7");
+        assert_eq!(
+            extract_client_ip(&headers, peer([127, 0, 0, 1])),
+            "203.0.113.7"
+        );
+        assert_eq!(
+            extract_client_ip(&headers, peer([10, 0, 0, 5])),
+            "203.0.113.7"
+        );
+    }
+
+    /// Without any proxy header the real peer address is used, so two direct
+    /// clients no longer share one lockout bucket.
+    #[test]
+    fn direct_clients_do_not_share_a_bucket() {
+        let a = extract_client_ip(&HeaderMap::new(), peer([198, 51, 100, 9]));
+        let b = extract_client_ip(&HeaderMap::new(), peer([198, 51, 100, 10]));
+        println!("a={a} b={b}");
+        assert_eq!(a, "198.51.100.9");
+        assert_eq!(b, "198.51.100.10");
+    }
+
+    /// Last-resort fallback when the peer address is unavailable.
+    #[test]
+    fn missing_peer_falls_back_to_unknown() {
+        assert_eq!(extract_client_ip(&HeaderMap::new(), None), "unknown");
+    }
+
+    fn peer_v6(addr: std::net::Ipv6Addr) -> Option<SocketAddr> {
+        Some(SocketAddr::new(IpAddr::V6(addr), 12345))
+    }
+
+    /// A dual-stack listener reports a loopback reverse proxy as
+    /// `::ffff:127.0.0.1`. `Ipv6Addr::is_loopback()` is false for it, so without
+    /// unwrapping the mapped form every proxied login would share one bucket.
+    #[test]
+    fn ipv4_mapped_loopback_peer_is_trusted() {
+        let headers = with("x-real-ip", "203.0.113.7");
+        let mapped: std::net::Ipv6Addr = "::ffff:127.0.0.1".parse().unwrap();
+        assert_eq!(
+            extract_client_ip(&headers, peer_v6(mapped)),
+            "203.0.113.7",
+            "IPv4-mapped loopback must count as a trusted proxy"
+        );
+
+        let mapped_private: std::net::Ipv6Addr = "::ffff:10.1.2.3".parse().unwrap();
+        assert_eq!(
+            extract_client_ip(&headers, peer_v6(mapped_private)),
+            "203.0.113.7"
+        );
+    }
+
+    /// ULA (fc00::/7) and link-local (fe80::/10) proxies are local too.
+    #[test]
+    fn ipv6_ula_and_link_local_peers_are_trusted() {
+        let headers = with("x-real-ip", "203.0.113.7");
+        for proxy in ["fc00::1", "fd12:3456::7", "fe80::1"] {
+            let addr: std::net::Ipv6Addr = proxy.parse().unwrap();
+            assert_eq!(
+                extract_client_ip(&headers, peer_v6(addr)),
+                "203.0.113.7",
+                "{proxy} should be treated as a trusted local proxy"
+            );
+        }
+    }
+
+    /// Reverse proxies append the real address, so the last segment is the one
+    /// the proxy wrote. Using the first segment would honour the value the
+    /// client injected itself.
+    #[test]
+    fn forwarded_for_uses_the_last_segment() {
+        let headers = with("x-forwarded-for", "1.2.3.4, 10.0.0.1, 203.0.113.7");
+        assert_eq!(
+            extract_client_ip(&headers, peer([127, 0, 0, 1])),
+            "203.0.113.7",
+            "must not take the client-supplied first segment"
+        );
+    }
+
+    /// A header that is not a valid IP falls through to the next source instead
+    /// of becoming a rate-limit key (which would let a caller grow the map
+    /// without bound with arbitrary strings).
+    #[test]
+    fn invalid_forwarded_headers_are_ignored() {
+        let headers = with("x-forwarded-for", "not-an-ip");
+        assert_eq!(extract_client_ip(&headers, peer([127, 0, 0, 1])), "127.0.0.1");
+
+        let mut both = with("x-real-ip", "garbage");
+        both.insert(
+            "x-forwarded-for",
+            HeaderValue::from_str("203.0.113.9").unwrap(),
+        );
+        assert_eq!(extract_client_ip(&both, peer([127, 0, 0, 1])), "203.0.113.9");
+    }
 }
