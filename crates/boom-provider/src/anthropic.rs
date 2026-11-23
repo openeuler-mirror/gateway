@@ -453,6 +453,18 @@ impl AnthropicProvider {
             .and_then(|t| t.as_u64())
             .map(|v| v as u32);
 
+        // Anthropic's `input_tokens` counts only the uncached prefix: cache
+        // reads and cache writes are reported separately. OpenAI's
+        // `prompt_tokens` is the full input, so fold them back in — otherwise
+        // billing and quotas see only the uncached slice, and the cache
+        // discount (which reads `prompt_tokens_details.cached_tokens`) never
+        // applies.
+        let cache_read_tokens = cache_read.unwrap_or(0);
+        let cache_creation_tokens = cache_creation.unwrap_or(0);
+        let prompt_tokens = input_tokens
+            .saturating_add(cache_read_tokens)
+            .saturating_add(cache_creation_tokens);
+
         let finish_reason = stop_reason
             .map(|r| match r.as_str() {
                 "tool_use" => "tool_calls".to_string(),
@@ -521,12 +533,14 @@ impl AnthropicProvider {
                 logprobs: None,
             }],
             usage: Some(Usage {
-                prompt_tokens: input_tokens,
+                prompt_tokens,
                 completion_tokens: output_tokens,
-                total_tokens: input_tokens + output_tokens,
+                total_tokens: prompt_tokens.saturating_add(output_tokens),
                 cache_creation_input_tokens: cache_creation,
                 cache_read_input_tokens: cache_read,
-                prompt_tokens_details: None,
+                prompt_tokens_details: cache_read.map(|cached| PromptTokensDetails {
+                    cached_tokens: Some(cached),
+                }),
                 completion_tokens_details: None,
             }),
             system_fingerprint: None,
@@ -882,6 +896,18 @@ impl Provider for AnthropicProvider {
                                     // trace channel's gen_ai.usage.cache_*.
                                     let cache_read = as_i32("cache_read_input_tokens");
                                     let cache_creation = as_i32("cache_creation_input_tokens");
+                                    // Anthropic's `input_tokens` counts only the
+                                    // uncached prefix; OpenAI's `prompt_tokens`
+                                    // is the full input. Fold them together here
+                                    // exactly like the non-streaming
+                                    // `from_anthropic_response`, otherwise the
+                                    // streamed usage under-reports by orders of
+                                    // magnitude and the discount path finds no
+                                    // cached_tokens.
+                                    let prompt_tokens = input_tokens.map(|it| {
+                                        it.saturating_add(cache_read.unwrap_or(0))
+                                            .saturating_add(cache_creation.unwrap_or(0))
+                                    });
 
                                     // Emit a role chunk so OpenAI clients see `role: "assistant"`
                                     // in the first SSE chunk (matching litellm behavior).
@@ -900,9 +926,14 @@ impl Provider for AnthropicProvider {
                                             },
                                             finish_reason: None,
                                         }],
-                                        usage: input_tokens.map(|it| StreamUsage {
+                                        usage: prompt_tokens.map(|it| StreamUsage {
                                             prompt_tokens: Some(it),
                                             completion_tokens: Some(0),
+                                            prompt_tokens_details: cache_read.map(|cached| {
+                                                PromptTokensDetails {
+                                                    cached_tokens: Some(cached.max(0) as u32),
+                                                }
+                                            }),
                                             cache_read_input_tokens: cache_read,
                                             cache_creation_input_tokens: cache_creation,
                                             ..Default::default()
@@ -1203,5 +1234,53 @@ mod tests {
             }
         }
         assert!(saw_content, "CRLF-framed frames must not hang the stream");
+    }
+
+    /// Anthropic reports `input_tokens` as the uncached prefix only; cache
+    /// reads and cache writes live in separate fields. `prompt_tokens` must
+    /// fold all three back together (OpenAI semantics), otherwise billing sees
+    /// only the uncached slice and the discount path finds no cached_tokens.
+    #[test]
+    fn cache_tokens_are_folded_into_prompt_tokens() {
+        let provider = provider_for("http://localhost".to_string(), Some("k".to_string()));
+        let mut resp = fake_anthropic_response();
+        resp["usage"] = serde_json::json!({
+            "input_tokens": 12,
+            "output_tokens": 5,
+            "cache_read_input_tokens": 50000,
+            "cache_creation_input_tokens": 3000
+        });
+
+        let out = provider.from_anthropic_response(resp, "claude-test");
+        let usage = out.usage.expect("usage must be present");
+
+        assert_eq!(
+            usage.prompt_tokens, 53012,
+            "prompt_tokens must include cache_read + cache_creation"
+        );
+        assert_eq!(usage.completion_tokens, 5);
+        assert_eq!(usage.total_tokens, 53017);
+        assert_eq!(usage.cache_read_input_tokens, Some(50000));
+        assert_eq!(usage.cache_creation_input_tokens, Some(3000));
+        assert_eq!(
+            usage
+                .prompt_tokens_details
+                .and_then(|details| details.cached_tokens),
+            Some(50000),
+            "cached_tokens must carry the cache-read count for the discount path"
+        );
+    }
+
+    /// Without any cache fields the mapping must stay identical to before.
+    #[test]
+    fn usage_without_cache_fields_is_unchanged() {
+        let provider = provider_for("http://localhost".to_string(), Some("k".to_string()));
+        let out = provider.from_anthropic_response(fake_anthropic_response(), "claude-test");
+        let usage = out.usage.expect("usage must be present");
+
+        assert_eq!(usage.prompt_tokens, 5);
+        assert_eq!(usage.completion_tokens, 1);
+        assert_eq!(usage.total_tokens, 6);
+        assert!(usage.prompt_tokens_details.is_none());
     }
 }
