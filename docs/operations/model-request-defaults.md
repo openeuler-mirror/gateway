@@ -55,7 +55,7 @@ model_list:
 
 沿用仓库原有配置权威规则：数据库模式下 YAML 仅用于空库初始导入；日常修改使用控制台。仅修改已有 YAML 后执行 reload 不会覆盖数据库。无数据库模式从 YAML 构建 Provider。配置查询、YAML 导出和回写包含该字段。
 
-控制台管理接口 `POST /dashboard/api/admin/models`、`PUT /dashboard/api/admin/models/{id}` 的请求体顶层新增 `request_defaults` 对象；列表响应也会返回该对象。PUT 沿用全量更新语义，省略该字段等同于清空默认值。非对象输入返回 422；非法保留字段或不支持的 Provider 沿用模型管理接口的 JSON `error` 响应，写库前拒绝。
+控制台模型管理接口的请求和列表响应使用顶层 `request_defaults` 对象。POST 省略该字段时以 `{}` 初始化。PUT 省略该字段时保留已保存的值，传入 `{}` 时显式清空。更换到不支持非空默认参数的 Provider 时，可在同一次 PUT 中传 `{}` 清空。非对象输入（包括 `null`）返回 422，非法保留字段或与 Provider 不兼容的默认值会在写库前拒绝。
 
 更新随控制台命令在当前网关实例生效，共享数据库的其他实例沿用现有路由配置同步机制。数据库迁移在启动时先探测列是否存在，需要时才执行 DDL，为 `boom_model_deployment` 增加 `request_defaults JSONB NOT NULL DEFAULT '{}'`，DDL 保持在表所属的 boom-routing 中。
 

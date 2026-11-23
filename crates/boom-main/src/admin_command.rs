@@ -387,7 +387,8 @@ async fn handle_create_model(
     req: boom_dashboard::handlers_admin::CreateDeploymentRequest,
 ) -> Result<Value, String> {
     ensure_not_workflow_model(state, &req.model_name)?;
-    boom_core::request_defaults::validate_for_model(&req.litellm_model, &req.request_defaults)?;
+    let request_defaults = req.request_defaults.unwrap_or_default();
+    boom_core::request_defaults::validate_for_model(&req.litellm_model, &request_defaults)?;
     let db_pool = state.db_pool.as_ref().ok_or("Database not available")?;
     let headers_json = serde_json::to_value(&req.headers).unwrap_or(json!({}));
     let visibility = parse_model_visibility(&req.visibility)?;
@@ -406,7 +407,7 @@ async fn handle_create_model(
         tpm: req.tpm,
         timeout: req.timeout,
         headers: headers_json,
-        request_defaults: Value::Object(req.request_defaults.clone()),
+        request_defaults: Value::Object(request_defaults),
         temperature: req.temperature,
         max_tokens: req.max_tokens,
         enabled: req.enabled,
@@ -446,10 +447,19 @@ async fn handle_update_model(
     req: boom_dashboard::handlers_admin::CreateDeploymentRequest,
 ) -> Result<Value, String> {
     ensure_not_workflow_model(state, &req.model_name)?;
-    boom_core::request_defaults::validate_for_model(&req.litellm_model, &req.request_defaults)?;
     let db_pool = state.db_pool.as_ref().ok_or("Database not available")?;
     let headers_json = serde_json::to_value(&req.headers).unwrap_or(json!({}));
     let visibility = parse_model_visibility(&req.visibility)?;
+
+    let mut tx = db_pool.begin().await.map_err(|e| format!("DB update failed: {e}"))?;
+    let request_defaults = match req.request_defaults {
+        Some(defaults) => defaults,
+        None => DeploymentStore::request_defaults_for_update(&mut tx, id)
+            .await
+            .map_err(|e| format!("Could not read stored request_defaults: {e}"))?
+            .ok_or("Model deployment not found")?,
+    };
+    boom_core::request_defaults::validate_for_model(&req.litellm_model, &request_defaults)?;
 
     let input = boom_routing::DeploymentInput {
         model_name: req.model_name.clone(),
@@ -465,7 +475,7 @@ async fn handle_update_model(
         tpm: req.tpm,
         timeout: req.timeout,
         headers: headers_json,
-        request_defaults: Value::Object(req.request_defaults.clone()),
+        request_defaults: Value::Object(request_defaults),
         temperature: req.temperature,
         max_tokens: req.max_tokens,
         enabled: req.enabled,
@@ -485,18 +495,16 @@ async fn handle_update_model(
         visibility,
     };
 
-    let old_model_name = DeploymentStore::update_db(db_pool, id, &input)
+    let old_model_name = DeploymentStore::update_db(&mut tx, id, &input)
         .await
-        .map_err(|e| format!("DB update failed: {}", e))?;
-
-    let old_model_name = match old_model_name {
-        Some(name) => name,
-        None => return Err("Model deployment not found".to_string()),
-    };
+        .map_err(|e| format!("DB update failed: {e}"))?
+        .ok_or("Model deployment not found")?;
+    tx.commit().await.map_err(|e| format!("DB update failed: {e}"))?;
+    boom_state::revision::bump_best_effort(db_pool, boom_state::revision::CATEGORY_ROUTING).await;
 
     // Reload the affected model + wildcard from DB so the updated deployment
     // (new api_base/api_key/flow-control limits/serve_not_match toggle) takes
-    // effect immediately. YAML persistence is best-effort in the dispatcher.
+    // effect immediately.
     reload_model_deployments(state, &req.model_name).await;
 
     // Rename: converge the OLD model group too. Without this the old key

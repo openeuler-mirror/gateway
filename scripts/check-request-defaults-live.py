@@ -249,6 +249,9 @@ def main():
                 body["request_defaults"] = []
                 assert request_http("/dashboard/api/admin/models/" + body["id"], body, "PUT")[0] == 422
                 passed("non-object defaults rejected")
+                body["request_defaults"] = None
+                assert request_http("/dashboard/api/admin/models/" + body["id"], body, "PUT")[0] == 422
+                passed("explicit null defaults rejected")
 
                 created = admin_json("/admin/models", {"model_name": "created", "litellm_model": "openai/backend",
                     "api_base": f"http://127.0.0.1:{backend.server_port}/created/v1",
@@ -259,6 +262,24 @@ def main():
                 assert next(r for r in bad if r["id"] == created["id"])["request_defaults"] == {"reasoning_effort": "low"}
 
                 edit(by_name["standard"], {"reasoning_effort": "high"})
+                # Older clients can update a deployment without sending the new field.
+                row = next(r for r in admin_json("/admin/models")["models"] if r["model_name"] == "standard")
+                body = {**row, "timeout": 120, "api_key": None,
+                        "aws_access_key_id": None, "aws_secret_access_key": None}
+                del body["request_defaults"]
+                path = "/admin/models/" + row["id"]
+                admin_json(path, body, "PUT")
+                current = next(r for r in admin_json("/admin/models")["models"] if r["id"] == row["id"])
+                assert current["timeout"] == 120
+                assert current["request_defaults"] == {"reasoning_effort": "high"}, current["request_defaults"]
+                assert chat("standard")["body"]["reasoning_effort"] == "high"
+                passed("omitted defaults preserve the value while another field changes")
+
+                incompatible = {**body, "litellm_model": "anthropic/claude-sonnet"}
+                status, raw = request_http("/dashboard/api" + path, incompatible, "PUT")
+                assert status == 200 and "request_defaults" in json.loads(raw)["error"], raw
+                assert chat("standard")["body"]["reasoning_effort"] == "high"
+                passed("provider change validates retained defaults")
                 snapshot = admin_json("/admin/config")
                 entries = snapshot["model_list"]
                 assert next(e for e in entries if e["model_name"] == "standard")["litellm_params"]["request_defaults"] == {"reasoning_effort": "high"}
@@ -275,7 +296,10 @@ def main():
                 assert chat("standard")["body"]["reasoning_effort"] == "high"
                 assert chat("qwen")["body"]["chat_template_kwargs"]["enable_thinking"] is False
                 assert chat("created")["body"]["reasoning_effort"] == "low"
-                passed("restart retains DB edits and created deployment")
+                persisted = next(r for r in admin_json("/admin/models")["models"] if r["id"] == row["id"])
+                assert persisted["timeout"] == 120
+                assert persisted["request_defaults"] == {"reasoning_effort": "high"}
+                passed("restart retains defaults after an update that omits them")
                 admin_json("/admin/models/" + created["id"], method="DELETE")
                 passed("Dashboard delete deployment with defaults")
             except Exception:
