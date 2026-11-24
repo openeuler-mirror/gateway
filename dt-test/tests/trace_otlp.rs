@@ -28,7 +28,7 @@ use boom_core::OtlpConfig;
 use boom_core::trace::{ProbeResult, SpanAttributeValue};
 use boom_trace::otlp_export::TraceExporter;
 use boom_trace::otlp_export::{convert_span_to_resource_spans, ping_endpoint};
-use boom_trace::{parse_traceparent, RequestSpan, UpstreamAttempt};
+use boom_trace::{parse_traceparent, synthetic_context, RequestSpan, UpstreamAttempt};
 use opentelemetry_proto::tonic::common::v1::any_value::Value as OtlpAnyValue;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Respond, ResponseTemplate};
@@ -488,6 +488,52 @@ fn convert_span_maps_ids_status_and_attributes() {
     assert!(matches!(attr(&rs_err, "error.type"), Some(OtlpAnyValue::StringValue(v)) if v == "_OTHER"));
 }
 
+#[test]
+fn convert_synthetic_root_includes_genai_bodies() {
+    let w3c = synthetic_context("req-no-header-root");
+    let mut span = RequestSpan::new(
+        "req-no-header-root".into(),
+        &w3c,
+        "demo_model".into(),
+        "/v1/chat/completions".into(),
+        false,
+        1_000_000_000,
+        true,
+    );
+    span.set_llm_request(
+        Arc::new(serde_json::json!({"messages": [{"role": "user", "content": "hello"}]})),
+        0,
+        false,
+    );
+    span.set_llm_response(
+        Arc::new(serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}]
+        })),
+        0,
+    );
+    span.finalize_ok(2_000_000_000);
+
+    let rs = convert_span_to_resource_spans(&span, &empty_resource(), 0);
+    let converted = &rs.scope_spans[0].spans[0];
+    assert_eq!(converted.trace_id, w3c.trace_id.to_vec());
+    assert!(!converted.span_id.iter().all(|byte| *byte == 0));
+    assert!(converted.parent_span_id.is_empty(), "synthetic span must be a root");
+    match attr(&rs, "gen_ai.input.messages") {
+        Some(OtlpAnyValue::StringValue(value)) => {
+            let messages: serde_json::Value = serde_json::from_str(value).expect("input messages JSON");
+            assert_eq!(messages[0]["role"], "user");
+        }
+        other => panic!("missing gen_ai.input.messages: {other:?}"),
+    }
+    match attr(&rs, "gen_ai.output.messages") {
+        Some(OtlpAnyValue::StringValue(value)) => {
+            let messages: serde_json::Value = serde_json::from_str(value).expect("output messages JSON");
+            assert_eq!(messages[0]["role"], "assistant");
+        }
+        other => panic!("missing gen_ai.output.messages: {other:?}"),
+    }
+}
+
 /// DT-OTLP-11：resource 挂载 service.name / service.version（Some/None 两态）。
 #[test]
 fn convert_span_carries_resource_metadata() {
@@ -577,4 +623,79 @@ async fn ping_endpoint_matrix() {
     // 连接失败
     let err = ping_endpoint(&config("http://127.0.0.1:1")).await.err().expect("refused");
     assert!(!err.is_empty());
+}
+
+/// DT-OTLP-14：无有效 traceparent 的 synthetic root 导出为非零 trace/span id、
+/// 空 parent，并携带 GenAI 输入/输出（issue #78 根 span 形态）。
+#[test]
+fn synthetic_root_without_traceparent_exports_input_output() {
+    let w3c = synthetic_context("req-synthetic-root");
+    let mut span = RequestSpan::new(
+        "req-synthetic-root".into(),
+        &w3c,
+        "demo_model".into(),
+        "/v1/chat/completions".into(),
+        false,
+        1_000_000_000,
+        true,
+    );
+    span.set_llm_request(
+        Arc::new(serde_json::json!({
+            "messages": [{"role": "user", "content": "hello root"}]
+        })),
+        0,
+        false,
+    );
+    span.set_llm_response(
+        Arc::new(serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": "hi back"}}]
+        })),
+        0,
+    );
+    span.finalize_ok(2_000_000_000);
+
+    let rs = convert_span_to_resource_spans(&span, &empty_resource(), 0);
+    let s = &rs.scope_spans[0].spans[0];
+    assert!(s.parent_span_id.is_empty(), "synthetic root has no parent");
+    assert_eq!(s.trace_id, w3c.trace_id.to_vec());
+    assert!(s.trace_id.iter().any(|b| *b != 0), "trace id is non-zero");
+    assert!(s.span_id.iter().any(|b| *b != 0), "span id is non-zero");
+    assert!(
+        matches!(attr(&rs, "gen_ai.input.messages"), Some(OtlpAnyValue::StringValue(v)) if v.contains("hello root"))
+    );
+    assert!(
+        matches!(attr(&rs, "gen_ai.output.messages"), Some(OtlpAnyValue::StringValue(v)) if v.contains("hi back"))
+    );
+}
+
+/// DT-OTLP-15：capture_body=false 的 synthetic root 仍导出根元数据，
+/// 但不含输入/输出消息，也没有 upstream attempt 事件。
+#[test]
+fn capture_body_false_root_has_metadata_but_no_messages_or_attempts() {
+    let w3c = synthetic_context("req-synthetic-no-body");
+    let mut span = RequestSpan::new(
+        "req-synthetic-no-body".into(),
+        &w3c,
+        "demo_model".into(),
+        "/v1/chat/completions".into(),
+        false,
+        1_000_000_000,
+        true,
+    );
+    span.set_provider_type("demo_provider".to_string());
+    span.finalize_ok(2_000_000_000);
+
+    let rs = convert_span_to_resource_spans(&span, &empty_resource(), 0);
+    let s = &rs.scope_spans[0].spans[0];
+    assert!(s.parent_span_id.is_empty(), "synthetic root has no parent");
+    assert!(
+        matches!(attr(&rs, "boom-gateway.model"), Some(OtlpAnyValue::StringValue(v)) if v == "demo_model")
+    );
+    assert_eq!(s.status.as_ref().unwrap().code, 1);
+    assert!(attr(&rs, "gen_ai.input.messages").is_none());
+    assert!(attr(&rs, "gen_ai.output.messages").is_none());
+    assert!(
+        s.events.iter().all(|event| event.name != "ai.gateway.upstream.attempt"),
+        "capture_body=false records no upstream attempts"
+    );
 }

@@ -1202,11 +1202,7 @@ async fn chat_completions_inner(
         .get("traceparent")
         .and_then(|v| v.to_str().ok())
         .and_then(parse_traceparent);
-    let should_trace = trace_cfg.enabled
-        && w3c_ctx
-            .as_ref()
-            .map(|w| boom_trace::trace_filter_matches(&trace_cfg.report_filter.tracestate_keys, &trace_cfg.report_filter.trace_id_regex, w))
-            .unwrap_or(false);
+    let should_trace = trace_export_eligible(&trace_cfg, w3c_ctx.as_ref());
     // Full-coverage guard (issue #49): a span is created for every request
     // so metrics see all traffic — a synthetic W3C context stands in when
     // the client sent no traceparent. `should_trace` only gates OTLP trace
@@ -3925,14 +3921,11 @@ pub async fn messages(
         .get("traceparent")
         .and_then(|v| v.to_str().ok())
         .and_then(parse_traceparent);
-    let should_trace = trace_cfg.enabled
-        && w3c_ctx
-            .as_ref()
-            .map(|w| boom_trace::trace_filter_matches(&trace_cfg.report_filter.tracestate_keys, &trace_cfg.report_filter.trace_id_regex, w))
-            .unwrap_or(false);
-    // Guard is created unconditionally (metrics need full coverage); spans
-    // without an inbound traceparent get a synthetic W3C context and are
-    // never exported as traces (export_eligible=false).
+    let should_trace = trace_export_eligible(&trace_cfg, w3c_ctx.as_ref());
+    // Guard is created unconditionally (metrics need full coverage); a
+    // synthetic W3C context stands in when the client sent no traceparent.
+    // `should_trace` gates OTLP trace export only — the export switch
+    // decides whether a synthetic root is eligible — not metrics.
     let synthetic_w3c = boom_trace::synthetic_context(&request_id);
     let mut trace_guard = TraceGuard::start(
         state.trace.clone(),
@@ -4738,6 +4731,28 @@ struct EdgeRequestPrep {
     trace_id: Option<String>,
 }
 
+/// Decide whether this request should export a trace span. `enabled` is the
+/// master switch; with a valid inbound context the existing report filter is
+/// authoritative, otherwise the synthetic-root switch decides.
+fn trace_export_eligible(config: &boom_config::TraceConfig, w3c: Option<&W3cContext>) -> bool {
+    config.enabled
+        && w3c.map_or(config.export_without_traceparent, |w| {
+            boom_trace::trace_filter_matches(
+                &config.report_filter.tracestate_keys,
+                &config.report_filter.trace_id_regex,
+                w,
+            )
+        })
+}
+
+    gateway_span_id: [u8; 8],
+) -> (String, Option<String>) {
+    (
+        boom_trace::build_child_traceparent(parent.trace_id, gateway_span_id, parent.sampled),
+        (!parent.trace_state.is_empty()).then(|| parent.trace_state.clone()),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prepare_edge_request<T: serde::Serialize>(
     state: &AppState,
@@ -4759,26 +4774,17 @@ fn prepare_edge_request<T: serde::Serialize>(
     let blocklist_armed =
         state.block_rule_store.is_enabled() && !state.block_rule_store.is_empty();
     // Trace votes on body construction independently: enabled && capture_body
-    // is channel-level (every span carries the same attribute set), not
-    // per-request — per-request export filtering stays in the handler.
+    // is channel-level (every span carries the same attribute set) and keeps
+    // non-exported spans useful for metrics; raw provider-exchange capture is
+    // per-request and additionally requires export eligibility.
     let trace_cfg = state.inner.load().config.trace.clone().unwrap_or_default();
     let trace_wants_body = trace_cfg.enabled && trace_cfg.capture_body;
-    // Per-request raw capture for the trace channel: only requests that would
-    // actually export a trace create the provider-body side channel, so
-    // untraced traffic pays nothing for it.
-    let trace_should_raw = trace_wants_body
-        && headers
-            .get("traceparent")
-            .and_then(|v| v.to_str().ok())
-            .and_then(parse_traceparent)
-            .map(|w| {
-                boom_trace::trace_filter_matches(
-                    &trace_cfg.report_filter.tracestate_keys,
-                    &trace_cfg.report_filter.trace_id_regex,
-                    &w,
-                )
-            })
-            .unwrap_or(false);
+    let trace_w3c: Option<W3cContext> = headers
+        .get("traceparent")
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_traceparent);
+    let trace_should_raw =
+        trace_cfg.capture_body && trace_export_eligible(&trace_cfg, trace_w3c.as_ref());
     let req_body_value: Option<Arc<serde_json::Value>> =
         if blocklist_armed || prompt_log_should || trace_wants_body {
             serde_json::to_value(req).ok().map(Arc::new)
@@ -4974,14 +4980,11 @@ pub async fn responses(
         .get("traceparent")
         .and_then(|v| v.to_str().ok())
         .and_then(parse_traceparent);
-    let should_trace = trace_cfg.enabled
-        && w3c_ctx
-            .as_ref()
-            .map(|w| boom_trace::trace_filter_matches(&trace_cfg.report_filter.tracestate_keys, &trace_cfg.report_filter.trace_id_regex, w))
-            .unwrap_or(false);
-    // Guard is created unconditionally (metrics need full coverage); spans
-    // without an inbound traceparent get a synthetic W3C context and are
-    // never exported as traces (export_eligible=false).
+    let should_trace = trace_export_eligible(&trace_cfg, w3c_ctx.as_ref());
+    // Guard is created unconditionally (metrics need full coverage); a
+    // synthetic W3C context stands in when the client sent no traceparent.
+    // `should_trace` gates OTLP trace export only — the export switch
+    // decides whether a synthetic root is eligible — not metrics.
     let synthetic_w3c = boom_trace::synthetic_context(&request_id);
     let mut trace_guard = TraceGuard::start(
         state.trace.clone(),
@@ -6449,6 +6452,65 @@ mod tests {
             expires_at: None,
             metadata: serde_json::Value::Null,
         }
+    }
+
+    fn w3c_with_trace_id(trace_id: [u8; 16]) -> boom_trace::W3cContext {
+        boom_trace::W3cContext {
+            trace_id,
+            parent_span_id: [0u8; 8],
+            sampled: false,
+            trace_state: String::new(),
+        }
+    }
+
+    #[test]
+    fn trace_export_eligible_missing_context_follows_switch() {
+        let mut cfg = boom_config::TraceConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        cfg.export_without_traceparent = false;
+        assert!(!trace_export_eligible(&cfg, None));
+        cfg.export_without_traceparent = true;
+        assert!(trace_export_eligible(&cfg, None));
+    }
+
+    #[test]
+    fn trace_export_eligible_valid_context_ignores_switch_and_uses_filter() {
+        let w3c = w3c_with_trace_id([0xab; 16]);
+        for switch in [false, true] {
+            let matching = boom_config::TraceConfig {
+                enabled: true,
+                export_without_traceparent: switch,
+                report_filter: boom_config::TraceFilterConfig {
+                    tracestate_keys: Vec::new(),
+                    trace_id_regex: Some("^ab".to_string()),
+                },
+                ..Default::default()
+            };
+            assert!(trace_export_eligible(&matching, Some(&w3c)));
+
+            let mismatched = boom_config::TraceConfig {
+                enabled: true,
+                export_without_traceparent: switch,
+                report_filter: boom_config::TraceFilterConfig {
+                    tracestate_keys: Vec::new(),
+                    trace_id_regex: Some("^cd".to_string()),
+                },
+                ..Default::default()
+            };
+            assert!(!trace_export_eligible(&mismatched, Some(&w3c)));
+        }
+    }
+
+    #[test]
+    fn trace_export_eligible_disabled_is_always_false() {
+        let cfg = boom_config::TraceConfig {
+            enabled: false,
+            export_without_traceparent: true,
+            ..Default::default()
+        };
+        assert!(!trace_export_eligible(&cfg, None));
     }
 
     async fn state_from_yaml(yaml: &str) -> crate::state::AppState {
