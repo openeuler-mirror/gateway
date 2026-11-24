@@ -917,6 +917,50 @@ pub async fn adopt_router_behavior_db(
     Ok(())
 }
 
+/// DB-backed prompt-log retention policy: read the `boom_config` KV row,
+/// seeding it from the YAML `prompt_log.retention` section on first contact
+/// (fresh DB). After that the row is authoritative — the YAML section is
+/// seed-only (CATEGORY_PROMPTLOG broadcast; every instance enforces the
+/// shared policy against its own local segment directory). A malformed row
+/// falls back to the seed value wholesale (the next dashboard PUT heals it).
+pub async fn adopt_prompt_log_retention_db(
+    pool: &PgPool,
+    prompt_log: &mut boom_promptlog::PromptLogConfig,
+) -> Result<(), sqlx::Error> {
+    let seed = prompt_log.retention.clone();
+    let seed_json = serde_json::to_value(&seed).unwrap_or(serde_json::json!({}));
+    let value = boom_dashboard::config_kv::adopt_value(
+        pool,
+        boom_dashboard::config_kv::PROMPT_LOG_RETENTION,
+        seed_json,
+    )
+    .await?;
+    let adopted = serde_json::from_value::<boom_promptlog::RetentionConfig>(value).unwrap_or_else(|e| {
+        tracing::warn!(
+            error = %e,
+            "malformed prompt_log_retention KV row — using the YAML seed values"
+        );
+        seed
+    });
+    prompt_log.retention = adopted;
+    Ok(())
+}
+
+/// 防呆 companion for the prompt-log retention policy, same pristine-timing
+/// contract as `warn_inert_router_policy_group`: call at the load sites
+/// BEFORE the adopt overlays the DB value. Warn condition = any value that
+/// differs from the built-in default (a non-default YAML value would be
+/// silently ignored after the first boot).
+pub fn warn_inert_prompt_log_retention(prompt_log: &boom_promptlog::PromptLogConfig) {
+    if prompt_log.retention != boom_promptlog::RetentionConfig::default() {
+        tracing::warn!(
+            "prompt_log.retention in YAML is inert (seed-only) — the retention policy is \
+             managed in the DB via the Dashboard (Config page, Prompt Log card) or \
+             PUT /dashboard/api/admin/prompt-log/retention"
+        );
+    }
+}
+
 /// 防呆: warn when YAML still carries runtime-section content that is now
 /// inert (DB is the authority). Called on boot (when the DB already carried
 /// config) and on every reload in DB mode.

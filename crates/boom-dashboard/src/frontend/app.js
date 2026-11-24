@@ -7167,7 +7167,16 @@
     try {
       const cfg = await api("/admin/config");
       _configCache = cfg;
-      wrap.innerHTML = renderConfigPage(cfg);
+      // Retention is DB-authoritative — the live adopted policy comes from
+      // the prompt-log status endpoint, not the YAML snapshot. Best-effort:
+      // on failure the form falls back to the YAML section value (which is
+      // the authority in no-DB mode anyway).
+      let liveRetention = null;
+      try {
+        const st = await api("/admin/prompt-log/status");
+        liveRetention = (st && st.retention) || null;
+      } catch (e) { /* fall back to YAML value */ }
+      wrap.innerHTML = renderConfigPage(cfg, liveRetention);
       wireConfigPage(cfg);
     } catch (err) {
       wrap.innerHTML = '<p style="color:var(--danger)">' + esc(err.message) + "</p>";
@@ -7182,12 +7191,12 @@
   // is persisted in sessionStorage so a refresh keeps you on the same card.
   // On narrow viewports (<960px) the sidebar hides and a <select> takes
   // over so mobile users can still switch cards.
-  function renderConfigPage(cfg) {
+  function renderConfigPage(cfg, liveRetention) {
     const items = [
       { group: "runtime", section: "runtime-server",       label: t("config.section.server"),                icon: "server",       html: renderCardServer(cfg.server || {}) },
       { group: "runtime", section: "runtime-general",      label: t("config.section.general_settings"),     icon: "general",       html: renderCardGeneral(cfg.general_settings || {}, cfg.router_settings || {}) },
       { group: "runtime", section: "runtime-health",       label: t("config.section.deployment_health_check"), icon: "health",     html: renderCardHealthCheck(cfg.deployment_health_check || {}) },
-      { group: "runtime", section: "runtime-prompt-log",   label: t("config.section.prompt_log"),            icon: "prompt-log",   html: renderCardPromptLog(cfg.prompt_log || {}) },
+      { group: "runtime", section: "runtime-prompt-log",   label: t("config.section.prompt_log"),            icon: "prompt-log",   html: renderCardPromptLog(cfg.prompt_log || {}, liveRetention) },
       { group: "runtime", section: "runtime-trace",        label: t("config.section.trace"),                 icon: "trace",        html: renderCardTrace(cfg.trace || {}) },
       { group: "traffic", section: "traffic-rate-limit",   label: t("config.section.rate_limit"),            icon: "rate-limit",    html: renderCardRateLimit(cfg.rate_limit || {}) },
       { group: "traffic", section: "traffic-blockrules",  label: t("config.section.client_blocklist"),       icon: "blockrules",    html: renderCardBlockRules(cfg.client_blocklist || {}) },
@@ -7390,18 +7399,35 @@
     </div>`;
   }
 
-  function renderCardPromptLog(p) {
+  // liveRetention: the DB-adopted retention policy from the prompt-log
+  // status endpoint (DB mode). Null → render from the YAML section value
+  // (no-DB mode, where YAML is the authority).
+  function renderCardPromptLog(p, liveRetention) {
     const o = (p && p.otlp) || {};
+    const seg = (p && p.segment) || {};
+    const r = liveRetention || (p && p.retention) || {};
     return `<div class="form-card" data-section="prompt_log">
       <div class="form-card-title">${t("config.section.prompt_log")}</div>
       <div class="form-card-grid">
         ${fieldCheckbox("cfg-pl-enabled", t("config.field.enabled"), p.enabled, {})}
         ${fieldText("cfg-pl-dir", t("config.field.dir"), p.dir, { full: true })}
-        ${fieldNum("cfg-pl-max-mb", t("config.field.max_file_size_mb"), p.max_file_size_mb, { min: 1 })}
         ${fieldCheckbox("cfg-pl-capture", t("config.field.capture_raw_upstream"), p.capture_raw_upstream, { note: t("config.tip.capture_raw_upstream") })}
         ${fieldFullList("cfg-pl-excluded-keys", t("config.field.excluded_keys"), p.excluded_keys || [], {})}
         ${fieldFullList("cfg-pl-excluded-teams", t("config.field.excluded_teams"), p.excluded_teams || [], {})}
         ${fieldFullList("cfg-pl-record-headers", t("config.field.record_headers"), p.record_headers || [], {})}
+      </div>
+
+      <div class="form-card-subtitle">${t("config.section.prompt_log_segment")}</div>
+      <div class="form-card-grid">
+        ${fieldNum("cfg-pl-seg-max-mb", t("config.field.seg_max_mb"), seg.max_segment_mb ?? 512, { min: 16, tip: t("config.tip.seg_max_mb") })}
+      </div>
+
+      <div class="form-card-subtitle">${t("config.section.prompt_log_retention")}</div>
+      <div class="form-card-grid">
+        ${fieldCheckbox("cfg-pl-ret-enabled", t("config.field.ret_enabled"), !!r.enabled, { tip: t("config.tip.ret_enabled") })}
+        ${fieldNum("cfg-pl-ret-max-age", t("config.field.ret_max_age"), r.max_age_days ?? 7, { min: 0, tip: t("config.tip.ret_max_age") })}
+        ${fieldNum("cfg-pl-ret-max-total-gb", t("config.field.ret_max_total_gb"), r.max_total_gb ?? 0, { min: 0, tip: t("config.tip.ret_max_total_gb") })}
+        ${fieldNum("cfg-pl-ret-disk-pct", t("config.field.ret_disk_pct"), r.disk_pct_watermark ?? 90, { min: 0, tip: t("config.tip.ret_disk_pct") })}
       </div>
 
       <div class="form-card-subtitle">${t("config.section.prompt_log_otlp")}</div>
@@ -8023,28 +8049,62 @@
           request_failure_threshold: numOr($("cfg-hc-req-fail-thr"), 3),
         });
       } else if (kind === "prompt_log") {
-        await saveConfigSection("prompt_log", {
-          enabled: $("cfg-pl-enabled").checked,
-          dir: $("cfg-pl-dir").value || "/data/prompt_logs",
-          max_file_size_mb: numOr($("cfg-pl-max-mb"), 50),
-          capture_raw_upstream: $("cfg-pl-capture").checked,
-          excluded_keys: parseListInput($("cfg-pl-excluded-keys")),
-          excluded_teams: parseListInput($("cfg-pl-excluded-teams")),
-          record_headers: parseListInput($("cfg-pl-record-headers")),
-          otlp: {
-            enabled: $("cfg-pl-otlp-enabled").checked,
-            endpoint: $("cfg-pl-otlp-endpoint").value || "",
-            service_name: $("cfg-pl-otlp-service-name").value || "boom-gateway",
-            service_version: $("cfg-pl-otlp-service-version").value || null,
-            timeout_secs: numOr($("cfg-pl-otlp-timeout-secs"), 10),
-            batch_size: numOr($("cfg-pl-otlp-batch-size"), 512),
-            flush_interval_secs: numOr($("cfg-pl-otlp-flush-interval-secs"), 5),
-            max_attribute_bytes: numOr($("cfg-pl-otlp-max-attribute-bytes"), 4096),
-            headers: parseJsonInput($("cfg-pl-otlp-headers"), {}),
-            max_queue_size: numOr($("cfg-pl-otlp-max-queue-size"), 10000),
-            max_queue_bytes: numOr($("cfg-pl-otlp-max-queue-bytes"), 67108864),
-          },
-        });
+        // Retention is DB-authoritative (boom_config KV + CATEGORY_PROMPTLOG
+        // broadcast) — direct PUT to the dedicated endpoint, immediate
+        // cluster-wide effect. In no-DB mode that PUT 400s and the section
+        // write below carries the values (YAML is the authority there).
+        // Storage knobs beyond max_segment_mb (seal age, block size) and the
+        // fsync/zstd/backpressure internals are built-in — hidden from the
+        // form, sourced from the loaded config cache on save so a whole-
+        // section rewrite never drops them.
+        if (!confirm(t("common.confirm_write"))) throw new Error(t("common.canceled"));
+        const retention = {
+          enabled: $("cfg-pl-ret-enabled").checked,
+          max_age_days: numOr($("cfg-pl-ret-max-age"), 7),
+          max_total_gb: numOr($("cfg-pl-ret-max-total-gb"), 0),
+          disk_pct_watermark: numOr($("cfg-pl-ret-disk-pct"), 90),
+        };
+        try {
+          await api("/admin/prompt-log/retention", {
+            method: "PUT", skipConfirm: true,
+            body: JSON.stringify(retention),
+          });
+        } catch (e) {
+          if (!String(e.message || "").includes("Database not available")) throw e;
+        }
+        const baseSeg = ((_configCache && _configCache.prompt_log) || {}).segment || {};
+        await saveConfigSections([
+          ["prompt_log", {
+            enabled: $("cfg-pl-enabled").checked,
+            dir: $("cfg-pl-dir").value || "/data/prompt_logs",
+            capture_raw_upstream: $("cfg-pl-capture").checked,
+            excluded_keys: parseListInput($("cfg-pl-excluded-keys")),
+            excluded_teams: parseListInput($("cfg-pl-excluded-teams")),
+            record_headers: parseListInput($("cfg-pl-record-headers")),
+            segment: {
+              max_segment_mb: numOr($("cfg-pl-seg-max-mb"), 512),
+              max_segment_age_secs: baseSeg.max_segment_age_secs ?? 86400,
+              block_bytes: baseSeg.block_bytes ?? 10485760,
+            },
+            // Seed-only in YAML (DB mode); carrying the live values keeps the
+            // file from silently dropping the section on whole-section
+            // rewrite and feeds no-DB mode.
+            retention,
+            otlp: {
+              enabled: $("cfg-pl-otlp-enabled").checked,
+              endpoint: $("cfg-pl-otlp-endpoint").value || "",
+              service_name: $("cfg-pl-otlp-service-name").value || "boom-gateway",
+              service_version: $("cfg-pl-otlp-service-version").value || null,
+              timeout_secs: numOr($("cfg-pl-otlp-timeout-secs"), 10),
+              batch_size: numOr($("cfg-pl-otlp-batch-size"), 512),
+              flush_interval_secs: numOr($("cfg-pl-otlp-flush-interval-secs"), 5),
+              max_attribute_bytes: numOr($("cfg-pl-otlp-max-attribute-bytes"), 4096),
+              headers: parseJsonInput($("cfg-pl-otlp-headers"), {}),
+              max_queue_size: numOr($("cfg-pl-otlp-max-queue-size"), 10000),
+              max_queue_bytes: numOr($("cfg-pl-otlp-max-queue-bytes"), 67108864),
+            },
+          }],
+        ], { skipConfirm: true });
       } else if (kind === "trace") {
         // metrics.enabled is DB-authoritative (boom_config KV) — direct PUT
         // to the dedicated endpoint, immediate effect. The rest of the trace
@@ -10244,7 +10304,7 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
             : '<span style="color:var(--danger)" title="' + esc(l.error_message) + '">' + esc(etype.substring(0, 20)) + '</span>')
           : "-";
         const detailCell = promptLogEnabled && l.request_id
-          ? '<button class="btn-small" onclick="window._viewPromptLog(\'' + esc(l.request_id) + '\',\'' + esc(l.key_hash) + '\',\'' + esc(l.team_alias || "") + '\')">' + t("action.view") + '</button>'
+          ? '<button class="btn-small" onclick="window._viewPromptLog(\'' + esc(l.request_id) + '\',\'' + esc(l.instance_id || "") + '\')">' + t("action.view") + '</button>'
           : "-";
         // Time + IP merged into one stacked cell — halves the lead-column
         // width without dropping information: the full year lives in the
@@ -10383,7 +10443,7 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
         : '<span style="color:var(--danger)" title="' + esc(l.error_message) + '">' + esc(etype.substring(0, 20)) + '</span>')
       : "-";
     var detailCell = promptLogEnabled && l.request_id
-      ? '<button class="btn-small" onclick="window._viewPromptLog(\'' + esc(l.request_id) + '\',\'' + esc(l.key_hash) + '\',\'' + esc(l.team_alias || "") + '\')">' + t("action.view") + '</button>'
+      ? '<button class="btn-small" onclick="window._viewPromptLog(\'' + esc(l.request_id) + '\',\'' + esc(l.instance_id || "") + '\')">' + t("action.view") + '</button>'
       : "-";
     // Trie-Hit and Trie Fill are folded into the Prefix Hit cell.
     var prefixCell =
@@ -10481,12 +10541,15 @@ ci-runner,,ci,automation,,,gpt-4,30,,,,,,`;
   window._loadKvcDfxPage = function(p) { loadKvcDfx(p); };
 
   // ── Prompt Log Entry Viewer ──────────────────────────
-  window._viewPromptLog = async function(requestId, keyHash, teamAlias) {
+  // instanceId: the boom_request_log row's instance_id. Empty/absent → the
+  // entry is fetched from THIS instance; a peer id → the dashboard proxies
+  // to that instance (prompt-log segments are instance-local).
+  window._viewPromptLog = async function(requestId, instanceId) {
     showModal('<div style="text-align:center;padding:40px">' + t("common.loading") + '</div>', { wide: true });
     try {
-      const params = new URLSearchParams({ key_hash: keyHash });
-      if (teamAlias) params.set("team_alias", teamAlias);
-      const data = await api("/admin/prompt-log/entry/" + encodeURIComponent(requestId) + "?" + params);
+      const params = new URLSearchParams();
+      if (instanceId) params.set("instance_id", instanceId);
+      const data = await api("/admin/prompt-log/entry/" + encodeURIComponent(requestId) + (params.toString() ? "?" + params : ""));
       const containerId = "plj-" + Date.now();
       showModal(
         '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">' +

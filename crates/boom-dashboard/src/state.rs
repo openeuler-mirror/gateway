@@ -157,6 +157,17 @@ pub enum AdminCommand {
         config: PromptLogConfig,
         reply: oneshot::Sender<Result<(), String>>,
     },
+    /// Replace the DB-authoritative prompt-log retention policy
+    /// (`boom_config` KV `prompt_log_retention`; the YAML `retention`
+    /// section is seed-only). Boom-main writes the KV row + bumps
+    /// CATEGORY_PROMPTLOG, then overlays the policy onto the live writer
+    /// config — the writer's aging task picks it up on its next scan. The
+    /// rest of prompt_log stays YAML-private, so only the retention fields
+    /// are merged (CLAUDE.md §7 global domain).
+    SetPromptLogRetention {
+        retention: boom_promptlog::RetentionConfig,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
     /// Probe a remote OTLP/HTTP collector. The dashboard passes the live
     /// endpoint/headers/timeout (read from the prompt-log card form — not the
     /// committed YAML, so the operator can type a new endpoint and test it

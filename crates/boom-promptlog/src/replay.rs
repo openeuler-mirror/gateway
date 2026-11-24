@@ -251,7 +251,7 @@ mod tests {
             None,
             None,
         );
-        let lines = vec![
+        let lines = [
             serde_json::to_string(&entry1).unwrap(),
             serde_json::to_string(&entry2).unwrap(),
             "".to_string(), // blank line, should be skipped

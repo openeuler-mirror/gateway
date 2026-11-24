@@ -49,6 +49,13 @@ pub const CATEGORY_ROUTER_BEHAVIOR: &str = "router_behavior";
 /// Trace observability switches changed (`boom_config` KV
 /// `trace_metrics_enabled`).
 pub const CATEGORY_TRACE: &str = "trace";
+/// Prompt-log retention policy changed (`boom_config` KV
+/// `prompt_log_retention`). The aging policy is an operator business
+/// decision that must be uniform fleet-wide, so all instances re-adopt it
+/// and each enforces it against its own local segment directory. Re-adopt
+/// is a plain retention overlay on the writer's live config; the rest of
+/// prompt_log stays YAML-private (instance-local).
+pub const CATEGORY_PROMPTLOG: &str = "promptlog";
 
 /// Atomically increment a category's revision counter.
 ///

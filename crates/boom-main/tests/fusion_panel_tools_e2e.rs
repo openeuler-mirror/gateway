@@ -229,7 +229,8 @@ rate_limit:
 prompt_log:
   enabled: true
   dir: {prompt_log_dir}
-  max_file_size_mb: 10
+  segment:
+    max_segment_mb: 16
 
 deployment_health_check:
   auto_offline_enabled: false
@@ -658,51 +659,60 @@ async fn wait_for_prompt_logs_with_timeout(
     }
 }
 
-/// Read the Response-phase prompt log entries from disk. After the otlp
-/// refactor, prompt logs are split into two phase files per request:
-/// `request_*.jsonl` (carrying the request body, written at ingress) and
-/// `response_*.jsonl` (carrying the assembled response body, status, duration,
+/// Read the Response-phase prompt log entries from the segment store. Each
+/// request writes two entries: the Request phase (inbound body, written at
+/// ingress) and the Response phase (assembled response body, status, duration,
 /// fusion trace — written on completion). Fusion trace data lives only in the
 /// Response phase, so the bulk of the assertions in this file read from there.
 fn read_prompt_logs(config: &TempConfig) -> Vec<Value> {
-    read_phase(config, "response")
+    read_phase(config, boom_promptlog::LogPhase::Response)
 }
 
 /// Read the Request-phase prompt log entries from disk. Used by tests that
 /// need to inspect the inbound request body (e.g. `messages` content).
 fn read_prompt_log_requests(config: &TempConfig) -> Vec<Value> {
-    read_phase(config, "request")
+    read_phase(config, boom_promptlog::LogPhase::Request)
 }
 
-fn read_phase(config: &TempConfig, phase: &str) -> Vec<Value> {
-    let key_dir = config.prompt_log_dir.join("_no_team").join("master");
+/// Offline scan of the segment store: every `.seg` file (sealed or active),
+/// every block, every record — filtered to `phase` and re-serialized to JSON
+/// Values so assertions keep the same shape as the old JSONL lines.
+fn read_phase(config: &TempConfig, phase: boom_promptlog::LogPhase) -> Vec<Value> {
+    use boom_promptlog::segment;
+    let seg_dir = config.prompt_log_dir.join("segments");
     let mut out: Vec<Value> = Vec::new();
-    let entries = match fs::read_dir(&key_dir) {
+    let files = match fs::read_dir(&seg_dir) {
         Ok(e) => e,
         Err(_) => return out,
     };
-    for entry in entries.flatten() {
+    for entry in files.flatten() {
         let path = entry.path();
-        let name = match path.file_name().and_then(|s| s.to_str()) {
-            Some(s) => s,
-            None => continue,
+        if path.extension().and_then(|s| s.to_str()) != Some(segment::SEG_EXT) {
+            continue;
+        }
+        let Ok(mut file) = fs::File::open(&path) else {
+            continue;
         };
-        // Match `{phase}_{seq:06}.jsonl` (active) or `{phase}_{seq:06}.jsonl.gz`
-        // (rotated). We don't decompress .gz — the active .jsonl is what the
-        // tests are reading within their timeout window.
-        let prefix = format!("{phase}_");
-        if !name.starts_with(&prefix) || !(name.ends_with(".jsonl") || name.ends_with(".jsonl.gz")) {
+        let Ok(Some(header)) = segment::read_header(&mut file) else {
             continue;
-        }
-        if name.ends_with(".gz") {
+        };
+        let Ok((blocks, _)) = segment::scan_blocks(&file, header.data_offset) else {
             continue;
-        }
-        if let Ok(content) = fs::read_to_string(&path) {
-            for line in content.lines() {
-                if let Ok(v) = serde_json::from_str::<Value>(line) {
-                    out.push(v);
+        };
+        for b in blocks {
+            let Ok(payload) = segment::read_block_at(&file, b.file_pos) else {
+                continue;
+            };
+            let _ = segment::for_each_record(&payload, |frame, _| {
+                if let Ok(e) = segment::decode_record(frame) {
+                    if e.phase == phase {
+                        if let Ok(v) = serde_json::to_value(e) {
+                            out.push(v);
+                        }
+                    }
                 }
-            }
+                Ok(())
+            });
         }
     }
     out

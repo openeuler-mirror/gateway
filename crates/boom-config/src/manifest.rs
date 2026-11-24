@@ -316,9 +316,6 @@ pub fn process_section_fields() -> &'static [FieldMeta] {
         FieldMeta { field: "prompt_log.dir", section: "prompt_log", input_type: "text",
                     label_key: "config.field.dir", tip_key: "",
                     home: ConfigHome::Yaml },
-        FieldMeta { field: "prompt_log.max_file_size_mb", section: "prompt_log", input_type: "number",
-                    label_key: "config.field.max_file_size_mb", tip_key: "",
-                    home: ConfigHome::Yaml },
         FieldMeta { field: "prompt_log.capture_raw_upstream", section: "prompt_log", input_type: "bool",
                     label_key: "config.field.capture_raw_upstream", tip_key: "",
                     home: ConfigHome::Yaml },
@@ -331,6 +328,31 @@ pub fn process_section_fields() -> &'static [FieldMeta] {
         FieldMeta { field: "prompt_log.record_headers", section: "prompt_log", input_type: "list",
                     label_key: "config.field.record_headers", tip_key: "",
                     home: ConfigHome::Yaml },
+        // ── prompt_log storage knobs (segment store, process-local) ──
+        FieldMeta { field: "prompt_log.segment.max_segment_mb", section: "prompt_log", input_type: "number",
+                    label_key: "config.field.seg_max_mb", tip_key: "config.tip.seg_max_mb",
+                    home: ConfigHome::Yaml },
+        FieldMeta { field: "prompt_log.segment.max_segment_age_secs", section: "prompt_log", input_type: "number",
+                    label_key: "config.field.seg_max_age", tip_key: "config.tip.seg_max_age",
+                    home: ConfigHome::Yaml },
+        FieldMeta { field: "prompt_log.segment.block_bytes", section: "prompt_log", input_type: "number",
+                    label_key: "config.field.seg_block_bytes", tip_key: "config.tip.seg_block_bytes",
+                    home: ConfigHome::Yaml },
+        // ── prompt_log.retention (the §7 global exception — boom_config KV
+        //    prompt_log_retention, CATEGORY_PROMPTLOG broadcast; YAML is
+        //    first-boot seed only) ──
+        FieldMeta { field: "prompt_log.retention.enabled", section: "prompt_log", input_type: "bool",
+                    label_key: "config.field.ret_enabled", tip_key: "config.tip.ret_enabled",
+                    home: ConfigHome::Db },
+        FieldMeta { field: "prompt_log.retention.max_age_days", section: "prompt_log", input_type: "number",
+                    label_key: "config.field.ret_max_age", tip_key: "config.tip.ret_max_age",
+                    home: ConfigHome::Db },
+        FieldMeta { field: "prompt_log.retention.max_total_gb", section: "prompt_log", input_type: "number",
+                    label_key: "config.field.ret_max_total_gb", tip_key: "config.tip.ret_max_total_gb",
+                    home: ConfigHome::Db },
+        FieldMeta { field: "prompt_log.retention.disk_pct_watermark", section: "prompt_log", input_type: "number",
+                    label_key: "config.field.ret_disk_pct", tip_key: "config.tip.ret_disk_pct",
+                    home: ConfigHome::Db },
         // ── prompt_log.otlp sub-card ──
         FieldMeta { field: "prompt_log.otlp.enabled", section: "prompt_log", input_type: "bool",
                     label_key: "config.field.otlp_enabled", tip_key: "config.tip.prompt_log_otlp",
@@ -746,7 +768,9 @@ mod tests {
                 )
             }))
             .chain(process_section_fields().iter().filter(|m| {
-                m.field != "trace.metrics.enabled" && !m.field.starts_with("rate_limit.")
+                m.field != "trace.metrics.enabled"
+                    && !m.field.starts_with("rate_limit.")
+                    && !m.field.starts_with("prompt_log.retention.")
             }))
         {
             assert_eq!(
@@ -818,6 +842,18 @@ mod tests {
                 ConfigHome::Db,
                 "`{}` is DB-authoritative (boom_config KV, CATEGORY_PLAN) — \
                  cluster-shared counters require cluster-shared thresholds",
+                m.field
+            );
+        }
+        for m in process_section_fields()
+            .iter()
+            .filter(|m| m.field.starts_with("prompt_log.retention."))
+        {
+            assert_eq!(
+                m.home,
+                ConfigHome::Db,
+                "`{}` is DB-authoritative (boom_config KV prompt_log_retention, \
+                 CATEGORY_PROMPTLOG) — retention is a fleet-wide operator policy",
                 m.field
             );
         }

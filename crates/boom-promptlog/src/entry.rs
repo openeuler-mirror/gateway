@@ -162,7 +162,7 @@ impl PromptLogEntry {
         512
             + self.request.as_ref().map_or(0, |v| approx_value_size(v))
             + self.response.as_ref().map_or(0, |v| approx_value_size(v))
-            + self.fusion.as_ref().map_or(0, |v| approx_value_size(v))
+            + self.fusion.as_ref().map_or(0, approx_value_size)
             + self.raw_upstream_response.as_ref().map_or(0, |v| approx_value_size(v))
             + self.bg_request.as_ref().map_or(0, |s| s.len() + 16)
             + self.raw_response.as_ref().map_or(0, |s| s.len() + 16)

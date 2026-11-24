@@ -1,167 +1,319 @@
-use crate::config::{OtlpConfig, PromptLogConfig};
-use crate::entry::{LogPhase, PromptLogEntry};
+//! Background writer — the producer-facing pipeline around `SegmentStore`.
+//!
+//! No-loss backpressure chain (per request):
+//!
+//! 1. **Memory channel** with a built-in byte budget (256MB). Producers
+//!    never block: `try_send` atomically claims budget, sends, and the
+//!    writer returns the budget once the entry is appended to the
+//!    segment's in-memory tail.
+//! 2. **Spill file** (`{dir}/spill.log`, built-in 2GB budget): when
+//!    the channel is full or over budget (writer stalled, slow disk), the
+//!    producer appends the record frame straight to disk — sequential I/O,
+//!    tens of µs. The writer drains the spill back into the store whenever
+//!    the channel goes idle.
+//! 3. **Drop + count + warn** — only when the spill itself cannot take
+//!    more (disk full / IO error / budget exhausted).
+//!
+//! Durability: group commit — the tick fsyncs at most once per
+//! [`BUILTIN_FSYNC_INTERVAL_MS`], so power loss costs at most the last
+//! interval. Sealing always fsyncs.
+
+use std::io;
+use std::path::Path;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use arc_swap::ArcSwap;
+use tokio::sync::{mpsc, oneshot};
+
+use crate::config::{
+    BUILTIN_CHANNEL_MAX_BYTES, BUILTIN_FSYNC_INTERVAL_MS, BUILTIN_RETENTION_SCAN_SECS,
+    BUILTIN_SPILL_MAX_BYTES, OtlpConfig, PromptLogConfig,
+};
+use crate::entry::PromptLogEntry;
+use crate::index::id_hash;
+use crate::segment;
+use crate::spill::SpillStore;
+use crate::store::SegmentStore;
+
 #[cfg(feature = "otlp")]
 use crate::otlp::{ExporterStatusSnapshot, OtelExporter, ProbeResult};
-use arc_swap::ArcSwap;
-use flate2::write::GzEncoder;
-use flate2::Compression;
-use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
-use tokio::sync::mpsc;
 
-/// Bounded-channel capacity between handlers and the background writer.
-/// Entries hold full request/response bodies, so an unbounded channel is an
-/// unbounded memory commitment whenever the writer stalls (slow disk, OTLP
-/// backpressure). On full, producers drop the entry (oldest-data-loss is the
-/// same policy as the OTLP queues) with a warn + running drop counter.
-const CHANNEL_CAPACITY: usize = 1024;
+/// Entry-count cap on the channel. The real bound is the byte budget;
+/// this only stops unbounded metadata when producers send tiny entries
+/// faster than the writer drains them.
+const CHANNEL_CAPACITY: usize = 4096;
 
-/// Counting handle to the bounded writer channel. ALL producers — the
+/// Maintenance tick: flush/fsync cadence, spill drain, dir-change check.
+/// Every tick action is a no-op or a cheap syscall in the healthy path.
+const TICK: Duration = Duration::from_millis(250);
+
+/// Bound for the shutdown handshake — a wedged flush must not block the
+/// gateway exit.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Counting, budget-aware handle to the writer channel. ALL producers —
 /// handler paths, the error path, the stream wrapper's Drop — go through
-/// this so `dropped_on_full()` reflects every entry lost to writer stalls,
-/// not just whichever path happened to count.
-///
-/// `try_send` never blocks: on Full the entry is dropped, counted once,
-/// and warned about here; the `Err` variants let callers still distinguish
-/// `Closed` (which each site logs at its own level).
+/// this so `dropped_on_full()` reflects every entry that failed to reach
+/// ANY persistence tier, not just whichever path happened to count.
 #[derive(Clone)]
 pub struct PromptLogSender {
     sender: mpsc::Sender<PromptLogEntry>,
-    dropped_on_full: Arc<std::sync::atomic::AtomicU64>,
+    /// Remaining byte budget of the in-memory channel (may transiently go
+    /// negative under races; it is a damper, not an accountant).
+    budget: Arc<AtomicI64>,
+    dropped_on_full: Arc<AtomicU64>,
+    spill: Arc<SpillStore>,
 }
 
 impl PromptLogSender {
-    pub fn new(
-        sender: mpsc::Sender<PromptLogEntry>,
-        dropped_on_full: Arc<std::sync::atomic::AtomicU64>,
-    ) -> Self {
-        Self {
-            sender,
-            dropped_on_full,
+    /// Non-blocking send. Over budget or channel-full → spill file;
+    /// spill failure → drop + count + warn. Only `Closed` is returned to
+    /// the caller (each site logs it at its own level) — everything else
+    /// has been parked somewhere durable.
+    // The error must carry the entry back so the caller can spill it.
+    #[allow(clippy::result_large_err)]
+    pub fn try_send(
+        &self,
+        entry: PromptLogEntry,
+    ) -> Result<(), mpsc::error::TrySendError<PromptLogEntry>> {
+        let bytes = entry.estimated_bytes() as i64;
+        let remaining = self.budget.fetch_sub(bytes, Ordering::Relaxed) - bytes;
+        if remaining < 0 {
+            self.budget.fetch_add(bytes, Ordering::Relaxed);
+            self.spill_or_drop(entry);
+            return Ok(());
         }
-    }
-
-    /// Non-blocking send. Full → drop + count + warn (here, once);
-    /// Closed → returned for the caller to log.
-    pub fn try_send(&self, entry: PromptLogEntry) -> Result<(), mpsc::error::TrySendError<PromptLogEntry>> {
         match self.sender.try_send(entry) {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(e)) => {
-                let n = self
-                    .dropped_on_full
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                    + 1;
-                tracing::warn!(
-                    "Prompt log channel full (writer stalled?), dropped entry {} ({} dropped total)",
-                    e.request_id,
-                    n
-                );
-                Err(mpsc::error::TrySendError::Full(e))
+                self.budget.fetch_add(bytes, Ordering::Relaxed);
+                self.spill_or_drop(e);
+                Ok(())
             }
-            Err(e @ mpsc::error::TrySendError::Closed(_)) => Err(e),
+            Err(e @ mpsc::error::TrySendError::Closed(_)) => {
+                self.budget.fetch_add(bytes, Ordering::Relaxed);
+                Err(e)
+            }
+        }
+    }
+
+    fn spill_or_drop(&self, entry: PromptLogEntry) {
+        let request_id = entry.request_id.clone();
+        match segment::encode_record_frame(&entry) {
+            Ok(frame) => match self.spill.try_write(&frame) {
+                Ok(()) => {}
+                Err(e) => self.count_drop(&request_id, &e.to_string()),
+            },
+            Err(e) => self.count_drop(&request_id, &e.to_string()),
+        }
+    }
+
+    fn count_drop(&self, request_id: &str, error: &str) {
+        let n = self.dropped_on_full.fetch_add(1, Ordering::Relaxed) + 1;
+        tracing::warn!(
+            request_id,
+            error,
+            total_dropped = n,
+            "prompt log entry dropped: channel over budget AND spill failed"
+        );
+    }
+
+    /// Test-only constructor: unlimited budget, 1-byte spill (any spill
+    /// attempt fails into the drop counter — exactly what stream tests
+    /// want to observe). Production code clones the writer's real sender
+    /// via [`PromptLogWriter::sender`].
+    #[doc(hidden)]
+    pub fn for_tests(sender: mpsc::Sender<PromptLogEntry>) -> Self {
+        Self {
+            sender,
+            budget: Arc::new(AtomicI64::new(i64::MAX / 2)),
+            dropped_on_full: Arc::new(AtomicU64::new(0)),
+            spill: Arc::new(SpillStore::new(&std::env::temp_dir(), 1)),
         }
     }
 }
 
 /// Handle to the background prompt log writer.
 ///
-/// Clone-safe handle that checks `should_capture()` against the live config.
-/// The actual file I/O happens in a background tokio task.
-///
-/// The OTLP exporter is held in an `Arc<ArcSwap<Option<Arc<OtelExporter>>>>`
-/// so it can be hot-swapped at runtime via `replace_otlp()` — the background
-/// writer reads `otlp.load()` on every entry, so the new exporter takes
-/// effect immediately for new entries after a reload.
+/// Clone-safe handle that checks `should_capture()` against the live
+/// config. Segment file I/O happens in the background task; the segment
+/// store is shared with the query path through `store()`.
 #[derive(Clone)]
 pub struct PromptLogWriter {
     config: Arc<ArcSwap<PromptLogConfig>>,
     sender: PromptLogSender,
-    dropped_on_full: Arc<std::sync::atomic::AtomicU64>,
+    dropped_on_full: Arc<AtomicU64>,
+    /// `None` = degraded boot (store failed to open): capture is hard-off,
+    /// no background task runs; the config handles stay live so the
+    /// dashboard renders the committed state. A restart re-opens the store.
+    store: Option<Arc<SegmentStore>>,
+    shutdown_tx: mpsc::Sender<oneshot::Sender<()>>,
     #[cfg(feature = "otlp")]
     otlp: Arc<ArcSwap<Option<Arc<OtelExporter>>>>,
     #[cfg(feature = "otlp")]
     flush_handle: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
+/// Everything the background task owns.
+struct WriterTask {
+    receiver: mpsc::Receiver<PromptLogEntry>,
+    config: Arc<ArcSwap<PromptLogConfig>>,
+    store: Arc<SegmentStore>,
+    spill: Arc<SpillStore>,
+    budget: Arc<AtomicI64>,
+    shutdown_rx: mpsc::Receiver<oneshot::Sender<()>>,
+    #[cfg(feature = "otlp")]
+    otlp: Arc<ArcSwap<Option<Arc<OtelExporter>>>>,
+}
+
 impl PromptLogWriter {
-    /// Spawn the background writer with no OTLP exporter — local JSONL only.
-    /// Available regardless of feature gate. When the `otlp` feature is on
-    /// but the caller doesn't have a configured exporter, this is the right
-    /// entrypoint: it just passes `None` through to the inner writer.
-    pub fn spawn(config: PromptLogConfig) -> Self {
-        let config = Arc::new(ArcSwap::from_pointee(config));
-        let (sender, receiver) = mpsc::channel(CHANNEL_CAPACITY);
-        let config_clone = config.clone();
-        let dropped_on_full = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let sender = PromptLogSender::new(sender, dropped_on_full.clone());
+    /// Spawn the background writer with no OTLP exporter — local
+    /// segments only. Recovers or creates the segment store under
+    /// `{cfg.dir}/segments/`; opening the store is fatal to bubble
+    /// (silently dropping every entry would defeat the no-loss goal —
+    /// boom-main logs and continues without prompt logging).
+    pub fn spawn(config: PromptLogConfig, instance_id: &str) -> std::io::Result<Self> {
         #[cfg(feature = "otlp")]
-        let otlp: Arc<ArcSwap<Option<Arc<OtelExporter>>>> =
-            Arc::new(ArcSwap::from_pointee(None));
-        #[cfg(feature = "otlp")]
-        let otlp_clone = otlp.clone();
-        #[cfg(feature = "otlp")]
-        let flush_handle: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>> =
-            Arc::new(std::sync::Mutex::new(None));
-        tokio::spawn(async move {
-            #[cfg(feature = "otlp")]
-            background_writer(receiver, config_clone, otlp_clone).await;
-            #[cfg(not(feature = "otlp"))]
-            background_writer(receiver, config_clone).await;
-        });
-        Self {
-            config,
-            sender,
-            dropped_on_full,
-            #[cfg(feature = "otlp")]
-            otlp,
-            #[cfg(feature = "otlp")]
-            flush_handle,
-        }
+        let otlp: Arc<ArcSwap<Option<Arc<OtelExporter>>>> = Arc::new(ArcSwap::from_pointee(None));
+        #[cfg(not(feature = "otlp"))]
+        let otlp = ();
+        let (writer, task) = Self::build(config, instance_id, otlp, BUILTIN_CHANNEL_MAX_BYTES)?;
+        tokio::spawn(background_writer(task));
+        Ok(writer)
     }
 
-    /// Spawn the background writer with an OTLP exporter. Only available when
-    /// the `otlp` feature is on. Caller also typically calls
-    /// `exporter.spawn_flush_task_to_handle()` to start periodic flushes
-    /// (writes the JoinHandle into the writer's `flush_handle` slot so
-    /// `replace_otlp` can abort it on reload).
+    /// Test seam: spawn with a shrunken channel budget so the spill path
+    /// can be exercised without manufacturing 256MB entries.
+    #[doc(hidden)]
+    pub fn spawn_with_channel_budget_for_tests(
+        config: PromptLogConfig,
+        instance_id: &str,
+        channel_bytes: u64,
+    ) -> std::io::Result<Self> {
+        #[cfg(feature = "otlp")]
+        let otlp: Arc<ArcSwap<Option<Arc<OtelExporter>>>> = Arc::new(ArcSwap::from_pointee(None));
+        #[cfg(not(feature = "otlp"))]
+        let otlp = ();
+        let (writer, task) = Self::build(config, instance_id, otlp, channel_bytes)?;
+        tokio::spawn(background_writer(task));
+        Ok(writer)
+    }
+
+    /// Spawn with an OTLP exporter; also starts its periodic flush task.
     #[cfg(feature = "otlp")]
-    pub fn spawn_with_otlp(config: PromptLogConfig, exporter: Arc<OtelExporter>) -> Self {
-        let config = Arc::new(ArcSwap::from_pointee(config));
-        let (sender, receiver) = mpsc::channel(CHANNEL_CAPACITY);
-        let config_clone = config.clone();
-        let dropped_on_full = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let sender = PromptLogSender::new(sender, dropped_on_full.clone());
-        let flush_handle: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>> =
-            Arc::new(std::sync::Mutex::new(None));
-        let flush_handle_for_task = flush_handle.clone();
-        // Spawn the flush task into the writer's handle slot.
-        exporter.spawn_flush_task_to_handle(flush_handle_for_task.clone());
+    pub fn spawn_with_otlp(
+        config: PromptLogConfig,
+        instance_id: &str,
+        exporter: Arc<OtelExporter>,
+    ) -> std::io::Result<Self> {
         let otlp: Arc<ArcSwap<Option<Arc<OtelExporter>>>> =
             Arc::new(ArcSwap::from_pointee(Some(exporter.clone())));
-        let otlp_clone = otlp.clone();
-        tokio::spawn(async move {
-            background_writer(receiver, config_clone, otlp_clone).await;
-        });
+        let (writer, task) =
+            Self::build(config, instance_id, otlp.clone(), BUILTIN_CHANNEL_MAX_BYTES)?;
+        exporter.spawn_flush_task_to_handle(writer.flush_handle.clone());
+        tokio::spawn(background_writer(task));
+        Ok(writer)
+    }
+
+    fn build(
+        config: PromptLogConfig,
+        instance_id: &str,
+        #[cfg(feature = "otlp")] otlp: Arc<ArcSwap<Option<Arc<OtelExporter>>>>,
+        channel_bytes: u64,
+    ) -> std::io::Result<(Self, WriterTask)> {
+        let config = Arc::new(ArcSwap::from_pointee(config));
+        let store = SegmentStore::open_sync(config.clone(), instance_id)?;
+        let dir = Path::new(&config.load().dir).to_path_buf();
+        let spill = Arc::new(SpillStore::new(&dir, BUILTIN_SPILL_MAX_BYTES));
+        // Fixed at boot: hot-adjusting a live budget means reconciling
+        // in-flight claims — restart changes it, everything else
+        // (dir/segment/retention) is hot.
+        let budget = Arc::new(AtomicI64::new(channel_bytes as i64));
+        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+        let dropped_on_full = Arc::new(AtomicU64::new(0));
+        let sender = PromptLogSender {
+            sender: tx,
+            budget: budget.clone(),
+            dropped_on_full: dropped_on_full.clone(),
+            spill: spill.clone(),
+        };
+        let writer = Self {
+            config: config.clone(),
+            sender,
+            dropped_on_full,
+            store: Some(store.clone()),
+            shutdown_tx,
+            #[cfg(feature = "otlp")]
+            otlp: otlp.clone(),
+            #[cfg(feature = "otlp")]
+            flush_handle: Arc::new(std::sync::Mutex::new(None)),
+        };
+        let task = WriterTask {
+            receiver: rx,
+            config,
+            store,
+            spill,
+            budget,
+            shutdown_rx,
+            #[cfg(feature = "otlp")]
+            otlp,
+        };
+        Ok((writer, task))
+    }
+
+    /// Degraded writer for an unbootable store (bad `dir`, full disk,
+    /// unreadable recovery). Capture is hard-disabled — `should_capture`
+    /// returns false regardless of config — no background task runs, and
+    /// the config handles stay live so the dashboard renders the committed
+    /// YAML state (and the OTLP exporter still answers status/probes).
+    #[allow(unused_variables)]
+    pub fn degraded(
+        config: PromptLogConfig,
+        #[cfg(feature = "otlp")] otlp: Arc<ArcSwap<Option<Arc<OtelExporter>>>>,
+    ) -> Self {
+        let config = Arc::new(ArcSwap::from_pointee(config));
+        let (tx, _rx) = mpsc::channel(1); // receiver dropped — Closed if ever sent to
+        let (shutdown_tx, _shutdown_rx) = mpsc::channel(1);
+        let dropped_on_full = Arc::new(AtomicU64::new(0));
+        let sender = PromptLogSender {
+            sender: tx,
+            budget: Arc::new(AtomicI64::new(0)),
+            dropped_on_full: dropped_on_full.clone(),
+            // Last-resort backstop only: capture is hard-off, so nothing
+            // reaches the spill anyway.
+            spill: Arc::new(SpillStore::new(Path::new("/nonexistent"), 0)),
+        };
+        tracing::error!(
+            "prompt log writer degraded: the segment store is unavailable; \
+             prompt logging is off until a restart re-opens it"
+        );
         Self {
             config,
             sender,
             dropped_on_full,
+            store: None,
+            shutdown_tx,
+            #[cfg(feature = "otlp")]
             otlp,
-            flush_handle,
+            #[cfg(feature = "otlp")]
+            flush_handle: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
-    #[cfg(not(feature = "otlp"))]
-    pub fn spawn_with_otlp(config: PromptLogConfig, _exporter: ()) -> Self {
-        Self::spawn(config)
+    /// The segment store shared with the query path. `None` in degraded
+    /// mode — the query handle must fall back to the disabled impl.
+    pub fn store(&self) -> Option<Arc<SegmentStore>> {
+        self.store.clone()
     }
 
     /// Check if this key/team should be captured.
     /// Call this BEFORE cloning the request body to avoid unnecessary work.
+    /// Hard-off in degraded mode — a broken store cannot honor capture.
     pub fn should_capture(&self, key_hash: &str, team_id: Option<&str>) -> bool {
-        self.config.load().should_capture(key_hash, team_id)
+        self.store.is_some() && self.config.load().should_capture(key_hash, team_id)
     }
 
     /// Get a clone of the counting sender for passing to stream wrappers.
@@ -169,60 +321,59 @@ impl PromptLogWriter {
         self.sender.clone()
     }
 
-    /// Cumulative entries dropped because the bounded channel was full
-    /// (writer stalled). Surfaced for diagnostics.
+    /// Cumulative entries dropped because every persistence tier refused
+    /// them (channel over budget AND spill failed). Surfaced for
+    /// diagnostics.
     pub fn dropped_on_full(&self) -> u64 {
-        self.dropped_on_full.load(std::sync::atomic::Ordering::Relaxed)
+        self.dropped_on_full.load(Ordering::Relaxed)
     }
 
-    /// Send an entry to the background writer (non-blocking, fire-and-forget).
-    /// Never blocks: when the bounded channel is full the entry is dropped
-    /// and counted — the gateway must not stall request handling on log I/O.
+    /// Send an entry to the background writer (non-blocking,
+    /// fire-and-forget). Over-budget entries spill to disk; only a closed
+    /// channel (shutdown) drops in memory. No-op in degraded mode.
     pub fn send(&self, entry: PromptLogEntry) {
-        // Full is counted + warned inside the sender; only Closed is ours.
+        if self.store.is_none() {
+            return;
+        }
         if let Err(mpsc::error::TrySendError::Closed(e)) = self.sender.try_send(entry) {
             tracing::warn!("Prompt log channel closed, dropping entry: {}", e.request_id);
         }
     }
 
-    /// Update config at runtime (hot-reload). Updates the runtime config
-    /// seen by the background writer — affects local sink (dir, max_size,
-    /// capture flag, excluded_*, record_headers) and the `otlp.enabled`
-    /// toggle. Does NOT touch the running exporter (endpoint / batch_size /
-    /// timeout / etc.); use `replace_otlp` for those.
+    /// Update config at runtime (hot-reload). The writer picks up segment
+    /// thresholds, retention, durability, spill budget and `dir` changes
+    /// on its next tick; capture toggles apply immediately. Does NOT touch
+    /// the running exporter — use `replace_otlp` for those.
     pub fn update_config(&self, new_config: PromptLogConfig) {
         self.config.store(Arc::new(new_config));
+    }
+
+    /// Overlay only the retention policy onto the live config, leaving the
+    /// YAML-home fields untouched. This is the DB-adopt path (retention is
+    /// the one global-domain prompt-log field, CATEGORY_PROMPTLOG): the KV
+    /// row carries retention alone, so the merge must not clobber
+    /// instance-local values with stale ones.
+    pub fn set_retention(&self, retention: crate::config::RetentionConfig) {
+        let mut cfg = self.config();
+        if cfg.retention != retention {
+            cfg.retention = retention;
+            self.config.store(Arc::new(cfg));
+        }
     }
 
     /// Hot-swap the OTLP exporter. Aborts the old flush task, runs a
     /// best-effort final flush on the old exporter to drain its queue,
     /// constructs a new exporter from `new_otlp`, stores it, and spawns a
-    /// fresh flush task. Called from boom-main reload path when the `otlp`
-    /// sub-config differs from the running exporter's config.
-    ///
-    /// The best-effort flush is bounded by `new_otlp.timeout_secs + 2` so
-    /// a slow/unreachable old endpoint can't stall the reload. Entries that
-    /// arrive during the swap may briefly hit the old exporter (race window
-    /// between abort and store) — those entries stay in the old queue and
-    /// are dropped on overflow. Local JSONL is unaffected.
+    /// fresh flush task.
     #[cfg(feature = "otlp")]
     pub async fn replace_otlp(&self, new_otlp: &OtlpConfig) {
-        // 1. Abort the old flush task. The task may be mid-.await (HTTP
-        //    in-flight); abort() cancels cooperatively at the next .await.
         if let Some(h) = self.flush_handle.lock().unwrap().take() {
             h.abort();
         }
-        // 2. Best-effort final flush on the old exporter to drain its
-        //    in-memory batch. Bounded so a dead endpoint doesn't stall
-        //    reload. Reuse the *new* timeout as the bound — it's a hint,
-        //    not a contract.
         if let Some(old) = self.otlp.load().as_ref() {
             let bound = std::time::Duration::from_secs(new_otlp.timeout_secs.max(1) + 2);
             let _ = tokio::time::timeout(bound, old.flush()).await;
         }
-        // 3. Construct the new exporter + spawn its flush task into the
-        //    shared handle slot. The ArcSwap store is atomic — the
-        //    background writer sees the new exporter on its next entry.
         let new = OtelExporter::new(new_otlp);
         new.spawn_flush_task_to_handle(self.flush_handle.clone());
         self.otlp.store(Arc::new(Some(new)));
@@ -234,20 +385,15 @@ impl PromptLogWriter {
         );
     }
 
-    /// Read-only snapshot of the live OTLP exporter's state machine. Returns
-    /// `None` when OTLP is not configured (no exporter in the ArcSwap) — the
-    /// dashboard treats `None` as "disabled" (gray indicator).
-    ///
-    /// Takes an owned `Arc<OtelExporter>` out of the ArcSwap guard before
-    /// returning, so callers can `.await` freely without holding the guard.
+    /// Read-only snapshot of the live OTLP exporter's state machine.
+    /// `None` = OTLP not configured (the dashboard renders that as
+    /// "disabled").
     #[cfg(feature = "otlp")]
     pub async fn otlp_status(&self) -> Option<ExporterStatusSnapshot> {
         let g = self.otlp.load();
         let Some(exporter) = g.as_ref() else {
             return None;
         };
-        // Clone out of the ArcSwap guard before awaiting so we don't hold the
-        // guard across the (potentially long) await.
         Some(exporter.clone().status_snapshot())
     }
 
@@ -256,23 +402,13 @@ impl PromptLogWriter {
         None
     }
 
-    /// Manual probe of the live OTLP exporter. Drives the state machine: on
-    /// success, transitions Offline → Online; on failure, records a probe
-    /// failure (but does NOT drive Online → Offline — only repeated flush
-    /// failures do that).
-    ///
-    /// Used by the dashboard's manual "Probe now" action when the operator
-    /// wants to attempt recovery before the next periodic tick. The periodic
-    /// tick calls `run_probe_cycle` internally; this is the user-triggered
-    /// counterpart that returns a `ProbeResult` for UI feedback.
+    /// Manual probe of the live OTLP exporter (dashboard "Probe now").
     #[cfg(feature = "otlp")]
     pub async fn probe_otlp(&self) -> Option<ProbeResult> {
         let g = self.otlp.load();
         let Some(exporter) = g.as_ref() else {
             return None;
         };
-        // Clone out of the ArcSwap guard before awaiting so we don't hold
-        // the guard across the network probe.
         Some(exporter.clone().probe().await)
     }
 
@@ -286,570 +422,437 @@ impl PromptLogWriter {
         self.config.load().as_ref().clone()
     }
 
-    /// Read-only config handle, for use by `FilePromptLogQuery`.
+    /// Read-only config handle, for use by query paths.
     pub fn config_handle(&self) -> Arc<ArcSwap<PromptLogConfig>> {
         self.config.clone()
     }
 
-    /// Trigger final flush of any OTLP batch and wait for it to drain.
-    /// Called once during shutdown — best-effort, never blocks the gateway
-    /// exit longer than the configured timeout. Reads the current exporter
-    /// via the ArcSwap so a `replace_otlp` mid-shutdown is honored.
-    #[cfg(feature = "otlp")]
+    /// Drain the channel, flush and fsync the active segment, flush the
+    /// OTLP batch. Bounded by `SHUTDOWN_TIMEOUT` so a wedged disk cannot
+    /// block the gateway exit. Called once during shutdown.
     pub async fn shutdown_flush(&self) {
+        #[cfg(feature = "otlp")]
         if let Some(exporter) = self.otlp.load().as_ref() {
-            exporter.flush().await;
+            let bound = std::time::Duration::from_secs(exporter_timeout_secs(exporter));
+            let _ = tokio::time::timeout(bound, exporter.flush()).await;
         }
+        #[cfg(feature = "otlp")]
         if let Some(h) = self.flush_handle.lock().unwrap().take() {
             h.abort();
         }
-    }
-
-    #[cfg(not(feature = "otlp"))]
-    pub async fn shutdown_flush(&self) {}
-}
-
-/// State for one open log file.
-struct OpenFile {
-    file: tokio::fs::File,
-    size: u64,
-}
-
-/// One aligned generation for a key directory: the request and response
-/// files share the same sequence number and rotate together, so a request
-/// entry and the response entries of the same generation always land in
-/// files with the same `{phase}_{seq:06}` suffix. Pairing them then only
-/// ever needs to look inside one seq (at most two adjacent ones, when
-/// rotation falls between a request and its response).
-///
-/// Phase files open lazily: a generation resumed after a restart (or a phase
-/// not yet written) stays `None` until its first entry arrives.
-struct Generation {
-    seq: u64,
-    request: Option<OpenFile>,
-    response: Option<OpenFile>,
-}
-
-impl Generation {
-    fn phase(&self, phase: LogPhase) -> &Option<OpenFile> {
-        match phase {
-            LogPhase::Request => &self.request,
-            LogPhase::Response => &self.response,
+        if self.store.is_none() {
+            return; // degraded: no writer task, no store to flush
         }
-    }
-
-    fn phase_mut(&mut self, phase: LogPhase) -> &mut Option<OpenFile> {
-        match phase {
-            LogPhase::Request => &mut self.request,
-            LogPhase::Response => &mut self.response,
+        let (tx, rx) = oneshot::channel();
+        if self.shutdown_tx.send(tx).await.is_ok() {
+            let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, rx).await;
+        } else {
+            // The writer task is gone — flush what we can directly. The
+            // store's flush is safe here precisely because the single
+            // writer no longer exists.
+            if let Some(store) = &self.store {
+                let _ = store.flush_active_block().await;
+                let _ = store.sync_active();
+            }
         }
     }
 }
 
-fn phase_file_name(phase: &str, seq: u64) -> String {
-    format!("{}_{:06}.jsonl", phase, seq)
-}
-
-/// Background writer loop. Each entry is written to one of two phase files
-/// (`request.jsonl` / `response.jsonl`) under `{dir}/{team}/{key_hash}/`.
-/// When the OTLP feature is on, a copy is also handed to the exporter — the
-/// local file sink is never blocked by the remote backend.
 #[cfg(feature = "otlp")]
-async fn background_writer(
-    receiver: mpsc::Receiver<PromptLogEntry>,
-    config: Arc<ArcSwap<PromptLogConfig>>,
-    otlp: Arc<ArcSwap<Option<Arc<OtelExporter>>>>,
-) {
-    background_writer_impl(receiver, config, otlp).await
+fn exporter_timeout_secs(exporter: &OtelExporter) -> u64 {
+    // Best-effort bound for the final OTLP flush; the exporter's own
+    // timeout config is private, so use a generous fixed cap.
+    let _ = exporter;
+    30
 }
 
-#[cfg(not(feature = "otlp"))]
-async fn background_writer(
-    receiver: mpsc::Receiver<PromptLogEntry>,
-    config: Arc<ArcSwap<PromptLogConfig>>,
-) {
-    background_writer_impl(receiver, config, ()).await
+/// The background loop. Exactly one task runs this: it is the sole
+/// appender, flusher and sealer of the active segment.
+async fn background_writer(mut task: WriterTask) {
+    let mut interval = tokio::time::interval(TICK);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_fsync = Instant::now();
+    let mut last_retention = Instant::now();
+
+    loop {
+        tokio::select! {
+            entry = task.receiver.recv() => {
+                let Some(entry) = entry else {
+                    break; // all senders dropped — normal exit path
+                };
+                process_entry(
+                    entry,
+                    &task.config,
+                    &task.store,
+                    &task.budget,
+                    #[cfg(feature = "otlp")]
+                    &task.otlp,
+                )
+                .await;
+            }
+            _ = interval.tick() => {
+                maintain(
+                    &task.store,
+                    &task.spill,
+                    &task.config,
+                    &mut last_fsync,
+                    &mut last_retention,
+                )
+                .await;
+            }
+            cmd = task.shutdown_rx.recv() => {
+                match cmd {
+                    Some(done) => {
+                        // Drain what is already queued, then the loop's
+                        // exit path does the final flush + fsync.
+                        while let Ok(entry) = task.receiver.try_recv() {
+                            process_entry(
+                                entry,
+                                &task.config,
+                                &task.store,
+                                &task.budget,
+                                #[cfg(feature = "otlp")]
+                                &task.otlp,
+                            )
+                            .await;
+                        }
+                        let _ = done.send(());
+                        break;
+                    }
+                    None => break, // handle dropped; exit via final flush
+                }
+            }
+        }
+    }
+
+    // Exit path (channel closed or shutdown): flush the tail and make it
+    // durable. A crash before this point loses at most the last fsync
+    // interval — the documented durability semantics.
+    if let Err(e) = task.store.flush_active_block().await {
+        tracing::warn!(error = %e, "final block flush failed during writer exit");
+    }
+    if let Err(e) = task.store.sync_active() {
+        tracing::warn!(error = %e, "final fsync failed during writer exit");
+    }
+    tracing::info!("Prompt log writer exiting");
 }
 
-/// Background writer body. The third argument is `Arc<ArcSwap<Option<Arc<OtelExporter>>>>`
-/// when the otlp feature is on, or `()` when off. Reading `otlp.load()` on
-/// every entry lets `replace_otlp` hot-swap the exporter mid-run — new
-/// entries are enqueued to whatever exporter is current.
-#[cfg_attr(feature = "otlp", allow(clippy::type_complexity))]
-async fn background_writer_impl(
-    mut receiver: mpsc::Receiver<PromptLogEntry>,
-    config: Arc<ArcSwap<PromptLogConfig>>,
-    #[cfg(feature = "otlp")] otlp: Arc<ArcSwap<Option<Arc<OtelExporter>>>>,
-    #[cfg(not(feature = "otlp"))] _otlp: (),
+/// Append one entry: OTLP fork first (local store is the source of truth
+/// and must never be skipped by an exporter failure), then the segment
+/// append with block cutting and seal checks.
+#[allow(unused_variables)]
+async fn process_entry(
+    entry: PromptLogEntry,
+    config: &Arc<ArcSwap<PromptLogConfig>>,
+    store: &Arc<SegmentStore>,
+    budget: &Arc<AtomicI64>,
+    #[cfg(feature = "otlp")] otlp: &Arc<ArcSwap<Option<Arc<OtelExporter>>>>,
+    #[cfg(not(feature = "otlp"))] _otlp: &(),
 ) {
-    // "{dir}/{team_alias}/{key_hash}" → aligned generation. The key carries
-    // the full path (including dir) so a runtime `dir` change naturally
-    // starts fresh generations in the new directory instead of rotating
-    // files under paths that no longer match the open handles.
-    let mut open_gens: HashMap<PathBuf, Generation> = HashMap::new();
-
-    while let Some(entry) = receiver.recv().await {
-        let cfg = config.load();
-        let base_dir = PathBuf::from(&cfg.dir);
-        // Clamp to >=1MB: an explicit `max_file_size_mb: 0` would satisfy the
-        // rotation predicate on every write and rotate once per line (one
-        // file + one compress spawn per request).
-        let max_bytes = cfg.max_file_size_mb.max(1) * 1024 * 1024;
-        #[cfg(feature = "otlp")]
-        let otlp_enabled = cfg.otlp.enabled;
-        drop(cfg); // release config guard
-
-        // Fork to OTLP exporter first (under feature gate). Failure here must
-        // never skip the local file write — local JSONL is the source of truth.
-        // Respect the live `otlp.enabled` toggle: the exporter may have been
-        // disabled via dashboard — skip enqueuing in that case so the in-memory
-        // queue drains instead of accumulating entries nobody will pick up.
-        //
-        // `otlp.load()` is read every entry, so a `replace_otlp` mid-run is
-        // picked up immediately — new entries go to the new exporter. The
-        // `max_attribute_bytes` is no longer passed here (the previous
-        // parameter was silently ignored); the exporter uses its own frozen
-        // value, which is the current config value because replace_otlp
-        // rebuilds the exporter from the new config.
-        #[cfg(feature = "otlp")]
+    #[cfg(feature = "otlp")]
+    {
+        let (otlp_enabled, exporter) = {
+            let cfg = config.load();
+            let enabled = cfg.otlp.enabled;
+            let exporter = otlp.load().clone();
+            (enabled, exporter)
+        };
         if otlp_enabled {
-            if let Some(exporter) = otlp.load().as_ref() {
+            if let Some(exporter) = exporter.as_ref() {
                 exporter.enqueue(entry.clone()).await;
             }
         }
-
-        // Directory layout: {dir}/{team_alias}/{key_hash}/{phase}.jsonl
-        // If no team_alias, use "_no_team" as fallback.
-        let team_dir_name = entry.team_alias.as_deref().unwrap_or("_no_team");
-        let phase_name = match entry.phase {
-            LogPhase::Request => "request",
-            LogPhase::Response => "response",
-        };
-        let key_dir = base_dir.join(team_dir_name).join(&entry.key_hash);
-
-        // Ensure directory exists.
-        if let Err(e) = tokio::fs::create_dir_all(&key_dir).await {
-            tracing::error!("Failed to create prompt log dir {:?}: {}", key_dir, e);
-            continue;
-        }
-
-        // Serialize entry to a single JSON line.
-        let json_line = match serde_json::to_string(&entry) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!("Failed to serialize prompt log entry: {}", e);
-                continue;
-            }
-        };
-        let line_bytes = json_line.len() as u64;
-
-        // Get or create the aligned generation for this team/key. On first
-        // sight of the directory, scan it to decide where to (re)start and
-        // compress any stale .jsonl files left over from a crash.
-        let gen = match open_gens.entry(key_dir.clone()) {
-            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-            std::collections::hash_map::Entry::Vacant(e) => {
-                let (seq, stale) = scan_generation_state(&key_dir).await;
-                if !stale.is_empty() {
-                    tokio::spawn(async move {
-                        for p in stale {
-                            if let Err(err) = compress_file(&p).await {
-                                tracing::warn!("Failed to compress stale file {:?}: {}", p, err);
-                            }
-                        }
-                    });
-                }
-                e.insert(Generation { seq, request: None, response: None })
-            }
-        };
-
-        // Lazily open this phase's file at the generation seq. On a resumed
-        // generation the file already exists and metadata restores its size,
-        // so the threshold keeps counting from where the last run left off.
-        if gen.phase_mut(entry.phase).is_none() {
-            let path = key_dir.join(phase_file_name(phase_name, gen.seq));
-            match tokio::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-                .await
-            {
-                Ok(file) => {
-                    let size = match tokio::fs::metadata(&path).await {
-                        Ok(m) => m.len(),
-                        Err(_) => 0,
-                    };
-                    *gen.phase_mut(entry.phase) = Some(OpenFile { file, size });
-                }
-                Err(err) => {
-                    tracing::error!("Failed to open prompt log file {:?}: {}", path, err);
-                    continue;
-                }
-            }
-        }
-
-        // Rotate when this write would overflow the phase file. The whole
-        // generation rotates together — both phases — so request/response
-        // seq suffixes stay aligned. Checking only the phase being written is
-        // sufficient: files only grow on writes, and every write checks
-        // itself first, so whichever phase crosses the threshold first seals
-        // the generation.
-        let should_rotate = {
-            let of = gen.phase(entry.phase).as_ref().unwrap();
-            of.size > 0 && of.size + line_bytes + 1 > max_bytes
-        };
-        if should_rotate {
-            let old_seq = gen.seq;
-            let new_seq = old_seq + 1;
-            let new_path = key_dir.join(phase_file_name(phase_name, new_seq));
-            match tokio::fs::File::create(&new_path).await {
-                Ok(file) => {
-                    tracing::info!(
-                        path = %new_path.display(),
-                        key_hash = %entry.key_hash,
-                        phase = phase_name,
-                        old_seq,
-                        new_seq,
-                        "Rotated prompt log generation"
-                    );
-                    // Seal both phases: drop open handles so no later write
-                    // targets old_seq; the other phase reopens lazily at
-                    // new_seq on its next entry.
-                    gen.request = None;
-                    gen.response = None;
-                    gen.seq = new_seq;
-                    *gen.phase_mut(entry.phase) = Some(OpenFile { file, size: 0 });
-                    // Compress both sealed files that exist on disk — the
-                    // phase not written this generation (e.g. resumed from a
-                    // previous run with no handle open yet) may have none.
-                    let old_req = key_dir.join(phase_file_name("request", old_seq));
-                    let old_resp = key_dir.join(phase_file_name("response", old_seq));
-                    tokio::spawn(async move {
-                        for p in [old_req, old_resp] {
-                            if matches!(tokio::fs::try_exists(&p).await, Ok(true)) {
-                                if let Err(e) = compress_file(&p).await {
-                                    tracing::warn!("Failed to compress {:?}: {}", p, e);
-                                }
-                            }
-                        }
-                    });
-                }
-                Err(err) => {
-                    tracing::error!("Failed to create new prompt log file {:?}: {}", new_path, err);
-                    continue;
-                }
-            }
-        }
-
-        // Write the line.
-        let of = gen.phase_mut(entry.phase).as_mut().unwrap();
-        if let Err(e) = of.file.write_all(json_line.as_bytes()).await {
-            tracing::error!("Failed to write prompt log entry: {}", e);
-        }
-        if let Err(e) = of.file.write_all(b"\n").await {
-            tracing::error!("Failed to write prompt log newline: {}", e);
-        }
-        of.size += line_bytes + 1; // +1 for newline
     }
 
-    tracing::info!("Prompt log writer channel closed, exiting background task");
+    let bytes = entry.estimated_bytes() as i64;
+    let frame = match segment::encode_record_frame(&entry) {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::error!(request_id = %entry.request_id, error = %e, "prompt log entry serialization failed");
+            budget.fetch_add(bytes, Ordering::Relaxed);
+            return;
+        }
+    };
+    let hash = id_hash(&entry.request_id);
+    let phase = segment::phase_to_u8(entry.phase);
+    let ts = segment::entry_ts_ms(&entry);
+    if let Err(e) = store.append_frame(&frame, hash, phase, ts) {
+        tracing::error!(request_id = %entry.request_id, error = %e, "segment append failed");
+    }
+    budget.fetch_add(bytes, Ordering::Relaxed);
+
+    if store.wants_flush() {
+        if let Err(e) = store.flush_active_block().await {
+            tracing::warn!(error = %e, "block flush failed");
+        }
+    }
+    if store.should_seal() {
+        seal_and_age(store, config).await;
+    }
 }
 
-/// Scan a key directory and decide where to (re)start writing.
-///
-/// Files are `{phase}_{seq:06}.jsonl` / `{phase}_{seq:06}.jsonl.gz` with
-/// request and response sharing one sequence space (a "generation"). Returns
-/// `(start_seq, stale_paths)`:
-///
-/// - If the newest uncompressed generation is aligned — both phases agree on
-///   the max `.jsonl` seq, or only one phase has files — and neither phase
-///   has a `.gz` at that seq, writing resumes at that seq: a restart
-///   mid-generation appends to the half-full pair instead of abandoning it
-///   as an uncompressed orphan until the next restart.
-/// - Otherwise (misaligned leftovers from pre-alignment runs, or a `.gz`
-///   twin already present at the newest seq) a fresh generation starts at
-///   `overall_max + 1`, and every leftover `.jsonl` without a `.gz` twin is
-///   returned as stale for compression — including the previous newest,
-///   which the old `s < newest_jsonl` filter always skipped.
-async fn scan_generation_state(dir: &std::path::Path) -> (u64, Vec<PathBuf>) {
-    let mut jsonl: Vec<(&'static str, u64)> = Vec::new();
-    let mut gz: std::collections::HashSet<(&'static str, u64)> = std::collections::HashSet::new();
+/// Periodic maintenance, every TICK: spill drain, dir change, tail flush,
+/// group-commit fsync, seal, retention.
+async fn maintain(
+    store: &Arc<SegmentStore>,
+    spill: &Arc<SpillStore>,
+    config: &Arc<ArcSwap<PromptLogConfig>>,
+    last_fsync: &mut Instant,
+    last_retention: &mut Instant,
+) {
+    let dir = config.load().dir.clone();
 
-    let mut entries = match tokio::fs::read_dir(dir).await {
-        Ok(rd) => rd,
-        Err(_) => return (1, Vec::new()),
+    // 1. Replay any spilled frames (no-op in the healthy path).
+    drain_spill(store, spill).await;
+
+    // 2. Config `dir` change: seal, move the store, follow with the spill.
+    if store.dir_changed() {
+        if let Err(e) = store.seal_active().await {
+            tracing::warn!(error = %e, "seal before dir change failed; will retry next tick");
+            return;
+        }
+        match store.update_dir() {
+            Ok(()) => spill.update_dir(Path::new(&dir)),
+            Err(e) => tracing::error!(error = %e, "segment store dir change failed"),
+        }
+    }
+
+    // 3. Flush the tail so the crash window and the unqueryable-tail stay
+    //    bounded.
+    if let Err(e) = store.flush_active_block().await {
+        tracing::warn!(error = %e, "periodic block flush failed");
+    }
+
+    // 4. Group-commit fsync (built-in cadence — retired as a knob).
+    let every = Duration::from_millis(BUILTIN_FSYNC_INTERVAL_MS.max(100));
+    if last_fsync.elapsed() >= every {
+        let _ = store.sync_active();
+        *last_fsync = Instant::now();
+    }
+
+    // 5. Seal when a threshold is crossed; otherwise run retention on its
+    //    own timer (seal_and_age runs it immediately after every seal).
+    if store.should_seal() {
+        seal_and_age(store, config).await;
+    } else if last_retention.elapsed() >= Duration::from_secs(BUILTIN_RETENTION_SCAN_SECS) {
+        run_retention(store, config).await;
+        *last_retention = Instant::now();
+    }
+}
+
+async fn seal_and_age(store: &Arc<SegmentStore>, config: &Arc<ArcSwap<PromptLogConfig>>) {
+    match store.seal_active().await {
+        Ok(()) => run_retention(store, config).await,
+        Err(e) => tracing::warn!(error = %e, "segment seal failed; retried next tick"),
+    }
+}
+
+async fn run_retention(store: &Arc<SegmentStore>, config: &Arc<ArcSwap<PromptLogConfig>>) {
+    let cfg = config.load().retention.clone();
+    let store = store.clone();
+    let report = match tokio::task::spawn_blocking(move || crate::aging::enforce_once(&store, &cfg))
+        .await
+    {
+        Ok(Ok(r)) => Ok(r),
+        Ok(Err(e)) => Err(e),
+        Err(e) => Err(io::Error::other(format!("retention task: {e}"))),
     };
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        for phase in ["request", "response"] {
-            let Some(rest) = name.strip_prefix(&format!("{}_", phase)) else {
-                continue;
+    match report {
+        Ok(r) if r.deleted_segments > 0 => {
+            tracing::info!(
+                deleted = r.deleted_segments,
+                freed_bytes = r.freed_bytes,
+                "retention pass"
+            );
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "retention pass failed"),
+    }
+}
+
+/// Replay the spill into the segment store. Frame decode failures skip
+/// the frame (undecodable data is unrecoverable by definition); an append
+/// failure stops the drain and leaves the frame for the next pass.
+async fn drain_spill(store: &Arc<SegmentStore>, spill: &Arc<SpillStore>) {
+    if spill.bytes() == 0 {
+        return;
+    }
+    let store = store.clone();
+    let spill = spill.clone();
+    let result = match tokio::task::spawn_blocking(move || {
+        spill.drain(|body| {
+            let entry = match segment::decode_record(body) {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!(error = %e, "spill frame undecodable; skipping");
+                    return Ok(());
+                }
             };
-            if let Some(seq_str) = rest.strip_suffix(".jsonl") {
-                if let Ok(seq) = seq_str.parse::<u64>() {
-                    jsonl.push((phase, seq));
-                }
-            } else if let Some(seq_str) = rest.strip_suffix(".jsonl.gz") {
-                if let Ok(seq) = seq_str.parse::<u64>() {
-                    gz.insert((phase, seq));
-                }
-            }
-        }
-    }
-
-    let (start, stale) = plan_generation_start(&jsonl, &gz);
-    let stale_paths = stale
-        .into_iter()
-        .map(|(phase, seq)| dir.join(phase_file_name(phase, seq)))
-        .collect();
-    (start, stale_paths)
-}
-
-/// Pure decision core of [`scan_generation_state`], split out for testing.
-/// Takes `(phase, seq)` pairs of uncompressed files and the set of files
-/// that already have a `.gz` twin; returns the seq to write at and the
-/// uncompressed `(phase, seq)` pairs to compress.
-fn plan_generation_start(
-    jsonl: &[(&'static str, u64)],
-    gz: &std::collections::HashSet<(&'static str, u64)>,
-) -> (u64, Vec<(&'static str, u64)>) {
-    let phase_max = |p: &str| {
-        jsonl
-            .iter()
-            .filter(|(ph, _)| *ph == p)
-            .map(|(_, s)| *s)
-            .max()
-    };
-    let overall_max = jsonl
-        .iter()
-        .map(|(_, s)| *s)
-        .chain(gz.iter().map(|(_, s)| *s))
-        .max()
-        .unwrap_or(0);
-
-    // Resume only when the newest jsonl generation is aligned and no phase
-    // already has a compressed twin at that seq — a crash between writing
-    // the .gz and deleting the .jsonl would otherwise duplicate content if
-    // we appended to the jsonl.
-    let aligned_seq = match (phase_max("request"), phase_max("response")) {
-        (Some(a), Some(b)) if a == b => Some(a),
-        (Some(a), None) | (None, Some(a)) => Some(a),
-        _ => None,
-    };
-    let start = match aligned_seq {
-        Some(s) if !gz.iter().any(|(_, gs)| *gs == s) => s,
-        _ => overall_max + 1,
-    };
-
-    let stale = jsonl
-        .iter()
-        .copied()
-        .filter(|&(_, s)| s != start)
-        .filter(|&(p, s)| !gz.contains(&(p, s)))
-        .collect();
-
-    (start, stale)
-}
-
-/// Compress a file to `.gz` and delete the original on success.
-async fn compress_file(path: &std::path::Path) -> std::io::Result<()> {
-    let data = tokio::fs::read(path).await?;
-    let gz_path = PathBuf::from(format!("{}.gz", path.display()));
-
-    let gz_path_clone = gz_path.clone();
-    let compressed = tokio::task::spawn_blocking(move || {
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
-        use std::io::Write;
-        encoder.write_all(&data)?;
-        encoder.finish()
+            let mut frame = Vec::with_capacity(4 + body.len());
+            frame.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            frame.extend_from_slice(body);
+            store.append_frame(
+                &frame,
+                id_hash(&entry.request_id),
+                segment::phase_to_u8(entry.phase),
+                segment::entry_ts_ms(&entry),
+            )
+        })
     })
     .await
-    .map_err(std::io::Error::other)??;
-
-    tokio::fs::write(&gz_path_clone, &compressed).await?;
-    tokio::fs::remove_file(path).await?;
-    tracing::info!(
-        original = %path.display(),
-        compressed = %gz_path_clone.display(),
-        "Compressed prompt log file"
-    );
-    Ok(())
+    {
+        Ok(Ok(n)) => Ok(n),
+        Ok(Err(e)) => Err(e),
+        Err(e) => Err(io::Error::other(format!("spill drain task: {e}"))),
+    };
+    match result {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(replayed = n, "spill drained into segment store"),
+        Err(e) => tracing::warn!(error = %e, "spill drain failed; retried next tick"),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::entry::LogPhase;
+    use crate::store::EntryPair;
 
-    fn gzset(pairs: &[(&'static str, u64)]) -> std::collections::HashSet<(&'static str, u64)> {
-        pairs.iter().copied().collect()
-    }
-
-    #[test]
-    fn empty_dir_starts_at_one() {
-        let (start, stale) = plan_generation_start(&[], &gzset(&[]));
-        assert_eq!(start, 1);
-        assert!(stale.is_empty());
-    }
-
-    #[test]
-    fn aligned_generation_is_resumed() {
-        let jsonl = [("request", 3), ("response", 3), ("request", 2), ("response", 1)];
-        let (start, stale) = plan_generation_start(&jsonl, &gzset(&[("request", 1), ("request", 2)]));
-        assert_eq!(start, 3);
-        // seq 1/2 are old generations: request sides already gzipped,
-        // response seq 1 has no twin yet → the only stale file.
-        assert_eq!(stale, vec![("response", 1)]);
-    }
-
-    #[test]
-    fn single_phase_generation_is_resumed() {
-        let (start, stale) = plan_generation_start(&[("request", 7)], &gzset(&[]));
-        assert_eq!(start, 7);
-        assert!(stale.is_empty());
-    }
-
-    #[test]
-    fn misaligned_generation_starts_fresh_and_compresses_all() {
-        // Pre-alignment leftovers: request stopped at 7, response at 9.
-        let (start, stale) = plan_generation_start(&[("request", 7), ("response", 9)], &gzset(&[]));
-        assert_eq!(start, 10);
-        assert_eq!(stale, vec![("request", 7), ("response", 9)]);
-    }
-
-    #[test]
-    fn gz_twin_at_newest_prevents_resume() {
-        // Crash between writing the .gz and deleting the .jsonl: resuming
-        // would append to a file whose content is already in a .gz twin.
-        let (start, stale) = plan_generation_start(
-            &[("request", 5), ("response", 5)],
-            &gzset(&[("response", 5)]),
-        );
-        assert_eq!(start, 6);
-        // response 5 is skipped (twin exists — healed state); request 5 is
-        // recompressed, which overwrites nothing but removes the jsonl.
-        assert_eq!(stale, vec![("request", 5)]);
-    }
-
-    #[test]
-    fn gz_only_dir_starts_after_max() {
-        let (start, stale) = plan_generation_start(&[], &gzset(&[("request", 4), ("response", 4)]));
-        assert_eq!(start, 5);
-        assert!(stale.is_empty());
-    }
-
-    #[tokio::test]
-    async fn lockstep_rotation_keeps_request_response_aligned() {
-        use crate::config::PromptLogConfig;
-        use std::time::{Duration, Instant};
-
-        let tmp = tempfile::tempdir().unwrap();
-        let cfg = PromptLogConfig {
-            dir: tmp.path().to_string_lossy().into_owned(),
-            max_file_size_mb: 1,
+    fn test_config(dir: &std::path::Path) -> PromptLogConfig {
+        PromptLogConfig {
+            dir: dir.to_string_lossy().into_owned(),
             ..Default::default()
-        };
-        let writer = PromptLogWriter::spawn(cfg);
+        }
+    }
 
-        let entry = |id: &str, phase: LogPhase, payload: usize| {
-            let body = Arc::new(serde_json::Value::String("x".repeat(payload)));
-            let mut e = PromptLogEntry::new_request(
-                id,
-                None,
-                "keyhash",
-                Some("alice"),
-                Some("team1"),
-                "gpt-4o",
-                "/v1/chat/completions",
-                false,
-                body,
-                Some("127.0.0.1"),
-                None,
-            );
-            e.phase = phase;
-            e
-        };
+    fn entry(id: &str, payload: usize) -> PromptLogEntry {
+        let body = Arc::new(serde_json::Value::String("x".repeat(payload)));
+        PromptLogEntry::new_request(
+            id,
+            None,
+            "keyhash",
+            None,
+            Some("team1"),
+            "gpt-4o",
+            "/v1/chat/completions",
+            false,
+            body,
+            None,
+            None,
+        )
+    }
 
-        writer.send(entry("r1", LogPhase::Request, 10));
-        writer.send(entry("r1", LogPhase::Response, 10));
-        // ~1.2MB request line on a non-empty file crosses the 1MB threshold
-        // and must rotate the WHOLE generation to seq 2 — including the
-        // half-empty response file.
-        writer.send(entry("r2", LogPhase::Request, 1_200_000));
-        writer.send(entry("r2", LogPhase::Response, 10));
-
-        let key_dir = tmp.path().join("team1").join("keyhash");
+    async fn wait_for<F>(mut f: F)
+    where
+        F: FnMut() -> bool,
+    {
         let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            if let Ok(content) = tokio::fs::read_to_string(key_dir.join("response_000002.jsonl")).await {
-                if content.contains("\"r2\"") {
-                    break;
-                }
-            }
+        while !f() {
             assert!(
                 Instant::now() < deadline,
-                "timed out waiting for generation-2 files to appear"
+                "timed out waiting for the writer to catch up"
             );
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
-
-        // Generation-1 files were sealed by the rotation and are compressed
-        // asynchronously — accept either form, but both phases must survive.
-        for phase in ["request", "response"] {
-            let jsonl = tokio::fs::try_exists(key_dir.join(format!("{}_000001.jsonl", phase)))
-                .await
-                .unwrap();
-            let gz = tokio::fs::try_exists(key_dir.join(format!("{}_000001.jsonl.gz", phase)))
-                .await
-                .unwrap();
-            assert!(
-                jsonl || gz,
-                "generation-1 {phase} file must survive in some form"
-            );
-        }
-        let req2 = tokio::fs::read_to_string(key_dir.join("request_000002.jsonl"))
-            .await
-            .unwrap();
-        assert!(req2.contains("\"r2\""));
-        let resp2 = tokio::fs::read_to_string(key_dir.join("response_000002.jsonl"))
-            .await
-            .unwrap();
-        assert!(resp2.contains("\"r2\""));
     }
 
     #[tokio::test]
-    async fn send_drops_and_counts_when_channel_full() {
-        // Capacity-1 channel with a receiver that's never drained: the
-        // second send must drop (not block) and bump the counter.
-        let (sender, _receiver_keep_open) = mpsc::channel::<PromptLogEntry>(1);
-        let dropped_on_full = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let writer = PromptLogWriter {
-            config: Arc::new(ArcSwap::from_pointee(PromptLogConfig::default())),
-            sender: PromptLogSender::new(sender, dropped_on_full.clone()),
-            dropped_on_full,
-            #[cfg(feature = "otlp")]
-            otlp: Arc::new(ArcSwap::from_pointee(None)),
-            #[cfg(feature = "otlp")]
-            flush_handle: Arc::new(std::sync::Mutex::new(None)),
+    async fn send_then_queryable_via_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = PromptLogWriter::spawn(test_config(dir.path()), "gw-test")
+            .unwrap();
+
+        let e = entry("r1", 64);
+        let resp = {
+            let mut r = PromptLogEntry::new_response_from(&e);
+            r.set_response(Arc::new(serde_json::json!({"a": 1})));
+            r
         };
-        let entry = |id: &str| {
-            PromptLogEntry::new_request(
-                id,
-                None,
-                "kh",
-                None,
-                None,
-                "m",
-                "/p",
-                false,
-                Arc::new(serde_json::json!({})),
-                None,
-                None,
-            )
-        };
-        writer.send(entry("r-1"));
+        writer.send(e);
+        writer.send(resp);
+
+        let store = writer.store().expect("healthy writer in tests");
+        wait_for(|| store.find_pair_sync("r1").complete()).await;
+        assert!(store.find_pair_sync("absent").request.is_none());
+        writer.shutdown_flush().await;
+    }
+
+    #[tokio::test]
+    async fn over_budget_entries_spill_not_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        // 1-byte channel budget: every entry is over budget → spill path.
+        let writer = PromptLogWriter::spawn_with_channel_budget_for_tests(
+            test_config(dir.path()),
+            "gw-test",
+            1,
+        )
+        .unwrap();
+
+        writer.send(entry("spilled-1", 512));
+        writer.send(entry("spilled-2", 512));
         assert_eq!(writer.dropped_on_full(), 0);
-        writer.send(entry("r-2")); // full → dropped, counted
-        assert_eq!(writer.dropped_on_full(), 1);
+
+        let store = writer.store().expect("healthy writer in tests");
+        wait_for(|| store.find_sync("spilled-1", LogPhase::Request).is_some()).await;
+        wait_for(|| store.find_sync("spilled-2", LogPhase::Request).is_some()).await;
+        assert_eq!(writer.dropped_on_full(), 0);
+        writer.shutdown_flush().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_flush_drains_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = PromptLogWriter::spawn(test_config(dir.path()), "gw-test")
+            .unwrap();
+        writer.send(entry("r-final", 64));
+        // Shutdown drains the queue and flushes before returning.
+        writer.shutdown_flush().await;
+
+        let store = writer.store().expect("healthy writer in tests");
+        assert!(
+            store.find_sync("r-final", LogPhase::Request).is_some(),
+            "entry sent before shutdown must be flushed"
+        );
+    }
+
+    #[tokio::test]
+    async fn entry_pair_from_writer_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = PromptLogWriter::spawn(test_config(dir.path()), "gw-test")
+            .unwrap();
+        let e = entry("pair-check", 32);
+        let resp = {
+            let mut r = PromptLogEntry::new_response_from(&e);
+            r.set_response(Arc::new(serde_json::json!({"ok": true})));
+            r
+        };
+        writer.send(e);
+        writer.send(resp);
+        let store = writer.store().expect("healthy writer in tests");
+        wait_for(|| store.find_pair_sync("pair-check").complete()).await;
+        let EntryPair { request, response } = store.find_pair_sync("pair-check");
+        assert_eq!(request.unwrap().team_alias.as_deref(), Some("team1"));
+        assert!(response.is_some());
+        writer.shutdown_flush().await;
+    }
+
+    #[tokio::test]
+    async fn sender_drops_when_spill_also_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, _rx_keep_open) = mpsc::channel::<PromptLogEntry>(1);
+        let spill = Arc::new(SpillStore::new(dir.path(), 1)); // 1-byte spill
+        let dropped = Arc::new(AtomicU64::new(0));
+        let sender = PromptLogSender {
+            sender: tx,
+            budget: Arc::new(AtomicI64::new(1024)),
+            dropped_on_full: dropped.clone(),
+            spill,
+        };
+
+        assert!(sender.try_send(entry("ok-1", 8)).is_ok());
+        // Channel (capacity 1) is now full → second send spills → spill
+        // budget (1 byte) rejects → dropped + counted, not an Err.
+        assert!(sender.try_send(entry("too-big", 64)).is_ok());
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
     }
 }

@@ -1974,6 +1974,46 @@ fn require_master(identity: &AuthIdentity) -> Result<(), GatewayErrorReply> {
 }
 
 // ============================================================
+// Internal: cross-instance prompt-log entry fetch
+// ============================================================
+
+/// GET /internal/prompt-log/entry/{request_id}
+///
+/// Serves a prompt-log entry pair from THIS instance's local segments.
+/// Master-key only — peer dashboards authenticate with the shared master
+/// key. Prompt-log segments are instance-local (YAML-private `dir`), so
+/// when a dashboard serves a request that landed on a peer instance, it
+/// proxies here instead of reading shared storage.
+pub async fn internal_prompt_log_entry(
+    State(state): State<AppState>,
+    auth: RequiredAuth,
+    Path(request_id): Path<String>,
+) -> axum::response::Response {
+    if let Err(e) = require_master(auth.identity()) {
+        return e.into_response();
+    }
+    let query = state.prompt_log_query.clone();
+    let pair = tokio::task::spawn_blocking(move || query.find_pair(&request_id))
+        .await
+        .unwrap_or_default();
+
+    match (pair.request, pair.response) {
+        (None, None) => (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Request not found in prompt logs"})),
+        )
+            .into_response(),
+        (Some(req), None) => Json(serde_json::to_value(req).unwrap_or_default()).into_response(),
+        (None, Some(resp)) => Json(serde_json::to_value(resp).unwrap_or_default()).into_response(),
+        (Some(req), Some(resp)) => Json(serde_json::json!({
+            "request": serde_json::to_value(req).unwrap_or_default(),
+            "response": serde_json::to_value(resp).unwrap_or_default(),
+        }))
+        .into_response(),
+    }
+}
+
+// ============================================================
 // Error Response — stream-aware wrappers
 // ============================================================
 
@@ -6813,10 +6853,7 @@ trace:
         let response_id_slot = new_streamed_response_id_slot();
         let mut wrapper = PromptLogStream::new(
             sse,
-            boom_promptlog::PromptLogSender::new(
-                tx,
-                Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            ),
+            boom_promptlog::PromptLogSender::for_tests(tx),
             req,
             sse_raw_data_extractor(response_id_slot.clone()),
         )

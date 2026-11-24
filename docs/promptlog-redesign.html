@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Prompt Log 存储重构方案 · 评审稿</title>
+<style>
+  :root{
+    --ink:#1a2233; --sub:#5a6478; --line:#e3e7ef; --bg:#f7f8fb; --card:#ffffff;
+    --accent:#2f5fd7; --accent-soft:#eef2fd; --ok:#1a7f4e; --ok-soft:#e9f6ef;
+    --new:#b25e00; --new-soft:#fdf1e3; --bad:#b02a2a; --bad-soft:#fbeeee;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font:15px/1.75 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif;color:var(--ink);background:var(--bg);padding:36px 16px}
+  .page{max-width:1020px;margin:0 auto}
+  header{margin-bottom:28px}
+  header h1{font-size:26px;letter-spacing:.5px}
+  header .meta{color:var(--sub);font-size:13px;margin-top:6px;display:flex;gap:14px;flex-wrap:wrap;align-items:center}
+  .tag{display:inline-block;padding:1px 10px;border-radius:999px;font-size:12px;font-weight:600}
+  .tag.review{background:var(--accent-soft);color:var(--accent)}
+  section{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:22px 26px;margin-bottom:18px}
+  section h2{font-size:17px;margin-bottom:14px;display:flex;align-items:baseline;gap:10px}
+  section h2 .no{color:var(--accent);font-family:var(--mono);font-size:13px}
+  section h2 .en{color:var(--sub);font-size:12px;font-weight:400;margin-left:auto;letter-spacing:1px}
+  table{width:100%;border-collapse:collapse;font-size:13.5px}
+  th,td{border:1px solid var(--line);padding:7px 11px;text-align:left;vertical-align:top}
+  th{background:#f2f4f9;font-weight:600;white-space:nowrap}
+  code{font-family:var(--mono);font-size:12.5px;background:#f2f4f9;padding:1px 5px;border-radius:4px;color:#3a3f52}
+  ul{padding-left:20px} li{margin:4px 0}
+  .badge{display:inline-block;padding:0 8px;border-radius:4px;font-size:12px;font-weight:600;white-space:nowrap}
+  .b-have{background:var(--ok-soft);color:var(--ok)}
+  .b-new{background:var(--new-soft);color:var(--new)}
+  .b-drop{background:var(--bad-soft);color:var(--bad)}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  .grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px}
+  .box{border:1px solid var(--line);border-radius:8px;padding:12px 15px}
+  .box h4{font-size:13.5px;margin-bottom:6px}
+  .box p,.box li{font-size:13px;color:var(--sub)}
+  .box ul{padding-left:16px}
+  .diagram{background:#fafbfd;border:1px dashed #c9d2e5;border-radius:8px;padding:16px;font-family:var(--mono);font-size:12.5px;line-height:1.9;overflow-x:auto;white-space:pre;color:#333c52}
+  .arch{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:6px}
+  .arch .cell{border:1px solid var(--line);border-radius:8px;padding:10px 13px;font-size:13px}
+  .arch .cell b{display:block;font-size:13.5px}
+  .arch .cell span{color:var(--sub);font-size:12.5px}
+  .flow{font-family:var(--mono);font-size:12px;color:var(--sub);text-align:center;margin:2px 0 10px}
+  .verdict{background:var(--accent-soft);border-radius:8px;padding:12px 16px;font-size:14px}
+  .verdict b{color:var(--accent)}
+  .note{font-size:12.5px;color:var(--sub);margin-top:10px}
+  .k{color:var(--accent);font-weight:600}
+  footer{color:var(--sub);font-size:12px;text-align:center;margin-top:6px}
+  @media print{body{background:#fff;padding:0}section{break-inside:avoid;border-color:#ccc}}
+</style>
+</head>
+<body>
+<div class="page">
+
+<header>
+  <h1>Prompt Log 存储重构方案</h1>
+  <div class="meta">
+    <span class="tag review">评审稿 · 待确认影响性后实施</span>
+    <span>2026-11-24</span>
+    <span>范围：crates/boom-promptlog + 薄接线（boom-main / boom-dashboard）</span>
+    <span>现状代码基线：writer.rs / query.rs / entry.rs</span>
+  </div>
+</header>
+
+<!-- 01 问题 -->
+<section>
+  <h2><span class="no">01</span>现状问题：一个根因，四个症状<span class="en">PROBLEM</span></h2>
+  <p style="margin-bottom:12px">现有实现的根本决策是<b>把目录树当索引用</b>（<code>{dir}/{team}/{key_hash}/{phase}_{seq}.jsonl</code>），由此决定了全部四个症状：</p>
+  <div class="grid2">
+    <div class="box"><h4>① 查询 O(N) 全扫描</h4>
+      <ul><li>必须携带 <code>key_hash + team_alias</code> 才能定位目录，只凭 request_id 无从下手</li>
+      <li>定位后仍是<b>整个读入解压每个文件、逐行 JSON parse 匹配</b>（<code>scan_dir_for_entry</code>）</li>
+      <li>感知上"压缩后查不到"——实际是 .gz 被全量解压扫描，慢到形同不可用</li></ul></div>
+    <div class="box"><h4>② 无老化，磁盘无限涨</h4>
+      <ul><li>全 crate 唯一删除是压缩后删原文件；内容与 <code>boom_request_log</code> 元数据表均无清理</li>
+      <li>目录树无全局时间序，"按时间删"结构上做不了</li></ul></div>
+    <div class="box"><h4>③ 过载丢行</h4>
+      <ul><li>channel 容量 1024，<b>满即丢弃</b>（慢盘 / OTLP 阻塞时真实发生）</li>
+      <li>"不许阻塞请求"的动机正确，但顺序 I/O 排空能力远大于生产速率，应分层吸收而非丢</li></ul></div>
+    <div class="box"><h4>④ 小文件森林</h4>
+      <ul><li>每 key 2 个文件独立 gzip：句柄散、写打散、<b>单文件压缩</b>丢掉跨条联合压缩收益</li>
+      <li>两相位 lockstep 对齐 + 崩溃自愈已需要 6 个测试场景伺候——目录布局带来的意外复杂度</li></ul></div>
+  </div>
+</section>
+
+<!-- 02 架构 -->
+<section>
+  <h2><span class="no">02</span>总体架构：元数据 / 内容分离（split store）<span class="en">ARCHITECTURE</span></h2>
+  <div class="arch">
+    <div class="cell"><b>① boom_request_log <span class="badge b-have">已有</span></b><span>PG 元数据层：列表 / 过滤 / 统计 / 审计。request_id + instance_id 是 join key，零改动</span></div>
+    <div class="cell"><b>② 段存储引擎 <span class="badge b-new">新建 ★</span></b><span>boom-promptlog 内：追加 / 块压缩 / request_id 索引 / 封段。唯一新建组件，~2k 行机制胶水</span></div>
+    <div class="cell"><b>③ boom-state 心跳注册表 <span class="badge b-have">已有</span></b><span>多实例寻址：详情请求按 instance_id 代理到持有数据的实例</span></div>
+    <div class="cell"><b>④ 老化删除任务 <span class="badge b-new">新建（薄）</span></b><span>保留策略执行：整段 unlink。OTLP exporter（⑤，已有）作为外部平台出口保持不变</span></div>
+  </div>
+  <div class="diagram">请求热路径 ─┬─► boom-audit  ──────► PG boom_request_log（元数据行）
+             └─► boom-promptlog ──► 单写者 ─► 追加活跃段 ─(满/到期)─► 封存 + 固化索引
+
+看板 ──列表/过滤──► PG                    （两条记录靠 request_id 关联）
+     ──点详情──► 行含 instance_id ─► 心跳注册表寻址 ─► 代理到目标实例 ─► 段索引定位 ─► 解压单块
+
+老化任务 ──超期──► 整段 unlink ──► 对应 request_id 详情返回 410 "已被保留策略删除"
+OTLP    ──► 外部采集器（有数据平台的部署方由此消费，双写不冲突）</div>
+  <p class="note"><b>依赖原则不变</b>：不引入任何新第三方<b>系统</b>；新增第三方<b>库</b>仅 zstd / xxhash / crc 三个原语级 crate。自研部分 = 文件格式 + 点查索引 + 删除循环三件胶水——与 PlanStore=DashMap+机制层、audit=sqlx+PG+表结构同一哲学。段存储不依赖 DB，no-DB 部署模式天然可用。</p>
+</section>
+
+<!-- 03 机制 -->
+<section>
+  <h2><span class="no">03</span>核心机制<span class="en">MECHANISM</span></h2>
+  <div class="grid2">
+    <div class="box"><h4>存储形态：段 → 块 → 记录</h4>
+      <div class="diagram" style="padding:10px 12px;margin:6px 0">SegmentFile（封存后不可变）
+├ Header  magic | instance_id | start_ts
+├ Block×N  zstd(多条 JSON 记录拼合, ~2MB)
+├ Footer   记录数 | 时间范围 | CRC
+{seg}.idx  request_id→块号·偏移（排序二分）+ bloom</div>
+      <ul><li><b>块级压缩</b>：偏移写入时永久固定，封段零额外工作，点查只解压命中块（Kafka batch / Loki chunk 同构）</li>
+      <li>payload 保持现有 <code>PromptLogEntry</code> JSON 原样——schema 不变</li></ul></div>
+    <div class="box"><h4>写路径：不丢失的分层背压</h4>
+      <ul>
+        <li>热路径只做 Arc clone + <code>try_send</code>（现有形态，开销已合格）</li>
+        <li><b>内存 channel（字节预算）→ 磁盘 spill → 仅盘满时 drop+计数+告警</b>：把"慢"分层吸收，丢行点从"队列满"退到"磁盘满"</li>
+        <li>组提交 fsync（默认 interval）：进程崩溃零丢失，掉电窗口 ≤1s（语义可配置）</li>
+        <li>request 入口即写 + response 完成写的<b>两相语义保留</b>（上游挂了也有请求记录）</li></ul></div>
+    <div class="box"><h4>查询路径：索引定位，O(log n)</h4>
+      <ul>
+        <li>request_id → bloom 剪枝 → .idx 二分 → 解压<b>一个块</b> → 返回</li>
+        <li><b>不再需要 key_hash / team 提示</b>；压缩数据是一等公民</li>
+        <li>多实例：看板实例代理到目标实例（instance_id 列已存在）</li>
+        <li>配套 CLI：<code>list / cat / get / dump --from --to</code>，<b>离线可用</b>（拷走 segments 目录即可，dump 输出与今天 JSONL 同构）</li></ul></div>
+    <div class="box"><h4>老化：整段删除，O(1)</h4>
+      <ul>
+        <li>策略：max_age_days + max_total_gb + 磁盘水位（90% 强删最老段并告警）</li>
+        <li>封存段不可变 → 删除 = 从 manifest 摘除 + unlink，<b>零碎片整理、零写放大</b></li>
+        <li>段自描述（header/footer/CRC）→ manifest 只是缓存，崩溃后扫描目录可重建</li>
+        <li>配套：boom_request_log 同口径老化，避免元数据悬空；已删 → 410 如实返回</li></ul></div>
+  </div>
+  <div class="verdict"><b>一句话</b>：写路径保留"单写者顺序追加"的正确内核，把"满即丢"换成"内存队列 → 磁盘 spill"；查询从"目录遍历全扫描"换成"bloom + 固化索引定位"；老化从"不存在"换成"整段 O(1) 删除"；检索（PG）与内容（段文件）各归其位。</div>
+</section>
+
+<!-- 04 取舍 -->
+<section>
+  <h2><span class="no">04</span>关键取舍：为什么不是它们<span class="en">TRADE-OFFS</span></h2>
+  <table>
+    <tr><th style="width:180px">候选</th><th>否决理由</th></tr>
+    <tr><td><b>SQLite（嵌入式）</b></td><td>点查甚至更快，但三个结构错配：<b>老化</b>= DELETE+VACUUM 反复重写全库（"每天一个库文件"绕路 = 重新发明段存储，更差）；<b>压缩非原生</b>（逐条 blob 压缩比差）；WAL 每字节双写；坏页伤全树。B-tree 为"按 key 改/精确删"优化，日志 workload 是"只追加、按时间删"</td></tr>
+    <tr><td><b>全进 PG</b></td><td>MB 级 blob 的 TOAST/WAL 放大 + vacuum 常年期；no-DB 模式直接不可用</td></tr>
+    <tr><td><b>外部平台<br>（ClickHouse / Loki / S3）</b></td><td>数据路径上最"标准"，但破坏自包含部署底线、看板要跨系统拼接。OTLP sink 已是它的完整实现——有平台的部署方现在就能走，不是本次重构的替代项</td></tr>
+    <tr><td><b>嵌入式 KV<br>（redb / rocksdb）</b></td><td>MB 级大 value 写放大严重；老化由 compaction 驱动，无法整文件删</td></tr>
+    <tr><td><b>修补现有布局</b></td><td>加索引 → 索引指向会被 gzip/轮转的文件，偏移失效；加老化 → 目录树无时间序；现有 lockstep 对齐治理（6 个测试场景）就是修补成本的实证</td></tr>
+  </table>
+  <p class="note">业界印证：Loki chunk / VictoriaLogs part / Kafka log segment / ClickHouse part 全部是"时间分区 + 追加文件 + 整文件删除"形态——LLM 网关 prompt log 与它们同构，借形状不借体量。</p>
+</section>
+
+<!-- 05 影响面 -->
+<section>
+  <h2><span class="no">05</span>影响面清单（评审重点）<span class="en">IMPACT</span></h2>
+  <table>
+    <tr><th style="width:90px">类别</th><th>内容</th></tr>
+    <tr><td><span class="badge b-have">不变</span></td><td>
+      配置项语义（enabled / excluded_* / record_headers / capture_raw_upstream）；两相写入与流式捕获（LoggedStream）；OTLP 双 sink 与 replay；boom_request_log 表结构；dashboard 交互流（列表→点详情）；崩溃自愈能力（形态更简）</td></tr>
+    <tr><td><span class="badge b-new">改变</span></td><td>
+      <b>磁盘形态</b>：{team}/{key}/*.jsonl(.gz) → segments/*.seg + .idx（裸文件不再 cat 可读，配套 CLI 补偿，dump 输出同构）；
+      <b>详情端点</b>：key_hash 从必填→可选；<b>过载行为</b>：满即丢→spill 降级；<b>压缩数据查询</b>：全解压扫描→索引定位</td></tr>
+    <tr><td><span class="badge b-new">新增</span></td><td>
+      promptlog CLI（离线）；旧数据一次性导入工具；老化删除 + 410 语义；私域 YAML 配置段（segment / retention / durability / spill——按三判据全部为本机语义，各实例异构正确）</td></tr>
+    <tr><td><span class="badge b-drop">明确放弃</span></td><td>
+      按目录人工浏览（改由 dump / 查询 API 承载）；不做查询时的 legacy 降级扫描（双路径必然腐化，靠一次性导入收口）</td></tr>
+  </table>
+  <p class="note">新增决策均为<b>私域 YAML</b>（本机磁盘路径/水位/fsync/段参数），符合配置三域判据，不进 DB、不广播；无 DDL 变更（instance_id 列已存在）。</p>
+</section>
+
+<!-- 06 迁移 -->
+<section>
+  <h2><span class="no">06</span>迁移与验收<span class="en">MIGRATION</span></h2>
+  <ul>
+    <li><b>三步走</b>：① 新格式 + 索引查询上线（dashboard 端点 key_hash 转可选）→ ② 旧目录一次性导入（旧文件不动，人工确认后清理）→ ③ 观察期后移除旧写路径</li>
+    <li><b>验收</b>：高并发压测断言 dropped == 0（spill 命中率单列计数）；老化删段后 410 语义正确；点查延迟达标（结构上 O(log n) / 单块解压，具体数值以压测为准）；崩溃恢复（尾部截断）</li>
+    <li><b>回滚</b>：旧目录在导入后保留至人工确认，期间可回退旧版本读写</li>
+    <li><b>规模预估</b>：boom-promptlog ~2–3k 行（格式/索引/查询/老化/CLI/导入）+ dashboard / boom-main 薄接线</li>
+  </ul>
+</section>
+
+<!-- 07 待决策 -->
+<section>
+  <h2><span class="no">07</span>待拍板决策点<span class="en">DECISIONS</span></h2>
+  <table>
+    <tr><th style="width:200px">决策</th><th>选项与推荐</th></tr>
+    <tr><td>「不丢失」的语义边界</td><td>推荐<b>组提交 fsync</b>（掉电 ≤1s / 进程崩溃零丢）；可选宽松（仅 page cache）或每条 sync（审计级，吞吐代价 1–2 个量级）</td></tr>
+    <tr><td>老化默认保留期</td><td>推荐<b>默认 7 天</b> + 可选容量上限 + 磁盘水位强删（给会自动清理的安全默认，避免上线即无限涨）；可选 30 天 / 默认永久</td></tr>
+    <tr><td>段文件格式预留</td><td>推荐自研二进制段起步，manifest 按可导出形态预留（将来接数据平台时封存段可转 parquet，纯增量演进）；若公司终局明确是日志进数仓，可直接选 parquet 起步（引入 arrow 依赖树）</td></tr>
+  </table>
+</section>
+
+<footer>Intelligence Boom Gateway · boom-promptlog 存储重构评审稿 · 机制推导未含实测数字，性能结论以压测为准</footer>
+</div>
+</body>
+</html>

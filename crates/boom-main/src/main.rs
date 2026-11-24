@@ -287,6 +287,12 @@ fn build_router(state: AppState) -> Router {
         .route(
             "/admin/plans/assignments",
             get(routes::admin_list_assignments),
+        )
+        // Cross-instance prompt-log fetch: serves this instance's local
+        // segments to peer dashboards (master-key auth, see handler).
+        .route(
+            "/internal/prompt-log/entry/{request_id}",
+            get(routes::internal_prompt_log_entry),
         );
 
     // Dashboard router (Web UI + dashboard API).

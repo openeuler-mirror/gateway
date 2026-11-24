@@ -542,29 +542,79 @@ impl AppState {
         ));
 
         // 6. Build inner state (config + auth + health).
-        let prompt_log_config = config.prompt_log.as_ref()
+        let mut prompt_log_config = config.prompt_log.as_ref()
             .and_then(|v| serde_json::from_value::<boom_promptlog::PromptLogConfig>(v.clone()).ok())
             .unwrap_or_default();
+        // Retention policy: DB-authoritative global domain (boom_config KV
+        // prompt_log_retention, CATEGORY_PROMPTLOG broadcast). The YAML
+        // section is the first-boot seed only — warn before the adopt
+        // overlays it, so the operator learns the YAML value is inert.
+        crate::config_reconcile::warn_inert_prompt_log_retention(&prompt_log_config);
+        if let Some(ref pool) = db_pool {
+            crate::config_reconcile::adopt_prompt_log_retention_db(pool, &mut prompt_log_config)
+                .await?;
+        }
 
         // Wire the OTLP exporter when the feature is on. The exporter is
         // always constructed at startup (cheap: just an HTTP client + queue),
         // and the runtime `otlp.enabled` toggle in YAML is consulted on every
         // entry in the background writer — so flipping the dashboard switch
         // off→on (or on→off) takes effect immediately without a restart.
+        //
+        // A store-open failure (bad `dir`, full disk) degrades instead of
+        // failing the boot: prompt logging is auxiliary, the gateway keeps
+        // routing. Capture is hard-off until a restart re-opens the store.
         #[cfg(feature = "otlp")]
         let prompt_log_writer = {
             let exporter = boom_promptlog::OtelExporter::new(&prompt_log_config.otlp);
-            exporter.spawn_flush_task();
-            PromptLogWriter::spawn_with_otlp(prompt_log_config, exporter)
+            let otlp_handle: std::sync::Arc<
+                arc_swap::ArcSwap<Option<std::sync::Arc<boom_promptlog::OtelExporter>>>,
+            > = std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(Some(exporter.clone())));
+            match PromptLogWriter::spawn_with_otlp(
+                prompt_log_config.clone(),
+                &instance_id,
+                exporter,
+            ) {
+                Ok(w) => w,
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        dir = %prompt_log_config.dir,
+                        "prompt log store failed to open — prompt logging disabled until restart"
+                    );
+                    PromptLogWriter::degraded(prompt_log_config.clone(), otlp_handle)
+                }
+            }
         };
         #[cfg(not(feature = "otlp"))]
-        let prompt_log_writer = PromptLogWriter::spawn(prompt_log_config);
+        let prompt_log_writer = match PromptLogWriter::spawn(
+            prompt_log_config.clone(),
+            &instance_id,
+        ) {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    dir = %prompt_log_config.dir,
+                    "prompt log store failed to open — prompt logging disabled until restart"
+                );
+                PromptLogWriter::degraded(prompt_log_config.clone())
+            }
+        };
 
-        // Read-only query handle: shares the writer's `Arc<ArcSwap<config>>`,
-        // so dashboard sees hot-reloads without touching the writer directly.
-        let prompt_log_query: Arc<dyn boom_promptlog::PromptLogQueryApi> = Arc::new(
-            boom_promptlog::FilePromptLogQuery::new(prompt_log_writer.config_handle()),
-        );
+        // Read-only query handle: the segment store (present) or the
+        // disabled impl (degraded boot). Both share the writer's
+        // `Arc<ArcSwap<config>>`, so dashboard sees hot-reloads.
+        let prompt_log_query: Arc<dyn boom_promptlog::PromptLogQueryApi> =
+            match prompt_log_writer.store() {
+                Some(store) => Arc::new(boom_promptlog::SegmentPromptLogQuery::new(
+                    store,
+                    prompt_log_writer.config_handle(),
+                )),
+                None => Arc::new(boom_promptlog::DisabledPromptLogQuery::new(
+                    prompt_log_writer.config_handle(),
+                )),
+            };
 
         // Trace registry — top-level Arc, survives reloads (CLAUDE.md §4).
         // Active span table + slow ring live here; the OTLP traces exporter
@@ -1014,8 +1064,16 @@ impl AppState {
         //    rebuilds the exporter when endpoint/headers/batch/timeout/etc.
         //    differ — those are frozen in OtelExporter at construction time
         //    and only take effect via rebuild.
+        //    Retention is the §7 global exception: in DB mode the KV row
+        //    overlays whatever the YAML section said (or defaulted to), so a
+        //    YAML edit can never clobber the cluster-wide aging policy. In
+        //    no-DB mode the YAML value IS the authority.
         if let Some(ref v) = new_config.prompt_log {
-            if let Ok(pc) = serde_json::from_value::<boom_promptlog::PromptLogConfig>(v.clone()) {
+            if let Ok(mut pc) = serde_json::from_value::<boom_promptlog::PromptLogConfig>(v.clone()) {
+                crate::config_reconcile::warn_inert_prompt_log_retention(&pc);
+                if let Some(ref pool) = self.db_pool {
+                    crate::config_reconcile::adopt_prompt_log_retention_db(pool, &mut pc).await?;
+                }
                 let old_otlp = self.prompt_log_writer.config().otlp;
                 self.prompt_log_writer.update_config(pc.clone());
                 if old_otlp != pc.otlp {
@@ -1023,7 +1081,11 @@ impl AppState {
                 }
             }
         } else {
-            self.prompt_log_writer.update_config(boom_promptlog::PromptLogConfig::default());
+            let mut pc = boom_promptlog::PromptLogConfig::default();
+            if let Some(ref pool) = self.db_pool {
+                crate::config_reconcile::adopt_prompt_log_retention_db(pool, &mut pc).await?;
+            }
+            self.prompt_log_writer.update_config(pc);
         }
 
         // 5b. Hot-reload trace config — same pattern as prompt_log. Rebuilds

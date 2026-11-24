@@ -44,6 +44,10 @@ pub struct LogRow {
     pub duration_ms: Option<i32>,
     pub created_at: Option<DateTime<Utc>>,
     pub queue_wait_ms: Option<i32>,
+    /// Instance that served (and prompt-logged) this request. The prompt-log
+    /// segments are instance-local, so the dashboard uses this to decide
+    /// whether to serve the entry locally or proxy to the owning instance.
+    pub instance_id: Option<String>,
 }
 
 /// Paginated result for listing logs.
@@ -109,7 +113,7 @@ pub async fn list_logs(pool: &PgPool, query: ListLogsQuery) -> Result<LogsPage, 
         r#"SELECT request_id, key_hash, key_name, team_id, model, api_path,
                   is_stream, status_code, error_type, error_message,
                   input_tokens, output_tokens, duration_ms, created_at,
-                  queue_wait_ms
+                  queue_wait_ms, instance_id
            FROM boom_request_log
            {where_sql}
            ORDER BY created_at DESC
@@ -169,6 +173,7 @@ pub fn logs_page_to_json(page: LogsPage) -> Value {
                 "duration_ms": r.duration_ms,
                 "created_at": r.created_at.map(|d| d.to_rfc3339()),
                 "queue_wait_ms": r.queue_wait_ms,
+                "instance_id": r.instance_id,
             })
         })
         .collect();
