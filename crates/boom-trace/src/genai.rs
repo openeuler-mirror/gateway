@@ -31,7 +31,8 @@ pub fn convert_input_messages(
     request: &Value,
     max_bytes: usize,
 ) -> Option<ConvertedMessages> {
-    let mut messages = match api_kind(api_path)? {
+    let kind = api_kind(api_path)?;
+    let mut messages = match kind {
         ApiKind::Chat | ApiKind::Anthropic => {
             convert_openai_messages(request.get("messages")?.as_array()?)
         }
@@ -60,6 +61,11 @@ pub fn convert_input_messages(
             }
         }
     };
+    if let Some(directive) = directive_system_message(kind, request) {
+        if let Some(items) = messages.as_array_mut() {
+            items.insert(0, directive);
+        }
+    }
     retain_actual_content(&mut messages);
     let original_messages = messages.clone();
     enforce_input_budget(&mut messages, max_bytes);
@@ -626,6 +632,20 @@ fn convert_tool_response(response: &Value) -> Option<Value> {
     }))
 }
 
+/// Anthropic top-level `system` and Responses `instructions` carry the prompt
+/// directive outside the message list; convert to a leading canonical system message.
+fn directive_system_message(kind: ApiKind, request: &Value) -> Option<Value> {
+    let parts = match kind {
+        ApiKind::Chat | ApiKind::Legacy => return None,
+        ApiKind::Anthropic => convert_content(request.get("system")?),
+        ApiKind::Responses => convert_content(request.get("instructions")?),
+    };
+    if parts.is_empty() {
+        return None;
+    }
+    Some(message_from_parts("system", parts))
+}
+
 fn message_from_parts(role: &str, parts: Vec<Value>) -> Value {
     json!({"role": role, "parts": parts})
 }
@@ -804,9 +824,9 @@ mod tests {
     }
 
     #[test]
-    fn genai_anthropic_input_excludes_top_level_system() {
+    fn genai_anthropic_input_prepends_top_level_system() {
         let request = json!({
-            "system": "not a separate field",
+            "system": "You are a helpful assistant.",
             "messages": [{"role": "user", "content": [
                 {"type": "text", "text": "你好"},
                 {"type": "tool_result", "tool_use_id": "tool-1", "content": "sunny"}
@@ -815,13 +835,71 @@ mod tests {
         assert_eq!(
             convert_input_messages("/v1/messages", &request, 16_384)
                 .map(|converted| converted.messages),
-            Some(json!([{
-                "role": "user",
-                "parts": [
-                    {"type": "text", "content": "你好"},
-                    {"type": "tool_call_response", "id": "tool-1", "response": "sunny"}
-                ]
-            }]))
+            Some(json!([
+                text_message("system", "You are a helpful assistant."),
+                {
+                    "role": "user",
+                    "parts": [
+                        {"type": "text", "content": "你好"},
+                        {"type": "tool_call_response", "id": "tool-1", "response": "sunny"}
+                    ]
+                }
+            ]))
+        );
+    }
+
+    #[test]
+    fn genai_anthropic_system_block_array_keeps_text_only() {
+        let request = json!({
+            "system": [
+                {"type": "text", "text": "You are Claude.", "cache_control": {"type": "ephemeral"}},
+                {"type": "redacted_thinking", "data": "secret"},
+                {"type": "text", "text": "Be terse."}
+            ],
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let converted = convert_input_messages("/v1/messages", &request, 16_384)
+            .expect("text-only system blocks convert");
+        assert_eq!(
+            converted.messages,
+            json!([
+                {"role": "system", "parts": [
+                    {"type": "text", "content": "You are Claude."},
+                    {"type": "text", "content": "Be terse."}
+                ]},
+                text_message("user", "hi")
+            ])
+        );
+        let serialized = serde_json::to_string(&converted.messages).expect("valid JSON");
+        assert!(
+            serialized.find("cache_control").is_none(),
+            "cache_control must not leak into gen_ai.input.messages"
+        );
+        assert!(
+            serialized.find("redacted_thinking").is_none(),
+            "non-text system blocks must be dropped"
+        );
+    }
+
+    #[test]
+    fn genai_anthropic_system_without_text_yields_no_system_message() {
+        let request = json!({
+            "system": [{"type": "redacted_thinking", "data": "secret"}],
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        assert_eq!(
+            convert_input_messages("/v1/messages", &request, 16_384)
+                .map(|converted| converted.messages),
+            Some(json!([text_message("user", "hi")]))
+        );
+        let empty_blocks = json!({
+            "system": [],
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        assert_eq!(
+            convert_input_messages("/v1/messages", &empty_blocks, 16_384)
+                .map(|converted| converted.messages),
+            Some(json!([text_message("user", "hi")]))
         );
     }
 
@@ -874,7 +952,7 @@ mod tests {
             Some(json!([text_message("user", "hello")]))
         );
         let request = json!({
-            "instructions": "not a separate field",
+            "instructions": "Be terse.",
             "input": [
                 {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "weather"}]},
                 {"type": "function_call", "call_id": "call-1", "name": "weather", "arguments": "{\"city\":\"Paris\"}"},
@@ -885,6 +963,7 @@ mod tests {
             convert_input_messages("/v1/responses", &request, 16_384)
                 .map(|converted| converted.messages),
             Some(json!([
+                text_message("system", "Be terse."),
                 text_message("user", "weather"),
                 {"role": "assistant", "parts": [{
                     "type": "tool_call", "id": "call-1", "name": "weather", "arguments": {"city": "Paris"}
@@ -994,6 +1073,27 @@ mod tests {
         let final_bytes = serde_json::to_string(&c.messages).unwrap().len();
         assert_eq!(c.omitted_bytes, c.original_bytes - final_bytes);
         assert!(final_bytes <= 2000);
+    }
+
+    #[test]
+    fn budget_preserves_prepended_directive_system() {
+        let request = json!({
+            "system": "SYS",
+            "messages": [
+                {"role": "user", "content": "old1-".to_string() + &"a".repeat(2000)},
+                {"role": "assistant", "content": "old2-".to_string() + &"b".repeat(2000)},
+                {"role": "user", "content": "LATEST"}
+            ]
+        });
+        let c = convert_input_messages("/v1/messages", &request, 2000).unwrap();
+        let roles: Vec<&str> = c.messages.as_array().unwrap().iter()
+            .map(|m| m["role"].as_str().unwrap()).collect();
+        assert_eq!(roles, vec!["system", "user"]);
+        assert_eq!(c.messages[0]["parts"][0]["content"], "SYS");
+        assert_eq!(c.messages[1]["parts"][0]["content"], "LATEST");
+        let serialized = serde_json::to_string(&c.messages).unwrap();
+        assert!(serialized.len() <= 2000);
+        assert!(c.truncated);
     }
 
     #[test]
