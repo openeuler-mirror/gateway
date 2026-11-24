@@ -605,7 +605,6 @@ impl UsageTrackerState {
 
 #[derive(Default, Clone)]
 struct StreamMetaState {
-    first_content_at: Option<Instant>,
     response_id: Option<String>,
     response_model: Option<String>,
     finish_reasons: std::collections::BTreeMap<u32, String>,
@@ -628,28 +627,6 @@ fn stream_finish_reasons(meta: &StreamMetaState) -> Vec<String> {
     meta.finish_reasons.values().cloned().collect()
 }
 
-fn chunk_has_valid_content(chunk: &ChatStreamChunk) -> bool {
-    chunk.choices.iter().any(|choice| {
-        let delta = &choice.delta;
-        delta.content.as_ref().is_some_and(|content| !content.is_empty())
-            || delta
-                .reasoning_content
-                .as_ref()
-                .is_some_and(|content| !content.is_empty())
-            || delta.tool_calls.as_ref().is_some_and(|calls| {
-                calls.iter().any(|call| {
-                    call.function.as_ref().is_some_and(|function| {
-                        function.name.as_ref().is_some_and(|name| !name.is_empty())
-                            || function
-                                .arguments
-                                .as_ref()
-                                .is_some_and(|arguments| !arguments.is_empty())
-                    })
-                })
-            })
-    })
-}
-
 fn note_stream_response_id(tracker: &StreamMetaTracker, response_id: &str) {
     if response_id.is_empty() {
         return;
@@ -665,9 +642,6 @@ fn note_stream_chunk_meta(tracker: &StreamMetaTracker, chunk: &ChatStreamChunk) 
     let Ok(mut state) = tracker.lock() else {
         return;
     };
-    if state.first_content_at.is_none() && chunk_has_valid_content(chunk) {
-        state.first_content_at = Some(Instant::now());
-    }
     if state.response_id.is_none() && !chunk.id.is_empty() {
         state.response_id = Some(chunk.id.clone());
     }
@@ -832,10 +806,10 @@ impl<S> Drop for LoggedStream<S> {
         });
         if let Some(g) = self.trace_guard.as_mut() {
             g.set_duration_ms(self.start.elapsed().as_millis() as u64);
+            if let Some(first) = self.first_token_at {
+                g.set_ttft_ms((first - self.start).as_millis() as u64);
+            }
             if let Some(meta) = stream_meta {
-                if let Some(first) = meta.first_content_at {
-                    g.set_ttft_ms((first - self.start).as_millis() as u64);
-                }
                 let finish_reasons = stream_finish_reasons(&meta);
                 stamp_response_metadata(
                     g,
@@ -1472,7 +1446,7 @@ async fn chat_completions_inner(
     };
 
     // Capture request body for debug recording if debug mode is enabled.
-    let debug_req_body = if cfg!(debug_assertions) && state.debug_store.is_enabled() {
+    let debug_req_body = if state.debug_store.is_enabled() {
         serde_json::to_string(&req).ok()
     } else {
         None
@@ -4165,7 +4139,7 @@ pub async fn messages(
     }
 
     // Capture request body for debug recording if debug mode is enabled.
-    let debug_req_body = if cfg!(debug_assertions) && state.debug_store.is_enabled() {
+    let debug_req_body = if state.debug_store.is_enabled() {
         serde_json::to_string(&req).ok()
     } else {
         None
@@ -5201,7 +5175,7 @@ pub async fn responses(
         }
     }
 
-    let debug_req_body = if cfg!(debug_assertions) && state.debug_store.is_enabled() {
+    let debug_req_body = if state.debug_store.is_enabled() {
         serde_json::to_string(&req).ok()
     } else {
         None
@@ -6425,7 +6399,7 @@ mod tests {
         stamp_gen_ai_request_params, stamp_gen_ai_usage_attrs, stamp_provider_attribution,
         stamp_response_metadata, stamp_responses_nonstream_metadata, stamp_streamed_response_id, mark_trace_error,
         PreferredUsage, UsageTracker, UsageTrackerState, UserTags,
-        chunk_has_valid_content, note_stream_chunk_meta, note_stream_response_id,
+        note_stream_chunk_meta, note_stream_response_id,
         LoggedStream, StreamMetaTracker, stream_failure_sink,
         stream_finish_reasons, StreamMetaState,
     };
@@ -7577,37 +7551,6 @@ trace:
     }
 
     #[test]
-    fn valid_chunk_content_accepts_only_real_output() {
-        let role_only = StreamDelta { role: Some(MessageRole::Assistant), ..empty_stream_delta() };
-        assert!(!chunk_has_valid_content(&stream_meta_chunk(role_only)));
-        let empty_text = StreamDelta { content: Some(String::new()), ..empty_stream_delta() };
-        assert!(!chunk_has_valid_content(&stream_meta_chunk(empty_text)));
-        let text = StreamDelta { content: Some("hello".to_string()), ..empty_stream_delta() };
-        assert!(chunk_has_valid_content(&stream_meta_chunk(text)));
-        let reasoning = StreamDelta { reasoning_content: Some("think".to_string()), ..empty_stream_delta() };
-        assert!(chunk_has_valid_content(&stream_meta_chunk(reasoning)));
-        for function in [
-            FunctionCallDelta { name: Some("weather".to_string()), arguments: None },
-            FunctionCallDelta { name: None, arguments: Some("{}".to_string()) },
-        ] {
-            let tool = StreamDelta {
-                tool_calls: Some(vec![ToolCallDelta { index: 0, id: None, call_type: None, function: Some(function) }]),
-                ..empty_stream_delta()
-            };
-            assert!(chunk_has_valid_content(&stream_meta_chunk(tool)));
-        }
-        let id_only_tool = StreamDelta {
-            tool_calls: Some(vec![ToolCallDelta { index: 0, id: Some("call-1".to_string()), call_type: None, function: None }]),
-            ..empty_stream_delta()
-        };
-        assert!(!chunk_has_valid_content(&stream_meta_chunk(id_only_tool)));
-        let mut usage_only = stream_meta_chunk(empty_stream_delta());
-        usage_only.choices.clear();
-        usage_only.usage = Some(StreamUsage::default());
-        assert!(!chunk_has_valid_content(&usage_only));
-    }
-
-    #[test]
     fn stream_metadata_is_first_wins_and_preserves_client_ids() {
         let tracker = StreamMetaTracker::default();
         note_stream_response_id(&tracker, "msg_real");
@@ -7627,7 +7570,6 @@ trace:
         assert_eq!(state.response_id.as_deref(), Some("msg_real"));
         assert_eq!(state.response_model.as_deref(), Some("actual-model"));
         assert_eq!(state.finish_reasons.get(&0).map(String::as_str), Some("stop"));
-        assert!(state.first_content_at.is_some());
         drop(state);
 
         let responses_tracker = StreamMetaTracker::default();
@@ -7687,14 +7629,13 @@ trace:
         let tracker = StreamMetaTracker::default();
         {
             let mut state = tracker.lock().unwrap();
-            state.first_content_at = Some(start + std::time::Duration::from_millis(25));
             state.response_id = Some("chatcmpl-real".to_string());
             state.response_model = Some("actual-model".to_string());
             state.finish_reasons.insert(0, "stop".to_string());
             state.stream_error = Some(("upstream_error".to_string(), "boom".to_string()));
         }
-        let logged = LoggedStream::new(
-            futures::stream::empty::<ChatStreamChunk>(),
+        let mut logged = LoggedStream::new(
+            futures::stream::iter(vec![stream_meta_chunk(empty_stream_delta())]),
             None,
             request_log_for_stream_test(),
             start,
@@ -7703,6 +7644,7 @@ trace:
         )
         .with_trace_guard(guard)
         .with_stream_meta(tracker);
+        let _ = logged.next().await;
         drop(logged);
 
         let snapshot = registry.snapshot().await;
@@ -7720,7 +7662,6 @@ trace:
         }));
         let metrics = registry.prometheus_text().expect("metrics enabled");
         assert!(metrics.contains("gen_ai.client.operation.time_to_first_chunk_seconds_sum"));
-        assert!(metrics.contains("0.025"));
         assert!(metrics.contains("error.type=\"upstream_error\""));
     }
 
@@ -7766,7 +7707,7 @@ trace:
     }
 
     #[tokio::test]
-    async fn role_and_usage_only_stream_has_no_ttft() {
+    async fn role_only_first_chunk_sets_ttft() {
         let (registry, guard) = traced_stream_guard("req-no-valid-content");
         registry.set_metrics_enabled(true);
         let tracker = StreamMetaTracker::default();
@@ -7790,7 +7731,7 @@ trace:
         let _ = logged.next().await;
         drop(logged);
         let metrics = registry.prometheus_text().expect("metrics enabled");
-        assert!(!metrics.contains("gen_ai.client.operation.time_to_first_chunk_seconds"));
+        assert!(metrics.contains("gen_ai.client.operation.time_to_first_chunk_seconds"));
     }
 
     // ---- Task 9: raw capture → span attempts / provider-bound input ----
