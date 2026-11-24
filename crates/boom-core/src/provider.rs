@@ -148,59 +148,101 @@ pub type SharedProviderPromptTrace = Arc<dyn ProviderPromptTrace>;
 
 /// Side channel capturing the exact bodies exchanged with the upstream
 /// provider. Created by the route layer when `prompt_log.capture_raw_upstream`
-/// is enabled; providers write at their send/receive sites; the prompt log
-/// entry reads the buffers when the Response-phase entry is composed.
+/// or raw trace capture is enabled; providers write at their send/receive
+/// sites; readers snapshot it for the trace and drain the legacy buffers when
+/// the prompt log entry is composed.
 ///
 /// Semantics:
-/// - `request_body`: the JSON string exactly as serialized for the upstream
-///   call (byte-identical to what reqwest puts on the wire — same Value,
-///   same serializer).
+/// - one `RawAttempt` per upstream call (retries and fallbacks append);
+/// - `request_body`: the JSON string exactly as serialized for that call
+///   (byte-identical to what reqwest puts on the wire — same Value, same
+///   serializer), empty when not recorded;
 /// - `response_frames`: one entry per complete SSE frame for streaming
 ///   (frame text as received, `event:`/`data:` prefixes and comments kept,
 ///   frames that fail JSON parse included), or the whole body as a single
 ///   entry for non-streaming responses and upstream HTTP error bodies.
 ///   Callers join frames with `\n\n` to reconstruct the raw stream.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RawAttempt {
+    /// `Provider::name()` at the record site.
+    pub provider: String,
+    pub request_body: String,
+    pub response_frames: Vec<String>,
+}
+
 #[derive(Debug, Default)]
 pub struct RawCaptureChannel {
-    pub request_body: Mutex<Option<String>>,
-    pub response_frames: Mutex<Vec<String>>,
+    attempts: Mutex<Vec<RawAttempt>>,
 }
 
 impl RawCaptureChannel {
-    /// Record the upstream request body. First writer wins — later calls
-    /// (e.g. retries) do not overwrite, keeping the log deterministic.
-    pub fn record_request_body(&self, body: &str) {
-        if let Ok(mut slot) = self.request_body.lock() {
-            if slot.is_none() {
-                *slot = Some(body.to_string());
+    /// Start a new attempt holding `body` as its upstream request body.
+    /// Retries and fallbacks append rather than overwrite the first body.
+    pub fn record_request_body(&self, provider: &str, body: &str) {
+        if let Ok(mut attempts) = self.attempts.lock() {
+            attempts.push(RawAttempt {
+                provider: provider.to_string(),
+                request_body: body.to_string(),
+                response_frames: Vec::new(),
+            });
+        }
+    }
+
+    /// Append a response frame to the attempt currently in flight, creating
+    /// a default attempt when none was recorded yet.
+    pub fn push_response_frame(&self, frame: String) {
+        if let Ok(mut attempts) = self.attempts.lock() {
+            if attempts.is_empty() {
+                attempts.push(RawAttempt::default());
+            }
+            if let Some(attempt) = attempts.last_mut() {
+                attempt.response_frames.push(frame);
             }
         }
     }
 
-    pub fn push_response_frame(&self, frame: String) {
-        if let Ok(mut frames) = self.response_frames.lock() {
-            frames.push(frame);
-        }
-    }
-
+    /// Legacy single-slot view: the first non-empty request body. Every
+    /// attempt is cleared, so a second call yields `None`.
     pub fn take_request_body(&self) -> Option<String> {
-        self.request_body.lock().ok().and_then(|mut slot| slot.take())
+        let mut attempts = match self.attempts.lock() {
+            Ok(attempts) => attempts,
+            Err(_) => return None,
+        };
+        let mut first = None;
+        for attempt in attempts.iter_mut() {
+            let body = std::mem::take(&mut attempt.request_body);
+            if first.is_none() && !body.is_empty() {
+                first = Some(body);
+            }
+        }
+        first
     }
 
-    /// Drain accumulated frames into a single raw string. Streaming frames
-    /// are joined with `\n\n` (the SSE frame separator); a lone
+    /// Drain every attempt's frames into a single raw string. Streaming
+    /// frames are joined with `\n\n` (the SSE frame separator); a lone
     /// non-streaming body is returned verbatim.
     pub fn take_response_body(&self) -> Option<String> {
-        let frames = self
-            .response_frames
-            .lock()
-            .ok()
-            .map(|mut frames| std::mem::take(&mut *frames))
-            .unwrap_or_default();
+        let mut attempts = match self.attempts.lock() {
+            Ok(attempts) => attempts,
+            Err(_) => return None,
+        };
+        let mut frames = Vec::new();
+        for attempt in attempts.iter_mut() {
+            frames.append(&mut attempt.response_frames);
+        }
         if frames.is_empty() {
             None
         } else {
             Some(frames.join("\n\n"))
+        }
+    }
+
+    /// Non-draining clone of every attempt, in upstream call order. Trace
+    /// readers call this before the legacy takes drain the buffers.
+    pub fn snapshot_attempts(&self) -> Vec<RawAttempt> {
+        match self.attempts.lock() {
+            Ok(attempts) => attempts.clone(),
+            Err(_) => Vec::new(),
         }
     }
 }
@@ -265,6 +307,11 @@ pub trait Provider: Send + Sync + 'static {
 
     /// Provider identifier (e.g. "openai", "anthropic").
     fn name(&self) -> &str;
+
+    /// Raw deployment provider type used for `gen_ai.provider.name`.
+    fn provider_type(&self) -> &str {
+        self.name()
+    }
 
     /// Upstream API protocol implemented by this provider.
     fn protocol(&self) -> ProviderProtocol {
@@ -400,8 +447,8 @@ mod raw_capture_tests {
     #[test]
     fn request_body_first_writer_wins() {
         let cap = RawCaptureChannel::default();
-        cap.record_request_body("first");
-        cap.record_request_body("second");
+        cap.record_request_body("openai", "first");
+        cap.record_request_body("openai", "second");
         assert_eq!(cap.take_request_body().as_deref(), Some("first"));
         assert_eq!(cap.take_request_body(), None, "take drains the slot");
     }
@@ -430,5 +477,69 @@ mod raw_capture_tests {
         let cap = RawCaptureChannel::default();
         assert_eq!(cap.take_request_body(), None);
         assert_eq!(cap.take_response_body(), None);
+    }
+
+    #[test]
+    fn second_record_starts_new_attempt() {
+        let cap = RawCaptureChannel::default();
+        cap.record_request_body("openai", "first");
+        cap.record_request_body("openai", "second");
+        let attempts = cap.snapshot_attempts();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[1].request_body, "second");
+        assert_eq!(cap.take_request_body().as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn frames_route_to_current_attempt() {
+        let cap = RawCaptureChannel::default();
+        cap.record_request_body("openai", "req-a");
+        cap.push_response_frame("err-body-a".into());   // attempt 1 fails
+        cap.record_request_body("openai", "req-b");
+        cap.push_response_frame("data: {\"a\":1}".into());
+        let attempts = cap.snapshot_attempts();
+        assert_eq!(attempts[0].response_frames, vec!["err-body-a".to_string()]);
+        assert_eq!(attempts[1].response_frames, vec!["data: {\"a\":1}".to_string()]);
+        assert_eq!(cap.take_response_body().as_deref(), Some("err-body-a\n\ndata: {\"a\":1}"));
+    }
+
+    #[test]
+    fn snapshot_does_not_drain() {
+        let cap = RawCaptureChannel::default();
+        cap.record_request_body("openai", "x");
+        assert_eq!(cap.snapshot_attempts().len(), 1);
+        assert_eq!(cap.snapshot_attempts().len(), 1);
+    }
+}
+
+
+#[cfg(test)]
+mod provider_type_tests {
+    use super::*;
+
+    struct FakeProvider;
+
+    #[async_trait]
+    impl Provider for FakeProvider {
+        async fn chat(&self, _request: ChatCompletionRequest) -> Result<ChatCompletionResponse, GatewayError> {
+            unimplemented!()
+        }
+
+        async fn chat_stream(&self, _request: ChatCompletionRequest) -> Result<ChatStream, GatewayError> {
+            unimplemented!()
+        }
+
+        fn name(&self) -> &str {
+            "fake"
+        }
+
+        fn models(&self) -> &[String] {
+            &[]
+        }
+    }
+
+    #[test]
+    fn provider_type_defaults_to_name() {
+        assert_eq!(FakeProvider.provider_type(), "fake");
     }
 }

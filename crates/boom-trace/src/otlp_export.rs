@@ -13,14 +13,13 @@
 //! the registry returns `None` from `otlp_status` / `probe_otlp`, the dashboard
 //! surfaces "disabled", and `enqueue` is a no-op.
 
-use crate::metrics::{
-    operation_name, service_instance_id, truncate_bounded, ERROR_TYPE_MAX_CHARS,
-};
+use crate::metrics::{operation_name, service_instance_id};
 use crate::span::{truncate_at_byte_boundary, RequestSpan};
 use boom_core::trace::{ExporterStatusSnapshot, ProbeResult};
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::common::v1::{
-    any_value::Value as OtlpAnyValue, AnyValue, InstrumentationScope, KeyValue as OtlpKeyValue,
+    any_value::Value as OtlpAnyValue, AnyValue, ArrayValue, InstrumentationScope,
+    KeyValue as OtlpKeyValue, KeyValueList,
 };
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use opentelemetry_proto::tonic::trace::v1::span::Event as OtlpEvent;
@@ -45,6 +44,20 @@ const STATUS_OFFLINE: u8 = 1;
 const STATUS_CODE_UNSET: i32 = 0;
 const STATUS_CODE_OK: i32 = 1;
 const STATUS_CODE_ERROR: i32 = 2;
+// GenAI messages intentionally use the generic Json arm below: downstream
+// OTLP consumers parse their JSON text from StringValue, not nested AnyValues.
+// Their documents also skip the wire cap — see WIRE_CAP_EXEMPT_JSON_KEYS.
+const STRUCTURED_JSON_KEYS: &[&str] = &["gen_ai.response.finish_reasons"];
+
+/// Json attributes under these keys serialize as full JSON text and skip the
+/// per-attribute wire cap: a byte cap can only cut a message document
+/// mid-JSON, leaving a StringValue downstream GenAI consumers cannot parse.
+const WIRE_CAP_EXEMPT_JSON_KEYS: &[&str] = &["gen_ai.input.messages", "gen_ai.output.messages"];
+
+/// Hard cap on the per-attempt span events a single span can carry. Keeps
+/// the exported payload bounded when an upstream is retried in a loop; the
+/// excess is reported in the span's `dropped_events_count`.
+const MAX_UPSTREAM_ATTEMPT_EVENTS: usize = 16;
 
 /// OTLP traces exporter. State machine identical to promptlog's
 /// `OtelExporter` (Online → push → tick → flush; Offline → skip + probe).
@@ -429,12 +442,21 @@ fn build_resource(config: &OtlpConfig) -> Resource {
         .service_version
         .clone()
         .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
+    let mut attributes = vec![
+        otlp_kv_string("service.name", &config.service_name),
+        otlp_kv_string("service.version", &service_version),
+        otlp_kv_string("service.instance.id", &service_instance_id()),
+    ];
+    if let Some(environment) = config
+        .environment
+        .as_deref()
+        .map(str::trim)
+        .filter(|environment| !environment.is_empty())
+    {
+        attributes.push(otlp_kv_string("deployment.environment.name", environment));
+    }
     Resource {
-        attributes: vec![
-            otlp_kv_string("service.name", &config.service_name),
-            otlp_kv_string("service.version", &service_version),
-            otlp_kv_string("service.instance.id", &service_instance_id()),
-        ],
+        attributes,
         ..Default::default()
     }
 }
@@ -479,6 +501,35 @@ fn otlp_kv_bool(key: &str, value: bool) -> OtlpKeyValue {
     }
 }
 
+fn json_to_any_value(value: &serde_json::Value) -> AnyValue {
+    let value = match value {
+        serde_json::Value::Null => None,
+        serde_json::Value::Bool(value) => Some(OtlpAnyValue::BoolValue(*value)),
+        serde_json::Value::Number(value) => {
+            if let Some(value) = value.as_i64() {
+                Some(OtlpAnyValue::IntValue(value))
+            } else {
+                value.as_f64().map(OtlpAnyValue::DoubleValue)
+            }
+        }
+        serde_json::Value::String(value) => Some(OtlpAnyValue::StringValue(value.clone())),
+        serde_json::Value::Array(values) => Some(OtlpAnyValue::ArrayValue(ArrayValue {
+            values: values.iter().map(json_to_any_value).collect(),
+        })),
+        serde_json::Value::Object(values) => Some(OtlpAnyValue::KvlistValue(KeyValueList {
+            values: values
+                .iter()
+                .map(|(key, value)| OtlpKeyValue {
+                    key: key.clone(),
+                    value: Some(json_to_any_value(value)),
+                    ..Default::default()
+                })
+                .collect(),
+        })),
+    };
+    AnyValue { value }
+}
+
 /// Apply the OTLP per-attribute wire cap. Increments `dropped` when
 /// truncation fires so the span's `dropped_attributes_count` reflects the
 /// data loss (same semantics as promptlog's logs channel).
@@ -500,9 +551,11 @@ fn bound_attr_bytes(s: String, max_attribute_bytes: usize, dropped: &mut u32) ->
 /// fields. Request params (`gen_ai.request.temperature` / `top_p` /
 /// `top_k` / `max_tokens`) and usage (`gen_ai.usage.*`) arrive as regular
 /// attributes stamped by the route layer (issue #57) and pass through
-/// the bag loop unchanged. Three span events are emitted: the standard
-/// `exception` event on error spans, plus `ai.gateway.request.id` /
-/// `ai.gateway.request.body` (the latter only when body capture was on).
+/// the bag loop unchanged. Span events: `ai.gateway.request.id`,
+/// `ai.gateway.request.body` (latter only when body capture was on), one
+/// `ai.gateway.upstream.attempt` per recorded attempt (capped at
+/// `MAX_UPSTREAM_ATTEMPT_EVENTS`, excess in `dropped_events_count`), plus
+/// the standard `exception` event on error spans.
 ///
 /// `max_attribute_bytes` is the OTLP wire cap (OtlpConfig, 0 = unlimited):
 /// string attributes longer than the cap are truncated and the span's
@@ -529,14 +582,24 @@ pub fn convert_span_to_resource_spans(
     if let Some(rm) = &span.response_model {
         otlp_attrs.push(otlp_kv_string("gen_ai.response.model", rm));
     }
+    if let Some(provider) = &span.provider_type {
+        otlp_attrs.push(otlp_kv_string("gen_ai.provider.name", provider));
+    }
     otlp_attrs.push(otlp_kv_bool("boom-gateway.is_stream", span.is_stream));
-    otlp_attrs.push(otlp_kv_bool("gen_ai.request.stream", span.is_stream));
+    if span.is_stream {
+        otlp_attrs.push(otlp_kv_bool("gen_ai.request.stream", true));
+    }
     if let Some(did) = &span.deployment_id {
         otlp_attrs.push(otlp_kv_string("boom-gateway.deployment_id", did));
         otlp_attrs.push(otlp_kv_string("ai.gateway.target.deployment.id", did));
     }
-    if let Some(ttft) = span.ttft_ms {
-        otlp_attrs.push(otlp_kv_int("gen_ai.response.time_to_first_chunk", ttft as i64));
+    if span.is_stream {
+        if let Some(ttft) = span.ttft_ms {
+            otlp_attrs.push(otlp_kv_double(
+                "gen_ai.response.time_to_first_chunk",
+                ttft as f64 / 1000.0,
+            ));
+        }
     }
     if !span.trace_state.is_empty() {
         otlp_attrs.push(otlp_kv_string("boom-gateway.trace_state", &span.trace_state));
@@ -564,8 +627,19 @@ pub fn convert_span_to_resource_spans(
             SpanAttributeValue::Int(n) => otlp_attrs.push(otlp_kv_int(k, *n)),
             SpanAttributeValue::Double(d) => otlp_attrs.push(otlp_kv_double(k, *d)),
             SpanAttributeValue::Bool(b) => otlp_attrs.push(otlp_kv_bool(k, *b)),
+            SpanAttributeValue::Json(v) if STRUCTURED_JSON_KEYS.contains(&k.as_str()) => {
+                otlp_attrs.push(OtlpKeyValue {
+                    key: k.clone(),
+                    value: Some(json_to_any_value(v)),
+                    ..Default::default()
+                });
+            }
             SpanAttributeValue::Json(v) => {
                 let s = serde_json::to_string(v).unwrap_or_default();
+                if WIRE_CAP_EXEMPT_JSON_KEYS.contains(&k.as_str()) {
+                    otlp_attrs.push(otlp_kv_string(k, &s));
+                    continue;
+                }
                 let bounded = bound_attr_bytes(s, max_attribute_bytes, &mut dropped_attrs);
                 otlp_attrs.push(otlp_kv_string(k, &bounded));
                 if k == "boom-gateway.llm_request" {
@@ -599,17 +673,60 @@ pub fn convert_span_to_resource_spans(
             dropped_attributes_count: 0,
         });
     }
-    if status_code == STATUS_CODE_ERROR && !status_msg.is_empty() {
-        otlp_attrs.push(otlp_kv_string(
-            "error.type",
-            &truncate_bounded(&status_msg, ERROR_TYPE_MAX_CHARS),
+    // One event per provider attempt, stamped at span start so consumers can
+    // order attempts against the request. Attempt bodies are NOT wire-cap
+    // exempt: only the gen_ai message documents are.
+    let dropped_events = span
+        .upstream_attempts
+        .len()
+        .saturating_sub(MAX_UPSTREAM_ATTEMPT_EVENTS) as u32;
+    for attempt in span.upstream_attempts.iter().take(MAX_UPSTREAM_ATTEMPT_EVENTS) {
+        let mut event_attrs: Vec<OtlpKeyValue> = Vec::with_capacity(4);
+        let mut event_dropped: u32 = 0;
+        event_attrs.push(otlp_kv_int(
+            "ai.gateway.upstream.attempt.number",
+            i64::from(attempt.attempt),
         ));
+        event_attrs.push(otlp_kv_string(
+            "ai.gateway.upstream.attempt.provider",
+            &attempt.provider,
+        ));
+        if let Some(body) = &attempt.request_body {
+            let bounded = bound_attr_bytes(body.clone(), max_attribute_bytes, &mut event_dropped);
+            event_attrs.push(otlp_kv_string(
+                "ai.gateway.upstream.attempt.request_body",
+                &bounded,
+            ));
+        }
+        if let Some(body) = &attempt.response_body {
+            let bounded = bound_attr_bytes(body.clone(), max_attribute_bytes, &mut event_dropped);
+            event_attrs.push(otlp_kv_string(
+                "ai.gateway.upstream.attempt.response_body",
+                &bounded,
+            ));
+        }
         events.push(OtlpEvent {
-            time_unix_nano: span.end_time_unix_nano,
-            name: "exception".to_string(),
-            attributes: vec![otlp_kv_string("exception.message", &status_msg)],
-            dropped_attributes_count: 0,
+            time_unix_nano: span.start_time_unix_nano,
+            name: "ai.gateway.upstream.attempt".to_string(),
+            attributes: event_attrs,
+            dropped_attributes_count: event_dropped,
         });
+    }
+    if status_code == STATUS_CODE_ERROR {
+        let error_type = span
+            .error_type
+            .as_deref()
+            .filter(|error_type| !error_type.trim().is_empty())
+            .unwrap_or("_OTHER");
+        otlp_attrs.push(otlp_kv_string("error.type", error_type));
+        if !status_msg.is_empty() {
+            events.push(OtlpEvent {
+                time_unix_nano: span.end_time_unix_nano,
+                name: "exception".to_string(),
+                attributes: vec![otlp_kv_string("exception.message", &status_msg)],
+                dropped_attributes_count: 0,
+            });
+        }
     }
 
     let otlp_span = OtlpSpan {
@@ -629,7 +746,7 @@ pub fn convert_span_to_resource_spans(
         attributes: otlp_attrs,
         dropped_attributes_count: dropped_attrs,
         events,
-        dropped_events_count: 0,
+        dropped_events_count: dropped_events,
         links: Vec::new(),
         dropped_links_count: 0,
         status: Some(OtlpStatus {
@@ -692,7 +809,7 @@ pub use boom_core::OtlpConfig;
 mod tests {
     use super::*;
     use crate::context::parse_traceparent;
-    use crate::span::RequestSpan;
+    use crate::span::{RequestSpan, UpstreamAttempt};
 
     fn make_span(req_id: &str) -> RequestSpan {
         let w3c = parse_traceparent(
@@ -702,7 +819,7 @@ mod tests {
         let mut span = RequestSpan::new(
             req_id.to_string(),
             &w3c,
-            "gpt-4".to_string(),
+            "demo_model".to_string(),
             "/v1/chat/completions".to_string(),
             false,
             1_000_000_000,
@@ -768,7 +885,7 @@ mod tests {
             0,
             true,
         );
-        span.set_llm_request(Arc::new(serde_json::json!({"messages": []})), 0);
+        span.set_llm_request(Arc::new(serde_json::json!({"messages": []})), 0, false);
         span.finalize_ok(1);
         let cfg = OtlpConfig::default();
         let resource = build_resource(&cfg);
@@ -790,12 +907,14 @@ mod tests {
     #[test]
     fn gen_ai_dual_write_attributes_present() {
         let mut span = make_span("r-dual");
+        span.is_stream = true;
         span.set_deployment_id("dep-1".to_string());
-        span.set_response_model("gpt-4-actual".to_string());
+        span.set_response_model("demo_model_actual".to_string());
+        span.set_provider_type("demo_provider".to_string());
         span.set_ttft_ms(120);
         span.set_attribute(
             "boom-gateway.user.id",
-            SpanAttributeValue::String("alice".to_string()),
+            SpanAttributeValue::String("demo_user".to_string()),
         );
         // Request params + usage are stamped by the route layer (issue #57)
         // as regular attributes — the exporter passes them through.
@@ -806,9 +925,9 @@ mod tests {
         span.set_attribute("gen_ai.usage.input_tokens", SpanAttributeValue::Int(120));
         span.set_attribute("gen_ai.usage.output_tokens", SpanAttributeValue::Int(80));
         span.set_attribute("gen_ai.usage.cache_read.input_tokens", SpanAttributeValue::Int(64));
-        span.set_attribute("gen_ai.usage.cache_creation.input_tokens", SpanAttributeValue::Int(32));
+        span.set_attribute("gen_ai.usage.cache_write.input_tokens", SpanAttributeValue::Int(32));
         span.set_attribute("gen_ai.usage.reasoning.output_tokens", SpanAttributeValue::Int(12));
-        span.set_llm_request(Arc::new(serde_json::json!({"messages": [], "max_tokens": 4096})), 0);
+        span.set_llm_request(Arc::new(serde_json::json!({"messages": [], "max_tokens": 4096})), 0, false);
         span.finalize_ok(3_000_000_000);
         let cfg = OtlpConfig::default();
         let resource = build_resource(&cfg);
@@ -829,13 +948,15 @@ mod tests {
             "gen_ai.usage.input_tokens",
             "gen_ai.usage.output_tokens",
             "gen_ai.usage.cache_read.input_tokens",
-            "gen_ai.usage.cache_creation.input_tokens",
+            "gen_ai.usage.cache_write.input_tokens",
+            "gen_ai.provider.name",
             "gen_ai.usage.reasoning.output_tokens",
             "user.id",
             "http.route",
         ] {
             assert!(keys.contains(&expected), "missing dual-write key {expected}");
         }
+        assert!(!keys.contains(&"gen_ai.usage.cache_creation.input_tokens"));
         // Doubles survive as OTLP DoubleValue (not stringified).
         let temp = otlp_span
             .attributes
@@ -864,7 +985,7 @@ mod tests {
     }
 
     #[test]
-    fn error_span_emits_exception_event_and_bounded_error_type() {
+    fn error_span_emits_exception_event_and_stable_error_type() {
         let w3c = parse_traceparent(
             "00-0af76598164860bd9a43d7c1a31725ab-00f067aa0ba902b7-01",
         )
@@ -878,8 +999,8 @@ mod tests {
             1_000,
             true,
         );
-        let long_msg = "x".repeat(64);
-        span.finalize_error(2_000, long_msg);
+        span.set_error_type("upstream_error".to_string());
+        span.finalize_error(2_000, "x".repeat(64));
         let cfg = OtlpConfig::default();
         let resource = build_resource(&cfg);
         let rs = convert_span_to_resource_spans(&span, &resource, 0);
@@ -894,7 +1015,7 @@ mod tests {
         else {
             panic!("error.type should be string");
         };
-        assert_eq!(s.chars().count(), ERROR_TYPE_MAX_CHARS);
+        assert_eq!(s, "upstream_error");
         let exception = otlp_span
             .events
             .iter()
@@ -944,6 +1065,7 @@ mod tests {
         span.set_llm_request(
             Arc::new(serde_json::json!({"prompt": "x".repeat(500)})),
             0,
+            false,
         );
         let cfg = OtlpConfig::default();
         let resource = build_resource(&cfg);
@@ -976,6 +1098,122 @@ mod tests {
         assert!(ev.len() <= 64);
     }
 
+    fn event_attr<'a>(event: &'a OtlpEvent, key: &str) -> Option<&'a OtlpAnyValue> {
+        event
+            .attributes
+            .iter()
+            .find(|attribute| attribute.key == key)
+            .and_then(|attribute| attribute.value.as_ref())
+            .and_then(|value| value.value.as_ref())
+    }
+
+    #[test]
+    fn attempt_events_emitted_one_per_upstream_attempt() {
+        let mut span = make_span("r-attempts");
+        span.record_upstream_attempts(vec![
+            UpstreamAttempt {
+                attempt: 1,
+                provider: "demo_provider".to_string(),
+                request_body: Some("req-a".to_string()),
+                response_body: Some("err-a".to_string()),
+            },
+            UpstreamAttempt {
+                attempt: 2,
+                provider: "demo_provider".to_string(),
+                request_body: Some("req-b".to_string()),
+                response_body: Some("ok-b".to_string()),
+            },
+        ]);
+        let rs = convert_span_to_resource_spans(&span, &Resource::default(), 0);
+        let otlp_span = &rs.scope_spans[0].spans[0];
+        let attempts: Vec<&OtlpEvent> = otlp_span
+            .events
+            .iter()
+            .filter(|event| event.name == "ai.gateway.upstream.attempt")
+            .collect();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(otlp_span.dropped_events_count, 0);
+        for (event, (number, request, response)) in attempts.iter().zip([
+            (1, "req-a", "err-a"),
+            (2, "req-b", "ok-b"),
+        ]) {
+            assert_eq!(event.time_unix_nano, span.start_time_unix_nano);
+            assert!(matches!(
+                event_attr(event, "ai.gateway.upstream.attempt.number"),
+                Some(OtlpAnyValue::IntValue(n)) if *n == number
+            ));
+            assert!(matches!(
+                event_attr(event, "ai.gateway.upstream.attempt.provider"),
+                Some(OtlpAnyValue::StringValue(p)) if p == "demo_provider"
+            ));
+            assert!(matches!(
+                event_attr(event, "ai.gateway.upstream.attempt.request_body"),
+                Some(OtlpAnyValue::StringValue(b)) if b == request
+            ));
+            assert!(matches!(
+                event_attr(event, "ai.gateway.upstream.attempt.response_body"),
+                Some(OtlpAnyValue::StringValue(b)) if b == response
+            ));
+            assert_eq!(event.dropped_attributes_count, 0);
+        }
+    }
+
+    #[test]
+    fn attempt_event_bodies_respect_wire_cap() {
+        let mut span = make_span("r-attempt-cap");
+        span.record_upstream_attempts(vec![UpstreamAttempt {
+            attempt: 1,
+            provider: "demo_provider".to_string(),
+            request_body: Some("x".repeat(500)),
+            response_body: None,
+        }]);
+        let rs = convert_span_to_resource_spans(&span, &Resource::default(), 64);
+        let otlp_span = &rs.scope_spans[0].spans[0];
+        let event = otlp_span
+            .events
+            .iter()
+            .find(|event| event.name == "ai.gateway.upstream.attempt")
+            .expect("attempt event present");
+        let OtlpAnyValue::StringValue(body) =
+            event_attr(event, "ai.gateway.upstream.attempt.request_body")
+                .expect("request body present")
+        else {
+            panic!("attempt request body should be string");
+        };
+        assert!(body.len() <= 64, "attempt body is {} bytes", body.len());
+        assert!(event.dropped_attributes_count >= 1);
+        assert!(event_attr(event, "ai.gateway.upstream.attempt.response_body").is_none());
+        // Attempt bodies are NOT wire-cap exempt: the span ingress cap only
+        // covers the two gen_ai message keys.
+        assert_eq!(otlp_span.dropped_attributes_count, 0);
+    }
+
+    #[test]
+    fn attempt_events_overflow_sets_dropped_events_count() {
+        let mut span = make_span("r-attempt-overflow");
+        span.record_upstream_attempts(
+            (1..=17)
+                .map(|number| UpstreamAttempt {
+                    attempt: number,
+                    provider: "demo_provider".to_string(),
+                    request_body: None,
+                    response_body: None,
+                })
+                .collect(),
+        );
+        let rs = convert_span_to_resource_spans(&span, &Resource::default(), 0);
+        let otlp_span = &rs.scope_spans[0].spans[0];
+        assert_eq!(
+            otlp_span
+                .events
+                .iter()
+                .filter(|event| event.name == "ai.gateway.upstream.attempt")
+                .count(),
+            16
+        );
+        assert_eq!(otlp_span.dropped_events_count, 1);
+    }
+
     #[test]
     fn batch_queue_byte_budget_drops_oldest() {
         let mut q = BatchQueue::default();
@@ -987,6 +1225,7 @@ mod tests {
             s.set_llm_request(
                 Arc::new(serde_json::json!({"prompt": "y".repeat(400)})),
                 0,
+                false,
             );
             q.push(s, 10_000, 1_000, &dropped);
         }
@@ -1022,5 +1261,172 @@ mod tests {
         assert_eq!(rest.len(), 3);
         assert_eq!(q.bytes, 0);
         assert!(q.spans.is_empty());
+    }
+}
+
+
+#[cfg(test)]
+mod genai_export_tests {
+    use super::*;
+    use crate::context::parse_traceparent;
+
+    fn make_span(api_path: &str, is_stream: bool) -> RequestSpan {
+        let w3c = parse_traceparent(
+            "00-0af76598164860bd9a43d7c1a31725ab-00f067aa0ba902b7-01",
+        )
+        .unwrap();
+        RequestSpan::new(
+            "r-genai".to_string(),
+            &w3c,
+            "demo_model".to_string(),
+            api_path.to_string(),
+            is_stream,
+            1_000,
+            true,
+        )
+    }
+
+    fn attr<'a>(rs: &'a ResourceSpans, key: &str) -> Option<&'a OtlpAnyValue> {
+        rs.scope_spans[0].spans[0]
+            .attributes
+            .iter()
+            .find(|attribute| attribute.key == key)
+            .and_then(|attribute| attribute.value.as_ref())
+            .and_then(|value| value.value.as_ref())
+    }
+
+    #[test]
+    fn stream_flag_and_ttft_follow_actual_streaming() {
+        let mut nonstream = make_span("/v1/chat/completions", false);
+        nonstream.set_ttft_ms(250);
+        let rs = convert_span_to_resource_spans(&nonstream, &Resource::default(), 0);
+        assert!(attr(&rs, "gen_ai.request.stream").is_none());
+        assert!(attr(&rs, "gen_ai.response.time_to_first_chunk").is_none());
+        assert!(matches!(attr(&rs, "boom-gateway.is_stream"), Some(OtlpAnyValue::BoolValue(false))));
+
+        let mut stream = make_span("/v1/chat/completions", true);
+        stream.set_ttft_ms(250);
+        let rs = convert_span_to_resource_spans(&stream, &Resource::default(), 0);
+        assert!(matches!(attr(&rs, "gen_ai.request.stream"), Some(OtlpAnyValue::BoolValue(true))));
+        assert!(matches!(attr(&rs, "gen_ai.response.time_to_first_chunk"), Some(OtlpAnyValue::DoubleValue(seconds)) if (*seconds - 0.25).abs() < f64::EPSILON));
+    }
+
+    #[test]
+    fn provider_is_exported_only_when_present() {
+        let mut span = make_span("/v1/chat/completions", false);
+        span.set_provider_type("demo_provider".to_string());
+        let rs = convert_span_to_resource_spans(&span, &Resource::default(), 0);
+        assert!(matches!(attr(&rs, "gen_ai.provider.name"), Some(OtlpAnyValue::StringValue(provider)) if provider == "demo_provider"));
+
+        let span = make_span("/v1/chat/completions", false);
+        let rs = convert_span_to_resource_spans(&span, &Resource::default(), 0);
+        assert!(attr(&rs, "gen_ai.provider.name").is_none());
+    }
+
+    #[test]
+    fn error_type_defaults_to_other_even_without_message() {
+        let mut span = make_span("/v1/chat/completions", false);
+        span.finalize_error(2_000, String::new());
+        let rs = convert_span_to_resource_spans(&span, &Resource::default(), 0);
+        assert!(matches!(attr(&rs, "error.type"), Some(OtlpAnyValue::StringValue(error_type)) if error_type == "_OTHER"));
+    }
+
+    #[test]
+    fn resource_environment_is_trimmed_and_optional() {
+        for environment in [None, Some("".to_string()), Some(" \t\n".to_string())] {
+            let config = OtlpConfig { environment, ..OtlpConfig::default() };
+            let resource = build_resource(&config);
+            assert!(!resource.attributes.iter().any(|attribute| attribute.key == "deployment.environment.name"));
+        }
+        let config = OtlpConfig {
+            environment: Some(" test ".to_string()),
+            ..OtlpConfig::default()
+        };
+        let resource = build_resource(&config);
+        let environment = resource
+            .attributes
+            .iter()
+            .find(|attribute| attribute.key == "deployment.environment.name")
+            .and_then(|attribute| attribute.value.as_ref())
+            .and_then(|value| value.value.as_ref());
+        assert!(matches!(environment, Some(OtlpAnyValue::StringValue(value)) if value == "test"));
+    }
+
+    #[test]
+    fn json_to_any_value_recursively_preserves_all_json_types() {
+        let value = json_to_any_value(&serde_json::json!({
+            "null": null,
+            "bool": true,
+            "int": 7,
+            "double": 0.5,
+            "string": "x",
+            "array": [1, "two"],
+            "object": {"nested": false}
+        }));
+        let Some(OtlpAnyValue::KvlistValue(object)) = value.value else {
+            panic!("root must be a key-value list");
+        };
+        let fields: std::collections::HashMap<_, _> = object
+            .values
+            .iter()
+            .map(|entry| (entry.key.as_str(), entry.value.as_ref().unwrap()))
+            .collect();
+        assert!(fields["null"].value.is_none());
+        assert!(matches!(fields["bool"].value, Some(OtlpAnyValue::BoolValue(true))));
+        assert!(matches!(fields["int"].value, Some(OtlpAnyValue::IntValue(7))));
+        assert!(matches!(fields["double"].value, Some(OtlpAnyValue::DoubleValue(v)) if (v - 0.5).abs() < f64::EPSILON));
+        assert!(matches!(fields["string"].value, Some(OtlpAnyValue::StringValue(ref v)) if v == "x"));
+        assert!(matches!(fields["array"].value, Some(OtlpAnyValue::ArrayValue(_))));
+        assert!(matches!(fields["object"].value, Some(OtlpAnyValue::KvlistValue(_))));
+    }
+
+    #[test]
+    fn genai_messages_export_as_json_strings() {
+        let mut span = make_span("/v1/chat/completions", false);
+        span.set_structured_attribute("gen_ai.input.messages", serde_json::json!([{"role": "user", "parts": []}]));
+        span.set_structured_attribute("gen_ai.output.messages", serde_json::json!([{"role": "assistant", "parts": []}]));
+        span.set_response_finish_reasons(&["stop".to_string()]);
+        let rs = convert_span_to_resource_spans(&span, &Resource::default(), 0);
+        for (key, expected_role) in [("gen_ai.input.messages", "user"), ("gen_ai.output.messages", "assistant")] {
+            match attr(&rs, key) {
+                Some(OtlpAnyValue::StringValue(json)) => {
+                    let messages: serde_json::Value = serde_json::from_str(json)
+                        .unwrap_or_else(|error| panic!("{key} must contain JSON text: {error}"));
+                    assert_eq!(messages[0]["role"], expected_role, "{key} JSON: {json}");
+                }
+                other => panic!("{key} must be an OTLP StringValue, got {other:?}"),
+            }
+        }
+        assert!(matches!(attr(&rs, "gen_ai.response.finish_reasons"), Some(OtlpAnyValue::ArrayValue(_))), "gen_ai.response.finish_reasons must stay an OTLP array");
+    }
+
+    #[test]
+    fn genai_messages_exempt_from_wire_cap_and_stay_valid_json() {
+        let mut span = make_span("/v1/chat/completions", false);
+        let big = serde_json::json!([{"role": "user", "parts": [
+            {"type": "text", "content": "x".repeat(5000)}]}]);
+        span.set_structured_attribute("gen_ai.input.messages", big.clone());
+        // convert_message only reads "content", so the 5000-char text must arrive there.
+        span.set_llm_request(
+            Arc::new(serde_json::json!({"messages": [
+                {"role": "user", "content": "x".repeat(5000)}]})),
+            0,
+            false,
+        );
+        let rs = convert_span_to_resource_spans(&span, &Resource::default(), 64);
+        match attr(&rs, "gen_ai.input.messages") {
+            Some(OtlpAnyValue::StringValue(json)) => {
+                let parsed: serde_json::Value = serde_json::from_str(json)
+                    .expect("messages must stay parseable JSON past the wire cap");
+                assert_eq!(parsed[0]["parts"][0]["content"].as_str().unwrap().len(), 5000);
+            }
+            other => panic!("must be StringValue, got {other:?}"),
+        }
+        // legacy raw body keeps the cap
+        let raw = match attr(&rs, "boom-gateway.llm_request") {
+            Some(OtlpAnyValue::StringValue(s)) => s.clone(),
+            other => panic!("raw body must stay capped StringValue: {other:?}"),
+        };
+        assert!(raw.len() <= 64);
     }
 }

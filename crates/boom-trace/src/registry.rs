@@ -9,7 +9,7 @@
 use crate::context::W3cContext;
 use crate::metrics::MetricsRecorder;
 use crate::otlp_export::TraceExporter;
-use crate::span::RequestSpan;
+use crate::span::{RequestSpan, UpstreamAttempt};
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use boom_core::trace::{
@@ -281,6 +281,25 @@ impl TraceRegistry {
         let _ = self.with_span_mut(request_id, |s| s.set_llm_response(body, max_body_bytes));
     }
 
+    /// Refresh the provider-bound `gen_ai.input.messages` / tool-definition
+    /// attributes on the active span without touching the client request body.
+    pub fn set_span_provider_bound_request(
+        &self,
+        request_id: &str,
+        body: Arc<serde_json::Value>,
+        max_body_bytes: usize,
+        capture_tool_details: bool,
+    ) {
+        let _ = self.with_span_mut(request_id, |s| {
+            s.set_provider_bound_request(body, max_body_bytes, capture_tool_details)
+        });
+    }
+
+    /// Replace the per-attempt upstream records on the active span.
+    pub fn record_span_upstream_attempts(&self, request_id: &str, attempts: Vec<UpstreamAttempt>) {
+        let _ = self.with_span_mut(request_id, |s| s.record_upstream_attempts(attempts));
+    }
+
     /// Mark the span as finalized-OK and remove it from the active table.
     /// Every finalized span (regardless of duration) lands in the recent
     /// ring so the dashboard can show "what just finished". OTLP traces
@@ -446,7 +465,7 @@ mod tests {
             "00-0af76598164860bd9a43d7c1a31725ab-00f067aa0ba902b7-01",
         )
         .unwrap();
-        ctx.trace_state = "opencode_user_id=alice".to_string();
+        ctx.trace_state = "opencode_user_id=demo_user".to_string();
         ctx
     }
 
@@ -460,7 +479,7 @@ mod tests {
         let _span = reg.start_request(
             "req-1".to_string(),
             &w3c,
-            "gpt-4".to_string(),
+            "demo_model".to_string(),
             "/p".to_string(),
             false,
             1_000_000_000,
@@ -513,7 +532,7 @@ mod tests {
         let _span = reg.start_request(
             "r-metrics".to_string(),
             &w3c,
-            "gpt-4".to_string(),
+            "demo_model".to_string(),
             "/v1/chat/completions".to_string(),
             false,
             1_000_000_000,

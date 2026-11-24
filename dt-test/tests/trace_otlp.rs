@@ -16,7 +16,9 @@
 //!   恢复成功回 Online 并补 flush）
 //! - convert_span_to_resource_spans：trace/span/parent id 映射、
 //!   status(Unset/Ok/Error) + message、deployment_id/trace_state 属性、
-//!   attribute bag 四种类型、重复 key 覆盖、scope/version 元数据
+//!   attribute bag 四种类型、重复 key 覆盖、scope/version 元数据、
+//!   每上游尝试一个 ai.gateway.upstream.attempt 事件（≤16，溢出计入
+//!   dropped_events_count）
 //! - ping_endpoint：空 endpoint / 成功延迟 / HTTP 错误码 / 连接失败
 
 use std::sync::Arc;
@@ -26,7 +28,7 @@ use boom_core::OtlpConfig;
 use boom_core::trace::{ProbeResult, SpanAttributeValue};
 use boom_trace::otlp_export::TraceExporter;
 use boom_trace::otlp_export::{convert_span_to_resource_spans, ping_endpoint};
-use boom_trace::{parse_traceparent, RequestSpan};
+use boom_trace::{parse_traceparent, RequestSpan, UpstreamAttempt};
 use opentelemetry_proto::tonic::common::v1::any_value::Value as OtlpAnyValue;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Respond, ResponseTemplate};
@@ -39,7 +41,7 @@ const TP_ZERO_PARENT: &str = "00-0af76598164860bd9a43d7c1a31725ab-00000000000000
 /// 带自定义 header / 小批量参数的配置。
 fn config(endpoint: &str) -> OtlpConfig {
     let mut headers = std::collections::HashMap::new();
-    headers.insert("X-Otlp-Key".to_string(), "dt-secret".to_string());
+    headers.insert("X-Otlp-Key".to_string(), "__YOUR_API_KEY__".to_string());
     OtlpConfig {
         endpoint: endpoint.to_string(),
         enabled: true,
@@ -59,7 +61,7 @@ fn make_span(req_id: &str) -> RequestSpan {
     let mut span = RequestSpan::new(
         req_id.to_string(),
         &w3c,
-        "gpt-4".to_string(),
+        "demo_model".to_string(),
         "/v1/chat/completions".to_string(),
         false,
         1_000_000_000,
@@ -393,7 +395,7 @@ fn convert_span_maps_ids_status_and_attributes() {
     let mut span = RequestSpan::new(
         "r-1".into(),
         &w3c,
-        "gpt-4".into(),
+        "demo_model".into(),
         "/v1/chat/completions".into(),
         true,
         1_000_000_000,
@@ -401,12 +403,14 @@ fn convert_span_maps_ids_status_and_attributes() {
     );
     span.set_deployment_id("dep-7".into());
     span.trace_state = "vendor=1".to_string();
+    span.set_ttft_ms(250);
+    span.set_provider_type("demo_provider".to_string());
     span.set_attribute("k.str", SpanAttributeValue::String("v".into()));
     span.set_attribute("k.int", SpanAttributeValue::Int(7));
     span.set_attribute("k.bool", SpanAttributeValue::Bool(true));
     span.set_attribute("k.dup", SpanAttributeValue::Int(1));
     span.set_attribute("k.dup", SpanAttributeValue::Int(2)); // 覆盖旧值
-    span.set_llm_request(Arc::new(serde_json::json!({"messages": [1]})), 0);
+    span.set_llm_request(Arc::new(serde_json::json!({"messages": [{"role": "user", "content": "hello"}]})), 0, false);
     span.finalize_ok(2_000_000_000);
 
     let rs = convert_span_to_resource_spans(&span, &empty_resource(), 0);
@@ -435,10 +439,20 @@ fn convert_span_maps_ids_status_and_attributes() {
         other => panic!("request.id wrong: {other:?}"),
     }
     match attr(&rs, "boom-gateway.model") {
-        Some(OtlpAnyValue::StringValue(v)) => assert_eq!(v, "gpt-4"),
+        Some(OtlpAnyValue::StringValue(v)) => assert_eq!(v, "demo_model"),
         other => panic!("model wrong: {other:?}"),
     }
     assert!(matches!(attr(&rs, "boom-gateway.is_stream"), Some(OtlpAnyValue::BoolValue(true))));
+    assert!(matches!(attr(&rs, "gen_ai.request.stream"), Some(OtlpAnyValue::BoolValue(true))));
+    assert!(matches!(attr(&rs, "gen_ai.response.time_to_first_chunk"), Some(OtlpAnyValue::DoubleValue(v)) if (*v - 0.25).abs() < f64::EPSILON));
+    assert!(matches!(attr(&rs, "gen_ai.provider.name"), Some(OtlpAnyValue::StringValue(v)) if v == "demo_provider"));
+    match attr(&rs, "gen_ai.input.messages") {
+        Some(OtlpAnyValue::StringValue(v)) => {
+            let messages: serde_json::Value = serde_json::from_str(v).expect("messages must be JSON text");
+            assert_eq!(messages[0]["role"], "user", "messages json: {v}");
+        }
+        other => panic!("gen_ai.input.messages wrong: {other:?}"),
+    }
     assert!(matches!(attr(&rs, "boom-gateway.deployment_id"),
         Some(OtlpAnyValue::StringValue(v)) if v == "dep-7"));
     assert!(matches!(attr(&rs, "boom-gateway.trace_state"),
@@ -471,6 +485,7 @@ fn convert_span_maps_ids_status_and_attributes() {
     let st = rs_err.scope_spans[0].spans[0].status.as_ref().unwrap();
     assert_eq!(st.code, 2);
     assert_eq!(st.message, "boom");
+    assert!(matches!(attr(&rs_err, "error.type"), Some(OtlpAnyValue::StringValue(v)) if v == "_OTHER"));
 }
 
 /// DT-OTLP-11：resource 挂载 service.name / service.version（Some/None 两态）。
@@ -490,6 +505,50 @@ fn convert_span_carries_resource_metadata() {
     let rs = convert_span_to_resource_spans(&span, &res, 0);
     assert_eq!(resource_attr(&rs, "service.name").as_deref(), Some("boom-dt"));
     assert!(rs.resource.is_some());
+}
+
+/// DT-OTLP-13：record_upstream_attempts → 每个尝试一个 ai.gateway.upstream.attempt
+/// 事件（number/provider/body、span 起始时间）；17 次封顶 16 个事件，
+/// 溢出记入 dropped_events_count。
+#[test]
+fn convert_span_emits_one_event_per_upstream_attempt() {
+    let mut span = make_span("r-attempts");
+    span.record_upstream_attempts(
+        (1..=17)
+            .map(|attempt| UpstreamAttempt {
+                attempt,
+                provider: "demo_provider".to_string(),
+                request_body: Some(format!("req-{attempt}")),
+                response_body: None,
+            })
+            .collect(),
+    );
+    let rs = convert_span_to_resource_spans(&span, &empty_resource(), 0);
+    let s = &rs.scope_spans[0].spans[0];
+    let attempts: Vec<_> = s
+        .events
+        .iter()
+        .filter(|event| event.name == "ai.gateway.upstream.attempt")
+        .collect();
+    assert_eq!(attempts.len(), 16);
+    assert_eq!(s.dropped_events_count, 1);
+    for (index, event) in attempts.iter().enumerate() {
+        assert_eq!(event.time_unix_nano, s.start_time_unix_nano);
+        let number = event
+            .attributes
+            .iter()
+            .find(|attribute| attribute.key == "ai.gateway.upstream.attempt.number")
+            .and_then(|attribute| attribute.value.as_ref())
+            .and_then(|value| value.value.as_ref());
+        assert!(matches!(number, Some(OtlpAnyValue::IntValue(n)) if *n == index as i64 + 1));
+        let body = event
+            .attributes
+            .iter()
+            .find(|attribute| attribute.key == "ai.gateway.upstream.attempt.request_body")
+            .and_then(|attribute| attribute.value.as_ref())
+            .and_then(|value| value.value.as_ref());
+        assert!(matches!(body, Some(OtlpAnyValue::StringValue(b)) if b == &format!("req-{}", index + 1)));
+    }
 }
 
 // ═════════════════════════════════════════════════════════════════

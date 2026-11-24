@@ -13,7 +13,7 @@
 
 use crate::context::W3cContext;
 use crate::registry::TraceRegistry;
-use crate::span::RequestSpan;
+use crate::span::{RequestSpan, UpstreamAttempt};
 use boom_core::trace::SpanAttributeValue;
 use std::sync::Arc;
 
@@ -122,9 +122,35 @@ impl TraceGuard {
     /// under the retention cap; oversized bodies are truncated on the span
     /// (see `RequestSpan::set_llm_request`). `max_body_bytes` comes from
     /// `TraceConfig.max_body_bytes` (0 = unlimited).
-    pub fn set_llm_request(&self, body: Arc<serde_json::Value>, max_body_bytes: usize) {
+    pub fn set_llm_request(
+        &self,
+        body: Arc<serde_json::Value>,
+        max_body_bytes: usize,
+        capture_tool_details: bool,
+    ) {
         let _ = self.registry.with_span_mut(&self.request_id, |s: &mut RequestSpan| {
-            s.set_llm_request(body, max_body_bytes);
+            s.set_llm_request(body, max_body_bytes, capture_tool_details);
+        });
+    }
+
+    /// Refresh `gen_ai.input.messages` (+markers) and `gen_ai.tool.definitions`
+    /// from the provider-bound body without touching the client-facing
+    /// `boom-gateway.llm_request` attribute.
+    pub fn set_provider_bound_request(
+        &self,
+        body: Arc<serde_json::Value>,
+        max_body_bytes: usize,
+        capture_tool_details: bool,
+    ) {
+        let _ = self.registry.with_span_mut(&self.request_id, |s: &mut RequestSpan| {
+            s.set_provider_bound_request(body, max_body_bytes, capture_tool_details);
+        });
+    }
+
+    /// Replace the per-attempt upstream records on the active span.
+    pub fn record_upstream_attempts(&self, attempts: Vec<UpstreamAttempt>) {
+        let _ = self.registry.with_span_mut(&self.request_id, |s: &mut RequestSpan| {
+            s.record_upstream_attempts(attempts);
         });
     }
 
@@ -137,10 +163,16 @@ impl TraceGuard {
     }
 
     /// Mark the span as ending in error. Drop will call `finalize_error`
-    /// with this message.
-    pub fn mark_error(&mut self, message: String) {
+    /// with the stable error category and full message.
+    pub fn mark_error(&mut self, error_type: String, message: String) {
         self.errored = true;
         self.error_message = Some(message);
+        let _ = self.registry.with_span_mut(&self.request_id, |s: &mut RequestSpan| {
+            s.set_error_type(error_type);
+            if !s.attributes.iter().any(|(key, _)| key == "gen_ai.response.finish_reasons") {
+                s.set_response_finish_reasons(&["error".to_string()]);
+            }
+        });
     }
 
     // ---- Metrics data setters (issue #49) ----
@@ -181,6 +213,37 @@ impl TraceGuard {
             if let Some(m) = response_model {
                 s.set_response_model(m);
             }
+        });
+    }
+
+    /// Record the actual deployment provider type for `gen_ai.provider.name`.
+    pub fn set_provider_type(&self, provider_type: &str) {
+        let _ = self.registry.with_span_mut(&self.request_id, |s: &mut RequestSpan| {
+            s.set_provider_type(provider_type.to_string());
+        });
+    }
+
+    /// Record the actual response model, overriding the routing-time target when known.
+    pub fn set_response_model(&self, model: &str) {
+        let _ = self.registry.with_span_mut(&self.request_id, |s: &mut RequestSpan| {
+            s.set_response_model(model.to_string());
+        });
+    }
+
+    /// Record the actual provider response identifier, if non-empty.
+    pub fn set_response_id(&self, response_id: &str) {
+        if response_id.trim().is_empty() {
+            return;
+        }
+        let _ = self.registry.with_span_mut(&self.request_id, |s: &mut RequestSpan| {
+            s.set_attribute("gen_ai.response.id", boom_core::trace::SpanAttributeValue::String(response_id.to_string()));
+        });
+    }
+
+    /// Record finish reasons in choice order as a GenAI string array.
+    pub fn set_response_finish_reasons(&self, reasons: &[String]) {
+        let _ = self.registry.with_span_mut(&self.request_id, |s: &mut RequestSpan| {
+            s.set_response_finish_reasons(reasons);
         });
     }
 
@@ -239,7 +302,7 @@ mod tests {
             "00-0af76598164860bd9a43d7c1a31725ab-00f067aa0ba902b7-01",
         )
         .unwrap();
-        ctx.trace_state = "opencode_user_id=alice".to_string();
+        ctx.trace_state = "opencode_user_id=demo_user".to_string();
         ctx
     }
 
@@ -304,7 +367,7 @@ mod tests {
                 true,
             )
             .expect("started");
-            g.mark_error("upstream 500".to_string());
+            g.mark_error("upstream_error".to_string(), "upstream 500".to_string());
         }
         let snap = reg.snapshot().await;
         assert_eq!(snap.total_spans_error, 1);
@@ -328,7 +391,7 @@ mod tests {
                 true,
             )
             .expect("started");
-            g.set_llm_request(body.clone(), 16 * 1024);
+            g.set_llm_request(body.clone(), 16 * 1024, false);
             // Verify attribute was set on the live span.
             let has_attr = reg
                 .with_span_mut("req-4", |s: &mut RequestSpan| {
@@ -344,5 +407,108 @@ mod tests {
         // set on the live span — the snapshot may or may not carry
         // attributes depending on `to_snapshot`. We just verify no panic.
         assert_eq!(reg.active_count(), 0);
+    }
+}
+
+
+#[cfg(test)]
+mod response_metadata_tests {
+    use super::*;
+    use crate::context::parse_traceparent;
+
+    fn make_w3c() -> W3cContext {
+        let mut ctx = parse_traceparent(
+            "00-0af76598164860bd9a43d7c1a31725ab-00f067aa0ba902b7-01",
+        )
+        .unwrap();
+        ctx.trace_state = "opencode_user_id=demo_user".to_string();
+        ctx
+    }
+
+    #[tokio::test]
+    async fn mark_error_records_stable_error_type() {
+        let reg = TraceRegistry::new();
+        reg.set_enabled_for_test(true);
+        let w3c = make_w3c();
+        let mut guard = TraceGuard::start(
+            reg.clone(),
+            "req-error-type".to_string(),
+            &w3c,
+            "m".to_string(),
+            "/p".to_string(),
+            false,
+            1_000,
+            true,
+        )
+        .expect("started");
+        guard.mark_error("upstream_error".to_string(), "boom".to_string());
+        let error_type = reg
+            .with_span_mut("req-error-type", |s| s.error_type.clone())
+            .expect("span exists");
+        assert_eq!(error_type.as_deref(), Some("upstream_error"));
+        let has_error_reason = reg.with_span_mut("req-error-type", |s| {
+            s.attributes.iter().any(|(k, v)| {
+                k == "gen_ai.response.finish_reasons" && matches!(v, SpanAttributeValue::Json(reasons) if reasons.as_array().map_or(false, |items| items.len() == 1 && items[0] == "error"))
+            })
+        }).expect("span exists");
+        assert!(has_error_reason, "mark_error must stamp finish_reasons=[error] when absent");
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn mark_error_preserves_provider_finish_reasons() {
+        let reg = TraceRegistry::new();
+        reg.set_enabled_for_test(true);
+        let w3c = make_w3c();
+        let mut guard = TraceGuard::start(
+            reg.clone(),
+            "req-error-existing-reason".to_string(),
+            &w3c,
+            "m".to_string(),
+            "/p".to_string(),
+            false,
+            1_000,
+            true,
+        )
+        .expect("started");
+        guard.set_response_finish_reasons(&["stop".to_string()]);
+        guard.mark_error("upstream_error".to_string(), "boom".to_string());
+        let preserved = reg.with_span_mut("req-error-existing-reason", |s| {
+            s.attributes.iter().any(|(k, v)| {
+                k == "gen_ai.response.finish_reasons" && matches!(v, SpanAttributeValue::Json(reasons) if reasons.as_array().map_or(false, |items| items.len() == 1 && items[0] == "stop"))
+            })
+        }).expect("span exists");
+        assert!(preserved, "provider-reported finish reason must not be overwritten");
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn response_metadata_is_written_as_structured_attributes() {
+        let reg = TraceRegistry::new();
+        reg.set_enabled_for_test(true);
+        let w3c = make_w3c();
+        let guard = TraceGuard::start(
+            reg.clone(),
+            "req-response-meta".to_string(),
+            &w3c,
+            "m".to_string(),
+            "/p".to_string(),
+            false,
+            1_000,
+            true,
+        )
+        .expect("started");
+        guard.set_response_id("resp-1");
+        guard.set_response_model("model-actual");
+        guard.set_response_finish_reasons(&["stop".to_string(), "length".to_string()]);
+        reg.with_span_mut("req-response-meta", |s| {
+            assert_eq!(s.response_model.as_deref(), Some("model-actual"));
+            assert!(s.attributes.iter().any(|(k, v)| {
+                k == "gen_ai.response.id" && matches!(v, SpanAttributeValue::String(id) if id == "resp-1")
+            }));
+            assert!(s.attributes.iter().any(|(k, v)| {
+                k == "gen_ai.response.finish_reasons" && matches!(v, SpanAttributeValue::Json(reasons) if reasons.as_array().map_or(false, |items| items.len() == 2))
+            }));
+        });
     }
 }

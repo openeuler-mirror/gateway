@@ -218,7 +218,8 @@ pub fn create_provider_with_request_defaults(
                     max_context_tokens,
                 )
                 .with_custom_headers(attached)
-                .with_request_defaults(request_defaults.clone()),
+                .with_request_defaults(request_defaults.clone())
+                .with_provider_type(provider_type),
             ))
         }
         "anthropic" => {
@@ -299,8 +300,8 @@ pub fn create_provider_with_request_defaults(
 /// instances behind the same host.
 ///
 /// Examples:
-///   (`dep-1`, `http://10.0.0.5:8000/v1`) → `dep-1`
-///   (None,    `http://10.0.0.5:8000/v1`) → `None` (no id → not a participant)
+///   (`dep-1`, `http://example.internal:8000/v1`) → `dep-1`
+///   (None,    `http://example.internal:8000/v1`) → `None` (no id → not a participant)
 ///   (`dep-1`, None)                      → `None` (gate: no api_base)
 pub fn kv_worker_id_for(deployment_id: Option<&str>, api_base: Option<&str>) -> Option<String> {
     if api_base.map(str::trim).filter(|s| !s.is_empty()).is_none() {
@@ -372,7 +373,7 @@ mod tests {
         headers.insert("api_version".to_string(), "2024-02-01".to_string());
         // Hard-blocked → dropped.
         headers.insert("x-gateway-priority".to_string(), "spoof".to_string());
-        headers.insert("Authorization".to_string(), "Bearer leak".to_string());
+        headers.insert("Authorization".to_string(), "__YOUR_TOKEN__".to_string());
         // Transport-critical → dropped.
         headers.insert("content-type".to_string(), "text/plain".to_string());
         // Invalid header name (space) → dropped.
@@ -419,5 +420,46 @@ mod tests {
             provider.custom_headers().is_empty(),
             "reserved key must not become an upstream header"
         );
+    }
+}
+
+
+#[cfg(test)]
+mod provider_type_tests {
+    use super::*;
+
+    fn create(model: &str) -> std::sync::Arc<dyn Provider> {
+        create_provider(
+            model,
+            Some("test-key".to_string()),
+            Some("http://127.0.0.1:1/v1".to_string()),
+            1,
+            &HashMap::new(),
+            &HashMap::new(),
+            None,
+            false,
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn explicit_provider_type_is_preserved() {
+        assert_eq!(create("hosted_vllm/m").provider_type(), "hosted_vllm");
+        assert_eq!(create("openai/gpt-4").provider_type(), "openai");
+        assert_eq!(create("anthropic/claude-x").provider_type(), "anthropic");
+    }
+
+    #[test]
+    fn direct_openai_constructor_uses_openai_fallback() {
+        let provider = openai::OpenAIProvider::new(
+            reqwest::Client::new(),
+            None,
+            Some("http://127.0.0.1:1/v1".to_string()),
+            "m",
+            None,
+            false,
+        );
+        assert_eq!(provider.provider_type(), "openai");
     }
 }

@@ -19,6 +19,17 @@ enum StreamEnd {
     Failed,
 }
 
+/// One tool-call fragment from a streaming delta. Fragments sharing an
+/// `index` belong to the same call: the provider's `id`/`name` arrive on the
+/// first fragment, `arguments` streams across the rest.
+#[derive(Default, Debug, Clone)]
+pub struct ToolCallDelta {
+    pub index: u64,
+    pub id: Option<String>,
+    pub name: Option<String>,
+    pub arguments: Option<String>,
+}
+
 /// Per-chunk delta extracted by a producer-supplied closure. The closure is
 /// provider-specific (OpenAI: `choices[0].delta.content` /
 /// `choices[0].finish_reason` / `usage`; Anthropic: `content_block_delta.delta.text`
@@ -35,6 +46,11 @@ pub struct ChunkDelta {
     /// FAILURE — the wrapper logs 5xx + the error code on Drop, regardless
     /// of any terminal marker seen before it.
     pub error: Option<serde_json::Value>,
+    /// Concatenated reasoning fragments (OpenAI `reasoning_content`; some
+    /// providers send `reasoning`).
+    pub reasoning: Option<String>,
+    /// Tool-call fragments carried by this chunk, in provider order.
+    pub tool_calls: Vec<ToolCallDelta>,
 }
 
 /// Stream wrapper that accumulates streaming chunks into a single assembled
@@ -67,6 +83,10 @@ pub struct PromptLogStream<S, F> {
     start: Instant,
     /// Concatenated content deltas.
     accumulated_content: String,
+    /// Concatenated reasoning deltas.
+    accumulated_reasoning: String,
+    /// Tool-call fragments keyed by `index`: (id, name, concatenated arguments).
+    tool_calls: std::collections::BTreeMap<u64, (Option<String>, Option<String>, String)>,
     /// `finish_reason` from the terminal chunk, if we got one.
     finish_reason: Option<String>,
     /// `usage` object from the terminal chunk, if any.
@@ -88,6 +108,8 @@ pub struct PromptLogStream<S, F> {
     /// land on a dead span. Sharing the Arc keeps stream paths zero-copy
     /// with the prompt log entry.
     response_sink: Option<Arc<dyn Fn(&Arc<serde_json::Value>) + Send + Sync>>,
+    /// Observes in-band upstream failures before the inner stream is dropped.
+    failure_sink: Option<Arc<dyn Fn(&serde_json::Value) + Send + Sync>>,
 }
 
 impl<S: Unpin, F: Unpin> Unpin for PromptLogStream<S, F> {}
@@ -108,6 +130,8 @@ impl<S, F> PromptLogStream<S, F> {
             request_entry: Some(request_entry),
             start,
             accumulated_content: String::new(),
+            accumulated_reasoning: String::new(),
+            tool_calls: std::collections::BTreeMap::new(),
             finish_reason: None,
             usage: None,
             end_state: None,
@@ -115,6 +139,7 @@ impl<S, F> PromptLogStream<S, F> {
             delta_fn,
             entry_enricher: None,
             response_sink: None,
+            failure_sink: None,
         }
     }
 
@@ -137,6 +162,8 @@ impl<S, F> PromptLogStream<S, F> {
             model,
             start,
             accumulated_content: String::new(),
+            accumulated_reasoning: String::new(),
+            tool_calls: std::collections::BTreeMap::new(),
             finish_reason: None,
             usage: None,
             end_state: None,
@@ -144,6 +171,7 @@ impl<S, F> PromptLogStream<S, F> {
             delta_fn,
             entry_enricher: None,
             response_sink: None,
+            failure_sink: None,
         }
     }
 
@@ -162,6 +190,15 @@ impl<S, F> PromptLogStream<S, F> {
         sink: Arc<dyn Fn(&Arc<serde_json::Value>) + Send + Sync>,
     ) -> Self {
         self.response_sink = Some(sink);
+        self
+    }
+
+    /// Attach an observer called once for `StreamEnd::Failed`, before inner drop.
+    pub fn with_failure_sink(
+        mut self,
+        sink: Arc<dyn Fn(&serde_json::Value) + Send + Sync>,
+    ) -> Self {
+        self.failure_sink = Some(sink);
         self
     }
 }
@@ -196,6 +233,32 @@ impl<S, F> Drop for PromptLogStream<S, F> {
             }],
             "usage": self.usage.clone(),
         });
+        if !self.accumulated_reasoning.is_empty() {
+            response["choices"][0]["message"]["reasoning_content"] =
+                serde_json::Value::String(self.accumulated_reasoning.clone());
+        }
+        // One OpenAI-shaped tool_call per seen index, ascending. An entry only
+        // counts when an id or name was ever seen — a bare argument fragment
+        // has nothing to attach to.
+        let tool_calls: Vec<serde_json::Value> = self
+            .tool_calls
+            .values()
+            .filter(|(id, name, _)| id.is_some() || name.is_some())
+            .map(|(id, name, arguments)| {
+                serde_json::json!({
+                    "id": id.clone().unwrap_or_default(),
+                    "type": "function",
+                    "function": {
+                        "name": name.clone().unwrap_or_default(),
+                        "arguments": arguments,
+                    },
+                })
+            })
+            .collect();
+        if !tool_calls.is_empty() {
+            response["choices"][0]["message"]["tool_calls"] =
+                serde_json::Value::Array(tool_calls);
+        }
         if let Some(err) = &self.stream_error {
             // The failure sentinel rides on the assembled response so the
             // provider's original code/message stay diagnosable even though
@@ -205,6 +268,12 @@ impl<S, F> Drop for PromptLogStream<S, F> {
         let response = Arc::new(response);
         if let Some(sink) = self.response_sink.take() {
             sink(&response);
+        }
+
+        if matches!(&self.end_state, Some(StreamEnd::Failed)) {
+            if let (Some(sink), Some(error)) = (self.failure_sink.take(), self.stream_error.as_ref()) {
+                sink(error);
+            }
         }
 
         // Nested provider streams finalize their trace state on drop. Runs
@@ -293,6 +362,21 @@ where
                     if let Some(content) = delta.content {
                         this.accumulated_content.push_str(&content);
                     }
+                    if let Some(reasoning) = delta.reasoning {
+                        this.accumulated_reasoning.push_str(&reasoning);
+                    }
+                    for call in delta.tool_calls {
+                        let entry = this.tool_calls.entry(call.index).or_default();
+                        if let Some(id) = call.id {
+                            entry.0.get_or_insert(id);
+                        }
+                        if let Some(name) = call.name {
+                            entry.1.get_or_insert(name);
+                        }
+                        if let Some(arguments) = call.arguments {
+                            entry.2.push_str(&arguments);
+                        }
+                    }
                     if let Some(reason) = delta.finish_reason {
                         // First terminal marker wins (OpenAI sends one
                         // chunk with finish_reason + usage together).
@@ -354,12 +438,14 @@ mod tests {
     }
 
     /// Fake upstream chunk carrying the bits a ChunkDelta knows how to extract.
-    #[derive(Clone)]
+    #[derive(Clone, Default)]
     struct FakeChunk {
         content: Option<String>,
         finish_reason: Option<String>,
         usage: Option<serde_json::Value>,
         error: Option<serde_json::Value>,
+        reasoning: Option<String>,
+        tool_calls: Vec<ToolCallDelta>,
     }
 
     fn extractor(c: &FakeChunk) -> Option<ChunkDelta> {
@@ -368,6 +454,8 @@ mod tests {
             finish_reason: c.finish_reason.clone(),
             usage: c.usage.clone(),
             error: c.error.clone(),
+            reasoning: c.reasoning.clone(),
+            tool_calls: c.tool_calls.clone(),
         })
     }
 
@@ -385,13 +473,14 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(64);
         let req = make_request_entry("req-1");
         let chunks = vec![
-            FakeChunk { content: Some("Hello".to_string()), finish_reason: None, usage: None, error: None },
-            FakeChunk { content: Some(", world".to_string()), finish_reason: None, usage: None, error: None },
+            FakeChunk { content: Some("Hello".to_string()), ..Default::default() },
+            FakeChunk { content: Some(", world".to_string()), ..Default::default() },
             FakeChunk {
                 content: None,
                 finish_reason: Some("stop".to_string()),
                 usage: Some(serde_json::json!({"prompt_tokens": 5, "completion_tokens": 3})),
                 error: None,
+                ..Default::default()
             },
         ];
         let s = stream::iter(chunks);
@@ -414,7 +503,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(64);
         let req = make_request_entry("req-2");
         let chunks = vec![
-            FakeChunk { content: Some("partial".to_string()), finish_reason: None, usage: None, error: None },
+            FakeChunk { content: Some("partial".to_string()), ..Default::default() },
             // No terminal chunk — stream just ends.
         ];
         let s = stream::iter(chunks);
@@ -440,13 +529,14 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(64);
         let req = make_request_entry("req-fail");
         let chunks = vec![
-            FakeChunk { content: Some("partial ".to_string()), finish_reason: None, usage: None, error: None },
-            FakeChunk { content: Some("answer".to_string()), finish_reason: None, usage: None, error: None },
+            FakeChunk { content: Some("partial ".to_string()), ..Default::default() },
+            FakeChunk { content: Some("answer".to_string()), ..Default::default() },
             FakeChunk {
                 content: None,
                 finish_reason: None,
                 usage: None,
                 error: Some(serde_json::json!({ "code": "upstream_error", "message": "connection reset" })),
+                ..Default::default()
             },
         ];
         let s = stream::iter(chunks);
@@ -468,9 +558,11 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(64);
         let req = make_request_entry("req-fail2");
         let chunks = vec![
-            FakeChunk { content: Some("x".to_string()), finish_reason: Some("stop".to_string()), usage: None, error: None },
-            FakeChunk { content: None, finish_reason: None, usage: None,
-                error: Some(serde_json::json!({ "code": "timeout" })) },
+            FakeChunk { content: Some("x".to_string()), finish_reason: Some("stop".to_string()), ..Default::default() },
+            FakeChunk {
+                error: Some(serde_json::json!({ "code": "timeout" })),
+                ..Default::default()
+            },
         ];
         let s = stream::iter(chunks);
         let mut wrapper = PromptLogStream::new(s, counting_sender(tx), req, extractor);
@@ -494,6 +586,7 @@ mod tests {
                 finish_reason: None,
                 usage: None,
                 error: Some(serde_json::json!({ "code": code, "message": "boom" })),
+                ..Default::default()
             }];
             let s = stream::iter(chunks);
             let mut wrapper = PromptLogStream::new(s, counting_sender(tx), req, extractor);
@@ -518,6 +611,7 @@ mod tests {
             finish_reason: None,
             usage: None,
             error: None,
+            ..Default::default()
         }];
         let s = stream::iter(chunks);
         let _wrapper = PromptLogStream::new(s, counting_sender(tx), req, extractor);
@@ -674,5 +768,143 @@ mod tests {
 
         assert!(dropped.load(Ordering::SeqCst), "inner stream still drops");
         assert!(sink_ran.load(Ordering::SeqCst), "sink must run");
+    }
+
+    struct FailingDropStream {
+        dropped: Arc<AtomicBool>,
+        yielded: bool,
+    }
+
+    impl Stream for FailingDropStream {
+        type Item = FakeChunk;
+
+        fn poll_next(mut self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            if self.yielded {
+                return Poll::Ready(None);
+            }
+            self.yielded = true;
+            Poll::Ready(Some(FakeChunk {
+                content: Some("partial".to_string()),
+                finish_reason: None,
+                usage: None,
+                error: Some(serde_json::json!({"code": "upstream_error", "message": "boom"})),
+                ..Default::default()
+            }))
+        }
+    }
+
+    impl Drop for FailingDropStream {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn failure_sink_runs_once_for_failed_before_inner_drop() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (tx, _rx) = mpsc::channel(64);
+        let sink_dropped = dropped.clone();
+        let sink_calls = calls.clone();
+        let mut wrapper = PromptLogStream::new(
+            FailingDropStream { dropped: dropped.clone(), yielded: false },
+            counting_sender(tx),
+            make_request_entry("req-failure-sink"),
+            extractor,
+        )
+        .with_failure_sink(Arc::new(move |error| {
+            assert_eq!(error["code"], "upstream_error");
+            assert!(!sink_dropped.load(Ordering::SeqCst), "failure sink must run before inner drop");
+            sink_calls.fetch_add(1, Ordering::SeqCst);
+        }));
+        let _ = wrapper.next().await;
+        drop(wrapper);
+        assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn failure_sink_is_not_called_for_finished_stream() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (tx, _rx) = mpsc::channel(64);
+        let sink_calls = calls.clone();
+        let chunks = vec![FakeChunk {
+            content: Some("done".to_string()),
+            finish_reason: Some("stop".to_string()),
+            usage: None,
+            error: None,
+            ..Default::default()
+        }];
+        let mut wrapper = PromptLogStream::new(
+            stream::iter(chunks),
+            counting_sender(tx),
+            make_request_entry("req-finished-sink"),
+            extractor,
+        )
+        .with_failure_sink(Arc::new(move |_| {
+            sink_calls.fetch_add(1, Ordering::SeqCst);
+        }));
+        while wrapper.next().await.is_some() {}
+        drop(wrapper);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn stream_assembles_reasoning_and_tool_call_fragments() {
+        // Reasoning deltas concatenate; tool-call fragments fold into one
+        // entry per `index` with the argument fragments joined in arrival
+        // order. Terminal marker makes it a clean 200.
+        let (tx, mut rx) = mpsc::channel(64);
+        let req = make_request_entry("req-reasoning");
+        let tool_call =
+            |index: u64, id: Option<&str>, name: Option<&str>, arguments: Option<&str>| {
+                ToolCallDelta {
+                    index,
+                    id: id.map(str::to_string),
+                    name: name.map(str::to_string),
+                    arguments: arguments.map(str::to_string),
+                }
+            };
+        let chunks = vec![
+            FakeChunk { reasoning: Some("thin".to_string()), ..Default::default() },
+            FakeChunk {
+                reasoning: Some("king".to_string()),
+                tool_calls: vec![tool_call(0, Some("call-1"), Some("weather"), None)],
+                ..Default::default()
+            },
+            FakeChunk {
+                tool_calls: vec![tool_call(0, None, None, Some("{\"ci"))],
+                ..Default::default()
+            },
+            FakeChunk {
+                tool_calls: vec![tool_call(0, None, None, Some("ty\":\"Paris\"}"))],
+                ..Default::default()
+            },
+            FakeChunk {
+                content: Some("done".to_string()),
+                finish_reason: Some("tool_calls".to_string()),
+                ..Default::default()
+            },
+        ];
+        let s = stream::iter(chunks);
+        let mut wrapper = PromptLogStream::new(s, counting_sender(tx), req, extractor);
+        while wrapper.next().await.is_some() {}
+        drop(wrapper);
+        let entry = rx.recv().await.expect("entry sent");
+        let resp = entry.response.expect("response set");
+        assert_eq!(resp["choices"][0]["message"]["reasoning_content"], "thinking");
+        assert_eq!(resp["choices"][0]["message"]["content"], "done");
+        assert_eq!(
+            resp["choices"][0]["message"]["tool_calls"],
+            serde_json::json!([{
+                "id": "call-1",
+                "type": "function",
+                "function": {
+                    "name": "weather",
+                    "arguments": "{\"city\":\"Paris\"}",
+                },
+            }])
+        );
+        assert_eq!(resp["choices"][0]["finish_reason"], "tool_calls");
     }
 }

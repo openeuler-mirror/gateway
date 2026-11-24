@@ -10,7 +10,7 @@
 use serde::{Deserialize, Serialize};
 
 /// OTLP/HTTP exporter config. Used as `prompt_log.otlp` and `trace.otlp`.
-/// Endpoint is OTLP/HTTP base (e.g. `http://otel-collector:4318`); the
+/// Endpoint is OTLP/HTTP base (e.g. `http://example.internal:4318`); the
 /// exporter appends `/v1/logs` or `/v1/traces` itself.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct OtlpConfig {
@@ -23,6 +23,9 @@ pub struct OtlpConfig {
     /// Defaults to the gateway's CARGO_PKG_VERSION when None.
     #[serde(default)]
     pub service_version: Option<String>,
+    /// Optional deployment environment recorded as `deployment.environment.name`.
+    #[serde(default)]
+    pub environment: Option<String>,
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
     #[serde(default = "default_batch_size")]
@@ -54,6 +57,7 @@ impl Default for OtlpConfig {
             endpoint: String::new(),
             service_name: default_service_name(),
             service_version: None,
+            environment: None,
             timeout_secs: default_timeout_secs(),
             batch_size: default_batch_size(),
             flush_interval_secs: default_flush_interval_secs(),
@@ -91,4 +95,22 @@ fn default_max_queue_size() -> usize {
 
 fn default_max_queue_bytes() -> usize {
     64 * 1024 * 1024
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn environment_deserializes_optional_value() {
+        let configured: OtlpConfig = serde_yaml::from_str("environment: prod").unwrap();
+        assert_eq!(configured.environment.as_deref(), Some("prod"));
+
+        let empty: OtlpConfig = serde_yaml::from_str("environment: \"\"").unwrap();
+        assert_eq!(empty.environment.as_deref(), Some(""));
+
+        let missing = OtlpConfig::default();
+        assert_eq!(missing.environment, None);
+    }
 }

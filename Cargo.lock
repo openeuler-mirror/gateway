@@ -285,7 +285,7 @@ dependencies = [
 
 [[package]]
 name = "boom-alert"
-version = "1.1.0"
+version = "1.1.2-RC1"
 dependencies = [
  "async-trait",
  "boom-core",
@@ -298,7 +298,7 @@ dependencies = [
 
 [[package]]
 name = "boom-audit"
-version = "1.1.0"
+version = "1.1.2-RC1"
 dependencies = [
  "arc-swap",
  "boom-core",
@@ -313,7 +313,7 @@ dependencies = [
 
 [[package]]
 name = "boom-auth"
-version = "1.1.0"
+version = "1.1.2-RC1"
 dependencies = [
  "async-trait",
  "boom-core",
@@ -331,7 +331,7 @@ dependencies = [
 
 [[package]]
 name = "boom-config"
-version = "1.1.0"
+version = "1.1.2-RC1"
 dependencies = [
  "boom-core",
  "rust_decimal",
@@ -345,7 +345,7 @@ dependencies = [
 
 [[package]]
 name = "boom-core"
-version = "1.1.0"
+version = "1.1.2-RC1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -354,6 +354,7 @@ dependencies = [
  "rust_decimal",
  "serde",
  "serde_json",
+ "serde_yaml",
  "sqlx",
  "thiserror",
  "tokio",
@@ -362,7 +363,7 @@ dependencies = [
 
 [[package]]
 name = "boom-ctxaware"
-version = "1.1.0"
+version = "1.1.2-RC1"
 dependencies = [
  "boom-core",
  "serde",
@@ -371,7 +372,7 @@ dependencies = [
 
 [[package]]
 name = "boom-dashboard"
-version = "1.1.0"
+version = "1.1.2-RC1"
 dependencies = [
  "axum",
  "boom-audit",
@@ -436,7 +437,7 @@ dependencies = [
 
 [[package]]
 name = "boom-flowcontrol"
-version = "1.1.0"
+version = "1.1.2-RC1"
 dependencies = [
  "boom-core",
  "dashmap",
@@ -447,7 +448,7 @@ dependencies = [
 
 [[package]]
 name = "boom-fusion"
-version = "1.1.0"
+version = "1.1.2-RC1"
 dependencies = [
  "async-trait",
  "boom-core",
@@ -461,7 +462,7 @@ dependencies = [
 
 [[package]]
 name = "boom-gatekeeper"
-version = "1.1.0"
+version = "1.1.2-RC1"
 dependencies = [
  "boom-config",
  "boom-core",
@@ -476,7 +477,7 @@ dependencies = [
 
 [[package]]
 name = "boom-hooks-sdk"
-version = "1.1.0"
+version = "1.1.2-RC1"
 dependencies = [
  "hex",
  "serde",
@@ -486,7 +487,7 @@ dependencies = [
 
 [[package]]
 name = "boom-kvindex"
-version = "1.1.0"
+version = "1.1.2-RC1"
 dependencies = [
  "boom-core",
  "dashmap",
@@ -502,7 +503,7 @@ dependencies = [
 
 [[package]]
 name = "boom-limiter"
-version = "1.1.0"
+version = "1.1.2-RC1"
 dependencies = [
  "async-trait",
  "boom-config",
@@ -522,7 +523,7 @@ dependencies = [
 
 [[package]]
 name = "boom-main"
-version = "1.1.0"
+version = "1.1.2-RC1"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -574,7 +575,7 @@ dependencies = [
 
 [[package]]
 name = "boom-promptlog"
-version = "1.1.0"
+version = "1.1.2-RC1"
 dependencies = [
  "arc-swap",
  "boom-core",
@@ -601,7 +602,7 @@ dependencies = [
 
 [[package]]
 name = "boom-provider"
-version = "1.1.0"
+version = "1.1.2-RC1"
 dependencies = [
  "async-trait",
  "boom-core",
@@ -621,7 +622,7 @@ dependencies = [
 
 [[package]]
 name = "boom-responses"
-version = "1.1.0"
+version = "1.1.2-RC1"
 dependencies = [
  "boom-core",
  "serde",
@@ -635,7 +636,7 @@ dependencies = [
 
 [[package]]
 name = "boom-rollback"
-version = "1.1.0"
+version = "1.1.2-RC1"
 dependencies = [
  "async-trait",
  "boom-core",
@@ -645,7 +646,7 @@ dependencies = [
 
 [[package]]
 name = "boom-routing"
-version = "1.1.0"
+version = "1.1.2-RC1"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -672,7 +673,7 @@ dependencies = [
 
 [[package]]
 name = "boom-state"
-version = "1.1.0"
+version = "1.1.2-RC1"
 dependencies = [
  "boom-core",
  "chrono",
@@ -683,7 +684,7 @@ dependencies = [
 
 [[package]]
 name = "boom-stressmon"
-version = "1.1.0"
+version = "1.1.2-RC1"
 dependencies = [
  "async-trait",
  "boom-core",
@@ -696,7 +697,7 @@ dependencies = [
 
 [[package]]
 name = "boom-trace"
-version = "1.1.0"
+version = "1.1.2-RC1"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1211,7 +1212,7 @@ dependencies = [
 
 [[package]]
 name = "example-pre-auth-hook"
-version = "1.1.0"
+version = "1.1.2-RC1"
 dependencies = [
  "boom-hooks-sdk",
  "serde",
