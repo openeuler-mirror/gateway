@@ -7440,6 +7440,7 @@
         ${fieldCheckbox("cfg-tr-capture-body", t("config.field.trace_capture_body"), p.capture_body !== false, { tip: t("config.tip.trace_capture_body") })}
         ${fieldNum("cfg-tr-max-body-bytes", t("config.field.trace_max_body_bytes"), p.max_body_bytes || 16384, { min: 256, step: 256, tip: t("config.tip.trace_max_body_bytes") })}
         ${fieldCheckbox("cfg-tr-propagate-only", t("config.field.trace_propagate_only"), p.propagate_only !== false, { tip: t("config.tip.trace_propagate_only") })}
+        ${fieldCheckbox("cfg-tr-export-without-traceparent", t("config.field.trace_export_without_traceparent"), p.export_without_traceparent === true, { tip: t("config.tip.trace_export_without_traceparent") })}
         ${fieldCheckbox("cfg-tr-metrics-enabled", t("config.field.trace_metrics_enabled"), !!m.enabled, { tip: t("config.tip.trace_metrics_enabled") })}
       </div>
       ${m.enabled && !p.enabled ? `<p class="cfg-warn-note">${t("config.tip.trace_metrics_master_off")}</p>` : ""}
@@ -8063,6 +8064,7 @@
             capture_body: $("cfg-tr-capture-body").checked,
             max_body_bytes: numOr($("cfg-tr-max-body-bytes"), 16384),
             propagate_only: $("cfg-tr-propagate-only").checked,
+            export_without_traceparent: $("cfg-tr-export-without-traceparent").checked,
             // Seed-only in YAML; carrying the live DB value keeps the file
             // from silently dropping the field on a whole-section rewrite.
             metrics: { enabled: metricsOn },
