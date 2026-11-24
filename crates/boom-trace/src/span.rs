@@ -40,6 +40,16 @@ pub struct UpstreamAttempt {
     pub response_body: Option<String>,
 }
 
+impl UpstreamAttempt {
+    /// Serialized footprint counted toward the span's OTLP queue byte
+    /// estimate: the provider name plus both retained body strings.
+    fn payload_bytes(&self) -> usize {
+        self.provider.len()
+            + self.request_body.as_ref().map_or(0, String::len)
+            + self.response_body.as_ref().map_or(0, String::len)
+    }
+}
+
 /// One in-flight or finalized request span. The lifetime is bound to a
 /// request_id — `TraceRegistry::start_request` returns a `RequestSpan`
 /// already inserted into the active map; `finalize` removes it and (if
@@ -238,18 +248,21 @@ impl RequestSpan {
         }
     }
 
-    /// Replace the per-attempt records and add their payload sizes to the
-    /// OTLP queue byte estimate so the budget accounts for them.
+    /// Replace the per-attempt records, swapping their payload sizes in the
+    /// OTLP queue byte estimate: the previous attempts' bytes are subtracted
+    /// (saturating) before the new ones are added, so repeated stamping with
+    /// identical data leaves `estimated_bytes` unchanged and an empty
+    /// replacement restores the pre-attempt baseline. Retries and fallbacks
+    /// re-stamp the full attempt list, so purely additive accounting would
+    /// grow the queue budget without bound.
     pub fn record_upstream_attempts(&mut self, attempts: Vec<UpstreamAttempt>) {
-        let serialized: usize = attempts
+        let previous: usize = self
+            .upstream_attempts
             .iter()
-            .map(|a| {
-                a.provider.len()
-                    + a.request_body.as_ref().map_or(0, String::len)
-                    + a.response_body.as_ref().map_or(0, String::len)
-            })
+            .map(UpstreamAttempt::payload_bytes)
             .sum();
-        self.body_bytes = self.body_bytes.saturating_add(serialized);
+        let current: usize = attempts.iter().map(UpstreamAttempt::payload_bytes).sum();
+        self.body_bytes = self.body_bytes.saturating_sub(previous).saturating_add(current);
         self.upstream_attempts = attempts;
     }
 
@@ -526,8 +539,9 @@ impl std::io::Write for BoundedJsonWriter {
 }
 
 /// Byte-budget truncation that never splits a UTF-8 code point: backs off
-/// to the nearest char boundary at or below `max_bytes`.
-pub(crate) fn truncate_at_byte_boundary(mut s: String, max_bytes: usize) -> String {
+/// to the nearest char boundary at or below `max_bytes`. Public so boom-main
+/// can reuse it when capping raw attempt bodies.
+pub fn truncate_at_byte_boundary(mut s: String, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
         return s;
     }
@@ -762,6 +776,42 @@ mod tests {
         assert_eq!(out, "你");
         assert_eq!(truncate_at_byte_boundary("abc".to_string(), 10), "abc");
         assert_eq!(truncate_at_byte_boundary("abc".to_string(), 0), "");
+    }
+
+    #[test]
+    fn record_upstream_attempts_replacement_accounting() {
+        let w3c = make_w3c();
+        let mut span = RequestSpan::new(
+            "r-attempts".to_string(),
+            &w3c,
+            "m".to_string(),
+            "/p".to_string(),
+            false,
+            0,
+            true,
+        );
+        let baseline = span.estimated_bytes();
+        let attempts = vec![UpstreamAttempt {
+            attempt: 1,
+            provider: "demo_provider".to_string(),
+            request_body: Some("{\"model\":\"demo_model\"}".to_string()),
+            response_body: Some("{\"id\":\"resp\"}".to_string()),
+        }];
+        span.record_upstream_attempts(attempts.clone());
+        let stamped_once = span.estimated_bytes();
+        assert!(stamped_once > baseline, "first stamp must grow the estimate");
+
+        // Re-stamping the same attempts is a replacement, not an addition.
+        span.record_upstream_attempts(attempts);
+        assert_eq!(
+            span.estimated_bytes(),
+            stamped_once,
+            "identical re-stamp must not double-count the payload bytes"
+        );
+
+        // Replacing with nothing restores the pre-attempt baseline.
+        span.record_upstream_attempts(Vec::new());
+        assert_eq!(span.estimated_bytes(), baseline, "empty replacement must restore the baseline");
     }
 }
 

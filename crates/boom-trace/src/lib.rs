@@ -100,7 +100,7 @@ pub use metrics::MetricsRecorder;
 #[cfg(feature = "otlp")]
 pub use otlp_export::{convert_span_to_resource_spans, ping_endpoint, TraceExporter};
 pub use registry::TraceRegistry;
-pub use span::{RequestSpan, UpstreamAttempt};
+pub use span::{RequestSpan, UpstreamAttempt, truncate_at_byte_boundary};
 
 // Re-export boom-core types consumers expect from this crate.
 pub use boom_core::trace::{

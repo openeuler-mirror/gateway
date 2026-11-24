@@ -158,21 +158,58 @@ fn mark_trace_error(trace_guard: &mut Option<TraceGuard>, error: &GatewayError) 
 
 /// Snapshot the provider-side raw capture into per-attempt span records:
 /// 1-based numbering, provider as recorded, request body only when non-empty,
-/// response frames joined with the SSE frame separator.
+/// response frames joined with the SSE frame separator. Retained bodies are
+/// capped at `max_body_bytes` (0 = unlimited) so the span — and through it
+/// the active map, the recent ring and the OTLP queue — never pins full
+/// MB-scale upstream exchanges.
 fn map_raw_attempts(
-    cap: &boom_core::provider::SharedRawCapture,
+    attempts: Vec<boom_core::provider::RawAttempt>,
+    max_body_bytes: usize,
 ) -> Vec<boom_trace::UpstreamAttempt> {
-    cap.snapshot_attempts()
+    attempts
         .into_iter()
         .enumerate()
         .map(|(idx, attempt)| boom_trace::UpstreamAttempt {
             attempt: idx as u32 + 1,
             provider: attempt.provider,
-            request_body: (!attempt.request_body.is_empty()).then_some(attempt.request_body),
-            response_body: (!attempt.response_frames.is_empty())
-                .then(|| attempt.response_frames.join("\n\n")),
+            request_body: cap_body(attempt.request_body, max_body_bytes),
+            response_body: join_frames_within_cap(&attempt.response_frames, max_body_bytes),
         })
         .collect()
+}
+/// Cap a retained attempt body at `max_body_bytes` (0 = unlimited); an
+/// empty body stays `None` so the "no body" semantics are preserved.
+fn cap_body(body: String, max_body_bytes: usize) -> Option<String> {
+    if body.is_empty() {
+        return None;
+    }
+    Some(if max_body_bytes == 0 {
+        body
+    } else {
+        boom_trace::truncate_at_byte_boundary(body, max_body_bytes)
+    })
+}
+
+/// Join SSE frames with `\n\n` while staying inside `max_body_bytes`
+/// (0 = unlimited): frames are appended one at a time and the join is cut at
+/// the first frame that crosses the cap, so the full multi-frame join is
+/// never materialized just to be truncated afterwards. The `\n\n` separator
+/// is preserved for every frame kept and "no frames" stays `None`.
+fn join_frames_within_cap(frames: &[String], max_body_bytes: usize) -> Option<String> {
+    if frames.is_empty() {
+        return None;
+    }
+    let mut joined = String::new();
+    for (idx, frame) in frames.iter().enumerate() {
+        if idx > 0 {
+            joined.push_str("\n\n");
+        }
+        joined.push_str(frame);
+        if max_body_bytes != 0 && joined.len() > max_body_bytes {
+            return Some(boom_trace::truncate_at_byte_boundary(joined, max_body_bytes));
+        }
+    }
+    Some(joined)
 }
 
 /// Stamp the raw upstream exchange on the active span: attempts first, then
@@ -191,11 +228,12 @@ fn stamp_upstream_exchange(
     max_body_bytes: usize,
     capture_tool_details: bool,
 ) {
-    let attempts = map_raw_attempts(cap);
-    let bound = attempts.iter().rev().find_map(|attempt| {
-        serde_json::from_str::<serde_json::Value>(attempt.request_body.as_deref()?).ok()
+    let raw_attempts = cap.snapshot_attempts();
+    let bound = raw_attempts.iter().rev().find_map(|attempt| {
+        serde_json::from_str::<serde_json::Value>(&attempt.request_body).ok()
     });
-    let had_body = attempts.iter().any(|attempt| attempt.request_body.is_some());
+    let had_body = raw_attempts.iter().any(|attempt| !attempt.request_body.is_empty());
+    let attempts = map_raw_attempts(raw_attempts, max_body_bytes);
     reg.record_span_upstream_attempts(request_id, attempts);
     if let Some(body) = bound {
         reg.set_span_provider_bound_request(
@@ -7765,7 +7803,7 @@ trace:
         cap.push_response_frame("f2".to_string());
         cap.record_request_body("azure", r#"{"model":"m2"}"#);
 
-        let attempts = super::map_raw_attempts(&Arc::new(cap));
+        let attempts = super::map_raw_attempts(cap.snapshot_attempts(), 0);
 
         assert_eq!(attempts.len(), 2);
         assert_eq!(attempts[0].attempt, 1);
@@ -7782,11 +7820,69 @@ trace:
         let cap = boom_core::provider::RawCaptureChannel::default();
         cap.push_response_frame("only-frames".to_string());
 
-        let attempts = super::map_raw_attempts(&Arc::new(cap));
+        let attempts = super::map_raw_attempts(cap.snapshot_attempts(), 0);
 
         assert_eq!(attempts.len(), 1);
         assert_eq!(attempts[0].request_body, None, "empty body must not become Some(\"\")");
         assert_eq!(attempts[0].response_body.as_deref(), Some("only-frames"));
+    }
+
+    #[test]
+    fn map_raw_attempts_caps_request_body_to_max() {
+        let cap = boom_core::provider::RawCaptureChannel::default();
+        cap.record_request_body("openai", &"x".repeat(200));
+
+        let attempts = super::map_raw_attempts(cap.snapshot_attempts(), 64);
+
+        let body = attempts[0].request_body.as_deref().expect("body kept");
+        assert!(body.len() <= 64, "request body retained {} bytes", body.len());
+        assert!(body.is_char_boundary(body.len()));
+    }
+
+    #[test]
+    fn map_raw_attempts_joins_multi_frame_response_within_cap() {
+        let cap = boom_core::provider::RawCaptureChannel::default();
+        cap.push_response_frame("f1".to_string());
+        cap.push_response_frame("f2".to_string());
+        cap.push_response_frame("f3".to_string());
+
+        let attempts = super::map_raw_attempts(cap.snapshot_attempts(), 5);
+
+        let response = attempts[0].response_body.as_deref().expect("joined frames kept");
+        assert!(response.len() <= 5, "response join retained {} bytes", response.len());
+        assert!(response.starts_with("f1\n\n"), "SSE separator preserved within the cap");
+        assert!(response.is_char_boundary(response.len()));
+    }
+
+    #[test]
+    fn map_raw_attempts_truncation_respects_utf8_boundary() {
+        let cap = boom_core::provider::RawCaptureChannel::default();
+        // Each CJK char is 3 bytes, so the 8-byte cap cuts mid-character.
+        cap.record_request_body("openai", &"你".repeat(10));
+        cap.push_response_frame("好".repeat(10));
+
+        let attempts = super::map_raw_attempts(cap.snapshot_attempts(), 8);
+
+        let body = attempts[0].request_body.as_deref().expect("body kept");
+        assert!(body.len() <= 8, "request body retained {} bytes", body.len());
+        assert!(body.is_char_boundary(body.len()));
+        let response = attempts[0].response_body.as_deref().expect("response kept");
+        assert!(response.len() <= 8, "response body retained {} bytes", response.len());
+        assert!(response.is_char_boundary(response.len()));
+    }
+
+    #[test]
+    fn map_raw_attempts_zero_cap_keeps_full_bodies() {
+        let cap = boom_core::provider::RawCaptureChannel::default();
+        let big = "x".repeat(500);
+        cap.record_request_body("openai", &big);
+        cap.push_response_frame("f1".to_string());
+        cap.push_response_frame("f2".to_string());
+
+        let attempts = super::map_raw_attempts(cap.snapshot_attempts(), 0);
+
+        assert_eq!(attempts[0].request_body.as_deref(), Some(big.as_str()));
+        assert_eq!(attempts[0].response_body.as_deref(), Some("f1\n\nf2"));
     }
 
     fn span_attr(
@@ -7883,6 +7979,47 @@ trace:
         assert_eq!(bound[0]["parts"][0]["content"], "attempt-two");
         let client = span_attr(&registry, rid, "boom-gateway.llm_request").expect("client body");
         assert_eq!(client["messages"][0]["content"], "client");
+    }
+
+    #[test]
+    fn stamp_upstream_exchange_caps_attempt_bodies_to_max() {
+        let rid = "req-stamp-capped";
+        let (registry, _guard) = traced_guard(rid);
+        let cap = Arc::new(boom_core::provider::RawCaptureChannel::default());
+        cap.record_request_body("openai", &"x".repeat(200));
+        cap.push_response_frame("y".repeat(200));
+
+        super::stamp_upstream_exchange(&registry, rid, &cap, 64, false);
+
+        let attempts = registry
+            .with_span_mut(rid, |span| span.upstream_attempts.clone())
+            .expect("active span");
+        assert_eq!(attempts.len(), 1);
+        let request = attempts[0].request_body.as_deref().expect("request kept");
+        assert!(request.len() <= 64, "request body retained {} bytes", request.len());
+        let response = attempts[0].response_body.as_deref().expect("response kept");
+        assert!(response.len() <= 64, "response body retained {} bytes", response.len());
+    }
+
+    #[test]
+    fn stamp_upstream_exchange_parses_uncapped_request_before_capping() {
+        let rid = "req-stamp-uncapped-parse";
+        let (registry, _guard) = traced_guard(rid);
+        let cap = Arc::new(boom_core::provider::RawCaptureChannel::default());
+        let body = json!({
+            "messages": [{"role": "user", "content": format!("full-request-{}", "x".repeat(200))}]
+        });
+        cap.record_request_body("openai", &body.to_string());
+
+        super::stamp_upstream_exchange(&registry, rid, &cap, 64, false);
+
+        let bound = span_attr(&registry, rid, "gen_ai.input.messages")
+            .expect("provider-bound input must be parsed from the uncapped JSON");
+        assert_eq!(bound[0]["role"], "user");
+        let attempts = registry
+            .with_span_mut(rid, |span| span.upstream_attempts.clone())
+            .expect("active span");
+        assert!(attempts[0].request_body.as_deref().is_some_and(|body| body.len() <= 64));
     }
 
     #[tokio::test]
