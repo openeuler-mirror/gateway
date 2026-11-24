@@ -160,6 +160,15 @@ fn mark_trace_error(trace_guard: &mut Option<TraceGuard>, error: &GatewayError) 
 /// `tracestate` to forward. A synthetic root has an empty `trace_state`, so
 /// it never inherits an unrelated inbound `tracestate`.
 fn upstream_child_trace_context(
+    parent: &W3cContext,
+    gateway_span_id: [u8; 8],
+) -> (String, Option<String>) {
+    (
+        boom_trace::build_child_traceparent(parent.trace_id, gateway_span_id, parent.sampled),
+        (!parent.trace_state.is_empty()).then(|| parent.trace_state.clone()),
+    )
+}
+
 /// Snapshot the provider-side raw capture into per-attempt span records:
 /// 1-based numbering, provider as recorded, request body only when non-empty,
 /// response frames joined with the SSE frame separator. Retained bodies are
@@ -4755,14 +4764,6 @@ fn trace_export_eligible(config: &boom_config::TraceConfig, w3c: Option<&W3cCont
                 w,
             )
         })
-}
-
-    gateway_span_id: [u8; 8],
-) -> (String, Option<String>) {
-    (
-        boom_trace::build_child_traceparent(parent.trace_id, gateway_span_id, parent.sampled),
-        (!parent.trace_state.is_empty()).then(|| parent.trace_state.clone()),
-    )
 }
 
 #[allow(clippy::too_many_arguments)]
