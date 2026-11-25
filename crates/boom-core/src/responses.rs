@@ -773,18 +773,36 @@ fn convert_request(
             }
             InputKind::FunctionCall { call_id, name, arguments } => {
                 let call_id = if call_id.is_empty() { new_item_id("call") } else { call_id };
-                messages.push(Message {
-                    role: MessageRole::Assistant,
-                    content: MessageContent::Text(String::new()),
-                    name: None,
-                    tool_calls: Some(vec![ToolCall {
-                        id: call_id,
-                        call_type: "function".to_string(),
-                        function: FunctionCall { name, arguments },
-                    }]),
-                    tool_call_id: None,
-                    reasoning_content: pending_reasoning.take(),
-                });
+                let tool_call = ToolCall {
+                    id: call_id,
+                    call_type: "function".to_string(),
+                    function: FunctionCall { name, arguments },
+                };
+                // Parallel tool calls: consecutive function_call items (with
+                // no output in between) are ONE upstream assistant turn —
+                // OpenAI's native shape is a single message carrying many
+                // tool_calls. Emitting one message per call leaves middle
+                // assistant(tool_calls) messages with no tool reply
+                // immediately following, which strict upstreams (DeepSeek)
+                // reject: "must be followed by tool messages responding to
+                // each tool_call_id".
+                match messages.last_mut() {
+                    Some(prev)
+                        if matches!(prev.role, MessageRole::Assistant)
+                            && prev.tool_calls.is_some()
+                            && pending_reasoning.is_none() =>
+                    {
+                        prev.tool_calls.as_mut().expect("just checked").push(tool_call);
+                    }
+                    _ => messages.push(Message {
+                        role: MessageRole::Assistant,
+                        content: MessageContent::Text(String::new()),
+                        name: None,
+                        tool_calls: Some(vec![tool_call]),
+                        tool_call_id: None,
+                        reasoning_content: pending_reasoning.take(),
+                    }),
+                }
             }
             InputKind::FunctionCallOutput { call_id, output } => {
                 flush_reasoning(&mut messages, &mut pending_reasoning);
@@ -1747,6 +1765,49 @@ mod tests {
         assert_eq!(out.messages.len(), 2, "reasoning merges into the tool_call message");
         assert_eq!(out.messages[0].reasoning_content.as_deref(), Some("decide to call"));
         assert!(out.messages[0].tool_calls.is_some(), "same message carries the tool_calls");
+    }
+
+    #[test]
+    fn parallel_function_calls_merge_into_one_assistant_message() {
+        // Three consecutive function_call items (parallel calls, no output
+        // in between) → ONE assistant message with three tool_calls —
+        // strict upstreams reject middle assistant(tool_calls) messages
+        // whose tool replies don't immediately follow.
+        let req = parse_req(json!({
+            "model": "m",
+            "input": [
+                { "type": "reasoning", "id": "rs_1", "summary": [
+                    { "type": "summary_text", "text": "fan out three probes" }
+                ]},
+                { "type": "function_call", "call_id": "c0", "name": "f", "arguments": "{}" },
+                { "type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}" },
+                { "type": "function_call", "call_id": "c2", "name": "f", "arguments": "{}" },
+                { "type": "function_call_output", "call_id": "c0", "output": "a" },
+                { "type": "function_call_output", "call_id": "c1", "output": "b" },
+                { "type": "function_call_output", "call_id": "c2", "output": "c" }
+            ]
+        }));
+        let out = responses_request_to_openai(&req).unwrap();
+        assert_eq!(out.messages.len(), 4, "one tool_calls message + three tool replies");
+        let calls = out.messages[0].tool_calls.as_ref().unwrap();
+        assert_eq!(calls.len(), 3, "all three calls on one message");
+        assert_eq!(calls.iter().map(|c| (c.id.as_str(), c.function.name.as_str())).collect::<Vec<_>>(),
+                   vec![("c0", "f"), ("c1", "f"), ("c2", "f")]);
+        assert_eq!(out.messages[0].reasoning_content.as_deref(), Some("fan out three probes"));
+
+        // A second round separated by outputs must NOT merge across the gap.
+        let req = parse_req(json!({
+            "model": "m",
+            "input": [
+                { "type": "function_call", "call_id": "c0", "name": "f", "arguments": "{}" },
+                { "type": "function_call_output", "call_id": "c0", "output": "a" },
+                { "type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}" },
+                { "type": "function_call_output", "call_id": "c1", "output": "b" }
+            ]
+        }));
+        let out = responses_request_to_openai(&req).unwrap();
+        let tc_msgs = out.messages.iter().filter(|m| m.tool_calls.is_some()).count();
+        assert_eq!(tc_msgs, 2, "sequential rounds stay separate messages");
     }
 
     #[test]
