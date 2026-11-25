@@ -7436,44 +7436,59 @@
     return `<div class="form-card" data-section="trace">
       <div class="form-card-title">${t("config.section.trace")}</div>
       <div class="form-card-grid">
-        ${fieldCheckbox("cfg-tr-enabled", t("config.field.trace_enabled"), p.enabled, { tip: t("config.tip.trace_enabled") })}
-        ${fieldCheckbox("cfg-tr-capture-body", t("config.field.trace_capture_body"), p.capture_body !== false, { tip: t("config.tip.trace_capture_body") })}
-        ${fieldNum("cfg-tr-max-body-bytes", t("config.field.trace_max_body_bytes"), p.max_body_bytes || 16384, { min: 256, step: 256, tip: t("config.tip.trace_max_body_bytes") })}
-        ${fieldCheckbox("cfg-tr-propagate-only", t("config.field.trace_propagate_only"), p.propagate_only !== false, { tip: t("config.tip.trace_propagate_only") })}
-        ${fieldCheckbox("cfg-tr-export-without-traceparent", t("config.field.trace_export_without_traceparent"), p.export_without_traceparent === true, { tip: t("config.tip.trace_export_without_traceparent") })}
-        ${fieldCheckbox("cfg-tr-metrics-enabled", t("config.field.trace_metrics_enabled"), !!m.enabled, { tip: t("config.tip.trace_metrics_enabled") })}
-      </div>
-      ${m.enabled && !p.enabled ? `<p class="cfg-warn-note">${t("config.tip.trace_metrics_master_off")}</p>` : ""}
-
-      <div class="form-card-subtitle">${t("config.section.trace_filter")}</div>
-      <div class="form-card-grid">
-        ${fieldFullList("cfg-tr-filter-keys", t("config.field.trace_tracestate_keys"), f.tracestate_keys || [], {})}
-        ${fieldText("cfg-tr-filter-regex", t("config.field.trace_trace_id_regex"), f.trace_id_regex || "", { full: true, tip: t("config.tip.trace_trace_id_regex") })}
-      </div>
-
-      <div class="form-card-subtitle">${t("config.section.trace_otlp")}</div>
-      <div class="form-card-grid">
-        ${fieldCheckbox("cfg-tr-otlp-enabled", t("config.field.otlp_enabled"), o.enabled, { tip: t("config.tip.trace_otlp") })}
-        <div class="form-group field-full">
-          <label>${t("config.field.otlp_endpoint")} ${tip(t("config.tip.otlp_endpoint"))}</label>
-          <div id="cfg-tr-otlp-ping" class="otlp-ping-row" data-state="unknown">
-            <span class="otlp-ping-dot"></span>
-            <span class="otlp-ping-text">${t("config.tip.otlp_ping_unknown")}</span>
+        <div class="field-full trace-checkbox-row">
+          ${fieldCheckbox("cfg-tr-enabled", t("config.field.trace_enabled"), p.enabled, { tip: t("config.tip.trace_enabled") })}
+          <div id="cfg-tr-capture-body-field"${p.enabled ? "" : " hidden"}>
+            ${fieldCheckbox("cfg-tr-capture-body", t("config.field.trace_capture_body"), p.capture_body !== false, { tip: t("config.tip.trace_capture_body") })}
           </div>
-          <div class="otlp-endpoint-row">
-            <input id="cfg-tr-otlp-endpoint" type="text" value="${esc(o.endpoint || "")}" placeholder="http://otel-collector:4318">
-            <button type="button" id="cfg-tr-otlp-test" class="btn-small btn-secondary">${t("action.test")}</button>
+          <div id="cfg-tr-propagate-only-field"${p.enabled ? " hidden" : ""}>
+            ${fieldCheckbox("cfg-tr-propagate-only", t("config.field.trace_propagate_only"), p.propagate_only !== false, { tip: t("config.tip.trace_propagate_only") })}
+          </div>
+          <div id="cfg-tr-export-without-traceparent-field"${p.enabled ? "" : " hidden"}>
+            ${fieldCheckbox("cfg-tr-export-without-traceparent", t("config.field.trace_export_without_traceparent"), p.export_without_traceparent === true, { tip: t("config.tip.trace_export_without_traceparent") })}
           </div>
         </div>
-        ${fieldText("cfg-tr-otlp-service-name", t("config.field.otlp_service_name"), o.service_name, { placeholder: "boom-gateway", tip: t("config.tip.otlp_service_name") })}
-        ${fieldText("cfg-tr-otlp-service-version", t("config.field.otlp_service_version"), o.service_version || "", { placeholder: t("config.tip.otlp_service_version_default"), tip: t("config.tip.otlp_service_version_default") })}
-        ${fieldNum("cfg-tr-otlp-timeout-secs", t("config.field.otlp_timeout_secs"), o.timeout_secs, { min: 1, tip: t("config.tip.otlp_timeout_secs") })}
-        ${fieldNum("cfg-tr-otlp-batch-size", t("config.field.otlp_batch_size"), o.batch_size, { min: 1, tip: t("config.tip.otlp_batch_size") })}
-        ${fieldNum("cfg-tr-otlp-flush-interval-secs", t("config.field.otlp_flush_interval_secs"), o.flush_interval_secs, { min: 1, tip: t("config.tip.otlp_flush_interval_secs") })}
-        ${fieldNum("cfg-tr-otlp-max-attribute-bytes", t("config.field.otlp_max_attribute_bytes"), o.max_attribute_bytes, { min: 256, step: 256, tip: t("config.tip.otlp_max_attribute_bytes") })}
-        ${fieldNum("cfg-tr-otlp-max-queue-size", t("config.field.otlp_max_queue_size"), o.max_queue_size, { min: 100, step: 100, tip: t("config.tip.otlp_max_queue_size") })}
-        ${fieldNum("cfg-tr-otlp-max-queue-bytes", t("config.field.otlp_max_queue_bytes"), o.max_queue_bytes ?? 67108864, { min: 0, step: 1048576, tip: t("config.tip.otlp_max_queue_bytes") })}
-        ${fieldTextarea("cfg-tr-otlp-headers", t("config.field.otlp_headers"), o.headers || {}, { rows: 3, tip: t("config.tip.otlp_headers") })}
+        <div id="cfg-tr-max-body-field" class="field-full"${!p.enabled || p.capture_body === false ? " hidden" : ""}>
+          ${fieldNum("cfg-tr-max-body-bytes", t("config.field.trace_max_body_bytes"), p.max_body_bytes || 16384, { min: 256, step: 256, tip: t("config.tip.trace_max_body_bytes") })}
+        </div>
+        <div id="cfg-tr-metrics-field" class="field-full trace-metrics-row"${p.enabled ? "" : " hidden"}>
+          ${fieldCheckbox("cfg-tr-metrics-enabled", t("config.field.trace_metrics_enabled"), !!m.enabled, { tip: t("config.tip.trace_metrics_enabled") })}
+        </div>
+      </div>
+
+      <div id="cfg-tr-filter-section"${p.enabled ? "" : " hidden"}>
+        <div class="form-card-subtitle">${t("config.section.trace_filter")}</div>
+        <div class="form-card-grid">
+          ${fieldFullList("cfg-tr-filter-keys", t("config.field.trace_tracestate_keys"), f.tracestate_keys || [], {})}
+          ${fieldText("cfg-tr-filter-regex", t("config.field.trace_trace_id_regex"), f.trace_id_regex || "", { full: true, tip: t("config.tip.trace_trace_id_regex") })}
+        </div>
+      </div>
+
+      <div id="cfg-tr-otlp-section"${p.enabled ? "" : " hidden"}>
+        <div class="form-card-subtitle">${t("config.section.trace_otlp")}</div>
+        <div class="form-card-grid">
+          ${fieldCheckbox("cfg-tr-otlp-enabled", t("config.field.otlp_enabled"), o.enabled, { tip: t("config.tip.trace_otlp") })}
+          <div class="form-group field-full">
+            <label>${t("config.field.otlp_endpoint")} ${tip(t("config.tip.otlp_endpoint"))}</label>
+            <div id="cfg-tr-otlp-ping" class="otlp-ping-row" data-state="unknown">
+              <span class="otlp-ping-dot"></span>
+              <span class="otlp-ping-text">${t("config.tip.otlp_ping_unknown")}</span>
+            </div>
+            <div class="otlp-endpoint-row">
+              <input id="cfg-tr-otlp-endpoint" type="text" value="${esc(o.endpoint || "")}" placeholder="http://otel-collector:4318">
+              <button type="button" id="cfg-tr-otlp-test" class="btn-small btn-secondary">${t("action.test")}</button>
+            </div>
+          </div>
+          ${fieldText("cfg-tr-otlp-service-name", t("config.field.otlp_service_name"), o.service_name, { placeholder: "boom-gateway", tip: t("config.tip.otlp_service_name") })}
+          ${fieldText("cfg-tr-otlp-service-version", t("config.field.otlp_service_version"), o.service_version || "", { placeholder: t("config.tip.otlp_service_version_default"), tip: t("config.tip.otlp_service_version_default") })}
+          ${fieldNum("cfg-tr-otlp-timeout-secs", t("config.field.otlp_timeout_secs"), o.timeout_secs, { min: 1, tip: t("config.tip.otlp_timeout_secs") })}
+          ${fieldNum("cfg-tr-otlp-batch-size", t("config.field.otlp_batch_size"), o.batch_size, { min: 1, tip: t("config.tip.otlp_batch_size") })}
+          ${fieldNum("cfg-tr-otlp-flush-interval-secs", t("config.field.otlp_flush_interval_secs"), o.flush_interval_secs, { min: 1, tip: t("config.tip.otlp_flush_interval_secs") })}
+          ${fieldNum("cfg-tr-otlp-max-attribute-bytes", t("config.field.otlp_max_attribute_bytes"), o.max_attribute_bytes, { min: 256, step: 256, tip: t("config.tip.otlp_max_attribute_bytes") })}
+          ${fieldNum("cfg-tr-otlp-max-queue-size", t("config.field.otlp_max_queue_size"), o.max_queue_size, { min: 100, step: 100, tip: t("config.tip.otlp_max_queue_size") })}
+          ${fieldNum("cfg-tr-otlp-max-queue-bytes", t("config.field.otlp_max_queue_bytes"), o.max_queue_bytes ?? 67108864, { min: 0, step: 1048576, tip: t("config.tip.otlp_max_queue_bytes") })}
+          ${fieldTextarea("cfg-tr-otlp-headers", t("config.field.otlp_headers"), o.headers || {}, { rows: 3, tip: t("config.tip.otlp_headers") })}
+        </div>
       </div>
 
       <div class="form-card-actions">
@@ -7576,6 +7591,18 @@
     </div>`;
   }
 
+  function syncTraceFields() {
+    const traceEnabled = document.getElementById("cfg-tr-enabled").checked;
+    const captureBody = document.getElementById("cfg-tr-capture-body").checked;
+    document.getElementById("cfg-tr-capture-body-field").hidden = !traceEnabled;
+    document.getElementById("cfg-tr-max-body-field").hidden = !traceEnabled || !captureBody;
+    document.getElementById("cfg-tr-propagate-only-field").hidden = traceEnabled;
+    document.getElementById("cfg-tr-export-without-traceparent-field").hidden = !traceEnabled;
+    document.getElementById("cfg-tr-metrics-field").hidden = !traceEnabled;
+    document.getElementById("cfg-tr-filter-section").hidden = !traceEnabled;
+    document.getElementById("cfg-tr-otlp-section").hidden = !traceEnabled;
+  }
+
   function wireConfigPage(cfg) {
     document.querySelectorAll("[data-save]").forEach((btn) => {
       btn.addEventListener("click", () => {
@@ -7583,6 +7610,8 @@
         saveConfigSectionKind(kind, cfg);
       });
     });
+    document.getElementById("cfg-tr-enabled").addEventListener("change", syncTraceFields);
+    document.getElementById("cfg-tr-capture-body").addEventListener("change", syncTraceFields);
     // Selecting the L2 policy auto-expands the KV-cache parameter card —
     // those fields only take effect under kvc_aware.
     const policySel = document.getElementById("cfg-rs-policy");
