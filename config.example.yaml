@@ -328,6 +328,7 @@ trace:
   # truncation while the permanent raw-body retention policy is pending.
   max_body_bytes: 131072
   capture_tool_details: false   # true also captures tool description/parameters
+  export_without_traceparent: false  # true exports all traceparent-less requests with synthetic roots; valid-context filtering is unchanged
   otlp:
     max_attribute_bytes: 131072
 

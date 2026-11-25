@@ -224,7 +224,15 @@ pub fn openai_response_to_anthropic(resp: &ChatCompletionResponse) -> AnthropicM
         usage: {
             let usage = resp.usage.clone().unwrap_or_default();
             AnthropicUsage {
-                input_tokens: usage.prompt_tokens,
+                // `Usage.prompt_tokens` is the OpenAI-style total (uncached +
+                // cache_read + cache_creation). Anthropic's wire field is the
+                // uncached prefix only, so subtract the split back out. Clients
+                // that sum all three fields to size the context (Claude Code
+                // does) would otherwise double-count the cached part.
+                input_tokens: usage
+                    .prompt_tokens
+                    .saturating_sub(usage.cache_read_input_tokens.unwrap_or(0))
+                    .saturating_sub(usage.cache_creation_input_tokens.unwrap_or(0)),
                 output_tokens: usage.completion_tokens,
                 cache_creation_input_tokens: usage.cache_creation_input_tokens,
                 cache_read_input_tokens: usage.cache_read_input_tokens,
@@ -1326,6 +1334,95 @@ mod tests {
         let kinds: Vec<&str> = events.iter().map(|e| e.event.as_str()).collect();
         assert_eq!(kinds, vec!["content_block_delta", "content_block_stop"]);
         assert_eq!(partial_json_of(&events[0]), "\"BJ\"}");
+    }
+
+    /// `Usage.prompt_tokens` holds the OpenAI-style total (uncached +
+    /// cache_read + cache_creation). Anthropic's wire field is the uncached
+    /// prefix only, so the split must be subtracted back out — otherwise
+    /// `/v1/messages` clients that sum all three fields to size the context
+    /// double-count the cached part.
+    #[test]
+    fn anthropic_usage_splits_the_openai_total_back_apart() {
+        let resp = ChatCompletionResponse {
+            id: "chatcmpl-cache".to_string(),
+            object: "chat.completion".to_string(),
+            created: 0,
+            model: "claude-test".to_string(),
+            choices: vec![Choice {
+                index: 0,
+                message: Message {
+                    role: MessageRole::Assistant,
+                    content: MessageContent::Text("ok".to_string()),
+                    name: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                },
+                finish_reason: Some("stop".to_string()),
+                logprobs: None,
+            }],
+            usage: Some(Usage {
+                prompt_tokens: 53_012,
+                completion_tokens: 5,
+                total_tokens: 53_017,
+                cache_creation_input_tokens: Some(3_000),
+                cache_read_input_tokens: Some(50_000),
+                prompt_tokens_details: None,
+                completion_tokens_details: None,
+            }),
+            system_fingerprint: None,
+            raw_response: None,
+        };
+
+        let anthro = openai_response_to_anthropic(&resp);
+        assert_eq!(anthro.usage.input_tokens, 12);
+        assert_eq!(anthro.usage.cache_read_input_tokens, Some(50_000));
+        assert_eq!(anthro.usage.cache_creation_input_tokens, Some(3_000));
+        assert_eq!(
+            anthro.usage.input_tokens + 50_000 + 3_000,
+            53_012,
+            "the three Anthropic fields must sum to the upstream total"
+        );
+    }
+
+    /// No cache split: the total maps straight through (no underflow).
+    #[test]
+    fn anthropic_usage_without_cache_split_is_unchanged() {
+        let resp = ChatCompletionResponse {
+            id: "chatcmpl-plain".to_string(),
+            object: "chat.completion".to_string(),
+            created: 0,
+            model: "claude-test".to_string(),
+            choices: vec![Choice {
+                index: 0,
+                message: Message {
+                    role: MessageRole::Assistant,
+                    content: MessageContent::Text("ok".to_string()),
+                    name: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                },
+                finish_reason: Some("stop".to_string()),
+                logprobs: None,
+            }],
+            usage: Some(Usage {
+                prompt_tokens: 42,
+                completion_tokens: 7,
+                total_tokens: 49,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+                prompt_tokens_details: None,
+                completion_tokens_details: None,
+            }),
+            system_fingerprint: None,
+            raw_response: None,
+        };
+
+        let anthro = openai_response_to_anthropic(&resp);
+        assert_eq!(anthro.usage.input_tokens, 42);
+        assert_eq!(anthro.usage.output_tokens, 7);
+        assert_eq!(anthro.usage.cache_read_input_tokens, None);
     }
 }
 

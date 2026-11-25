@@ -2073,6 +2073,12 @@ pub struct TraceConfig {
     /// trace context without producing any spans itself. Default true.
     #[serde(default = "default_trace_propagate_only")]
     pub propagate_only: bool,
+    /// When true and the request carries no valid `traceparent`, export the
+    /// gateway-created synthetic root span instead of dropping it. Default
+    /// false keeps the pre-existing behavior; `enabled` still gates all
+    /// tracing, and `otlp.enabled` still gates actual export.
+    #[serde(default)]
+    pub export_without_traceparent: bool,
     /// Filter that decides which inbound requests get a span. A request must
     /// match the filter (any tracestate key OR trace_id regex) to be traced.
     /// Lets ops trace a subset (e.g. only `opencode_user_id` traffic) without
@@ -2120,6 +2126,7 @@ impl Default for TraceConfig {
             capture_tool_details: false,
             max_body_bytes: default_trace_max_body_bytes(),
             propagate_only: default_trace_propagate_only(),
+            export_without_traceparent: false,
             report_filter: TraceFilterConfig::default(),
             metrics: MetricsConfig::default(),
         }
@@ -2191,6 +2198,18 @@ report_filter:
         let yaml = "enabled: true\nmetrics:\n  enabled: true\n";
         let cfg: TraceConfig = serde_yaml::from_str(yaml).unwrap();
         assert!(cfg.metrics.enabled);
+    }
+
+    #[test]
+    fn trace_config_parses_export_without_traceparent() {
+        let cfg: Config = serde_yaml::from_str(
+            "trace:\n  export_without_traceparent: true\n",
+        )
+        .unwrap();
+        assert!(cfg.trace.expect("trace section").export_without_traceparent);
+
+        let cfg: TraceConfig = serde_yaml::from_str("enabled: true\n").unwrap();
+        assert!(!cfg.export_without_traceparent, "defaults false");
     }
 
     #[test]
