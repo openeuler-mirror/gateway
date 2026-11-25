@@ -609,6 +609,13 @@ pub struct ResponsesStoreSettings {
     pub ttl_secs: u64,
     #[serde(default = "default_responses_max_history_items")]
     pub max_history_items: usize,
+    /// Persist every completed turn even when the client sends
+    /// `store: false`. Clients like Codex request store:false yet still
+    /// chain on the returned id (`previous_response_id`), which 404s
+    /// without a checkpoint. With force_persist the id stays continuable;
+    /// OpenAI-semantics strict operators leave this off (default).
+    #[serde(default)]
+    pub force_persist: bool,
 }
 fn default_responses_enabled() -> bool { true }
 fn default_responses_ttl_secs() -> u64 { 2_592_000 }
@@ -619,6 +626,7 @@ impl Default for ResponsesStoreSettings {
             enabled: default_responses_enabled(),
             ttl_secs: default_responses_ttl_secs(),
             max_history_items: default_responses_max_history_items(),
+            force_persist: false,
         }
     }
 }

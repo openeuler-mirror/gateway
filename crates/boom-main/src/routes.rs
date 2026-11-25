@@ -4984,7 +4984,11 @@ pub async fn responses(
 
     // when the response store is unavailable. Only completed/incomplete turns
     // are checkpointed (failed turns are not retrievable continuations).
-    let mut persist_ctx = if store_available && req.store != Some(false) {
+    // force_persist (responses_store): store the turn even when the client
+    // sent store:false — Codex requests store:false but still chains on the
+    // returned id (previous_response_id), which 404s without a checkpoint.
+    let persist_eligible = store_available && (store_cfg.force_persist || req.store != Some(false));
+    let mut persist_ctx = if persist_eligible {
         Some(ResponsesPersistCtx {
             response_id: response_id.clone(),
             previous_response_id: req.previous_response_id.clone(),
