@@ -156,6 +156,19 @@ fn mark_trace_error(trace_guard: &mut Option<TraceGuard>, error: &GatewayError) 
     }
 }
 
+/// The child `traceparent` for the upstream call, plus the inbound
+/// `tracestate` to forward. A synthetic root has an empty `trace_state`, so
+/// it never inherits an unrelated inbound `tracestate`.
+fn upstream_child_trace_context(
+    parent: &W3cContext,
+    gateway_span_id: [u8; 8],
+) -> (String, Option<String>) {
+    (
+        boom_trace::build_child_traceparent(parent.trace_id, gateway_span_id, parent.sampled),
+        (!parent.trace_state.is_empty()).then(|| parent.trace_state.clone()),
+    )
+}
+
 /// Snapshot the provider-side raw capture into per-attempt span records:
 /// 1-based numbering, provider as recorded, request body only when non-empty,
 /// response frames joined with the SSE frame separator. Retained bodies are
@@ -1202,11 +1215,7 @@ async fn chat_completions_inner(
         .get("traceparent")
         .and_then(|v| v.to_str().ok())
         .and_then(parse_traceparent);
-    let should_trace = trace_cfg.enabled
-        && w3c_ctx
-            .as_ref()
-            .map(|w| boom_trace::trace_filter_matches(&trace_cfg.report_filter.tracestate_keys, &trace_cfg.report_filter.trace_id_regex, w))
-            .unwrap_or(false);
+    let should_trace = trace_export_eligible(&trace_cfg, w3c_ctx.as_ref());
     // Full-coverage guard (issue #49): a span is created for every request
     // so metrics see all traffic — a synthetic W3C context stands in when
     // the client sent no traceparent. `should_trace` only gates OTLP trace
@@ -1403,24 +1412,20 @@ async fn chat_completions_inner(
         api_path,
         provider.client_type_header(),
     );
-    // Inject the child traceparent for the upstream LLM call. parent_span_id
-    // is the gateway's span_id; trace_id is the inbound W3C trace_id. When
-    // the trace channel is disabled (or no inbound traceparent), the
-    // `propagate_only` flag still forwards the original traceparent
-    // unchanged (W3C proxy-node minimum obligation). When neither channel
-    // is on AND propagate_only=false, we don't inject anything — the
-    // upstream sees no traceparent.
+    // Inject the child traceparent for the upstream LLM call. With a valid
+    // inbound context, the gateway span becomes the upstream parent and the
+    // inbound trace id / sampled flag / tracestate are preserved. When the
+    // trace channel is disabled, `propagate_only` still forwards the original
+    // context unchanged (W3C proxy-node minimum obligation). A request with
+    // no valid inbound context injects nothing unless it is export-eligible,
+    // in which case it hangs under the synthetic root span.
     if let Some(w3c) = w3c_ctx.as_ref() {
         if let Some(g) = trace_guard.as_ref() {
-            // Trace channel on: mint a child traceparent with gateway span as parent.
-            let child_tp = boom_trace::build_child_traceparent(
-                w3c.trace_id,
-                g.child_parent_span_id(),
-                w3c.sampled,
-            );
+            let (child_tp, child_ts) =
+                upstream_child_trace_context(w3c, g.child_parent_span_id());
             insert_header_ci(&mut req.gateway_headers, "traceparent", child_tp);
-            if !w3c.trace_state.is_empty() {
-                insert_header_ci(&mut req.gateway_headers, "tracestate", w3c.trace_state.clone());
+            if let Some(ts) = child_ts {
+                insert_header_ci(&mut req.gateway_headers, "tracestate", ts);
             }
         } else if trace_cfg.propagate_only {
             // Trace channel off but propagate_only=true: forward the inbound
@@ -1432,6 +1437,15 @@ async fn chat_completions_inner(
             if let Some(raw) = headers.get("tracestate").and_then(|v| v.to_str().ok()) {
                 insert_header_ci(&mut req.gateway_headers, "tracestate", raw.to_string());
             }
+        }
+    } else if should_trace {
+        // No valid inbound context, but a synthetic root is export-eligible:
+        // hang the upstream call under the gateway span. The synthetic root
+        // carries no tracestate, so none is inherited.
+        if let Some(g) = trace_guard.as_ref() {
+            let (child_tp, _) =
+                upstream_child_trace_context(&synthetic_w3c, g.child_parent_span_id());
+            insert_header_ci(&mut req.gateway_headers, "traceparent", child_tp);
         }
     }
     let provider_billing = ProviderBilling::default();
@@ -3965,14 +3979,11 @@ pub async fn messages(
         .get("traceparent")
         .and_then(|v| v.to_str().ok())
         .and_then(parse_traceparent);
-    let should_trace = trace_cfg.enabled
-        && w3c_ctx
-            .as_ref()
-            .map(|w| boom_trace::trace_filter_matches(&trace_cfg.report_filter.tracestate_keys, &trace_cfg.report_filter.trace_id_regex, w))
-            .unwrap_or(false);
-    // Guard is created unconditionally (metrics need full coverage); spans
-    // without an inbound traceparent get a synthetic W3C context and are
-    // never exported as traces (export_eligible=false).
+    let should_trace = trace_export_eligible(&trace_cfg, w3c_ctx.as_ref());
+    // Guard is created unconditionally (metrics need full coverage); a
+    // synthetic W3C context stands in when the client sent no traceparent.
+    // `should_trace` gates OTLP trace export only — the export switch
+    // decides whether a synthetic root is eligible — not metrics.
     let synthetic_w3c = boom_trace::synthetic_context(&request_id);
     let mut trace_guard = TraceGuard::start(
         state.trace.clone(),
@@ -4156,17 +4167,14 @@ pub async fn messages(
         provider.client_type_header(),
     );
     // Inject child traceparent — see chat_completions path for the long-form
-    // explanation of the propagate_only / trace-on branching.
+    // explanation of the valid-context / propagate_only / synthetic branching.
     if let Some(w3c) = w3c_ctx.as_ref() {
         if let Some(g) = trace_guard.as_ref() {
-            let child_tp = boom_trace::build_child_traceparent(
-                w3c.trace_id,
-                g.child_parent_span_id(),
-                w3c.sampled,
-            );
+            let (child_tp, child_ts) =
+                upstream_child_trace_context(w3c, g.child_parent_span_id());
             insert_header_ci(&mut openai_req.gateway_headers, "traceparent", child_tp);
-            if !w3c.trace_state.is_empty() {
-                insert_header_ci(&mut openai_req.gateway_headers, "tracestate", w3c.trace_state.clone());
+            if let Some(ts) = child_ts {
+                insert_header_ci(&mut openai_req.gateway_headers, "tracestate", ts);
             }
         } else if trace_cfg.propagate_only {
             if let Some(raw) = headers.get("traceparent").and_then(|v| v.to_str().ok()) {
@@ -4175,6 +4183,12 @@ pub async fn messages(
             if let Some(raw) = headers.get("tracestate").and_then(|v| v.to_str().ok()) {
                 insert_header_ci(&mut openai_req.gateway_headers, "tracestate", raw.to_string());
             }
+        }
+    } else if should_trace {
+        if let Some(g) = trace_guard.as_ref() {
+            let (child_tp, _) =
+                upstream_child_trace_context(&synthetic_w3c, g.child_parent_span_id());
+            insert_header_ci(&mut openai_req.gateway_headers, "traceparent", child_tp);
         }
     }
 
@@ -4778,6 +4792,20 @@ struct EdgeRequestPrep {
     trace_id: Option<String>,
 }
 
+/// Decide whether this request should export a trace span. `enabled` is the
+/// master switch; with a valid inbound context the existing report filter is
+/// authoritative, otherwise the synthetic-root switch decides.
+fn trace_export_eligible(config: &boom_config::TraceConfig, w3c: Option<&W3cContext>) -> bool {
+    config.enabled
+        && w3c.map_or(config.export_without_traceparent, |w| {
+            boom_trace::trace_filter_matches(
+                &config.report_filter.tracestate_keys,
+                &config.report_filter.trace_id_regex,
+                w,
+            )
+        })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prepare_edge_request<T: serde::Serialize>(
     state: &AppState,
@@ -4799,26 +4827,17 @@ fn prepare_edge_request<T: serde::Serialize>(
     let blocklist_armed =
         state.block_rule_store.is_enabled() && !state.block_rule_store.is_empty();
     // Trace votes on body construction independently: enabled && capture_body
-    // is channel-level (every span carries the same attribute set), not
-    // per-request — per-request export filtering stays in the handler.
+    // is channel-level (every span carries the same attribute set) and keeps
+    // non-exported spans useful for metrics; raw provider-exchange capture is
+    // per-request and additionally requires export eligibility.
     let trace_cfg = state.inner.load().config.trace.clone().unwrap_or_default();
     let trace_wants_body = trace_cfg.enabled && trace_cfg.capture_body;
-    // Per-request raw capture for the trace channel: only requests that would
-    // actually export a trace create the provider-body side channel, so
-    // untraced traffic pays nothing for it.
-    let trace_should_raw = trace_wants_body
-        && headers
-            .get("traceparent")
-            .and_then(|v| v.to_str().ok())
-            .and_then(parse_traceparent)
-            .map(|w| {
-                boom_trace::trace_filter_matches(
-                    &trace_cfg.report_filter.tracestate_keys,
-                    &trace_cfg.report_filter.trace_id_regex,
-                    &w,
-                )
-            })
-            .unwrap_or(false);
+    let trace_w3c: Option<W3cContext> = headers
+        .get("traceparent")
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_traceparent);
+    let trace_should_raw =
+        trace_cfg.capture_body && trace_export_eligible(&trace_cfg, trace_w3c.as_ref());
     let req_body_value: Option<Arc<serde_json::Value>> =
         if blocklist_armed || prompt_log_should || trace_wants_body {
             serde_json::to_value(req).ok().map(Arc::new)
@@ -5014,14 +5033,11 @@ pub async fn responses(
         .get("traceparent")
         .and_then(|v| v.to_str().ok())
         .and_then(parse_traceparent);
-    let should_trace = trace_cfg.enabled
-        && w3c_ctx
-            .as_ref()
-            .map(|w| boom_trace::trace_filter_matches(&trace_cfg.report_filter.tracestate_keys, &trace_cfg.report_filter.trace_id_regex, w))
-            .unwrap_or(false);
-    // Guard is created unconditionally (metrics need full coverage); spans
-    // without an inbound traceparent get a synthetic W3C context and are
-    // never exported as traces (export_eligible=false).
+    let should_trace = trace_export_eligible(&trace_cfg, w3c_ctx.as_ref());
+    // Guard is created unconditionally (metrics need full coverage); a
+    // synthetic W3C context stands in when the client sent no traceparent.
+    // `should_trace` gates OTLP trace export only — the export switch
+    // decides whether a synthetic root is eligible — not metrics.
     let synthetic_w3c = boom_trace::synthetic_context(&request_id);
     let mut trace_guard = TraceGuard::start(
         state.trace.clone(),
@@ -5194,16 +5210,14 @@ pub async fn responses(
         "/v1/responses",
         provider.client_type_header(),
     );
+    // Inject child traceparent — see chat_completions path for the branching.
     if let Some(w3c) = w3c_ctx.as_ref() {
         if let Some(g) = trace_guard.as_ref() {
-            let child_tp = boom_trace::build_child_traceparent(
-                w3c.trace_id,
-                g.child_parent_span_id(),
-                w3c.sampled,
-            );
+            let (child_tp, child_ts) =
+                upstream_child_trace_context(w3c, g.child_parent_span_id());
             insert_header_ci(&mut openai_req.gateway_headers, "traceparent", child_tp);
-            if !w3c.trace_state.is_empty() {
-                insert_header_ci(&mut openai_req.gateway_headers, "tracestate", w3c.trace_state.clone());
+            if let Some(ts) = child_ts {
+                insert_header_ci(&mut openai_req.gateway_headers, "tracestate", ts);
             }
         } else if trace_cfg.propagate_only {
             if let Some(raw) = headers.get("traceparent").and_then(|v| v.to_str().ok()) {
@@ -5212,6 +5226,12 @@ pub async fn responses(
             if let Some(raw) = headers.get("tracestate").and_then(|v| v.to_str().ok()) {
                 insert_header_ci(&mut openai_req.gateway_headers, "tracestate", raw.to_string());
             }
+        }
+    } else if should_trace {
+        if let Some(g) = trace_guard.as_ref() {
+            let (child_tp, _) =
+                upstream_child_trace_context(&synthetic_w3c, g.child_parent_span_id());
+            insert_header_ci(&mut openai_req.gateway_headers, "traceparent", child_tp);
         }
     }
 
@@ -6442,6 +6462,8 @@ mod tests {
         note_stream_chunk_meta, note_stream_response_id,
         LoggedStream, StreamMetaTracker, stream_failure_sink,
         stream_finish_reasons, StreamMetaState,
+trace_export_eligible,
+upstream_child_trace_context,
     };
     use axum::http::{HeaderMap, HeaderName, HeaderValue};
     use boom_core::types::{
@@ -6489,6 +6511,65 @@ mod tests {
             expires_at: None,
             metadata: serde_json::Value::Null,
         }
+    }
+
+    fn w3c_with_trace_id(trace_id: [u8; 16]) -> boom_trace::W3cContext {
+        boom_trace::W3cContext {
+            trace_id,
+            parent_span_id: [0u8; 8],
+            sampled: false,
+            trace_state: String::new(),
+        }
+    }
+
+    #[test]
+    fn trace_export_eligible_missing_context_follows_switch() {
+        let mut cfg = boom_config::TraceConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        cfg.export_without_traceparent = false;
+        assert!(!trace_export_eligible(&cfg, None));
+        cfg.export_without_traceparent = true;
+        assert!(trace_export_eligible(&cfg, None));
+    }
+
+    #[test]
+    fn trace_export_eligible_valid_context_ignores_switch_and_uses_filter() {
+        let w3c = w3c_with_trace_id([0xab; 16]);
+        for switch in [false, true] {
+            let matching = boom_config::TraceConfig {
+                enabled: true,
+                export_without_traceparent: switch,
+                report_filter: boom_config::TraceFilterConfig {
+                    tracestate_keys: Vec::new(),
+                    trace_id_regex: Some("^ab".to_string()),
+                },
+                ..Default::default()
+            };
+            assert!(trace_export_eligible(&matching, Some(&w3c)));
+
+            let mismatched = boom_config::TraceConfig {
+                enabled: true,
+                export_without_traceparent: switch,
+                report_filter: boom_config::TraceFilterConfig {
+                    tracestate_keys: Vec::new(),
+                    trace_id_regex: Some("^cd".to_string()),
+                },
+                ..Default::default()
+            };
+            assert!(!trace_export_eligible(&mismatched, Some(&w3c)));
+        }
+    }
+
+    #[test]
+    fn trace_export_eligible_disabled_is_always_false() {
+        let cfg = boom_config::TraceConfig {
+            enabled: false,
+            export_without_traceparent: true,
+            ..Default::default()
+        };
+        assert!(!trace_export_eligible(&cfg, None));
     }
 
     async fn state_from_yaml(yaml: &str) -> crate::state::AppState {
@@ -8070,5 +8151,135 @@ trace:
             prep.raw_capture.is_none(),
             "no exported trace ⇒ no raw side channel"
         );
+    }
+
+    #[tokio::test]
+    async fn no_traceparent_export_switch_controls_raw_capture() {
+        let off = state_from_yaml(
+            r#"
+server: { port: 18080 }
+general_settings:
+  master_key: __YOUR_API_KEY__
+trace:
+  enabled: true
+  capture_body: true
+"#,
+        )
+        .await;
+        let off_prep = super::prepare_edge_request(
+            &off,
+            &test_identity(),
+            &HeaderMap::new(),
+            &json!({"model": "m", "messages": []}),
+            "m",
+            "/v1/chat/completions",
+            false,
+            "req-no-header-off",
+            "127.0.0.1",
+            [None, None, None],
+            std::time::Instant::now(),
+        )
+        .expect("prep ok");
+        assert!(
+            off_prep.raw_capture.is_none(),
+            "switch off ⇒ no synthetic root ⇒ no raw side channel"
+        );
+
+        let on = state_from_yaml(
+            r#"
+server: { port: 18080 }
+general_settings:
+  master_key: __YOUR_API_KEY__
+trace:
+  enabled: true
+  capture_body: true
+  export_without_traceparent: true
+"#,
+        )
+        .await;
+        let on_prep = super::prepare_edge_request(
+            &on,
+            &test_identity(),
+            &HeaderMap::new(),
+            &json!({"model": "m", "messages": []}),
+            "m",
+            "/v1/chat/completions",
+            false,
+            "req-no-header-on",
+            "127.0.0.1",
+            [None, None, None],
+            std::time::Instant::now(),
+        )
+        .expect("prep ok");
+        assert!(
+            on_prep.raw_capture.is_some(),
+            "switch on ⇒ synthetic root exports ⇒ raw side channel armed"
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_body_false_disables_raw_even_when_export_eligible() {
+        let state = state_from_yaml(
+            r#"
+server: { port: 18080 }
+general_settings:
+  master_key: __YOUR_API_KEY__
+trace:
+  enabled: true
+  capture_body: false
+  export_without_traceparent: true
+"#,
+        )
+        .await;
+        let prep = super::prepare_edge_request(
+            &state,
+            &test_identity(),
+            &HeaderMap::new(),
+            &json!({"model": "m", "messages": []}),
+            "m",
+            "/v1/chat/completions",
+            false,
+            "req-no-body-raw",
+            "127.0.0.1",
+            [None, None, None],
+            std::time::Instant::now(),
+        )
+        .expect("prep ok");
+        assert!(
+            prep.raw_capture.is_none(),
+            "capture_body=false must not arm the raw side channel"
+        );
+    }
+
+    #[test]
+    fn upstream_child_trace_context_uses_synthetic_root_and_gateway_span() {
+        let synthetic = boom_trace::synthetic_context("req-synthetic-root");
+        let gateway_span_id = [0x11u8; 8];
+        let (child_tp, child_ts) = upstream_child_trace_context(&synthetic, gateway_span_id);
+        assert!(child_ts.is_none(), "synthetic root inherits no tracestate");
+        let child = parse_traceparent(&child_tp).expect("child traceparent parses");
+        assert_eq!(child.trace_id, synthetic.trace_id);
+        assert_eq!(child.parent_span_id, gateway_span_id);
+        assert!(child.sampled);
+        assert_ne!(child.trace_id, [0u8; 16], "synthetic trace id is non-zero");
+        assert_ne!(child.parent_span_id, [0u8; 8], "gateway span id is non-zero");
+    }
+
+    #[test]
+    fn upstream_child_trace_context_preserves_valid_parent_and_sampled() {
+        let w3c = boom_trace::W3cContext {
+            trace_id: [0x0a; 16],
+            parent_span_id: [0x22; 8],
+            sampled: false,
+            trace_state: "vendor=1".to_string(),
+        };
+        let gateway_span_id = [0x11u8; 8];
+        let (child_tp, child_ts) = upstream_child_trace_context(&w3c, gateway_span_id);
+        assert_eq!(child_ts.as_deref(), Some("vendor=1"));
+        let child = parse_traceparent(&child_tp).expect("child traceparent parses");
+        assert_eq!(child.trace_id, w3c.trace_id);
+        assert_eq!(child.parent_span_id, gateway_span_id);
+        assert_ne!(child.parent_span_id, w3c.parent_span_id);
+        assert!(!child.sampled, "valid sampled=0 is preserved");
     }
 }

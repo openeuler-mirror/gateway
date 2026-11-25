@@ -403,6 +403,9 @@ pub fn process_section_fields() -> &'static [FieldMeta] {
         FieldMeta { field: "trace.propagate_only", section: "trace", input_type: "bool",
                     label_key: "config.field.trace_propagate_only", tip_key: "config.tip.trace_propagate_only",
                     home: ConfigHome::Yaml },
+        FieldMeta { field: "trace.export_without_traceparent", section: "trace", input_type: "bool",
+                    label_key: "config.field.trace_export_without_traceparent", tip_key: "config.tip.trace_export_without_traceparent",
+                    home: ConfigHome::Yaml },
         FieldMeta { field: "trace.metrics.enabled", section: "trace", input_type: "bool",
                     label_key: "config.field.trace_metrics_enabled", tip_key: "config.tip.trace_metrics_enabled",
                     home: ConfigHome::Db },
@@ -836,6 +839,11 @@ mod tests {
             ConfigHome::Db,
             "trace.metrics.enabled is DB-authoritative (boom_config KV, CATEGORY_TRACE)"
         );
+        let export_without = process_section_fields()
+            .iter()
+            .find(|m| m.field == "trace.export_without_traceparent")
+            .expect("trace.export_without_traceparent must stay registered in process_section_fields");
+        assert_eq!(export_without.home, ConfigHome::Yaml);
         for m in process_section_fields()
             .iter()
             .filter(|m| m.field.starts_with("rate_limit."))
