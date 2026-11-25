@@ -4942,7 +4942,16 @@ pub async fn responses(
                 }
             }
             Err(boom_responses::ResponseStoreError::NotFound) => {
-                // Uniform 404: missing, expired, or another key's id.
+                // Uniform 404: missing, expired, or another key's id. Log the
+                // miss context at debug — Codex WS continuation probes hit
+                // this on every resume (locally-derived ids), and the probe
+                // is followed by a successful full replay; operators grepping
+                // for errors need to know this class is expected.
+                tracing::debug!(
+                    request_id = %request_id,
+                    previous_response_id = %prev_id,
+                    "previous_response_id not found (client should replay full history)"
+                );
                 let e = GatewayError::ResponseNotFound(prev_id.clone());
                 log_error(&state, &identity, &req.model, "/v1/responses", req.stream.unwrap_or(false), start, &e, Some(request_id.clone()), None, None, Some(client_ip.clone()), user_tags.clone());
                 return Err(ResponsesErrorReply(e));
