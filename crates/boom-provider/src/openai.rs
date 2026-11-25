@@ -538,17 +538,59 @@ impl Provider for OpenAIProvider {
                 GatewayError::ProviderError("Upstream provider unavailable".to_string())
             })?;
 
-        let status = resp.status();
-        if !status.is_success() {
-            let error_body = resp.text().await.unwrap_or_default();
-            if let Some(ref cap) = raw_capture {
-                cap.push_response_frame(error_body.clone());
+        // Same structured-output fallback as the non-stream path: retry once
+        // with the schema prompt-injected (Codex title-gen turns stream and
+        // hit the 400 without this). A successful retry replaces `resp` so
+        // it flows into the shared SSE parser below.
+        let resp = match resp.status() {
+            s if s.is_success() => resp,
+            s => {
+                let error_body = resp.text().await.unwrap_or_default();
+                if s.as_u16() == 400
+                    && body.get("response_format").is_some()
+                    && !error_body.is_empty()
+                    && error_body.contains("response_format")
+                {
+                    tracing::warn!(
+                        "upstream rejected response_format (stream); retrying with prompt-injected schema"
+                    );
+                    let downgraded = downgrade_response_format_to_prompt(&body);
+                    let mut builder = self.client.post(&url);
+                    if let Some(ref key) = self.api_key {
+                        builder = builder.bearer_auth(key);
+                    }
+                    builder = crate::apply_gateway_headers(builder, &gateway_headers);
+                    match builder.json(&downgraded).send().await {
+                        Ok(resp2) if resp2.status().is_success() => resp2,
+                        Ok(resp2) => {
+                            let status2 = resp2.status().as_u16();
+                            let error_body2 = resp2.text().await.unwrap_or_default();
+                            if let Some(ref cap) = raw_capture {
+                                cap.push_response_frame(error_body2.clone());
+                            }
+                            return Err(GatewayError::UpstreamError {
+                                status: status2,
+                                message: error_body2,
+                            });
+                        }
+                        Err(e) => {
+                            tracing::error!("OpenAI stream retry failed: {}", e);
+                            return Err(GatewayError::ProviderError(
+                                "Upstream provider unavailable".to_string(),
+                            ));
+                        }
+                    }
+                } else {
+                    if let Some(ref cap) = raw_capture {
+                        cap.push_response_frame(error_body.clone());
+                    }
+                    return Err(GatewayError::UpstreamError {
+                        status: s.as_u16(),
+                        message: error_body,
+                    });
+                }
             }
-            return Err(GatewayError::UpstreamError {
-                status: status.as_u16(),
-                message: error_body,
-            });
-        }
+        };
 
         // Parse SSE byte stream into ChatStreamChunk items.
         let (tx, rx) = tokio::sync::mpsc::channel(32);
