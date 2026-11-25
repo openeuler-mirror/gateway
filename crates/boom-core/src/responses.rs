@@ -183,7 +183,11 @@ enum InputKind {
     CustomToolCall { call_id: String, name: String, input: String },
     /// Accepted but dropped: the chat kernel has no reasoning replay channel
     /// (Response.md §6.3; native fidelity lands with the P2 passthrough).
-    Reasoning,
+    Reasoning {
+        /// Concatenated summary[].text — replayed to thinking-mode upstreams
+        /// as `reasoning_content` (DeepSeek requires it be passed back).
+        summary_text: String,
+    },
 }
 
 fn parse_input_item(v: &serde_json::Value) -> Result<InputKind, GatewayError> {
@@ -223,7 +227,19 @@ fn parse_input_item(v: &serde_json::Value) -> Result<InputKind, GatewayError> {
             call_id: v.get("call_id").and_then(|c| c.as_str()).unwrap_or_default().to_string(),
             output: v.get("output").cloned().unwrap_or(serde_json::Value::Null),
         }),
-        "reasoning" => Ok(InputKind::Reasoning),
+        "reasoning" => Ok(InputKind::Reasoning {
+            summary_text: v
+                .get("summary")
+                .and_then(|s| s.as_array())
+                .map(|parts| {
+                    parts
+                        .iter()
+                        .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_default(),
+        }),
         other => Err(GatewayError::UnsupportedMode(format!(
             "unsupported input item type '{other}'"
         ))),
@@ -768,7 +784,28 @@ fn convert_request(
                     reasoning_content: None,
                 });
             }
-            InputKind::Reasoning => {} // dropped by design
+            InputKind::Reasoning { summary_text } => {
+                // Thinking-mode round-trip: DeepSeek-class upstreams emit
+                // `reasoning_content` and REQUIRE it to be passed back on
+                // multi-turn replay ("The reasoning_content in the thinking
+                // mode must be passed back"). The rs_ item we minted on the
+                // way out is restored as an assistant message carrying the
+                // reasoning_content field (with empty visible content — the
+                // accompanying message item follows separately in the item
+                // stream, matching how the upstream originally sent it).
+                messages.push(Message {
+                    role: MessageRole::Assistant,
+                    content: MessageContent::Text(String::new()),
+                    name: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: if summary_text.is_empty() {
+                        None
+                    } else {
+                        Some(summary_text.clone())
+                    },
+                });
+            }
         }
     }
 
@@ -1656,7 +1693,9 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_items_are_dropped() {
+    fn reasoning_items_replay_as_reasoning_content() {
+        // Empty-summary rs_ items still replay (DeepSeek thinking mode
+        // requires the field present on the assistant turn).
         let req = parse_req(json!({
             "model": "m",
             "input": [
@@ -1665,7 +1704,20 @@ mod tests {
             ]
         }));
         let out = responses_request_to_openai(&req).unwrap();
-        assert_eq!(out.messages.len(), 1);
+        assert_eq!(out.messages.len(), 2);
+        assert!(matches!(out.messages[0].role, MessageRole::Assistant));
+        assert_eq!(out.messages[0].reasoning_content, None, "empty summary → no content");
+
+        // Non-empty summary → reasoning_content carries the text back.
+        let req = parse_req(json!({
+            "model": "m",
+            "input": [{
+                "type": "reasoning", "id": "rs_2",
+                "summary": [{ "type": "summary_text", "text": "thinking hard" }]
+            }]
+        }));
+        let out = responses_request_to_openai(&req).unwrap();
+        assert_eq!(out.messages[0].reasoning_content.as_deref(), Some("thinking hard"));
     }
 
     #[test]
