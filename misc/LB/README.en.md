@@ -80,6 +80,13 @@ cargo build --release
 CONFIG_PATH=/path/to/routes.yaml ./target/release/gateway-lb
 ```
 
+Cargo.lock is committed (standard for binary crates) and the Docker build
+uses `--locked`. tokio is constrained to `>=1.52.3, <1.54` in Cargo.toml:
+pingora 0.8.1's accept path uses `with_capacity(0, 0)` for lazy buffering,
+while tokio 1.54 added a zero-capacity panic there — fresh dependency
+resolution without the pin panicked on the first accepted connection. Do
+not lift the constraint until pingora changes that pattern.
+
 ### Docker (recommended)
 
 ```bash

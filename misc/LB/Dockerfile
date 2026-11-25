@@ -12,14 +12,17 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src/ ./src/
 
-# Cache dependencies with a dummy build, then build the real binary
+# Cache dependencies with a dummy build, then build the real binary.
+# --locked: fail the build rather than silently resolving around the
+# committed Cargo.lock (whose tokio pin guards the pingora 0.8.1
+# with_capacity(0, ..) / tokio>=1.54 panic incompatibility).
 RUN mkdir -p src && \
     echo 'fn main() {}' > src/main.rs && \
-    cargo build --release && \
+    cargo build --release --locked && \
     rm -rf src
 
 COPY src/ ./src/
-RUN touch src/main.rs && cargo build --release
+RUN touch src/main.rs && cargo build --release --locked
 
 FROM openeuler/openeuler:24.03
 

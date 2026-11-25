@@ -61,6 +61,11 @@ cargo build --release
 CONFIG_PATH=/path/to/routes.yaml ./target/release/gateway-lb
 ```
 
+Cargo.lock 已提交(二进制 crate 标准做法),Docker 构建走 `--locked`。
+tokio 被 Cargo.toml 约束在 `>=1.52.3, <1.54`:pingora 0.8.1 的 accept 路径
+用 `with_capacity(0,0)` 惰性分配缓冲,而 tokio 1.54 对 0 容量加了 panic
+断言——曾导致全新解析依赖的构建一收连接就 panic;升级 pingora 前勿动此约束。
+
 ### Docker(推荐)
 
 ```bash
