@@ -249,6 +249,36 @@ pub async fn admin_command_handler(mut rx: tokio::sync::mpsc::Receiver<AdminComm
                 state.prompt_log_writer.update_config(config);
                 let _ = reply.send(Ok(()));
             }
+            AdminCommand::SetPromptLogRetention { retention, reply } => {
+                // DB-authoritative retention policy (global domain):
+                // DB write first, CATEGORY_PROMPTLOG bump second (peer
+                // instances re-adopt on their next poll, ≤5s), local writer
+                // overlay third. Only the retention fields are merged — the
+                // rest of prompt_log stays YAML-private.
+                let result = match state.db_pool.as_ref() {
+                    Some(pool) => async {
+                        let json = serde_json::to_value(&retention)
+                            .map_err(|e| e.to_string())?;
+                        boom_dashboard::config_kv::set_value(
+                            pool,
+                            boom_dashboard::config_kv::PROMPT_LOG_RETENTION,
+                            json.clone(),
+                        )
+                        .await
+                        .map_err(|e| format!("DB write failed: {e}"))?;
+                        boom_state::revision::bump_best_effort(
+                            pool,
+                            boom_state::CATEGORY_PROMPTLOG,
+                        )
+                        .await;
+                        state.prompt_log_writer.set_retention(retention);
+                        Ok(json)
+                    }
+                    .await,
+                    None => Err("no DB pool — retention is YAML-home in no-DB mode".to_string()),
+                };
+                let _ = reply.send(result);
+            }
             AdminCommand::PingOtlpEndpoint { endpoint, headers, timeout_secs, reply } => {
                 // Single attempt — no retry. The dashboard polls every 5s and
                 // would compound backoff if we retried internally.

@@ -38,6 +38,16 @@ pub const RATE_LIMIT_FALLBACK: &str = "rate_limit_fallback";
 /// request differently depending on which instance served it.
 pub const ROUTER_BEHAVIOR: &str = "router_behavior";
 
+/// Prompt-log retention policy (`prompt_log.retention` YAML section is
+/// seed-only): `enabled` / `max_age_days` / `max_total_gb` /
+/// `disk_pct_watermark` — parsed back into
+/// `boom_promptlog::RetentionConfig` by the callers. CATEGORY_PROMPTLOG
+/// broadcast: the aging policy is an operator business decision enforced
+/// uniformly; each instance applies it to its own local segment directory.
+/// `enabled` defaults to false — nothing is ever deleted until the
+/// operator opts in.
+pub const PROMPT_LOG_RETENTION: &str = "prompt_log_retention";
+
 fn value_to_bool(v: serde_json::Value) -> Option<bool> {
     match v {
         serde_json::Value::Bool(b) => Some(b),

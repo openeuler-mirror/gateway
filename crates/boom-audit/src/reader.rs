@@ -66,6 +66,9 @@ pub struct LogRow {
     pub trie_max_blocks: Option<i64>,
     pub request_tokens: Option<i64>,
     pub queue_wait_ms: Option<i32>,
+    /// Instance that served (and prompt-logged) this request. The prompt-log
+    /// segments are instance-local, so the dashboard uses this to decide
+    /// whether to serve the entry locally or proxy to the owning instance.
     pub instance_id: Option<String>,
     pub user_tag1: Option<String>,
     pub user_tag2: Option<String>,

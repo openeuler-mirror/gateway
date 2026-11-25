@@ -32,6 +32,13 @@ futures = { workspace = true }
 flate2 = { workspace = true }
 hex = { workspace = true }
 sha2 = { workspace = true }
+twox-hash = { workspace = true }
+zstd = { workspace = true }
+crc32fast = { workspace = true }
+fs2 = { workspace = true }
+clap = { workspace = true }
+lru = { workspace = true }
+thiserror = { workspace = true }
 
 # OTLP-exporter deps — only pulled in when the `otlp` feature is on.
 # All three opentelemetry-* crates are released in lockstep; pin them to the
@@ -44,10 +51,12 @@ prost = { version = "0.14", optional = true }
 bytes = { workspace = true, optional = true }
 # Used by replay.rs (gz decompression to a temp file). Only needed with otlp.
 tempfile = { version = "3", optional = true }
-thiserror = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
-clap = { workspace = true }
 tracing-subscriber = { workspace = true }
 tokio = { workspace = true }
+
+[[bin]]
+name = "boom-pl"
+path = "src/bin/boom_pl.rs"

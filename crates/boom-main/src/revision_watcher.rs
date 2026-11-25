@@ -529,6 +529,42 @@ async fn dispatch(category: &str, state: &AppState, pool: &PgPool) -> anyhow::Re
             state.trace.set_metrics_enabled(enabled);
             tracing::info!(enabled, "trace metrics switch re-adopted (revision bump)");
         }
+        boom_state::CATEGORY_PROMPTLOG => {
+            // Peer retention PUT: read the KV row and overlay the policy
+            // onto the local writer. Only the retention fields merge — the
+            // YAML-private storage knobs stay untouched. The bump implies
+            // the row exists; a missing/malformed row keeps the current
+            // policy (warned — the next PUT heals the row).
+            let value = boom_dashboard::config_kv::get_value(
+                pool,
+                boom_dashboard::config_kv::PROMPT_LOG_RETENTION,
+            )
+            .await?;
+            match value {
+                Some(v) => {
+                    match serde_json::from_value::<boom_promptlog::RetentionConfig>(v) {
+                        Ok(retention) => {
+                            tracing::info!(
+                                max_age_days = retention.max_age_days,
+                                "prompt-log retention policy re-adopted (revision bump)"
+                            );
+                            state.prompt_log_writer.set_retention(retention);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "malformed prompt_log_retention KV row — keeping current policy"
+                            );
+                        }
+                    }
+                }
+                None => {
+                    tracing::warn!(
+                        "prompt_log_retention KV row vanished — keeping current policy"
+                    );
+                }
+            }
+        }
         other => {
             // warn, not debug: a bumped category without a dispatch arm means
             // someone added a write-side bump but forgot the reconcile —

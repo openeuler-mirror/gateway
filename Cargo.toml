@@ -119,6 +119,12 @@ rust_decimal_macros = { version = "1" }
 # Dynamic library loading (hook framework)
 libloading = "0.8"
 
+# prompt-log segment store: block compression, footer/idx checksums,
+# disk-watermark probing for the retention enforcer.
+zstd = "0.13"
+crc32fast = "1"
+fs2 = "0.4"
+
 [workspace.lints.rust]
 # `tokio_unstable` is set via `--cfg tokio_unstable` rustflag (see
 # `.cargo/config.toml`). It gates `worker_local_queue_depth` /

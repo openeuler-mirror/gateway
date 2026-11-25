@@ -28,6 +28,7 @@ hex = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
+reqwest = { workspace = true }
 dashmap = { workspace = true }
 rust_decimal = { workspace = true }
 csv = { workspace = true }

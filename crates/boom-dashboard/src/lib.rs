@@ -374,6 +374,10 @@ pub fn build_router<S: Clone + Send + Sync + 'static>(state: DashboardState) -> 
             get(handlers_admin::get_prompt_log_entry),
         )
         .route(
+            "/dashboard/api/admin/prompt-log/retention",
+            put(handlers_admin::set_prompt_log_retention),
+        )
+        .route(
             "/dashboard/api/admin/prompt-log/otlp-ping",
             post(handlers_admin::ping_otlp_endpoint),
         )

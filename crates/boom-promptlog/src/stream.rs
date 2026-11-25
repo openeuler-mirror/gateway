@@ -7,6 +7,9 @@ use std::task::{Context, Poll};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
+type EntryEnricher = Arc<dyn Fn(&mut PromptLogEntry) + Send + Sync>;
+type ResponseSink = Arc<dyn Fn(&Arc<serde_json::Value>) + Send + Sync>;
+
 /// What the stream wrapper accumulated when it ended. `Finished` means the
 /// upstream sent a terminal chunk with `finish_reason`; `Truncated` means the
 /// stream ended without one (timeout / client disconnect); `Failed` means the
@@ -100,14 +103,14 @@ pub struct PromptLogStream<S, F> {
     /// events (e.g. comment lines in Anthropic SSE).
     delta_fn: F,
     /// Adds provider-owned metadata after the wrapped stream has been dropped.
-    entry_enricher: Option<Arc<dyn Fn(&mut PromptLogEntry) + Send + Sync>>,
+    entry_enricher: Option<EntryEnricher>,
     /// Observer for the assembled response, called at Drop BEFORE the inner
     /// stream is dropped. boom-main attaches a closure that stamps the
     /// response on the still-active trace span (`llm_response`) — the inner
     /// `LoggedStream`'s Drop finalizes the span, so anything after it would
     /// land on a dead span. Sharing the Arc keeps stream paths zero-copy
     /// with the prompt log entry.
-    response_sink: Option<Arc<dyn Fn(&Arc<serde_json::Value>) + Send + Sync>>,
+    response_sink: Option<ResponseSink>,
     /// Observes in-band upstream failures before the inner stream is dropped.
     failure_sink: Option<Arc<dyn Fn(&serde_json::Value) + Send + Sync>>,
 }
@@ -177,7 +180,7 @@ impl<S, F> PromptLogStream<S, F> {
 
     pub fn with_entry_enricher(
         mut self,
-        enricher: Arc<dyn Fn(&mut PromptLogEntry) + Send + Sync>,
+        enricher: EntryEnricher,
     ) -> Self {
         self.entry_enricher = Some(enricher);
         self
@@ -187,7 +190,7 @@ impl<S, F> PromptLogStream<S, F> {
     /// sit next to `with_entry_enricher`.
     pub fn with_response_sink(
         mut self,
-        sink: Arc<dyn Fn(&Arc<serde_json::Value>) + Send + Sync>,
+        sink: ResponseSink,
     ) -> Self {
         self.response_sink = Some(sink);
         self
@@ -462,10 +465,7 @@ mod tests {
     fn counting_sender(
         sender: mpsc::Sender<PromptLogEntry>,
     ) -> crate::writer::PromptLogSender {
-        crate::writer::PromptLogSender::new(
-            sender,
-            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        )
+        crate::writer::PromptLogSender::for_tests(sender)
     }
 
     #[tokio::test]
@@ -486,7 +486,7 @@ mod tests {
         let s = stream::iter(chunks);
         let mut wrapper = PromptLogStream::new(s, counting_sender(tx), req, extractor);
         // Drive the stream to completion so the wrapper sees the terminal chunk.
-        while let Some(_) = wrapper.next().await {}
+        while wrapper.next().await.is_some() {}
         drop(wrapper);
         let entry = rx.recv().await.expect("entry sent");
         assert_eq!(entry.phase, LogPhase::Response);
@@ -510,7 +510,7 @@ mod tests {
         let mut wrapper = PromptLogStream::new(s, counting_sender(tx), req, extractor);
         // Drive the stream to completion — but it ends without a finish_reason
         // marker, so Drop should record a truncation.
-        while let Some(_) = wrapper.next().await {}
+        while wrapper.next().await.is_some() {}
         drop(wrapper);
         let entry = rx.recv().await.expect("entry sent");
         assert_eq!(entry.phase, LogPhase::Response);
@@ -541,7 +541,7 @@ mod tests {
         ];
         let s = stream::iter(chunks);
         let mut wrapper = PromptLogStream::new(s, counting_sender(tx), req, extractor);
-        while let Some(_) = wrapper.next().await {}
+        while wrapper.next().await.is_some() {}
         drop(wrapper);
         let entry = rx.recv().await.expect("entry sent");
         assert_eq!(entry.phase, LogPhase::Response);
@@ -566,7 +566,7 @@ mod tests {
         ];
         let s = stream::iter(chunks);
         let mut wrapper = PromptLogStream::new(s, counting_sender(tx), req, extractor);
-        while let Some(_) = wrapper.next().await {}
+        while wrapper.next().await.is_some() {}
         drop(wrapper);
         let entry = rx.recv().await.expect("entry sent");
         assert_eq!(entry.status_code, Some(504));
@@ -590,7 +590,7 @@ mod tests {
             }];
             let s = stream::iter(chunks);
             let mut wrapper = PromptLogStream::new(s, counting_sender(tx), req, extractor);
-            while let Some(_) = wrapper.next().await {}
+            while wrapper.next().await.is_some() {}
             drop(wrapper);
             let entry = rx.recv().await.expect("entry sent");
             assert_eq!(entry.status_code, Some(502), "code {code}");
