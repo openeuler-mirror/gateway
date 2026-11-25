@@ -126,12 +126,37 @@ pub fn create_provider(
     client_type_header: bool,
     max_context_tokens: Option<u64>,
 ) -> Result<Arc<dyn Provider>, GatewayError> {
+    create_provider_with_request_defaults(model, api_key, api_base, timeout, extra,
+        custom_headers, deployment_id, client_type_header, max_context_tokens, &serde_json::Map::new())
+}
+
+/// Build a deployment with defaults applied only to OpenAI-compatible bodies.
+pub fn create_provider_with_request_defaults(
+    model: &str,
+    api_key: Option<String>,
+    api_base: Option<String>,
+    timeout: u64,
+    extra: &HashMap<String, String>,
+    custom_headers: &HashMap<String, String>,
+    deployment_id: Option<String>,
+    client_type_header: bool,
+    max_context_tokens: Option<u64>,
+    request_defaults: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Arc<dyn Provider>, GatewayError> {
+    let (provider_type, actual_model) =
+        boom_core::provider::resolve_model_provider(model).unwrap_or_else(|| {
+            tracing::warn!(
+                "Cannot auto-detect provider for '{}', defaulting to openai",
+                model
+            );
+            ("openai", model)
+        });
+    boom_core::request_defaults::validate_for_provider(provider_type, request_defaults)
+        .map_err(GatewayError::ConfigError)?;
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(timeout.max(1)))
         .build()
         .map_err(|e| GatewayError::ConfigError(format!("Failed to create HTTP client: {}", e)))?;
-
-    let (provider_type, actual_model) = parse_model_provider(model);
 
     // Backward compatibility: reserved keys configured inside the headers
     // map used to reach `extra` through namespace merging and act as
@@ -187,12 +212,14 @@ pub fn create_provider(
                     client,
                     key,
                     api_base,
-                    &actual_model,
+                    actual_model,
                     deployment_id,
                     client_type_header,
                     max_context_tokens,
                 )
-                .with_custom_headers(attached),
+                .with_custom_headers(attached)
+                .with_request_defaults(request_defaults.clone())
+                .with_provider_type(provider_type),
             ))
         }
         "anthropic" => {
@@ -200,7 +227,7 @@ pub fn create_provider(
                 client,
                 api_key,
                 api_base,
-                &actual_model,
+                actual_model,
                 deployment_id,
                 client_type_header,
             )
@@ -216,7 +243,7 @@ pub fn create_provider(
                 client,
                 api_key,
                 api_base,
-                &actual_model,
+                actual_model,
                 &api_version,
                 deployment_id,
                 client_type_header,
@@ -226,7 +253,7 @@ pub fn create_provider(
         "gemini" => Ok(Arc::new(gemini::GeminiProvider::new(
             client,
             api_key,
-            &actual_model,
+            actual_model,
             deployment_id,
             client_type_header,
         )
@@ -238,7 +265,7 @@ pub fn create_provider(
                 .unwrap_or_else(|| "us-east-1".to_string());
             Ok(Arc::new(bedrock::BedrockProvider::new(
                 client,
-                &actual_model,
+                actual_model,
                 &region,
                 deployment_id,
                 client_type_header,
@@ -248,54 +275,6 @@ pub fn create_provider(
             "Unknown provider: '{}'. Supported: openai, anthropic, azure, gemini, bedrock, hosted_vllm, vllm, ollama, deepseek, groq, etc.",
             provider_type
         ))),
-    }
-}
-
-/// Parse `provider/model-id` format. Returns (provider, actual_model).
-fn parse_model_provider(model: &str) -> (&str, String) {
-    if let Some((provider, rest)) = model.split_once('/') {
-        (provider, rest.to_string())
-    } else {
-        let provider = auto_detect_provider(model);
-        (provider, model.to_string())
-    }
-}
-
-/// Auto-detect provider from model name when no explicit prefix is given.
-fn auto_detect_provider(model: &str) -> &'static str {
-    let lower = model.to_lowercase();
-    if lower.starts_with("gpt-")
-        || lower.starts_with("o1-")
-        || lower.starts_with("o3-")
-        || lower.starts_with("o4-")
-        || lower.starts_with("text-")
-        || lower.starts_with("dall-e-")
-        || lower.starts_with("chatgpt-")
-        || lower.starts_with("ft:gpt-")
-    {
-        "openai"
-    } else if lower.starts_with("claude-") {
-        "anthropic"
-    } else if lower.starts_with("gemini-") || lower.starts_with("gemma-") {
-        "gemini"
-    } else if lower.starts_with("anthropic.")
-        || lower.starts_with("amazon.")
-        || lower.starts_with("meta.")
-        || lower.starts_with("mistral.")
-    {
-        "bedrock"
-    } else if lower.starts_with("deepseek") {
-        "deepseek"
-    } else if lower.starts_with("llama") || lower.starts_with("qwen") || lower.starts_with("yi-") {
-        // Common open-weights models typically served via vLLM/Ollama.
-        // Default to OpenAI-compatible since vLLM uses OpenAI format.
-        "openai"
-    } else {
-        tracing::warn!(
-            "Cannot auto-detect provider for '{}', defaulting to openai",
-            model
-        );
-        "openai"
     }
 }
 
@@ -321,8 +300,8 @@ fn auto_detect_provider(model: &str) -> &'static str {
 /// instances behind the same host.
 ///
 /// Examples:
-///   (`dep-1`, `http://10.0.0.5:8000/v1`) → `dep-1`
-///   (None,    `http://10.0.0.5:8000/v1`) → `None` (no id → not a participant)
+///   (`dep-1`, `http://example.internal:8000/v1`) → `dep-1`
+///   (None,    `http://example.internal:8000/v1`) → `None` (no id → not a participant)
 ///   (`dep-1`, None)                      → `None` (gate: no api_base)
 pub fn kv_worker_id_for(deployment_id: Option<&str>, api_base: Option<&str>) -> Option<String> {
     if api_base.map(str::trim).filter(|s| !s.is_empty()).is_none() {
@@ -394,7 +373,7 @@ mod tests {
         headers.insert("api_version".to_string(), "2024-02-01".to_string());
         // Hard-blocked → dropped.
         headers.insert("x-gateway-priority".to_string(), "spoof".to_string());
-        headers.insert("Authorization".to_string(), "Bearer leak".to_string());
+        headers.insert("Authorization".to_string(), "__YOUR_TOKEN__".to_string());
         // Transport-critical → dropped.
         headers.insert("content-type".to_string(), "text/plain".to_string());
         // Invalid header name (space) → dropped.
@@ -441,5 +420,46 @@ mod tests {
             provider.custom_headers().is_empty(),
             "reserved key must not become an upstream header"
         );
+    }
+}
+
+
+#[cfg(test)]
+mod provider_type_tests {
+    use super::*;
+
+    fn create(model: &str) -> std::sync::Arc<dyn Provider> {
+        create_provider(
+            model,
+            Some("test-key".to_string()),
+            Some("http://127.0.0.1:1/v1".to_string()),
+            1,
+            &HashMap::new(),
+            &HashMap::new(),
+            None,
+            false,
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn explicit_provider_type_is_preserved() {
+        assert_eq!(create("hosted_vllm/m").provider_type(), "hosted_vllm");
+        assert_eq!(create("openai/gpt-4").provider_type(), "openai");
+        assert_eq!(create("anthropic/claude-x").provider_type(), "anthropic");
+    }
+
+    #[test]
+    fn direct_openai_constructor_uses_openai_fallback() {
+        let provider = openai::OpenAIProvider::new(
+            reqwest::Client::new(),
+            None,
+            Some("http://127.0.0.1:1/v1".to_string()),
+            "m",
+            None,
+            false,
+        );
+        assert_eq!(provider.provider_type(), "openai");
     }
 }

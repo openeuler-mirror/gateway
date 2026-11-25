@@ -451,53 +451,17 @@ pub async fn get_user_logs(
         None => return Json(json!({"error": "Database not available"})).into_response(),
     };
 
+    // §3 SQL 所有权:boom_request_log 查询在 boom-audit。
     let page = query.page.max(1);
     let per_page = query.per_page.clamp(1, 1000);
-    let offset = (page - 1) * per_page;
-
-    // Fetch per_page + 1 to detect if there is a next page (probe survives
-    // even when the count below hits its cap and can't tell anymore).
-    // The count is bounded the same way as the admin logs page: the inner
-    // SELECT stops at LOGS_COUNT_CAP matches, so a key whose history spans
-    // a huge table costs O(cap) — an index walk — not O(key rows).
-    let (rows, total): (Vec<UserLogRow>, i64) = match async {
-        let mut tx = crate::handlers_admin::begin_with_timeout(db_pool).await?;
-        let rows = sqlx::query_as(
-            r#"SELECT model, api_path, is_stream, status_code,
-                      input_tokens, output_tokens, duration_ms,
-                      error_type, error_message, created_at, client_ip,
-                      cached_tokens, queue_wait_ms
-               FROM boom_request_log
-               WHERE key_hash = $1
-               ORDER BY created_at DESC
-               LIMIT $2 OFFSET $3"#,
-        )
-        .bind(key_hash)
-        .bind(per_page + 1)
-        .bind(offset)
-        .fetch_all(&mut *tx)
-        .await?;
-        let total = sqlx::query_scalar(
-            r#"SELECT COUNT(*) FROM (
-                   SELECT 1 FROM boom_request_log WHERE key_hash = $1 LIMIT $2
-               ) t"#,
-        )
-        .bind(key_hash)
-        .bind(crate::handlers_admin::LOGS_COUNT_CAP)
-        .fetch_one(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok::<_, sqlx::Error>((rows, total))
-    }
-    .await
-    {
+    let (rows, total) = match boom_audit::list_logs_for_key(db_pool, key_hash, page, per_page).await {
         Ok(r) => r,
         Err(e) => {
             tracing::error!("User get_user_logs query failed: {}", e);
             return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response();
         }
     };
-
+    let offset = (page - 1) * per_page;
     let has_next = rows.len() > per_page as usize || total >= offset + per_page + 1;
 
     let logs: Vec<Value> = rows
@@ -528,7 +492,7 @@ pub async fn get_user_logs(
         "per_page": per_page,
         "has_next": has_next,
         "total": total,
-        "total_capped": total >= crate::handlers_admin::LOGS_COUNT_CAP,
+        "total_capped": total >= boom_audit::LOGS_COUNT_CAP,
     }))
     .into_response()
 }

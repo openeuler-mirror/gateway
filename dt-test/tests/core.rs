@@ -597,10 +597,10 @@ fn convert_image_source_unknown_type() {
 /// DT-CORE-27：IPv4 + 端口 + 路径 / 主机名 / 裸 host。
 #[test]
 fn host_of_api_base_ipv4_and_hostname() {
-    assert_eq!(host_of_api_base("http://7.150.7.202:8000/v1"), Some("7.150.7.202".into()));
+    assert_eq!(host_of_api_base("http://192.0.2.1:8000/v1"), Some("192.0.2.1".into()));
     assert_eq!(host_of_api_base("http://worker-0/v1"), Some("worker-0".into()));
     assert_eq!(host_of_api_base("http://host:8000"), Some("host".into()));
-    assert_eq!(host_of_api_base("7.150.7.202"), Some("7.150.7.202".into()));
+    assert_eq!(host_of_api_base("192.0.2.1"), Some("192.0.2.1".into()));
     assert_eq!(host_of_api_base("https://api.example.com:443/v1/chat"), Some("api.example.com".into()));
 }
 
@@ -863,8 +863,8 @@ fn provider_billing_usage_none_details() {
 #[test]
 fn raw_capture_request_body_first_writer_wins() {
     let c = RawCaptureChannel::default();
-    c.record_request_body("first");
-    c.record_request_body("second"); // 忽略
+    c.record_request_body("openai", "first");
+    c.record_request_body("openai", "second"); // 第二个 attempt
     assert_eq!(c.take_request_body().as_deref(), Some("first"));
     assert_eq!(c.take_request_body(), None); // take 后清空
 }

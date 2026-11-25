@@ -459,30 +459,9 @@ pub struct RollbackStats {
     affinity_direct: std::sync::atomic::AtomicU64,
     /// Per-model breakdown (debug pane tree view).
     models: dashmap::DashMap<String, PerModelRollback>,
-    /// 维测:窗口化收敛率 24 个 1h 槽(direct/retry 各一,槽存 epoch-hour
-    /// 防回绕混代)。
-    conv_direct: [std::sync::atomic::AtomicU64; 24],
-    conv_retry: [std::sync::atomic::AtomicU64; 24],
-    conv_hour: [std::sync::atomic::AtomicI64; 24],
 }
 
-/// ═══ 维测:窗口化收敛率/// ═══ 维测:窗口化收敛率(1h × 24 槽,墙钟对齐)═══
-/// The lifetime-cumulative convergence rate is dragged down forever by the
-/// early retries of a cold trie. The windowed view answers "is it improving
-/// NOW". Slots are tumbling wall-clock hours (now/3600), same alignment idea
-/// as the quota windows; the slot stores its epoch-hour so wraparound
-/// resets stale slots instead of mixing generations.
-#[derive(Debug, Clone, Default, serde::Serialize)]
-pub struct ConvWindow {
-    /// Epoch hour this slot belongs to (0 = never written).
-    pub hour: i64,
-    /// Affinity direct hits in this hour (convergence numerator).
-    pub direct: u64,
-    /// Rollback retry successes in this hour (denominator complement).
-    pub retry: u64,
-}
-
-/// Serializable point-in-time snapshot. Field names are the dashboard API
+/// ═══ 维测:窗口化收敛率/// Serializable point-in-time snapshot. Field names are the dashboard API
 /// contract (`GET /admin/stats/rollback`).
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct RollbackStatsSnapshot {
@@ -496,8 +475,6 @@ pub struct RollbackStatsSnapshot {
     pub guard_error: u64,
     pub no_fallback_return: u64,
     pub affinity_direct: u64,
-    /// 维测:窗口化收敛率(24 个 1h 槽,仅含已写槽).
-    pub convergence_windows: Vec<ConvWindow>,
     /// Per-model tree breakdown (keyed by model_name).
     pub models: std::collections::BTreeMap<String, PerModelRollbackSnapshot>,
 }
@@ -812,7 +789,6 @@ impl RollbackStats {
     ) -> String {
         Self::rb_bump(&self.retry_success);
         self.record_model_success_ms(model, ms);
-        self.conv_bump(false);
         let code = error_code_of(fixed_error);
         self.record_model_error_code(model, "retry_success", &code);
         self.record_model_deploys(model, "retry_success", &code, from, to);
@@ -875,50 +851,11 @@ impl RollbackStats {
     pub fn record_affinity_direct(&self, model: &str) {
         Self::rb_bump(&self.affinity_direct);
         self.record_model(model, "affinity_direct");
-        self.conv_bump(true);
     }
 
     // ═══ 维测:事件 ring / 迁移矩阵 / 窗口化收敛率 ═══
 
 
-    /// Tumbling-hour slot bump: the slot stores its epoch-hour; a stale
-    /// slot (wraparound or first write) resets the direct/retry PAIR so
-    /// both counters always belong to the same generation. `direct` picks
-    /// the counter (true = affinity direct hit, false = retry success).
-    fn conv_bump(&self, direct: bool) {
-        const R: std::sync::atomic::Ordering = std::sync::atomic::Ordering::Relaxed;
-        let hour = chrono::Utc::now().timestamp() / 3600;
-        let idx = (hour % 24) as usize;
-        if self.conv_hour[idx].load(R) != hour {
-            self.conv_hour[idx].store(hour, R);
-            self.conv_direct[idx].store(0, R);
-            self.conv_retry[idx].store(0, R);
-        }
-        if direct {
-            self.conv_direct[idx].fetch_add(1, R);
-        } else {
-            self.conv_retry[idx].fetch_add(1, R);
-        }
-    }
-
-    /// Windowed convergence snapshot: slots that were written this
-    /// generation only (hour != 0), ascending by hour.
-    fn conv_windows(&self) -> Vec<ConvWindow> {
-        const R: std::sync::atomic::Ordering = std::sync::atomic::Ordering::Relaxed;
-        let mut out = Vec::new();
-        for idx in 0..24 {
-            let hour = self.conv_hour[idx].load(R);
-            if hour != 0 {
-                out.push(ConvWindow {
-                    hour,
-                    direct: self.conv_direct[idx].load(R),
-                    retry: self.conv_retry[idx].load(R),
-                });
-            }
-        }
-        out.sort_by_key(|w| w.hour);
-        out
-    }
 
 
     pub fn snapshot(&self) -> RollbackStatsSnapshot {
@@ -934,7 +871,6 @@ impl RollbackStats {
             guard_error: self.guard_error.load(Relaxed),
             no_fallback_return: self.no_fallback_return.load(Relaxed),
             affinity_direct: self.affinity_direct.load(Relaxed),
-            convergence_windows: self.conv_windows(),
             models: self.model_snapshots(),
         }
     }

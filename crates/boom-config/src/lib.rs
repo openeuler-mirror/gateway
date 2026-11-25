@@ -452,6 +452,9 @@ pub struct ProviderParams {
     /// Custom headers to send with every request.
     #[serde(default)]
     pub headers: HashMap<String, String>,
+    /// Fill missing OpenAI-compatible request fields for this deployment.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub request_defaults: serde_json::Map<String, serde_json::Value>,
     /// Temperature override.
     pub temperature: Option<f64>,
     /// Max tokens override.
@@ -577,7 +580,7 @@ pub struct GeneralSettings {
     /// Up to 3 HTTP headers whose values are recorded (values only, one
     /// independent `boom_request_log.user_tagN` column per header in list
     /// order, e.g. `user_tag_headers: [X-User-Tag, X-User-Id]` →
-    /// user_tag1=alice, user_tag2=7f3a) for per-user attribution when one
+    /// user_tag1=demo_user, user_tag2=7f3a) for per-user attribution when one
     /// key is shared by multiple users. None/empty disables extraction.
     /// Display-only attribution — must never participate in auth/routing
     /// decisions.
@@ -1160,6 +1163,16 @@ impl Config {
         // Compose per-section validation. Each settings struct owns its own
         // semantic checks; Config::validate just orchestrates them so new
         // sections plug in without growing this method.
+        for entry in &self.model_list {
+            let params = &entry.litellm_params;
+            boom_core::request_defaults::validate_for_model(&params.model, &params.request_defaults)
+                .map_err(|err| {
+                    GatewayError::ConfigError(format!(
+                        "model_list entry '{}': {err}",
+                        entry.model_name
+                    ))
+                })?;
+        }
         self.router_settings.kvc_aware.validate()?;
         if self
             .router_settings
@@ -1566,21 +1579,21 @@ mod tests {
         assert!(msg.contains("BOOM_MASTER_KEY"), "msg: {}", msg);
         assert!(msg.contains("BOOM_DATABASE_URL"), "msg: {}", msg);
 
-        env::set_var(key, "sk-test");
+        env::set_var(key, "__YOUR_API_KEY__");
         assert!(bootstrap_from_env().is_err());
         env::remove_var(key);
 
-        env::set_var(db, "postgres://u:p@h/db");
+        env::set_var(db, "postgres://__YOUR_DB_USER__:__YOUR_DB_PASSWORD__@__YOUR_DB_HOST__/__YOUR_DB_NAME__");
         assert!(bootstrap_from_env().is_err());
         env::remove_var(db);
 
-        env::set_var(key, "sk-test");
-        env::set_var(db, "postgres://u:p@h/db");
+        env::set_var(key, "__YOUR_API_KEY__");
+        env::set_var(db, "postgres://__YOUR_DB_USER__:__YOUR_DB_PASSWORD__@__YOUR_DB_HOST__/__YOUR_DB_NAME__");
         let cfg = bootstrap_from_env().expect("both vars set");
-        assert_eq!(cfg.general_settings.master_key.as_deref(), Some("sk-test"));
+        assert_eq!(cfg.general_settings.master_key.as_deref(), Some("__YOUR_API_KEY__"));
         assert_eq!(
             cfg.general_settings.database_url.as_deref(),
-            Some("postgres://u:p@h/db")
+            Some("postgres://__YOUR_DB_USER__:__YOUR_DB_PASSWORD__@__YOUR_DB_HOST__/__YOUR_DB_NAME__")
         );
         // Field-level `#[serde(default = "...")]` functions must run — this
         // is why bootstrap parses a document instead of Config::default().
@@ -1616,15 +1629,15 @@ mod tests {
     #[test]
     fn test_mask_secrets_in_place_masks_known_fields() {
         let mut v = serde_json::json!({
-            "master_key": "sk-live-123",
-            "database_url": "postgres://user:pw@host/db",
+            "master_key": "__YOUR_API_KEY__",
+            "database_url": "postgres://__YOUR_DB_USER__:__YOUR_DB_PASSWORD__@__YOUR_DB_HOST__/__YOUR_DB_NAME__",
             "model_list": [
                 {
                     "litellm_params": {
-                        "api_key": "sk-real",
-                        "model": "gpt-4",
+                        "api_key": "__YOUR_API_KEY__",
+                        "model": "demo_model",
                         "headers": {
-                            "Authorization": "Bearer secret",
+                            "Authorization": "__YOUR_TOKEN__",
                             "X-Custom": "keep-me"
                         }
                     }
@@ -1645,7 +1658,7 @@ mod tests {
         );
         // Non-secret fields preserved verbatim, including case-insensitive
         // matching for Authorization.
-        assert_eq!(v["model_list"][0]["litellm_params"]["model"], "gpt-4");
+        assert_eq!(v["model_list"][0]["litellm_params"]["model"], "demo_model");
         assert_eq!(
             v["model_list"][0]["litellm_params"]["headers"]["X-Custom"],
             "keep-me"
@@ -1658,7 +1671,7 @@ mod tests {
         // Null means "field unset" — UI must distinguish from "configured".
         let mut v = serde_json::json!({
             "master_key": null,
-            "api_key": "sk-real"
+            "api_key": "__YOUR_API_KEY__"
         });
         mask_secrets_in_place(&mut v);
         assert!(v["master_key"].is_null());
@@ -1679,6 +1692,7 @@ mod tests {
             tpm: None,
             timeout: 120,
             headers: HashMap::new(),
+            request_defaults: serde_json::Map::new(),
             temperature: None,
             max_tokens: None,
             max_context_tokens: None,
@@ -1702,6 +1716,7 @@ mod tests {
             tpm: None,
             timeout: 120,
             headers: HashMap::new(),
+            request_defaults: serde_json::Map::new(),
             temperature: None,
             max_tokens: None,
             max_context_tokens: None,
@@ -1719,6 +1734,38 @@ mod tests {
     #[test]
     fn test_auto_detect_gemini() {
         assert_eq!(auto_detect_provider("gemini-2.0-flash"), "gemini");
+    }
+
+    #[test]
+    fn test_validate_request_defaults_provider() {
+        let mut config: Config = serde_yaml::from_str(
+            "model_list:
+              - model_name: test-deployment
+                litellm_params:
+                  model: vllm/claude-model
+                  request_defaults:
+                    temperature: 0.2",
+        )
+        .unwrap();
+        assert!(config.validate().is_ok());
+
+        for (model, provider) in [
+            ("anthropic/claude-model", "anthropic"),
+            ("azure/deployment", "azure"),
+            ("gemini/model", "gemini"),
+            ("bedrock/model", "bedrock"),
+            ("claude-model", "anthropic"),
+            ("amazon.model", "bedrock"),
+        ] {
+            config.model_list[0].litellm_params.model = model.into();
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains("test-deployment"), "{error}");
+            assert!(error.contains("request_defaults"), "{error}");
+            assert!(error.contains(&format!("provider: {provider}")), "{error}");
+        }
+
+        config.model_list[0].litellm_params.request_defaults.clear();
+        assert!(config.validate().is_ok());
     }
 
     #[test]
@@ -2010,6 +2057,10 @@ pub struct TraceConfig {
     /// attributes (request.id, time_in_queue, user.id) are set.
     #[serde(default = "default_trace_capture_body")]
     pub capture_body: bool,
+    /// When true, `gen_ai.tool.definitions` also carries each tool's
+    /// description and parameters. Default false — names and types only.
+    #[serde(default)]
+    pub capture_tool_details: bool,
     /// Body truncation threshold (bytes). Bodies larger than this are
     /// truncated to the threshold and a `boom-gateway.body_truncated=true`
     /// attribute is set. Default 16 KiB — large enough for typical prompts,
@@ -2066,6 +2117,7 @@ impl Default for TraceConfig {
             enabled: false,
             otlp: boom_core::OtlpConfig::default(),
             capture_body: default_trace_capture_body(),
+            capture_tool_details: false,
             max_body_bytes: default_trace_max_body_bytes(),
             propagate_only: default_trace_propagate_only(),
             report_filter: TraceFilterConfig::default(),
@@ -2116,7 +2168,7 @@ mod trace_config_tests {
 enabled: true
 otlp:
   enabled: true
-  endpoint: http://collector:4318
+  endpoint: http://example.internal:4318
 capture_body: false
 max_body_bytes: 4096
 propagate_only: false
@@ -2139,6 +2191,18 @@ report_filter:
         let yaml = "enabled: true\nmetrics:\n  enabled: true\n";
         let cfg: TraceConfig = serde_yaml::from_str(yaml).unwrap();
         assert!(cfg.metrics.enabled);
+    }
+
+    #[test]
+    fn trace_config_parses_capture_tool_details() {
+        let cfg: Config = serde_yaml::from_str(
+            "trace:\n  capture_tool_details: true\n",
+        )
+        .unwrap();
+        assert!(cfg.trace.expect("trace section").capture_tool_details);
+
+        let cfg: Config = serde_yaml::from_str("trace:\n  enabled: true\n").unwrap();
+        assert!(!cfg.trace.expect("trace section").capture_tool_details);
     }
 
     #[test]

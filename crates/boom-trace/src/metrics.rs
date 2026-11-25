@@ -38,10 +38,9 @@
 //!
 //! ## Cardinality
 //!
-//! Labels are restricted to a bounded set: `gen_ai.operation.name`
-//! (chat|messages|responses), `gen_ai.request.model`,
-//! `ai.gateway.target.deployment.id`, and `error.type` (truncated, error
-//! series only). Never `user.id` / `request_id` / client IP.
+//! (chat|text_completion), `gen_ai.request.model`,
+//! `ai.gateway.target.deployment.id`, and `error.type` (stable bounded type,
+//! `_OTHER` when absent, error series only). Never `user.id` / `request_id` / client IP.
 
 use crate::span::RequestSpan;
 use dashmap::DashMap;
@@ -144,10 +143,14 @@ impl MetricsRecorder {
             operation: operation_name(&span.api_path),
             model: span.model.clone(),
             deployment_id: span.deployment_id.clone(),
-            error_type: errored
-                .then(|| span.error_message.as_ref())
-                .flatten()
-                .map(|m| truncate_bounded(m, ERROR_TYPE_MAX_CHARS)),
+            error_type: errored.then(|| {
+                let error_type = span
+                    .error_type
+                    .as_deref()
+                    .filter(|error_type| !error_type.trim().is_empty())
+                    .unwrap_or("_OTHER");
+                truncate_bounded(error_type, ERROR_TYPE_MAX_CHARS)
+            }),
         };
 
         // Server duration from span start/end: guard Drop (or LoggedStream
@@ -383,15 +386,12 @@ fn escape_label_value(s: &str) -> String {
 }
 
 /// Map the gateway API path onto the bounded `gen_ai.operation.name` value
-/// set. Unknown paths fall back to the raw path (still a small bounded set
-/// of configured routes). Shared with the traces channel's dual-write.
+/// set. Unknown paths use the bounded `chat` fallback. Shared with the traces channel.
 pub(crate) fn operation_name(api_path: &str) -> String {
-    if api_path.starts_with("/v1/responses") {
-        "responses".to_string()
-    } else if api_path == "/v1/messages" {
-        "messages".to_string()
+    if matches!(api_path, "/v1/completions" | "/completions") {
+        "text_completion".to_string()
     } else {
-        // /v1/chat/completions, /v1/completions (legacy), anything else.
+        // Chat Completions, Messages, Responses Create, and unknown paths.
         "chat".to_string()
     }
 }
@@ -431,9 +431,10 @@ mod tests {
     #[test]
     fn operation_name_maps_paths_onto_bounded_set() {
         assert_eq!(operation_name("/v1/chat/completions"), "chat");
-        assert_eq!(operation_name("/v1/completions"), "chat");
-        assert_eq!(operation_name("/v1/messages"), "messages");
-        assert_eq!(operation_name("/v1/responses"), "responses");
+        assert_eq!(operation_name("/v1/completions"), "text_completion");
+        assert_eq!(operation_name("/v1/messages"), "chat");
+        assert_eq!(operation_name("/v1/responses"), "chat");
+        assert_eq!(operation_name("/v1/unknown"), "chat");
     }
 
     #[test]
@@ -456,6 +457,7 @@ mod tests {
         // label value that realistically contains specials.
         let recorder = MetricsRecorder::new();
         let mut span = make_span("/v1/chat/completions", false);
+        span.set_error_type("quote \" backslash \\ newline \n".to_string());
         span.finalize_error(2_000_000_000, "quote \" backslash \\ newline \n".to_string());
         recorder.record_request_done(&span);
         let text = recorder.render();
@@ -472,7 +474,7 @@ mod tests {
         RequestSpan::new(
             "r-metrics".to_string(),
             &make_w3c(),
-            "gpt-4".to_string(),
+            "demo_model".to_string(),
             api_path.to_string(),
             is_stream,
             1_000_000_000,
@@ -495,7 +497,7 @@ mod tests {
         recorder.record_request_done(&span);
 
         let text = recorder.render();
-        let labels = "gen_ai.operation.name=\"chat\",gen_ai.request.model=\"gpt-4\",ai.gateway.target.deployment.id=\"dep-1\"";
+        let labels = "gen_ai.operation.name=\"chat\",gen_ai.request.model=\"demo_model\",ai.gateway.target.deployment.id=\"dep-1\"";
         assert!(text.contains("# TYPE http.server.request.duration_seconds histogram\n"));
         assert!(text.contains(&format!(
             "http.server.request.duration_seconds_count{{{labels}}} 1\n"
@@ -530,7 +532,7 @@ mod tests {
             recorder.record_request_done(&span);
         }
         let text = recorder.render();
-        let labels = "gen_ai.operation.name=\"chat\",gen_ai.request.model=\"gpt-4\"";
+        let labels = "gen_ai.operation.name=\"chat\",gen_ai.request.model=\"demo_model\"";
         assert!(text.contains(&format!(
             "http.server.request.duration_seconds_bucket{{{labels},le=\"0.005\"}} 1\n"
         )));
@@ -552,7 +554,7 @@ mod tests {
         span.finalize_ok(1_005_000_000); // exactly 5ms == the le="0.005" boundary
         recorder.record_request_done(&span);
         let text = recorder.render();
-        let labels = "gen_ai.operation.name=\"chat\",gen_ai.request.model=\"gpt-4\"";
+        let labels = "gen_ai.operation.name=\"chat\",gen_ai.request.model=\"demo_model\"";
         assert!(text.contains(&format!(
             "http.server.request.duration_seconds_bucket{{{labels},le=\"0.005\"}} 1\n"
         )));
@@ -562,15 +564,25 @@ mod tests {
     }
 
     #[test]
-    fn error_span_labels_carry_bounded_error_type() {
+    fn error_span_labels_carry_stable_error_type() {
         let recorder = MetricsRecorder::new();
         let mut span = make_span("/v1/messages", false);
+        span.set_error_type("upstream_error".to_string());
         span.finalize_error(2_000_000_000, "x".repeat(64));
         recorder.record_request_done(&span);
         let text = recorder.render();
-        assert!(text.contains(&format!("error.type=\"{}\"", "x".repeat(32))));
-        assert!(!text.contains(&format!("error.type=\"{}\"", "x".repeat(33))));
-        assert!(text.contains("gen_ai.operation.name=\"messages\""));
+        assert!(text.contains("error.type=\"upstream_error\""));
+        assert!(!text.contains("error.type=\"xxxxxxxx"));
+        assert!(text.contains("gen_ai.operation.name=\"chat\""));
+    }
+
+    #[test]
+    fn error_span_labels_default_to_other() {
+        let recorder = MetricsRecorder::new();
+        let mut span = make_span("/v1/chat/completions", false);
+        span.finalize_error(2_000_000_000, "full upstream message".to_string());
+        recorder.record_request_done(&span);
+        assert!(recorder.render().contains("error.type=\"_OTHER\""));
     }
 
     #[test]
@@ -584,7 +596,7 @@ mod tests {
         span.finalize_error(2_000_000_000, "upstream 500".to_string());
         recorder.record_request_done(&span);
         let text = recorder.render();
-        let labels = "gen_ai.operation.name=\"chat\",gen_ai.request.model=\"gpt-4\"";
+        let labels = "gen_ai.operation.name=\"chat\",gen_ai.request.model=\"demo_model\"";
         assert!(text.contains(&format!(
             "http.client.active_requests{{{labels}}} 0\n"
         )));
@@ -593,12 +605,12 @@ mod tests {
     #[test]
     fn server_active_pairs_to_zero() {
         let recorder = MetricsRecorder::new();
-        recorder.add_server_active(1, "gpt-4", "/v1/chat/completions");
-        recorder.add_server_active(-1, "gpt-4", "/v1/chat/completions");
+        recorder.add_server_active(1, "demo_model", "/v1/chat/completions");
+        recorder.add_server_active(-1, "demo_model", "/v1/chat/completions");
         let text = recorder.render();
         assert!(text.contains("# TYPE http.server.active_requests gauge\n"));
         assert!(text.contains(
-            "http.server.active_requests{gen_ai.operation.name=\"chat\",gen_ai.request.model=\"gpt-4\"} 0\n"
+            "http.server.active_requests{gen_ai.operation.name=\"chat\",gen_ai.request.model=\"demo_model\"} 0\n"
         ));
     }
 
@@ -614,7 +626,7 @@ mod tests {
         let mut span = make_span("/v1/chat/completions", false);
         span.finalize_ok(2_000_000_000); // 1s
         recorder.record_request_done(&span);
-        let l = "gen_ai.operation.name=\"chat\",gen_ai.request.model=\"gpt-4\"";
+        let l = "gen_ai.operation.name=\"chat\",gen_ai.request.model=\"demo_model\"";
         let expected = format!(
             concat!(
                 "# HELP http.server.request.duration_seconds Gateway server-side request duration (ingress to response completion).\n",

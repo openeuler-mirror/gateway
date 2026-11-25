@@ -44,6 +44,9 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
     // 2. Model deployments + aliases (boom-routing).
     tracing::info!("Migration 2/7: deployment...");
     run_ddl_on_conn(&mut conn, boom_routing::migrations::deployment_ddl()).await?;
+    if columns_missing(&mut conn, "boom_model_deployment", &["request_defaults"]).await {
+        run_ddl_on_conn(&mut conn, boom_routing::migrations::migration_add_request_defaults()).await?;
+    }
     // Add deployment_id column to existing tables (no-op if already present).
     let _ = sqlx::query(
         r#"ALTER TABLE boom_model_deployment ADD COLUMN IF NOT EXISTS deployment_id TEXT"#,

@@ -3869,24 +3869,6 @@
       html += '</div>';
     }
 
-    // ── 维测①:窗口化收敛率(1h 槽,墙钟对齐)── 生命周期累计值会被
-    // 冷 trie 期的重试长期压低;窗口化回答"现在是否在改善"。
-    const wins = (data.convergence_windows || []).slice(-24);
-    if (wins.length) {
-      html += '<div class="rb-tree-section">' + t("debug.rollback.conv_windows") + '</div>';
-      html += '<table class="data-table rb-mini-table"><thead><tr>' +
-        '<th>' + t("debug.rollback.conv_hour") + '</th><th class="num">' + t("debug.rollback.conv_direct") + '</th>' +
-        '<th class="num">' + t("debug.rollback.conv_retry") + '</th><th class="num">' + t("debug.rollback.convergence") + '</th></tr></thead><tbody>';
-      for (const w of wins) {
-        const total = w.direct + w.retry;
-        const pct = total > 0 ? Math.round(w.direct * 100 / total) : null;
-        const hourLabel = new Date(w.hour * 3600 * 1000).toISOString().slice(11, 13) + ":00";
-        html += '<tr><td class="mono">' + hourLabel + '</td><td class="num">' + w.direct + '</td><td class="num">' + w.retry + '</td>' +
-          '<td class="num">' + (pct === null ? "—" : pct + '%') + '</td></tr>';
-      }
-      html += '</tbody></table>';
-    }
-
     // ── 维测④:识别自检——新报错形态离线验证,零副作用。
     html += '<div class="rb-tree-section">' + t("debug.rollback.selftest_title") + '</div>';
     html += '<div class="rb-selftest"><p class="kcs-breakdown">' + t("debug.rollback.selftest_hint") + '</p>' +
@@ -6594,6 +6576,7 @@
     }
     const p = prefill || {};
     const headers = p.headers || {};
+    const requestDefaults = p.request_defaults || {};
     const modelInfo = p.model_info || {};
     // Unified visibility. Legacy rows without the field infer private from
     // a non-null allowed_teams array.
@@ -6676,6 +6659,7 @@
             <div class="form-group"><label>${t("form.model.timeout")} ${tip(t("tip.model.timeout"))}</label><input id="m-model-timeout" type="number" value="${p.timeout || 1200}"></div>
             <div class="form-group"><label>${t("form.model.temp")} ${tip(t("tip.model.temp"))}</label><input id="m-model-temp" type="number" step="0.1" value="${p.temperature || ""}"></div>
             <div class="form-group"><label>${t("form.model.maxtok")} ${tip(t("tip.model.maxtok"))}</label><input id="m-model-maxtok" type="number" value="${p.max_tokens || ""}"></div>
+            <div class="form-group field-full"><label for="m-model-request-defaults">${t("form.model.request_defaults")} ${tip(t("tip.model.request_defaults"))}</label><textarea id="m-model-request-defaults" rows="5" style="font-family:var(--mono);font-size:12px" placeholder='{"reasoning_effort":"medium"}'>${esc(Object.keys(requestDefaults).length ? JSON.stringify(requestDefaults, null, 2) : "")}</textarea><p class="modal-hint">${t("hint.model.request_defaults")}</p></div>
           </div>
         </div>
         <div class="form-card">
@@ -6795,6 +6779,15 @@
           catch (e) { throw new Error(t("config.error.invalid_json", { msg: e.message })); }
         }
         // Build model_info only when cost_template is selected.
+        const defaultsText = document.getElementById("m-model-request-defaults").value.trim();
+        let requestDefaults = {};
+        if (defaultsText) {
+          try { requestDefaults = JSON.parse(defaultsText); }
+          catch (e) { throw new Error(t("config.error.invalid_json", { msg: e.message })); }
+          if (!requestDefaults || Array.isArray(requestDefaults) || typeof requestDefaults !== "object") {
+            throw new Error(t("error.model.request_defaults_object"));
+          }
+        }
         const costTemplate = document.getElementById("m-model-cost-template").value;
         const modelInfo = {};
         if (costTemplate) modelInfo.cost_template = costTemplate;
@@ -6829,6 +6822,7 @@
             ? Array.from(document.querySelectorAll("#m-model-allowed-teams .team-pick.selected")).map((el) => el.dataset.value)
             : null,
           headers,
+          request_defaults: requestDefaults,
         };
         if (Object.keys(modelInfo).length > 0) body.model_info = modelInfo;
 

@@ -140,6 +140,7 @@ pub struct DeploymentRow {
     pub tpm: Option<i64>,
     pub timeout: i64,
     pub headers: serde_json::Value,
+    pub request_defaults: serde_json::Value,
     pub temperature: Option<f64>,
     pub max_tokens: Option<i32>,
     pub enabled: Option<bool>,
@@ -192,6 +193,7 @@ pub struct DeploymentProviderRow {
     pub aws_region_name: Option<String>,
     pub timeout: i64,
     pub headers: serde_json::Value,
+    pub request_defaults: serde_json::Value,
     pub deployment_id: Option<String>,
     pub client_type_header: Option<bool>,
     /// Whether this deployment also serves as catch-all for unmatched model
@@ -274,6 +276,7 @@ pub const DEPLOYMENT_CORE_COLUMNS: &[&str] = &[
     "allowed_teams",
     "visibility",
     "max_context_tokens",
+    "request_defaults",
 ];
 
 /// Build an INSERT statement for `boom_model_deployment` from the canonical
@@ -362,7 +365,7 @@ const DEPLOYMENT_ROW_SELECT_COLUMNS: &str = concat!(
     "source, deployment_id, quota_count_ratio, ",
     "max_inflight_queue_len, max_context_len, client_type_header, ",
     "serve_not_match, model_info, allowed_teams, visibility, ",
-    "max_context_tokens, created_at, updated_at"
+    "max_context_tokens, request_defaults, created_at, updated_at"
 );
 
 /// Canonical SELECT column list for provider-building reads
@@ -373,7 +376,7 @@ const PROVIDER_ROW_COLUMNS: &str = concat!(
     "aws_region_name, timeout, headers, deployment_id, client_type_header, ",
     "serve_not_match, quota_count_ratio, max_inflight_queue_len, ",
     "max_context_len, max_context_tokens, ",
-    "model_info, allowed_teams, visibility"
+    "model_info, allowed_teams, visibility, request_defaults"
 );
 
 /// SQL for `snapshot_db` — config export MUST include disabled rows.
@@ -382,7 +385,7 @@ const PROVIDER_ROW_COLUMNS: &str = concat!(
 /// statically verify the absence of `enabled IS NOT FALSE`. Putting the filter
 /// back here would silently turn "disable" into "delete" on the next
 /// `persist_config_in_place` → `sync_yaml_to_db` round-trip.
-const SNAPSHOT_DB_SQL: &str = "SELECT id, model_name, litellm_model, api_key, api_key_env, api_base, api_version, aws_region_name, aws_access_key_id, aws_secret_access_key, rpm, tpm, timeout, headers, temperature, max_tokens, enabled, auto_disabled, source, deployment_id, quota_count_ratio, max_inflight_queue_len, max_context_len, client_type_header, serve_not_match, model_info, allowed_teams, visibility, max_context_tokens, created_at, updated_at FROM boom_model_deployment ORDER BY model_name, created_at";
+const SNAPSHOT_DB_SQL: &str = "SELECT id, model_name, litellm_model, api_key, api_key_env, api_base, api_version, aws_region_name, aws_access_key_id, aws_secret_access_key, rpm, tpm, timeout, headers, temperature, max_tokens, enabled, auto_disabled, source, deployment_id, quota_count_ratio, max_inflight_queue_len, max_context_len, client_type_header, serve_not_match, model_info, allowed_teams, visibility, max_context_tokens, request_defaults, created_at, updated_at FROM boom_model_deployment ORDER BY model_name, created_at";
 
 /// Input for creating/updating a deployment in DB.
 ///
@@ -404,6 +407,7 @@ pub struct DeploymentInput {
     pub tpm: Option<i64>,
     pub timeout: i64,
     pub headers: serde_json::Value,
+    pub request_defaults: serde_json::Value,
     pub temperature: Option<f64>,
     pub max_tokens: Option<i32>,
     pub enabled: bool,
@@ -747,6 +751,7 @@ impl DeploymentStore {
                 // here = "bind supplies 25 parameters but statement requires
                 // 27" on every fresh-DB YAML boot (e2e-caught).
                 .bind(d.max_context_tokens)
+                .bind(&d.request_defaults)
                 .execute(&mut *conn)
                 .await?;
         }
@@ -925,7 +930,8 @@ impl DeploymentStore {
             .bind(allowed_teams_json(&input.allowed_teams))
             .bind(visibility_str(input.visibility))
             .bind(input.max_context_tokens)
-                .fetch_one(pool)
+            .bind(&input.request_defaults)
+            .fetch_one(pool)
             .await?;
 
         boom_state::revision::bump_best_effort(pool, boom_state::revision::CATEGORY_ROUTING)
@@ -972,12 +978,28 @@ impl DeploymentStore {
             .bind(allowed_teams_json(&input.allowed_teams))
             .bind(visibility_str(input.visibility))
             .bind(input.max_context_tokens)
-                .fetch_one(pool)
+            .bind(&input.request_defaults)
+            .fetch_one(pool)
             .await?;
 
         boom_state::revision::bump_best_effort(pool, boom_state::revision::CATEGORY_ROUTING)
             .await;
         Ok(row.get("id"))
+    }
+
+    /// Read the current defaults and lock the deployment until the caller
+    /// writes its update, so an omitted field cannot overwrite a concurrent edit.
+    pub async fn request_defaults_for_update(
+        conn: &mut sqlx::PgConnection,
+        id: uuid::Uuid,
+    ) -> Result<Option<serde_json::Map<String, serde_json::Value>>, sqlx::Error> {
+        let defaults = sqlx::query_scalar::<_, sqlx::types::Json<_>>(
+            "SELECT request_defaults FROM boom_model_deployment WHERE id = $1 FOR UPDATE",
+        )
+        .bind(id)
+        .fetch_optional(conn)
+        .await?;
+        Ok(defaults.map(|defaults| defaults.0))
     }
 
     /// Update a deployment in DB by ID. Returns the row's previous
@@ -986,7 +1008,7 @@ impl DeploymentStore {
     /// key keeps stale providers and lingers in /v1/models until a full
     /// reload.
     pub async fn update_db(
-        pool: &sqlx::PgPool,
+        conn: &mut sqlx::PgConnection,
         id: uuid::Uuid,
         input: &DeploymentInput,
     ) -> Result<Option<String>, sqlx::Error> {
@@ -1019,6 +1041,7 @@ impl DeploymentStore {
                    allowed_teams = $25,
                    visibility = $26,
                    max_context_tokens = $27,
+                   request_defaults = $28,
                    updated_at = NOW()
                WHERE id = $1
                RETURNING (SELECT model_name FROM old) AS old_model_name"#,
@@ -1050,13 +1073,9 @@ impl DeploymentStore {
         .bind(allowed_teams_json(&input.allowed_teams))
         .bind(visibility_str(input.visibility))
         .bind(input.max_context_tokens)
-        .fetch_optional(pool)
+        .bind(&input.request_defaults)
+        .fetch_optional(conn)
         .await?;
-
-        if result.is_some() {
-            boom_state::revision::bump_best_effort(pool, boom_state::revision::CATEGORY_ROUTING)
-                .await;
-        }
         Ok(result.map(|row| row.get::<Option<String>, _>("old_model_name")).flatten())
     }
 
@@ -1207,7 +1226,8 @@ mod tests {
                 model_info = COALESCE($24, model_info),
                 allowed_teams = $25,
                 visibility = $26,
-                max_context_tokens = $27
+                max_context_tokens = $27,
+                request_defaults = $28
         "#;
         for col in DEPLOYMENT_CORE_COLUMNS {
             let needle = format!(" {} ", col);

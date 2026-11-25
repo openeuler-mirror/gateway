@@ -177,6 +177,8 @@ pub struct OpenAIProvider {
     client_type_header: bool,
     custom_headers: Vec<(String, String)>,
     max_context_tokens: Option<u64>,
+    request_defaults: serde_json::Map<String, serde_json::Value>,
+    provider_type: Option<String>,
 }
 
 impl OpenAIProvider {
@@ -223,11 +225,24 @@ impl OpenAIProvider {
             client_type_header,
             custom_headers: Vec::new(),
             max_context_tokens,
+            request_defaults: serde_json::Map::new(),
+            provider_type: None,
         }
     }
 
     pub fn with_custom_headers(mut self, headers: Vec<(String, String)>) -> Self {
         self.custom_headers = headers;
+        self
+    }
+
+    pub fn with_request_defaults(mut self, defaults: serde_json::Map<String, serde_json::Value>) -> Self {
+        self.request_defaults = defaults;
+        self
+    }
+
+    /// Preserve the provider type parsed from the deployment model string.
+    pub fn with_provider_type(mut self, provider_type: &str) -> Self {
+        self.provider_type = Some(provider_type.to_string());
         self
     }
 
@@ -271,6 +286,7 @@ impl OpenAIProvider {
         // fields (service_tier, store, reasoning_effort, ...) reach OpenAI-
         // compatible upstreams as-is.
         let mut body = serde_json::to_value(&req).unwrap_or_default();
+        boom_core::request_defaults::apply(&mut body, &self.request_defaults);
 
         // Inject vllm_xargs for KV cache full reporting when requested by gateway.
         if kv_cache_report_full {
@@ -297,7 +313,7 @@ impl Provider for OpenAIProvider {
         // the same Value with the same serializer, so this is byte-identical
         // to what goes on the wire.
         if let Some(ref cap) = raw_capture {
-            cap.record_request_body(&body.to_string());
+            cap.record_request_body(self.name(), &body.to_string());
         }
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
 
@@ -395,9 +411,6 @@ impl Provider for OpenAIProvider {
         let gateway_headers = std::mem::take(&mut req.gateway_headers);
         let raw_capture = std::mem::take(&mut req.raw_capture);
         let mut body = self.build_request(req);
-        if let Some(ref cap) = raw_capture {
-            cap.record_request_body(&body.to_string());
-        }
         // Ensure stream is enabled and request usage in the final chunk.
         if let Some(obj) = body.as_object_mut() {
             obj.insert("stream".to_string(), serde_json::Value::Bool(true));
@@ -405,6 +418,9 @@ impl Provider for OpenAIProvider {
                 "stream_options".to_string(),
                 serde_json::json!({ "include_usage": true }),
             );
+        }
+        if let Some(ref cap) = raw_capture {
+            cap.record_request_body(self.name(), &body.to_string());
         }
 
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
@@ -586,6 +602,10 @@ impl Provider for OpenAIProvider {
 
     fn name(&self) -> &str {
         "openai"
+    }
+
+    fn provider_type(&self) -> &str {
+        self.provider_type.as_deref().unwrap_or("openai")
     }
 
     fn protocol(&self) -> ProviderProtocol {
@@ -790,6 +810,29 @@ mod tests {
         .await;
     }
 
+    #[test]
+    fn anthropic_thinking_takes_precedence_over_deployment_defaults() {
+        let mut req = request_with_headers(&[]);
+        req.from_anthropic_protocol = true;
+        req.extra.insert(
+            "thinking".to_string(),
+            serde_json::json!({"type": "disabled"}),
+        );
+        let defaults = serde_json::json!({
+            "reasoning_effort": "high",
+            "chat_template_kwargs": {"enable_thinking": true},
+            "temperature": 0.2
+        });
+        let provider = provider_for("http://localhost".to_string(), None)
+            .with_request_defaults(defaults.as_object().unwrap().clone());
+
+        let body = provider.build_request(req);
+        assert_eq!(body["reasoning_effort"], "none");
+        assert_eq!(body["temperature"], serde_json::json!(0.2));
+        assert!(body.get("thinking").is_none());
+        assert!(body.get("chat_template_kwargs").is_none());
+    }
+
     /// An explicit client-side reasoning_effort wins over the translation;
     /// `thinking` is still stripped.
     #[tokio::test]
@@ -924,14 +967,14 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
-            .and(header("Authorization", "Bearer sk-test-key"))
+            .and(header("Authorization", "Bearer __YOUR_API_KEY__"))
             .and(header("X-Gateway-Priority", "100"))
             .respond_with(ResponseTemplate::new(200).set_body_json(fake_completion_response()))
             .expect(1)
             .mount(&server)
             .await;
 
-        let provider = provider_for(server.uri(), Some("sk-test-key".to_string()));
+        let provider = provider_for(server.uri(), Some("__YOUR_API_KEY__".to_string()));
         let req = request_with_headers(&[("X-Gateway-Priority", "100")]);
         assert!(provider.chat(req).await.is_ok());
     }
@@ -1135,9 +1178,9 @@ mod tests {
     #[tokio::test]
     async fn chat_stream_data_prefix_without_space_parses() {
         let sse = concat!(
-            "data:{\"choices\":[{\"delta\":{\"content\":\"<think>\\n\\nHere\",\"name\":\"\",\"role\":\"assistant\"},\"index\":0}],\"created\":2143545432432,\"id\":\"653624532443\",\"model\":\"Qwen3.6-35B-MLP\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":0,\"prompt_tokens\":0,\"total_tokens\":0}}\n\n",
-            "data:{\"choices\":[{\"delta\":{\"content\":\"lo\"},\"index\":0}],\"created\":2143545432432,\"id\":\"653624532443\",\"model\":\"Qwen3.6-35B-MLP\",\"object\":\"chat.completion.chunk\"}\n\n",
-            "data:{\"choices\":[],\"created\":2143545432432,\"id\":\"653624532443\",\"model\":\"Qwen3.6-35B-MLP\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":7,\"prompt_tokens\":5,\"total_tokens\":12}}\n\n",
+            "data:{\"choices\":[{\"delta\":{\"content\":\"<think>\\n\\nHere\",\"name\":\"\",\"role\":\"assistant\"},\"index\":0}],\"created\":2143545432432,\"id\":\"653624532443\",\"model\":\"demo-model\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":0,\"prompt_tokens\":0,\"total_tokens\":0}}\n\n",
+            "data:{\"choices\":[{\"delta\":{\"content\":\"lo\"},\"index\":0}],\"created\":2143545432432,\"id\":\"653624532443\",\"model\":\"demo-model\",\"object\":\"chat.completion.chunk\"}\n\n",
+            "data:{\"choices\":[],\"created\":2143545432432,\"id\":\"653624532443\",\"model\":\"demo-model\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":7,\"prompt_tokens\":5,\"total_tokens\":12}}\n\n",
             "data:[DONE]\n\n",
         );
         let server = MockServer::start().await;

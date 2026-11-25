@@ -128,6 +128,9 @@ pub fn model_deployment_fields() -> &'static [FieldMeta] {
                     label_key: "form.model.maxtok", tip_key: "tip.model.maxtok",
                     home: ConfigHome::Db },
         // ── behavior ──
+        FieldMeta { field: "request_defaults", section: "tuning", input_type: "json",
+                    label_key: "form.model.request_defaults", tip_key: "tip.model.request_defaults",
+                    home: ConfigHome::Db },
         FieldMeta { field: "serve_not_match", section: "behavior", input_type: "bool",
                     label_key: "form.model.serve_not_match", tip_key: "tip.model.serve_not_match",
                     home: ConfigHome::Db },
@@ -642,7 +645,7 @@ mod tests {
             "model", "api_key", "api_base", "api_version",
             "aws_region_name", "aws_access_key_id", "aws_secret_access_key",
             "rpm", "tpm", "timeout", "headers", "temperature", "max_tokens",
-            "max_context_tokens",
+            "max_context_tokens", "request_defaults",
             // ModelEntry (top-level)
             "model_name", "enabled", "serve_not_match", "client_type_header",
             "allowed_teams", "visibility",

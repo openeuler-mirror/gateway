@@ -17,7 +17,7 @@ use boom_trace::{
 fn w3c() -> W3cContext {
     let mut ctx = parse_traceparent("00-0af76598164860bd9a43d7c1a31725ab-00f067aa0ba902b7-01")
         .expect("well-formed traceparent");
-    ctx.trace_state = "opencode_user_id=alice,vendor=acme".to_string();
+    ctx.trace_state = "opencode_user_id=demo_user,vendor=acme".to_string();
     ctx
 }
 
@@ -88,7 +88,7 @@ fn build_child_round_trips() {
 #[test]
 fn tracestate_value_lookup() {
     let ctx = w3c();
-    assert_eq!(ctx.tracestate_value("opencode_user_id"), Some("alice".to_string()));
+    assert_eq!(ctx.tracestate_value("opencode_user_id"), Some("demo_user".to_string()));
     assert_eq!(ctx.tracestate_value("vendor"), Some("acme".to_string()));
     assert_eq!(ctx.tracestate_value("missing"), None);
 
@@ -161,7 +161,7 @@ fn span_set_attribute_replaces_and_body_setters() {
     assert_eq!(span.attributes.len(), 2);
 
     let body = std::sync::Arc::new(serde_json::json!({"messages": []}));
-    span.set_llm_request(body.clone(), 0);
+    span.set_llm_request(body.clone(), 0, false);
     span.set_llm_response(body.clone(), 0);
     assert_eq!(span.attributes.len(), 4); // k, other, llm_request, llm_response
     span.set_deployment_id("dep-1".to_string());
@@ -343,7 +343,7 @@ async fn guard_mark_error_routes_to_finalize_error() {
             true,
         )
         .expect("started");
-        g.mark_error("upstream 500".to_string());
+        g.mark_error("upstream_error".to_string(), "upstream 500".to_string());
     }
     let snap = reg.snapshot().await;
     assert_eq!(snap.total_spans_error, 1);
@@ -369,7 +369,7 @@ async fn guard_attribute_setters_and_child_span_id() {
     .expect("started");
     assert_eq!(g.request_id(), "req-4");
     g.set_attribute("custom", SpanAttributeValue::String("v".to_string()));
-    g.set_llm_request(body.clone(), 0);
+    g.set_llm_request(body.clone(), 0, false);
     g.set_llm_response(body.clone(), 0);
     let child_id = g.child_parent_span_id();
     assert_ne!(child_id, [0u8; 8]); // 非零

@@ -34,9 +34,12 @@ function loadBlock(startMarker, endMarker, returns) {
   const end = src.indexOf(endMarker);
   if (start < 0 || end < 0 || end <= start) fail(`block not found: ${startMarker}`);
   const block = src.slice(start, end);
-  return new Function('t', 'esc', 'tip', 'renderDeployCell', 'visibilityBadgeFor', 'vendorOf', 'document', 'window',
+  // setupModelsFilter 桩:上游 !144 视觉重构后 renderModelsTable 会调用它
+  const noop = () => {};
+  const identity = (m) => m;  // applyModelFilters 桩:无过滤态,原样返回
+  return new Function('t', 'esc', 'tip', 'renderDeployCell', 'visibilityBadgeFor', 'vendorOf', 'document', 'window', 'setupModelsFilter', 'refreshModelsVendorOptions', 'applyModelFilters',
     block + `\nreturn { ${returns} };`
-  )(t, esc, tip, renderDeployCell, visibilityBadgeFor, vendorOf, document, globalThis);
+  )(t, esc, tip, renderDeployCell, visibilityBadgeFor, vendorOf, document, globalThis, noop, noop, identity);
 }
 
 const pool = loadBlock('  function renderModelsTable', '  async function showNewModelModal',
@@ -107,13 +110,6 @@ const rbSnapshot = {
   "guard_error": 1,
   "no_fallback_return": 1,
   "affinity_direct": 1,
-  "convergence_windows": [
-    {
-      "hour": 498564,
-      "direct": 1,
-      "retry": 1
-    }
-  ],
   "models": {
     "glm-5.3": {
       "identify_miss": 1,
@@ -206,7 +202,6 @@ if (rbHtml.includes('events_title') || rbHtml.includes('matrix_title')) fail('ev
 if (src.includes('_rbEvData') || src.includes('_rbEventsApply')) fail('events handlers must be gone');
 
 // 维测渲染:窗口收敛率 / 池状态 / 自检表单
-if (!rbHtml.includes('debug.rollback.conv_windows')) fail('convergence windows section missing');
 if (!rbHtml.includes('debug.rollback.selftest_title')) fail('self-test form missing');
 if (!src.includes('window._rbSelfTest')) fail('self-test handler missing');
 
@@ -244,7 +239,7 @@ if (!rbHtml.includes('debug.rollback.disabled')) fail('disabled marker rendered'
 const poolsSeg = rbHtml.split('debug.rollback.pools_title')[1] || '';
 if (!poolsSeg.includes('rb-tree-head')) fail('collapsible pool head missing');
 if (!poolsSeg.includes("toggle('rb-open')") && !poolsSeg.includes('toggle(\'rb-open\')')) fail('collapse toggle wired');
-console.log('SMOKE OK: diagnostics — pool states (collapsible), hourly convergence, deploy sub-rows, self-test form');
+console.log('SMOKE OK: diagnostics — pool states (collapsible), deploy sub-rows, self-test form');
 
 // ── 4. KVC DFX 表:Detail 列 + 错误详情链接(与主日志页同款) ─────
 // 提取块引用闭包变量 debugEnabled / promptLogEnabled → 以参数注入。
@@ -253,10 +248,10 @@ const formatNumber = (v) => String(v);
 const formatTimestamp = (v) => String(v);
 function loadKvcBlock(debugEnabled, promptLogEnabled) {
   return new Function('t', 'esc', 'formatTimestamp', 'formatNumber', 'fmtPrefixHit',
-    'debugEnabled', 'promptLogEnabled',
+    'debugEnabled', 'promptLogEnabled', 'instanceChip',
     src.slice(src.indexOf('  function kvcDfxShellHtml() {'), src.indexOf('  function setupKvcFilters() {')) +
     '\nreturn { kvcDfxShellHtml, renderKvcDfxRow };'
-  )(t, esc, formatTimestamp, formatNumber, fmtPrefixHit, debugEnabled, promptLogEnabled);
+  )(t, esc, formatTimestamp, formatNumber, fmtPrefixHit, debugEnabled, promptLogEnabled, (id) => String(id));
 }
 // 表头:16 列,Detail 在末尾;筛选行 16 格,10 个输入框不变
 const kvcShell = loadKvcBlock(false, false).kvcDfxShellHtml();
