@@ -167,6 +167,43 @@ fn assemble_sse_response(text: &str) -> Result<ChatCompletionResponse, String> {
 }
 
 /// OpenAI provider — also serves as the base for Azure (same API format).
+/// Downgrade a serialized chat body's `response_format` (json_schema /
+/// json_object) into prompt instructions, stripping the field. The schema
+/// text is appended as a leading system message so the model still aims at
+/// the shape; strictness is best-effort on upstreams without native support.
+fn downgrade_response_format_to_prompt(body: &serde_json::Value) -> serde_json::Value {
+    let mut out = body.clone();
+    out.as_object_mut().map(|o| {
+        o.remove("response_format");
+    });
+    let describe = |rf: &serde_json::Value| -> String {
+        let ty = rf.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        if ty == "json_schema" {
+            let js = rf.get("json_schema").cloned().unwrap_or_default();
+            let name = js.get("name").and_then(|n| n.as_str()).unwrap_or("response");
+            let schema = js.get("schema").unwrap_or(&serde_json::Value::Null);
+            format!(
+                "Respond with a single JSON object matching this schema (field `{name}`):\n{schema}\n                 Output ONLY the JSON object, no prose, no code fences."
+            )
+        } else {
+            "Respond with a single valid JSON object. Output ONLY the JSON, no prose.".to_string()
+        }
+    };
+    if let Some(rf) = body.get("response_format") {
+        let instruction = describe(rf);
+        if let Some(obj) = out.as_object_mut() {
+            if let Some(messages) = obj.get_mut("messages").and_then(|m| m.as_array_mut()) {
+                let sys = serde_json::json!({
+                    "role": "system",
+                    "content": instruction,
+                });
+                messages.insert(0, sys);
+            }
+        }
+    }
+    out
+}
+
 pub struct OpenAIProvider {
     client: Client,
     api_key: Option<String>,
@@ -335,6 +372,67 @@ impl Provider for OpenAIProvider {
         let status = resp.status();
         if !status.is_success() {
             let error_body = resp.text().await.unwrap_or_default();
+            // Structured-output fallback: many OpenAI-compatible upstreams
+            // (free-tier aggregators, older vLLM) reject
+            // `response_format.type = "json_schema"` with a 400 even though
+            // they accept everything else. Downgrade once — move the schema
+            // into a system instruction and strip the field — and retry;
+            // clients like Codex send this on every title-generation turn.
+            if status.as_u16() == 400
+                && body.get("response_format").is_some()
+                && !error_body.is_empty()
+                && error_body.contains("response_format")
+            {
+                tracing::warn!(
+                    "upstream rejected response_format; retrying with prompt-injected schema"
+                );
+                let downgraded = downgrade_response_format_to_prompt(&body);
+                let mut builder = self.client.post(&url);
+                if let Some(ref key) = self.api_key {
+                    builder = builder.bearer_auth(key);
+                }
+                builder = crate::apply_gateway_headers(builder, &gateway_headers);
+                let resp2 = builder.json(&downgraded).send().await.map_err(|e| {
+                    tracing::error!("OpenAI retry failed: {}", e);
+                    GatewayError::ProviderError("Upstream provider unavailable".to_string())
+                })?;
+                let status2 = resp2.status();
+                if status2.is_success() {
+                    // Minimal parse mirroring the success path below (the
+                    // full parser is inline there; keep the retry lean).
+                    let raw2 = resp2.text().await.unwrap_or_default();
+                    match serde_json::from_str::<ChatCompletionResponse>(&raw2) {
+                        Ok(mut parsed) => {
+                            if parsed.id.is_empty()
+                                && parsed.object.is_empty()
+                                && parsed.choices.is_empty()
+                                && parsed.usage.is_none()
+                            {
+                                return Err(GatewayError::UpstreamParseError {
+                                    parse_error: "no recognizable completion fields".to_string(),
+                                    raw_body: raw2,
+                                });
+                            }
+                            parsed.raw_response = Some(raw2);
+                            return Ok(parsed);
+                        }
+                        Err(e) => {
+                            return Err(GatewayError::UpstreamParseError {
+                                parse_error: e.to_string(),
+                                raw_body: raw2,
+                            });
+                        }
+                    }
+                }
+                let error_body2 = resp2.text().await.unwrap_or_default();
+                if let Some(ref cap) = raw_capture {
+                    cap.push_response_frame(error_body2.clone());
+                }
+                return Err(GatewayError::UpstreamError {
+                    status: status2.as_u16(),
+                    message: error_body2,
+                });
+            }
             if let Some(ref cap) = raw_capture {
                 cap.push_response_frame(error_body.clone());
             }
@@ -1175,6 +1273,37 @@ mod tests {
     /// non-standard `name` field inside delta). The streaming parser used to
     /// require `"data: "` and silently dropped every chunk — empty reply, no
     /// error. Payload mirrors the real upstream shape.
+    #[test]
+    fn response_format_downgrade_moves_schema_to_system() {
+        let body = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "gen"}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "t", "schema": {"type": "object"}, "strict": true},
+            },
+        });
+        let out = downgrade_response_format_to_prompt(&body);
+        assert!(out.get("response_format").is_none(), "field must be stripped");
+        let messages = out["messages"].as_array().unwrap();
+        assert_eq!(messages[0]["role"], "system");
+        let sys = messages[0]["content"].as_str().unwrap();
+        assert!(sys.contains("`t`"), "carries schema name");
+        assert_eq!(messages.len(), 2, "original user message preserved");
+    }
+
+    #[test]
+    fn response_format_downgrade_json_object_keeps_user_messages() {
+        let body = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "gen"}],
+            "response_format": {"type": "json_object"},
+        });
+        let out = downgrade_response_format_to_prompt(&body);
+        assert!(out.get("response_format").is_none());
+        assert_eq!(out["messages"].as_array().unwrap().len(), 2);
+    }
+
     #[tokio::test]
     async fn chat_stream_data_prefix_without_space_parses() {
         let sse = concat!(
