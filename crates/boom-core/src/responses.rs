@@ -725,6 +725,26 @@ fn convert_request(
         }
         ResponsesInput::Items(current) => items.extend(current.iter().cloned()),
     }
+    // Pending reasoning from rs_ items: DeepSeek-class thinking upstreams
+    // attach `reasoning_content` to the SAME assistant message as the
+    // visible content / tool_calls, and require it back that way ("must be
+    // passed back"). Hold the text and merge into the next assistant item
+    // (message / function_call / custom_tool_call); a non-assistant item
+    // flushes it as a standalone assistant turn first (degenerate ordering,
+    // nothing lost).
+    let mut pending_reasoning: Option<String> = None;
+    let mut flush_reasoning = |messages: &mut Vec<Message>, pending: &mut Option<String>| {
+        if let Some(r) = pending.take() {
+            messages.push(Message {
+                role: MessageRole::Assistant,
+                content: MessageContent::Text(String::new()),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: Some(r),
+            });
+        }
+    };
     for item in &items {
         // LENIENT (R2): unknown item types are skipped in the chat view —
         // strict rejection for conversion deployments happens post-routing
@@ -734,14 +754,23 @@ fn convert_request(
             continue;
         };
         match kind {
-            InputKind::Message { role, content } => messages.push(Message {
-                role: chat_role(&role),
-                content: message_content_from(&content),
-                name: None,
-                tool_calls: None,
-                tool_call_id: None,
-                reasoning_content: None,
-            }),
+            InputKind::Message { role, content } => {
+                let chat_r = chat_role(&role);
+                let reasoning = if matches!(chat_r, MessageRole::Assistant) {
+                    pending_reasoning.take()
+                } else {
+                    flush_reasoning(&mut messages, &mut pending_reasoning);
+                    None
+                };
+                messages.push(Message {
+                    role: chat_r,
+                    content: message_content_from(&content),
+                    name: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: reasoning,
+                });
+            }
             InputKind::FunctionCall { call_id, name, arguments } => {
                 let call_id = if call_id.is_empty() { new_item_id("call") } else { call_id };
                 messages.push(Message {
@@ -754,17 +783,20 @@ fn convert_request(
                         function: FunctionCall { name, arguments },
                     }]),
                     tool_call_id: None,
+                    reasoning_content: pending_reasoning.take(),
+                });
+            }
+            InputKind::FunctionCallOutput { call_id, output } => {
+                flush_reasoning(&mut messages, &mut pending_reasoning);
+                messages.push(Message {
+                    role: MessageRole::Tool,
+                    content: MessageContent::Text(output_to_text(&output)),
+                    name: None,
+                    tool_calls: None,
+                    tool_call_id: Some(call_id),
                     reasoning_content: None,
                 });
             }
-            InputKind::FunctionCallOutput { call_id, output } => messages.push(Message {
-                role: MessageRole::Tool,
-                content: MessageContent::Text(output_to_text(&output)),
-                name: None,
-                tool_calls: None,
-                tool_call_id: Some(call_id),
-                reasoning_content: None,
-            }),
             InputKind::CustomToolCall { call_id, name, input } => {
                 // Replay as the wrapped function call the upstream saw.
                 let call_id = if call_id.is_empty() { new_item_id("call") } else { call_id };
@@ -781,33 +813,21 @@ fn convert_request(
                         },
                     }]),
                     tool_call_id: None,
-                    reasoning_content: None,
+                    reasoning_content: pending_reasoning.take(),
                 });
             }
             InputKind::Reasoning { summary_text } => {
-                // Thinking-mode round-trip: DeepSeek-class upstreams emit
-                // `reasoning_content` and REQUIRE it to be passed back on
-                // multi-turn replay ("The reasoning_content in the thinking
-                // mode must be passed back"). The rs_ item we minted on the
-                // way out is restored as an assistant message carrying the
-                // reasoning_content field (with empty visible content — the
-                // accompanying message item follows separately in the item
-                // stream, matching how the upstream originally sent it).
-                messages.push(Message {
-                    role: MessageRole::Assistant,
-                    content: MessageContent::Text(String::new()),
-                    name: None,
-                    tool_calls: None,
-                    tool_call_id: None,
-                    reasoning_content: if summary_text.is_empty() {
-                        None
-                    } else {
-                        Some(summary_text.clone())
-                    },
-                });
+                if !summary_text.is_empty() {
+                    pending_reasoning = Some(match pending_reasoning.take() {
+                        Some(prev) => format!("{prev}\n{summary_text}"),
+                        None => summary_text.clone(),
+                    });
+                }
             }
         }
     }
+
+    flush_reasoning(&mut messages, &mut pending_reasoning);
 
     let tools = match req.tools.as_deref() {
         Some(t) => convert_tools(t)?,
@@ -1694,30 +1714,39 @@ mod tests {
 
     #[test]
     fn reasoning_items_replay_as_reasoning_content() {
-        // Empty-summary rs_ items still replay (DeepSeek thinking mode
-        // requires the field present on the assistant turn).
+        // rs_ followed by a user message: pending flushes as its own
+        // assistant turn (degenerate ordering, DeepSeek still satisfied).
         let req = parse_req(json!({
             "model": "m",
             "input": [
-                { "type": "reasoning", "id": "rs_1", "summary": [] },
+                { "type": "reasoning", "id": "rs_1", "summary": [
+                    { "type": "summary_text", "text": "thinking hard" }
+                ]},
                 { "role": "user", "content": "hi" }
             ]
         }));
         let out = responses_request_to_openai(&req).unwrap();
         assert_eq!(out.messages.len(), 2);
         assert!(matches!(out.messages[0].role, MessageRole::Assistant));
-        assert_eq!(out.messages[0].reasoning_content, None, "empty summary → no content");
+        assert_eq!(out.messages[0].reasoning_content.as_deref(), Some("thinking hard"));
 
-        // Non-empty summary → reasoning_content carries the text back.
+        // rs_ followed by an assistant message / function_call (the real
+        // Codex replay shape): reasoning merges INTO that assistant message
+        // — upstream shape, no bare reasoning-only message.
         let req = parse_req(json!({
             "model": "m",
-            "input": [{
-                "type": "reasoning", "id": "rs_2",
-                "summary": [{ "type": "summary_text", "text": "thinking hard" }]
-            }]
+            "input": [
+                { "type": "reasoning", "id": "rs_2", "summary": [
+                    { "type": "summary_text", "text": "decide to call" }
+                ]},
+                { "type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}" },
+                { "type": "function_call_output", "call_id": "c1", "output": "r" }
+            ]
         }));
         let out = responses_request_to_openai(&req).unwrap();
-        assert_eq!(out.messages[0].reasoning_content.as_deref(), Some("thinking hard"));
+        assert_eq!(out.messages.len(), 2, "reasoning merges into the tool_call message");
+        assert_eq!(out.messages[0].reasoning_content.as_deref(), Some("decide to call"));
+        assert!(out.messages[0].tool_calls.is_some(), "same message carries the tool_calls");
     }
 
     #[test]
