@@ -9,7 +9,7 @@ BooMGateway 的可选前端,也可单独部署。以 Docker 镜像提供(Rust �
 - **路由**:按 `host`(支持通配符 `*.example.com`)、`path` 前缀(按段边界匹配,`/api`
   不会误配 `/api2`)、`client_ip` CIDR 首条匹配生效;未命中落默认后端。
 - **后端策略**:
-  - `active-active`(默认):一致性哈希(FNV-1a,跨进程稳定)+ API Key 会话亲和;
+  - `active-active`(默认):一致性哈希(FNV-1a + splitmix64 终结器,跨进程稳定;终结器修复裸 FNV 把单后端 vnode 挤成 1 个有效点、双后端流量 3:7 的缺陷)+ API Key 会话亲和;
   - `active-standby`:按序 failover,前面的后端不健康才切备机;
   - 默认后端支持 failover 列表(`default_backends`)。
 - **健康检查**:TCP connect 或 HTTP GET(可配路径与期望状态码);探测周期与失败阈值可配;
@@ -179,5 +179,5 @@ API Key 亲和取自 `Authorization: Bearer`、`X-API-Key` 或客户端 IP(按�
 cargo test
 ```
 
-57 个测试覆盖路由解析、一致性哈希、黑名单、XFF、探针状态码解析、配置校验等;
+73 个测试覆盖路由解析、一致性哈希(含环覆盖与双/三后端均衡回归)、黑名单、XFF、探针状态码解析、配置校验等;
 其中 3 个依赖真实 socket(syslog 收发、TCP 探针)在受限沙箱中会跳过,正常环境可跑。

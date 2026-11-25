@@ -11,7 +11,9 @@ natively.
   (segment-boundary aware: `/api` does not match `/api2`), and `client_ip` CIDR;
   unmatched requests fall through to the default backends.
 - **Backend policies**:
-  - `active-active` (default): consistent hashing (FNV-1a, stable across processes)
+  - `active-active` (default): consistent hashing (FNV-1a + splitmix64 finalizer,
+    stable across processes; the finalizer fixes raw FNV clustering each backend's
+    vnodes into ~1 effective point, which skewed two-backend traffic to ~3:7)
     with API-key session affinity;
   - `active-standby`: ordered failover — traffic prefers `backends[0]` and only
     switches when earlier backends are unhealthy;
@@ -214,6 +216,7 @@ keep them on internal networks only.
 cargo test
 ```
 
-57 tests cover route resolution, consistent hashing, blacklist, XFF, probe status
-parsing, config validation, and more; 3 tests that need real sockets (syslog I/O,
+73 tests cover route resolution, consistent hashing (including ring-coverage and
+two/three-backend balance regressions), blacklist, XFF, probe status parsing,
+config validation, and more; 3 tests that need real sockets (syslog I/O,
 TCP probe) are skipped in restricted sandboxes but run in normal environments.
