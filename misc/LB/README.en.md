@@ -11,9 +11,7 @@ natively.
   (segment-boundary aware: `/api` does not match `/api2`), and `client_ip` CIDR;
   unmatched requests fall through to the default backends.
 - **Backend policies**:
-  - `active-active` (default): consistent hashing (FNV-1a + splitmix64 finalizer,
-    stable across processes; the finalizer fixes raw FNV clustering each backend's
-    vnodes into ~1 effective point, which skewed two-backend traffic to ~3:7)
+  - `active-active` (default): consistent hashing (FNV-1a, stable across processes)
     with API-key session affinity;
   - `active-standby`: ordered failover — traffic prefers `backends[0]` and only
     switches when earlier backends are unhealthy;
@@ -79,13 +77,6 @@ cargo build --release
 # or via the environment variable
 CONFIG_PATH=/path/to/routes.yaml ./target/release/gateway-lb
 ```
-
-Cargo.lock is committed (standard for binary crates) and the Docker build
-uses `--locked`. tokio is constrained to `>=1.52.3, <1.54` in Cargo.toml:
-pingora 0.8.1's accept path uses `with_capacity(0, 0)` for lazy buffering,
-while tokio 1.54 added a zero-capacity panic there — fresh dependency
-resolution without the pin panicked on the first accepted connection. Do
-not lift the constraint until pingora changes that pattern.
 
 ### Docker (recommended)
 
@@ -223,7 +214,6 @@ keep them on internal networks only.
 cargo test
 ```
 
-73 tests cover route resolution, consistent hashing (including ring-coverage and
-two/three-backend balance regressions), blacklist, XFF, probe status parsing,
-config validation, and more; 3 tests that need real sockets (syslog I/O,
+57 tests cover route resolution, consistent hashing, blacklist, XFF, probe status
+parsing, config validation, and more; 3 tests that need real sockets (syslog I/O,
 TCP probe) are skipped in restricted sandboxes but run in normal environments.

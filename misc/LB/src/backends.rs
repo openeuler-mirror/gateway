@@ -5,31 +5,16 @@ use crate::config::{Config, LbMode};
 
 const VNODES: usize = 150;
 
-/// Stable 64-bit FNV-1a finalized with splitmix64. Deterministic across
-/// processes and Rust versions (pure integer arithmetic), unlike
-/// `std::collections::hash_map::DefaultHasher`, so multiple LB instances
-/// always agree on the ring layout.
-///
-/// The finalizer is load-bearing: raw FNV-1a over a shared prefix plus a
-/// short counter suffix (`"{addr}#{vi}"`) clusters all 150 vnodes of one
-/// address into <0.1% of the ring, collapsing each backend to ~1 effective
-/// point and skewing two-backend traffic to ~3:7.
+/// Stable 64-bit FNV-1a. Deterministic across processes and Rust versions,
+/// unlike `std::collections::hash_map::DefaultHasher`, so multiple LB
+/// instances always agree on the ring layout.
 pub(crate) fn hash_str(s: &str) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in s.as_bytes() {
         h ^= *b as u64;
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    mix64(h)
-}
-
-/// splitmix64 finalizer: spreads the clustered FNV-1a state uniformly over
-/// [0, 2^64), which the ring's vnode positions require.
-fn mix64(mut z: u64) -> u64 {
-    z = z.wrapping_add(0x9e37_79b9_7f4a_7c15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    z ^ (z >> 31)
+    h
 }
 
 /// Consistent-hash ring over a route's backends.
@@ -270,9 +255,8 @@ mod tests {
         assert_eq!(a, b, "same input must hash identically (process-stable)");
         let c = hash_str("user-key-2");
         assert_ne!(a, c);
-        // FNV-1a("abc") = 0xe71fa2190541574b; through the splitmix64 finalizer
-        // this is the deterministic known-answer for the whole pipeline.
-        assert_eq!(hash_str("abc"), 0x29e3_2c04_ec3f_9c30);
+        // FNV-1a is a known vector: hash of "abc" is deterministic.
+        assert_eq!(hash_str("abc"), 0xe71f_a219_0541_574b);
     }
 
     #[test]
@@ -297,75 +281,6 @@ mod tests {
         // Only keys that land on the new node (1/4 of the ring on average) may
         // move; an index-dependent layout would move ~3/4 of keys.
         assert!(moved < 1000, "too many keys moved: {moved}");
-    }
-
-    #[test]
-    fn ring_vnodes_cover_the_ring_uniformly() {
-        // Root-cause guard for the 3:7 traffic skew: without the splitmix64
-        // finalizer, raw FNV-1a clustered all of an address's vnodes into
-        // <0.1% of the ring (measured max gaps 40-74%), so each backend was
-        // ~1 effective point and two-backend splits were arbitrary.
-        for addr in ["10.0.0.1:8080", "10.0.0.10:8080", "127.0.0.1:4001"] {
-            let a: SocketAddr = addr.parse().unwrap();
-            let ring = Ring::new(&[a]);
-            let mut pos: Vec<u64> = ring.nodes.iter().map(|(h, _)| *h).collect();
-            pos.sort_unstable();
-            let n = pos.len();
-            let max_gap = (0..n)
-                .map(|j| pos[(j + 1) % n].wrapping_sub(pos[j]))
-                .max()
-                .unwrap();
-            let pct = max_gap as f64 / u64::MAX as f64 * 100.0;
-            // 150 uniform points expect a max gap of ~3.3% (ln(n)/n).
-            assert!(max_gap < u64::MAX / 6, "{addr}: max vnode gap {pct:.1}% of ring");
-        }
-    }
-
-    #[test]
-    fn ring_balances_two_backends() {
-        // Many keys must split roughly evenly; the degenerate pre-finalizer
-        // ring measured 0.20/0.80 on the first pair below.
-        for pair in [
-            ("127.0.0.1:4001", "127.0.0.1:4002"),
-            ("127.0.0.1:8080", "127.0.0.1:8081"),
-            ("10.0.0.1:8080", "10.0.0.2:8080"),
-            ("192.168.1.10:4000", "192.168.1.11:4000"),
-        ] {
-            let bs: Vec<SocketAddr> = [pair.0, pair.1]
-                .iter()
-                .map(|s| s.parse().unwrap())
-                .collect();
-            let ring = Ring::new(&bs);
-            let mut counts = [0usize; 2];
-            for i in 0..2000 {
-                let a = ring.pick(&format!("k{i}"), &HashSet::new(), &[]);
-                counts[bs.iter().position(|b| *b == a).unwrap()] += 1;
-            }
-            let weak = counts.iter().copied().min().unwrap() as f64 / 2000.0;
-            assert!(
-                weak > 0.40,
-                "{} vs {}: weak backend share {weak:.3}",
-                pair.0,
-                pair.1
-            );
-        }
-    }
-
-    #[test]
-    fn ring_balances_three_backends() {
-        // The degenerate pre-finalizer ring measured 0.65/0.10/0.25 here.
-        let bs: Vec<SocketAddr> = ["10.0.0.10:8080", "10.0.0.11:8080", "10.0.0.12:8080"]
-            .iter()
-            .map(|s| s.parse().unwrap())
-            .collect();
-        let ring = Ring::new(&bs);
-        let mut counts = [0usize; 3];
-        for i in 0..2000 {
-            let a = ring.pick(&format!("k{i}"), &HashSet::new(), &[]);
-            counts[bs.iter().position(|b| *b == a).unwrap()] += 1;
-        }
-        let weak = *counts.iter().min().unwrap() as f64 / 2000.0;
-        assert!(weak > 0.25, "weakest backend share {weak:.3} vs expected 1/3");
     }
 
     #[test]

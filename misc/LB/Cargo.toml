@@ -19,9 +19,3 @@ notify = { version = "7", default-features = false, features = ["macos_kqueue"] 
 clap = { version = "4", features = ["derive", "env"] }
 bytes = "1"
 http = "1"
-# Governance pin, not a code dependency: tokio 1.54 made
-# BufReader/BufWriter/BufStream::with_capacity(0, ..) panic, while pingora
-# 0.8.1's accept path deliberately constructs streams with zero capacity
-# (lazy buffering). Lift this when a pingora release drops that pattern.
-# The committed Cargo.lock pins the concrete version (1.52.3).
-tokio = ">=1.52.3, <1.54"
