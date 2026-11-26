@@ -153,9 +153,10 @@ pub struct AppState {
     /// immediately for low latency.
     pub alerts: Arc<boom_alert::AlertManager>,
     /// Daily business-volume snapshot for the analytics board (数据看板):
-    /// natural-day aggregates over boom_request_log, refreshed from the DB
-    /// by `spawn_daily_stats_sync` (startup + every 30s). Survives reloads
-    /// (top-level Arc). None until the first successful refresh.
+    /// natural-day aggregates over boom_request_log, refreshed lazily from
+    /// the DB on dashboard reads (TTL snapshot cache inside
+    /// `DailyStatsTracker`; there is no background sync task). Survives
+    /// reloads (top-level Arc). None until the first successful refresh.
     pub daily_stats: Arc<boom_audit::DailyStatsTracker>,
     /// Serializes reloads across ALL trigger sources (SIGHUP, HTTP
     /// `/admin/config/reload`, config-section editor) — they funnel through
