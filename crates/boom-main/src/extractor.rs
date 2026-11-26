@@ -78,6 +78,13 @@ impl RequiredAuth {
         Self { identity, new_model: None }
     }
 
+    /// Surface a per-frame `ReplaceModel` outcome to the handler. The WS
+    /// transport runs the pre_auth hook per frame (outside the extractor),
+    /// so unlike the HTTP path the rewrite arrives after construction.
+    pub fn set_new_model(&mut self, new_model: Option<String>) {
+        self.new_model = new_model;
+    }
+
     /// Take the hook-decided `new_model`, if any. Leaves `None` in its place
     /// so subsequent calls return `None` (write-once semantics — the handler
     /// applies the rewrite exactly once, before `check_model_access`).
@@ -373,7 +380,7 @@ pub async fn buffer_request_body(
 /// validated with `HeaderValue::from_bytes` (not `from_str`) so
 /// non-ASCII UTF-8 passes as obs-text, matching `extract_user_tags`'s
 /// lossy-decode handling of non-ASCII client values.
-fn apply_hook_headers(
+pub(crate) fn apply_hook_headers(
     headers: &mut axum::http::HeaderMap,
     hook_headers: &std::collections::HashMap<String, String>,
 ) {

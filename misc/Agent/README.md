@@ -19,6 +19,12 @@
 3. **自由格式 custom 工具（P0.5，严格契约）**：`type:"custom"` 工具对客户端必须以
    `custom_tool_call`（freeform `input`）呈现——泄漏为 `function_call` 即 FAIL
    （该强转会破坏 Codex，vLLM #49724），且 `input` 必须是解包后的字符串。
+4. **WebSocket 传输（P0 验收，设计 §4）**：`GET /v1/responses` WS 升级端点的
+   `ws_responses_loop` 检查——单连接双车道并发（stream_id 路由）、同车道严格 FIFO
+   （completed(#1) 先于 created(#2)）、每密钥连接数上限（第 5 个握手 429）、超限帧
+   传输层拒绝（连接被杀 + 重连恢复）、`generate:false` 停车 + 断线重连续接
+   （有 response store 时断言续接，无 store 时 SKIP）。网关未开启
+   `general_settings.responses_ws.enabled` 时整个检查优雅 SKIP。
 
 ## 用法
 
@@ -49,6 +55,7 @@ PASS  agent_tool_loop             turns=2 final="The current time is unix_time_.
 PASS  store_continuation          skipped (no response store on this gateway)
 PASS  custom_tool_loop            turns=2 final="...PATCH_RESULT:ok:*** Begin Patch..."
 PASS  passthrough_fidelity        skipped (deployment is not protocol: responses)
+PASS  ws_transport_smoke          lanes=2 fifo_ok conn_cap=4 oversize_killed parked=resp_... continuation_ok
 ```
 
 ## 本地全链路自测（无需真实推理后端）
@@ -72,6 +79,7 @@ model_list:
       timeout: 30
 general_settings:
   master_key: smoke-master-key
+  responses_ws: { enabled: true }   # WS 传输检查需要；关闭则该项 SKIP
 server: { host: 127.0.0.1, port: 18400, workers: 1 }
 rate_limit: { enabled: false }
 YAML
@@ -93,5 +101,5 @@ Agent 只依赖标准 Responses 协议，可直接指向任意网关部署；真
 
 | 文件 | 说明 |
 |---|---|
-| `src/main.rs` | Agent：7 项检查 + SSE 解析 + 工具循环 |
+| `src/main.rs` | Agent：8 项检查（HTTP 7 项 + WS 传输 1 项）+ SSE 解析 + 工具循环 |
 | `src/bin/mock_upstream.rs` | 本地 mock 上游（tiny_http，零推理） |

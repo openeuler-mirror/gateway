@@ -204,6 +204,66 @@ fn downgrade_response_format_to_prompt(body: &serde_json::Value) -> serde_json::
     out
 }
 
+/// Parse a non-streaming success body through the full tolerance ladder:
+/// BOM strip → SSE-assembly fallback (non-standard upstreams answering a
+/// non-streaming request with `data:` chunks) → strict JSON with the
+/// shapeless-body guard (no id/object/choices/usage at all = parse failure
+/// carrying the raw bytes). Shared by the primary success path AND the
+/// response_format downgrade retry — the upstreams that reject
+/// response_format are exactly the non-standard ones most likely to need
+/// the SSE/BOM fallbacks on the retried response too; a strict
+/// `from_str` there would turn a 200 into UpstreamParseError.
+fn parse_completion_body(raw_text: &str) -> Result<ChatCompletionResponse, GatewayError> {
+    // Tolerate a UTF-8 BOM: some upstreams prepend one invisibly (curl
+    // output looks fine) and serde_json fails with "expected value at
+    // line 1 column 1". Stripped for parsing only — raw_response and the
+    // prompt-log raw body keep the bytes as sent.
+    let parse_input = raw_text.strip_prefix('\u{feff}').unwrap_or(raw_text);
+    let parsed = if parse_input.trim_start().starts_with("data:") {
+        // Non-standard upstream answered a non-streaming request with an
+        // SSE stream — assemble the chunks into a complete response.
+        match assemble_sse_response(parse_input) {
+            Ok(assembled) => assembled,
+            Err(e) => {
+                tracing::error!("Failed to assemble SSE response for non-stream request: {}", e);
+                return Err(GatewayError::UpstreamParseError {
+                    parse_error: e,
+                    raw_body: raw_text.to_string(),
+                });
+            }
+        }
+    } else {
+        match serde_json::from_str::<ChatCompletionResponse>(parse_input) {
+            Ok(parsed) => {
+                // Lenient defaults (choices-missing nemotron bodies) made
+                // SHAPELESS bodies parse as all-default Ok — a body with
+                // no recognizable completion field at all is still a
+                // parse failure carrying the raw bytes.
+                if parsed.id.is_empty()
+                    && parsed.object.is_empty()
+                    && parsed.choices.is_empty()
+                    && parsed.usage.is_none()
+                {
+                    tracing::error!("OpenAI response has no recognizable completion fields");
+                    return Err(GatewayError::UpstreamParseError {
+                        parse_error: "no recognizable completion fields".to_string(),
+                        raw_body: raw_text.to_string(),
+                    });
+                }
+                parsed
+            }
+            Err(e) => {
+                tracing::error!("Failed to parse OpenAI response: {}", e);
+                return Err(GatewayError::UpstreamParseError {
+                    parse_error: e.to_string(),
+                    raw_body: raw_text.to_string(),
+                });
+            }
+        }
+    };
+    Ok(parsed)
+}
+
 pub struct OpenAIProvider {
     client: Client,
     api_key: Option<String>,
@@ -383,6 +443,12 @@ impl Provider for OpenAIProvider {
                 && !error_body.is_empty()
                 && error_body.contains("response_format")
             {
+                // The first 400 is part of the request's story — record it
+                // before the retry replaces it, or prompt-log raw capture
+                // misses the downgrade trigger entirely.
+                if let Some(ref cap) = raw_capture {
+                    cap.push_response_frame(error_body.clone());
+                }
                 tracing::warn!(
                     "upstream rejected response_format; retrying with prompt-injected schema"
                 );
@@ -398,31 +464,18 @@ impl Provider for OpenAIProvider {
                 })?;
                 let status2 = resp2.status();
                 if status2.is_success() {
-                    // Minimal parse mirroring the success path below (the
-                    // full parser is inline there; keep the retry lean).
                     let raw2 = resp2.text().await.unwrap_or_default();
-                    match serde_json::from_str::<ChatCompletionResponse>(&raw2) {
-                        Ok(mut parsed) => {
-                            if parsed.id.is_empty()
-                                && parsed.object.is_empty()
-                                && parsed.choices.is_empty()
-                                && parsed.usage.is_none()
-                            {
-                                return Err(GatewayError::UpstreamParseError {
-                                    parse_error: "no recognizable completion fields".to_string(),
-                                    raw_body: raw2,
-                                });
-                            }
-                            parsed.raw_response = Some(raw2);
-                            return Ok(parsed);
-                        }
-                        Err(e) => {
-                            return Err(GatewayError::UpstreamParseError {
-                                parse_error: e.to_string(),
-                                raw_body: raw2,
-                            });
-                        }
+                    if let Some(ref cap) = raw_capture {
+                        cap.push_response_frame(raw2.clone());
                     }
+                    // Same parser as the primary success path — the
+                    // aggregators that reject response_format are exactly
+                    // the ones that answer non-stream requests with SSE
+                    // bodies / BOMs; strict from_str turned the retried
+                    // 200 into UpstreamParseError.
+                    let mut parsed = parse_completion_body(&raw2)?;
+                    parsed.raw_response = Some(raw2);
+                    return Ok(parsed);
                 }
                 let error_body2 = resp2.text().await.unwrap_or_default();
                 if let Some(ref cap) = raw_capture {
@@ -450,56 +503,7 @@ impl Provider for OpenAIProvider {
             cap.push_response_frame(raw_text.clone());
         }
 
-        // Tolerate a UTF-8 BOM: some upstreams prepend one invisibly (curl
-        // output looks fine) and serde_json fails with "expected value at
-        // line 1 column 1". Stripped for parsing only — raw_response and the
-        // prompt-log raw body keep the bytes as sent.
-        let parse_input = raw_text.strip_prefix('\u{feff}').unwrap_or(&raw_text);
-        let mut parsed: ChatCompletionResponse = if parse_input.trim_start().starts_with("data:") {
-            // Non-standard upstream answered a non-streaming request with an
-            // SSE stream — assemble the chunks into a complete response.
-            match assemble_sse_response(parse_input) {
-                Ok(assembled) => assembled,
-                Err(e) => {
-                    tracing::error!("Failed to assemble SSE response for non-stream request: {}", e);
-                    return Err(GatewayError::UpstreamParseError {
-                        parse_error: e,
-                        raw_body: raw_text,
-                    });
-                }
-            }
-        } else {
-            match serde_json::from_str::<ChatCompletionResponse>(parse_input) {
-                Ok(parsed) => {
-                    // Lenient defaults (choices-missing nemotron bodies) made
-                    // SHAPELESS bodies parse as all-default Ok — a body with
-                    // no recognizable completion field at all is still a
-                    // parse failure carrying the raw bytes.
-                    if parsed.id.is_empty()
-                        && parsed.object.is_empty()
-                        && parsed.choices.is_empty()
-                        && parsed.usage.is_none()
-                    {
-                        tracing::error!(
-                            "OpenAI response has no recognizable completion fields"
-                        );
-                        return Err(GatewayError::UpstreamParseError {
-                            parse_error: "no recognizable completion fields".to_string(),
-                            raw_body: raw_text,
-                        });
-                    }
-                    parsed
-                }
-                Err(e) => {
-                    tracing::error!("Failed to parse OpenAI response: {}", e);
-                    return Err(GatewayError::UpstreamParseError {
-                        parse_error: e.to_string(),
-                        raw_body: raw_text,
-                    });
-                }
-            }
-        };
-
+        let mut parsed = parse_completion_body(&raw_text)?;
         parsed.raw_response = Some(raw_text);
         Ok(parsed)
     }
@@ -551,6 +555,11 @@ impl Provider for OpenAIProvider {
                     && !error_body.is_empty()
                     && error_body.contains("response_format")
                 {
+                    // Record the first 400 before the retry — same
+                    // prompt-log completeness rule as the non-stream path.
+                    if let Some(ref cap) = raw_capture {
+                        cap.push_response_frame(error_body.clone());
+                    }
                     tracing::warn!(
                         "upstream rejected response_format (stream); retrying with prompt-injected schema"
                     );

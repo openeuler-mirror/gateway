@@ -728,23 +728,16 @@ fn convert_request(
     // Pending reasoning from rs_ items: DeepSeek-class thinking upstreams
     // attach `reasoning_content` to the SAME assistant message as the
     // visible content / tool_calls, and require it back that way ("must be
-    // passed back"). Hold the text and merge into the next assistant item
-    // (message / function_call / custom_tool_call); a non-assistant item
-    // flushes it as a standalone assistant turn first (degenerate ordering,
-    // nothing lost).
+    // passed back"). Assistant text messages carry a COPY (kept alive) so
+    // the pending survives to the next tool_calls-bearing item
+    // (function_call / custom_tool_call), which consumes it — the message
+    // with tool_calls is the one that must carry reasoning_content. At a
+    // non-assistant boundary or end of input the pending text is dropped:
+    // flushing it as a standalone assistant turn would emit an
+    // empty-content assistant message, an invalid/semantics-changing shape
+    // on several upstreams (Anthropic empty text blocks, schema-validating
+    // gateways) that turns previously-successful requests into 400s.
     let mut pending_reasoning: Option<String> = None;
-    let mut flush_reasoning = |messages: &mut Vec<Message>, pending: &mut Option<String>| {
-        if let Some(r) = pending.take() {
-            messages.push(Message {
-                role: MessageRole::Assistant,
-                content: MessageContent::Text(String::new()),
-                name: None,
-                tool_calls: None,
-                tool_call_id: None,
-                reasoning_content: Some(r),
-            });
-        }
-    };
     for item in &items {
         // LENIENT (R2): unknown item types are skipped in the chat view —
         // strict rejection for conversion deployments happens post-routing
@@ -757,9 +750,19 @@ fn convert_request(
             InputKind::Message { role, content } => {
                 let chat_r = chat_role(&role);
                 let reasoning = if matches!(chat_r, MessageRole::Assistant) {
-                    pending_reasoning.take()
+                    // Don't consume pending reasoning on plain text messages:
+                    // the gateway's own output order is reasoning → message
+                    // text → function_call; consuming it here starves the
+                    // tool_calls message of its reasoning_content (DeepSeek
+                    // requires it on the tool_calls message). Keep the
+                    // pending through the text message; it is consumed by
+                    // the tool_calls item, or dropped at a non-assistant
+                    // item / loop end.
+                    pending_reasoning.clone()
                 } else {
-                    flush_reasoning(&mut messages, &mut pending_reasoning);
+                    // Non-assistant boundary: nothing to attach the pending
+                    // reasoning to — drop it (no empty assistant turn).
+                    pending_reasoning = None;
                     None
                 };
                 messages.push(Message {
@@ -805,7 +808,9 @@ fn convert_request(
                 }
             }
             InputKind::FunctionCallOutput { call_id, output } => {
-                flush_reasoning(&mut messages, &mut pending_reasoning);
+                // Tool replies must follow their tool_calls message; any
+                // reasoning still pending here has no owner — drop it.
+                pending_reasoning = None;
                 messages.push(Message {
                     role: MessageRole::Tool,
                     content: MessageContent::Text(output_to_text(&output)),
@@ -818,21 +823,37 @@ fn convert_request(
             InputKind::CustomToolCall { call_id, name, input } => {
                 // Replay as the wrapped function call the upstream saw.
                 let call_id = if call_id.is_empty() { new_item_id("call") } else { call_id };
-                messages.push(Message {
-                    role: MessageRole::Assistant,
-                    content: MessageContent::Text(String::new()),
-                    name: None,
-                    tool_calls: Some(vec![ToolCall {
-                        id: call_id,
-                        call_type: "function".to_string(),
-                        function: FunctionCall {
-                            name,
-                            arguments: serde_json::json!({ "input": input }).to_string(),
-                        },
-                    }]),
-                    tool_call_id: None,
-                    reasoning_content: pending_reasoning.take(),
-                });
+                let tool_call = ToolCall {
+                    id: call_id,
+                    call_type: "function".to_string(),
+                    function: FunctionCall {
+                        name,
+                        arguments: serde_json::json!({ "input": input }).to_string(),
+                    },
+                };
+                // Same parallel-round merge as function_call: consecutive
+                // custom_tool_call items (or a mix with function_call —
+                // Codex apply_patch fan-outs) are ONE upstream assistant
+                // turn. One message per call leaves assistant(tool_calls)
+                // messages with no tool reply immediately following — the
+                // exact DeepSeek 400 shape this conversion exists to avoid.
+                match messages.last_mut() {
+                    Some(prev)
+                        if matches!(prev.role, MessageRole::Assistant)
+                            && prev.tool_calls.is_some()
+                            && pending_reasoning.is_none() =>
+                    {
+                        prev.tool_calls.as_mut().expect("just checked").push(tool_call);
+                    }
+                    _ => messages.push(Message {
+                        role: MessageRole::Assistant,
+                        content: MessageContent::Text(String::new()),
+                        name: None,
+                        tool_calls: Some(vec![tool_call]),
+                        tool_call_id: None,
+                        reasoning_content: pending_reasoning.take(),
+                    }),
+                }
             }
             InputKind::Reasoning { summary_text } => {
                 if !summary_text.is_empty() {
@@ -845,7 +866,8 @@ fn convert_request(
         }
     }
 
-    flush_reasoning(&mut messages, &mut pending_reasoning);
+    // End of input: any reasoning still pending has no assistant item to
+    // merge into — dropped (never flushed as an empty assistant turn).
 
     let tools = match req.tools.as_deref() {
         Some(t) => convert_tools(t)?,
@@ -1732,8 +1754,9 @@ mod tests {
 
     #[test]
     fn reasoning_items_replay_as_reasoning_content() {
-        // rs_ followed by a user message: pending flushes as its own
-        // assistant turn (degenerate ordering, DeepSeek still satisfied).
+        // rs_ followed by a user message: nothing to attach the pending
+        // reasoning to — it is dropped, NOT flushed as a standalone
+        // empty-content assistant turn (invalid shape on several upstreams).
         let req = parse_req(json!({
             "model": "m",
             "input": [
@@ -1744,13 +1767,51 @@ mod tests {
             ]
         }));
         let out = responses_request_to_openai(&req).unwrap();
-        assert_eq!(out.messages.len(), 2);
-        assert!(matches!(out.messages[0].role, MessageRole::Assistant));
-        assert_eq!(out.messages[0].reasoning_content.as_deref(), Some("thinking hard"));
+        assert_eq!(out.messages.len(), 1, "orphan reasoning is dropped, no empty assistant");
+        assert!(matches!(out.messages[0].role, MessageRole::User));
 
-        // rs_ followed by an assistant message / function_call (the real
-        // Codex replay shape): reasoning merges INTO that assistant message
-        // — upstream shape, no bare reasoning-only message.
+        // Input ending on a hanging rs_ item: dropped too, no trailing
+        // empty assistant message.
+        let req = parse_req(json!({
+            "model": "m",
+            "input": [
+                { "type": "reasoning", "id": "rs_0", "summary": [
+                    { "type": "summary_text", "text": "dangling" }
+                ]}
+            ]
+        }));
+        let out = responses_request_to_openai(&req).unwrap();
+        assert!(out.messages.is_empty(), "trailing reasoning is dropped");
+
+        // rs_ followed by an assistant text message then a function_call
+        // (the gateway's own output order: reasoning → message →
+        // function_call): the text message carries a copy and the pending
+        // survives to the tool_calls message, which consumes it — DeepSeek
+        // requires reasoning_content on the tool_calls-bearing message.
+        let req = parse_req(json!({
+            "model": "m",
+            "input": [
+                { "type": "reasoning", "id": "rs_3", "summary": [
+                    { "type": "summary_text", "text": "decide to call" }
+                ]},
+                { "role": "assistant", "content": "calling the probe" },
+                { "type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}" },
+                { "type": "function_call_output", "call_id": "c1", "output": "r" }
+            ]
+        }));
+        let out = responses_request_to_openai(&req).unwrap();
+        assert_eq!(out.messages.len(), 3, "text + tool_calls + tool reply");
+        assert_eq!(out.messages[0].reasoning_content.as_deref(), Some("decide to call"));
+        assert!(out.messages[1].tool_calls.is_some());
+        assert_eq!(
+            out.messages[1].reasoning_content.as_deref(),
+            Some("decide to call"),
+            "the tool_calls message carries the reasoning_content"
+        );
+
+        // rs_ followed directly by a function_call (the compact Codex
+        // replay shape): reasoning merges INTO the tool_call message —
+        // upstream shape, no bare reasoning-only message.
         let req = parse_req(json!({
             "model": "m",
             "input": [
@@ -1808,6 +1869,42 @@ mod tests {
         let out = responses_request_to_openai(&req).unwrap();
         let tc_msgs = out.messages.iter().filter(|m| m.tool_calls.is_some()).count();
         assert_eq!(tc_msgs, 2, "sequential rounds stay separate messages");
+    }
+
+    #[test]
+    fn parallel_custom_tool_calls_merge_into_one_assistant_message() {
+        // Codex apply_patch fan-outs: consecutive custom_tool_call items →
+        // ONE assistant message — same contract as function_call merging.
+        let req = parse_req(json!({
+            "model": "m",
+            "input": [
+                { "type": "custom_tool_call", "call_id": "k0", "name": "apply_patch", "input": "*** Begin Patch" },
+                { "type": "custom_tool_call", "call_id": "k1", "name": "apply_patch", "input": "*** Update File" },
+                { "type": "custom_tool_call_output", "call_id": "k0", "output": "ok" },
+                { "type": "custom_tool_call_output", "call_id": "k1", "output": "ok" }
+            ]
+        }));
+        let out = responses_request_to_openai(&req).unwrap();
+        assert_eq!(out.messages.len(), 3, "one tool_calls message + two tool replies");
+        let calls = out.messages[0].tool_calls.as_ref().unwrap();
+        assert_eq!(calls.len(), 2, "both custom calls on one message");
+
+        // Mixed adjacent function_call + custom_tool_call: still one turn.
+        let req = parse_req(json!({
+            "model": "m",
+            "input": [
+                { "type": "function_call", "call_id": "c0", "name": "f", "arguments": "{}" },
+                { "type": "custom_tool_call", "call_id": "k0", "name": "apply_patch", "input": "patch" },
+                { "type": "function_call_output", "call_id": "c0", "output": "a" },
+                { "type": "custom_tool_call_output", "call_id": "k0", "output": "b" }
+            ]
+        }));
+        let out = responses_request_to_openai(&req).unwrap();
+        assert_eq!(out.messages.len(), 3, "mixed fan-out is one assistant turn");
+        let calls = out.messages[0].tool_calls.as_ref().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].id, "c0");
+        assert_eq!(calls[1].id, "k0");
     }
 
     #[test]

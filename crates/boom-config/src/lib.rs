@@ -598,6 +598,11 @@ pub struct GeneralSettings {
     /// (`previous_response_id`). None ≡ defaults (enabled, 30-day TTL).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub responses_store: Option<ResponsesStoreSettings>,
+    /// WebSocket transport for `/v1/responses` (GET upgrade). None ≡
+    /// defaults (disabled — rollout switch off, connection limits at the
+    /// design values).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub responses_ws: Option<ResponsesWsSettings>,
 }
 
 /// Response store tunables.
@@ -631,6 +636,62 @@ impl Default for ResponsesStoreSettings {
     }
 }
 
+/// WebSocket transport tunables for `/v1/responses` (`GET` upgrade).
+/// Process-level YAML (§7 私域配置): connection limits are per-instance
+/// knobs, not cluster business data. `enabled` is the rollout switch —
+/// the endpoint 404s while it is off, so merging the transport never
+/// flips production traffic over unannounced.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResponsesWsSettings {
+    /// Endpoint switch (rollout). Default false: the WS upgrade path
+    /// rejects until a deployment opts in.
+    #[serde(default = "default_responses_ws_enabled")]
+    pub enabled: bool,
+    /// Per-connection outstanding create requests.
+    #[serde(default = "default_responses_ws_max_outstanding_requests")]
+    pub max_outstanding_requests: usize,
+    /// Per-connection in-flight input-bytes budget.
+    #[serde(default = "default_responses_ws_max_outstanding_bytes")]
+    pub max_outstanding_bytes: usize,
+    /// Distinct stream_id lanes per connection.
+    #[serde(default = "default_responses_ws_max_session_lanes")]
+    pub max_session_lanes: usize,
+    /// Single outbound frame cap (checked before enqueue).
+    #[serde(default = "default_responses_ws_max_stream_event_bytes")]
+    pub max_stream_event_bytes: usize,
+    /// Outbound channel capacity (frames buffered ahead of the writer).
+    #[serde(default = "default_responses_ws_outbound_buffer")]
+    pub outbound_buffer: usize,
+    /// Single-frame send timeout; an unwriteable client is disconnected.
+    #[serde(default = "default_responses_ws_send_timeout_ms")]
+    pub send_timeout_ms: u64,
+    /// Concurrent WS connections per API key (per instance).
+    #[serde(default = "default_responses_ws_max_connections_per_key")]
+    pub max_connections_per_key: usize,
+}
+fn default_responses_ws_enabled() -> bool { false }
+fn default_responses_ws_max_outstanding_requests() -> usize { 64 }
+fn default_responses_ws_max_outstanding_bytes() -> usize { 12 * 1024 * 1024 }
+fn default_responses_ws_max_session_lanes() -> usize { 128 }
+fn default_responses_ws_max_stream_event_bytes() -> usize { 256 * 1024 }
+fn default_responses_ws_outbound_buffer() -> usize { 64 }
+fn default_responses_ws_send_timeout_ms() -> u64 { 10_000 }
+fn default_responses_ws_max_connections_per_key() -> usize { 4 }
+impl Default for ResponsesWsSettings {
+    fn default() -> Self {
+        Self {
+            enabled: default_responses_ws_enabled(),
+            max_outstanding_requests: default_responses_ws_max_outstanding_requests(),
+            max_outstanding_bytes: default_responses_ws_max_outstanding_bytes(),
+            max_session_lanes: default_responses_ws_max_session_lanes(),
+            max_stream_event_bytes: default_responses_ws_max_stream_event_bytes(),
+            outbound_buffer: default_responses_ws_outbound_buffer(),
+            send_timeout_ms: default_responses_ws_send_timeout_ms(),
+            max_connections_per_key: default_responses_ws_max_connections_per_key(),
+        }
+    }
+}
+
 impl Default for GeneralSettings {
     fn default() -> Self {
         Self {
@@ -641,6 +702,7 @@ impl Default for GeneralSettings {
             user_tag_headers: None,
             public_models: Vec::new(),
             responses_store: None,
+            responses_ws: None,
         }
     }
 }
@@ -2571,5 +2633,65 @@ client_blocklist:
         let cfg: Config =
             serde_yaml::from_str("quota_sync: { interval_secs: 99999 }\n").unwrap();
         assert_eq!(cfg.quota_sync.effective_interval_secs(), 600);
+    }
+}
+
+#[cfg(test)]
+mod responses_ws_settings_tests {
+    use super::*;
+
+    #[test]
+    fn responses_ws_defaults_to_disabled_with_design_limits() {
+        // Absent section ≡ disabled endpoint, design-doc limit values —
+        // merging the transport never flips production traffic over
+        // unannounced.
+        let gs = GeneralSettings::default();
+        let cfg = gs.responses_ws.clone().unwrap_or_default();
+        assert!(!cfg.enabled, "rollout switch defaults off");
+        assert_eq!(cfg.max_outstanding_requests, 64);
+        assert_eq!(cfg.max_outstanding_bytes, 12 * 1024 * 1024);
+        assert_eq!(cfg.max_session_lanes, 128);
+        assert_eq!(cfg.max_stream_event_bytes, 256 * 1024);
+        assert_eq!(cfg.outbound_buffer, 64);
+        assert_eq!(cfg.send_timeout_ms, 10_000);
+        assert_eq!(cfg.max_connections_per_key, 4);
+    }
+
+    #[test]
+    fn responses_ws_partial_section_fills_defaults() {
+        // Only the switch is set — the rest stays at the design values so a
+        // minimal YAML enablement is not a footgun of zero-limits.
+        let yaml = "responses_ws:\n  enabled: true\n";
+        let gs: GeneralSettings = serde_yaml::from_str(yaml).unwrap();
+        let cfg = gs.responses_ws.expect("section parsed");
+        assert!(cfg.enabled);
+        assert_eq!(cfg.max_outstanding_requests, 64);
+        assert_eq!(cfg.send_timeout_ms, 10_000);
+        assert_eq!(cfg.max_connections_per_key, 4);
+    }
+
+    #[test]
+    fn responses_ws_full_section_parses() {
+        let yaml = "\
+responses_ws:
+  enabled: true
+  max_outstanding_requests: 16
+  max_outstanding_bytes: 1048576
+  max_session_lanes: 8
+  max_stream_event_bytes: 65536
+  outbound_buffer: 32
+  send_timeout_ms: 5000
+  max_connections_per_key: 2
+";
+        let gs: GeneralSettings = serde_yaml::from_str(yaml).unwrap();
+        let cfg = gs.responses_ws.expect("section parsed");
+        assert!(cfg.enabled);
+        assert_eq!(cfg.max_outstanding_requests, 16);
+        assert_eq!(cfg.max_outstanding_bytes, 1_048_576);
+        assert_eq!(cfg.max_session_lanes, 8);
+        assert_eq!(cfg.max_stream_event_bytes, 65_536);
+        assert_eq!(cfg.outbound_buffer, 32);
+        assert_eq!(cfg.send_timeout_ms, 5_000);
+        assert_eq!(cfg.max_connections_per_key, 2);
     }
 }

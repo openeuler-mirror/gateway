@@ -557,6 +557,7 @@ dependencies = [
  "clap",
  "dashmap",
  "futures",
+ "http-body",
  "http-body-util",
  "libloading",
  "moka",

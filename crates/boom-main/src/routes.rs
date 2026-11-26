@@ -3801,6 +3801,116 @@ async fn check_plan_limits(
     })
 }
 
+/// Rate-limit resolution shared by the WS transport wrappers below —
+/// identical to the in-handler `check_plan_limits` call site (same plan
+/// resolution, windows, weight, budget source), so a WS frame is judged by
+/// exactly the same policy an HTTP request with the same key+model gets.
+fn ws_rate_limit_inputs(
+    state: &AppState,
+    identity: &AuthIdentity,
+    requested_model: &str,
+) -> (
+    Vec<boom_core::types::WindowLimit>,
+    u64,
+    String,
+    Option<u64>,
+    Option<u64>,
+    Option<f64>,
+    Option<u64>,
+    Option<u32>,
+) {
+    let rate_limit_cfg = state.plan_store.fallback();
+    let window_limits = effective_window_limits(&rate_limit_cfg.window_limits, &rate_limit_cfg);
+    let weight = resolve_quota_weight(requested_model, state);
+    let resolved_model_for_quota = resolve_model_name(requested_model, state);
+    let (effective_rpm, effective_tpm) = effective_key_limits(identity, &rate_limit_cfg);
+    (
+        window_limits,
+        weight,
+        resolved_model_for_quota,
+        effective_rpm,
+        effective_tpm,
+        identity.max_budget,
+        identity.budget_period_secs,
+        identity.max_parallel_requests,
+    )
+}
+
+/// Peek-only rate-limit preflight for the WebSocket transport. Design
+/// invariant §5.1: a rate-limited create holds NO capacity — the mux
+/// admission (lane slot + byte budget) must not be occupied by a create
+/// the plan layer is about to reject. This resolves the same check the
+/// handler runs (peek-only by construction) and drops the charge without
+/// committing: concurrency guards are released immediately, no counter
+/// moves. The authoritative check+commit still runs inside
+/// `routes::responses` for inference creates; a create that passes here
+/// and races past the limit inside is the same window the HTTP path has
+/// between peek and commit.
+pub async fn responses_rate_preflight(
+    state: &AppState,
+    identity: &AuthIdentity,
+    requested_model: &str,
+) -> Result<(), GatewayError> {
+    let (window_limits, weight, resolved_model_for_quota, rpm, tpm, budget, budget_period, max_parallel) =
+        ws_rate_limit_inputs(state, identity, requested_model);
+    let charge = check_plan_limits(
+        state,
+        &state.plan_store,
+        &state.limiter,
+        &identity.key_hash,
+        identity.team_id.as_deref(),
+        requested_model,
+        &resolved_model_for_quota,
+        rpm,
+        tpm,
+        budget,
+        budget_period,
+        max_parallel,
+        &window_limits,
+        weight,
+    )
+    .await?;
+    drop(charge); // peek-only: guards released, nothing committed
+    Ok(())
+}
+
+/// Rate-limit check + counts commit for `generate:false` WS creates. These
+/// are served locally (no inference, no `routes::responses` pass), so the
+/// counts-dimension commit an inference create gets inside the handler
+/// must happen here — otherwise store-only creates are invisible to RPM
+/// counters and budget enforcement (a free, unmetered write path). Tokens
+/// and costs stay at zero: nothing was generated.
+///
+/// The concurrency guard acquired by `check_plan_limits` is dropped on
+/// return — there is no upstream in-flight to hold it against.
+pub async fn responses_charge_local(
+    state: &AppState,
+    identity: &AuthIdentity,
+    requested_model: &str,
+) -> Result<(), GatewayError> {
+    let (window_limits, weight, resolved_model_for_quota, rpm, tpm, budget, budget_period, max_parallel) =
+        ws_rate_limit_inputs(state, identity, requested_model);
+    let mut charge = check_plan_limits(
+        state,
+        &state.plan_store,
+        &state.limiter,
+        &identity.key_hash,
+        identity.team_id.as_deref(),
+        requested_model,
+        &resolved_model_for_quota,
+        rpm,
+        tpm,
+        budget,
+        budget_period,
+        max_parallel,
+        &window_limits,
+        weight,
+    )
+    .await?;
+    charge.commit();
+    Ok(())
+}
+
 // ============================================================
 // Helpers
 // ============================================================
