@@ -31,8 +31,7 @@
 //! - OTLP traces 导出器（feature-gated）
 //!
 //! **不管：**
-//! - 不写 DB 表 — 持久化数据由 boom-audit 的 `boom_request_log` 担任；
-//!   本模块只在启动时从该表回填历史 N 天到 in-memory 直方图（只读）
+//! - 不读写 DB 表 — 持久化数据由 boom-audit 的 `boom_request_log` 担任
 //! - 不记录 prompt 内容 — 那是 boom-promptlog 的职责；本模块的 span
 //!   只记时间维度 + 元数据，不记请求/响应 body
 //! - 不做路由决策 — 不感知 Provider 具体实现
@@ -78,7 +77,7 @@
 //! | 模块 | 关系 |
 //! |------|------|
 //! | boom-core | 持有 `TraceApi` trait + `RequestSpan` + `OtlpConfig` 等共享类型 |
-//! | boom-audit | 本模块在启动时只读 `boom_request_log` 回填历史百分位；不写表 |
+//! | boom-audit | 持久化由 boom-audit 的 `boom_request_log` 担任；本模块不读写 DB |
 //! | boom-promptlog | 互补：promptlog 管 prompt 内容 + OTLP logs 导出；本模块管 trace 链路 + OTLP traces 导出。body 通过 `Arc<serde_json::Value>` 共享单份内存 |
 //! | boom-stressmon | 互补：stressmon 是机器压力（1Hz 采样）；本模块是请求级延迟（per-request span） |
 //! | boom-provider / boom-fusion | 不直接依赖；gateway span 通过 `gateway_headers` 注入 `traceparent` 头，provider 已有 header 注入循环（openai.rs:89 / anthropic.rs:539）零改动应用 |

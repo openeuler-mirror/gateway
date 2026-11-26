@@ -427,23 +427,6 @@ pub struct UserLogsQuery {
 fn default_page() -> i64 { 1 }
 fn default_per_page() -> i64 { 50 }
 
-#[derive(Debug, sqlx::FromRow)]
-struct UserLogRow {
-    model: String,
-    api_path: String,
-    is_stream: bool,
-    status_code: i16,
-    input_tokens: Option<i32>,
-    output_tokens: Option<i32>,
-    duration_ms: Option<i32>,
-    error_type: Option<String>,
-    error_message: Option<String>,
-    created_at: Option<chrono::DateTime<chrono::Utc>>,
-    client_ip: Option<String>,
-    cached_tokens: Option<i64>,
-    queue_wait_ms: Option<i32>,
-}
-
 pub async fn get_user_logs(
     session: DashboardSession,
     Extension(state): Extension<std::sync::Arc<DashboardState>>,

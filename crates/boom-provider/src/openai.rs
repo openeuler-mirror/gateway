@@ -167,6 +167,103 @@ fn assemble_sse_response(text: &str) -> Result<ChatCompletionResponse, String> {
 }
 
 /// OpenAI provider — also serves as the base for Azure (same API format).
+/// Downgrade a serialized chat body's `response_format` (json_schema /
+/// json_object) into prompt instructions, stripping the field. The schema
+/// text is appended as a leading system message so the model still aims at
+/// the shape; strictness is best-effort on upstreams without native support.
+fn downgrade_response_format_to_prompt(body: &serde_json::Value) -> serde_json::Value {
+    let mut out = body.clone();
+    out.as_object_mut().map(|o| {
+        o.remove("response_format");
+    });
+    let describe = |rf: &serde_json::Value| -> String {
+        let ty = rf.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        if ty == "json_schema" {
+            let js = rf.get("json_schema").cloned().unwrap_or_default();
+            let name = js.get("name").and_then(|n| n.as_str()).unwrap_or("response");
+            let schema = js.get("schema").unwrap_or(&serde_json::Value::Null);
+            format!(
+                "Respond with a single JSON object matching this schema (field `{name}`):\n{schema}\n                 Output ONLY the JSON object, no prose, no code fences."
+            )
+        } else {
+            "Respond with a single valid JSON object. Output ONLY the JSON, no prose.".to_string()
+        }
+    };
+    if let Some(rf) = body.get("response_format") {
+        let instruction = describe(rf);
+        if let Some(obj) = out.as_object_mut() {
+            if let Some(messages) = obj.get_mut("messages").and_then(|m| m.as_array_mut()) {
+                let sys = serde_json::json!({
+                    "role": "system",
+                    "content": instruction,
+                });
+                messages.insert(0, sys);
+            }
+        }
+    }
+    out
+}
+
+/// Parse a non-streaming success body through the full tolerance ladder:
+/// BOM strip → SSE-assembly fallback (non-standard upstreams answering a
+/// non-streaming request with `data:` chunks) → strict JSON with the
+/// shapeless-body guard (no id/object/choices/usage at all = parse failure
+/// carrying the raw bytes). Shared by the primary success path AND the
+/// response_format downgrade retry — the upstreams that reject
+/// response_format are exactly the non-standard ones most likely to need
+/// the SSE/BOM fallbacks on the retried response too; a strict
+/// `from_str` there would turn a 200 into UpstreamParseError.
+fn parse_completion_body(raw_text: &str) -> Result<ChatCompletionResponse, GatewayError> {
+    // Tolerate a UTF-8 BOM: some upstreams prepend one invisibly (curl
+    // output looks fine) and serde_json fails with "expected value at
+    // line 1 column 1". Stripped for parsing only — raw_response and the
+    // prompt-log raw body keep the bytes as sent.
+    let parse_input = raw_text.strip_prefix('\u{feff}').unwrap_or(raw_text);
+    let parsed = if parse_input.trim_start().starts_with("data:") {
+        // Non-standard upstream answered a non-streaming request with an
+        // SSE stream — assemble the chunks into a complete response.
+        match assemble_sse_response(parse_input) {
+            Ok(assembled) => assembled,
+            Err(e) => {
+                tracing::error!("Failed to assemble SSE response for non-stream request: {}", e);
+                return Err(GatewayError::UpstreamParseError {
+                    parse_error: e,
+                    raw_body: raw_text.to_string(),
+                });
+            }
+        }
+    } else {
+        match serde_json::from_str::<ChatCompletionResponse>(parse_input) {
+            Ok(parsed) => {
+                // Lenient defaults (choices-missing nemotron bodies) made
+                // SHAPELESS bodies parse as all-default Ok — a body with
+                // no recognizable completion field at all is still a
+                // parse failure carrying the raw bytes.
+                if parsed.id.is_empty()
+                    && parsed.object.is_empty()
+                    && parsed.choices.is_empty()
+                    && parsed.usage.is_none()
+                {
+                    tracing::error!("OpenAI response has no recognizable completion fields");
+                    return Err(GatewayError::UpstreamParseError {
+                        parse_error: "no recognizable completion fields".to_string(),
+                        raw_body: raw_text.to_string(),
+                    });
+                }
+                parsed
+            }
+            Err(e) => {
+                tracing::error!("Failed to parse OpenAI response: {}", e);
+                return Err(GatewayError::UpstreamParseError {
+                    parse_error: e.to_string(),
+                    raw_body: raw_text.to_string(),
+                });
+            }
+        }
+    };
+    Ok(parsed)
+}
+
 pub struct OpenAIProvider {
     client: Client,
     api_key: Option<String>,
@@ -335,6 +432,60 @@ impl Provider for OpenAIProvider {
         let status = resp.status();
         if !status.is_success() {
             let error_body = resp.text().await.unwrap_or_default();
+            // Structured-output fallback: many OpenAI-compatible upstreams
+            // (free-tier aggregators, older vLLM) reject
+            // `response_format.type = "json_schema"` with a 400 even though
+            // they accept everything else. Downgrade once — move the schema
+            // into a system instruction and strip the field — and retry;
+            // clients like Codex send this on every title-generation turn.
+            if status.as_u16() == 400
+                && body.get("response_format").is_some()
+                && !error_body.is_empty()
+                && error_body.contains("response_format")
+            {
+                // The first 400 is part of the request's story — record it
+                // before the retry replaces it, or prompt-log raw capture
+                // misses the downgrade trigger entirely.
+                if let Some(ref cap) = raw_capture {
+                    cap.push_response_frame(error_body.clone());
+                }
+                tracing::warn!(
+                    "upstream rejected response_format; retrying with prompt-injected schema"
+                );
+                let downgraded = downgrade_response_format_to_prompt(&body);
+                let mut builder = self.client.post(&url);
+                if let Some(ref key) = self.api_key {
+                    builder = builder.bearer_auth(key);
+                }
+                builder = crate::apply_gateway_headers(builder, &gateway_headers);
+                let resp2 = builder.json(&downgraded).send().await.map_err(|e| {
+                    tracing::error!("OpenAI retry failed: {}", e);
+                    GatewayError::ProviderError("Upstream provider unavailable".to_string())
+                })?;
+                let status2 = resp2.status();
+                if status2.is_success() {
+                    let raw2 = resp2.text().await.unwrap_or_default();
+                    if let Some(ref cap) = raw_capture {
+                        cap.push_response_frame(raw2.clone());
+                    }
+                    // Same parser as the primary success path — the
+                    // aggregators that reject response_format are exactly
+                    // the ones that answer non-stream requests with SSE
+                    // bodies / BOMs; strict from_str turned the retried
+                    // 200 into UpstreamParseError.
+                    let mut parsed = parse_completion_body(&raw2)?;
+                    parsed.raw_response = Some(raw2);
+                    return Ok(parsed);
+                }
+                let error_body2 = resp2.text().await.unwrap_or_default();
+                if let Some(ref cap) = raw_capture {
+                    cap.push_response_frame(error_body2.clone());
+                }
+                return Err(GatewayError::UpstreamError {
+                    status: status2.as_u16(),
+                    message: error_body2,
+                });
+            }
             if let Some(ref cap) = raw_capture {
                 cap.push_response_frame(error_body.clone());
             }
@@ -352,56 +503,7 @@ impl Provider for OpenAIProvider {
             cap.push_response_frame(raw_text.clone());
         }
 
-        // Tolerate a UTF-8 BOM: some upstreams prepend one invisibly (curl
-        // output looks fine) and serde_json fails with "expected value at
-        // line 1 column 1". Stripped for parsing only — raw_response and the
-        // prompt-log raw body keep the bytes as sent.
-        let parse_input = raw_text.strip_prefix('\u{feff}').unwrap_or(&raw_text);
-        let mut parsed: ChatCompletionResponse = if parse_input.trim_start().starts_with("data:") {
-            // Non-standard upstream answered a non-streaming request with an
-            // SSE stream — assemble the chunks into a complete response.
-            match assemble_sse_response(parse_input) {
-                Ok(assembled) => assembled,
-                Err(e) => {
-                    tracing::error!("Failed to assemble SSE response for non-stream request: {}", e);
-                    return Err(GatewayError::UpstreamParseError {
-                        parse_error: e,
-                        raw_body: raw_text,
-                    });
-                }
-            }
-        } else {
-            match serde_json::from_str::<ChatCompletionResponse>(parse_input) {
-                Ok(parsed) => {
-                    // Lenient defaults (choices-missing nemotron bodies) made
-                    // SHAPELESS bodies parse as all-default Ok — a body with
-                    // no recognizable completion field at all is still a
-                    // parse failure carrying the raw bytes.
-                    if parsed.id.is_empty()
-                        && parsed.object.is_empty()
-                        && parsed.choices.is_empty()
-                        && parsed.usage.is_none()
-                    {
-                        tracing::error!(
-                            "OpenAI response has no recognizable completion fields"
-                        );
-                        return Err(GatewayError::UpstreamParseError {
-                            parse_error: "no recognizable completion fields".to_string(),
-                            raw_body: raw_text,
-                        });
-                    }
-                    parsed
-                }
-                Err(e) => {
-                    tracing::error!("Failed to parse OpenAI response: {}", e);
-                    return Err(GatewayError::UpstreamParseError {
-                        parse_error: e.to_string(),
-                        raw_body: raw_text,
-                    });
-                }
-            }
-        };
-
+        let mut parsed = parse_completion_body(&raw_text)?;
         parsed.raw_response = Some(raw_text);
         Ok(parsed)
     }
@@ -440,17 +542,64 @@ impl Provider for OpenAIProvider {
                 GatewayError::ProviderError("Upstream provider unavailable".to_string())
             })?;
 
-        let status = resp.status();
-        if !status.is_success() {
-            let error_body = resp.text().await.unwrap_or_default();
-            if let Some(ref cap) = raw_capture {
-                cap.push_response_frame(error_body.clone());
+        // Same structured-output fallback as the non-stream path: retry once
+        // with the schema prompt-injected (Codex title-gen turns stream and
+        // hit the 400 without this). A successful retry replaces `resp` so
+        // it flows into the shared SSE parser below.
+        let resp = match resp.status() {
+            s if s.is_success() => resp,
+            s => {
+                let error_body = resp.text().await.unwrap_or_default();
+                if s.as_u16() == 400
+                    && body.get("response_format").is_some()
+                    && !error_body.is_empty()
+                    && error_body.contains("response_format")
+                {
+                    // Record the first 400 before the retry — same
+                    // prompt-log completeness rule as the non-stream path.
+                    if let Some(ref cap) = raw_capture {
+                        cap.push_response_frame(error_body.clone());
+                    }
+                    tracing::warn!(
+                        "upstream rejected response_format (stream); retrying with prompt-injected schema"
+                    );
+                    let downgraded = downgrade_response_format_to_prompt(&body);
+                    let mut builder = self.client.post(&url);
+                    if let Some(ref key) = self.api_key {
+                        builder = builder.bearer_auth(key);
+                    }
+                    builder = crate::apply_gateway_headers(builder, &gateway_headers);
+                    match builder.json(&downgraded).send().await {
+                        Ok(resp2) if resp2.status().is_success() => resp2,
+                        Ok(resp2) => {
+                            let status2 = resp2.status().as_u16();
+                            let error_body2 = resp2.text().await.unwrap_or_default();
+                            if let Some(ref cap) = raw_capture {
+                                cap.push_response_frame(error_body2.clone());
+                            }
+                            return Err(GatewayError::UpstreamError {
+                                status: status2,
+                                message: error_body2,
+                            });
+                        }
+                        Err(e) => {
+                            tracing::error!("OpenAI stream retry failed: {}", e);
+                            return Err(GatewayError::ProviderError(
+                                "Upstream provider unavailable".to_string(),
+                            ));
+                        }
+                    }
+                } else {
+                    if let Some(ref cap) = raw_capture {
+                        cap.push_response_frame(error_body.clone());
+                    }
+                    return Err(GatewayError::UpstreamError {
+                        status: s.as_u16(),
+                        message: error_body,
+                    });
+                }
             }
-            return Err(GatewayError::UpstreamError {
-                status: status.as_u16(),
-                message: error_body,
-            });
-        }
+        };
 
         // Parse SSE byte stream into ChatStreamChunk items.
         let (tx, rx) = tokio::sync::mpsc::channel(32);
@@ -1175,6 +1324,37 @@ mod tests {
     /// non-standard `name` field inside delta). The streaming parser used to
     /// require `"data: "` and silently dropped every chunk — empty reply, no
     /// error. Payload mirrors the real upstream shape.
+    #[test]
+    fn response_format_downgrade_moves_schema_to_system() {
+        let body = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "gen"}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "t", "schema": {"type": "object"}, "strict": true},
+            },
+        });
+        let out = downgrade_response_format_to_prompt(&body);
+        assert!(out.get("response_format").is_none(), "field must be stripped");
+        let messages = out["messages"].as_array().unwrap();
+        assert_eq!(messages[0]["role"], "system");
+        let sys = messages[0]["content"].as_str().unwrap();
+        assert!(sys.contains("`t`"), "carries schema name");
+        assert_eq!(messages.len(), 2, "original user message preserved");
+    }
+
+    #[test]
+    fn response_format_downgrade_json_object_keeps_user_messages() {
+        let body = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "gen"}],
+            "response_format": {"type": "json_object"},
+        });
+        let out = downgrade_response_format_to_prompt(&body);
+        assert!(out.get("response_format").is_none());
+        assert_eq!(out["messages"].as_array().unwrap().len(), 2);
+    }
+
     #[tokio::test]
     async fn chat_stream_data_prefix_without_space_parses() {
         let sse = concat!(

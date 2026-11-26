@@ -22,16 +22,23 @@
 //!                  freeform input; a leaked function_call is a FAIL
 //!                  (P0.5: coercion breaks Codex, vLLM #49724)
 //! 7. passthrough — native reasoning item fidelity on protocol:responses
+//! 8. ws transport — GET /v1/responses WebSocket upgrade (P0 acceptance):
+//!    dual-lane concurrency, same-lane strict FIFO, per-key connection
+//!    cap (handshake 429), oversize frame transport rejection, reconnect
+//!    + generate:false continuation. SKIPs cleanly when the rollout
+//!    switch is off (handshake 404).
 //!
 //! Usage:
 //!   agent --base-url http://127.0.0.1:18400 --key smoke-master-key --model test-model
 //!
 //! Exit code 0 = all checks passed.
 
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::Message;
 
 struct Config {
     base_url: String,
@@ -119,6 +126,7 @@ async fn run_all_checks(cfg: &Config) -> Vec<(&'static str, Result<String, Strin
         ("store_continuation", check_store_continuation(&client, cfg).await),
         ("custom_tool_loop", check_custom_tool_loop(&client, cfg).await),
         ("passthrough_fidelity", check_passthrough_fidelity(&client, cfg).await),
+        ("ws_transport_smoke", check_ws_transport(&client, cfg).await),
     ]
 }
 
@@ -711,4 +719,308 @@ async fn check_passthrough_fidelity(client: &Client, cfg: &Config) -> Result<Str
         ));
     }
     Ok(format!("reasoning_item={} round2={text:?}", reasoning["id"].as_str().unwrap_or("?")))
+}
+
+// ---------------------------------------------------------------
+// Check 8 (P0): WebSocket transport (`GET /v1/responses` upgrade,
+// vLLM agentic-api protocol). The design §4 P0 acceptance run:
+// dual-lane concurrency, same-lane strict FIFO, per-key connection
+// cap, oversize-frame transport rejection, reconnect + generate:false
+// continuation. SKIPs when the rollout switch is off (handshake 404).
+// ---------------------------------------------------------------
+
+type WsStream = tokio_tungstenite::WebSocketStream<
+    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+>;
+
+const WS_FRAME_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Connect the WS endpoint with the bearer key at the handshake.
+async fn ws_connect(
+    cfg: &Config,
+) -> Result<WsStream, tokio_tungstenite::tungstenite::Error> {
+    let url = format!("{}/v1/responses", cfg.base_url.replacen("http", "ws", 1));
+    let mut request = url
+        .into_client_request()
+        .expect("ws request url");
+    request.headers_mut().insert(
+        "Authorization",
+        tokio_tungstenite::tungstenite::http::HeaderValue::from_str(&format!("Bearer {}", cfg.key))
+            .expect("header value"),
+    );
+    let (stream, _resp) = tokio_tungstenite::connect_async(request).await?;
+    Ok(stream)
+}
+
+/// Handshake status when the server rejects the upgrade (404/401/429...).
+fn ws_reject_status(e: &tokio_tungstenite::tungstenite::Error) -> Option<u16> {
+    if let tokio_tungstenite::tungstenite::Error::Http(resp) = e {
+        Some(resp.status().as_u16())
+    } else {
+        None
+    }
+}
+
+/// Next JSON frame as a Value; None on close. Pings/binary are skipped.
+async fn ws_next_event(stream: &mut WsStream) -> Result<Option<Value>, String> {
+    loop {
+        match tokio::time::timeout(WS_FRAME_TIMEOUT, stream.next()).await {
+            Err(_) => return Err("timeout waiting for ws frame".to_string()),
+            Ok(None) => return Ok(None),
+            Ok(Some(Err(e))) => return Err(format!("ws read error: {e}")),
+            Ok(Some(Ok(Message::Text(t)))) => {
+                let v: Value = serde_json::from_str(&t).map_err(|e| format!("bad frame json: {e}"))?;
+                if v.get("type").and_then(|t| t.as_str()) == Some("error") {
+                    return Err(format!("error frame: {v}"));
+                }
+                return Ok(Some(v));
+            }
+            Ok(Some(Ok(Message::Close(_)))) => return Ok(None),
+            // A close frame is how the transport reports the oversize-kill —
+            // surfaced by the caller via Ok(None).
+            Ok(Some(Ok(_))) => {} // ping/pong/binary — keep reading
+        }
+    }
+}
+
+/// Send one response.create text frame.
+async fn ws_send(stream: &mut WsStream, frame: Value) -> Result<(), String> {
+    let text = serde_json::to_string(&frame).expect("frame json");
+    tokio::time::timeout(WS_FRAME_TIMEOUT, stream.send(Message::Text(text.into())))
+        .await
+        .map_err(|_| "timeout sending frame".to_string())?
+        .map_err(|e| format!("ws send failed: {e}"))
+}
+
+fn ws_create(model: &str, input: &str, stream_id: Option<&str>) -> Value {
+    let mut v = json!({ "type": "response.create", "model": model, "input": input });
+    if let Some(id) = stream_id {
+        v["stream_id"] = json!(id);
+    }
+    v
+}
+
+fn is_terminal(name: &str) -> bool {
+    matches!(name, "response.completed" | "response.incomplete" | "response.failed")
+}
+
+/// Read frames until `predicate` fires, collecting everything seen.
+async fn ws_collect_until(
+    stream: &mut WsStream,
+    mut predicate: impl FnMut(&Value) -> bool,
+) -> Result<Vec<Value>, String> {
+    let mut seen = Vec::new();
+    loop {
+        let v = ws_next_event(stream).await?.ok_or("stream closed before predicate")?;
+        let done = predicate(&v);
+        seen.push(v);
+        if done {
+            return Ok(seen);
+        }
+        if seen.len() > 500 {
+            return Err("runaway event collection (>500 frames)".to_string());
+        }
+    }
+}
+
+async fn check_ws_transport(_client: &Client, cfg: &Config) -> Result<String, String> {
+    // Probe: rollout switch off → handshake 404 → SKIP (the endpoint does
+    // not exist by design; the other 7 checks cover the HTTP transport).
+    let mut stream = match ws_connect(cfg).await {
+        Ok(s) => s,
+        Err(e) => match ws_reject_status(&e) {
+            Some(404) => return Ok("skipped (responses_ws.enabled is off on this gateway)".to_string()),
+            Some(other) => return Err(format!("handshake rejected with {other}: {e}")),
+            None => return Err(format!("handshake failed: {e}")),
+        },
+    };
+
+    // ── Dual-lane concurrency: two lanes, one connection, both complete. ──
+    ws_send(&mut stream, ws_create(&cfg.model, "ws lane-a", Some("lane-a"))).await?;
+    ws_send(&mut stream, ws_create(&cfg.model, "ws lane-b", Some("lane-b"))).await?;
+    let mut lane_a_terminal = false;
+    let mut lane_b_terminal = false;
+    let events = ws_collect_until(&mut stream, |v| {
+        if is_terminal(v["type"].as_str().unwrap_or("")) {
+            match v["stream_id"].as_str() {
+                Some("lane-a") => lane_a_terminal = true,
+                Some("lane-b") => lane_b_terminal = true,
+                _ => {}
+            }
+        }
+        lane_a_terminal && lane_b_terminal
+    })
+    .await?;
+    for lane in ["lane-a", "lane-b"] {
+        let lane_events = events.iter().filter(|v| v["stream_id"] == lane).count();
+        if lane_events == 0 {
+            return Err(format!("dual-lane: no events for {lane}"));
+        }
+        if !events.iter().any(|v| {
+            v["stream_id"] == lane && is_terminal(v["type"].as_str().unwrap_or(""))
+        }) {
+            return Err(format!("dual-lane: {lane} never reached a terminal event"));
+        }
+    }
+
+    // ── Same-lane strict FIFO: on lane-c, completed(#1) must precede
+    //    created(#2) — the second create may not start before the first
+    //    finishes (previous_response_id chains never race). ──
+    ws_send(&mut stream, ws_create(&cfg.model, "ws fifo 1", Some("lane-c"))).await?;
+    ws_send(&mut stream, ws_create(&cfg.model, "ws fifo 2", Some("lane-c"))).await?;
+    let mut lane_c_completed = 0usize;
+    let events = ws_collect_until(&mut stream, |v| {
+        if v["stream_id"] == "lane-c" && v["type"].as_str() == Some("response.completed") {
+            lane_c_completed += 1;
+        }
+        lane_c_completed >= 2
+    })
+    .await?;
+    let created_ids: Vec<&str> = events
+        .iter()
+        .filter(|v| v["type"].as_str() == Some("response.created"))
+        .filter_map(|v| v["response"]["id"].as_str())
+        .collect();
+    let completed_ids: Vec<&str> = events
+        .iter()
+        .filter(|v| v["type"].as_str() == Some("response.completed"))
+        .filter_map(|v| v["response"]["id"].as_str())
+        .collect();
+    if created_ids.len() < 2 || completed_ids.len() < 2 {
+        return Err(format!(
+            "fifo: expected 2 created + 2 completed, got {created_ids:?} / {completed_ids:?}"
+        ));
+    }
+    let first = created_ids[0];
+    let second = created_ids[1];
+    if first == second {
+        return Err("fifo: two creates produced the same response id".to_string());
+    }
+    // Position of #1's completion vs #2's creation.
+    let pos = |ids: &[Value], f: &dyn Fn(&Value) -> bool| -> Option<usize> {
+        ids.iter().position(f)
+    };
+    let completed_first_pos = pos(&events, &|v| {
+        v["type"].as_str() == Some("response.completed")
+            && v["response"]["id"].as_str() == Some(first)
+    });
+    let created_second_pos = pos(&events, &|v| {
+        v["type"].as_str() == Some("response.created")
+            && v["response"]["id"].as_str() == Some(second)
+    });
+    match (completed_first_pos, created_second_pos) {
+        (Some(a), Some(b)) if a < b => {}
+        (a, b) => {
+            return Err(format!(
+                "fifo violated: completed({first}) at {a:?} not before created({second}) at {b:?}"
+            ))
+        }
+    }
+
+    // ── Per-key connection cap: 4 concurrent handshakes pass, the 5th is
+    //    rejected 429 before any session state exists. ──
+    let mut extra = Vec::new();
+    for i in 0..3 {
+        extra.push(
+            ws_connect(cfg)
+                .await
+                .map_err(|e| format!("per-key cap: connection {i} rejected unexpectedly: {e}"))?,
+        );
+    }
+    match ws_connect(cfg).await {
+        Err(e) if ws_reject_status(&e) == Some(429) => {} // expected
+        Err(e) => return Err(format!("per-key cap: expected 429, got {e}")),
+        Ok(_) => return Err("per-key cap: 5th connection accepted (limit not enforced)".to_string()),
+    }
+    extra.clear(); // drop → registry releases the slots
+
+    // ── Oversize frame: the transport cap kills the connection (design
+    //    §1.2 — oversize frames never enter JSON parsing). A fresh
+    //    reconnect must work. ──
+    let big = json!({
+        "type": "response.create",
+        "model": cfg.model,
+        "input": "x".repeat(11 * 1024 * 1024),
+    });
+    // The server kills the socket mid-frame once the message cap trips, so
+    // the send itself may fail with a broken pipe — that IS the rejection.
+    if let Err(e) = ws_send(&mut stream, big).await {
+        if !e.contains("Broken pipe") {
+            return Err(format!("oversize frame: unexpected send error: {e}"));
+        }
+    }
+    match tokio::time::timeout(Duration::from_secs(15), stream.next()).await {
+        Err(_) => return Err("oversize frame: connection stayed open (cap not enforced)".to_string()),
+        Ok(None) => {}
+        Ok(Some(Ok(Message::Close(_)))) => {}
+        Ok(Some(Ok(Message::Text(t)))) => {
+            let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
+            if v.get("type").and_then(|t| t.as_str()) != Some("error") {
+                return Err("oversize frame: got a normal frame instead of rejection".to_string());
+            }
+            // An explicit error frame is also an acceptable rejection shape.
+        }
+        Ok(Some(Ok(_))) => {}
+        Ok(Some(Err(_))) => {} // transport error = killed, fine
+    }
+    stream = ws_connect(cfg).await.map_err(|e| format!("reconnect after oversize kill failed: {e}"))?;
+
+    // ── generate:false + reconnect continuation: park state on the store
+    //    with a non-generating create, then continue on a FRESH connection
+    //    via previous_response_id. Skipped when the gateway has no
+    //    response store (400 guard, same probe as check 5). ──
+    ws_send(
+        &mut stream,
+        json!({ "type": "response.create", "generate": false, "model": cfg.model, "input": "ws park state" }),
+    )
+    .await?;
+    let events = ws_collect_until(&mut stream, |v| {
+        v["type"].as_str() == Some("response.completed") && v["stream_id"].is_null()
+    })
+    .await?;
+    let parked_id = events
+        .iter()
+        .find(|v| v["type"].as_str() == Some("response.completed"))
+        .and_then(|v| v["response"]["id"].as_str())
+        .ok_or("generate:false produced no completed event")?
+        .to_string();
+
+    let mut stream2 = ws_connect(cfg)
+        .await
+        .map_err(|e| format!("continuation reconnect failed: {e}"))?;
+    ws_send(
+        &mut stream2,
+        ws_create_with_previous(&cfg.model, "ws continue after park", &parked_id, Some("lane-cont")),
+    )
+    .await?;
+    let mut stored_ok = true;
+    match ws_collect_until(&mut stream2, |v| {
+        v["stream_id"] == "lane-cont" && is_terminal(v["type"].as_str().unwrap_or(""))
+    })
+    .await
+    {
+        Ok(_) => {}
+        Err(e) if e.contains("error frame") && e.contains("previous_response_id") => {
+            // Store disabled on this gateway: the 400-guard shape over WS.
+            stored_ok = false;
+        }
+        Err(e) => return Err(format!("continuation failed: {e}")),
+    }
+    Ok(format!(
+        "lanes=2 fifo_ok conn_cap=4 oversize_killed parked={parked_id}{}",
+        if stored_ok { " continuation_ok" } else { " continuation_skipped(no store)" }
+    ))
+}
+
+fn ws_create_with_previous(model: &str, input: &str, previous: &str, stream_id: Option<&str>) -> Value {
+    let mut v = json!({
+        "type": "response.create",
+        "model": model,
+        "input": input,
+        "previous_response_id": previous,
+    });
+    if let Some(id) = stream_id {
+        v["stream_id"] = json!(id);
+    }
+    v
 }
