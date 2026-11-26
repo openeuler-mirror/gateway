@@ -161,39 +161,60 @@ pub async fn get_usage(
         .find(|w| w.window_secs == 60)
         .and_then(|w| w.counts);
 
-    // Counts dimension: from SlidingWindowLimiter (per-window aggregated).
-    // We dedupe by window_secs — multiple models under the same key collapse
-    // into one counts window because the plan limit is keyed by secs only.
+    // DB-authoritative reads: the shared rows hold every instance's pushed
+    // deltas (≤ one quota_sync interval stale); the in-memory mirrors only
+    // cover keys this instance has routed, so a user whose traffic lives on
+    // a peer instance would see zeros from the memory view.
+    let db_pool = match &state.db_pool {
+        Some(pool) => pool,
+        None => return Json(json!({"error": "Database not available"})),
+    };
+    let win_rows = match boom_limiter::peek_key_windows_db(db_pool, key_hash).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!("User usage window query failed: {}", e);
+            return Json(json!({"error": "Database query failed"}));
+        }
+    };
+    let cumulative = match boom_limiter::peek_cumulative_db(db_pool, key_hash).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("User usage cumulative query failed: {}", e);
+            return Json(json!({"error": "Database query failed"}));
+        }
+    };
+
+    // Per-window aggregation. We dedupe by window_secs — multiple models
+    // under the same key collapse into one window because the plan limit is
+    // keyed by secs only; per-model breakdown is not surfaced on the user
+    // usage card. One row feeds all three dimensions.
     let mut counts_by_secs: std::collections::HashMap<u64, (u64, u64, u64)> =
         std::collections::HashMap::new(); // secs → (count, elapsed, remaining)
-    for w in state.limiter.get_usage_for_key(key_hash) {
+    let mut tokens_by_secs: std::collections::HashMap<u64, (u64, u64)> =
+        std::collections::HashMap::new(); // secs → (count, remaining)
+    let mut costs_by_secs: std::collections::HashMap<u64, (u64, u64)> =
+        std::collections::HashMap::new(); // secs → (micros, remaining)
+    for w in &win_rows {
         let remaining = w.window_secs.saturating_sub(w.elapsed_secs);
         counts_by_secs
             .entry(w.window_secs)
             .and_modify(|e| e.0 = e.0.saturating_add(w.counts))
             .or_insert((w.counts, w.elapsed_secs, remaining));
-    }
-
-    // Tokens / costs dimension: from the limiter's multi-dim windows. Aggregate count by (secs, kind)
-    // — we don't surface per-model breakdown on the user usage card.
-    let mut tokens_by_secs: std::collections::HashMap<u64, (u64, u64)> =
-        std::collections::HashMap::new(); // secs → (count, remaining)
-    let mut costs_by_secs: std::collections::HashMap<u64, (u64, u64)> =
-        std::collections::HashMap::new(); // secs → (micros, remaining)
-    for w in state.limiter.peek_key_windows(key_hash) {
-        let entry = match w.kind {
-            boom_limiter::WindowKind::Tokens => tokens_by_secs
-                .entry(w.window_secs)
-                .or_insert((0, w.remaining_secs)),
-            boom_limiter::WindowKind::CostMicros => costs_by_secs
-                .entry(w.window_secs)
-                .or_insert((0, w.remaining_secs)),
-        };
-        entry.0 = entry.0.saturating_add(w.count);
         // Keep the smallest remaining (i.e. the soonest-resetting window in
         // that secs bucket — defensive in case of clock skew between models).
-        if w.remaining_secs < entry.1 {
-            entry.1 = w.remaining_secs;
+        if w.tokens > 0 {
+            let entry = tokens_by_secs.entry(w.window_secs).or_insert((0, remaining));
+            entry.0 = entry.0.saturating_add(w.tokens);
+            if remaining < entry.1 {
+                entry.1 = remaining;
+            }
+        }
+        if w.costs_micros > 0 {
+            let entry = costs_by_secs.entry(w.window_secs).or_insert((0, remaining));
+            entry.0 = entry.0.saturating_add(w.costs_micros);
+            if remaining < entry.1 {
+                entry.1 = remaining;
+            }
         }
     }
 
@@ -275,27 +296,12 @@ pub async fn get_usage(
         .collect();
 
     // Cumulative counters + plan cumulative limits.
-    let key_scope = boom_limiter::QuotaScope::Key {
-        key_hash: key_hash.to_string(),
-    };
-    let total_in = state
-        .limiter
-        .peek_cumulative(&key_scope, boom_limiter::CumulativeKind::TotalInputTokens);
-    let total_out = state
-        .limiter
-        .peek_cumulative(&key_scope, boom_limiter::CumulativeKind::TotalOutputTokens);
-    let total_cost_micros = state
-        .limiter
-        .peek_cumulative(&key_scope, boom_limiter::CumulativeKind::TotalCost);
-    let regular_input_cost_micros = state
-        .limiter
-        .peek_cumulative(&key_scope, boom_limiter::CumulativeKind::TotalRegularInputCost);
-    let cached_input_cost_micros = state
-        .limiter
-        .peek_cumulative(&key_scope, boom_limiter::CumulativeKind::TotalCachedInputCost);
-    let output_cost_micros = state
-        .limiter
-        .peek_cumulative(&key_scope, boom_limiter::CumulativeKind::TotalOutputCost);
+    let total_in = cumulative.input_tokens;
+    let total_out = cumulative.output_tokens;
+    let total_cost_micros = cumulative.total_cost_micros;
+    let regular_input_cost_micros = cumulative.regular_input_cost_micros;
+    let cached_input_cost_micros = cumulative.cached_input_cost_micros;
+    let output_cost_micros = cumulative.output_cost_micros;
 
     let concurrency = state.plan_store.get_concurrency(key_hash);
     // A plan governs and the key-level `max_parallel_requests` fallback is
@@ -368,23 +374,21 @@ pub async fn get_key_info(
 
     match row {
         Some((key_name, key_alias, _spend, expires, blocked, rpm_limit, tpm_limit, max_budget, budget_duration, metadata, created_at)) => {
-            // Token totals and cost all come from limiter.cumulative
-            // (boom_rate_limit_cumulative backed, in-memory read) — NOT a
+            // Token totals and cost come from the shared cumulative rows in
+            // the DB (cluster-wide, ≤ one quota_sync interval stale) — NOT a
             // SUM over boom_request_log, which scans every historical row of
-            // a busy key on each key-info page load. Note the semantic:
+            // a busy key on each key-info page load. Same semantic as before:
             // cumulative counters reset on explicit quota reset.
-            let key_scope = boom_limiter::QuotaScope::Key {
-                key_hash: key_hash.to_string(),
+            let cumulative = match boom_limiter::peek_cumulative_db(db_pool, key_hash).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!("User key-info cumulative query failed: {}", e);
+                    return Json(json!({"error": "Database query failed"}));
+                }
             };
-            let input_tokens = state
-                .limiter
-                .peek_cumulative(&key_scope, boom_limiter::CumulativeKind::TotalInputTokens);
-            let output_tokens = state
-                .limiter
-                .peek_cumulative(&key_scope, boom_limiter::CumulativeKind::TotalOutputTokens);
-            let total_cost_micros = state
-                .limiter
-                .peek_cumulative(&key_scope, boom_limiter::CumulativeKind::TotalCost);
+            let input_tokens = cumulative.input_tokens;
+            let output_tokens = cumulative.output_tokens;
+            let total_cost_micros = cumulative.total_cost_micros;
             let total_cost = rust_decimal::Decimal::from(total_cost_micros)
                 / rust_decimal::Decimal::from(1_000_000);
 

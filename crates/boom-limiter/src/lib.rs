@@ -12,6 +12,7 @@ pub use migrations::{
     team_assignment_ddl,
 };
 pub use sliding_window::{
-    decimal_to_micros, micros_to_decimal, CumulativeKind, CumulativeSnapshot, QuotaScope,
-    SlidingWindowLimiter, TeamRecomputeResult, WindowInfo, WindowKind, WindowUsage,
+    decimal_to_micros, micros_to_decimal, peek_cumulative_batch_db, peek_cumulative_db,
+    peek_key_windows_db, peek_plan_windows_db, CumulativeDb, CumulativeKind, CumulativeSnapshot,
+    QuotaScope, SlidingWindowLimiter, TeamRecomputeResult, WindowInfo, WindowKind, WindowUsage,
 };
