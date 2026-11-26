@@ -459,6 +459,10 @@ pub struct ResponsesStoreSettings {
     pub ttl_secs: u64,
     #[serde(default = "default_max_items")]
     pub max_history_items: usize,
+    /// Persist even `store: false` turns (mirror of boom-config field —
+    /// Codex chains on ids it asked not to store).
+    #[serde(default)]
+    pub force_persist: bool,
 }
 fn default_enabled() -> bool { true }
 fn default_ttl() -> u64 { 2_592_000 }
@@ -470,6 +474,7 @@ impl Default for ResponsesStoreSettings {
             enabled: default_enabled(),
             ttl_secs: default_ttl(),
             max_history_items: default_max_items(),
+            force_persist: false,
         }
     }
 }

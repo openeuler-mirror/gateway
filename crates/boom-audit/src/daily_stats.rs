@@ -270,7 +270,15 @@ async fn query_snapshot(
                   COALESCE(SUM(input_tokens), 0)::BIGINT AS input_tokens,
                   COALESCE(SUM(output_tokens), 0)::BIGINT AS output_tokens,
                   COALESCE(SUM(cached_tokens), 0)::BIGINT AS cached_tokens,
-                  COUNT(CASE WHEN status_code >= 400 THEN 1 END)::BIGINT AS errors
+                  -- response_not_found on /v1/responses is the Codex WS
+                  -- continuation probe (locally-derived ids, followed by a
+                  -- successful full replay within the same second); counting
+                  -- it as an error mislabels every resume turn as failed.
+                  COUNT(CASE WHEN status_code >= 400
+                             AND NOT (api_path = '/v1/responses'
+                                      AND status_code = 404
+                                      AND error_type = 'response_not_found')
+                       THEN 1 END)::BIGINT AS errors
            FROM boom_request_log
            WHERE created_at >= $1
            GROUP BY model
