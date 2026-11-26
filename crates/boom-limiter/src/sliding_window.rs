@@ -1595,6 +1595,197 @@ impl SlidingWindowLimiter {
 }
 
 // ═══════════════════════════════════════════════════════════
+// DB-authoritative reads (dashboard display)
+//
+// Free functions on purpose — they bypass the in-memory mirrors
+// entirely: the mirrors only cover keys this instance has routed, so
+// display reads for a user whose traffic lives on a peer instance
+// would show zeros. The shared rows hold every instance's pushed
+// deltas (≤ one quota_sync interval stale). Enforcement never calls
+// these; it keeps reading the in-memory mirrors on the hot path.
+// ═══════════════════════════════════════════════════════════
+
+/// Every cumulative kind — display dims and budget-period anchors alike.
+const CUMULATIVE_KINDS: [CumulativeKind; 8] = [
+    CumulativeKind::TotalInputTokens,
+    CumulativeKind::TotalOutputTokens,
+    CumulativeKind::TotalCost,
+    CumulativeKind::TotalRegularInputCost,
+    CumulativeKind::TotalCachedInputCost,
+    CumulativeKind::TotalOutputCost,
+    CumulativeKind::BudgetPeriodStart,
+    CumulativeKind::BudgetPeriodBaseCost,
+];
+
+/// Per-scope cumulative state read from the shared DB rows: the six display
+/// dims plus the budget-period anchors.
+#[derive(Debug, Clone, Default)]
+pub struct CumulativeDb {
+    pub display: CumulativeSnapshot,
+    pub budget_period_start: u64,
+    pub budget_period_base_cost: u64,
+}
+
+impl CumulativeDb {
+    /// Spend accrued inside the current budget period — the read-only twin
+    /// of the limiter's `peek_budget_period_cost_micros` partition math.
+    /// Display only: re-anchoring an expired period stays with the
+    /// enforcement path.
+    pub fn budget_period_spend_micros(&self, period_secs: u64, now: u64) -> u64 {
+        budget_period_partition(
+            self.budget_period_start,
+            self.budget_period_base_cost,
+            self.display.total_cost_micros,
+            now,
+            period_secs,
+        )
+        .2
+    }
+}
+
+/// One key's cumulative display dims from `boom_rate_limit_cumulative`.
+pub async fn peek_cumulative_db(
+    pool: &sqlx::PgPool,
+    key_hash: &str,
+) -> Result<CumulativeSnapshot, sqlx::Error> {
+    let scope = QuotaScope::Key {
+        key_hash: key_hash.to_string(),
+    };
+    let mut map = peek_cumulative_batch_db(pool, std::slice::from_ref(&scope)).await?;
+    Ok(map.remove(&scope).map(|c| c.display).unwrap_or_default())
+}
+
+/// Batched cumulative read for many scopes (key and/or team) — one
+/// `= ANY` point query over the scopes' exact cache_keys (PK lookup, no
+/// table scans). Returns an entry for every requested scope, defaulting
+/// when no rows exist.
+pub async fn peek_cumulative_batch_db(
+    pool: &sqlx::PgPool,
+    scopes: &[QuotaScope],
+) -> Result<HashMap<QuotaScope, CumulativeDb>, sqlx::Error> {
+    let mut key_lookup: HashMap<String, (QuotaScope, CumulativeKind)> = HashMap::new();
+    let mut keys: Vec<String> = Vec::with_capacity(scopes.len() * CUMULATIVE_KINDS.len());
+    for scope in scopes {
+        for kind in CUMULATIVE_KINDS {
+            let ck = cumulative_cache_key(scope, kind);
+            key_lookup.insert(ck.clone(), (scope.clone(), kind));
+            keys.push(ck);
+        }
+    }
+    let mut out: HashMap<QuotaScope, CumulativeDb> = scopes
+        .iter()
+        .map(|s| (s.clone(), CumulativeDb::default()))
+        .collect();
+    if keys.is_empty() {
+        return Ok(out);
+    }
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT cache_key, value FROM boom_rate_limit_cumulative WHERE cache_key = ANY($1)",
+    )
+    .bind(&keys)
+    .fetch_all(pool)
+    .await?;
+    for (cache_key, value) in rows {
+        let Some((scope, kind)) = key_lookup.get(&cache_key).cloned() else {
+            continue;
+        };
+        let Some(cum) = out.get_mut(&scope) else {
+            continue;
+        };
+        let v = value.max(0) as u64;
+        match kind {
+            CumulativeKind::TotalInputTokens => cum.display.input_tokens = v,
+            CumulativeKind::TotalOutputTokens => cum.display.output_tokens = v,
+            CumulativeKind::TotalCost => cum.display.total_cost_micros = v,
+            CumulativeKind::TotalRegularInputCost => cum.display.regular_input_cost_micros = v,
+            CumulativeKind::TotalCachedInputCost => cum.display.cached_input_cost_micros = v,
+            CumulativeKind::TotalOutputCost => cum.display.output_cost_micros = v,
+            CumulativeKind::BudgetPeriodStart => cum.budget_period_start = v,
+            CumulativeKind::BudgetPeriodBaseCost => cum.budget_period_base_cost = v,
+        }
+    }
+    Ok(out)
+}
+
+/// One key's current-generation window counters from
+/// `boom_rate_limit_state` (non-expired rows only, same filter as
+/// `restore_counters_from_db`). Covers per-model entries and the
+/// `__plan__` namespace — the same scope the in-memory
+/// `get_usage_for_key` / `peek_key_windows` reads serve.
+pub async fn peek_key_windows_db(
+    pool: &sqlx::PgPool,
+    key_hash: &str,
+) -> Result<Vec<WindowUsage>, sqlx::Error> {
+    let now = now_epoch_secs();
+    let rows: Vec<(String, i64, Option<i64>, Option<i64>, i64, i64)> = sqlx::query_as(
+        r#"SELECT cache_key, count, tokens, costs_micros, window_start, window_secs
+           FROM boom_rate_limit_state
+           WHERE cache_key LIKE $1
+             AND window_start + window_secs > EXTRACT(EPOCH FROM NOW())::BIGINT"#,
+    )
+    .bind(format!("{}:%", key_hash))
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(cache_key, counts, tokens, costs_micros, window_start, window_secs)| WindowUsage {
+            cache_key,
+            counts: counts.max(0) as u64,
+            tokens: tokens.unwrap_or(0).max(0) as u64,
+            costs_micros: costs_micros.unwrap_or(0).max(0) as u64,
+            window_secs: window_secs.max(0) as u64,
+            elapsed_secs: now.saturating_sub(window_start.max(0) as u64),
+        })
+        .collect())
+}
+
+/// Batched plan-namespace window read (`{kh}:__plan__:{secs}` current
+/// generations) for many keys — one `LIKE ANY` query over the
+/// `__plan__`-scoped patterns, non-expired rows only. Rows are attributed
+/// to their owning key hash (extracted from the cache_key; hashes are hex,
+/// so `:__plan__:` cannot occur inside one).
+pub async fn peek_plan_windows_db(
+    pool: &sqlx::PgPool,
+    key_hashes: &[String],
+) -> Result<HashMap<String, Vec<WindowUsage>>, sqlx::Error> {
+    if key_hashes.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let now = now_epoch_secs();
+    let patterns: Vec<String> = key_hashes
+        .iter()
+        .map(|h| format!("{}:__plan__:%", h))
+        .collect();
+    let rows: Vec<(String, i64, Option<i64>, Option<i64>, i64, i64)> = sqlx::query_as(
+        r#"SELECT cache_key, count, tokens, costs_micros, window_start, window_secs
+           FROM boom_rate_limit_state
+           WHERE cache_key LIKE ANY($1)
+             AND window_start + window_secs > EXTRACT(EPOCH FROM NOW())::BIGINT"#,
+    )
+    .bind(&patterns)
+    .fetch_all(pool)
+    .await?;
+
+    let mut out: HashMap<String, Vec<WindowUsage>> = HashMap::new();
+    for (cache_key, counts, tokens, costs_micros, window_start, window_secs) in rows {
+        let owner = match cache_key.split_once(":__plan__:") {
+            Some((o, _)) => o.to_string(),
+            None => continue,
+        };
+        out.entry(owner).or_default().push(WindowUsage {
+            cache_key,
+            counts: counts.max(0) as u64,
+            tokens: tokens.unwrap_or(0).max(0) as u64,
+            costs_micros: costs_micros.unwrap_or(0).max(0) as u64,
+            window_secs: window_secs.max(0) as u64,
+            elapsed_secs: now.saturating_sub(window_start.max(0) as u64),
+        });
+    }
+    Ok(out)
+}
+
+// ═══════════════════════════════════════════════════════════
 // Reset operations (DB-backed, cascade-aware)
 // ═══════════════════════════════════════════════════════════
 

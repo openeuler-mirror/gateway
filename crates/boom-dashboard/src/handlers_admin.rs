@@ -953,6 +953,49 @@ pub async fn list_keys(
 
     let _total_before_filter = rows.len() as i64;
 
+    // DB-authoritative quota reads: cumulative rows + plan-window usage for
+    // every listed key — two batched queries, the same cluster-consistent
+    // source the user dashboard reads. In-memory mirrors only cover keys
+    // this instance has routed, so keys whose traffic lives on a peer
+    // instance would otherwise show zeros here.
+    let scopes: Vec<boom_limiter::QuotaScope> = rows
+        .iter()
+        .map(|r| boom_limiter::QuotaScope::Key {
+            key_hash: r.token.clone(),
+        })
+        .collect();
+    let cumulative_db = match boom_limiter::peek_cumulative_batch_db(db_pool, &scopes).await {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::error!("Dashboard list_keys cumulative query failed: {}", e);
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal error",
+            )
+                .into_response();
+        }
+    };
+    let plan_windows = match boom_limiter::peek_plan_windows_db(
+        db_pool,
+        &rows.iter().map(|r| r.token.clone()).collect::<Vec<_>>(),
+    )
+    .await
+    {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::error!("Dashboard list_keys plan-window query failed: {}", e);
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal error",
+            )
+                .into_response();
+        }
+    };
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
     let mut keys: Vec<Value> = rows
         .into_iter()
         .map(|r| {
@@ -990,7 +1033,10 @@ pub async fn list_keys(
                 match state.plan_store.resolve_effective_key_plan(&r.token) {
                     None => (None, None, None, 0u64, false),
                     Some(plan) => {
-                        let windows = state.limiter.peek_plan_window_usage(&r.token);
+                        let windows: &[boom_limiter::WindowUsage] = plan_windows
+                            .get(&r.token)
+                            .map(|v| v.as_slice())
+                            .unwrap_or(&[]);
                         let (_, effective, _) = plan.effective_limits();
                         let mut dim_secs: [Option<u64>; 3] = [None, None, None]; // counts/tokens/cost
                         let mut max_secs: Option<u64> = None;
@@ -1059,17 +1105,14 @@ pub async fn list_keys(
                 rust_decimal::Decimal::from(micros) / rust_decimal::Decimal::from(1_000_000)
             });
 
-            // Cumulative total cost across the key's lifetime — comes from
-            // limiter.cumulative (boom_rate_limit_cumulative backed), NOT
-            // boom_verification_token.spend (litellm legacy column we never write).
-            let total_cost_micros = state
-                .limiter
-                .peek_cumulative(
-                    &boom_limiter::QuotaScope::Key {
-                        key_hash: r.token.clone(),
-                    },
-                    boom_limiter::CumulativeKind::TotalCost,
-                );
+            // Cumulative total cost across the key's lifetime — cluster-wide
+            // DB truth (boom_rate_limit_cumulative, ≤ one quota_sync interval
+            // stale), NOT boom_verification_token.spend (litellm legacy column
+            // we never write).
+            let key_scope = boom_limiter::QuotaScope::Key { key_hash: r.token.clone() };
+            let cum_db = cumulative_db.get(&key_scope);
+            let total_cost_micros =
+                cum_db.map(|c| c.display.total_cost_micros).unwrap_or(0);
             let total_cost = rust_decimal::Decimal::from(total_cost_micros)
                 / rust_decimal::Decimal::from(1_000_000);
 
@@ -1083,10 +1126,9 @@ pub async fn list_keys(
                 .as_deref()
                 .and_then(boom_core::types::parse_budget_duration_secs)
                 .map(|secs| {
-                    let micros = state.limiter.peek_budget_period_cost_micros(
-                        &boom_limiter::QuotaScope::Key { key_hash: r.token.clone() },
-                        secs,
-                    );
+                    let micros = cum_db
+                        .map(|c| c.budget_period_spend_micros(secs, now_epoch))
+                        .unwrap_or(0);
                     let d = rust_decimal::Decimal::from(micros)
                         / rust_decimal::Decimal::from(1_000_000);
                     (d.to_string(), format!("period({raw})", raw = r.budget_duration.clone().unwrap_or_default()))
@@ -2144,9 +2186,16 @@ pub async fn get_key_usage(
     Extension(state): Extension<std::sync::Arc<DashboardState>>,
     Path(key_hash): Path<String>,
 ) -> Json<Value> {
-    let windows: Vec<Value> = state
-        .limiter
-        .get_usage_for_key(&key_hash)
+    // Cluster-wide DB truth (≤ one quota_sync interval stale); falls back to
+    // empty windows when no DB is configured or the query fails.
+    let db_windows = match &state.db_pool {
+        Some(pool) => boom_limiter::peek_key_windows_db(pool, &key_hash).await.unwrap_or_else(|e| {
+            tracing::error!("Dashboard get_key_usage query failed: {}", e);
+            Vec::new()
+        }),
+        None => Vec::new(),
+    };
+    let windows: Vec<Value> = db_windows
         .into_iter()
         .map(|w| {
             json!({
@@ -6165,27 +6214,11 @@ async fn proxy_prompt_log_entry(
 
 // ═══════════════════════════════════════════════════════════
 // Quota management — team-organized view of cumulative / window
-// counters across all keys & teams. Cumulative counters are read
-// from the live in-memory limiter (same source as /admin/keys);
-// boom_rate_limit_cumulative is only a 600s snapshot and would lag.
+// counters across all keys & teams. Cumulative/window reads all
+// go to the shared DB (cluster-wide truth, at most one quota_sync
+// interval stale) — the in-memory limiter only tracks keys that
+// have served traffic on this instance.
 // ═══════════════════════════════════════════════════════════
-
-/// Live cumulative counters for one quota scope, ordered
-/// `(input tokens, output tokens, total cost micros)`.
-///
-/// Dashboard cumulative views must all use this — reading
-/// `boom_rate_limit_cumulative` directly yields a stale (up to 600s old)
-/// value that disagrees with /admin/keys' `spend` for the same key.
-fn live_cumulative(
-    limiter: &boom_limiter::SlidingWindowLimiter,
-    scope: &boom_limiter::QuotaScope,
-) -> (i64, i64, i64) {
-    (
-        limiter.peek_cumulative(scope, boom_limiter::CumulativeKind::TotalInputTokens) as i64,
-        limiter.peek_cumulative(scope, boom_limiter::CumulativeKind::TotalOutputTokens) as i64,
-        limiter.peek_cumulative(scope, boom_limiter::CumulativeKind::TotalCost) as i64,
-    )
-}
 
 #[derive(Debug, sqlx::FromRow)]
 struct QuotaKeyRow {
@@ -6199,8 +6232,9 @@ struct QuotaKeyRow {
 /// totals, plus a synthetic "no_team" entry for keys without a team.
 ///
 /// GaussDB distributed note: each SELECT is a single-table query (no
-/// cross-table JOINs). Cumulative counters come from the live limiter
-/// rather than `boom_rate_limit_cumulative`, which is a 600s snapshot.
+/// cross-table JOINs). Cumulative counters come from the shared DB
+/// (`boom_rate_limit_cumulative`, cluster-wide and at most one quota_sync
+/// interval stale), not the local limiter.
 pub async fn quota_overview(
     _session: AdminSession,
     Extension(state): Extension<std::sync::Arc<DashboardState>>,
@@ -6264,18 +6298,50 @@ pub async fn quota_overview(
         }
     };
 
-    // 4. Cumulative counters come from the live in-memory limiter (team
-    // scope for team totals, key scope for the no-team rollup) — same source
-    // as /admin/keys and /admin/quota/{team,unassigned}. The DB table
-    // boom_rate_limit_cumulative is only a periodic (600s) snapshot, so
-    // reading it here made overview totals lag the per-key views.
+    // 4. Cumulative counters (team scope for team totals, key scope for the
+    // no-team rollup) — one batched DB read; cluster-wide truth, at most one
+    // quota_sync interval stale, consistent with /admin/keys.
+    let mut scopes: Vec<boom_limiter::QuotaScope> = team_rows
+        .iter()
+        .map(|(team_id, _, _)| boom_limiter::QuotaScope::Team {
+            team_id: team_id.clone(),
+        })
+        .collect();
+    scopes.extend(
+        token_team_rows
+            .iter()
+            .filter(|(_, t)| t.is_none())
+            .map(|(token, _)| boom_limiter::QuotaScope::Key {
+                key_hash: token.clone(),
+            }),
+    );
+    let cumulative_db = match boom_limiter::peek_cumulative_batch_db(db_pool, &scopes).await {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::error!("quota_overview cumulative query failed: {}", e);
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("quota_overview cumulative query failed: {e}"),
+            )
+                .into_response();
+        }
+    };
     let team_cum: std::collections::HashMap<String, (i64, i64, i64)> = team_rows
         .iter()
         .map(|(team_id, _, _)| {
-            let scope = boom_limiter::QuotaScope::Team {
-                team_id: team_id.clone(),
-            };
-            (team_id.clone(), live_cumulative(&state.limiter, &scope))
+            let cum = cumulative_db
+                .get(&boom_limiter::QuotaScope::Team {
+                    team_id: team_id.clone(),
+                })
+                .map(|c| {
+                    (
+                        c.display.input_tokens as i64,
+                        c.display.output_tokens as i64,
+                        c.display.total_cost_micros as i64,
+                    )
+                })
+                .unwrap_or((0, 0, 0));
+            (team_id.clone(), cum)
         })
         .collect();
 
@@ -6298,17 +6364,17 @@ pub async fn quota_overview(
         .cloned()
         .collect();
 
-    // No-team cumulative: sum the live key counters of tokens whose
+    // No-team cumulative: sum the DB key counters of tokens whose
     // team_id IS NULL.
     let mut no_team_cum = (0i64, 0i64, 0i64);
     for (token, _) in token_team_rows.iter().filter(|(_, t)| t.is_none()) {
-        let scope = boom_limiter::QuotaScope::Key {
+        if let Some(c) = cumulative_db.get(&boom_limiter::QuotaScope::Key {
             key_hash: token.clone(),
-        };
-        let c = live_cumulative(&state.limiter, &scope);
-        no_team_cum.0 += c.0;
-        no_team_cum.1 += c.1;
-        no_team_cum.2 += c.2;
+        }) {
+            no_team_cum.0 += c.display.input_tokens as i64;
+            no_team_cum.1 += c.display.output_tokens as i64;
+            no_team_cum.2 += c.display.total_cost_micros as i64;
+        }
     }
 
     // team → plan_name lookup (explicit assignments only).
@@ -6480,7 +6546,7 @@ async fn quota_keys_inner(
     // ── Branch on sort mode ──
     // For alias / created_at: SQL-side sort + pagination (cheap, scalable).
     // For cost / tokens: fetch full result set (capped at 5000), look up
-    // cumulative from the in-memory limiter, then sort + slice in memory.
+    // cumulative from the shared DB, then sort + slice in memory.
     let in_memory_sort = matches!(q.sort.as_deref(), Some("cost") | Some("tokens"));
 
     let mut sort_truncated = false;
@@ -6583,20 +6649,43 @@ async fn quota_keys_inner(
         }
     };
 
-    // Cumulative counters come from the live in-memory limiter — the same
-    // source /admin/keys and /admin/quota/key/{hash}/windows use. The DB
-    // table boom_rate_limit_cumulative is only a periodic (600s) snapshot,
-    // so reading it here made the quota list report a stale total_cost that
-    // disagreed with /admin/keys' spend for the same key.
-    let key_cum: std::collections::HashMap<String, (i64, i64, i64)> = rows
-        .iter()
-        .map(|r| {
-            let scope = boom_limiter::QuotaScope::Key {
+    // Cumulative counters — one batched DB read (cluster-wide truth, at
+    // most one quota_sync interval stale), consistent with /admin/keys and
+    // /admin/quota/overview.
+    let key_cum: std::collections::HashMap<String, (i64, i64, i64)> = {
+        let scopes: Vec<boom_limiter::QuotaScope> = rows
+            .iter()
+            .map(|r| boom_limiter::QuotaScope::Key {
                 key_hash: r.token.clone(),
-            };
-            (r.token.clone(), live_cumulative(&state.limiter, &scope))
-        })
-        .collect();
+            })
+            .collect();
+        match boom_limiter::peek_cumulative_batch_db(db_pool, &scopes).await {
+            Ok(m) => m
+                .into_iter()
+                .map(|(scope, c)| {
+                    let boom_limiter::QuotaScope::Key { key_hash } = scope else {
+                        return (String::new(), (0, 0, 0));
+                    };
+                    (
+                        key_hash,
+                        (
+                            c.display.input_tokens as i64,
+                            c.display.output_tokens as i64,
+                            c.display.total_cost_micros as i64,
+                        ),
+                    )
+                })
+                .collect(),
+            Err(e) => {
+                tracing::error!("quota_keys_inner cumulative query failed: {}", e);
+                return (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("quota_keys_inner cumulative query failed: {e}"),
+                )
+                    .into_response();
+            }
+        }
+    };
 
     // In-memory sort + page slice (only for cost/tokens mode).
     let page_rows: Vec<QuotaKeyRow> = if in_memory_sort {
@@ -6695,34 +6784,53 @@ pub async fn quota_key_windows(
         .find(|w| w.window_secs == 60)
         .and_then(|w| w.counts);
 
+    // All three dimensions come from one DB read of the key's non-expired
+    // window rows (model windows + plan namespace) — cluster-wide truth,
+    // at most one quota_sync interval stale.
+    let db_pool = match &state.db_pool {
+        Some(pool) => pool,
+        None => return Json(json!({"error": "Database not available"})).into_response(),
+    };
+    let db_windows = match boom_limiter::peek_key_windows_db(db_pool, &key_hash).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!("quota_key_windows query failed: {}", e);
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("quota_key_windows query failed: {e}"),
+            )
+                .into_response();
+        }
+    };
+
     // counts dimension
     let mut counts_by_secs: std::collections::HashMap<u64, (u64, u64)> =
         std::collections::HashMap::new();
-    for w in state.limiter.get_usage_for_key(&key_hash) {
-        let remaining = w.window_secs.saturating_sub(w.elapsed_secs);
-        counts_by_secs
-            .entry(w.window_secs)
-            .and_modify(|e| e.0 = e.0.saturating_add(w.counts))
-            .or_insert((w.counts, remaining));
-    }
-
-    // tokens / costs from limiter multi-dim windows
+    // tokens / costs dimensions (only rows that recorded them)
     let mut tokens_by_secs: std::collections::HashMap<u64, (u64, u64)> =
         std::collections::HashMap::new();
     let mut costs_by_secs: std::collections::HashMap<u64, (u64, u64)> =
         std::collections::HashMap::new();
-    for w in state.limiter.peek_key_windows(&key_hash) {
-        let entry = match w.kind {
-            boom_limiter::WindowKind::Tokens => tokens_by_secs
-                .entry(w.window_secs)
-                .or_insert((0, w.remaining_secs)),
-            boom_limiter::WindowKind::CostMicros => costs_by_secs
-                .entry(w.window_secs)
-                .or_insert((0, w.remaining_secs)),
-        };
-        entry.0 = entry.0.saturating_add(w.count);
-        if w.remaining_secs < entry.1 {
-            entry.1 = w.remaining_secs;
+    for w in db_windows {
+        let remaining = w.window_secs.saturating_sub(w.elapsed_secs);
+        let e = counts_by_secs.entry(w.window_secs).or_insert((0, remaining));
+        e.0 = e.0.saturating_add(w.counts);
+        if remaining < e.1 {
+            e.1 = remaining;
+        }
+        if w.tokens > 0 {
+            let e = tokens_by_secs.entry(w.window_secs).or_insert((0, remaining));
+            e.0 = e.0.saturating_add(w.tokens);
+            if remaining < e.1 {
+                e.1 = remaining;
+            }
+        }
+        if w.costs_micros > 0 {
+            let e = costs_by_secs.entry(w.window_secs).or_insert((0, remaining));
+            e.0 = e.0.saturating_add(w.costs_micros);
+            if remaining < e.1 {
+                e.1 = remaining;
+            }
         }
     }
 
@@ -6785,19 +6893,21 @@ pub async fn quota_key_windows(
         })
         .collect();
 
-    // Cumulative counters for this key.
-    let key_scope = boom_limiter::QuotaScope::Key {
-        key_hash: key_hash.clone(),
+    // Cumulative counters for this key — same DB truth.
+    let cumulative = match boom_limiter::peek_cumulative_db(db_pool, &key_hash).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("quota_key_windows cumulative query failed: {}", e);
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("quota_key_windows cumulative query failed: {e}"),
+            )
+                .into_response();
+        }
     };
-    let total_in = state
-        .limiter
-        .peek_cumulative(&key_scope, boom_limiter::CumulativeKind::TotalInputTokens);
-    let total_out = state
-        .limiter
-        .peek_cumulative(&key_scope, boom_limiter::CumulativeKind::TotalOutputTokens);
-    let total_cost_micros = state
-        .limiter
-        .peek_cumulative(&key_scope, boom_limiter::CumulativeKind::TotalCost);
+    let total_in = cumulative.input_tokens;
+    let total_out = cumulative.output_tokens;
+    let total_cost_micros = cumulative.total_cost_micros;
 
     Json(json!({
         "key_hash": key_hash,

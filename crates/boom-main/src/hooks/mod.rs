@@ -224,9 +224,15 @@ pub struct PreAuthResult {
     pub headers: HashMap<String, String>,
 }
 
-/// Registry of all loaded hooks. Lives in `AppStateInner` so it gets hot-
-/// swapped on config reload. Fields are `Option<...>` per hook point; `None`
-/// means "hook point not enabled" and the hot path short-circuits.
+/// Registry of all loaded hooks. Lives in `AppStateInner`; a reload swaps
+/// in a fresh registry ONLY when the hooks config changed — an unchanged
+/// config reuses the live registry (see the `hooks_for_reload` gate in
+/// boom-main's `reload_inner`), because rebuilding would re-invoke
+/// `hook_init` on the dlopen-cached library whose statics survive the
+/// "reload". A changed config that fails to load keeps this registry and
+/// the reload proceeds (degradation reason rides the reload summary).
+/// Fields are `Option<...>` per hook point; `None` means "hook point not
+/// enabled" and the hot path short-circuits.
 #[derive(Default)]
 pub struct HookRegistry {
     pre_auth: Option<LoadedHook>,

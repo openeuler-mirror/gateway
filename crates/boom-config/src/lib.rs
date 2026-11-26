@@ -78,7 +78,7 @@ pub struct Config {
 /// Top-level hook configuration. Each entry corresponds to one hook point
 /// the gateway exposes. All entries default to disabled, so omitting the
 /// whole `hooks` block is equivalent to "no hooks".
-#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq, Eq)]
 pub struct HooksConfig {
     #[serde(default)]
     pub pre_auth: PreAuthHookConfig,
@@ -106,7 +106,7 @@ pub struct HooksConfig {
 ///   gateway fully functional when a misconfigured hook breaks.
 /// - `deny`: hook call failure → reject the request with 500. Use when a
 ///   missing hook is a security-relevant event and silent fallback is worse.
-#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq, Eq)]
 pub struct PreAuthHookConfig {
     #[serde(default)]
     pub enabled: bool,
