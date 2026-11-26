@@ -643,7 +643,11 @@ impl AppState {
         // path (build_inner at the reload call site) passes `old_started_at`
         // to preserve this origin across hot reloads.
         let started_at = chrono::Utc::now();
-        let inner = Self::build_inner(config, &db_pool, started_at, 0)?;
+        // Fail-fast hook loading belongs to startup: a broken plugin must
+        // prevent boot. Reloads instead gate on hooks-config equality (see
+        // `hooks_for_reload`).
+        let hooks = Arc::new(crate::hooks::HookRegistry::from_config(&config.hooks)?);
+        let inner = Self::build_inner(config, hooks, &db_pool, started_at, 0)?;
 
         // Single shared Arc<ArcSwap> for kv_index — AppState and
         // KvcOrchestrator MUST observe the same swap. reload() stores a fresh
@@ -1114,18 +1118,29 @@ impl AppState {
             metrics_switch.unwrap_or(new_trace_config.metrics.enabled),
         );
 
-        // 6. Build new inner state.
+        // 6. Build new inner state. Hooks go through the equality gate: an
+        // unchanged hooks section reuses the live registry instead of
+        // re-running dlopen + hook_init; a changed section that fails to
+        // rebuild degrades to the old registry WITHOUT aborting the reload
+        // (see `hooks_for_reload`).
+        let old_inner = self.inner.load();
+        let (hooks, hooks_degraded) =
+            Self::hooks_for_reload(&old_inner.config, &old_inner.hooks, &mut new_config);
+        drop(old_inner);
         let new_inner =
-            Self::build_inner(new_config, &db_pool, old_started_at, new_reload_count)?;
+            Self::build_inner(new_config, hooks, &db_pool, old_started_at, new_reload_count)?;
 
         // 7. Atomic swap.
         self.inner.store(Arc::new(new_inner));
 
         let model_count = self.deployment_store.len();
-        let summary = format!(
+        let mut summary = format!(
             "Reloaded: {} model(s), reload #{}",
             model_count, new_reload_count,
         );
+        if let Some(reason) = hooks_degraded {
+            summary = format!("{}. {}", summary, reason);
+        }
         tracing::info!("{}", summary);
         Ok(summary)
     }
@@ -1368,9 +1383,72 @@ impl AppState {
         self.inner.store(Arc::new(new_inner));
     }
 
-    /// Build AppStateInner from config.
+    /// Hooks reload gate — the KVC-gate pattern applied to the plugin
+    /// registry, plus scope-limited degradation:
+    ///
+    /// - **Unchanged hooks section → reuse the live registry.** No dlopen,
+    ///   no `hook_init`: dlopen of an unchanged path returns the cached
+    ///   handle (the old registry still holds an `Arc<Library>` until the
+    ///   swap), so the plugin's statics survive and a rebuild would re-run
+    ///   `hook_init` on state the plugin may treat as
+    ///   already-initialized — non-idempotent plugins return an error
+    ///   there, which used to break every reload.
+    ///
+    /// - **Changed hooks section → rebuild.** On failure the OLD registry
+    ///   keeps serving, `new_config.hooks` is reverted to the running
+    ///   value, and the rest of the reload proceeds — a broken plugin must
+    ///   not hold the other config sections hostage, the same degradation
+    ///   stance as `failure_mode = allow` at request level. Aborting here
+    ///   wouldn't protect anything either: the failed `hook_init` has
+    ///   already run against statics shared with the old registry.
+    ///
+    /// The revert matters for retries: had the failed text been adopted,
+    /// the next reload with the same (still-broken) YAML would compare
+    /// equal and keep reusing the old registry forever. Reverting keeps
+    /// the next reload a genuine diff, so the rebuild is retried.
+    ///
+    /// Plugin-side caveat: because dlopen caches by path, re-init after a
+    /// pure `config` string change runs against persisting statics;
+    /// plugins that must pick up new config across reloads need reentrant
+    /// storage (RwLock/Atomic), not OnceLock.
+    ///
+    /// Returns the registry to install plus an optional degradation reason
+    /// (logged at ERROR here; the caller rides it in the reload summary).
+    /// Never fails.
+    fn hooks_for_reload(
+        old_config: &Config,
+        old_hooks: &Arc<crate::hooks::HookRegistry>,
+        new_config: &mut Config,
+    ) -> (Arc<crate::hooks::HookRegistry>, Option<String>) {
+        if new_config.hooks == old_config.hooks {
+            tracing::info!("Hooks config unchanged — reusing live plugin registry (no hook_init re-run)");
+            return (old_hooks.clone(), None);
+        }
+        match crate::hooks::HookRegistry::from_config(&new_config.hooks) {
+            Ok(registry) => (Arc::new(registry), None),
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "hook rebuild failed — keeping previous registry, rest of reload proceeds"
+                );
+                new_config.hooks = old_config.hooks.clone();
+                (
+                    old_hooks.clone(),
+                    Some(format!(
+                        "hooks config change NOT applied (kept previous hook): {e}"
+                    )),
+                )
+            }
+        }
+    }
+
+    /// Build AppStateInner from config. `hooks` is constructed by the
+    /// caller: startup builds it fresh (fail-fast on plugin errors), reload
+    /// routes through [`hooks_for_reload`] so unchanged hooks config keeps
+    /// the live registry.
     fn build_inner(
         config: Config,
+        hooks: Arc<crate::hooks::HookRegistry>,
         db_pool: &Option<PgPool>,
         started_at: chrono::DateTime<chrono::Utc>,
         reload_count: u64,
@@ -1389,8 +1467,6 @@ impl AppState {
             db_connected: db_pool.is_some(),
             reload_count,
         };
-
-        let hooks = Arc::new(crate::hooks::HookRegistry::from_config(&config.hooks)?);
 
         Ok(AppStateInner {
             config,
@@ -3430,6 +3506,76 @@ mod merge_runtime_sections_tests {
         assert!(
             !gs.contains_key(&Value::String("user_tag_headers".into())),
             "null field must not leak into general_settings"
+        );
+    }
+}
+
+#[cfg(test)]
+mod hooks_reload_gate_tests {
+    use super::AppState;
+    use crate::hooks::HookRegistry;
+    use boom_config::Config;
+    use std::sync::Arc;
+
+    fn config_with_hooks(enabled: bool, path: &str) -> Config {
+        let yaml = format!(
+            "hooks:\n  pre_auth:\n    enabled: {}\n    path: {}\n",
+            enabled, path
+        );
+        serde_yaml::from_str(&yaml).expect("parse config")
+    }
+
+    #[test]
+    fn unchanged_hooks_config_reuses_live_registry() {
+        // Disabled hook + bogus path: startup skips loading (enabled=false),
+        // so the registry is empty but valid.
+        let mut cfg = config_with_hooks(false, "/nonexistent/libhook.so");
+        let old_cfg = cfg.clone();
+        let old_hooks = Arc::new(HookRegistry::from_config(&cfg.hooks).expect("empty registry"));
+
+        // Same config → same Arc: no dlopen, no second hook_init.
+        let (reused, degraded) = AppState::hooks_for_reload(&old_cfg, &old_hooks, &mut cfg);
+        assert!(Arc::ptr_eq(&reused, &old_hooks));
+        assert!(degraded.is_none());
+    }
+
+    #[test]
+    fn changed_hooks_config_rebuilds() {
+        // Both sides disabled (an empty registry builds without touching the
+        // filesystem); the path difference is what triggers the rebuild.
+        let old_cfg = config_with_hooks(false, "/old/libhook.so");
+        let old_hooks = Arc::new(HookRegistry::from_config(&old_cfg.hooks).expect("empty registry"));
+        let mut new_cfg = config_with_hooks(false, "/new/libhook.so");
+
+        let (rebuilt, degraded) = AppState::hooks_for_reload(&old_cfg, &old_hooks, &mut new_cfg);
+        assert!(
+            !Arc::ptr_eq(&rebuilt, &old_hooks),
+            "changed config must rebuild the registry"
+        );
+        assert!(degraded.is_none());
+    }
+
+    #[test]
+    fn failed_rebuild_degrades_loudly_and_reverts_config() {
+        let old_cfg = config_with_hooks(false, "/old/libhook.so");
+        let old_hooks = Arc::new(HookRegistry::from_config(&old_cfg.hooks).expect("empty registry"));
+        let mut new_cfg = config_with_hooks(true, "/nonexistent/libhook.so");
+
+        let (kept, degraded) = AppState::hooks_for_reload(&old_cfg, &old_hooks, &mut new_cfg);
+        // Old registry keeps serving…
+        assert!(Arc::ptr_eq(&kept, &old_hooks));
+        // …and the failure is surfaced, not swallowed.
+        let reason = degraded.expect("failed rebuild must report a reason");
+        assert!(
+            reason.contains("failed to load library"),
+            "unexpected reason: {reason}"
+        );
+        // The failed text must NOT be adopted: the revert keeps the next
+        // reload a genuine diff, so the rebuild is retried instead of the
+        // broken text silently comparing "equal" forever.
+        assert_eq!(
+            new_cfg.hooks, old_cfg.hooks,
+            "new_config.hooks must be reverted to the running value"
         );
     }
 }
