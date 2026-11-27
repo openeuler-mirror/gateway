@@ -310,16 +310,21 @@ plan_settings:
 # ──────────────────────────────────────────────
 # Prompt 日志（完整请求/响应落盘，调试用）
 # ──────────────────────────────────────────────
-# 默认关闭。开启后每个请求的输入/输出会按天分目录写入 dir。
+# 默认关闭。开启后将请求和响应写入 dir/segments 下的二进制段。
 # 可在 Dashboard 按套餐/team/key 维度动态开关，也可在这里做全局默认。
 prompt_log:
   enabled: false                    # 全局开关，默认关闭
-  dir: "/path/to/prompt_logs"          # 日志根目录，按天分子目录
-  max_file_size_mb: 50              # 单文件大小上限（MB），超过自动滚动
+  dir: "/path/to/prompt_logs"        # 段存储和默认 JSONL 旁路的根目录
   capture_raw_upstream: false       # 同时记录网关↔上游原始交换（bg_request=网关组装发送的请求体，raw_response=上游原始响应；流式按SSE帧拼接，含解析失败帧与上游错误体）
   excluded_keys: []                 # 跳过这些 key（key_hash），不记录
   excluded_teams: []                # 跳过这些 team（team_id），不记录
   record_headers: []                # 记录到 prompt log 的请求 header 白名单（小写）；空=不记录任何 header，避免泄漏 Authorization/Cookie 等
+  jsonl_export:
+    enabled: false                  # 供 Filebeat 逐行采集的本地旁路
+    dir: ""                         # 空值使用 prompt_log.dir 下的 export/
+    max_file_mb: 100                 # 单文件轮转阈值（MiB，16–2048）
+    max_file_age_secs: 3600          # 0 关闭按时间轮转，否则限制在 60–86400 秒
+    max_files: 15                    # 每实例上限（2–500，包含当前文件）
 
 trace:
   enabled: false

@@ -29,11 +29,14 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::config::{
     BUILTIN_CHANNEL_MAX_BYTES, BUILTIN_FSYNC_INTERVAL_MS, BUILTIN_RETENTION_SCAN_SECS,
-    BUILTIN_SPILL_MAX_BYTES, OtlpConfig, PromptLogConfig,
+    BUILTIN_SPILL_MAX_BYTES, PromptLogConfig,
 };
+#[cfg(feature = "otlp")]
+use crate::config::OtlpConfig;
 use crate::entry::PromptLogEntry;
 use crate::index::id_hash;
 use crate::segment;
+use crate::jsonl_export::JsonlExport;
 use crate::spill::SpillStore;
 use crate::store::SegmentStore;
 
@@ -164,6 +167,7 @@ struct WriterTask {
     spill: Arc<SpillStore>,
     budget: Arc<AtomicI64>,
     shutdown_rx: mpsc::Receiver<oneshot::Sender<()>>,
+    jsonl_export: JsonlExport,
     #[cfg(feature = "otlp")]
     otlp: Arc<ArcSwap<Option<Arc<OtelExporter>>>>,
 }
@@ -177,9 +181,13 @@ impl PromptLogWriter {
     pub fn spawn(config: PromptLogConfig, instance_id: &str) -> std::io::Result<Self> {
         #[cfg(feature = "otlp")]
         let otlp: Arc<ArcSwap<Option<Arc<OtelExporter>>>> = Arc::new(ArcSwap::from_pointee(None));
-        #[cfg(not(feature = "otlp"))]
-        let otlp = ();
-        let (writer, task) = Self::build(config, instance_id, otlp, BUILTIN_CHANNEL_MAX_BYTES)?;
+        let (writer, task) = Self::build(
+            config,
+            instance_id,
+            #[cfg(feature = "otlp")]
+            otlp,
+            BUILTIN_CHANNEL_MAX_BYTES,
+        )?;
         tokio::spawn(background_writer(task));
         Ok(writer)
     }
@@ -194,9 +202,13 @@ impl PromptLogWriter {
     ) -> std::io::Result<Self> {
         #[cfg(feature = "otlp")]
         let otlp: Arc<ArcSwap<Option<Arc<OtelExporter>>>> = Arc::new(ArcSwap::from_pointee(None));
-        #[cfg(not(feature = "otlp"))]
-        let otlp = ();
-        let (writer, task) = Self::build(config, instance_id, otlp, channel_bytes)?;
+        let (writer, task) = Self::build(
+            config,
+            instance_id,
+            #[cfg(feature = "otlp")]
+            otlp,
+            channel_bytes,
+        )?;
         tokio::spawn(background_writer(task));
         Ok(writer)
     }
@@ -258,6 +270,7 @@ impl PromptLogWriter {
             spill,
             budget,
             shutdown_rx,
+            jsonl_export: JsonlExport::default(),
             #[cfg(feature = "otlp")]
             otlp,
         };
@@ -473,61 +486,40 @@ async fn background_writer(mut task: WriterTask) {
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_fsync = Instant::now();
     let mut last_retention = Instant::now();
+    task.jsonl_export
+        .maintain(&task.config.load(), task.store.instance_slug());
 
-    loop {
+    let done = loop {
         tokio::select! {
             entry = task.receiver.recv() => {
                 let Some(entry) = entry else {
-                    break; // all senders dropped — normal exit path
+                    break None;
                 };
-                process_entry(
-                    entry,
-                    &task.config,
-                    &task.store,
-                    &task.budget,
-                    #[cfg(feature = "otlp")]
-                    &task.otlp,
-                )
-                .await;
+                process_entry(entry, &mut task).await;
             }
             _ = interval.tick() => {
                 maintain(
-                    &task.store,
-                    &task.spill,
-                    &task.config,
+                    &mut task,
                     &mut last_fsync,
                     &mut last_retention,
                 )
                 .await;
             }
             cmd = task.shutdown_rx.recv() => {
-                match cmd {
-                    Some(done) => {
-                        // Drain what is already queued, then the loop's
-                        // exit path does the final flush + fsync.
-                        while let Ok(entry) = task.receiver.try_recv() {
-                            process_entry(
-                                entry,
-                                &task.config,
-                                &task.store,
-                                &task.budget,
-                                #[cfg(feature = "otlp")]
-                                &task.otlp,
-                            )
-                            .await;
-                        }
-                        let _ = done.send(());
-                        break;
-                    }
-                    None => break, // handle dropped; exit via final flush
+                task.receiver.close();
+                while let Some(entry) = task.receiver.recv().await {
+                    process_entry(entry, &mut task).await;
                 }
+                break cmd;
             }
         }
-    }
+    };
 
     // Exit path (channel closed or shutdown): flush the tail and make it
     // durable. A crash before this point loses at most the last fsync
     // interval — the documented durability semantics.
+    drain_spill(&task.store, &task.spill, &mut task.jsonl_export).await;
+    task.jsonl_export.close();
     if let Err(e) = task.store.flush_active_block().await {
         tracing::warn!(error = %e, "final block flush failed during writer exit");
     }
@@ -535,26 +527,21 @@ async fn background_writer(mut task: WriterTask) {
         tracing::warn!(error = %e, "final fsync failed during writer exit");
     }
     tracing::info!("Prompt log writer exiting");
+    if let Some(done) = done {
+        let _ = done.send(());
+    }
 }
 
 /// Append one entry: OTLP fork first (local store is the source of truth
 /// and must never be skipped by an exporter failure), then the segment
 /// append with block cutting and seal checks.
-#[allow(unused_variables)]
-async fn process_entry(
-    entry: PromptLogEntry,
-    config: &Arc<ArcSwap<PromptLogConfig>>,
-    store: &Arc<SegmentStore>,
-    budget: &Arc<AtomicI64>,
-    #[cfg(feature = "otlp")] otlp: &Arc<ArcSwap<Option<Arc<OtelExporter>>>>,
-    #[cfg(not(feature = "otlp"))] _otlp: &(),
-) {
+async fn process_entry(entry: PromptLogEntry, task: &mut WriterTask) {
     #[cfg(feature = "otlp")]
     {
         let (otlp_enabled, exporter) = {
-            let cfg = config.load();
+            let cfg = task.config.load();
             let enabled = cfg.otlp.enabled;
-            let exporter = otlp.load().clone();
+            let exporter = task.otlp.load().clone();
             (enabled, exporter)
         };
         if otlp_enabled {
@@ -569,41 +556,51 @@ async fn process_entry(
         Ok(f) => f,
         Err(e) => {
             tracing::error!(request_id = %entry.request_id, error = %e, "prompt log entry serialization failed");
-            budget.fetch_add(bytes, Ordering::Relaxed);
+            task.budget.fetch_add(bytes, Ordering::Relaxed);
             return;
         }
     };
     let hash = id_hash(&entry.request_id);
     let phase = segment::phase_to_u8(entry.phase);
     let ts = segment::entry_ts_ms(&entry);
-    if let Err(e) = store.append_frame(&frame, hash, phase, ts) {
-        tracing::error!(request_id = %entry.request_id, error = %e, "segment append failed");
+    match task.store.append_frame(&frame, hash, phase, ts) {
+        Ok(()) => task.jsonl_export.append(&frame[4..]),
+        Err(e) => tracing::error!(request_id = %entry.request_id, error = %e, "segment append failed"),
     }
-    budget.fetch_add(bytes, Ordering::Relaxed);
+    task.budget.fetch_add(bytes, Ordering::Relaxed);
 
-    if store.wants_flush() {
-        if let Err(e) = store.flush_active_block().await {
+    if task.store.wants_flush() {
+        if let Err(e) = task.store.flush_active_block().await {
             tracing::warn!(error = %e, "block flush failed");
         }
     }
-    if store.should_seal() {
-        seal_and_age(store, config).await;
+    if task.store.should_seal() {
+        seal_and_age(&task.store, &task.config).await;
     }
 }
 
 /// Periodic maintenance, every TICK: spill drain, dir change, tail flush,
 /// group-commit fsync, seal, retention.
 async fn maintain(
-    store: &Arc<SegmentStore>,
-    spill: &Arc<SpillStore>,
-    config: &Arc<ArcSwap<PromptLogConfig>>,
+    task: &mut WriterTask,
     last_fsync: &mut Instant,
     last_retention: &mut Instant,
 ) {
-    let dir = config.load().dir.clone();
+    let WriterTask {
+        store,
+        spill,
+        config,
+        jsonl_export,
+        ..
+    } = task;
+    let dir = {
+        let cfg = config.load();
+        jsonl_export.maintain(&cfg, store.instance_slug());
+        cfg.dir.clone()
+    };
 
     // 1. Replay any spilled frames (no-op in the healthy path).
-    drain_spill(store, spill).await;
+    drain_spill(store, spill, jsonl_export).await;
 
     // 2. Config `dir` change: seal, move the store, follow with the spill.
     if store.dir_changed() {
@@ -673,14 +670,19 @@ async fn run_retention(store: &Arc<SegmentStore>, config: &Arc<ArcSwap<PromptLog
 /// Replay the spill into the segment store. Frame decode failures skip
 /// the frame (undecodable data is unrecoverable by definition); an append
 /// failure stops the drain and leaves the frame for the next pass.
-async fn drain_spill(store: &Arc<SegmentStore>, spill: &Arc<SpillStore>) {
+async fn drain_spill(
+    store: &Arc<SegmentStore>,
+    spill: &Arc<SpillStore>,
+    jsonl_export: &mut JsonlExport,
+) {
     if spill.bytes() == 0 {
         return;
     }
     let store = store.clone();
     let spill = spill.clone();
+    let mut export = std::mem::take(jsonl_export);
     let result = match tokio::task::spawn_blocking(move || {
-        spill.drain(|body| {
+        let result = spill.drain(|body| {
             let entry = match segment::decode_record(body) {
                 Ok(e) => e,
                 Err(e) => {
@@ -696,13 +698,18 @@ async fn drain_spill(store: &Arc<SegmentStore>, spill: &Arc<SpillStore>) {
                 id_hash(&entry.request_id),
                 segment::phase_to_u8(entry.phase),
                 segment::entry_ts_ms(&entry),
-            )
-        })
+            )?;
+            export.append(body);
+            Ok(())
+        });
+        (result, export)
     })
     .await
     {
-        Ok(Ok(n)) => Ok(n),
-        Ok(Err(e)) => Err(e),
+        Ok((result, export)) => {
+            *jsonl_export = export;
+            result
+        }
         Err(e) => Err(io::Error::other(format!("spill drain task: {e}"))),
     };
     match result {
@@ -812,6 +819,88 @@ mod tests {
         assert!(
             store.find_sync("r-final", LogPhase::Request).is_some(),
             "entry sent before shutdown must be flushed"
+        );
+    }
+
+    #[tokio::test]
+    async fn jsonl_exports_normal_and_spilled_records_through_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.jsonl_export.enabled = true;
+        let normal = entry("normal", 32);
+        let spilled = entry("spilled", 4096);
+        let writer = PromptLogWriter::spawn_with_channel_budget_for_tests(
+            config,
+            "gw-test",
+            normal.estimated_bytes() as u64,
+        )
+        .unwrap();
+        writer.send(normal);
+        writer.send(spilled);
+        writer.shutdown_flush().await;
+
+        let store = writer.store().unwrap();
+        let dir = dir.path().join("export");
+        let mut ids = Vec::new();
+        for file in std::fs::read_dir(dir).unwrap() {
+            let path = file.unwrap().path();
+            if path.extension().is_some_and(|ext| ext == "jsonl") {
+                for line in std::fs::read_to_string(path).unwrap().lines() {
+                    let entry = segment::decode_record(line.as_bytes()).unwrap();
+                    assert!(store.find_sync(&entry.request_id, entry.phase).is_some());
+                    ids.push(entry.request_id);
+                }
+            }
+        }
+        ids.sort();
+        assert_eq!(ids, ["normal", "spilled"]);
+    }
+
+    #[tokio::test]
+    async fn jsonl_hot_reload_and_bad_directory_leave_segment_writes_available() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        let writer = PromptLogWriter::spawn(config.clone(), "gw-test").unwrap();
+        let store = writer.store().unwrap();
+        let export_dir = dir.path().join("export");
+        writer.send(entry("disabled", 32));
+        wait_for(|| store.find_sync("disabled", LogPhase::Request).is_some()).await;
+        assert!(!export_dir.exists());
+
+        config.jsonl_export.enabled = true;
+        config.jsonl_export.dir = dir.path().join("segments").to_string_lossy().into_owned();
+        writer.update_config(config.clone());
+        writer.send(entry("bad-directory", 32));
+        wait_for(|| store.find_sync("bad-directory", LogPhase::Request).is_some()).await;
+
+        config.jsonl_export.dir.clear();
+        writer.update_config(config.clone());
+        wait_for(|| export_dir.join(".prompt-gw-test.lock").exists()).await;
+        writer.send(entry("enabled", 32));
+        wait_for(|| store.find_sync("enabled", LogPhase::Request).is_some()).await;
+
+        config.jsonl_export.enabled = false;
+        writer.update_config(config);
+        let lock = std::fs::OpenOptions::new()
+            .write(true)
+            .open(export_dir.join(".prompt-gw-test.lock"))
+            .unwrap();
+        wait_for(|| lock.try_lock().is_ok()).await;
+        writer.send(entry("disabled-again", 32));
+        writer.shutdown_flush().await;
+        assert!(store.find_sync("disabled-again", LogPhase::Request).is_some());
+        let jsonl = std::fs::read_dir(export_dir)
+            .unwrap()
+            .map(|file| file.unwrap().path())
+            .find(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+            .unwrap();
+        let content = std::fs::read_to_string(jsonl).unwrap();
+        assert_eq!(content.lines().count(), 1);
+        assert_eq!(
+            segment::decode_record(content.trim_end().as_bytes())
+                .unwrap()
+                .request_id,
+            "enabled"
         );
     }
 
