@@ -2,6 +2,7 @@ pub mod aging;
 pub mod config;
 pub mod entry;
 pub mod index;
+mod jsonl_export;
 pub mod query;
 pub mod segment;
 pub mod spill;
@@ -14,7 +15,7 @@ pub mod otlp;
 pub mod replay;
 
 pub use aging::AgingReport;
-pub use config::{OtlpConfig, PromptLogConfig, RetentionConfig};
+pub use config::{JsonlExportConfig, OtlpConfig, PromptLogConfig, RetentionConfig};
 pub use entry::{error_code, LogPhase, PromptLogEntry};
 pub use index::BloomFilter;
 pub use query::{

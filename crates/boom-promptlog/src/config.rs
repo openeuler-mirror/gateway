@@ -80,6 +80,9 @@ pub struct PromptLogConfig {
     pub record_headers: Vec<String>,
     #[serde(default)]
     pub segment: SegmentConfig,
+    /// Optional instance-local JSONL output for file collectors.
+    #[serde(default)]
+    pub jsonl_export: JsonlExportConfig,
     #[serde(default)]
     pub retention: RetentionConfig,
     /// Optional OTLP exporter — when `enabled=true`, entries are also pushed
@@ -87,6 +90,31 @@ pub struct PromptLogConfig {
     /// are still written; this is a second sink, not a replacement.
     #[serde(default)]
     pub otlp: OtlpConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct JsonlExportConfig {
+    pub enabled: bool,
+    /// Empty uses the export subdirectory of the Prompt log root.
+    pub dir: String,
+    pub max_file_mb: u64,
+    /// Zero disables age-based rotation.
+    pub max_file_age_secs: u64,
+    /// Includes the active file.
+    pub max_files: usize,
+}
+
+impl Default for JsonlExportConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            dir: String::new(),
+            max_file_mb: 100,
+            max_file_age_secs: 3600,
+            max_files: 15,
+        }
+    }
 }
 
 /// Segment file layout knobs. Sealing happens on whichever threshold is hit
@@ -264,6 +292,7 @@ impl Default for PromptLogConfig {
             excluded_teams: Vec::new(),
             record_headers: Vec::new(),
             segment: SegmentConfig::default(),
+            jsonl_export: JsonlExportConfig::default(),
             retention: RetentionConfig::default(),
             otlp: OtlpConfig::default(),
         }

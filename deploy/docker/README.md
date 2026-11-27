@@ -213,6 +213,30 @@ curl http://localhost:4000/health/ready   # 就绪探针（配了 DB 且未连�
 镜像内置 HEALTHCHECK（`/health/live`，10s 间隔、30s 宽容期），配
 `--restart unless-stopped` 或 k8s liveness probe 使用。
 
+### Filebeat 采集 Prompt 日志
+
+需要沿用 Filebeat → Kafka 时，在每个实例的 YAML 中启用
+`prompt_log.enabled` 和 `prompt_log.jsonl_export.enabled`。将
+`prompt_log.dir` 挂载到持久化卷，并让宿主机 Filebeat 读取该挂载下的
+`export/prompt-*.jsonl`。显式设置 `jsonl_export.dir` 时，挂载并采集该目录。
+实例可热加载开关、目录和容量阈值。生产多实例各用独立目录。
+
+Filebeat 继续沿用原有解析与 Kafka 输出。更新输入路径，并按实际单条日志
+最大体积核对 filestream 的 `message_max_bytes`（旧版 log 输入为
+`max_bytes`）、Kafka 输出的 `max_message_bytes` 和 broker/topic 的限制。
+如果采集规则从文件路径提取 Team、Key 或阶段，改为读取 JSON 记录的字段。
+联调时也要核对文件身份识别。频繁淘汰可能复用 inode。使用 filestream
+的 fingerprint 时，文件必须达到所配置的指纹长度才会被发现。
+
+旁路按文件大小或存活时间轮转，并按序号淘汰最旧文件。默认每实例最多
+15 个文件，合计 1500 MiB。单条超过单文件阈值时可独占一文件，仍计入
+总量。单条超过总量时仅跳过旁路输出。该容量只统计旁路目录内文件，
+需要另计段存储，以及采集进程尚未关闭的已删除文件占用。
+
+淘汰不等待 Filebeat 或 Kafka 确认。下游停顿超过环形保留窗口时，未采集
+的最旧文件会丢失。按实际每秒写入的 JSONL 字节数和期望的中断时长规划
+容量，预留余量。时间轮转也会消耗文件名额，即使文件还没写满。
+
 ## 四、提交前冒烟
 
 ```bash
