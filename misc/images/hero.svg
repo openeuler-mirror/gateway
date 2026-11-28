@@ -1,0 +1,181 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1800 920" width="1800" height="920">
+  <defs>
+    <linearGradient id="brand" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#5053e8"/>
+      <stop offset="50%" stop-color="#7879f0"/>
+      <stop offset="100%" stop-color="#5053e8"/>
+    </linearGradient>
+  </defs>
+
+  <g font-family="'Inter','SF Pro Text',-apple-system,'Helvetica Neue','PingFang SC','Hiragino Sans GB','Microsoft YaHei','Noto Sans CJK SC',Arial,sans-serif">
+    <rect x="0.75" y="0.75" width="1798.5" height="918.5" fill="#ffffff" stroke="#d5d8de" stroke-width="1.5"/>
+
+    <!-- ── 标题栏 ── -->
+    <g transform="translate(84,76)">
+      <rect x="-12" y="-12" width="24" height="24" fill="url(#brand)" transform="rotate(45)"/>
+      <circle cx="-30" cy="0" r="2.5" fill="#5053e8" opacity=".28"/>
+      <circle cx="30" cy="0" r="2.5" fill="#5053e8" opacity=".28"/>
+      <circle cx="0" cy="-30" r="2.5" fill="#5053e8" opacity=".28"/>
+      <circle cx="0" cy="30" r="2.5" fill="#5053e8" opacity=".28"/>
+    </g>
+    <text x="134" y="92" font-size="44" font-weight="700" letter-spacing="3" fill="url(#brand)">BooM</text>
+    <text fill="#6b7280" x="284" y="92" font-size="44" font-weight="300" letter-spacing="1.5">Gateway</text>
+    <text fill="#111827" text-anchor="end" x="1728" y="70" font-size="26" font-weight="600">全 Rust 高性能 LLM API 网关</text>
+    <text fill="#6b7280" text-anchor="end" x="1728" y="102" font-size="19">KVC-Aware 调度 · 限流计费 · 全链路可观测 · Hook 扩展</text>
+    <line x1="0" y1="132" x2="1800" y2="132" stroke="#e5e7eb" stroke-width="1.5"/>
+
+    <!-- ── 列标题 ── -->
+    <g fill="#6b7280" font-size="20" font-weight="600" letter-spacing="2">
+      <text x="72" y="162">客户端</text>
+      <text x="400" y="162">网关</text>
+      <text x="1280" y="162">上游</text>
+    </g>
+
+    <!-- ── 客户端 ── -->
+    <g fill="#111827" text-anchor="middle" font-size="23" font-weight="500">
+      <rect fill="#f5f6f8" stroke="#d1d5db" stroke-width="1.5" x="72" y="187" width="240" height="52" rx="4" />
+      <rect fill="#f5f6f8" stroke="#d1d5db" stroke-width="1.5" x="72" y="253" width="240" height="52" rx="4" />
+      <rect fill="#f5f6f8" stroke="#d1d5db" stroke-width="1.5" x="72" y="319" width="240" height="52" rx="4" />
+      <rect fill="#f5f6f8" stroke="#d1d5db" stroke-width="1.5" x="72" y="385" width="240" height="52" rx="4" />
+      <text x="192" y="221">Claude Code</text>
+      <text x="192" y="287">Codex CLI</text>
+      <text x="192" y="353">opencode</text>
+      <text x="192" y="419">OpenAI SDK</text>
+    </g>
+    <path fill="none" stroke="#9ca3af" stroke-width="1.5" d="M312 213H364M312 279H364M312 345H364M312 411H364M364 213V411" />
+    <path fill="none" stroke="#6b7280" stroke-width="1.8" d="M364 312H396" />
+    <path d="M387.18 307.59L396 312L387.18 316.41" fill="none" stroke="#6b7280" stroke-width="2.02" stroke-linecap="round" stroke-linejoin="round"/>
+
+    <!-- ── 网关 ── -->
+    <rect x="400" y="204" width="816" height="396" rx="6" fill="#ffffff" stroke="#374151" stroke-width="1.5"/>
+    <text fill="#111827" x="432" y="247" font-size="23" font-weight="700">BooMGateway</text>
+    <text fill="#6b7280" x="622" y="247" font-size="19">单二进制 · 零停机热加载 · 多实例组网</text>
+    <text font-family="'SF Mono',Menlo,'JetBrains Mono',Consolas,'Courier New',monospace" fill="#9ca3af" text-anchor="end" x="1184" y="247" font-size="18">01</text>
+
+    <rect fill="#ffffff" stroke="#9ca3af" stroke-width="1.5" x="432" y="272" width="150" height="80" rx="4" />
+    <rect fill="#ffffff" stroke="#9ca3af" stroke-width="1.5" x="654" y="272" width="202" height="80" rx="4" />
+    <rect x="928" y="272" width="256" height="80" rx="4" fill="#5053e8" stroke="#5053e8" stroke-width="1.5"/>
+    <g text-anchor="middle">
+      <text fill="#111827" x="507" y="310" font-size="25" font-weight="600">认证鉴权</text>
+      <text fill="#6b7280" x="507" y="338" font-size="18">密钥 · 权限</text>
+      <text fill="#111827" x="755" y="310" font-size="25" font-weight="600">限流 · 流控</text>
+      <text fill="#6b7280" x="755" y="338" font-size="18">排队 · VIP 优先</text>
+      <text x="1056" y="310" font-size="25" font-weight="700" fill="#ffffff">KVC-Aware 调度</text>
+      <text x="1056" y="338" font-size="18" fill="#dcdcfc">Prefix Cache 命中</text>
+    </g>
+    <path fill="none" stroke="#6b7280" stroke-width="1.8" d="M582 312H646" />
+    <path d="M637.18 307.59L646 312L637.18 316.41" fill="none" stroke="#6b7280" stroke-width="2.02" stroke-linecap="round" stroke-linejoin="round"/>
+    <path fill="none" stroke="#6b7280" stroke-width="1.8" d="M856 312H920" />
+    <path d="M911.18 307.59L920 312L911.18 316.41" fill="none" stroke="#6b7280" stroke-width="2.02" stroke-linecap="round" stroke-linejoin="round"/>
+    <text font-family="'SF Mono',Menlo,'JetBrains Mono',Consolas,'Courier New',monospace" fill="#9ca3af" text-anchor="end" x="842" y="290" font-size="16">04</text>
+    <text font-family="'SF Mono',Menlo,'JetBrains Mono',Consolas,'Courier New',monospace" text-anchor="end" x="1176" y="289" font-size="16" fill="#c7c8fb">02</text>
+
+    <!-- Hook 接入点（规划中） -->
+    <line x1="432" y1="404" x2="1184" y2="404" stroke="#9ca3af" stroke-width="1.5" stroke-dasharray="7 5"/>
+    <g fill="#ffffff" stroke="#6b7280" stroke-width="1.5">
+      <circle cx="460" cy="404" r="5.5"/><circle cx="692" cy="404" r="5.5"/>
+      <circle cx="924" cy="404" r="5.5"/><circle cx="1156" cy="404" r="5.5"/>
+    </g>
+    <text font-family="'SF Mono',Menlo,'JetBrains Mono',Consolas,'Courier New',monospace" fill="#9ca3af" x="432" y="442" font-size="18">03</text>
+    <text fill="#111827" x="470" y="442" font-size="22" font-weight="600">Hook 接入点</text>
+    <rect fill="none" stroke="#9ca3af" stroke-width="1.2" stroke-dasharray="4 3" x="612" y="420" width="72" height="28" rx="3" />
+    <text fill="#6b7280" text-anchor="middle" x="648" y="439" font-size="17">规划中</text>
+    <text fill="#6b7280" text-anchor="end" x="1184" y="442" font-size="19">.so 热插拔 · 故障隔离 · 失败回滚 · 异步调度</text>
+
+    <!-- 可观测 -->
+    <rect fill="#f5f6f8" stroke="#d1d5db" stroke-width="1.5" x="432" y="484" width="752" height="76" rx="4" />
+    <text font-family="'SF Mono',Menlo,'JetBrains Mono',Consolas,'Courier New',monospace" fill="#9ca3af" x="456" y="529" font-size="18">05</text>
+    <text fill="#111827" x="492" y="529" font-size="23" font-weight="600">全链路可观测</text>
+    <text font-family="'SF Mono',Menlo,'JetBrains Mono',Consolas,'Courier New',monospace" fill="#6b7280" text-anchor="end" x="1160" y="529" font-size="18">OTLP Trace · Prometheus Metrics · Prompt Log</text>
+
+    <!-- ── 上游 ── -->
+    <rect x="1280" y="204" width="448" height="222" rx="6" fill="#ffffff" stroke="#374151" stroke-width="1.5"/>
+    <rect x="1296" y="194" width="212" height="20" fill="#ffffff"/>
+    <text fill="#111827" x="1304" y="211" font-size="20" font-weight="600">vLLM 集群<tspan font-size="17" font-weight="400" fill="#6b7280">  ·  KV Cache</tspan></text>
+
+    <rect x="1304" y="222" width="400" height="52" rx="4" fill="#eef0fd" stroke="#5053e8" stroke-width="1.8"/>
+    <rect fill="#f5f6f8" stroke="#d1d5db" stroke-width="1.5" x="1304" y="286" width="400" height="52" rx="4" />
+    <rect fill="#f5f6f8" stroke="#d1d5db" stroke-width="1.5" x="1304" y="350" width="400" height="52" rx="4" />
+    <text fill="#111827" x="1326" y="255" font-size="21" font-weight="600">节点 1</text>
+    <text fill="#374151" x="1326" y="319" font-size="21">节点 2</text>
+    <text fill="#374151" x="1326" y="383" font-size="21">节点 3</text>
+    <text text-anchor="end" x="1502" y="255" font-size="17" font-weight="600" fill="#5053e8">Cache 命中</text>
+    <g fill="#5053e8">
+      <rect x="1528" y="238" width="34" height="20" rx="2"/><rect x="1568" y="238" width="34" height="20" rx="2"/>
+      <rect x="1608" y="238" width="34" height="20" rx="2"/><rect x="1648" y="238" width="34" height="20" rx="2"/>
+    </g>
+    <g fill="#d1d5db">
+      <rect x="1528" y="302" width="34" height="20" rx="2"/><rect x="1568" y="302" width="34" height="20" rx="2"/>
+      <rect x="1608" y="302" width="34" height="20" rx="2"/><rect x="1648" y="302" width="34" height="20" rx="2"/>
+      <rect x="1528" y="366" width="34" height="20" rx="2"/><rect x="1568" y="366" width="34" height="20" rx="2"/>
+      <rect x="1608" y="366" width="34" height="20" rx="2"/><rect x="1648" y="366" width="34" height="20" rx="2"/>
+    </g>
+
+    <rect fill="#f5f6f8" stroke="#d1d5db" stroke-width="1.5" x="1280" y="484" width="448" height="76" rx="4" />
+    <text fill="#111827" x="1304" y="516" font-size="22" font-weight="600">云端 API · 20+ 服务商</text>
+    <text fill="#6b7280" x="1304" y="544" font-size="18">OpenAI · Anthropic · Bedrock · Gemini …</text>
+
+    <path d="M1216 312H1252V248H1296" fill="none" stroke="#5053e8" stroke-width="2.2"/>
+    <path d="M1285.22 242.61L1296 248L1285.22 253.39" fill="none" stroke="#5053e8" stroke-width="3.08" stroke-linecap="round" stroke-linejoin="round"/>
+    <path fill="none" stroke="#6b7280" stroke-width="1.8" d="M1252 312H1296" />
+    <path d="M1287.18 307.59L1296 312L1287.18 316.41" fill="none" stroke="#6b7280" stroke-width="2.02" stroke-linecap="round" stroke-linejoin="round"/>
+    <path fill="none" stroke="#6b7280" stroke-width="1.8" d="M1252 312V376H1296" />
+    <path d="M1287.18 371.59L1296 376L1287.18 380.41" fill="none" stroke="#6b7280" stroke-width="2.02" stroke-linecap="round" stroke-linejoin="round"/>
+
+    <!-- ── 五大能力 ── -->
+    <rect x="361" y="641" width="358" height="278" fill="#f6f6fe"/>
+    <line x1="0" y1="640" x2="1800" y2="640" stroke="#d5d8de" stroke-width="1.5"/>
+    <g stroke="#e5e7eb" stroke-width="1.5">
+      <line x1="360" y1="640" x2="360" y2="920"/><line x1="720" y1="640" x2="720" y2="920"/>
+      <line x1="1080" y1="640" x2="1080" y2="920"/><line x1="1440" y1="640" x2="1440" y2="920"/>
+    </g>
+
+    <!-- 01 -->
+    <text font-family="'SF Mono',Menlo,'JetBrains Mono',Consolas,'Courier New',monospace" font-size="22" fill="#9ca3af" x="32" y="703">01</text>
+    <text font-size="28" font-weight="700" fill="#111827" x="86" y="703">高性能 · 极简部署</text>
+    <text font-size="33" font-weight="700" fill="#111827" x="32" y="759">p50 ≈ 10ms</text>
+    <g font-size="20" fill="#374151">
+      <rect fill="#9ca3af" x="33" y="790" width="6" height="6" /><text x="50" y="804">p999 ≤ 36ms · 2000 RPS</text>
+      <rect fill="#9ca3af" x="33" y="824" width="6" height="6" /><text x="50" y="838">全 Rust · 单二进制 · 热加载</text>
+      <rect fill="#9ca3af" x="33" y="858" width="6" height="6" /><text x="50" y="872">多实例零配置组网</text>
+    </g>
+    <!-- 02 -->
+    <text font-family="'SF Mono',Menlo,'JetBrains Mono',Consolas,'Courier New',monospace" font-size="22" x="392" y="703" fill="#5053e8">02</text>
+    <text font-size="28" font-weight="700" fill="#111827" x="446" y="703">KVC-Aware 调度</text>
+    <text font-size="33" font-weight="700" x="392" y="759" fill="#5053e8">命中率 90%+</text>
+    <g font-size="20" fill="#374151">
+      <rect fill="#9ca3af" x="393" y="790" width="6" height="6" /><text x="410" y="804">TTFT 更低 · 上游零改造</text>
+      <rect fill="#9ca3af" x="393" y="824" width="6" height="6" /><text x="410" y="838">Prefix 亲和 · 语义路由</text>
+      <rect fill="#9ca3af" x="393" y="858" width="6" height="6" /><text x="410" y="872">负载均衡 · 故障转移</text>
+    </g>
+    <!-- 03 -->
+    <text font-family="'SF Mono',Menlo,'JetBrains Mono',Consolas,'Courier New',monospace" font-size="22" fill="#9ca3af" x="752" y="703">03</text>
+    <text font-size="28" font-weight="700" fill="#111827" x="806" y="703">Hook 扩展</text>
+    <rect fill="none" stroke="#9ca3af" stroke-width="1.2" stroke-dasharray="4 3" x="952" y="681" width="72" height="28" rx="3" />
+    <text fill="#6b7280" text-anchor="middle" x="988" y="700" font-size="17">规划中</text>
+    <text font-size="33" font-weight="700" fill="#111827" x="752" y="759">.so 热插拔</text>
+    <g font-size="20" fill="#374151">
+      <rect fill="#9ca3af" x="753" y="790" width="6" height="6" /><text x="770" y="804">业务定制不侵入主干</text>
+      <rect fill="#9ca3af" x="753" y="824" width="6" height="6" /><text x="770" y="838">故障隔离 · 失败回滚 · 异步调度</text>
+      <rect fill="#9ca3af" x="753" y="858" width="6" height="6" /><text x="770" y="872">多接入点可扩展</text>
+    </g>
+    <!-- 04 -->
+    <text font-family="'SF Mono',Menlo,'JetBrains Mono',Consolas,'Courier New',monospace" font-size="22" fill="#9ca3af" x="1112" y="703">04</text>
+    <text font-size="28" font-weight="700" fill="#111827" x="1166" y="703">流量治理与计费</text>
+    <text font-size="33" font-weight="700" fill="#111827" x="1112" y="759">超限排队不拒绝</text>
+    <g font-size="20" fill="#374151">
+      <rect fill="#9ca3af" x="1113" y="790" width="6" height="6" /><text x="1130" y="804">请求 / Token / 费用 配额</text>
+      <rect fill="#9ca3af" x="1113" y="824" width="6" height="6" /><text x="1130" y="838">密钥 / 团队 双层 · VIP 优先</text>
+      <rect fill="#9ca3af" x="1113" y="858" width="6" height="6" /><text x="1130" y="872">终身累计 + 时段窗口</text>
+    </g>
+    <!-- 05 -->
+    <text font-family="'SF Mono',Menlo,'JetBrains Mono',Consolas,'Courier New',monospace" font-size="22" fill="#9ca3af" x="1472" y="703">05</text>
+    <text font-size="28" font-weight="700" fill="#111827" x="1526" y="703">全链路可观测</text>
+    <text font-size="33" font-weight="700" fill="#111827" x="1472" y="759">每请求可追溯</text>
+    <g font-size="20" fill="#374151">
+      <rect fill="#9ca3af" x="1473" y="790" width="6" height="6" /><text x="1490" y="804">TTFT · 排队 · 调度决策</text>
+      <rect fill="#9ca3af" x="1473" y="824" width="6" height="6" /><text x="1490" y="838">OTLP / Prometheus 导出</text>
+      <rect fill="#9ca3af" x="1473" y="858" width="6" height="6" /><text x="1490" y="872">Prompt Log 落盘</text>
+    </g>
+  </g>
+</svg>

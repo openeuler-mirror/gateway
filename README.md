@@ -6,6 +6,10 @@
 
 **中文** | [English](README.en.md)
 
+<div align="center">
+  <img src="misc/images/hero.svg" alt="BooMGateway 五大能力" width="900">
+</div>
+
 使用 Rust 构建的生产级 LLM API 网关。统一接入 OpenAI、Anthropic、Gemini、Bedrock、vLLM、Ollama 等 20+ 上游服务商；兼容 litellm 密钥体系，自建限流、套餐、计费、流量治理、Web 管理面板、审计与完整 prompt 落盘。核心差异化能力：**面向 vLLM 前缀缓存优化的智能调度**——会话前缀亲和、密钥亲和、语义路由与反馈式负载均衡。
 
 [![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange)](https://www.rust-lang.org/)
