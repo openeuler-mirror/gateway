@@ -28,7 +28,7 @@
     <g fill="#6b7280" font-size="20" font-weight="600" letter-spacing="2">
       <text x="72" y="162">客户端</text>
       <text x="400" y="162">网关</text>
-      <text x="1280" y="162">上游</text>
+      <text x="1154" y="162">上游</text>
     </g>
 
     <!-- ── 客户端 ── -->
@@ -47,80 +47,116 @@
     <path d="M387.18 307.59L396 312L387.18 316.41" fill="none" stroke="#6b7280" stroke-width="2.02" stroke-linecap="round" stroke-linejoin="round"/>
 
     <!-- ── 网关 ── -->
-    <rect x="400" y="204" width="816" height="396" rx="6" fill="#ffffff" stroke="#374151" stroke-width="1.5"/>
+    <rect x="400" y="204" width="690" height="380" rx="6" fill="#ffffff" stroke="#374151" stroke-width="1.5"/>
     <text fill="#111827" x="432" y="247" font-size="23" font-weight="700">BooMGateway</text>
     <text fill="#6b7280" x="622" y="247" font-size="19">单二进制 · 零停机热加载 · 多实例组网</text>
-    <text font-family="'SF Mono',Menlo,'JetBrains Mono',Consolas,'Courier New',monospace" fill="#9ca3af" text-anchor="end" x="1184" y="247" font-size="18">01</text>
+    <text font-family="'SF Mono',Menlo,'JetBrains Mono',Consolas,'Courier New',monospace" fill="#9ca3af" text-anchor="end" x="1058" y="247" font-size="18">01</text>
 
-    <rect fill="#ffffff" stroke="#9ca3af" stroke-width="1.5" x="432" y="272" width="150" height="80" rx="4" />
-    <rect fill="#ffffff" stroke="#9ca3af" stroke-width="1.5" x="654" y="272" width="202" height="80" rx="4" />
-    <rect x="928" y="272" width="256" height="80" rx="4" fill="#5053e8" stroke="#5053e8" stroke-width="1.5"/>
+    <rect fill="#ffffff" stroke="#9ca3af" stroke-width="1.5" x="432" y="268" width="128" height="88" rx="4" />
+    <rect fill="#ffffff" stroke="#9ca3af" stroke-width="1.5" x="596" y="268" width="176" height="88" rx="4" />
+    <rect x="808" y="268" width="250" height="88" rx="4" fill="#5053e8" stroke="#5053e8" stroke-width="1.5"/>
     <g text-anchor="middle">
-      <text fill="#111827" x="507" y="310" font-size="25" font-weight="600">认证鉴权</text>
-      <text fill="#6b7280" x="507" y="338" font-size="18">密钥 · 权限</text>
-      <text fill="#111827" x="755" y="310" font-size="25" font-weight="600">限流 · 流控</text>
-      <text fill="#6b7280" x="755" y="338" font-size="18">排队 · VIP 优先</text>
-      <text x="1056" y="310" font-size="25" font-weight="700" fill="#ffffff">KVC-Aware 调度</text>
-      <text x="1056" y="338" font-size="18" fill="#dcdcfc">Prefix Cache 命中</text>
+      <text fill="#111827" x="496" y="314" font-size="25" font-weight="600">认证鉴权</text>
+      <text fill="#6b7280" x="496" y="342" font-size="18">密钥 · 权限</text>
+      <text fill="#111827" x="684" y="314" font-size="25" font-weight="600">限流 · 流控</text>
+      <text fill="#6b7280" x="684" y="342" font-size="18">排队 · VIP 优先</text>
+      <text x="933" y="314" font-size="25" font-weight="700" fill="#ffffff">KVC-Aware 调度</text>
+      <text x="933" y="342" font-size="19" fill="#dcdcfc">KV 亲和 · 负载均衡</text>
     </g>
-    <path fill="none" stroke="#6b7280" stroke-width="1.8" d="M582 312H646" />
-    <path d="M637.18 307.59L646 312L637.18 316.41" fill="none" stroke="#6b7280" stroke-width="2.02" stroke-linecap="round" stroke-linejoin="round"/>
-    <path fill="none" stroke="#6b7280" stroke-width="1.8" d="M856 312H920" />
-    <path d="M911.18 307.59L920 312L911.18 316.41" fill="none" stroke="#6b7280" stroke-width="2.02" stroke-linecap="round" stroke-linejoin="round"/>
-    <text font-family="'SF Mono',Menlo,'JetBrains Mono',Consolas,'Courier New',monospace" fill="#9ca3af" text-anchor="end" x="842" y="290" font-size="16">04</text>
-    <text font-family="'SF Mono',Menlo,'JetBrains Mono',Consolas,'Courier New',monospace" text-anchor="end" x="1176" y="289" font-size="16" fill="#c7c8fb">02</text>
+    <path fill="none" stroke="#6b7280" stroke-width="1.8" d="M560 312H596" />
+    <path d="M587.18 307.59L596 312L587.18 316.41" fill="none" stroke="#6b7280" stroke-width="2.02" stroke-linecap="round" stroke-linejoin="round"/>
+    <path fill="none" stroke="#6b7280" stroke-width="1.8" d="M772 312H808" />
+    <path d="M799.18 307.59L808 312L799.18 316.41" fill="none" stroke="#6b7280" stroke-width="2.02" stroke-linecap="round" stroke-linejoin="round"/>
+    <text font-family="'SF Mono',Menlo,'JetBrains Mono',Consolas,'Courier New',monospace" fill="#9ca3af" text-anchor="end" x="766" y="284" font-size="16">04</text>
+    <text font-family="'SF Mono',Menlo,'JetBrains Mono',Consolas,'Courier New',monospace" text-anchor="end" x="1052" y="284" font-size="16" fill="#c7c8fb">02</text>
 
     <!-- Hook 接入点（规划中） -->
-    <line x1="432" y1="404" x2="1184" y2="404" stroke="#9ca3af" stroke-width="1.5" stroke-dasharray="7 5"/>
+    <line x1="432" y1="404" x2="1058" y2="404" stroke="#9ca3af" stroke-width="1.5" stroke-dasharray="7 5"/>
     <g fill="#ffffff" stroke="#6b7280" stroke-width="1.5">
-      <circle cx="460" cy="404" r="5.5"/><circle cx="692" cy="404" r="5.5"/>
-      <circle cx="924" cy="404" r="5.5"/><circle cx="1156" cy="404" r="5.5"/>
+      <circle cx="460" cy="404" r="5.5"/><circle cx="650" cy="404" r="5.5"/>
+      <circle cx="840" cy="404" r="5.5"/><circle cx="1030" cy="404" r="5.5"/>
     </g>
     <text font-family="'SF Mono',Menlo,'JetBrains Mono',Consolas,'Courier New',monospace" fill="#9ca3af" x="432" y="442" font-size="18">03</text>
     <text fill="#111827" x="470" y="442" font-size="22" font-weight="600">Hook 接入点</text>
-    <rect fill="none" stroke="#9ca3af" stroke-width="1.2" stroke-dasharray="4 3" x="612" y="420" width="72" height="28" rx="3" />
-    <text fill="#6b7280" text-anchor="middle" x="648" y="439" font-size="17">规划中</text>
-    <text fill="#6b7280" text-anchor="end" x="1184" y="442" font-size="19">.so 热插拔 · 故障隔离 · 失败回滚 · 异步调度</text>
+    <rect fill="none" stroke="#9ca3af" stroke-width="1.2" stroke-dasharray="4 3" x="610" y="420" width="72" height="28" rx="3" />
+    <text fill="#6b7280" text-anchor="middle" x="646" y="439" font-size="17">规划中</text>
+    <text fill="#6b7280" text-anchor="end" x="1058" y="442" font-size="18">.so 热插拔 · 故障隔离 · 失败回滚 · 异步调度</text>
 
     <!-- 可观测 -->
-    <rect fill="#f5f6f8" stroke="#d1d5db" stroke-width="1.5" x="432" y="484" width="752" height="76" rx="4" />
+    <rect fill="#f5f6f8" stroke="#d1d5db" stroke-width="1.5" x="432" y="484" width="626" height="76" rx="4" />
     <text font-family="'SF Mono',Menlo,'JetBrains Mono',Consolas,'Courier New',monospace" fill="#9ca3af" x="456" y="529" font-size="18">05</text>
     <text fill="#111827" x="492" y="529" font-size="23" font-weight="600">全链路可观测</text>
-    <text font-family="'SF Mono',Menlo,'JetBrains Mono',Consolas,'Courier New',monospace" fill="#6b7280" text-anchor="end" x="1160" y="529" font-size="18">OTLP Trace · Prometheus Metrics · Prompt Log</text>
+    <text font-family="'SF Mono',Menlo,'JetBrains Mono',Consolas,'Courier New',monospace" fill="#6b7280" text-anchor="end" x="1034" y="529" font-size="18">OTLP Trace · Prometheus · Prompt Log</text>
 
     <!-- ── 上游 ── -->
-    <rect x="1280" y="204" width="448" height="222" rx="6" fill="#ffffff" stroke="#374151" stroke-width="1.5"/>
-    <rect x="1296" y="194" width="212" height="20" fill="#ffffff"/>
-    <text fill="#111827" x="1304" y="211" font-size="20" font-weight="600">vLLM 集群<tspan font-size="17" font-weight="400" fill="#6b7280">  ·  KV Cache</tspan></text>
+    <rect x="1154" y="204" width="574" height="282" rx="6" fill="#ffffff" stroke="#374151" stroke-width="1.5"/>
+    <rect x="1170" y="194" width="226" height="20" fill="#ffffff"/>
+    <text fill="#111827" x="1178" y="211" font-size="20" font-weight="600">vLLM 集群<tspan font-size="17" font-weight="400" fill="#6b7280">  ·  KV Cache</tspan></text>
 
-    <rect x="1304" y="222" width="400" height="52" rx="4" fill="#eef0fd" stroke="#5053e8" stroke-width="1.8"/>
-    <rect fill="#f5f6f8" stroke="#d1d5db" stroke-width="1.5" x="1304" y="286" width="400" height="52" rx="4" />
-    <rect fill="#f5f6f8" stroke="#d1d5db" stroke-width="1.5" x="1304" y="350" width="400" height="52" rx="4" />
-    <text fill="#111827" x="1326" y="255" font-size="21" font-weight="600">节点 1</text>
-    <text fill="#374151" x="1326" y="319" font-size="21">节点 2</text>
-    <text fill="#374151" x="1326" y="383" font-size="21">节点 3</text>
-    <text text-anchor="end" x="1502" y="255" font-size="17" font-weight="600" fill="#5053e8">Cache 命中</text>
-    <g fill="#5053e8">
-      <rect x="1528" y="238" width="34" height="20" rx="2"/><rect x="1568" y="238" width="34" height="20" rx="2"/>
-      <rect x="1608" y="238" width="34" height="20" rx="2"/><rect x="1648" y="238" width="34" height="20" rx="2"/>
-    </g>
-    <g fill="#d1d5db">
-      <rect x="1528" y="302" width="34" height="20" rx="2"/><rect x="1568" y="302" width="34" height="20" rx="2"/>
-      <rect x="1608" y="302" width="34" height="20" rx="2"/><rect x="1648" y="302" width="34" height="20" rx="2"/>
-      <rect x="1528" y="366" width="34" height="20" rx="2"/><rect x="1568" y="366" width="34" height="20" rx="2"/>
-      <rect x="1608" y="366" width="34" height="20" rx="2"/><rect x="1648" y="366" width="34" height="20" rx="2"/>
+    <!-- 列头 -->
+    <g fill="#9ca3af" font-size="16" letter-spacing="1">
+      <text x="1202" y="236">命中会话</text>
+      <text x="1294" y="236">节点</text>
+      <text x="1454" y="236" text-anchor="middle">Prefix Cache</text>
+      <text x="1596" y="236" text-anchor="middle">负载</text>
     </g>
 
-    <rect fill="#f5f6f8" stroke="#d1d5db" stroke-width="1.5" x="1280" y="484" width="448" height="76" rx="4" />
-    <text fill="#111827" x="1304" y="516" font-size="22" font-weight="600">云端 API · 20+ 服务商</text>
-    <text fill="#6b7280" x="1304" y="544" font-size="18">OpenAI · Anthropic · Bedrock · Gemini …</text>
+    <!-- 节点 1 -->
+    <rect fill="#f5f6f8" stroke="#d1d5db" stroke-width="1.5" x="1178" y="248" width="526" height="48" rx="4"/>
+    <rect fill="#eef0fd" stroke="#5053e8" stroke-width="1.5" x="1202" y="259" width="78" height="26" rx="13"/>
+    <text fill="#5053e8" text-anchor="middle" x="1241" y="278" font-size="17" font-weight="600">会话 A</text>
+    <text fill="#111827" x="1294" y="279" font-size="21" font-weight="600">节点 1</text>
+    <g>
+      <rect x="1372" y="263" width="24" height="18" rx="2" fill="#5053e8"/><rect x="1400" y="263" width="24" height="18" rx="2" fill="#5053e8"/><rect x="1428" y="263" width="24" height="18" rx="2" fill="#5053e8"/>
+      <rect x="1456" y="263" width="24" height="18" rx="2" fill="#d1d5db"/><rect x="1484" y="263" width="24" height="18" rx="2" fill="#d1d5db"/><rect x="1512" y="263" width="24" height="18" rx="2" fill="#d1d5db"/>
+    </g>
+    <rect fill="#e5e7eb" x="1554" y="267" width="84" height="10" rx="2"/>
+    <rect fill="#374151" x="1554" y="267" width="52" height="10" rx="2"/>
+    <text font-family="'SF Mono',Menlo,'JetBrains Mono',Consolas,'Courier New',monospace" fill="#374151" x="1648" y="278" font-size="17">62%</text>
 
-    <path d="M1216 312H1252V248H1296" fill="none" stroke="#5053e8" stroke-width="2.2"/>
-    <path d="M1285.22 242.61L1296 248L1285.22 253.39" fill="none" stroke="#5053e8" stroke-width="3.08" stroke-linecap="round" stroke-linejoin="round"/>
-    <path fill="none" stroke="#6b7280" stroke-width="1.8" d="M1252 312H1296" />
-    <path d="M1287.18 307.59L1296 312L1287.18 316.41" fill="none" stroke="#6b7280" stroke-width="2.02" stroke-linecap="round" stroke-linejoin="round"/>
-    <path fill="none" stroke="#6b7280" stroke-width="1.8" d="M1252 312V376H1296" />
-    <path d="M1287.18 371.59L1296 376L1287.18 380.41" fill="none" stroke="#6b7280" stroke-width="2.02" stroke-linecap="round" stroke-linejoin="round"/>
+    <!-- 节点 2 -->
+    <rect fill="#f5f6f8" stroke="#d1d5db" stroke-width="1.5" x="1178" y="304" width="526" height="48" rx="4"/>
+    <rect fill="#eef0fd" stroke="#5053e8" stroke-width="1.5" x="1202" y="315" width="78" height="26" rx="13"/>
+    <text fill="#5053e8" text-anchor="middle" x="1241" y="334" font-size="17" font-weight="600">会话 B</text>
+    <text fill="#111827" x="1294" y="335" font-size="21" font-weight="600">节点 2</text>
+    <g>
+      <rect x="1372" y="319" width="24" height="18" rx="2" fill="#5053e8"/><rect x="1400" y="319" width="24" height="18" rx="2" fill="#5053e8"/><rect x="1428" y="319" width="24" height="18" rx="2" fill="#5053e8"/>
+      <rect x="1456" y="319" width="24" height="18" rx="2" fill="#d1d5db"/><rect x="1484" y="319" width="24" height="18" rx="2" fill="#d1d5db"/><rect x="1512" y="319" width="24" height="18" rx="2" fill="#d1d5db"/>
+    </g>
+    <rect fill="#e5e7eb" x="1554" y="323" width="84" height="10" rx="2"/>
+    <rect fill="#374151" x="1554" y="323" width="51" height="10" rx="2"/>
+    <text font-family="'SF Mono',Menlo,'JetBrains Mono',Consolas,'Courier New',monospace" fill="#374151" x="1648" y="334" font-size="17">61%</text>
+
+    <!-- 节点 3 -->
+    <rect fill="#f5f6f8" stroke="#d1d5db" stroke-width="1.5" x="1178" y="360" width="526" height="48" rx="4"/>
+    <rect fill="#eef0fd" stroke="#5053e8" stroke-width="1.5" x="1202" y="371" width="78" height="26" rx="13"/>
+    <text fill="#5053e8" text-anchor="middle" x="1241" y="390" font-size="17" font-weight="600">会话 C</text>
+    <text fill="#111827" x="1294" y="391" font-size="21" font-weight="600">节点 3</text>
+    <g>
+      <rect x="1372" y="375" width="24" height="18" rx="2" fill="#5053e8"/><rect x="1400" y="375" width="24" height="18" rx="2" fill="#5053e8"/><rect x="1428" y="375" width="24" height="18" rx="2" fill="#5053e8"/>
+      <rect x="1456" y="375" width="24" height="18" rx="2" fill="#d1d5db"/><rect x="1484" y="375" width="24" height="18" rx="2" fill="#d1d5db"/><rect x="1512" y="375" width="24" height="18" rx="2" fill="#d1d5db"/>
+    </g>
+    <rect fill="#e5e7eb" x="1554" y="379" width="84" height="10" rx="2"/>
+    <rect fill="#374151" x="1554" y="379" width="50" height="10" rx="2"/>
+    <text font-family="'SF Mono',Menlo,'JetBrains Mono',Consolas,'Courier New',monospace" fill="#374151" x="1648" y="390" font-size="17">60%</text>
+
+    <!-- 调度规则 -->
+    <text fill="#5053e8" x="1202" y="436" font-size="17" font-weight="600">KV 亲和</text>
+    <text fill="#374151" x="1286" y="436" font-size="17">前缀命中 → 路由到缓存所在节点</text>
+    <text fill="#111827" x="1202" y="462" font-size="17" font-weight="600">负载均衡</text>
+    <text fill="#374151" x="1286" y="462" font-size="17">冷请求轮询均摊 · 负载差超阈值转交最低负载节点</text>
+
+    <rect fill="#f5f6f8" stroke="#d1d5db" stroke-width="1.5" x="1154" y="500" width="574" height="60" rx="4" />
+    <text fill="#111827" x="1178" y="524" font-size="22" font-weight="600">云端 API · 20+ 服务商</text>
+    <text fill="#6b7280" x="1178" y="548" font-size="18">OpenAI · Anthropic · Bedrock · Gemini …</text>
+
+    <!-- 网关 → 上游：三路等权分发 -->
+    <path d="M1090 312H1122V272H1170" fill="none" stroke="#5053e8" stroke-width="2.2"/>
+    <path d="M1159.22 266.61L1170 272L1159.22 277.39" fill="none" stroke="#5053e8" stroke-width="3.08" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M1122 312V328H1170" fill="none" stroke="#5053e8" stroke-width="2.2"/>
+    <path d="M1159.22 322.61L1170 328L1159.22 333.39" fill="none" stroke="#5053e8" stroke-width="3.08" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M1122 312V384H1170" fill="none" stroke="#5053e8" stroke-width="2.2"/>
+    <path d="M1159.22 378.61L1170 384L1159.22 389.39" fill="none" stroke="#5053e8" stroke-width="3.08" stroke-linecap="round" stroke-linejoin="round"/>
 
     <!-- ── 五大能力 ── -->
     <rect x="361" y="641" width="358" height="278" fill="#f6f6fe"/>
@@ -144,9 +180,9 @@
     <text font-size="28" font-weight="700" fill="#111827" x="446" y="703">KVC-Aware 调度</text>
     <text font-size="33" font-weight="700" x="392" y="759" fill="#5053e8">命中率 90%+</text>
     <g font-size="20" fill="#374151">
-      <rect fill="#9ca3af" x="393" y="790" width="6" height="6" /><text x="410" y="804">TTFT 更低 · 上游零改造</text>
-      <rect fill="#9ca3af" x="393" y="824" width="6" height="6" /><text x="410" y="838">Prefix 亲和 · 语义路由</text>
-      <rect fill="#9ca3af" x="393" y="858" width="6" height="6" /><text x="410" y="872">负载均衡 · 故障转移</text>
+      <rect fill="#9ca3af" x="393" y="790" width="6" height="6" /><text x="410" y="804">KV 亲和：前缀命中定向</text>
+      <rect fill="#9ca3af" x="393" y="824" width="6" height="6" /><text x="410" y="838">负载均衡：均摊 · 再平衡</text>
+      <rect fill="#9ca3af" x="393" y="858" width="6" height="6" /><text x="410" y="872">TTFT 更低 · 上游零改造</text>
     </g>
     <!-- 03 -->
     <text font-family="'SF Mono',Menlo,'JetBrains Mono',Consolas,'Courier New',monospace" font-size="22" fill="#9ca3af" x="752" y="703">03</text>
